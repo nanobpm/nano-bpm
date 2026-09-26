@@ -38,6 +38,13 @@ export const FAMILIES = {
   ZeebeTokenFlow: { base: 'ZeebeTokenFlow', glob: 'ZMC*.tla' }
 }
 
+// A check.sh glob (MC*.tla) as an anchored regex. validateGraphs uses it to
+// require a generated module to stay inside its family's descriptor glob, and
+// the --check orphan scan uses the SAME rule to spot stray generated models —
+// one source of truth, so the two can never drift (#1258 review).
+const globToRe = (glob) =>
+  new RegExp('^' + glob.replace(/[.]/g, '\\$&').replace(/\*/g, '.*') + '$')
+
 // node kind -> BPMN element + diagram footprint. `task` becomes a serviceTask
 // whose job type is the node id (the same key the trace tables and scenario
 // jobs use).
@@ -85,7 +92,14 @@ export const TLA_RESERVED = new Set([
 // and `--check` builds a DEDUPLICATED expected-path set, so a duplicate id or
 // module would let one graph silently overwrite another while --check still
 // reports clean (#1258 review). Duplicate flow ids within a graph collapse the
-// same way in the TLA+ MCEdges record. Fail loudly on any of these.
+// same way in the TLA+ MCEdges record. A graph must also target only a KNOWN
+// spec family and name its generated module inside that family's descriptor glob
+// (TokenFlow -> MC*, ZeebeTokenFlow -> ZMC*): a module like `Foo` (or the base
+// `TokenFlow`) writes formal/tla/Foo.tla outside the MC*/ZMC* glob — never
+// model-checked, and able to clobber the hand-written base — while --check still
+// reports clean. And every BPMN id in one process (the process id `g.id`, node
+// ids, flow ids) must be unique, or `bpmnFor` emits duplicate XML `id=` and the
+// diagram is invalid even though each id passes the grammar. Fail loudly on any.
 export function validateGraphs (graphs) {
   const bad = (msg) => { throw new Error(`corpus graph invalid: ${msg}`) }
   const checkId = (label, value) => {
@@ -102,20 +116,36 @@ export function validateGraphs (graphs) {
     checkId('graph id', g.id)
     if (seenIds.has(g.id)) bad(`duplicate graph id ${JSON.stringify(g.id)}`)
     seenIds.set(g.id, true)
+    // Every BPMN id emitted for this one process must be unique across the
+    // process id, node ids and flow ids (they share one XML id space).
+    const bpmnIds = new Set([g.id])
+    const claimBpmnId = (label, value) => {
+      if (bpmnIds.has(value)) {
+        bad(`graph ${g.id} ${label} ${JSON.stringify(value)} collides with another BPMN id in the same process (process/node/flow ids must be unique)`)
+      }
+      bpmnIds.add(value)
+    }
     for (const [fam, spec] of Object.entries(g.families ?? {})) {
+      if (!FAMILIES[fam]) {
+        bad(`graph ${g.id} targets unknown spec family ${JSON.stringify(fam)} (known: ${Object.keys(FAMILIES).join(', ')})`)
+      }
       checkId(`graph ${g.id} family ${fam} module`, spec.module)
+      if (!globToRe(FAMILIES[fam].glob).test(`${spec.module}.tla`)) {
+        bad(`graph ${g.id} family ${fam} module ${JSON.stringify(spec.module)} must match ${FAMILIES[fam].glob} to stay in the descriptor glob (else the generated model is never checked and may clobber the hand-written base)`)
+      }
       if (seenModules.has(spec.module)) {
         bad(`duplicate module ${JSON.stringify(spec.module)} (graphs ${seenModules.get(spec.module)} and ${g.id})`)
       }
       seenModules.set(spec.module, g.id)
     }
-    for (const n of Object.keys(g.nodes)) checkId(`graph ${g.id} node id`, n)
+    for (const n of Object.keys(g.nodes)) { checkId(`graph ${g.id} node id`, n); claimBpmnId('node id', n) }
     checkId(`graph ${g.id} start node`, g.start)
     const seenEdgeIds = new Set()
     for (const e of g.edges) {
       checkId(`graph ${g.id} flow id`, e.id)
       if (seenEdgeIds.has(e.id)) bad(`graph ${g.id} has duplicate flow id ${JSON.stringify(e.id)}`)
       seenEdgeIds.add(e.id)
+      claimBpmnId('flow id', e.id)
       checkId(`graph ${g.id} flow ${e.id} source`, e.from)
       checkId(`graph ${g.id} flow ${e.id} target`, e.to)
     }
@@ -184,16 +214,21 @@ export function tlaFor (graph, familyName) {
 function layout (graph) {
   const nodes = Object.keys(graph.nodes)
   const n = nodes.length
-  const rank = Object.fromEntries(nodes.map((id) => [id, 0]))
+  // ID-indexed maps use null prototypes so a node named `constructor` (or any
+  // other Object.prototype key that still matches SAFE_ID) is a plain data key,
+  // not an inherited method that would throw on `.push()` / mis-read (#1258
+  // review).
+  const rank = Object.create(null)
+  for (const id of nodes) rank[id] = 0
   for (let it = 0; it < n + 2; it++) {
     for (const e of graph.edges) {
       const nr = Math.min(rank[e.from] + 1, n)
       if (rank[e.to] < nr) rank[e.to] = nr
     }
   }
-  const preds = {}
+  const preds = Object.create(null)
   for (const e of graph.edges) (preds[e.to] ??= []).push(e.from)
-  const rowOf = {}
+  const rowOf = Object.create(null)
   const maxRank = Math.max(...nodes.map((id) => rank[id]))
   const desired = (id) => {
     const ps = (preds[id] ?? []).filter((p) => rowOf[p] !== undefined)
@@ -212,7 +247,7 @@ function layout (graph) {
     }
   }
   const OX = 160; const OY = 100; const COL = 190; const ROW = 110
-  const rects = {}
+  const rects = Object.create(null)
   for (const id of nodes) {
     const { w, h } = KIND[graph.nodes[id]]
     const cx = OX + rank[id] * COL
@@ -222,12 +257,59 @@ function layout (graph) {
   return rects
 }
 
-function waypoints (s, t) {
+// --- Orthogonal edge routing -------------------------------------------------
+// A generated diagram is only human-renderable if edges do not run through
+// unrelated shapes (#1258 review). The layout places nodes on a rank×row grid
+// (COL=190 wide, ROW=110 tall; node half-extents <=55 wide / <=40 tall), so the
+// column-midpoint verticals and row-midpoint horizontals are guaranteed-clear
+// gutters. The simple straight / single-bend route is kept whenever it is
+// already clear (the common adjacent case, so most edges are byte-unchanged);
+// only edges that would cross an intervening node — same-row spans and
+// backward/cyclic edges — detour through those gutters.
+const ROUTE_MARGIN = 6
+function segHitsRect (a, b, r) {
+  const loX = Math.min(a[0], b[0]); const hiX = Math.max(a[0], b[0])
+  const loY = Math.min(a[1], b[1]); const hiY = Math.max(a[1], b[1])
+  return loX <= r.x + r.w + ROUTE_MARGIN && hiX >= r.x - ROUTE_MARGIN &&
+    loY <= r.y + r.h + ROUTE_MARGIN && hiY >= r.y - ROUTE_MARGIN
+}
+function pathClear (pts, obstacles) {
+  for (let i = 0; i + 1 < pts.length; i++) {
+    for (const r of obstacles) if (segHitsRect(pts[i], pts[i + 1], r)) return false
+  }
+  return true
+}
+function waypoints (s, t, obstacles = []) {
   const sx = s.x + s.w; const sy = s.cy
   const tx = t.x; const ty = t.cy
-  if (Math.abs(sy - ty) < 0.5) return [[sx, sy], [tx, ty]]
-  const G = 18
-  return [[sx, sy], [tx - G, sy], [tx - G, ty], [tx, ty]]
+  const ROW = 110; const COL = 190
+  const backward = t.cx <= s.cx
+  // Preferred simple routes (unchanged for the many already-clear edges). A
+  // backward/cyclic edge is never routed straight: exiting the source's right
+  // side toward a target on its left doubles the segment back THROUGH the source
+  // shape, so it always takes the loop-under detour below.
+  const simple = Math.abs(sy - ty) < 0.5
+    ? [[sx, sy], [tx, ty]]
+    : (() => { const G = 18; return [[sx, sy], [tx - G, sy], [tx - G, ty], [tx, ty]] })()
+  if (!backward && pathClear(simple, obstacles)) return simple
+  // The straight route would cross a node (or is a backward edge). Detour
+  // through the row-gutter just below the lower of the two endpoints: a U for a
+  // backward/same-row edge, and for a forward span exit the source's right
+  // gutter, run the clear lane, and re-enter the target's left gutter. Both use
+  // only guaranteed-clear column/row midpoint gutters.
+  const laneY = Math.max(sy, ty) + ROW / 2
+  const candidates = []
+  if (backward) {
+    // Loop under both nodes: down out of the source, across, up into the target.
+    candidates.push([[s.cx, s.y + s.h], [s.cx, laneY], [t.cx, laneY], [t.cx, t.y + t.h]])
+  }
+  // Forward (or backward fallback): right gutter of source -> lane -> left
+  // gutter of target. Column/row midpoints never fall inside a node's extent.
+  const vxs = s.cx + COL / 2
+  const vxt = t.cx - COL / 2
+  candidates.push([[sx, sy], [vxs, sy], [vxs, laneY], [vxt, laneY], [vxt, ty], [tx, ty]])
+  for (const c of candidates) if (pathClear(c, obstacles)) return c
+  return simple // no clear detour found — keep the simple route rather than fail
 }
 
 const xmlEscape = (s) => String(s)
@@ -244,7 +326,7 @@ const xmlEscape = (s) => String(s)
 // exactly ONE selected branch, leaving the rest as faithfully-present dead
 // flows. Returns the set of taken flow ids.
 export function takenFlows (graph) {
-  const outFlows = {}
+  const outFlows = Object.create(null)
   for (const e of graph.edges) (outFlows[e.from] ??= []).push(e)
   const taken = new Set()
   for (const [from, outs] of Object.entries(outFlows)) {
@@ -262,7 +344,7 @@ export function takenFlows (graph) {
 // scheduling its job would deadlock the runner (the job is never created).
 export function reachableNodes (graph) {
   const taken = takenFlows(graph)
-  const outFlows = {}
+  const outFlows = Object.create(null)
   for (const e of graph.edges) (outFlows[e.from] ??= []).push(e)
   const seen = new Set([graph.start])
   const stack = [graph.start]
@@ -279,7 +361,7 @@ export function reachableNodes (graph) {
 // BPMN 2.0 XML + BPMNDI
 export function bpmnFor (graph) {
   const nodes = Object.keys(graph.nodes)
-  const outFlows = {}; const inFlows = {}
+  const outFlows = Object.create(null); const inFlows = Object.create(null)
   for (const e of graph.edges) {
     (outFlows[e.from] ??= []).push(e)
     ;(inFlows[e.to] ??= []).push(e)
@@ -367,7 +449,10 @@ export function bpmnFor (graph) {
   }
   for (const e of graph.edges) {
     L.push(`      <bpmndi:BPMNEdge id="${xmlEscape(e.id)}_di" bpmnElement="${xmlEscape(e.id)}">`)
-    for (const [x, y] of waypoints(rects[e.from], rects[e.to])) {
+    // Obstacles are every node except this edge's own endpoints, so routing
+    // keeps the segments out of unrelated shapes (a renderable diagram).
+    const obstacles = nodes.filter((id) => id !== e.from && id !== e.to).map((id) => rects[id])
+    for (const [x, y] of waypoints(rects[e.from], rects[e.to], obstacles)) {
       L.push(`        <di:waypoint x="${fmt(x)}" y="${fmt(y)}"/>`)
     }
     L.push('      </bpmndi:BPMNEdge>')
@@ -463,8 +548,6 @@ function main () {
     // root module — a new spec's base, say — is never mistaken for a stray
     // generated file. Base modules do not match those globs, so they are skipped
     // for free.
-    const globToRe = (glob) =>
-      new RegExp('^' + glob.replace(/[.]/g, '\\$&').replace(/\*/g, '.*') + '$')
     const generatedModelRes = Object.values(FAMILIES).map((f) => globToRe(f.glob))
     const isGeneratedModel = (name) => generatedModelRes.some((re) => re.test(name))
     if (fs.existsSync(repoTla)) {

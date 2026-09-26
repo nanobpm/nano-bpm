@@ -134,6 +134,10 @@
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="f9_di" bpmnElement="f9">
         <di:waypoint x="595" y="210"/>
+        <di:waypoint x="635" y="210"/>
+        <di:waypoint x="635" y="265"/>
+        <di:waypoint x="1015" y="265"/>
+        <di:waypoint x="1015" y="210"/>
         <di:waypoint x="1085" y="210"/>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="f10_di" bpmnElement="f10">

@@ -271,3 +271,110 @@ test('validateGraphs rejects TLA+ reserved words as identifiers', () => {
   const resGraph = base(); resGraph.id = 'TRUE'
   assert.throws(() => validateGraphs([resGraph]), /graph id "TRUE" is a TLA\+ reserved word/)
 })
+
+test('validateGraphs rejects unknown families and out-of-glob module names', () => {
+  // Regression (#1258 review): a graph must target a KNOWN spec family and name
+  // its generated module inside that family's descriptor glob (TokenFlow -> MC*,
+  // ZeebeTokenFlow -> ZMC*). A module like `Foo` (or the base `TokenFlow`) would
+  // write formal/tla/Foo.tla OUTSIDE the MC*/ZMC* glob — never model-checked, and
+  // able to clobber the hand-written base — while --check still reports clean.
+  const base = () => ({
+    id: 'Ok', start: 'S', nodes: { S: 'start', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'E' }],
+    families: { TokenFlow: { module: 'MCOk', comment: [] } }
+  })
+  const unknownFam = base(); unknownFam.families = { NotAFamily: { module: 'MCOk', comment: [] } }
+  assert.throws(() => validateGraphs([unknownFam]), /unknown spec family "NotAFamily"/)
+  const outOfGlob = base(); outOfGlob.families = { TokenFlow: { module: 'Foo', comment: [] } }
+  assert.throws(() => validateGraphs([outOfGlob]), /module "Foo" must match MC\*\.tla/)
+  const clobberBase = base(); clobberBase.families = { TokenFlow: { module: 'TokenFlow', comment: [] } }
+  assert.throws(() => validateGraphs([clobberBase]), /module "TokenFlow" must match MC\*\.tla/)
+  const wrongPrefix = base(); wrongPrefix.families = { ZeebeTokenFlow: { module: 'MCOk', comment: [] } }
+  assert.throws(() => validateGraphs([wrongPrefix]), /module "MCOk" must match ZMC\*\.tla/)
+  const okZmc = base(); okZmc.families = { ZeebeTokenFlow: { module: 'ZMCOk', comment: [] } }
+  assert.doesNotThrow(() => validateGraphs([okZmc]))
+})
+
+test('validateGraphs rejects collisions across process, node and flow ids', () => {
+  // Regression (#1258 review): the BPMN process id (g.id), node ids and flow ids
+  // share one XML id space. A node id equal to a flow id, or to g.id, makes
+  // `bpmnFor` emit duplicate `id=` attributes — invalid/ambiguous BPMN — even
+  // though every id passes the grammar. Seed a per-graph id set with g.id.
+  const nodeEqFlow = {
+    id: 'G', start: 'S', nodes: { S: 'start', dup: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'dup' }, { id: 'dup', from: 'dup', to: 'E' }],
+    families: { TokenFlow: { module: 'MCg', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([nodeEqFlow]), /flow id "dup" collides with another BPMN id/)
+  const nodeEqProcess = {
+    id: 'P', start: 'S', nodes: { S: 'start', P: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'P' }, { id: 'f2', from: 'P', to: 'E' }],
+    families: { TokenFlow: { module: 'MCp', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([nodeEqProcess]), /node id "P" collides with another BPMN id/)
+  const flowEqProcess = {
+    id: 'Q', start: 'S', nodes: { S: 'start', E: 'end' },
+    edges: [{ id: 'Q', from: 'S', to: 'E' }],
+    families: { TokenFlow: { module: 'MCq', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([flowEqProcess]), /flow id "Q" collides with another BPMN id/)
+})
+
+test('prototype-key node ids (constructor) generate without throwing', () => {
+  // Regression (#1258 review): `constructor` matches SAFE_ID and is a unique id,
+  // so it passes validation, but ID-indexed adjacency maps must be null-proto or
+  // `outFlows.constructor` resolves to Object's constructor and `.push()` throws
+  // before any artifact is produced.
+  const g = {
+    id: 'ProtoKeys', start: 'S',
+    nodes: { S: 'start', constructor: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'constructor' }, { id: 'f2', from: 'constructor', to: 'E' }],
+    families: { TokenFlow: { module: 'MCProtoKeys', comment: [] } }
+  }
+  assert.doesNotThrow(() => validateGraphs([g]))
+  let bpmn
+  assert.doesNotThrow(() => { bpmn = bpmnFor(g) })
+  assert.doesNotThrow(() => scenarioFor(g))
+  assert.doesNotThrow(() => tlaFor(g, 'TokenFlow'))
+  assert.ok(bpmn.includes('bpmnElement="constructor"'))
+  const s = JSON.parse(scenarioFor(g))
+  assert.deepEqual(s.jobs.map((j) => j.element), ['constructor'])
+})
+
+test('DI edges do not route through unrelated shapes', () => {
+  // Regression (#1258 review): a generated diagram is only human-renderable if no
+  // edge segment enters a node it does not connect. Parse each generated BPMN and
+  // assert every orthogonal segment stays out of every non-endpoint shape — the
+  // same corpus the reviewer flagged (ParallelJoinMultiArrival f9, the
+  // ParallelDuplicateFlows duplicates, the ExclusiveLoop back edge).
+  const num = (v) => Number.parseInt(v, 10)
+  let checkedSegments = 0
+  for (const g of graphs) {
+    const xml = bpmnFor(g)
+    const shapes = {}
+    const shRe = /<bpmndi:BPMNShape id="[^"]*" bpmnElement="([^"]+)"[^>]*>\s*<dc:Bounds x="([-\d]+)" y="([-\d]+)" width="([-\d]+)" height="([-\d]+)"/g
+    let m
+    while ((m = shRe.exec(xml))) shapes[m[1]] = { x: num(m[2]), y: num(m[3]), w: num(m[4]), h: num(m[5]) }
+    const flow = {}
+    for (const e of g.edges) flow[e.id] = { from: e.from, to: e.to }
+    const edRe = /<bpmndi:BPMNEdge id="[^"]*" bpmnElement="([^"]+)">([\s\S]*?)<\/bpmndi:BPMNEdge>/g
+    while ((m = edRe.exec(xml))) {
+      const id = m[1]
+      const wps = [...m[2].matchAll(/<di:waypoint x="([-\d]+)" y="([-\d]+)"/g)].map((w) => [num(w[1]), num(w[2])])
+      const ep = flow[id]
+      for (let i = 0; i + 1 < wps.length; i++) {
+        const a = wps[i]; const b = wps[i + 1]
+        const loX = Math.min(a[0], b[0]); const hiX = Math.max(a[0], b[0])
+        const loY = Math.min(a[1], b[1]); const hiY = Math.max(a[1], b[1])
+        checkedSegments++
+        for (const [nid, r] of Object.entries(shapes)) {
+          if (nid === ep.from || nid === ep.to) continue
+          // strict interior overlap: a segment must not enter an unrelated box.
+          const enters = loX < r.x + r.w && hiX > r.x && loY < r.y + r.h && hiY > r.y
+          assert.ok(!enters, `${g.id}: edge ${id} segment ${i} enters unrelated shape ${nid}`)
+        }
+      }
+    }
+  }
+  assert.ok(checkedSegments > 0, 'exercised edge segments')
+})
