@@ -682,3 +682,72 @@ test('validateGraphs rejects a family comment containing the TLA+ comment termin
   }
   assert.throws(() => validateGraphs([bad]), /contains the TLA\+ comment terminator "\*\)"/)
 })
+
+test('validateGraphs accepts a task after an inclusive (or) join', () => {
+  // Regression (#1258 review): an `or` node with multiple incoming flows is an
+  // inclusive JOIN — it synchronises its active inputs and emits ONE activation,
+  // not one per input. Modelling it as a merge (summing tokens) wrongly reported
+  // a task after `{A,B} -> J(or)` as activated twice and rejected a graph whose
+  // BPMN creates a single job for it. The inclusive split I feeds A and B, both
+  // reach J(or), and the following task T must be accepted (one activation).
+  const ok = {
+    id: 'OrJoinTask', start: 'S',
+    nodes: { S: 'start', I: 'or', A: 'task', B: 'task', J: 'or', T: 'task', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'I' },
+      { id: 'f2', from: 'I', to: 'A' }, { id: 'f3', from: 'I', to: 'B' },
+      { id: 'f4', from: 'A', to: 'J' }, { id: 'f5', from: 'B', to: 'J' },
+      { id: 'f6', from: 'J', to: 'T' }, { id: 'f7', from: 'T', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCOrJoinTask', comment: [] } }
+  }
+  assert.doesNotThrow(() => validateGraphs([ok]))
+  // A parallel (and) split into the SAME task, by contrast, delivers two tokens
+  // straight through an exclusive (xor) merge and is still (correctly) rejected.
+  const bad = {
+    id: 'XorMergeTask', start: 'S',
+    nodes: { S: 'start', P: 'and', A: 'task', B: 'task', M: 'xor', T: 'task', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'P' },
+      { id: 'f2', from: 'P', to: 'A' }, { id: 'f3', from: 'P', to: 'B' },
+      { id: 'f4', from: 'A', to: 'M' }, { id: 'f5', from: 'B', to: 'M' },
+      { id: 'f6', from: 'M', to: 'T' }, { id: 'f7', from: 'T', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCXorMergeTask', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /task "T" is activated 2 times/)
+})
+
+test('validateGraphs rejects an outgoing edge from an end node', () => {
+  // Regression (#1258 review): an `end` node maps to <bpmn:endEvent>, which
+  // Nano/Zeebe reject if it carries any outgoing sequence flow. The reachable-end
+  // check only ensures the route REACHES an end, never that an end has no
+  // successor, so `S -> A -> E(end) -> X` must be rejected as undeployable.
+  const bad = {
+    id: 'EndHasOut', start: 'S',
+    nodes: { S: 'start', A: 'task', E: 'end', X: 'task' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'E' },
+      { id: 'f3', from: 'E', to: 'X' }
+    ],
+    families: { TokenFlow: { module: 'MCEndHasOut', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /flow f3 leaves end node "E"/)
+})
+
+test('validateGraphs rejects a family comment that is not an array of strings', () => {
+  // Regression (#1258 review): tlaFor iterates `fam.comment` unconditionally, so
+  // a missing or non-array comment throws a raw TypeError there (or, for a
+  // string, silently iterates characters) instead of failing through validation.
+  // Require an array of strings first.
+  const mk = (comment) => ({
+    id: 'CommentShape', start: 'S', nodes: { S: 'start', A: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'E' }],
+    families: { TokenFlow: { module: 'MCCommentShape', comment } }
+  })
+  assert.throws(() => validateGraphs([mk(undefined)]), /comment must be an array of strings/)
+  assert.throws(() => validateGraphs([mk('a single string')]), /comment must be an array of strings/)
+  assert.throws(() => validateGraphs([mk(42)]), /comment must be an array of strings/)
+  assert.doesNotThrow(() => validateGraphs([mk(['a valid line'])]))
+  assert.doesNotThrow(() => validateGraphs([mk([])]))
+})

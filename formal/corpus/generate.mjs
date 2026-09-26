@@ -158,10 +158,18 @@ export function validateGraphs (graphs) {
       }
       seenModules.set(spec.module, g.id)
       // Family comment lines are copied verbatim into the generated TLA+
-      // `(* ... *)` header (tlaFor). A line containing the comment terminator
-      // `*)` would close that block early, spilling the remainder as invalid
-      // module syntax, yet still pass generation. Reject it here (#1258 review).
-      for (const c of spec.comment ?? []) {
+      // `(* ... *)` header (tlaFor). tlaFor iterates `fam.comment`
+      // UNCONDITIONALLY (`for (const c of fam.comment)`), so a missing or
+      // non-array comment throws a raw TypeError there instead of failing through
+      // this validation path — require it to be an array of strings first (#1258
+      // review).
+      if (!Array.isArray(spec.comment)) {
+        bad(`graph ${g.id} family ${fam} comment must be an array of strings (found ${JSON.stringify(spec.comment)}); tlaFor copies each line into the generated (* ... *) header and iterates it unconditionally`)
+      }
+      // A line containing the comment terminator `*)` would close that block
+      // early, spilling the remainder as invalid module syntax, yet still pass
+      // generation. Reject it here (#1258 review).
+      for (const c of spec.comment) {
         if (typeof c !== 'string') {
           bad(`graph ${g.id} family ${fam} comment must be an array of strings (found ${JSON.stringify(c)})`)
         }
@@ -219,6 +227,15 @@ export function validateGraphs (graphs) {
       // pointing at a non-existent element and layout has no coordinates for it.
       if (!nodeIds.has(e.from)) bad(`graph ${g.id} flow ${e.id} source ${JSON.stringify(e.from)} is not a node`)
       if (!nodeIds.has(e.to)) bad(`graph ${g.id} flow ${e.id} target ${JSON.stringify(e.to)} is not a node`)
+      // An `end` node maps to <bpmn:endEvent>, and Nano/Zeebe reject an end event
+      // that carries any outgoing sequence flow (engine-core/src/validate/
+      // cheap_rules.rs). The reachable-end check below only ensures the route
+      // REACHES an end node — it never rejects an edge leaving one — so a graph
+      // like `... -> E(end) -> X` still emits an undeployable BPMN artifact.
+      // Reject any edge whose source is an end node here (#1258 review).
+      if (g.nodes[e.from] === 'end') {
+        bad(`graph ${g.id} flow ${e.id} leaves end node ${JSON.stringify(e.from)}; an end event must have no outgoing sequence flow (Nano/Zeebe reject it), so the generated BPMN cannot deploy — remove the edge or change the node kind`)
+      }
     }
     // bpmnFor also emits document-wide ids in the SAME xsd:ID space: the
     // definitions id, the two constant BPMNDI container ids, and a `${id}_di`
@@ -256,11 +273,14 @@ export function validateGraphs (graphs) {
     // the scenario collapses reachable tasks to a set (`reachableNodes`) and
     // schedules T once, leaving the surplus job outstanding — a non-executable
     // pair. Propagate token counts along the acyclic taken subgraph and reject a
-    // graph that activates any task more than once (#1258 review). A parallel
-    // (`and`) JOIN legitimately absorbs a surplus (the "Tetris" principle: it
-    // fires once per complete set of incoming tokens), so it emits the MIN over
-    // its incoming taken flows; every other node passes each token through. Only
-    // TASK over-activation is a non-executable defect, so only it is rejected.
+    // graph that activates any task more than once (#1258 review). A synchronising
+    // JOIN legitimately absorbs a surplus (the "Tetris" principle: it fires once
+    // per complete set of incoming tokens), so it emits the MIN over its active
+    // incoming taken flows — this applies to BOTH the parallel (`and`) join and
+    // the inclusive (`or`) join (which synchronises only the incoming flows that
+    // are actually live on the route). An exclusive (`xor`) merge, by contrast,
+    // passes every token straight through (sum). Only TASK over-activation is a
+    // non-executable defect, so only it is rejected.
     const reachSet = reachableNodes(g)
     const takenIn = Object.create(null)
     const takenOutEdges = Object.create(null)
@@ -281,8 +301,8 @@ export function validateGraphs (graphs) {
       let throughput
       if (u === g.start) {
         throughput = 1 // the process instance seeds a single start token
-      } else if (g.nodes[u] === 'and' && ins.length > 0) {
-        throughput = Math.min(...ins.map((e) => edgeTokens[e.id])) // parallel join synchronises
+      } else if ((g.nodes[u] === 'and' || g.nodes[u] === 'or') && ins.length > 1) {
+        throughput = Math.min(...ins.map((e) => edgeTokens[e.id])) // parallel/inclusive join synchronises
       } else {
         throughput = ins.reduce((s, e) => s + edgeTokens[e.id], 0) // pass every token through
       }
