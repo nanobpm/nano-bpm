@@ -33,7 +33,7 @@ function argv (flag) {
 // prints: numbers, strings, TRUE/FALSE, sets {…}, tuples <<…>>, records
 // [k |-> v, …] and functions (k :> v @@ …). Whitespace/newlines are
 // insignificant between tokens.
-function parseTlaValue (text) {
+export function parseTlaValue (text) {
   let i = 0
   const s = text
   const ws = () => { while (i < s.length && /\s/.test(s[i])) i++ }
@@ -94,9 +94,18 @@ function parseTlaValue (text) {
     const out = {}
     for (;;) {
       ws()
-      let j = i
-      while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++
-      const key = s.slice(i, j); i = j
+      // TLC renders a finite function's key as a bare identifier (`[k |-> v]`)
+      // when it is alphanumeric, but quotes a string-domain key (`["S" |-> v]`),
+      // e.g. the `kind`/`edges`/state maps built from `MCNodes`/`MCFlows`. Accept
+      // both forms so a quoted key is not misparsed as an empty key.
+      let key
+      if (s[i] === '"') {
+        key = string()
+      } else {
+        let j = i
+        while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++
+        key = s.slice(i, j); i = j
+      }
       expect('|->')
       out[key] = value()
       ws()
@@ -270,4 +279,5 @@ function main () {
   process.stdout.write(JSON.stringify(fixture, null, 2) + '\n')
 }
 
-main()
+// Run the CLI only when executed directly, not when imported by a test.
+if (import.meta.url === `file://${process.argv[1]}`) main()
