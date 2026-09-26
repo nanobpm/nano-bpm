@@ -1,9 +1,20 @@
 // Nano backend for the two-backend parity runner (#1260).
 //
-// Drives the `engine-wasm` read-model `TestEngine` in-process. The read-model
-// engine is the gateway's C8-style REST read surface compiled to wasm, so its
-// `searchVariables` returns the identical `{ name, value }` shape as Zeebe's
-// `/v2/variables/search` — the two variable surfaces normalise the same way.
+// Drives the `engine-wasm` read-model `TestEngine` in-process. Final process
+// variables are read from the read-model `searchVariables` surface, but
+// restricted to the ROOT process-instance scope (`scopeKey == processInstanceKey`)
+// so the observation matches Camunda's `awaitCompletion` response — the C8
+// completion response carries the root-scope variables, NOT nested subprocess /
+// call-activity scopes (#1260 review). (The snapshot's `instance.variables` is
+// unusable here: it is emptied once the instance completes, which is exactly the
+// state the parity runner observes.)
+//
+// `searchVariables` truncates long values (`isTruncated`) and has no untruncated
+// opt-out yet, so a truncated value cannot be compared faithfully. Rather than
+// emit a lying (truncated) observation that would silently diverge from Camunda's
+// full value, `rootVariablesFromSearch` throws on a truncated root-scope
+// variable: adding an untruncated, scope-filtered variable API to engine-wasm is
+// the documented extension surface for long-value scenarios (#1260 review).
 //
 // The `TestEngine` runs every command to BPMN run-to-completion (RTC)
 // quiescence synchronously, so nano needs no timing serialisation at all: after
@@ -125,16 +136,12 @@ export class NanoBackend {
     }
 
     const snapshot = JSON.parse(this.engine.snapshot());
-    for (const incident of snapshot.incidents ?? []) {
-      if (String(incident.processInstanceKey ?? incident.instance_key) === pik) {
-        bump(obs.incidents, incident.type ?? incident.errorType ?? "UNKNOWN");
-      }
-    }
+    Object.assign(obs.incidents, incidentsFromSnapshot(snapshot, pik));
 
     const vars = JSON.parse(
       this.engine.searchVariables(JSON.stringify({ processInstanceKey: pik })),
     );
-    obs.variables = variablesFromSearchItems(vars.items);
+    obs.variables = rootVariablesFromSearch(vars.items, pik);
 
     return obs;
   }
@@ -146,4 +153,49 @@ export class NanoBackend {
   async close() {
     // in-process; nothing to tear down.
   }
+}
+
+/**
+ * The active-incident multiset for one process instance, read from a read-model
+ * snapshot. The snapshot's `IncidentDto` is camelCased (`engine-wasm/src/lib.rs`
+ * `IncidentDto`), so the instance is keyed by `instanceKey` and the incident
+ * class by `kind` — NOT `processInstanceKey`/`instance_key` or `type`/`errorType`
+ * (which never exist, so a mis-read silently records every incident under
+ * `UNKNOWN` and matches no instance — #1260 review).
+ */
+export function incidentsFromSnapshot(snapshot, pik) {
+  const counts = {};
+  for (const incident of snapshot.incidents ?? []) {
+    if (String(incident.instanceKey) !== String(pik)) continue;
+    bump(counts, incident.kind ?? "UNKNOWN");
+  }
+  return counts;
+}
+
+/**
+ * The complete, root-scope variables for one process instance, read from the
+ * read-model `searchVariables` items. Only the root scope
+ * (`scopeKey == processInstanceKey == pik`) is kept, matching Camunda's
+ * `awaitCompletion` response. Throws on a truncated root-scope value: the search
+ * surface has no untruncated opt-out yet, so a truncated preview cannot be
+ * compared faithfully against Camunda's full value and must fail loudly rather
+ * than silently diverge (#1260 review).
+ */
+export function rootVariablesFromSearch(items, pik) {
+  const rootItems = (items ?? []).filter(
+    (i) =>
+      String(i.processInstanceKey) === String(pik) &&
+      String(i.scopeKey) === String(pik),
+  );
+  for (const item of rootItems) {
+    if (item.isTruncated) {
+      throw new Error(
+        `variable '${item.name}' is truncated by the read-model search surface; ` +
+          `the parity observation cannot faithfully compare it against Camunda's ` +
+          `full value. Add an untruncated, scope-filtered variable API to ` +
+          `engine-wasm before using long values in a scenario.`,
+      );
+    }
+  }
+  return variablesFromSearchItems(rootItems);
 }

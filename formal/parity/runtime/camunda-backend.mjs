@@ -26,6 +26,12 @@ import { emptyObservation } from "./observation.mjs";
 
 const DEFAULT_ACTIVATE_TIMEOUT_MS = 60_000;
 const DEFAULT_LONG_POLL_MS = 30_000;
+// The `awaitCompletion` create call blocks until the instance completes. A
+// serialised scenario drives several long-polling job activations back-to-back
+// (each up to DEFAULT_LONG_POLL_MS), so the completion wait must cover the whole
+// scenario, not Camunda's short default (5s here) — otherwise the create times
+// out (504) before `observe()` can read the final result (#1260 review).
+const DEFAULT_COMPLETION_TIMEOUT_MS = 120_000;
 
 function requireOk(res, body, what) {
   if (!res.ok) {
@@ -85,10 +91,23 @@ export class CamundaBackend {
     return parsed;
   }
 
-  /** Liveness probe used by the runner to decide whether to run this backend. */
+  /**
+   * Liveness probe used by the runner to decide whether to run this backend.
+   * A TRANSPORT failure (DNS, refused connection, TLS) means the runtime is
+   * unreachable — the documented skip case — so it resolves `false`. An HTTP-level
+   * error (a reachable-but-misconfigured gateway, e.g. 401/403) is NOT swallowed:
+   * it throws so a configured-runtime problem fails loudly instead of silently
+   * skipping the differential (#1260 review).
+   */
   async ping() {
-    const res = await fetch(`${this.base}/topology`, { headers: this.headers() });
-    return res.ok;
+    let res;
+    try {
+      res = await fetch(`${this.base}/topology`, { headers: this.headers() });
+    } catch {
+      return false;
+    }
+    requireOk(res, await res.text().catch(() => ""), "topology");
+    return true;
   }
 
   async init() {
@@ -141,6 +160,7 @@ export class CamundaBackend {
         processDefinitionId: processId,
         variables: variables ?? {},
         awaitCompletion: true,
+        requestTimeout: DEFAULT_COMPLETION_TIMEOUT_MS,
       },
       "create process instance",
     );
