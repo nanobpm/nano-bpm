@@ -95,6 +95,19 @@ export class NanoBackend {
     const jobs = JSON.parse(
       this.engine.activateJobs(jobType, MAX_JOBS_TO_ACTIVATE, 60_000, "parity-runner"),
     );
+    // Parity: the Camunda adapter THROWS when its long-poll yields no job of this
+    // type, so nano must fail identically instead of silently `return 0`ing. A
+    // step with no activatable job means the two backends did not execute the same
+    // step — a malformed or regressed scenario — and must fail loudly, not slip
+    // through to pass its oracle on a mismatched run (#1260 review).
+    if (jobs.length === 0) {
+      throw new Error(
+        `no '${jobType}' job was activatable — the nano engine reached RTC ` +
+          `quiescence without creating this job (the Camunda adapter throws in ` +
+          `the same situation). A parity step must drive the same job on both ` +
+          `backends; a malformed or regressed scenario must fail, not proceed.`,
+      );
+    }
     for (const job of jobs) {
       this.engine.completeJob(String(job.key), JSON.stringify(variables ?? {}));
     }

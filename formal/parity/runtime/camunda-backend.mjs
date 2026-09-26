@@ -39,6 +39,20 @@ const DEFAULT_COMPLETION_TIMEOUT_MS = 120_000;
 // indefinitely. Bounding the probe turns that hang into the documented
 // unreachable-runtime skip (#1260 review).
 const DEFAULT_PING_TIMEOUT_MS = 10_000;
+// Every ordinary (non-long-poll) REST call — deploy, clock ops, message/signal
+// correlation, job completion — must also carry a deadline. `ping()` alone is
+// not enough: without a client-side timeout a reachable-but-wedged endpoint that
+// accepts the TCP connection but never answers any of THESE requests would leave
+// `fetch()` pending forever, hanging the change-gated (skip-tolerant) CI job
+// exactly as an unbounded probe would (#1260 review).
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+// A long-polling call (job activation, the awaitCompletion create) is bounded
+// too, but its CLIENT deadline must exceed the server-side long-poll window so
+// the broker's own timeout response returns normally — the client abort is only
+// a backstop for a connection that wedges mid-poll. Add a fixed margin on top of
+// the server window rather than racing it (which would turn a legitimate
+// long-poll into a spurious client abort).
+const REQUEST_TIMEOUT_MARGIN_MS = 15_000;
 
 function requireOk(res, body, what) {
   if (!res.ok) {
@@ -61,8 +75,11 @@ export class CamundaBackend {
    * @param {number} [opts.pingTimeoutMs] liveness-probe deadline (default
    *   DEFAULT_PING_TIMEOUT_MS); a wedged endpoint that never answers within it is
    *   treated as the unreachable-runtime skip.
+   * @param {number} [opts.requestTimeoutMs] deadline for ordinary (non-long-poll)
+   *   REST calls (default DEFAULT_REQUEST_TIMEOUT_MS); long-poll calls extend it
+   *   by REQUEST_TIMEOUT_MARGIN_MS over their server-side window.
    */
-  constructor({ address, token, basicAuth, pingTimeoutMs } = {}) {
+  constructor({ address, token, basicAuth, pingTimeoutMs, requestTimeoutMs } = {}) {
     if (!address) throw new Error("CamundaBackend requires a REST address");
     // `CAMUNDA_REST_ADDRESS` is documented repo-wide as the full REST base ending
     // in `/v2` (e.g. `http://localhost:8080/v2`, agent_brief.rs / USERGUIDE), but
@@ -74,6 +91,7 @@ export class CamundaBackend {
     this.token = token;
     this.basicAuth = basicAuth;
     this.pingTimeoutMs = pingTimeoutMs ?? DEFAULT_PING_TIMEOUT_MS;
+    this.requestTimeoutMs = requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     // Only the fields a bare gateway (no secondary storage) authoritatively
     // exposes via the v2 REST API.
     this.provides = new Set(["completed", "variables"]);
@@ -89,11 +107,15 @@ export class CamundaBackend {
     return h;
   }
 
-  async #json(method, path, body, what) {
+  async #json(method, path, body, what, { timeoutMs } = {}) {
+    // Bound every REST call. A caller may override the deadline for a long-poll
+    // (job activation, awaitCompletion create) whose server-side window exceeds
+    // the ordinary request timeout; otherwise a wedged endpoint hangs CI (#1260).
     const res = await fetch(`${this.base}${path}`, {
       method,
       headers: this.headers(),
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs ?? this.requestTimeoutMs),
     });
     const text = await res.text();
     let parsed = text;
@@ -157,6 +179,7 @@ export class CamundaBackend {
       method: "POST",
       headers,
       body: form,
+      signal: AbortSignal.timeout(this.requestTimeoutMs),
     });
     const text = await res.text();
     let body = text;
@@ -213,6 +236,7 @@ export class CamundaBackend {
         requestTimeout: DEFAULT_COMPLETION_TIMEOUT_MS,
       },
       "create process instance",
+      { timeoutMs: DEFAULT_COMPLETION_TIMEOUT_MS + REQUEST_TIMEOUT_MARGIN_MS },
     );
     // Surface a create-time rejection eagerly rather than as an unhandled
     // rejection; the stored promise is still awaited in `observe`.
@@ -232,6 +256,7 @@ export class CamundaBackend {
         requestTimeout: DEFAULT_LONG_POLL_MS,
       },
       "activate jobs",
+      { timeoutMs: DEFAULT_LONG_POLL_MS + REQUEST_TIMEOUT_MARGIN_MS },
     );
     const jobs = activated.jobs ?? [];
     if (jobs.length === 0) {

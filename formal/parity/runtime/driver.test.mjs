@@ -401,6 +401,53 @@ test("CamundaBackend.reset rewinds the pinned clock and fails loudly on a reset 
   }
 });
 
+test("CamundaBackend bounds ordinary REST calls too — a wedged endpoint rejects, never hangs", async () => {
+  // The `ping()` deadline alone is not enough: every #json REST call (clock ops,
+  // deploy, correlation, completion) must also be bounded, or a reachable-but-
+  // wedged endpoint that accepts the connection but never answers leaves fetch()
+  // pending forever and hangs the skip-tolerant CI job (#1260).
+  const sockets = new Set();
+  const server = createServer(() => {
+    // Accept the request but never respond: hold it open indefinitely.
+  });
+  server.on("connection", (s) => sockets.add(s));
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({
+      address: `http://127.0.0.1:${port}`,
+      requestTimeoutMs: 150,
+    });
+    backend.pinnedClockMs = 5000;
+    // `reset()` issues a #json POST /clock/reset — it must reject on the deadline,
+    // not hang. A swallowed reset is separately guarded elsewhere; here we only
+    // assert the bounded request fails loudly rather than pending forever.
+    await assert.rejects(() => backend.reset());
+  } finally {
+    for (const s of sockets) s.destroy();
+    server.close();
+    await once(server, "close");
+  }
+});
+
+test("nano activateAndComplete fails when no job is activatable (parity with Camunda)", async () => {
+  // The Camunda adapter throws when its long-poll yields no matching job; nano
+  // must fail identically instead of silently returning 0, so a malformed or
+  // regressed scenario cannot pass its oracle on a mismatched run (#1260).
+  const nano = await new NanoBackend().init();
+  try {
+    await nano.deploy(INCIDENT_BPMN);
+    const handle = await nano.start("parity-incident", {});
+    await assert.rejects(
+      () => nano.activateAndComplete(handle, "no-such-type", {}),
+      /no 'no-such-type' job was activatable/,
+    );
+  } finally {
+    await nano.close();
+  }
+});
+
 test("job activation cap is shared, finite, and identical across backends", () => {
   // Both adapters must activate the same bounded number of matching jobs so a
   // model with many same-type jobs drives an identical step sequence; an
