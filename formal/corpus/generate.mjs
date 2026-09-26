@@ -112,9 +112,11 @@ export const TLA_RESERVED = new Set([
 // ids, flow ids, plus the document-wide `Definitions_*`/`*_di` ids bpmnFor
 // derives from them) must be unique, or `bpmnFor` emits duplicate XML `id=` and
 // the diagram is invalid even though each id passes the grammar. Edge endpoints
-// and the start must reference real nodes, a graph must target at least one
-// known family, and the deterministic route must terminate (a taken xor branch
-// that loops back yields a non-executable BPMN/scenario pair). Fail loudly on any.
+// and the start must reference real nodes, every node kind must be one KIND
+// knows (start/end/task/and/or/xor) and the start node must itself be `start`,
+// a graph must target at least one known family and carry at least one edge, and
+// the deterministic route must terminate (a taken xor branch that loops back
+// yields a non-executable BPMN/scenario pair). Fail loudly on any.
 export function validateGraphs (graphs) {
   const bad = (msg) => { throw new Error(`corpus graph invalid: ${msg}`) }
   const checkId = (label, value) => {
@@ -157,9 +159,32 @@ export function validateGraphs (graphs) {
       seenModules.set(spec.module, g.id)
     }
     const nodeIds = new Set(Object.keys(g.nodes))
-    for (const n of nodeIds) { checkId(`graph ${g.id} node id`, n); claimBpmnId('node id', n) }
+    for (const n of nodeIds) {
+      checkId(`graph ${g.id} node id`, n)
+      claimBpmnId('node id', n)
+      // The kind must be one KIND knows: tlaFor maps an unknown kind to the
+      // `OTHER -> "task"` arm while bpmnFor dereferences KIND[kind].el and
+      // throws `Cannot read properties of undefined`, so a typo like "xorr" is
+      // neither rejected nor generated. Reject it here (#1258 review).
+      if (!KIND[g.nodes[n]]) {
+        bad(`graph ${g.id} node ${JSON.stringify(n)} has unknown kind ${JSON.stringify(g.nodes[n])} (known: ${Object.keys(KIND).join(', ')})`)
+      }
+    }
     checkId(`graph ${g.id} start node`, g.start)
     if (!nodeIds.has(g.start)) bad(`graph ${g.id} start ${JSON.stringify(g.start)} is not one of its nodes`)
+    // The configured start must itself be a `start` node, else bpmnFor emits no
+    // startEvent and the scenario waits forever for a job the process never
+    // creates (#1258 review).
+    if (g.nodes[g.start] !== 'start') {
+      bad(`graph ${g.id} start ${JSON.stringify(g.start)} must have kind "start", not ${JSON.stringify(g.nodes[g.start])}`)
+    }
+    // A graph with no edges makes tlaFor emit `MCEdges  == [` with no closing
+    // `]` (the bracket is appended only on the last edge line), producing an
+    // unparsable TLA+ model; a valid process is always start -> ... -> end, so
+    // require at least one edge (#1258 review).
+    if (g.edges.length === 0) {
+      bad(`graph ${g.id} has no edges; a valid process needs at least one flow (an empty edge list emits an unparsable MCEdges record)`)
+    }
     const seenEdgeIds = new Set()
     for (const e of g.edges) {
       checkId(`graph ${g.id} flow id`, e.id)

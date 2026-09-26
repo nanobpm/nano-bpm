@@ -466,3 +466,39 @@ test('validateGraphs rejects a non-terminating deterministic route (taken back e
   }
   assert.doesNotThrow(() => validateGraphs([okLoop]))
 })
+
+test('validateGraphs rejects an unknown node kind', () => {
+  // Regression (#1258 review): a node kind not in KIND (a typo like "xorr") is
+  // silently mapped to the `OTHER -> "task"` arm in TLA+, but bpmnFor then
+  // dereferences KIND[kind].el and throws `Cannot read properties of undefined`
+  // — neither rejected nor generated. Reject it during validation.
+  const bad = {
+    id: 'BadKind', start: 'S', nodes: { S: 'start', A: 'xorr', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'E' }],
+    families: { TokenFlow: { module: 'MCBadKind', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /node "A" has unknown kind "xorr"/)
+})
+
+test('validateGraphs requires the start node to have kind "start"', () => {
+  // Regression (#1258 review): naming a non-start node as start passes the
+  // is-a-node check but emits no BPMN startEvent, so the scenario waits forever
+  // for a job the process can never create.
+  const bad = {
+    id: 'BadStart', start: 'A', nodes: { A: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'A', to: 'E' }],
+    families: { TokenFlow: { module: 'MCBadStart', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /start "A" must have kind "start"/)
+})
+
+test('validateGraphs rejects a graph with no edges', () => {
+  // Regression (#1258 review): an empty edge list makes tlaFor emit `MCEdges  ==
+  // [` with no closing `]` (the bracket is appended only on the last edge line),
+  // an unparsable TLA+ model. A valid process is always start -> ... -> end.
+  const bad = {
+    id: 'NoEdges', start: 'S', nodes: { S: 'start' }, edges: [],
+    families: { TokenFlow: { module: 'MCNoEdges', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /has no edges/)
+})
