@@ -502,3 +502,99 @@ test('validateGraphs rejects a graph with no edges', () => {
   }
   assert.throws(() => validateGraphs([bad]), /has no edges/)
 })
+
+test('scenario completion order is topological, not layout rank (dead-cycle rank inflation)', () => {
+  // Regression (#1258 review): `layout` ranks every edge, INCLUDING a dead
+  // xor-branch cycle. A dead cycle `X -> B -> X` raises the selected-path tasks
+  // Z and A to the rank cap, and the old rank-then-id sort then let the id
+  // tie-break REVERSE their real dependency (Z runs before A, but `A < Z` sorted
+  // to `[A, Z]`), so the driver waited for a job `A` that can only be created
+  // after `Z` completes. The completion order must be a TOPOLOGICAL traversal of
+  // the reachable taken subgraph instead: `[Z, A]`.
+  const g = {
+    id: 'DeadCycleRank', start: 'S',
+    nodes: { S: 'start', X: 'xor', B: 'task', Z: 'task', A: 'task', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'X' },
+      // X's outs[0] (dead) is the branch into the cycle B; outs[1] (X -> Z) is
+      // the LIVE selected route. takenFlows selects outs[1].
+      { id: 'f2', from: 'X', to: 'B' },
+      { id: 'f3', from: 'X', to: 'Z' },
+      { id: 'f4', from: 'B', to: 'X' }, // dead back edge: closes the X <-> B cycle
+      { id: 'f5', from: 'Z', to: 'A' },
+      { id: 'f6', from: 'A', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCDeadCycleRank', comment: [] } }
+  }
+  validateGraphs([g]) // the dead cycle is on untaken edges, so it is accepted
+  const reach = reachableNodes(g)
+  assert.ok(!reach.has('B'), 'B is on the dead branch and unreachable')
+  const s = JSON.parse(scenarioFor(g))
+  // Z precedes A (its own predecessor on the live route) — never the reversed
+  // `[A, Z]` the rank tie-break produced.
+  assert.deepEqual(s.jobCompletionOrder, ['Z', 'A'])
+})
+
+test('validateGraphs rejects a task activated by multiple tokens on the deterministic route', () => {
+  // Regression (#1258 review): an `and` split -> A/B -> `xor` merge -> T sends
+  // TWO tokens through the merge to T, so the BPMN creates two `T` jobs while the
+  // scenario schedules T once (reachable tasks are a set) — the surplus job is
+  // left outstanding, a non-executable pair. Reject task over-activation.
+  const g = {
+    id: 'TaskMultiToken', start: 'S',
+    nodes: { S: 'start', P: 'and', A: 'task', B: 'task', M: 'xor', T: 'task', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'P' },
+      { id: 'f2', from: 'P', to: 'A' }, { id: 'f3', from: 'P', to: 'B' },
+      { id: 'f4', from: 'A', to: 'M' }, { id: 'f5', from: 'B', to: 'M' },
+      { id: 'f6', from: 'M', to: 'T' }, { id: 'f7', from: 'T', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCTaskMultiToken', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([g]), /task "T" is activated 2 times/)
+  // A parallel JOIN legitimately absorbs the surplus (the "Tetris" principle):
+  // `and` split -> A/B -> `and` join -> E synchronises to one token, so no task
+  // over-activates and the graph is accepted.
+  const ok = {
+    id: 'ParallelJoinOk', start: 'S',
+    nodes: { S: 'start', P: 'and', A: 'task', B: 'task', J: 'and', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'P' },
+      { id: 'f2', from: 'P', to: 'A' }, { id: 'f3', from: 'P', to: 'B' },
+      { id: 'f4', from: 'A', to: 'J' }, { id: 'f5', from: 'B', to: 'J' },
+      { id: 'f6', from: 'J', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCParallelJoinOk', comment: [] } }
+  }
+  assert.doesNotThrow(() => validateGraphs([ok]))
+})
+
+test('a backward DI edge to a node above its source routes around the source shape', () => {
+  // Regression (#1258 review): ExclusiveLoop's f4 (X -> E) targets an end event
+  // sitting directly above the X gateway, so the backward loop-under detour ran
+  // its return leg straight UP through the source gateway. Only the FIRST segment
+  // may leave the source; no later segment may cross it. Assert every segment of
+  // f4 after the first stays clear of X's shape.
+  const xml = bpmnFor(graphs.find((g) => g.id === 'ExclusiveLoop'))
+  const wpsOf = (flowId) => {
+    const block = new RegExp(`bpmnElement="${flowId}">([\\s\\S]*?)</bpmndi:BPMNEdge>`).exec(xml)[1]
+    return [...block.matchAll(/<di:waypoint x="(-?\d+)" y="(-?\d+)"\/>/g)]
+      .map((m) => [Number(m[1]), Number(m[2])])
+  }
+  const boundsOf = (nodeId) => {
+    const block = new RegExp(`bpmnElement="${nodeId}"[^>]*>([\\s\\S]*?)</bpmndi:BPMNShape>`).exec(xml)[1]
+    const m = /x="(-?\d+)" y="(-?\d+)" width="(\d+)" height="(\d+)"/.exec(block)
+    return { x: +m[1], y: +m[2], w: +m[3], h: +m[4] }
+  }
+  const wps = wpsOf('f4')
+  const x = boundsOf('X')
+  const hits = (a, b, r) => {
+    const loX = Math.min(a[0], b[0]); const hiX = Math.max(a[0], b[0])
+    const loY = Math.min(a[1], b[1]); const hiY = Math.max(a[1], b[1])
+    return loX < r.x + r.w && hiX > r.x && loY < r.y + r.h && hiY > r.y
+  }
+  for (let i = 1; i + 1 < wps.length; i++) {
+    assert.ok(!hits(wps[i], wps[i + 1], x),
+      `f4 segment ${i} ${JSON.stringify(wps[i])}->${JSON.stringify(wps[i + 1])} must not cross the X gateway`)
+  }
+})

@@ -228,6 +228,53 @@ export function validateGraphs (graphs) {
       dfsState.set(u, 2)
     }
     findCycle(g.start)
+    // A single deterministic route may still deliver MULTIPLE tokens to the same
+    // TASK — e.g. an `and` split -> A/B -> `xor` merge -> T sends two tokens
+    // through the merge to T. The BPMN then creates one job PER activation while
+    // the scenario collapses reachable tasks to a set (`reachableNodes`) and
+    // schedules T once, leaving the surplus job outstanding — a non-executable
+    // pair. Propagate token counts along the acyclic taken subgraph and reject a
+    // graph that activates any task more than once (#1258 review). A parallel
+    // (`and`) JOIN legitimately absorbs a surplus (the "Tetris" principle: it
+    // fires once per complete set of incoming tokens), so it emits the MIN over
+    // its incoming taken flows; every other node passes each token through. Only
+    // TASK over-activation is a non-executable defect, so only it is rejected.
+    const reachSet = reachableNodes(g)
+    const takenIn = Object.create(null)
+    const takenOutEdges = Object.create(null)
+    const tokenIndeg = Object.create(null)
+    for (const id of reachSet) tokenIndeg[id] = 0
+    for (const e of g.edges) {
+      if (takenRoute.has(e.id) && reachSet.has(e.from) && reachSet.has(e.to)) {
+        (takenIn[e.to] ??= []).push(e)
+        ;(takenOutEdges[e.from] ??= []).push(e)
+        tokenIndeg[e.to] += 1
+      }
+    }
+    const edgeTokens = Object.create(null) // taken edge id -> token count crossing it
+    const tokenReady = [...reachSet].filter((id) => tokenIndeg[id] === 0)
+    while (tokenReady.length) {
+      const u = tokenReady.shift()
+      const ins = takenIn[u] ?? []
+      let throughput
+      if (u === g.start) {
+        throughput = 1 // the process instance seeds a single start token
+      } else if (g.nodes[u] === 'and' && ins.length > 0) {
+        throughput = Math.min(...ins.map((e) => edgeTokens[e.id])) // parallel join synchronises
+      } else {
+        throughput = ins.reduce((s, e) => s + edgeTokens[e.id], 0) // pass every token through
+      }
+      if (g.nodes[u] === 'task' && u !== g.start) {
+        const arrivals = ins.reduce((s, e) => s + edgeTokens[e.id], 0)
+        if (arrivals > 1) {
+          bad(`graph ${g.id} task ${JSON.stringify(u)} is activated ${arrivals} times on the deterministic route (multiple tokens reach it); the BPMN creates one job per activation while the scenario schedules it once, leaving surplus jobs outstanding — reject the non-executable pair`)
+        }
+      }
+      for (const e of takenOutEdges[u] ?? []) {
+        edgeTokens[e.id] = throughput
+        if (--tokenIndeg[e.to] === 0) tokenReady.push(e.to)
+      }
+    }
   }
   return graphs
 }
@@ -352,9 +399,21 @@ function segHitsRect (a, b, r) {
   return loX <= r.x + r.w + ROUTE_MARGIN && hiX >= r.x - ROUTE_MARGIN &&
     loY <= r.y + r.h + ROUTE_MARGIN && hiY >= r.y - ROUTE_MARGIN
 }
-function pathClear (pts, obstacles) {
+function pathClear (pts, obstacles, s = null, t = null) {
+  const last = pts.length - 2
   for (let i = 0; i + 1 < pts.length; i++) {
     for (const r of obstacles) if (segHitsRect(pts[i], pts[i + 1], r)) return false
+    // The endpoint shapes are deliberately excluded from `obstacles` (an edge
+    // must touch its own source and target), but only the FIRST segment may
+    // leave the source and only the LAST may enter the target. A detour whose
+    // intermediate segment runs back THROUGH an endpoint shape makes the DI edge
+    // cross its own node — e.g. a backward edge to a target sitting directly
+    // above the source loops its return leg straight up through the source
+    // gateway — a non-renderable route (#1258 review). So still check the source
+    // on every segment but the first, and the target on every segment but the
+    // last.
+    if (s && i !== 0 && segHitsRect(pts[i], pts[i + 1], s)) return false
+    if (t && i !== last && segHitsRect(pts[i], pts[i + 1], t)) return false
   }
   return true
 }
@@ -387,7 +446,7 @@ function waypoints (s, t, obstacles = []) {
   const vxs = s.cx + COL / 2
   const vxt = t.cx - COL / 2
   candidates.push([[sx, sy], [vxs, sy], [vxs, laneY], [vxt, laneY], [vxt, ty], [tx, ty]])
-  for (const c of candidates) if (pathClear(c, obstacles)) return c
+  for (const c of candidates) if (pathClear(c, obstacles, s, t)) return c
   return simple // no clear detour found — keep the simple route rather than fail
 }
 
@@ -546,9 +605,6 @@ export function bpmnFor (graph) {
 // Scenario script: job-completion order, message correlation, timer ticks.
 export function scenarioFor (graph) {
   const nodes = Object.keys(graph.nodes)
-  const rects = layout(graph) // reuse the rank via layout coordinates
-  const OX = 160; const COL = 190
-  const rankOf = (id) => Math.round((rects[id].cx - OX) / COL)
   // Only a task a token can REACH under the deterministic route (`reachableNodes`)
   // becomes a job: a task behind a dead exclusive branch never activates, so
   // scheduling its job would deadlock the runner (#1258 review). The BPMN
@@ -556,10 +612,37 @@ export function scenarioFor (graph) {
   const reach = reachableNodes(graph)
   const jobs = nodes.filter((id) => graph.nodes[id] === 'task' && reach.has(id))
     .map((id) => ({ element: id, jobType: id }))
-  // A deterministic, causally-plausible completion order: by rank, then id.
-  const completionOrder = jobs
-    .map((j) => j.element)
-    .sort((a, b) => (rankOf(a) - rankOf(b)) || (a < b ? -1 : a > b ? 1 : 0))
+  // Completion order is a TOPOLOGICAL traversal of the REACHABLE subgraph (the
+  // nodes a token reaches, linked by taken flows) — NOT the layout rank.
+  // `layout` ranks every edge, including dead xor-branch cycles, which can raise
+  // both selected-path tasks to the rank cap and let the id tie-break REVERSE
+  // their real dependency (e.g. dead `X -> B -> X` with selected
+  // `X -> Z -> A -> E` yields `[A, Z]`, so the driver waits for a job `A` that
+  // can only be created after `Z`). The taken subgraph from start is acyclic
+  // (validateGraphs rejects a looping taken route), so Kahn's algorithm with a
+  // lexicographic tie-break yields a deterministic, dependency-respecting order
+  // (#1258 review).
+  const taken = takenFlows(graph)
+  const succ = Object.create(null)
+  const indeg = Object.create(null)
+  for (const id of reach) indeg[id] = 0
+  for (const e of graph.edges) {
+    if (taken.has(e.id) && reach.has(e.from) && reach.has(e.to)) {
+      (succ[e.from] ??= []).push(e.to)
+      indeg[e.to] += 1
+    }
+  }
+  const byId = (a, b) => (a < b ? -1 : a > b ? 1 : 0)
+  const ready = [...reach].filter((id) => indeg[id] === 0)
+  const completionOrder = []
+  while (ready.length) {
+    ready.sort(byId)
+    const id = ready.shift()
+    if (graph.nodes[id] === 'task') completionOrder.push(id)
+    for (const to of succ[id] ?? []) {
+      if (--indeg[to] === 0) ready.push(to)
+    }
+  }
   return JSON.stringify({
     // GENERATED — see formal/corpus/generate.mjs. Edit the graph source instead.
     generated: 'formal/corpus/generate.mjs',

@@ -70,10 +70,12 @@
         <di:waypoint x="865" y="100"/>
       </bpmndi:BPMNEdge>
       <bpmndi:BPMNEdge id="f4_di" bpmnElement="f4">
-        <di:waypoint x="920" y="345"/>
-        <di:waypoint x="920" y="375"/>
-        <di:waypoint x="920" y="375"/>
-        <di:waypoint x="920" y="228"/>
+        <di:waypoint x="945" y="320"/>
+        <di:waypoint x="1015" y="320"/>
+        <di:waypoint x="1015" y="375"/>
+        <di:waypoint x="825" y="375"/>
+        <di:waypoint x="825" y="210"/>
+        <di:waypoint x="902" y="210"/>
       </bpmndi:BPMNEdge>
     </bpmndi:BPMNPlane>
   </bpmndi:BPMNDiagram>
