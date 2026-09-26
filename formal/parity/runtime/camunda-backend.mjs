@@ -32,6 +32,13 @@ const DEFAULT_LONG_POLL_MS = 30_000;
 // scenario, not Camunda's short default (5s here) — otherwise the create times
 // out (504) before `observe()` can read the final result (#1260 review).
 const DEFAULT_COMPLETION_TIMEOUT_MS = 120_000;
+// The liveness probe must have a deadline. A reachable-but-wedged endpoint (a
+// provisioned service that accepts the TCP connection but never answers
+// `/topology`, or a network path that blackholes the request) would otherwise
+// leave `fetch()` pending forever, hanging the supposedly skip-tolerant CI job
+// indefinitely. Bounding the probe turns that hang into the documented
+// unreachable-runtime skip (#1260 review).
+const DEFAULT_PING_TIMEOUT_MS = 10_000;
 
 function requireOk(res, body, what) {
   if (!res.ok) {
@@ -51,8 +58,11 @@ export class CamundaBackend {
    * @param {string} opts.address base REST address, e.g. `http://localhost:8080`
    * @param {string} [opts.token] optional bearer token
    * @param {string} [opts.basicAuth] optional `user:pass` for Basic auth
+   * @param {number} [opts.pingTimeoutMs] liveness-probe deadline (default
+   *   DEFAULT_PING_TIMEOUT_MS); a wedged endpoint that never answers within it is
+   *   treated as the unreachable-runtime skip.
    */
-  constructor({ address, token, basicAuth } = {}) {
+  constructor({ address, token, basicAuth, pingTimeoutMs } = {}) {
     if (!address) throw new Error("CamundaBackend requires a REST address");
     // `CAMUNDA_REST_ADDRESS` is documented repo-wide as the full REST base ending
     // in `/v2` (e.g. `http://localhost:8080/v2`, agent_brief.rs / USERGUIDE), but
@@ -63,6 +73,7 @@ export class CamundaBackend {
     this.base = /\/v2$/.test(trimmed) ? trimmed : `${trimmed}/v2`;
     this.token = token;
     this.basicAuth = basicAuth;
+    this.pingTimeoutMs = pingTimeoutMs ?? DEFAULT_PING_TIMEOUT_MS;
     // Only the fields a bare gateway (no secondary storage) authoritatively
     // exposes via the v2 REST API.
     this.provides = new Set(["completed", "variables"]);
@@ -104,12 +115,22 @@ export class CamundaBackend {
    * error (a reachable-but-misconfigured gateway, e.g. 401/403) is NOT swallowed:
    * it throws so a configured-runtime problem fails loudly instead of silently
    * skipping the differential (#1260 review).
+   *
+   * The probe is bounded by DEFAULT_PING_TIMEOUT_MS: a wedged endpoint that
+   * accepts the connection but never responds aborts and is treated as the same
+   * unreachable-runtime skip (a hang would otherwise stall the skip-tolerant CI
+   * job forever). An actual HTTP response still propagates its status.
    */
   async ping() {
     let res;
     try {
-      res = await fetch(`${this.base}/topology`, { headers: this.headers() });
+      res = await fetch(`${this.base}/topology`, {
+        headers: this.headers(),
+        signal: AbortSignal.timeout(this.pingTimeoutMs),
+      });
     } catch {
+      // Transport failure (DNS, refused connection, TLS) OR the probe deadline
+      // firing on a wedged endpoint — both mean "runtime unreachable" → skip.
       return false;
     }
     requireOk(res, await res.text().catch(() => ""), "topology");
@@ -159,6 +180,29 @@ export class CamundaBackend {
     // Fire awaitCompletion WITHOUT awaiting the promise: the HTTP call blocks
     // until the instance completes, but we still need to drive its jobs
     // concurrently. `observe` awaits the promise to read the final state.
+    //
+    // No early CREATION BARRIER is possible on a bare gateway: `awaitCompletion`
+    // holds the HTTP response until the instance COMPLETES, so it exposes no
+    // "instance created / subscription open" acknowledgement to await here.
+    // Getting one would require either dropping awaitCompletion (then the final
+    // variables `observe` needs are only readable via the query API) or polling
+    // the query API for the subscription — both the secondary storage this
+    // bare-gateway backend deliberately excludes (see the file header). It is the
+    // same extension surface the richer element/flow history is deferred to.
+    //
+    // Why the current corpus is safe without it, and why the gap is LOUD (never a
+    // silent wrong differential) if a future scenario hits it:
+    //   * The driver serialises steps and every seed scenario's FIRST step is
+    //     `activateAndComplete`, whose job-activation LONG-POLL only returns once
+    //     the instance has reached that job's wait-state — a natural creation
+    //     barrier before any later step runs.
+    //   * A message/signal-first scenario (`correlateMessage`/`broadcastSignal`
+    //     as the first step) has no such barrier: v2 correlation does not buffer,
+    //     so a dispatch racing ahead of the subscription is dropped. But then the
+    //     instance simply never leaves its catch, the `awaitCompletion` create
+    //     times out (DEFAULT_COMPLETION_TIMEOUT_MS) and THROWS — the run fails
+    //     loudly instead of reporting a bogus match. Adding such a scenario is
+    //     gated on wiring the query-API barrier above (#1260 review).
     const pending = this.#json(
       "POST",
       "/process-instances",

@@ -297,6 +297,31 @@ test("CamundaBackend.ping throws on an HTTP error (misconfigured runtime fails l
   }
 });
 
+test("CamundaBackend.ping resolves false on a wedged endpoint that never responds (timeout skip)", async () => {
+  // A reachable endpoint that accepts the connection but never answers must not
+  // hang the skip-tolerant CI job forever — the bounded probe aborts on its
+  // deadline and treats it as the same unreachable-runtime skip (#1260).
+  const sockets = new Set();
+  const server = createServer(() => {
+    // Deliberately never write a response: hold the request open indefinitely.
+  });
+  server.on("connection", (s) => sockets.add(s));
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({
+      address: `http://127.0.0.1:${port}`,
+      pingTimeoutMs: 150,
+    });
+    assert.equal(await backend.ping(), false);
+  } finally {
+    for (const s of sockets) s.destroy();
+    server.close();
+    await once(server, "close");
+  }
+});
+
 test("CamundaBackend normalises an address that already ends in /v2 (no /v2/v2)", () => {
   // `CAMUNDA_REST_ADDRESS` is documented as the full base ending in `/v2`, so
   // appending `/v2` unconditionally would target `/v2/v2` and miss the gateway.
