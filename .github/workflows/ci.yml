@@ -70,6 +70,7 @@ jobs:
       docs: ${{ steps.filter.outputs.docs }}
       dapadapter: ${{ steps.filter.outputs.dapadapter }}
       formal: ${{ steps.filter.outputs.formal }}
+      parityruntime: ${{ steps.filter.outputs.parityruntime }}
       code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v5
@@ -157,6 +158,19 @@ jobs:
               - 'engine-core/Cargo.lock'
               # The pinned Rust toolchain compiles the FEEL differential harness.
               - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+            # The two-backend runtime parity runner (#1260, slice 5 of #1240):
+            # a single scenario driver replayed against nano (engine-wasm
+            # TestEngine) and, when a runtime is provisioned, a live Camunda 8
+            # (v2 REST). Scoped to its own paths so it runs ONLY when the runner
+            # or its corpus changes — a DISTINCT gate from `formal` above, and
+            # deliberately NON-REQUIRED (not in branch protection / .mergify.yml),
+            # so a skipped or absent-runtime run never blocks a sibling PR. The
+            # runner also consumes the committed engine-wasm read-model artifact,
+            # so a rebuild of that binary must re-run it.
+            parityruntime:
+              - 'formal/parity/runtime/**'
+              - 'engine-wasm/pkg/readmodel/**'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -717,6 +731,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
       - name: Lean build + FEEL differential fuzz
         run: formal/lean/feel-diff.sh
+
+  # Two-backend runtime parity runner (#1260, slice 5 of #1240). DISTINCT from
+  # the `formal` (tlc) job above and deliberately NON-REQUIRED: it is not in
+  # branch protection nor .mergify.yml, so a skip or a missing Camunda runtime
+  # never blocks a sibling PR (see AGENTS.md 'Merging PRs'). Change-gated to the
+  # runner's own paths. The nano half runs everywhere (in-process engine-wasm
+  # TestEngine, no Docker); the live Camunda 8 differential is SKIP-TOLERANT and
+  # runs only when a runtime is explicitly provisioned (the RUN_CAMUNDA_PARITY
+  # repo variable) — standing that runtime up is the pending environment
+  # decision tracked in formal/parity/runtime/README.md. NO retries anywhere: a
+  # nondeterministic scenario is a driver defect to root-cause.
+  parity-runtime:
+    name: parity-runtime (two-backend)
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.parityruntime == 'true' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Runner + oracle unit tests
+        run: node --test formal/parity/runtime/*.test.mjs
+      - name: Nano backend — corpus vs. its expect oracle
+        run: node formal/parity/runtime/run.mjs --backend nano
+      # Live Camunda 8 differential. Off by default (skip-tolerant): the step is
+      # gated on the RUN_CAMUNDA_PARITY repo variable so the job stays green
+      # until a maintainer provisions a Camunda 8 runtime and turns it on. When
+      # enabled it stands up a real Camunda 8 (no stub) and runs the SAME driver
+      # against BOTH backends, asserting the differential oracle finds no
+      # difference on the fields both expose. Provisioning specifics live in
+      # formal/parity/runtime/README.md.
+      - name: Two-backend differential (live Camunda 8)
+        if: ${{ vars.RUN_CAMUNDA_PARITY == 'true' }}
+        env:
+          # Provided by the maintainer's provisioning (a service container,
+          # c8run, or a self-hosted runner). Absent ⇒ the runner self-skips the
+          # Camunda side, so this step degrades to a nano-only run rather than
+          # failing.
+          CAMUNDA_REST_ADDRESS: ${{ vars.CAMUNDA_REST_ADDRESS }}
+          CAMUNDA_AUTH_TOKEN: ${{ secrets.CAMUNDA_AUTH_TOKEN }}
+          CAMUNDA_BASIC_AUTH: ${{ secrets.CAMUNDA_BASIC_AUTH }}
+        run: node formal/parity/runtime/run.mjs --backend both
 
   processos:
     name: processos (clippy + test)
