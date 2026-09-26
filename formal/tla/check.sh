@@ -353,4 +353,22 @@ if [[ $status -eq 0 && "$full_run" == true ]]; then
   fi
 fi
 
+# Single-source corpus drift guard (#1258, #1240 slice 3). The MC*/ZMC*.tla
+# models above, and the paired BPMN(+DI) and scenario artifacts under
+# formal/corpus/, are GENERATED from one graph source per model
+# (formal/corpus/graphs/<Id>.json). They are a derived artifact: on a full run,
+# regenerate them into memory and fail on drift, so a forgotten regeneration
+# (an edited graph, or a hand-edited generated .tla) fails CI instead of
+# shipping a silent MC/ZMC twin divergence. The generator's own structural
+# tests run here too. Needs node (the generator is node-only) — same
+# skip-when-absent discipline as the trace guard above.
+if [[ $status -eq 0 && "$full_run" == true ]]; then
+  if command -v node >/dev/null 2>&1; then
+    node "$here/../corpus/generate.mjs" --check || status=1
+    node --test "$here"/../corpus/*.test.mjs || status=1
+  else
+    echo "note: node not found; skipping single-source corpus drift guard (formal/corpus/generate.mjs --check)"
+  fi
+fi
+
 exit $status

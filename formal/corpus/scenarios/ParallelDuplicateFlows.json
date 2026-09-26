@@ -1,0 +1,15 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "ParallelDuplicateFlows",
+  "jobs": [
+    {
+      "element": "B",
+      "jobType": "B"
+    }
+  ],
+  "jobCompletionOrder": [
+    "B"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}

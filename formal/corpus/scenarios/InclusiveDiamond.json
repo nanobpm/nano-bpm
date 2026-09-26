@@ -1,0 +1,25 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "InclusiveDiamond",
+  "jobs": [
+    {
+      "element": "A",
+      "jobType": "A"
+    },
+    {
+      "element": "B",
+      "jobType": "B"
+    },
+    {
+      "element": "C",
+      "jobType": "C"
+    }
+  ],
+  "jobCompletionOrder": [
+    "A",
+    "B",
+    "C"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}

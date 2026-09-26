@@ -1,0 +1,25 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "InclusiveJoinSurplus",
+  "jobs": [
+    {
+      "element": "A1",
+      "jobType": "A1"
+    },
+    {
+      "element": "A2",
+      "jobType": "A2"
+    },
+    {
+      "element": "B",
+      "jobType": "B"
+    }
+  ],
+  "jobCompletionOrder": [
+    "B",
+    "A1",
+    "A2"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}

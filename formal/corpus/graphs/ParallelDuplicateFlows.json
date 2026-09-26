@@ -1,0 +1,53 @@
+{
+  "id": "ParallelDuplicateFlows",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "P1": "and",
+    "B": "task",
+    "P2": "and",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "P1"
+    },
+    {
+      "id": "f2",
+      "from": "P1",
+      "to": "P2"
+    },
+    {
+      "id": "f3",
+      "from": "P1",
+      "to": "P2"
+    },
+    {
+      "id": "f4",
+      "from": "P1",
+      "to": "B"
+    },
+    {
+      "id": "f5",
+      "from": "B",
+      "to": "P2"
+    },
+    {
+      "id": "f6",
+      "from": "P2",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCParallelDuplicateFlows",
+      "comment": [
+        "Two DISTINCT sequence flows share endpoints (fork -> join twice), plus a",
+        "third branch through a task:  S -> P1 =(d1, d2)=> P2;  P1 -> B -> P2 -> E.",
+        "P2 has three incoming flows, so it must wait for B."
+      ]
+    }
+  }
+}
