@@ -27,6 +27,7 @@ import {
   bump,
   emptyObservation,
   variablesFromSearchItems,
+  MAX_JOBS_TO_ACTIVATE,
 } from "./observation.mjs";
 
 const PKG_JS = fileURLToPath(
@@ -89,8 +90,10 @@ export class NanoBackend {
 
   async activateAndComplete(_handle, jobType, variables) {
     // RTC is synchronous, so the job is already `Created` and activatable.
+    // Use the SAME activation cap as the Camunda backend so both engines drive
+    // the identical step sequence on a model with many same-type jobs (#1260).
     const jobs = JSON.parse(
-      this.engine.activateJobs(jobType, Number.MAX_SAFE_INTEGER, 60_000, "parity-runner"),
+      this.engine.activateJobs(jobType, MAX_JOBS_TO_ACTIVATE, 60_000, "parity-runner"),
     );
     for (const job of jobs) {
       this.engine.completeJob(String(job.key), JSON.stringify(variables ?? {}));

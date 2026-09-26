@@ -15,6 +15,13 @@
 // while the per-scenario `expect` block (checked against nano, the always-on
 // reference) pins the richer element/flow multiset that only nano exposes here.
 
+// Shared job-activation cap for BOTH backends. A serialised scenario must drive
+// the same step sequence on nano and Camunda, so both adapters must activate the
+// same number of matching jobs per call — an unbounded nano activation against
+// Camunda's `maxJobsToActivate` cap would diverge on a model with more same-type
+// jobs than the cap (#1260 review). Keep this as the single source of truth.
+export const MAX_JOBS_TO_ACTIVATE = 100;
+
 /** The canonical field set an observation can carry. */
 export const OBSERVATION_FIELDS = Object.freeze([
   "completed",

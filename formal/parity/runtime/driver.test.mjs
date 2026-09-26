@@ -24,6 +24,7 @@ import {
   diffObservations,
   emptyObservation,
   variablesFromSearchItems,
+  MAX_JOBS_TO_ACTIVATE,
 } from "./observation.mjs";
 
 const corpusDir = fileURLToPath(new URL("./corpus", import.meta.url));
@@ -124,7 +125,7 @@ test("variablesFromSearchItems parses the C8 v2 variable shape", () => {
 // --- Regression coverage for the #1260 review findings -----------------------
 
 const INCIDENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_incident" targetNamespace="http://bpmn.io/schema/bpmn">
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_incident" targetNamespace="http://bpmn.io/schema/bpmn">
   <bpmn:process id="parity-incident" isExecutable="true">
     <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
     <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="GW" />
@@ -134,6 +135,15 @@ const INCIDENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
     </bpmn:sequenceFlow>
     <bpmn:endEvent id="End"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="parity-incident">
+      <bpmndi:BPMNShape id="Start_di" bpmnElement="Start"><dc:Bounds x="152" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="GW_di" bpmnElement="GW" isMarkerVisible="true"><dc:Bounds x="245" y="175" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_di" bpmnElement="End"><dc:Bounds x="352" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="188" y="200" /><di:waypoint x="245" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="295" y="200" /><di:waypoint x="352" y="200" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>`;
 
 test("nano observe records the incident kind (not UNKNOWN) keyed by instanceKey", async () => {
@@ -161,7 +171,7 @@ test("nano observe returns a completed instance's full root-scope variables", as
     variables: { seed: "s", count: 3 },
     steps: [{ op: "activateAndComplete", jobType: "work", variables: { done: true } }],
     xml: `<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_linear" targetNamespace="http://bpmn.io/schema/bpmn">
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_linear" targetNamespace="http://bpmn.io/schema/bpmn">
   <bpmn:process id="parity-linear" isExecutable="true">
     <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
     <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Task" />
@@ -169,6 +179,15 @@ test("nano observe returns a completed instance's full root-scope variables", as
     <bpmn:sequenceFlow id="f2" sourceRef="Task" targetRef="End" />
     <bpmn:endEvent id="End"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="parity-linear">
+      <bpmndi:BPMNShape id="Start_di" bpmnElement="Start"><dc:Bounds x="152" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_di" bpmnElement="Task"><dc:Bounds x="240" y="160" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_di" bpmnElement="End"><dc:Bounds x="392" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="188" y="200" /><di:waypoint x="240" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="340" y="200" /><di:waypoint x="392" y="200" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>`,
   };
   const nano = await new NanoBackend().init();
@@ -191,7 +210,7 @@ test("nano observe fails loudly on a truncated variable rather than diverging si
     variables: { big },
     steps: [{ op: "activateAndComplete", jobType: "work", variables: {} }],
     xml: `<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_linear_big" targetNamespace="http://bpmn.io/schema/bpmn">
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_linear_big" targetNamespace="http://bpmn.io/schema/bpmn">
   <bpmn:process id="parity-linear-big" isExecutable="true">
     <bpmn:startEvent id="Start"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
     <bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="Task" />
@@ -199,6 +218,15 @@ test("nano observe fails loudly on a truncated variable rather than diverging si
     <bpmn:sequenceFlow id="f2" sourceRef="Task" targetRef="End" />
     <bpmn:endEvent id="End"><bpmn:incoming>f2</bpmn:incoming></bpmn:endEvent>
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="parity-linear-big">
+      <bpmndi:BPMNShape id="Start_di" bpmnElement="Start"><dc:Bounds x="152" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_di" bpmnElement="Task"><dc:Bounds x="240" y="160" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_di" bpmnElement="End"><dc:Bounds x="392" y="182" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="188" y="200" /><di:waypoint x="240" y="200" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="340" y="200" /><di:waypoint x="392" y="200" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>`,
   };
   const nano = await new NanoBackend().init();
@@ -267,4 +295,50 @@ test("CamundaBackend.ping throws on an HTTP error (misconfigured runtime fails l
     server.close();
     await once(server, "close");
   }
+});
+
+test("CamundaBackend normalises an address that already ends in /v2 (no /v2/v2)", () => {
+  // `CAMUNDA_REST_ADDRESS` is documented as the full base ending in `/v2`, so
+  // appending `/v2` unconditionally would target `/v2/v2` and miss the gateway.
+  // Both the documented `/v2` form and a bare host must resolve to a single /v2.
+  assert.equal(
+    new CamundaBackend({ address: "http://localhost:8080/v2" }).base,
+    "http://localhost:8080/v2",
+  );
+  assert.equal(
+    new CamundaBackend({ address: "http://localhost:8080/v2/" }).base,
+    "http://localhost:8080/v2",
+  );
+  assert.equal(
+    new CamundaBackend({ address: "http://localhost:8080" }).base,
+    "http://localhost:8080/v2",
+  );
+  assert.equal(
+    new CamundaBackend({ address: "http://localhost:8080/" }).base,
+    "http://localhost:8080/v2",
+  );
+});
+
+test("CamundaBackend.observe preserves the create response's processCompleted flag", async () => {
+  // An await-completion timeout returns 200 with processCompleted:false; hard
+  // -coding completed:true would turn that incomplete run into a false match.
+  const backend = new CamundaBackend({ address: "http://localhost:8080/v2" });
+  const incomplete = await backend.observe({
+    pending: Promise.resolve({ processCompleted: false, variables: { a: 1 } }),
+  });
+  assert.equal(incomplete.completed, false);
+  assert.deepEqual(incomplete.variables, { a: 1 });
+  const done = await backend.observe({
+    pending: Promise.resolve({ processCompleted: true, variables: { a: 2 } }),
+  });
+  assert.equal(done.completed, true);
+  assert.deepEqual(done.variables, { a: 2 });
+});
+
+test("job activation cap is shared, finite, and identical across backends", () => {
+  // Both adapters must activate the same bounded number of matching jobs so a
+  // model with many same-type jobs drives an identical step sequence; an
+  // unbounded nano activation (MAX_SAFE_INTEGER) would diverge from Camunda.
+  assert.equal(Number.isSafeInteger(MAX_JOBS_TO_ACTIVATE), true);
+  assert.ok(MAX_JOBS_TO_ACTIVATE > 0 && MAX_JOBS_TO_ACTIVATE < Number.MAX_SAFE_INTEGER);
 });

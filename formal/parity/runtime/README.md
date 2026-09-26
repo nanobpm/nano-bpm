@@ -89,7 +89,7 @@ richer fields needs the v2 **query** API (secondary storage) and is future work
 node formal/parity/runtime/run.mjs --backend nano
 
 # both backends against a live Camunda 8:
-CAMUNDA_REST_ADDRESS=http://localhost:8080 \
+CAMUNDA_REST_ADDRESS=http://localhost:8080/v2 \
   node formal/parity/runtime/run.mjs --backend both
 
 # unit tests (nano + oracle logic):

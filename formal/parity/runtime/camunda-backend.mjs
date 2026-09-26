@@ -22,7 +22,7 @@
 //     API (secondary storage) and is the extension surface a future slice wires
 //     in.
 
-import { emptyObservation } from "./observation.mjs";
+import { emptyObservation, MAX_JOBS_TO_ACTIVATE } from "./observation.mjs";
 
 const DEFAULT_ACTIVATE_TIMEOUT_MS = 60_000;
 const DEFAULT_LONG_POLL_MS = 30_000;
@@ -54,7 +54,13 @@ export class CamundaBackend {
    */
   constructor({ address, token, basicAuth } = {}) {
     if (!address) throw new Error("CamundaBackend requires a REST address");
-    this.base = address.replace(/\/+$/, "") + "/v2";
+    // `CAMUNDA_REST_ADDRESS` is documented repo-wide as the full REST base ending
+    // in `/v2` (e.g. `http://localhost:8080/v2`, agent_brief.rs / USERGUIDE), but
+    // a bare host (`http://localhost:8080`) is also accepted for convenience.
+    // Normalise both to a single `/v2` base — appending `/v2` unconditionally
+    // would turn the documented value into `/v2/v2` and miss the gateway (#1260).
+    const trimmed = address.replace(/\/+$/, "");
+    this.base = /\/v2$/.test(trimmed) ? trimmed : `${trimmed}/v2`;
     this.token = token;
     this.basicAuth = basicAuth;
     // Only the fields a bare gateway (no secondary storage) authoritatively
@@ -176,7 +182,7 @@ export class CamundaBackend {
       "/jobs/activation",
       {
         type: jobType,
-        maxJobsToActivate: 100,
+        maxJobsToActivate: MAX_JOBS_TO_ACTIVATE,
         timeout: DEFAULT_ACTIVATE_TIMEOUT_MS,
         worker: "parity-runner",
         requestTimeout: DEFAULT_LONG_POLL_MS,
@@ -227,7 +233,11 @@ export class CamundaBackend {
   async observe(handle) {
     const obs = emptyObservation();
     const result = await handle.pending;
-    obs.completed = true;
+    // Preserve the create response's `processCompleted` flag verbatim: this repo
+    // deliberately returns HTTP 200 with `processCompleted: false` when an
+    // await-completion request times out (server/src/main.rs), so hard-coding
+    // `true` would turn an incomplete run into a false-match observation (#1260).
+    obs.completed = result?.processCompleted === true;
     obs.variables = result?.variables ?? {};
     return obs;
   }
