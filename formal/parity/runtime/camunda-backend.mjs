@@ -233,19 +233,40 @@ export class CamundaBackend {
   async observe(handle) {
     const obs = emptyObservation();
     const result = await handle.pending;
-    // Preserve the create response's `processCompleted` flag verbatim: this repo
-    // deliberately returns HTTP 200 with `processCompleted: false` when an
-    // await-completion request times out (server/src/main.rs), so hard-coding
-    // `true` would turn an incomplete run into a false-match observation (#1260).
-    obs.completed = result?.processCompleted === true;
+    // A successful Camunda v2 awaitCompletion create response IS the completion
+    // signal: HTTP 200 carries the result variables but NOT a `processCompleted`
+    // field (an await-completion timeout surfaces as an error status, not a 200 +
+    // flag). So an ABSENT flag means completed — defaulting it to `true` avoids a
+    // spurious `completed` mismatch on every successful Camunda scenario. Only an
+    // explicitly supplied `false` marks an incomplete run, preserved for
+    // forward-compat with a server that does report the flag (#1260 review).
+    obs.completed = result?.processCompleted !== false;
     obs.variables = result?.variables ?? {};
     return obs;
   }
 
   async reset() {
-    // Each scenario deploys its own process and pins the clock afresh; a shared
-    // gateway keeps prior deployments, which is harmless (distinct process ids).
-    await this.#json("POST", "/clock/reset", undefined, "reset clock").catch(() => {});
+    // A clock reset is the correct — and sufficient — per-scenario reset for this
+    // backend's execution model, NOT a papered-over engine wipe:
+    //   * Scenarios are SERIALISED and run to completion-or-throw: `start` fires
+    //     the create with `awaitCompletion`, and `runScenario` awaits `observe`
+    //     (hence the create) before the next scenario begins, so scenario N is
+    //     fully finished before N+1's reset runs.
+    //   * A COMPLETED instance leaves nothing to drain: Camunda removes a
+    //     terminated instance's remaining jobs/tokens, and `activateAndComplete`
+    //     completes every job it activates in the same call — so no activatable
+    //     job of a shared type survives into the next scenario.
+    //   * An INCOMPLETE scenario cannot silently contaminate the next: a create
+    //     that can't complete (e.g. more same-type jobs than the activation cap,
+    //     or a stuck token) times out and THROWS, failing the run loudly instead
+    //     of proceeding to the next scenario. Isolation failures are loud here,
+    //     never silent.
+    // The only sticky global mutation a completed scenario leaves is the PINNED
+    // clock — which is exactly what we rewind. That failure must be loud too: a
+    // swallowed `/clock/reset` (401/500/503) could leave the global clock pinned
+    // while the runner reports success, so — unlike the transport-only skip in
+    // `ping()` — it is NOT caught (#1260 review).
+    await this.#json("POST", "/clock/reset", undefined, "reset clock");
     this.pinnedClockMs = null;
   }
 

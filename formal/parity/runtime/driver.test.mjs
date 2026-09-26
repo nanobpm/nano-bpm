@@ -319,20 +319,61 @@ test("CamundaBackend normalises an address that already ends in /v2 (no /v2/v2)"
   );
 });
 
-test("CamundaBackend.observe preserves the create response's processCompleted flag", async () => {
-  // An await-completion timeout returns 200 with processCompleted:false; hard
-  // -coding completed:true would turn that incomplete run into a false match.
+test("CamundaBackend.observe defaults an absent processCompleted flag to completed", async () => {
+  // A real Camunda v2 awaitCompletion 200 IS the completion signal and carries
+  // no processCompleted field, so an ABSENT flag must default to completed —
+  // otherwise every successful Camunda scenario reports a false `completed`
+  // mismatch. An explicit `false` (a server that reports the flag) is preserved.
   const backend = new CamundaBackend({ address: "http://localhost:8080/v2" });
+  const absent = await backend.observe({
+    pending: Promise.resolve({ variables: { a: 1 } }),
+  });
+  assert.equal(absent.completed, true);
+  assert.deepEqual(absent.variables, { a: 1 });
   const incomplete = await backend.observe({
-    pending: Promise.resolve({ processCompleted: false, variables: { a: 1 } }),
+    pending: Promise.resolve({ processCompleted: false, variables: { a: 2 } }),
   });
   assert.equal(incomplete.completed, false);
-  assert.deepEqual(incomplete.variables, { a: 1 });
+  assert.deepEqual(incomplete.variables, { a: 2 });
   const done = await backend.observe({
-    pending: Promise.resolve({ processCompleted: true, variables: { a: 2 } }),
+    pending: Promise.resolve({ processCompleted: true, variables: { a: 3 } }),
   });
   assert.equal(done.completed, true);
-  assert.deepEqual(done.variables, { a: 2 });
+  assert.deepEqual(done.variables, { a: 3 });
+});
+
+test("CamundaBackend.reset rewinds the pinned clock and fails loudly on a reset error", async () => {
+  // A swallowed /clock/reset could leave the global clock pinned while the
+  // runner reports success, so cleanup must fail loudly, not be caught (#1260).
+  let mode = "ok";
+  const server = createServer((req, res) => {
+    if (req.url.endsWith("/clock/reset")) {
+      if (mode === "fail") {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end('{"message":"boom"}');
+        return;
+      }
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    backend.pinnedClockMs = 5000;
+    await backend.reset();
+    assert.equal(backend.pinnedClockMs, null);
+    mode = "fail";
+    await assert.rejects(() => backend.reset(), /reset clock failed: HTTP 500/);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
 });
 
 test("job activation cap is shared, finite, and identical across backends", () => {
