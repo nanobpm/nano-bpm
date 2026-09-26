@@ -378,3 +378,91 @@ test('DI edges do not route through unrelated shapes', () => {
   }
   assert.ok(checkedSegments > 0, 'exercised edge segments')
 })
+
+test('validateGraphs rejects document-wide BPMN id collisions (_di, definitions)', () => {
+  // Regression (#1258 review): bpmnFor emits ids AROUND the node/flow ids — a
+  // `${id}_di` shape/edge per node and flow, the definitions id, and the two
+  // constant BPMNDI container ids — all in one xsd:ID space. A node `A_di`
+  // therefore collides with node `A`'s generated shape id `A_di`, a duplicate
+  // xsd:ID, even though both node ids pass the grammar and the process/node/flow
+  // guard. The guard must claim the derived ids too.
+  const diClash = {
+    id: 'G', start: 'S', nodes: { S: 'start', A: 'task', A_di: 'task', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'A_di' },
+      { id: 'f3', from: 'A_di', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCg', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([diClash]), /collides with another BPMN id/)
+  // A node whose id equals the constant plane container id also collides.
+  const planeClash = {
+    id: 'H', start: 'S', nodes: { S: 'start', BPMNPlane_1: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'BPMNPlane_1' }, { id: 'f2', from: 'BPMNPlane_1', to: 'E' }],
+    families: { TokenFlow: { module: 'MCh', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([planeClash]), /collides with another BPMN id/)
+})
+
+test('validateGraphs requires at least one known spec family', () => {
+  // Regression (#1258 review): an empty/missing families object emits BPMN and a
+  // scenario but no registered MC*/ZMC* model, so generate.mjs reports success
+  // while the model silently disappears from TLC coverage. Require a family.
+  const noFam = {
+    id: 'NoFam', start: 'S', nodes: { S: 'start', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'E' }], families: {}
+  }
+  assert.throws(() => validateGraphs([noFam]), /must target at least one spec family/)
+  const missingFam = {
+    id: 'NoFam2', start: 'S', nodes: { S: 'start', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'E' }]
+  }
+  assert.throws(() => validateGraphs([missingFam]), /must target at least one spec family/)
+})
+
+test('validateGraphs rejects edge endpoints and start that are not nodes', () => {
+  // Regression (#1258 review): a safe-identifier endpoint that is not a key in
+  // g.nodes (a typo `to: "Missing"`) passes the grammar but makes bpmnFor emit a
+  // dangling targetRef and leaves layout without coordinates. Same for g.start.
+  const base = () => ({
+    id: 'Ok', start: 'S', nodes: { S: 'start', A: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'E' }],
+    families: { TokenFlow: { module: 'MCOk', comment: [] } }
+  })
+  const badTo = base(); badTo.edges[1].to = 'Missing'
+  assert.throws(() => validateGraphs([badTo]), /flow f2 target "Missing" is not a node/)
+  const badFrom = base(); badFrom.edges[1].from = 'Ghost'
+  assert.throws(() => validateGraphs([badFrom]), /flow f2 source "Ghost" is not a node/)
+  const badStart = base(); badStart.start = 'Nope'
+  assert.throws(() => validateGraphs([badStart]), /start "Nope" is not one of its nodes/)
+})
+
+test('validateGraphs rejects a non-terminating deterministic route (taken back edge)', () => {
+  // Regression (#1258 review): takenFlows picks an xor split's outs[1] by
+  // declaration order. If that branch loops back, the taken subgraph reachable
+  // from start has a cycle — the scenario schedules each task once while the BPMN
+  // loops forever creating the job, a non-executable pair. Reject it.
+  const loopTaken = {
+    id: 'BadLoop', start: 'S',
+    nodes: { S: 'start', A: 'task', X: 'xor', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'X' },
+      // outs[1] of X is the back edge f4 (X -> A): takenFlows selects it, so the
+      // route S -> A -> X -> A never reaches E.
+      { id: 'f3', from: 'X', to: 'E' }, { id: 'f4', from: 'X', to: 'A' }
+    ],
+    families: { TokenFlow: { module: 'MCBadLoop', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([loopTaken]), /loops back through/)
+  // The committed ExclusiveLoop (X's outs[1] is the EXIT X -> E) is acyclic here.
+  const okLoop = {
+    id: 'OkLoop', start: 'S',
+    nodes: { S: 'start', A: 'task', X: 'xor', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'X' },
+      { id: 'f3', from: 'X', to: 'A' }, { id: 'f4', from: 'X', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCOkLoop', comment: [] } }
+  }
+  assert.doesNotThrow(() => validateGraphs([okLoop]))
+})

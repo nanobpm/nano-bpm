@@ -45,6 +45,17 @@ export const FAMILIES = {
 const globToRe = (glob) =>
   new RegExp('^' + glob.replace(/[.]/g, '\\$&').replace(/\*/g, '.*') + '$')
 
+// The document-wide BPMN ids bpmnFor synthesises AROUND the per-node/flow ids:
+// the definitions id, the two constant BPMNDI container ids, and a `${id}_di`
+// shape/edge per node and flow. Defined once so both the emitter (bpmnFor) and
+// validateGraphs's id-collision guard derive the SAME xsd:ID space with no
+// drift — a node named `A_di` and a node `A` both map to shape id `A_di`, a
+// duplicate xsd:ID the guard must reject (#1258 review).
+const BPMN_DIAGRAM_ID = 'BPMNDiagram_1'
+const BPMN_PLANE_ID = 'BPMNPlane_1'
+const definitionsId = (graphId) => `Definitions_${graphId}`
+const diId = (id) => `${id}_di`
+
 // node kind -> BPMN element + diagram footprint. `task` becomes a serviceTask
 // whose job type is the node id (the same key the trace tables and scenario
 // jobs use).
@@ -98,8 +109,12 @@ export const TLA_RESERVED = new Set([
 // `TokenFlow`) writes formal/tla/Foo.tla outside the MC*/ZMC* glob — never
 // model-checked, and able to clobber the hand-written base — while --check still
 // reports clean. And every BPMN id in one process (the process id `g.id`, node
-// ids, flow ids) must be unique, or `bpmnFor` emits duplicate XML `id=` and the
-// diagram is invalid even though each id passes the grammar. Fail loudly on any.
+// ids, flow ids, plus the document-wide `Definitions_*`/`*_di` ids bpmnFor
+// derives from them) must be unique, or `bpmnFor` emits duplicate XML `id=` and
+// the diagram is invalid even though each id passes the grammar. Edge endpoints
+// and the start must reference real nodes, a graph must target at least one
+// known family, and the deterministic route must terminate (a taken xor branch
+// that loops back yields a non-executable BPMN/scenario pair). Fail loudly on any.
 export function validateGraphs (graphs) {
   const bad = (msg) => { throw new Error(`corpus graph invalid: ${msg}`) }
   const checkId = (label, value) => {
@@ -125,6 +140,9 @@ export function validateGraphs (graphs) {
       }
       bpmnIds.add(value)
     }
+    if (Object.keys(g.families ?? {}).length === 0) {
+      bad(`graph ${g.id} must target at least one spec family (${Object.keys(FAMILIES).join(', ')}); an empty families object emits BPMN/scenario but no model-checked MC*/ZMC* module, silently dropping it from TLC coverage`)
+    }
     for (const [fam, spec] of Object.entries(g.families ?? {})) {
       if (!FAMILIES[fam]) {
         bad(`graph ${g.id} targets unknown spec family ${JSON.stringify(fam)} (known: ${Object.keys(FAMILIES).join(', ')})`)
@@ -138,8 +156,10 @@ export function validateGraphs (graphs) {
       }
       seenModules.set(spec.module, g.id)
     }
-    for (const n of Object.keys(g.nodes)) { checkId(`graph ${g.id} node id`, n); claimBpmnId('node id', n) }
+    const nodeIds = new Set(Object.keys(g.nodes))
+    for (const n of nodeIds) { checkId(`graph ${g.id} node id`, n); claimBpmnId('node id', n) }
     checkId(`graph ${g.id} start node`, g.start)
+    if (!nodeIds.has(g.start)) bad(`graph ${g.id} start ${JSON.stringify(g.start)} is not one of its nodes`)
     const seenEdgeIds = new Set()
     for (const e of g.edges) {
       checkId(`graph ${g.id} flow id`, e.id)
@@ -148,7 +168,41 @@ export function validateGraphs (graphs) {
       claimBpmnId('flow id', e.id)
       checkId(`graph ${g.id} flow ${e.id} source`, e.from)
       checkId(`graph ${g.id} flow ${e.id} target`, e.to)
+      // Endpoints must reference real nodes, or bpmnFor emits a sourceRef/targetRef
+      // pointing at a non-existent element and layout has no coordinates for it.
+      if (!nodeIds.has(e.from)) bad(`graph ${g.id} flow ${e.id} source ${JSON.stringify(e.from)} is not a node`)
+      if (!nodeIds.has(e.to)) bad(`graph ${g.id} flow ${e.id} target ${JSON.stringify(e.to)} is not a node`)
     }
+    // bpmnFor also emits document-wide ids in the SAME xsd:ID space: the
+    // definitions id, the two constant BPMNDI container ids, and a `${id}_di`
+    // shape/edge per node and flow. Claim them too so e.g. a node `A_di` cannot
+    // collide with node `A`'s generated shape id (a duplicate xsd:ID) (#1258).
+    claimBpmnId('definitions id', definitionsId(g.id))
+    claimBpmnId('diagram id', BPMN_DIAGRAM_ID)
+    claimBpmnId('plane id', BPMN_PLANE_ID)
+    for (const n of nodeIds) claimBpmnId('shape id', diId(n))
+    for (const e of g.edges) claimBpmnId('edge di id', diId(e.id))
+    // The deterministic route (takenFlows) must terminate. takenFlows selects one
+    // xor branch by declaration order; if a taken edge loops back, the taken
+    // subgraph reachable from start has a cycle — the scenario schedules each task
+    // once while the BPMN loops forever creating that job, a non-executable pair
+    // (#1258 review). Reject it. (A loop whose taken branch is the EXIT, like
+    // ExclusiveLoop's X -> E, is acyclic here and passes.)
+    const takenRoute = takenFlows(g)
+    const takenOut = Object.create(null)
+    for (const e of g.edges) if (takenRoute.has(e.id)) (takenOut[e.from] ??= []).push(e.to)
+    const dfsState = new Map()
+    const findCycle = (u) => {
+      dfsState.set(u, 1)
+      for (const v of takenOut[u] ?? []) {
+        if (dfsState.get(v) === 1) {
+          bad(`graph ${g.id} deterministic route loops back through ${JSON.stringify(v)} (a taken xor branch is a back edge); the scenario schedules each task once while the BPMN would loop forever — reject the non-terminating pair`)
+        }
+        if (!dfsState.has(v)) findCycle(v)
+      }
+      dfsState.set(u, 2)
+    }
+    findCycle(g.start)
   }
   return graphs
 }
@@ -377,7 +431,7 @@ export function bpmnFor (graph) {
   L.push('    xmlns:di="http://www.omg.org/spec/DD/20100524/DI"')
   L.push('    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"')
   L.push('    xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"')
-  L.push(`    id="Definitions_${xmlEscape(graph.id)}" targetNamespace="http://nanobpm.io/corpus">`)
+  L.push(`    id="${xmlEscape(definitionsId(graph.id))}" targetNamespace="http://nanobpm.io/corpus">`)
   L.push(`  <bpmn:process id="${xmlEscape(graph.id)}" isExecutable="true">`)
 
   for (const id of nodes) {
@@ -438,17 +492,17 @@ export function bpmnFor (graph) {
   // BPMNDI
   const rects = layout(graph)
   const fmt = (v) => String(Math.round(v))
-  L.push('  <bpmndi:BPMNDiagram id="BPMNDiagram_1">')
-  L.push(`    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="${xmlEscape(graph.id)}">`)
+  L.push(`  <bpmndi:BPMNDiagram id="${BPMN_DIAGRAM_ID}">`)
+  L.push(`    <bpmndi:BPMNPlane id="${BPMN_PLANE_ID}" bpmnElement="${xmlEscape(graph.id)}">`)
   for (const id of nodes) {
     const b = rects[id]
     const marker = ['xor', 'or'].includes(graph.nodes[id]) ? ' isMarkerVisible="true"' : ''
-    L.push(`      <bpmndi:BPMNShape id="${xmlEscape(id)}_di" bpmnElement="${xmlEscape(id)}"${marker}>`)
+    L.push(`      <bpmndi:BPMNShape id="${xmlEscape(diId(id))}" bpmnElement="${xmlEscape(id)}"${marker}>`)
     L.push(`        <dc:Bounds x="${fmt(b.x)}" y="${fmt(b.y)}" width="${fmt(b.w)}" height="${fmt(b.h)}"/>`)
     L.push('      </bpmndi:BPMNShape>')
   }
   for (const e of graph.edges) {
-    L.push(`      <bpmndi:BPMNEdge id="${xmlEscape(e.id)}_di" bpmnElement="${xmlEscape(e.id)}">`)
+    L.push(`      <bpmndi:BPMNEdge id="${xmlEscape(diId(e.id))}" bpmnElement="${xmlEscape(e.id)}">`)
     // Obstacles are every node except this edge's own endpoints, so routing
     // keeps the segments out of unrelated shapes (a renderable diagram).
     const obstacles = nodes.filter((id) => id !== e.from && id !== e.to).map((id) => rects[id])
