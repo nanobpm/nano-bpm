@@ -1,0 +1,114 @@
+{
+  "id": "ParallelJoinSurplus",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "F": "and",
+    "PA": "and",
+    "PB": "and",
+    "A1": "task",
+    "A2": "task",
+    "B1": "task",
+    "B2": "task",
+    "XA": "xor",
+    "XB": "xor",
+    "J": "and",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "F"
+    },
+    {
+      "id": "f2",
+      "from": "F",
+      "to": "PA"
+    },
+    {
+      "id": "f3",
+      "from": "F",
+      "to": "PB"
+    },
+    {
+      "id": "f4",
+      "from": "PA",
+      "to": "A1"
+    },
+    {
+      "id": "f5",
+      "from": "PA",
+      "to": "A2"
+    },
+    {
+      "id": "f6",
+      "from": "PB",
+      "to": "B1"
+    },
+    {
+      "id": "f7",
+      "from": "PB",
+      "to": "B2"
+    },
+    {
+      "id": "f8",
+      "from": "A1",
+      "to": "XA"
+    },
+    {
+      "id": "f9",
+      "from": "A2",
+      "to": "XA"
+    },
+    {
+      "id": "f10",
+      "from": "B1",
+      "to": "XB"
+    },
+    {
+      "id": "f11",
+      "from": "B2",
+      "to": "XB"
+    },
+    {
+      "id": "f12",
+      "from": "XA",
+      "to": "J"
+    },
+    {
+      "id": "f13",
+      "from": "XB",
+      "to": "J"
+    },
+    {
+      "id": "f14",
+      "from": "J",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCParallelJoinSurplus",
+      "comment": [
+        "Every incoming flow of a parallel join is taken twice:",
+        "S -> F -> {PA, PB};  PA -> {A1, A2} -> XA (xor merge) -> J;",
+        "                     PB -> {B1, B2} -> XB (xor merge) -> J;  J -> E",
+        "Zeebe keeps the surplus (\"Tetris\" principle): J fires once per complete set",
+        "of incoming tokens, so it fires twice and the instance completes (#1233)."
+      ]
+    },
+    "ZeebeTokenFlow": {
+      "module": "ZMCParallelJoinSurplus",
+      "comment": [
+        "Zeebe reference (#1240, slice 1) of the \"Tetris\" surplus principle: every",
+        "incoming flow of the parallel join J is taken twice, so J fires twice,",
+        "keeping the surplus taken record between firings",
+        "(`cleanupSequenceFlowsTaken` consumes exactly one per flow). This is a",
+        "not-1-safe graph (BPMN lack of synchronization), and re-firing is the",
+        "correct verdict (`JoinFiresAtMostOnce` violated). nano's",
+        "`MCParallelJoinSurplus` must match."
+      ]
+    }
+  }
+}

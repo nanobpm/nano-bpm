@@ -1,0 +1,15 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "ExclusiveLoop",
+  "jobs": [
+    {
+      "element": "A",
+      "jobType": "A"
+    }
+  ],
+  "jobCompletionOrder": [
+    "A"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}

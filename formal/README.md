@@ -10,8 +10,8 @@ formal/
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
 │   ├── TokenFlow.tla         # single-instance token flow: gateways + join bookkeeping
 │   ├── ZeebeTokenFlow.tla    # Zeebe reference token flow (#1240): correct Camunda-8 gateway/join semantics
-│   ├── MC*.tla               # concrete process graphs for TokenFlow
-│   ├── ZMC*.tla              # concrete process graphs for ZeebeTokenFlow (the Zeebe reference corpus)
+│   ├── MC*.tla               # GENERATED process graphs for TokenFlow (from formal/corpus)
+│   ├── ZMC*.tla              # GENERATED process graphs for ZeebeTokenFlow (from formal/corpus)
 │   ├── raft/                 # RaftHandoff spec family (#1228): leadership handoff + reclaim
 │   │   ├── RaftHandoff.tla   # fence-epoch register (ADR 0019), anchored to nano-server-raft::fence
 │   │   └── RH*.tla           # models: fenced pass + a no-fencing split-brain violation
@@ -26,6 +26,11 @@ formal/
 │   ├── gen-traces.sh         # dumps TLC behaviours of the trace models to committed JSON fixtures
 │   ├── trace/parse.mjs       # TLC -tool output -> trace fixture JSON
 │   └── traces/<Spec>/*.json  # committed trace fixtures (replayed by engine-core/tests/trace_validation)
+├── corpus/                   # single-source corpus generator (#1258): one graph -> .tla + BPMN+DI + scenario
+│   ├── graphs/<Id>.json      # THE SOURCE: nodes/edges/start + which spec families (MC*/ZMC*) it emits
+│   ├── generate.mjs          # generator; --check is the drift guard run by check.sh
+│   ├── bpmn/<Id>.bpmn         # GENERATED BPMN 2.0 XML with a BPMNDI diagram (DI)
+│   └── scenarios/<Id>.json    # GENERATED scenario (job-completion order, message correlation, timer ticks)
 ├── lean/                     # Lean 4 reference semantics + differential fuzz (see below)
 │   ├── lean-toolchain        # pinned Lean version (elan reads this)
 │   ├── lakefile.lean         # Lake project: one lib target per slice + the feelfuzz exe
@@ -153,7 +158,9 @@ It registers through the multi-spec harness like any other family
 invariants/properties/expected). The `ZMC*` corpus is a representative sample —
 parallel sync, inclusive sync, the arrival-time inclusive-join guard (#1241),
 and a not-1-safe surplus — that TLC confirms the reference reproduces with the
-same verdicts (and the same state counts) as the matching `MC*` models.
+same verdicts (and the same state counts) as the matching `MC*` models. Each
+`ZMC*` and its `MC*` twin are **generated from one shared graph source**
+(`formal/corpus/`, #1258), so the twins can no longer drift apart.
 
 **The refinement (slice 2).** `TokenFlow.tla` must be trace-equivalent to
 `ZeebeTokenFlow` on every Camunda-expressible model. Every action other than a
@@ -170,12 +177,18 @@ historical divergence is a filed parity issue; the first, the arrival-time
 inclusive-join guard, is #1241 (closed). With it landed, `RefinesZeebe` holds on
 the entire corpus, so there is no open divergence to file.
 
-The differential *runtime* half of #1240 — a single-source corpus generator
-(graph → BPMN+DI + `MC*.tla` + scenario), a Zeebe-exporter trace normaliser,
-the one-driver/two-backend scenario runner (Camunda v2 REST against Nano and a
-live Camunda 8), and the executable differential oracle + extension register —
-extends this static formal proof to executable traces and lands in its own
-follow-up slices (it needs a Zeebe/Camunda-8 runtime this proof does not).
+The differential *runtime* half of #1240 builds on this static formal proof. Its
+first piece has landed: a **single-source corpus generator** (`formal/corpus/`,
+#1258) — one graph description per model produces its `MC*`/`ZMC*` `.tla`, its
+BPMN XML with a DI diagram, and its scenario script (job-completion order,
+message correlation, timer ticks), so the previously hand-maintained MC/ZMC
+twins are now generated from one source (see
+[Single-source corpus](corpus/README.md)). The remaining pieces — a
+Zeebe-exporter trace normaliser, the one-driver/two-backend scenario runner
+(Camunda v2 REST against Nano and a live Camunda 8), and the executable
+differential oracle + extension register — extend it to executable traces and
+land in their own follow-up slices (they need a Zeebe/Camunda-8 runtime this
+proof does not).
 
 ## Expected outcomes and known defects
 
@@ -318,19 +331,24 @@ the anti-drift anchor; keep it and `SnapshotReplay.tla` in sync in the same PR.
 
 ## Adding a model to TokenFlow
 
-1. Add `MCFoo.tla` (`EXTENDS TokenFlow`) and define `MCNodes`, `MCKind`,
-   `MCStart` and `MCEdges` (a record from flow id to `<<source, target>>`),
-   plus the derived `MCFlows`, `MCSrc` and `MCTgt` (copy these from an
-   existing model). Flows have their own ids, as in the engine, so two
-   distinct flows may share endpoints (`MCParallelDuplicateFlows`). Such a
-   duplicate-endpoint model is model-checked but **not** trace-anchored: the
-   engine's `SequenceFlowTaken` event carries no per-flow identity, so its
-   observable milestone multiset cannot distinguish the two same-endpoint
-   flows (see `SPEC_TRACE_MODELS` in `TokenFlow.spec`).
-2. Add a row to `SPEC_EXPECTED` in `formal/tla/specs/TokenFlow.spec` with its
-   expected outcome. There are no hand-written `.cfg` files. `check.sh`
-   generates the same config, with every property, for every model, so no model
-   can skip a property.
+The `MC*.tla` (and `ZMC*.tla`) models are **generated** from a single graph
+source (`formal/corpus/`, #1258) — do not hand-write or hand-edit them (a
+hand-edit fails the corpus drift guard in `check.sh`). To add a model:
+
+1. Add a graph source `formal/corpus/graphs/<Id>.json` (nodes, edges, start,
+   and a `families` entry naming the `MC*` module and, if the graph is also a
+   Zeebe reference, the `ZMC*` module). Flows have their own ids, as in the
+   engine, so two distinct flows may share endpoints (`ParallelDuplicateFlows`).
+   Such a duplicate-endpoint model is model-checked but **not** trace-anchored:
+   the engine's `SequenceFlowTaken` event carries no per-flow identity, so its
+   observable milestone multiset cannot distinguish the two same-endpoint flows
+   (see `SPEC_TRACE_MODELS` in `TokenFlow.spec`). Run
+   `node formal/corpus/generate.mjs` and commit the generated `.tla` (+ BPMN +
+   scenario). See [Single-source corpus](corpus/README.md).
+2. Add a row to `SPEC_EXPECTED` in `formal/tla/specs/TokenFlow.spec` (and
+   `specs/ZeebeTokenFlow.spec` for a `ZMC*`) with its expected outcome. There
+   are no hand-written `.cfg` files. `check.sh` generates the same config, with
+   every property, for every model, so no model can skip a property.
 
 If the model finds a violation, confirm it against the real engine with a red
 Rust test before recording it. The model may simply be wrong.

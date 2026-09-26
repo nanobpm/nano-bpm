@@ -1,0 +1,62 @@
+{
+  "id": "ParallelDiamond",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "P1": "and",
+    "A": "task",
+    "B": "task",
+    "P2": "and",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "P1"
+    },
+    {
+      "id": "f2",
+      "from": "P1",
+      "to": "A"
+    },
+    {
+      "id": "f3",
+      "from": "P1",
+      "to": "B"
+    },
+    {
+      "id": "f4",
+      "from": "A",
+      "to": "P2"
+    },
+    {
+      "id": "f5",
+      "from": "B",
+      "to": "P2"
+    },
+    {
+      "id": "f6",
+      "from": "P2",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCParallelDiamond",
+      "comment": [
+        "S -> P1 -> {A, B} -> P2 -> E"
+      ]
+    },
+    "ZeebeTokenFlow": {
+      "module": "ZMCParallelDiamond",
+      "comment": [
+        "Zeebe reference (#1240, slice 1) of the parallel diamond: a parallel split",
+        "fans to two tasks that a parallel join synchronises.",
+        "S -> P1(and) -> {A, B}; A,B -> P2(and) -> E.  Every incoming flow of P2 is",
+        "taken exactly once, so `canActivateParallelGateway` fires it once and the",
+        "instance completes — nano's `MCParallelDiamond` must match."
+      ]
+    }
+  }
+}

@@ -1,0 +1,70 @@
+{
+  "id": "ChainedInclusive",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "I1": "or",
+    "A": "task",
+    "B": "task",
+    "C": "task",
+    "J1": "or",
+    "J2": "or",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "I1"
+    },
+    {
+      "id": "f2",
+      "from": "I1",
+      "to": "A"
+    },
+    {
+      "id": "f3",
+      "from": "I1",
+      "to": "B"
+    },
+    {
+      "id": "f4",
+      "from": "I1",
+      "to": "C"
+    },
+    {
+      "id": "f5",
+      "from": "A",
+      "to": "J1"
+    },
+    {
+      "id": "f6",
+      "from": "B",
+      "to": "J1"
+    },
+    {
+      "id": "f7",
+      "from": "J1",
+      "to": "J2"
+    },
+    {
+      "id": "f8",
+      "from": "C",
+      "to": "J2"
+    },
+    {
+      "id": "f9",
+      "from": "J2",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCChainedInclusive",
+      "comment": [
+        "Chained inclusive joins (J2 must wait while J1 can still reach it):",
+        "S -> I1 -> {A, B, C};  A, B -> J1;  J1, C -> J2 -> E"
+      ]
+    }
+  }
+}

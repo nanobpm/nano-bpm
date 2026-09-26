@@ -1,0 +1,30 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "InclusiveInParallel",
+  "jobs": [
+    {
+      "element": "X",
+      "jobType": "X"
+    },
+    {
+      "element": "A1",
+      "jobType": "A1"
+    },
+    {
+      "element": "A2",
+      "jobType": "A2"
+    },
+    {
+      "element": "B",
+      "jobType": "B"
+    }
+  ],
+  "jobCompletionOrder": [
+    "B",
+    "X",
+    "A1",
+    "A2"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}

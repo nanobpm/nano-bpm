@@ -1,0 +1,77 @@
+{
+  "id": "ParallelJoinMultiArrival",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "P1": "and",
+    "P2": "and",
+    "X": "task",
+    "Y": "task",
+    "M": "xor",
+    "T": "task",
+    "J": "and",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "P1"
+    },
+    {
+      "id": "f2",
+      "from": "P1",
+      "to": "P2"
+    },
+    {
+      "id": "f3",
+      "from": "P1",
+      "to": "T"
+    },
+    {
+      "id": "f4",
+      "from": "P2",
+      "to": "X"
+    },
+    {
+      "id": "f5",
+      "from": "P2",
+      "to": "Y"
+    },
+    {
+      "id": "f6",
+      "from": "X",
+      "to": "M"
+    },
+    {
+      "id": "f7",
+      "from": "Y",
+      "to": "M"
+    },
+    {
+      "id": "f8",
+      "from": "M",
+      "to": "J"
+    },
+    {
+      "id": "f9",
+      "from": "T",
+      "to": "J"
+    },
+    {
+      "id": "f10",
+      "from": "J",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCParallelJoinMultiArrival",
+      "comment": [
+        "Two tokens reach a parallel join over the SAME incoming flow:",
+        "S -> P1 -> {P2, T};  P2 -> {X, Y} -> M (xor merge) -> J;  T -> J -> E",
+        "BPMN/Zeebe: J waits until T has also arrived."
+      ]
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "InclusiveDivergentPath",
+  "jobs": [
+    {
+      "element": "A",
+      "jobType": "A"
+    },
+    {
+      "element": "B",
+      "jobType": "B"
+    }
+  ],
+  "jobCompletionOrder": [
+    "A",
+    "B"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}
