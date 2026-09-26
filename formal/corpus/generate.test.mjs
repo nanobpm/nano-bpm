@@ -598,3 +598,87 @@ test('a backward DI edge to a node above its source routes around the source sha
       `f4 segment ${i} ${JSON.stringify(wps[i])}->${JSON.stringify(wps[i + 1])} must not cross the X gateway`)
   }
 })
+
+test('validateGraphs rejects a second start-kind node', () => {
+  // Regression (#1258 review): bpmnFor emits a startEvent for EVERY start-kind
+  // node, but reachableNodes and the TLA+ contract seed a single token at the
+  // configured g.start. A second start-kind node activates an unmodeled path
+  // whose jobs the scenario never schedules — reject it.
+  const bad = {
+    id: 'TwoStarts', start: 'S',
+    nodes: { S: 'start', S2: 'start', A: 'task', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'E' },
+      { id: 'f3', from: 'S2', to: 'A' }
+    ],
+    families: { TokenFlow: { module: 'MCTwoStarts', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /has 2 nodes of kind "start"/)
+})
+
+test('validateGraphs rejects an inactive incoming flow at a parallel (and) join', () => {
+  // Regression (#1258 review): the deterministic route can leave an `and` join's
+  // declared incoming flow inactive — here an xor selects B while A -> J(and) is
+  // never activated — yet bpmnFor still emits that incoming flow and the engine
+  // blocks forever waiting for A's token while the scenario completes B. Reject.
+  const bad = {
+    id: 'AndJoinInactive', start: 'S',
+    nodes: { S: 'start', X: 'xor', A: 'task', B: 'task', J: 'and', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'X' },
+      // X's outs[1] (X -> B) is the LIVE branch; outs[0] (X -> A) is dead, so
+      // A -> J never carries a token but J still declares it as incoming.
+      { id: 'f2', from: 'X', to: 'A' }, { id: 'f3', from: 'X', to: 'B' },
+      { id: 'f4', from: 'A', to: 'J' }, { id: 'f5', from: 'B', to: 'J' },
+      { id: 'f6', from: 'J', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCAndJoinInactive', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /parallel join "J" has an inactive incoming flow/)
+  // A parallel join whose every declared incoming flow is active is accepted.
+  const ok = {
+    id: 'AndJoinActive', start: 'S',
+    nodes: { S: 'start', P: 'and', A: 'task', B: 'task', J: 'and', E: 'end' },
+    edges: [
+      { id: 'f1', from: 'S', to: 'P' },
+      { id: 'f2', from: 'P', to: 'A' }, { id: 'f3', from: 'P', to: 'B' },
+      { id: 'f4', from: 'A', to: 'J' }, { id: 'f5', from: 'B', to: 'J' },
+      { id: 'f6', from: 'J', to: 'E' }
+    ],
+    families: { TokenFlow: { module: 'MCAndJoinActive', comment: [] } }
+  }
+  assert.doesNotThrow(() => validateGraphs([ok]))
+})
+
+test('validateGraphs rejects a deterministic route that never reaches an end node', () => {
+  // Regression (#1258 review): the generator contract is start -> ... -> end, but
+  // a route that dead-ends at a task (S(start) -> A(task)) emits a BPMN with no
+  // reachable end event and a scenario that can never observe completion. Reject
+  // any reachable node that neither takes an outgoing flow nor is an `end`.
+  const bad = {
+    id: 'NoEnd', start: 'S', nodes: { S: 'start', A: 'task' },
+    edges: [{ id: 'f1', from: 'S', to: 'A' }],
+    families: { TokenFlow: { module: 'MCNoEnd', comment: [] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /dead-ends at "A".*without reaching an "end" node/)
+  // A route that does reach an end node is accepted.
+  const ok = {
+    id: 'ReachesEnd', start: 'S', nodes: { S: 'start', A: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'E' }],
+    families: { TokenFlow: { module: 'MCReachesEnd', comment: [] } }
+  }
+  assert.doesNotThrow(() => validateGraphs([ok]))
+})
+
+test('validateGraphs rejects a family comment containing the TLA+ comment terminator', () => {
+  // Regression (#1258 review): family comment lines are copied verbatim into the
+  // generated TLA+ `(* ... *)` header. A line containing `*)` closes that block
+  // early, spilling the remainder as invalid module syntax while still passing
+  // generation. Reject the unsafe delimiter during validation.
+  const bad = {
+    id: 'BadComment', start: 'S', nodes: { S: 'start', A: 'task', E: 'end' },
+    edges: [{ id: 'f1', from: 'S', to: 'A' }, { id: 'f2', from: 'A', to: 'E' }],
+    families: { TokenFlow: { module: 'MCBadComment', comment: ['oops *) EXTENDS Naturals'] } }
+  }
+  assert.throws(() => validateGraphs([bad]), /contains the TLA\+ comment terminator "\*\)"/)
+})

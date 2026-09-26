@@ -157,6 +157,18 @@ export function validateGraphs (graphs) {
         bad(`duplicate module ${JSON.stringify(spec.module)} (graphs ${seenModules.get(spec.module)} and ${g.id})`)
       }
       seenModules.set(spec.module, g.id)
+      // Family comment lines are copied verbatim into the generated TLA+
+      // `(* ... *)` header (tlaFor). A line containing the comment terminator
+      // `*)` would close that block early, spilling the remainder as invalid
+      // module syntax, yet still pass generation. Reject it here (#1258 review).
+      for (const c of spec.comment ?? []) {
+        if (typeof c !== 'string') {
+          bad(`graph ${g.id} family ${fam} comment must be an array of strings (found ${JSON.stringify(c)})`)
+        }
+        if (c.includes('*)')) {
+          bad(`graph ${g.id} family ${fam} comment line ${JSON.stringify(c)} contains the TLA+ comment terminator "*)", which would close the generated (* ... *) header early and corrupt the module — remove or rephrase it`)
+        }
+      }
     }
     const nodeIds = new Set(Object.keys(g.nodes))
     for (const n of nodeIds) {
@@ -177,6 +189,16 @@ export function validateGraphs (graphs) {
     // creates (#1258 review).
     if (g.nodes[g.start] !== 'start') {
       bad(`graph ${g.id} start ${JSON.stringify(g.start)} must have kind "start", not ${JSON.stringify(g.nodes[g.start])}`)
+    }
+    // Exactly one node may have kind "start". bpmnFor emits a startEvent for
+    // EVERY start-kind node, but reachableNodes and the TLA+ contract
+    // (formal/tla/TokenFlow.tla) seed a single token at the configured
+    // `g.start`; a second start-kind node therefore activates an unmodeled path
+    // whose jobs the scenario never schedules — a non-executable pair (#1258
+    // review).
+    const startNodes = [...nodeIds].filter((n) => g.nodes[n] === 'start')
+    if (startNodes.length !== 1) {
+      bad(`graph ${g.id} has ${startNodes.length} nodes of kind "start" (${startNodes.map((n) => JSON.stringify(n)).join(', ')}); bpmnFor emits a startEvent for each while the scenario seeds a token only at ${JSON.stringify(g.start)}, activating an unmodeled path — require exactly one start node`)
     }
     // A graph with no edges makes tlaFor emit `MCEdges  == [` with no closing
     // `]` (the bracket is appended only on the last edge line), producing an
@@ -273,6 +295,31 @@ export function validateGraphs (graphs) {
       for (const e of takenOutEdges[u] ?? []) {
         edgeTokens[e.id] = throughput
         if (--tokenIndeg[e.to] === 0) tokenReady.push(e.to)
+      }
+    }
+    // Every declared incoming flow of a REACHABLE parallel (`and`) join must
+    // carry a token on the deterministic route, or the engine's join blocks
+    // forever while the scenario completes. The route can leave an incoming flow
+    // inactive — its source is off the reachable route (a dead xor branch) or
+    // the edge is not the taken branch — yet bpmnFor still emits that incoming
+    // flow and the engine still waits for it. E.g. an xor selecting `B` with
+    // `A -> J(and)` and `B -> J` completes `B` while `J` waits forever for `A`.
+    // Reject the non-completing pair rather than drop the input (#1258 review).
+    for (const e of g.edges) {
+      if (g.nodes[e.to] === 'and' && reachSet.has(e.to) &&
+          !(takenRoute.has(e.id) && reachSet.has(e.from))) {
+        bad(`graph ${g.id} parallel join ${JSON.stringify(e.to)} has an inactive incoming flow ${JSON.stringify(e.id)} from ${JSON.stringify(e.from)} (the deterministic route never delivers a token on it); the engine's and-join blocks forever waiting while the scenario completes — reject the non-executable pair`)
+      }
+    }
+    // The deterministic route must actually reach an `end` node. The generator's
+    // contract is `start -> ... -> end`, but a route that dead-ends at a task or
+    // gateway (e.g. `S(start) -> A(task)`) emits a BPMN with no reachable end
+    // event and a scenario that can never observe process completion. Every
+    // reachable node must therefore either take an outgoing flow onward or be an
+    // `end` node (#1258 review).
+    for (const id of reachSet) {
+      if ((takenOutEdges[id] ?? []).length === 0 && g.nodes[id] !== 'end') {
+        bad(`graph ${g.id} deterministic route dead-ends at ${JSON.stringify(id)} (kind ${JSON.stringify(g.nodes[id])}) without reaching an "end" node; a valid process is start -> ... -> end, so the scenario can never observe completion — reject`)
       }
     }
   }
