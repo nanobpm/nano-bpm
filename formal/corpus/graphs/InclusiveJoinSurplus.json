@@ -1,0 +1,81 @@
+{
+  "id": "InclusiveJoinSurplus",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "F": "and",
+    "PA": "and",
+    "A1": "task",
+    "A2": "task",
+    "B": "task",
+    "XA": "xor",
+    "J": "or",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "F"
+    },
+    {
+      "id": "f2",
+      "from": "F",
+      "to": "PA"
+    },
+    {
+      "id": "f3",
+      "from": "F",
+      "to": "B"
+    },
+    {
+      "id": "f4",
+      "from": "PA",
+      "to": "A1"
+    },
+    {
+      "id": "f5",
+      "from": "PA",
+      "to": "A2"
+    },
+    {
+      "id": "f6",
+      "from": "A1",
+      "to": "XA"
+    },
+    {
+      "id": "f7",
+      "from": "A2",
+      "to": "XA"
+    },
+    {
+      "id": "f8",
+      "from": "XA",
+      "to": "J"
+    },
+    {
+      "id": "f9",
+      "from": "B",
+      "to": "J"
+    },
+    {
+      "id": "f10",
+      "from": "J",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCInclusiveJoinSurplus",
+      "comment": [
+        "One incoming flow of an inclusive join is taken twice:",
+        "S -> F -> {PA, B};  PA -> {A1, A2} -> XA (xor merge) -> J;  B -> J;  J -> E",
+        "J is an inclusive join, evaluated only when a token arrives (#1241). When B's",
+        "token is not last, J fires on it, consuming one token per flow (\"Tetris\"",
+        "principle, #1237), and the last XA token fires it again: the instance",
+        "completes. When both XA tokens arrive first, J fires on B's token and the",
+        "surplus on XA -> J waits forever for a partner, as in Zeebe."
+      ]
+    }
+  }
+}
