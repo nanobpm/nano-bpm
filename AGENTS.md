@@ -209,6 +209,51 @@ PR — by then the duplicate work already happened.
   `nanobpm/nano-bpm` issue, and the resulting PRs link back to it — one place
   to look, whatever repo the diff ends up in.
 
+## Fan-out slices share code surfaces — pre-land the seam, don't collide on it
+
+An epic that fans a dozen slices out in parallel routinely has several slices
+touching the **same hunks**: fields on `struct ServerImpl` and their init in
+`ServerImpl::new` (`server/src/main.rs`), the flat `OVERRIDES` delegation table
+in `scripts/gen-stub-server.py`, and shared helpers in `server/src/query.rs`.
+Parallel PRs all appending to the same tail produce textual merge conflicts for
+every PR after the first — needless serialisation. Decompose to avoid it:
+
+- **Land the shared surface first, in a dedicated wave-0 scaffold task** (no
+  feature work, `dependsOn: []`), and make every feature slice `dependsOn` it.
+  The scaffold pre-declares one per-feature sub-struct + its `ServerImpl`
+  field/init and one comment-delimited region per slice, so each sibling then
+  edits **only its own disjoint region**. Do **not** fold the scaffold into a
+  feature slice and make the others depend on *that* — it serialises parallel
+  work behind the heaviest slice. Epic #903 is the reference: `# --- BEGIN/END
+  issue-N ... ---` blocks in `OVERRIDES` and one per-feature store on
+  `ServerImpl`.
+- **Placeholder state must compile under `warnings = "deny"`.** A scaffolded
+  field that no slice reads yet is `dead_code`, which this crate treats as a
+  hard build error (`server/Cargo.toml` sets `warnings = "deny"`; `make release`
+  builds the bin alone). Annotate each not-yet-consumed field/sub-struct
+  `#[allow(dead_code)]` — it stays harmless once its owner wires a real read.
+- **`server/src/query.rs` is shared: append, don't interleave.** Add new
+  matchers *after* the existing ones (before `pub struct SortKey`) so disjoint
+  slices never overlap hunks.
+
+## Each crate builds and tests on its own — there is no workspace root
+
+nano-bpm has **no workspace-root `Cargo.toml`**; `engine-core`, `server`,
+`read-model`, `processos` and `engine-wasm` are independent crates. Run cargo
+**from the crate directory** (`cd engine-core && cargo test`), not from the repo
+root — or use the `make` targets (`make build`, `make clippy`), which drive each
+crate for you. `make generate` regenerates the git-ignored `generated/` crate
+and `server/src/stub_impls.rs`, so never hand-edit those: the delegation source
+of truth is the `OVERRIDES` table in `scripts/gen-stub-server.py`.
+
+## The v2 REST conformance e2e suite is not vendored here
+
+The Camunda `qa/c8-orchestration-cluster-e2e-test-suite` Playwright specs are the
+v2 API parity DoD harness, but they run against a live cluster and are **not**
+checked into this repo. Don't go hunting for them or block on running them —
+verify v2 REST endpoints with the Rust `rest_*` unit tests (spec-conformant
+request/response shapes) instead.
+
 ## Merging PRs
 
 This repository does **not** auto-merge pull requests. Opening a PR is *not* the
