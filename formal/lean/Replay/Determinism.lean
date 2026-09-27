@@ -24,6 +24,20 @@ projection*, not of a bitwise-identical Rust engine. The snapshot-carried scalar
 `partition_id`, `num_partitions`, `now`, and `start_dispatch_rr` are restored
 verbatim by `from_snapshot` while a full `replay_partition` re-defaults them, so
 they are outside the fold and outside these theorems by construction.
+
+**Rust anchor (issue #1279).** This proof is generic over an abstract applier
+`apply : σ → Event → σ`, so on its own it is an *unanchored* spec — the drift
+surface epic #1224's anti-drift rule forbids. It is tied to the real engine by
+the differential guard `engine-core/tests/replay_determinism_differential.rs`,
+which is the **concrete instance** of `recover_snapshotAt` (and, across the range
+of split points, `recover_split_invariant`) on the real `Engine`:
+`from_snapshot(snapshot(replay_partition(take k))) ⊕ apply_replayed_events(drop k)`
+equals `replay_partition(evs)` on **exactly** the projection `(state, next_local)`
+these theorems assert equality of — for every journal and every split `k`. The
+snapshot is round-tripped through real serde JSON there, the faithful analogue of
+the `deserialize_serialize` identity used below. That guard makes the abstract
+`apply` non-abstract and fails CI the moment the real recovery path diverges from
+the equality proved here; keep the two in lockstep.
 -/
 
 namespace Replay
