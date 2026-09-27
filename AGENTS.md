@@ -32,6 +32,42 @@ There are no pre-existing failures or warnings, and you will not allow any to en
 
 All BPMN Models need DI for rendering for humans.
 
+## Building & Testing the Rust Crates Locally
+
+The Rust code is **not one workspace**. `engine-core`, `read-model` and
+`processos` are each their **own workspace root** (own `Cargo.lock`, no
+repo-root `Cargo.toml`), so `cd engine-core && cargo test` needs no codegen and
+Just Works. The `server/` tree is a separate workspace (root package
+`nanobpm-gateway-rest-server`, ADR 0064) whose manifest has path deps on the
+**git-ignored, generated** crates `../generated` and `../generated-console`.
+Those are produced by `make generate` (needs local **Java** + **uv**), so until
+you run it **any** `cargo build`/`cargo test` anywhere under `server/` fails
+with `failed to read …/generated-console/Cargo.toml` — a confusing error that is
+really "you haven't run codegen yet", not a broken dependency.
+
+- **Iterating on just `engine-core`?** `cd engine-core && cargo test` — no
+  `make generate` required.
+- **Iterating on just `nano-server-storage` (or another `server/crates/*`
+  member) without codegen?** Its own dep tree (`engine-core`, `read-model`)
+  does not need the generated crates. Temporarily append an empty `[workspace]`
+  table to `server/crates/nano-server-storage/Cargo.toml` to make it its own
+  workspace root, build/test, then **revert that edit and delete the stray
+  `Cargo.lock`** before committing. (The alternative is a full `make generate`.)
+
+- **`--features serde` is `engine-core`-only.** The snapshot/`Event` serde
+  derives are `cfg_attr(feature = "serde", …)`, so `engine-core` must be
+  built/tested with `--features serde` (the `engine-core (clippy + test)` CI job
+  already passes it) — **without the flag the golden drift guard and the
+  serde-gated tests compile to nothing and silently pass.** But
+  `nano-server-storage` has **no** `serde` feature of its own; it enables serde
+  on `engine-core` as a dependency feature. Build/test it with plain
+  `cargo build`/`cargo test` — passing `--features serde` there is an **error**.
+
+- **Point `CARGO_TARGET_DIR` under `/home`, not `/tmp`.** Building in `/tmp`
+  hits `Disk quota exceeded (os error 122)` (tmpfs is quota-capped). Set
+  `CARGO_TARGET_DIR` to a dir under your home (e.g.
+  `export CARGO_TARGET_DIR=$HOME/nano-target`) before `cargo build`/`cargo test`.
+
 ## Adding Support for a New BPMN Element
 
 A BPMN element type touches several layers. Because most of these are
