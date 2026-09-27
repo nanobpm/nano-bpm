@@ -1,0 +1,25 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "ParallelJoinMultiArrival",
+  "jobs": [
+    {
+      "element": "X",
+      "jobType": "X"
+    },
+    {
+      "element": "Y",
+      "jobType": "Y"
+    },
+    {
+      "element": "T",
+      "jobType": "T"
+    }
+  ],
+  "jobCompletionOrder": [
+    "T",
+    "X",
+    "Y"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}

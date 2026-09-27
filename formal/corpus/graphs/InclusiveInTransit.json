@@ -1,0 +1,62 @@
+{
+  "id": "InclusiveInTransit",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "I": "or",
+    "X": "xor",
+    "T": "task",
+    "J": "or",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "I"
+    },
+    {
+      "id": "f2",
+      "from": "I",
+      "to": "J"
+    },
+    {
+      "id": "f3",
+      "from": "I",
+      "to": "X"
+    },
+    {
+      "id": "f4",
+      "from": "I",
+      "to": "T"
+    },
+    {
+      "id": "f5",
+      "from": "X",
+      "to": "J"
+    },
+    {
+      "id": "f6",
+      "from": "T",
+      "to": "J"
+    },
+    {
+      "id": "f7",
+      "from": "J",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCInclusiveInTransit",
+      "comment": [
+        "Sibling tokens still in transit toward an inclusive join:",
+        "S -> I (inclusive split) -> {J, X, T};  X (xor) -> J;  T -> J;  J -> E",
+        "When I takes I -> J and I -> X in one command, J's first arrival must wait",
+        "for the token still queued on its way through X: an in-transit activation",
+        "is a live source, like Zeebe's `activeSequenceFlowIds` (#1241). Firing",
+        "early would fire J a second time on X's token."
+      ]
+    }
+  }
+}

@@ -1,0 +1,82 @@
+{
+  "id": "InclusiveInParallel",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "P1": "and",
+    "X": "task",
+    "I1": "or",
+    "A1": "task",
+    "A2": "task",
+    "I2": "or",
+    "B": "task",
+    "P2": "and",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "P1"
+    },
+    {
+      "id": "f2",
+      "from": "P1",
+      "to": "X"
+    },
+    {
+      "id": "f3",
+      "from": "P1",
+      "to": "B"
+    },
+    {
+      "id": "f4",
+      "from": "X",
+      "to": "I1"
+    },
+    {
+      "id": "f5",
+      "from": "I1",
+      "to": "A1"
+    },
+    {
+      "id": "f6",
+      "from": "I1",
+      "to": "A2"
+    },
+    {
+      "id": "f7",
+      "from": "A1",
+      "to": "I2"
+    },
+    {
+      "id": "f8",
+      "from": "A2",
+      "to": "I2"
+    },
+    {
+      "id": "f9",
+      "from": "I2",
+      "to": "P2"
+    },
+    {
+      "id": "f10",
+      "from": "B",
+      "to": "P2"
+    },
+    {
+      "id": "f11",
+      "from": "P2",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCInclusiveInParallel",
+      "comment": [
+        "An inclusive diamond on one branch of a parallel diamond:",
+        "S -> P1 -> {X, B};  X -> I1 -> {A1, A2} -> I2 -> P2;  B -> P2 -> E"
+      ]
+    }
+  }
+}

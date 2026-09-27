@@ -1,0 +1,80 @@
+{
+  "id": "InclusiveDivergentPath",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "I": "or",
+    "A": "task",
+    "B": "task",
+    "X": "xor",
+    "J": "or",
+    "E": "end",
+    "E2": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "I"
+    },
+    {
+      "id": "f2",
+      "from": "I",
+      "to": "A"
+    },
+    {
+      "id": "f3",
+      "from": "I",
+      "to": "B"
+    },
+    {
+      "id": "f4",
+      "from": "A",
+      "to": "J"
+    },
+    {
+      "id": "f5",
+      "from": "B",
+      "to": "X"
+    },
+    {
+      "id": "f6",
+      "from": "X",
+      "to": "J"
+    },
+    {
+      "id": "f7",
+      "from": "X",
+      "to": "E2"
+    },
+    {
+      "id": "f8",
+      "from": "J",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCInclusiveDivergentPath",
+      "comment": [
+        "An inclusive join whose competing path can diverge elsewhere:",
+        "S -> I (inclusive split) -> {A, B};  A -> J;  B -> X (xor) -> {J, E2};  J -> E",
+        "If A arrives while B is live, J waits for B. When X then routes to E2, no",
+        "token arrives at J again, so, exactly as in Zeebe, J is never re-evaluated",
+        "and holds A's token forever (#1241)."
+      ]
+    },
+    "ZeebeTokenFlow": {
+      "module": "ZMCInclusiveDivergentPath",
+      "comment": [
+        "Zeebe reference (#1240, slice 1) of the arrival-time inclusive-join guard",
+        "(#1241). S -> I(or) -> {A, B}; A -> J(or); B -> X(xor) -> {J, E2}; J -> E.",
+        "When A arrives while B is live, J waits; when X then routes to E2, no token",
+        "reaches J again, so — as Zeebe never re-evaluates a join on unrelated",
+        "progress (`canActivateInclusiveGateway` only runs on arrival) — J holds A's",
+        "token forever. nano's `MCInclusiveDivergentPath` must reproduce this stuck",
+        "verdict (`NoStuckInstance,Termination`)."
+      ]
+    }
+  }
+}

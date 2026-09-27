@@ -1,0 +1,15 @@
+{
+  "generated": "formal/corpus/generate.mjs",
+  "process": "InclusiveInTransit",
+  "jobs": [
+    {
+      "element": "T",
+      "jobType": "T"
+    }
+  ],
+  "jobCompletionOrder": [
+    "T"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": []
+}

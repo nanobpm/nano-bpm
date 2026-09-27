@@ -1,0 +1,42 @@
+{
+  "id": "ExclusiveLoop",
+  "start": "S",
+  "nodes": {
+    "S": "start",
+    "A": "task",
+    "X": "xor",
+    "E": "end"
+  },
+  "edges": [
+    {
+      "id": "f1",
+      "from": "S",
+      "to": "A"
+    },
+    {
+      "id": "f2",
+      "from": "A",
+      "to": "X"
+    },
+    {
+      "id": "f3",
+      "from": "X",
+      "to": "A"
+    },
+    {
+      "id": "f4",
+      "from": "X",
+      "to": "E"
+    }
+  ],
+  "families": {
+    "TokenFlow": {
+      "module": "MCExclusiveLoop",
+      "comment": [
+        "A rework loop: S -> A -> X; X -> A (loop back) or X -> E.",
+        "Termination holds under strong fairness on X's routing choice: the exit is",
+        "eventually taken. Without the exit flow it would be reported as a livelock."
+      ]
+    }
+  }
+}
