@@ -50,6 +50,19 @@ queue_rules:
       min: 1
       max: 5
     batch_max_wait_time: 5 min
+    # Explicit checks timeout. Without this, Mergify AUTO-DERIVES the timeout
+    # from the queue's *recent* CI runtime — and because CI is aggressively
+    # change-gated (see `.github/workflows/ci.yml`), most recent batches only run
+    # the cheap fast checks (or skip nearly everything), so the derived value
+    # collapsed to ~1 minute. A batch that actually triggers the slow gates —
+    # `formal (tlc)` plus the full per-crate Rust builds, where `server (clippy +
+    # test)` alone runs ~6+ min on the speculative draft — then never finishes
+    # inside that learned 1-minute window and is evicted with "Checks timed out"
+    # even though every required check ultimately passes (evicted #1273
+    # repeatedly this way). Pin a generous fixed ceiling well above the slowest
+    # realistic batch so the adaptive value can never undercut real CI duration;
+    # set to `null` to disable entirely.
+    checks_timeout: 30 min
 
 # The gate mirrors the canonical requiredChecks in AGENTS.md. The console
 # merge-gate tests enforce parity with that protocol and CI job names.
