@@ -209,6 +209,38 @@ PR — by then the duplicate work already happened.
   `nanobpm/nano-bpm` issue, and the resulting PRs link back to it — one place
   to look, whatever repo the diff ends up in.
 
+## A shared published package is a fan-out surface — one owner, subpath exports, no publish race
+
+When several fan-out slices all want to add to the **same published package**
+(`@nanobpm/nano-app-schema` / `spec-app`, `@nanobpm/engine-wasm`, `nano-bernd`,
+…), that package's manifest and publish are a shared surface exactly like a
+shared source file — and a worse one, because two agents editing the same
+`package.json` `version`/`exports` and each running the publish will textually
+conflict *and* race two publishes of overlapping versions (the second clobbers
+or fails). Each slice's CI is green alone; nothing exercises the combined
+package, so the collision only surfaces at merge/publish. Decompose it the same
+way as any shared surface (see the fan-out rules above):
+
+- **One slice owns the package manifest + publish, as a wave-0 scaffold.** It
+  version-bumps `package.json`, extends the `exports` map, edits the barrel and
+  runs the publish; every sibling that adds to the package `dependsOn` it and
+  branches off its merged, published version, bumping to the *next* version.
+  Do **not** schedule two manifest-editing slices in the same wave.
+- **Co-locate additions as subpath exports of the existing package — never a
+  second npm package.** If the new artifact's only consumers are the ones that
+  already consume the package (the token palette's consumers were exactly the
+  console + Urban, which already consume `@nanobpm/nano-app-schema`), there is
+  no distinct consumer, release cadence or runtime tier to justify a second
+  published unit — a new package is unjustified fragmentation (a
+  publish/credentials bootstrap plus a changelog and version cadence forever).
+  Add an `./thing` / `./thing.css` subpath to the existing `exports` map instead.
+- **Name the target package in the slice prompt.** A prompt that says only
+  "a published module" lets the executing agent fabricate a new package; name
+  `@nanobpm/nano-app-schema` and the exact subpath so it lands where the epic's
+  acceptance criterion requires. Epic #1005 lost a plan-review round to exactly
+  this: two same-wave slices racing the `spec-app` publish + a prompt that would
+  have spun up a second `@nanobpm/nano-tokens` package.
+
 ## Merging PRs
 
 This repository does **not** auto-merge pull requests. Opening a PR is *not* the
