@@ -266,11 +266,24 @@ fn journal_golden_corpus() -> NamedJournal {
 /// Every journal the differential runs over. Kept as a function so each test
 /// gets a fresh set (journals own `Vec<Event>`).
 fn journals() -> Vec<NamedJournal> {
-    vec![
+    let journals = vec![
         journal_service_task_lifecycle(),
         journal_nonzero_partition(),
         journal_golden_corpus(),
-    ]
+    ];
+    // Guard the guard: **every** journal must be non-trivial (more than one
+    // event), or its `0..=len` split loop would pass vacuously. This is `.all`,
+    // not `.any` — a single journal silently collapsing to empty (e.g. a golden
+    // corpus that failed to build any events) must not be able to hide behind its
+    // non-trivial siblings and contribute zero real coverage.
+    for journal in &journals {
+        assert!(
+            journal.events.len() > 1,
+            "journal `{}` must be non-trivial (>1 event) to avoid vacuous split coverage",
+            journal.name,
+        );
+    }
+    journals
 }
 
 /// **The anchor.** For every journal and every split point, snapshot∘replay-tail
@@ -281,11 +294,6 @@ fn journals() -> Vec<NamedJournal> {
 #[test]
 fn snapshot_replay_tail_equals_full_replay_for_every_split() {
     let journals = journals();
-    // Guard the guard: an empty corpus would make the loop vacuously pass.
-    assert!(
-        journals.iter().any(|j| j.events.len() > 1),
-        "differential must run over non-trivial journals"
-    );
     for journal in &journals {
         assert_snapshot_replay_tail_equals_full(journal);
     }
