@@ -158,3 +158,58 @@ designer instead of hand-written HTML.
   per-entity detail routes) need a routing model (Increment 2).
 - **Styling/theming** — v1 ships one built-in stylesheet; whether makers get theme tokens or per-node style
   props is deferred.
+
+## Addendum — Foldkit renderer spike (issue #958)
+
+**Status:** spike / exploratory. Does **not** change the default: the vanilla
+`RENDERER_JS` in `server/src/console/app_pages.ts` remains the shipped renderer.
+
+This ADR (§1) deliberately makes `page.json` independent of *both* the authoring
+canvas (Craft.js, console-only) *and* the runtime renderer — "the runtime
+renderer reads only this shape and never imports Craft.js". The spike exercises
+that seam: it builds a **second, independent renderer** for the exact same
+`page.json` contract and `/app/*` API, written in [Foldkit](https://foldkit.dev)
+(an Elm-architecture, Effect-based TS framework) instead of hand-rolled vanilla
+DOM. Source lives under `spikes/foldkit-urban-runtime/` (not wired into serving).
+
+**What it proves.** The renderer is genuinely pluggable with **zero data
+migration**. The Foldkit version consumes identical `GET /app/pages/<id>`,
+`GET /app/data/...?where=...&order=...`, and `POST /app/actions/start/<p>`
+responses, and renders the same text / actionForm / dataGrid vocabulary
+(headings, forms, tabbed+filtered grids, interval refresh). Verified headless
+(Playwright): the Fleet page renders, tab-switching re-filters rows, and form
+submit hits the action API — zero console errors.
+
+**What it costs (the honest number).** Bundle size, gzipped, JS-only:
+
+| Renderer | raw | gzip |
+| --- | --- | --- |
+| Vanilla `RENDERER_JS` (baseline) | 12.3 KB | **3.5 KB** |
+| Foldkit spike | 308.6 KB | **102.8 KB** |
+
+≈ **30× larger gzipped** (≈ 25× raw). The weight is the Effect + Foldkit runtime,
+not our code; it is largely fixed regardless of page complexity, so it amortizes
+poorly for the small, mostly-static pages this surface targets. A served app page
+is a per-visit download for an end user (not a developer tool), so this delta is
+the dominant consideration.
+
+**DX / architecture notes.**
+- **Wins:** the whole renderer is one `Model` + fact-named `Message` union +
+  exhaustive `update` + explicit `Command`s, and — the biggest gap over vanilla —
+  every page is **schema-validated** (`src/schema.ts`) instead of reading
+  `node.props.*` untyped and failing silently. Strongly aligned with Nano's
+  "inspectable primitives" thesis.
+- **Friction:** the pinned `foldkit@0.148` / `effect@4.0-rc` pair is pre-1.0 and
+  its published API drifted from the docs (`m()` not `defineMessageUnion`,
+  `S.Literals([...])` not variadic `S.Literal`, positional `S.Record(k, v)`, no
+  `Option.fromNullable`). A build step (vite + esbuild) is now required where
+  vanilla shipped a single `include_str!` string.
+- **Not implemented in the spike:** rowActions / expandable detail / child-grid
+  nesting / answer-form (Increment 2 surface), and SSR.
+
+**Recommendation.** Keep the vanilla renderer as the default for the served
+surface — the ~100 KB gzipped floor is not justified for small end-user pages.
+The pluggable-renderer seam is validated and worth preserving. Foldkit is a much
+stronger candidate for a *developer-facing, long-lived, stateful* surface (e.g. a
+console panel) where the runtime cost amortizes and the schema-driven discipline
+pays off — revisit once Foldkit reaches a stable (≥1.0) release.
