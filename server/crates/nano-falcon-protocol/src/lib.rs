@@ -65,6 +65,42 @@ mod lease_contract_tests {
             assert_eq!(decoded["leaseToken"], "opaque:not-a-number");
         }
     }
+
+    #[test]
+    fn mutation_frames_accept_canonical_job_lease_token_alias() {
+        // Deprecation window (#1283): the public `/falcon` client channel must
+        // accept the canonical Camunda 8.10 `jobLeaseToken` name on job commands,
+        // not just the pre-8.10 `leaseToken`, or a migrated client's fence would
+        // be silently dropped onto the unfenced path. The alias is deserialize-only:
+        // the intra-cluster peer wire keeps emitting `leaseToken`.
+        for mut wire in [
+            serde_json::json!({"type": "completeJob"}),
+            serde_json::json!({"type": "failJob", "retries": 2}),
+            serde_json::json!({"type": "throwError", "errorCode": "ERR"}),
+            serde_json::json!({"type": "updateJobRetries", "retries": 2}),
+            serde_json::json!({"type": "updateJobTimeout", "timeout": 1000}),
+            serde_json::json!({"type": "updateJob", "retries": 2}),
+        ] {
+            wire["corr"] = serde_json::json!(1);
+            wire["jobKey"] = serde_json::json!("42");
+            wire["jobLeaseToken"] = serde_json::json!("opaque:not-a-number");
+            let frame: ClientFrame = serde_json::from_value(wire.clone()).unwrap();
+            let decoded = serde_json::to_value(frame).unwrap();
+            // The canonical name reconciles into the same `lease_token` field, and
+            // the frame re-serializes under the legacy `leaseToken` spelling
+            // (peer-wire byte compatibility is preserved).
+            assert_eq!(
+                decoded["leaseToken"], "opaque:not-a-number",
+                "{}: jobLeaseToken must reconcile to the lease fence",
+                wire["type"]
+            );
+            assert!(
+                decoded.get("jobLeaseToken").is_none(),
+                "{}: the peer wire keeps the legacy leaseToken spelling",
+                wire["type"]
+            );
+        }
+    }
 }
 
 /// `serde` `skip_serializing_if` predicate: omit a `bool` field when it is `false`.
@@ -123,7 +159,11 @@ pub enum ClientFrame {
     CompleteJob {
         corr: u64,
         job_key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            alias = "jobLeaseToken",
+            skip_serializing_if = "Option::is_none"
+        )]
         lease_token: Option<String>,
         #[serde(default)]
         variables: Option<Map<String, Value>>,
@@ -143,7 +183,11 @@ pub enum ClientFrame {
     FailJob {
         corr: u64,
         job_key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            alias = "jobLeaseToken",
+            skip_serializing_if = "Option::is_none"
+        )]
         lease_token: Option<String>,
         #[serde(default)]
         retries: Option<i32>,
@@ -155,7 +199,11 @@ pub enum ClientFrame {
     ThrowError {
         corr: u64,
         job_key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            alias = "jobLeaseToken",
+            skip_serializing_if = "Option::is_none"
+        )]
         lease_token: Option<String>,
         error_code: String,
         #[serde(default)]
@@ -278,7 +326,11 @@ pub enum ClientFrame {
     UpdateJobRetries {
         corr: u64,
         job_key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            alias = "jobLeaseToken",
+            skip_serializing_if = "Option::is_none"
+        )]
         lease_token: Option<String>,
         retries: i32,
         #[serde(default)]
@@ -291,7 +343,11 @@ pub enum ClientFrame {
     UpdateJobTimeout {
         corr: u64,
         job_key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            alias = "jobLeaseToken",
+            skip_serializing_if = "Option::is_none"
+        )]
         lease_token: Option<String>,
         timeout: i64,
         #[serde(default)]
@@ -308,7 +364,11 @@ pub enum ClientFrame {
         timeout: Option<i64>,
         #[serde(default)]
         operation_reference: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            alias = "jobLeaseToken",
+            skip_serializing_if = "Option::is_none"
+        )]
         lease_token: Option<String>,
     },
     /// Forwards a canonical agent CREATE or UPDATE request to its partition leader.
