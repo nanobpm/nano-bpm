@@ -71,8 +71,12 @@ mod lease_contract_tests {
         // Deprecation window (#1283): the public `/falcon` client channel must
         // accept the canonical Camunda 8.10 `jobLeaseToken` name on job commands,
         // not just the pre-8.10 `leaseToken`, or a migrated client's fence would
-        // be silently dropped onto the unfenced path. The alias is deserialize-only:
-        // the intra-cluster peer wire keeps emitting `leaseToken`.
+        // be silently dropped onto the unfenced path. The two spellings are kept
+        // as *distinct* fields (not a `serde` alias) so the handler can reconcile
+        // them exactly as the REST boundary does — accept a matching dual-sent
+        // pair and count legacy-name use for the migration metric — rather than
+        // serde collapsing them (which rejects an equal pair as a duplicate field
+        // and bypasses the shared reconciliation/counting rule).
         for mut wire in [
             serde_json::json!({"type": "completeJob"}),
             serde_json::json!({"type": "failJob", "retries": 2}),
@@ -83,22 +87,38 @@ mod lease_contract_tests {
         ] {
             wire["corr"] = serde_json::json!(1);
             wire["jobKey"] = serde_json::json!("42");
-            wire["jobLeaseToken"] = serde_json::json!("opaque:not-a-number");
-            let frame: ClientFrame = serde_json::from_value(wire.clone()).unwrap();
+
+            // Canonical name alone: deserializes into the distinct `jobLeaseToken`
+            // field and round-trips under that spelling (the legacy field stays
+            // absent — the handler, not serde, projects it onto the lease fence).
+            let mut canonical = wire.clone();
+            canonical["jobLeaseToken"] = serde_json::json!("opaque:not-a-number");
+            let frame: ClientFrame = serde_json::from_value(canonical).unwrap();
             let decoded = serde_json::to_value(frame).unwrap();
-            // The canonical name reconciles into the same `lease_token` field, and
-            // the frame re-serializes under the legacy `leaseToken` spelling
-            // (peer-wire byte compatibility is preserved).
             assert_eq!(
-                decoded["leaseToken"], "opaque:not-a-number",
-                "{}: jobLeaseToken must reconcile to the lease fence",
+                decoded["jobLeaseToken"], "opaque:not-a-number",
+                "{}: canonical jobLeaseToken must survive the frame",
                 wire["type"]
             );
             assert!(
-                decoded.get("jobLeaseToken").is_none(),
-                "{}: the peer wire keeps the legacy leaseToken spelling",
+                decoded.get("leaseToken").is_none(),
+                "{}: legacy field stays absent when only the canonical name is sent",
                 wire["type"]
             );
+
+            // A dual-sent equal pair must NOT be rejected as a duplicate field
+            // (the exact regression a `serde(alias)` would introduce); both
+            // spellings survive for the handler to reconcile.
+            let mut pair = wire.clone();
+            pair["leaseToken"] = serde_json::json!("opaque:not-a-number");
+            pair["jobLeaseToken"] = serde_json::json!("opaque:not-a-number");
+            let frame: ClientFrame = serde_json::from_value(pair).expect(
+                "an equal jobLeaseToken/leaseToken pair must deserialize, not be \
+                 rejected as a duplicate field",
+            );
+            let decoded = serde_json::to_value(frame).unwrap();
+            assert_eq!(decoded["leaseToken"], "opaque:not-a-number");
+            assert_eq!(decoded["jobLeaseToken"], "opaque:not-a-number");
         }
     }
 }
@@ -159,12 +179,16 @@ pub enum ClientFrame {
     CompleteJob {
         corr: u64,
         job_key: String,
-        #[serde(
-            default,
-            alias = "jobLeaseToken",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_token: Option<String>,
+        /// Canonical Camunda 8.10 spelling of the lease token (#1283). Kept as a
+        /// distinct field from the legacy `leaseToken` (not a `serde` alias) so the
+        /// handler can reconcile the two exactly as the REST boundary does: accept a
+        /// dual-sent equal pair, reject a conflicting pair, and count legacy-name use
+        /// for the migration metric. `skip_serializing_if` keeps it off the
+        /// intra-cluster peer wire, which stays on `leaseToken`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_lease_token: Option<String>,
         #[serde(default)]
         variables: Option<Map<String, Value>>,
         /// Optional agentic ad-hoc sub-process result (Camunda `JobResult`),
@@ -183,12 +207,16 @@ pub enum ClientFrame {
     FailJob {
         corr: u64,
         job_key: String,
-        #[serde(
-            default,
-            alias = "jobLeaseToken",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_token: Option<String>,
+        /// Canonical Camunda 8.10 spelling of the lease token (#1283). Kept as a
+        /// distinct field from the legacy `leaseToken` (not a `serde` alias) so the
+        /// handler can reconcile the two exactly as the REST boundary does: accept a
+        /// dual-sent equal pair, reject a conflicting pair, and count legacy-name use
+        /// for the migration metric. `skip_serializing_if` keeps it off the
+        /// intra-cluster peer wire, which stays on `leaseToken`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_lease_token: Option<String>,
         #[serde(default)]
         retries: Option<i32>,
         #[serde(default)]
@@ -199,12 +227,16 @@ pub enum ClientFrame {
     ThrowError {
         corr: u64,
         job_key: String,
-        #[serde(
-            default,
-            alias = "jobLeaseToken",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_token: Option<String>,
+        /// Canonical Camunda 8.10 spelling of the lease token (#1283). Kept as a
+        /// distinct field from the legacy `leaseToken` (not a `serde` alias) so the
+        /// handler can reconcile the two exactly as the REST boundary does: accept a
+        /// dual-sent equal pair, reject a conflicting pair, and count legacy-name use
+        /// for the migration metric. `skip_serializing_if` keeps it off the
+        /// intra-cluster peer wire, which stays on `leaseToken`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_lease_token: Option<String>,
         error_code: String,
         #[serde(default)]
         error_message: Option<String>,
@@ -326,12 +358,16 @@ pub enum ClientFrame {
     UpdateJobRetries {
         corr: u64,
         job_key: String,
-        #[serde(
-            default,
-            alias = "jobLeaseToken",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_token: Option<String>,
+        /// Canonical Camunda 8.10 spelling of the lease token (#1283). Kept as a
+        /// distinct field from the legacy `leaseToken` (not a `serde` alias) so the
+        /// handler can reconcile the two exactly as the REST boundary does: accept a
+        /// dual-sent equal pair, reject a conflicting pair, and count legacy-name use
+        /// for the migration metric. `skip_serializing_if` keeps it off the
+        /// intra-cluster peer wire, which stays on `leaseToken`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_lease_token: Option<String>,
         retries: i32,
         #[serde(default)]
         operation_reference: Option<i64>,
@@ -343,12 +379,16 @@ pub enum ClientFrame {
     UpdateJobTimeout {
         corr: u64,
         job_key: String,
-        #[serde(
-            default,
-            alias = "jobLeaseToken",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_token: Option<String>,
+        /// Canonical Camunda 8.10 spelling of the lease token (#1283). Kept as a
+        /// distinct field from the legacy `leaseToken` (not a `serde` alias) so the
+        /// handler can reconcile the two exactly as the REST boundary does: accept a
+        /// dual-sent equal pair, reject a conflicting pair, and count legacy-name use
+        /// for the migration metric. `skip_serializing_if` keeps it off the
+        /// intra-cluster peer wire, which stays on `leaseToken`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_lease_token: Option<String>,
         timeout: i64,
         #[serde(default)]
         operation_reference: Option<i64>,
@@ -364,12 +404,16 @@ pub enum ClientFrame {
         timeout: Option<i64>,
         #[serde(default)]
         operation_reference: Option<i64>,
-        #[serde(
-            default,
-            alias = "jobLeaseToken",
-            skip_serializing_if = "Option::is_none"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         lease_token: Option<String>,
+        /// Canonical Camunda 8.10 spelling of the lease token (#1283). Kept as a
+        /// distinct field from the legacy `leaseToken` (not a `serde` alias) so the
+        /// handler can reconcile the two exactly as the REST boundary does: accept a
+        /// dual-sent equal pair, reject a conflicting pair, and count legacy-name use
+        /// for the migration metric. `skip_serializing_if` keeps it off the
+        /// intra-cluster peer wire, which stays on `leaseToken`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job_lease_token: Option<String>,
     },
     /// Forwards a canonical agent CREATE or UPDATE request to its partition leader.
     #[serde(rename_all = "camelCase")]
