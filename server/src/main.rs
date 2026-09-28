@@ -11781,7 +11781,17 @@ impl ServerImpl {
             )));
         }
         if let Some(node) = self.route_by_leader(element_instance_key) {
-            let forwarded = self.forward_agent_request(node, None, body).await;
+            // Forward a canonicalized body: the legacy `jobLease` alias is folded
+            // into `jobLeaseToken` so the owning peer's `reconcile_lease_token`
+            // sees a canonical-only request and does not count the legacy name a
+            // second time (the gateway already counted it above). This mirrors
+            // job-command forwarding, which carries only the resolved token.
+            let mut forwarded_body = body.clone();
+            forwarded_body.job_lease_token = job_lease_token.clone();
+            forwarded_body.job_lease = None;
+            let forwarded = self
+                .forward_agent_request(node, None, &forwarded_body)
+                .await;
             return Ok(match forwarded {
                 Ok(response) => response,
                 Err((status, detail)) => agent_create_http_error(status, detail),
@@ -11945,8 +11955,15 @@ impl ServerImpl {
             )));
         }
         if let Some(node) = self.route_by_leader(agent_instance_key) {
+            // Forward a canonicalized body (legacy `jobLease` folded into
+            // `jobLeaseToken`) so the owning peer does not count the legacy name a
+            // second time — the gateway already counted it above. Mirrors
+            // job-command forwarding, which carries only the resolved token.
+            let mut forwarded_body = body.clone();
+            forwarded_body.job_lease_token = job_lease_token.clone();
+            forwarded_body.job_lease = None;
             let forwarded = self
-                .forward_agent_request(node, Some(agent_instance_key.to_string()), body)
+                .forward_agent_request(node, Some(agent_instance_key.to_string()), &forwarded_body)
                 .await;
             return Ok(match forwarded {
                 Ok(response) => response,
