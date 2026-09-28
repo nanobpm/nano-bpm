@@ -20943,26 +20943,41 @@ fn legacy_lease_name_uses() -> u64 {
 /// alias (`leaseToken` / `jobLease`) with conflicting values.
 struct ConflictingLeaseTokens;
 
+/// Record that an accepted request carried a deprecated legacy lease-token field
+/// name (`leaseToken` / `jobLease`), so operators can see when every deployed
+/// worker has moved to `jobLeaseToken` and the transition-window alias is safe
+/// to drop (#1283).
+fn record_legacy_lease_name_use() {
+    LEGACY_LEASE_NAME_USES.fetch_add(1, Ordering::Relaxed);
+    tracing::debug!(
+        target: "nano::lease",
+        "request used a deprecated legacy lease-token field name (leaseToken/jobLease); \
+         prefer jobLeaseToken (#1283)"
+    );
+}
+
 /// Reconcile the canonical `jobLeaseToken` with its deprecated legacy alias for
 /// the Camunda 8.10 rename transition window (#1283). Prefers the canonical
-/// name; falls back to the legacy name (recording the use so the window can be
-/// closed later); rejects a request that supplies both names with differing
-/// values so a confused client fails loudly rather than fencing on a stale
-/// token.
+/// name; falls back to the legacy name; rejects a request that supplies both
+/// names with differing values so a confused client fails loudly rather than
+/// fencing on a stale token. Counts the deprecated name on *every* accepted
+/// request that carries it — including a matching `jobLeaseToken` + `jobLease`
+/// pair — so a fleet that keeps dual-sending the alias cannot make the migration
+/// metric appear drained before the alias is actually retired.
 fn reconcile_lease_token(
     canonical: Option<String>,
     legacy: Option<String>,
 ) -> Result<Option<String>, ConflictingLeaseTokens> {
     match (canonical, legacy) {
         (Some(c), Some(l)) if c != l => Err(ConflictingLeaseTokens),
-        (Some(c), _) => Ok(Some(c)),
+        (Some(c), legacy) => {
+            if legacy.is_some() {
+                record_legacy_lease_name_use();
+            }
+            Ok(Some(c))
+        }
         (None, Some(l)) => {
-            LEGACY_LEASE_NAME_USES.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(
-                target: "nano::lease",
-                "request used a deprecated legacy lease-token field name (leaseToken/jobLease); \
-                 prefer jobLeaseToken (#1283)"
-            );
+            record_legacy_lease_name_use();
             Ok(Some(l))
         }
         (None, None) => Ok(None),
@@ -36994,6 +37009,52 @@ mod call_activity_hierarchy_read_model_tests {
             )),
             "the /metrics counter reflects the recorded legacy-name uses"
         );
+    }
+
+    /// The deprecation-window counter must reflect *every* accepted request that
+    /// carried the legacy name — including a matching `jobLeaseToken` + `jobLease`
+    /// pair, which is accepted via the canonical arm. Undercounting the dual-send
+    /// case would let a fleet that keeps sending the alias make the migration
+    /// metric appear drained before the alias is safe to retire (#1283).
+    ///
+    /// The counter is a process-global static shared with other tests running in
+    /// parallel, so this asserts only race-safe properties: the pure return value
+    /// of each reconciliation arm, and a strict lower-bound (`> before`) increment
+    /// for the arms that must count the legacy name (a monotonic counter can never
+    /// make a genuine increment fail this, whatever other tests do concurrently).
+    #[test]
+    fn reconcile_lease_token_counts_legacy_name_on_every_accepted_request() {
+        let s = |v: &str| Some(v.to_string());
+
+        // Canonical only: honoured (return value is race-free).
+        assert_eq!(reconcile_lease_token(s("tok"), None).ok(), Some(s("tok")));
+
+        // Legacy only: honoured and counted.
+        let before = legacy_lease_name_uses();
+        assert_eq!(reconcile_lease_token(None, s("tok")).ok(), Some(s("tok")));
+        assert!(
+            legacy_lease_name_uses() > before,
+            "legacy-only is counted (#1283)"
+        );
+
+        // Matching dual-send: accepted via the canonical value AND counted, so the
+        // alias cannot hide behind the canonical name. This is the regression the
+        // fix closes — the previous `(Some(c), _)` arm skipped the count.
+        let before = legacy_lease_name_uses();
+        assert_eq!(
+            reconcile_lease_token(s("tok"), s("tok")).ok(),
+            Some(s("tok"))
+        );
+        assert!(
+            legacy_lease_name_uses() > before,
+            "a matching dual-send still counts the legacy name (#1283)"
+        );
+
+        // Conflicting dual-send: rejected loudly rather than fencing on a stale token.
+        assert!(reconcile_lease_token(s("tok"), s("other")).is_err());
+
+        // Neither present: nothing to reconcile.
+        assert_eq!(reconcile_lease_token(None, None).ok(), Some(None));
     }
 
     #[tokio::test]

@@ -180,8 +180,9 @@
       description: >
         Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
         during the rename transition window. Supply `jobLeaseToken` instead.
-        Exactly one of `jobLeaseToken` or `jobLease` must be present; if both are
-        supplied and differ, the request is rejected with 400.
+        At least one of `jobLeaseToken` or `jobLease` must be present; both may
+        be supplied when their values match, and if both are supplied and differ
+        the request is rejected with 400.
 - file: agent-instances.yaml
   target: components.schemas.AgentInstanceUpdateRequest.properties
   merge:
@@ -191,8 +192,9 @@
       description: >
         Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
         during the rename transition window. Supply `jobLeaseToken` instead.
-        Exactly one of `jobLeaseToken` or `jobLease` must be present; if both are
-        supplied and differ, the request is rejected with 400.
+        At least one of `jobLeaseToken` or `jobLease` must be present; both may
+        be supplied when their values match, and if both are supplied and differ
+        the request is rejected with 400.
 - file: agent-instances.yaml
   target: components.schemas.AgentInstanceHistoryItemResult.properties
   merge:
