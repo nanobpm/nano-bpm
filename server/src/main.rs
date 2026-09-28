@@ -11728,6 +11728,29 @@ impl ServerImpl {
         &self,
         body: &models::AgentInstanceCreationRequest,
     ) -> Result<apis::agent_instance::CreateAgentInstanceResponse, ()> {
+        // Client-edge entry (the generated trait dispatches here): count a
+        // deprecated legacy lease-name use against the migration metric.
+        self.create_agent_instance_inner(body, true).await
+    }
+
+    /// Peer-side entry for a request forwarded from another node
+    /// ([`agent_instance_forwarded`]). The forwarding gateway already counted any
+    /// legacy lease-name use at the client edge, so the owning peer reconciles
+    /// *without* counting — otherwise every forwarded request that carries the
+    /// legacy `jobLease` spelling (kept for mixed-version peers) is counted twice
+    /// (#1283).
+    async fn create_agent_instance_forwarded_impl(
+        &self,
+        body: &models::AgentInstanceCreationRequest,
+    ) -> Result<apis::agent_instance::CreateAgentInstanceResponse, ()> {
+        self.create_agent_instance_inner(body, false).await
+    }
+
+    async fn create_agent_instance_inner(
+        &self,
+        body: &models::AgentInstanceCreationRequest,
+        count_legacy: bool,
+    ) -> Result<apis::agent_instance::CreateAgentInstanceResponse, ()> {
         use apis::agent_instance::CreateAgentInstanceResponse as Resp;
 
         let element_instance_key: Key = match body.element_instance_key.0.parse() {
@@ -11744,17 +11767,20 @@ impl ServerImpl {
             }
         };
 
-        let job_lease_token =
-            match reconcile_lease_token(body.job_lease_token.clone(), body.job_lease.clone()) {
-                Ok(token) => token,
-                Err(ConflictingLeaseTokens) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid data",
-                        400,
-                        CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
-                    )));
-                }
-            };
+        let job_lease_token = match reconcile_lease_token_counted(
+            body.job_lease_token.clone(),
+            body.job_lease.clone(),
+            count_legacy,
+        ) {
+            Ok(token) => token,
+            Err(ConflictingLeaseTokens) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                )));
+            }
+        };
         let (job_key, job_lease) = match parse_agent_job_attribution(
             Some(body.job_key.0.as_str()),
             job_lease_token.as_deref(),
@@ -11781,14 +11807,18 @@ impl ServerImpl {
             )));
         }
         if let Some(node) = self.route_by_leader(element_instance_key) {
-            // Forward a canonicalized body: the legacy `jobLease` alias is folded
-            // into `jobLeaseToken` so the owning peer's `reconcile_lease_token`
-            // sees a canonical-only request and does not count the legacy name a
-            // second time (the gateway already counted it above). This mirrors
-            // job-command forwarding, which carries only the resolved token.
+            // Forward the resolved lease token under BOTH the canonical
+            // `jobLeaseToken` and the deprecated legacy `jobLease` spelling. The
+            // legacy spelling keeps a mixed-version rolling upgrade working: a
+            // newer gateway can route to an older peer whose request model only
+            // knows the pre-rename `jobLease`, which would otherwise reject the
+            // forwarded request as missing its lease. The owning peer reconciles
+            // via `create_agent_instance_forwarded_impl` (count = false), so
+            // carrying the legacy spelling does not double-count the migration
+            // metric — the gateway already counted the client's use above (#1283).
             let mut forwarded_body = body.clone();
             forwarded_body.job_lease_token = job_lease_token.clone();
-            forwarded_body.job_lease = None;
+            forwarded_body.job_lease = job_lease_token.clone();
             let forwarded = self
                 .forward_agent_request(node, None, &forwarded_body)
                 .await;
@@ -11896,6 +11926,29 @@ impl ServerImpl {
         path_params: &models::UpdateAgentInstancePathParams,
         body: &models::AgentInstanceUpdateRequest,
     ) -> Result<apis::agent_instance::UpdateAgentInstanceResponse, ()> {
+        // Client-edge entry: count a deprecated legacy lease-name use.
+        self.update_agent_instance_inner(path_params, body, true)
+            .await
+    }
+
+    /// Peer-side entry for a forwarded update ([`agent_instance_forwarded`]).
+    /// Reconciles without counting — the forwarding gateway already counted the
+    /// client's legacy lease-name use (#1283).
+    async fn update_agent_instance_forwarded_impl(
+        &self,
+        path_params: &models::UpdateAgentInstancePathParams,
+        body: &models::AgentInstanceUpdateRequest,
+    ) -> Result<apis::agent_instance::UpdateAgentInstanceResponse, ()> {
+        self.update_agent_instance_inner(path_params, body, false)
+            .await
+    }
+
+    async fn update_agent_instance_inner(
+        &self,
+        path_params: &models::UpdateAgentInstancePathParams,
+        body: &models::AgentInstanceUpdateRequest,
+        count_legacy: bool,
+    ) -> Result<apis::agent_instance::UpdateAgentInstanceResponse, ()> {
         use apis::agent_instance::UpdateAgentInstanceResponse as Resp;
 
         let agent_instance_key: Key = match path_params.agent_instance_key.parse() {
@@ -11925,17 +11978,20 @@ impl ServerImpl {
             }
         };
 
-        let job_lease_token =
-            match reconcile_lease_token(body.job_lease_token.clone(), body.job_lease.clone()) {
-                Ok(token) => token,
-                Err(ConflictingLeaseTokens) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid data",
-                        400,
-                        CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
-                    )));
-                }
-            };
+        let job_lease_token = match reconcile_lease_token_counted(
+            body.job_lease_token.clone(),
+            body.job_lease.clone(),
+            count_legacy,
+        ) {
+            Ok(token) => token,
+            Err(ConflictingLeaseTokens) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                )));
+            }
+        };
         let (job_key, job_lease) = match parse_agent_job_attribution(
             Some(body.job_key.0.as_str()),
             job_lease_token.as_deref(),
@@ -11955,13 +12011,16 @@ impl ServerImpl {
             )));
         }
         if let Some(node) = self.route_by_leader(agent_instance_key) {
-            // Forward a canonicalized body (legacy `jobLease` folded into
-            // `jobLeaseToken`) so the owning peer does not count the legacy name a
-            // second time — the gateway already counted it above. Mirrors
-            // job-command forwarding, which carries only the resolved token.
+            // Forward the resolved lease token under BOTH spellings — canonical
+            // `jobLeaseToken` and the deprecated legacy `jobLease` — so a
+            // mixed-version rolling upgrade keeps working (an older peer only
+            // knows the pre-rename `jobLease`). The owning peer reconciles via
+            // `update_agent_instance_forwarded_impl` (count = false), so the
+            // legacy spelling is not double-counted — the gateway already counted
+            // the client's use above (#1283).
             let mut forwarded_body = body.clone();
             forwarded_body.job_lease_token = job_lease_token.clone();
-            forwarded_body.job_lease = None;
+            forwarded_body.job_lease = job_lease_token.clone();
             let forwarded = self
                 .forward_agent_request(node, Some(agent_instance_key.to_string()), &forwarded_body)
                 .await;
@@ -12108,7 +12167,7 @@ impl ServerImpl {
         let result = if let Some(agent_instance_key) = key {
             let request = serde_json::from_value(body).map_err(|error| (400, error.to_string()))?;
             serde_json::to_value(
-                self.update_agent_instance_impl(
+                self.update_agent_instance_forwarded_impl(
                     &models::UpdateAgentInstancePathParams { agent_instance_key },
                     &request,
                 )
@@ -12118,7 +12177,7 @@ impl ServerImpl {
         } else {
             let request = serde_json::from_value(body).map_err(|error| (400, error.to_string()))?;
             serde_json::to_value(
-                self.create_agent_instance_impl(&request)
+                self.create_agent_instance_forwarded_impl(&request)
                     .await
                     .map_err(|()| (500, "Agent creation failed.".into()))?,
             )
@@ -20985,20 +21044,49 @@ fn reconcile_lease_token(
     canonical: Option<String>,
     legacy: Option<String>,
 ) -> Result<Option<String>, ConflictingLeaseTokens> {
+    reconcile_lease_token_counted(canonical, legacy, true)
+}
+
+/// Pure resolution of the canonical `jobLeaseToken` / deprecated legacy
+/// (`jobLease` / `leaseToken`) pair (#1283): returns the effective token and
+/// whether the deprecated legacy spelling was present. Prefers the canonical
+/// name, falls back to the legacy name, and rejects a request that supplies both
+/// names with differing values. Counting is deliberately *not* done here so it
+/// can be suppressed on internal peer forwards (which carry the legacy spelling
+/// for older peers) without duplicating this resolution/validation logic.
+fn resolve_lease_token(
+    canonical: Option<String>,
+    legacy: Option<String>,
+) -> Result<(Option<String>, bool), ConflictingLeaseTokens> {
     match (canonical, legacy) {
         (Some(c), Some(l)) if c != l => Err(ConflictingLeaseTokens),
-        (Some(c), legacy) => {
-            if legacy.is_some() {
-                record_legacy_lease_name_use();
-            }
-            Ok(Some(c))
-        }
-        (None, Some(l)) => {
-            record_legacy_lease_name_use();
-            Ok(Some(l))
-        }
-        (None, None) => Ok(None),
+        (Some(c), legacy) => Ok((Some(c), legacy.is_some())),
+        (None, Some(l)) => Ok((Some(l), true)),
+        (None, None) => Ok((None, false)),
     }
+}
+
+/// [`reconcile_lease_token`] with an explicit choice of whether to record a
+/// legacy-name use in the migration metric.
+///
+/// The count belongs at the **client edge only**: it measures how many *client*
+/// requests still use the deprecated `jobLease` / `leaseToken` spelling. An
+/// internal peer-to-peer forward is not a client request — the gateway that
+/// first received the client request already counted it — so the owning peer
+/// must reconcile with `count = false` to resolve/validate the token without
+/// double-counting it (#1283). A forwarded request also carries the legacy
+/// `jobLease` spelling for older peers (mixed-version rolling upgrades), which
+/// would otherwise make the peer's reconcile count it a second time.
+fn reconcile_lease_token_counted(
+    canonical: Option<String>,
+    legacy: Option<String>,
+    count: bool,
+) -> Result<Option<String>, ConflictingLeaseTokens> {
+    let (token, legacy_used) = resolve_lease_token(canonical, legacy)?;
+    if count && legacy_used {
+        record_legacy_lease_name_use();
+    }
+    Ok(token)
 }
 
 /// Human-readable 400 detail for a request that supplied both `jobLeaseToken`
@@ -37072,6 +37160,67 @@ mod call_activity_hierarchy_read_model_tests {
 
         // Neither present: nothing to reconcile.
         assert_eq!(reconcile_lease_token(None, None).ok(), Some(None));
+    }
+
+    /// The counting decision is a pure function of the (canonical, legacy) pair,
+    /// so it can be asserted deterministically (no dependency on the global
+    /// monotonic counter that concurrent tests also move). This is the
+    /// single source of truth that `reconcile_lease_token_counted` gates its
+    /// `record_legacy_lease_name_use()` on, and it is exactly what lets an
+    /// internal peer forward resolve/validate the token WITHOUT counting it a
+    /// second time (#1283): the same resolution, `legacy_used` reported
+    /// separately from the act of counting.
+    #[test]
+    fn resolve_lease_token_reports_legacy_use_without_counting() {
+        let s = |v: &str| Some(v.to_string());
+
+        // Canonical only: honoured, legacy NOT used → never counted.
+        assert_eq!(
+            resolve_lease_token(s("tok"), None).ok(),
+            Some((s("tok"), false))
+        );
+        // Legacy only: honoured, legacy used.
+        assert_eq!(
+            resolve_lease_token(None, s("tok")).ok(),
+            Some((s("tok"), true))
+        );
+        // Matching dual-send: canonical value honoured, legacy still flagged used.
+        assert_eq!(
+            resolve_lease_token(s("tok"), s("tok")).ok(),
+            Some((s("tok"), true))
+        );
+        // Conflicting dual-send: rejected loudly.
+        assert!(resolve_lease_token(s("tok"), s("other")).is_err());
+        // Neither present: nothing to reconcile, legacy not used.
+        assert_eq!(resolve_lease_token(None, None).ok(), Some((None, false)));
+    }
+
+    /// A forwarded (peer-side) reconcile must resolve/validate the lease token
+    /// EXACTLY as the client-edge reconcile, but with `count = false` it never
+    /// records a legacy-name use — the gateway already counted the client's use.
+    /// Carrying the legacy `jobLease` spelling on the forward (for mixed-version
+    /// peers) must therefore not double-count the migration metric (#1283). The
+    /// resolution equality is race-free; the no-count guarantee is proved
+    /// structurally by `resolve_lease_token_reports_legacy_use_without_counting`
+    /// (the count is gated on `count && legacy_used`).
+    #[test]
+    fn forwarded_reconcile_resolves_without_counting() {
+        let s = |v: &str| Some(v.to_string());
+        // count = false resolves identically to the counting client-edge path.
+        assert_eq!(
+            reconcile_lease_token_counted(None, s("tok"), false).ok(),
+            reconcile_lease_token_counted(None, s("tok"), true).ok(),
+        );
+        assert_eq!(
+            reconcile_lease_token_counted(s("tok"), s("tok"), false).ok(),
+            Some(s("tok")),
+        );
+        assert_eq!(
+            reconcile_lease_token_counted(s("tok"), None, false).ok(),
+            Some(s("tok")),
+        );
+        // A conflicting pair is still rejected on the forwarded path.
+        assert!(reconcile_lease_token_counted(s("tok"), s("other"), false).is_err());
     }
 
     #[tokio::test]
