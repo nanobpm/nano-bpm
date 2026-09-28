@@ -20933,8 +20933,8 @@ fn job_command_with_lease(command: Command, lease_token: Option<String>) -> Comm
 static LEGACY_LEASE_NAME_USES: AtomicU64 = AtomicU64::new(0);
 
 /// Number of times a client has used a deprecated legacy lease-token field name
-/// (`leaseToken` / `jobLease`) instead of `jobLeaseToken` (#1283).
-#[cfg_attr(not(test), allow(dead_code))]
+/// (`leaseToken` / `jobLease`) instead of `jobLeaseToken` (#1283). Exposed both
+/// to tests and to the Prometheus `/metrics` surface (`metrics_body`).
 fn legacy_lease_name_uses() -> u64 {
     LEGACY_LEASE_NAME_USES.load(Ordering::Relaxed)
 }
@@ -21854,6 +21854,24 @@ fn metrics_body(server: &ServerImpl) -> String {
              nanobpm_handoff_lag_entries {lag}\n",
         );
     }
+
+    // Deprecation-window (#1283) observability. Count of requests that supplied a
+    // job lease token under a pre-8.10 legacy field name (`leaseToken` /
+    // `jobLease`) instead of the canonical `jobLeaseToken`. A per-process counter
+    // reset on restart is exactly Prometheus counter semantics (`rate()` /
+    // `increase()` account for it); scraped across every worker it is the
+    // fleet-wide signal for when it is safe to drop the transition aliases — as
+    // long as any worker still increments it, some client is still sending a
+    // legacy name.
+    let _ = write!(
+        body,
+        "# HELP nanobpm_legacy_lease_name_uses Requests that used a deprecated \
+             pre-8.10 legacy lease-token field name (leaseToken/jobLease) instead \
+             of jobLeaseToken (#1283).\n\
+         # TYPE nanobpm_legacy_lease_name_uses counter\n\
+         nanobpm_legacy_lease_name_uses {}\n",
+        legacy_lease_name_uses(),
+    );
 
     body
 }
@@ -36958,6 +36976,24 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             "throw_job_error reconciles the lease-token names (#1283)"
         );
+
+        // 5. The deprecation-window counter is exposed on the Prometheus
+        //    `/metrics` surface (#1283) — not just a test-only accessor — so
+        //    operators can watch legacy-name usage drain to zero across the
+        //    fleet before the aliases are dropped. Step 2 above recorded at
+        //    least one legacy use.
+        let scraped = metrics_body(&srv);
+        assert!(
+            scraped.contains("# TYPE nanobpm_legacy_lease_name_uses counter"),
+            "the legacy-lease-name metric is exposed as a Prometheus counter"
+        );
+        assert!(
+            scraped.contains(&format!(
+                "nanobpm_legacy_lease_name_uses {}",
+                legacy_lease_name_uses()
+            )),
+            "the /metrics counter reflects the recorded legacy-name uses"
+        );
     }
 
     #[tokio::test]
@@ -37107,6 +37143,50 @@ mod call_activity_hierarchy_read_model_tests {
             ),
             "CREATE must reject a stale lease for {agent_type}"
         );
+        // Deprecation-window reconciliation on the CREATE path (#1283). Supplying
+        // both the canonical and the legacy name with DIFFERING values fails
+        // loudly (400) rather than fencing on a stale token.
+        let mut conflicting_create = create_body.clone();
+        conflicting_create.job_lease = Some(format!("{job_lease}-legacy"));
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&conflicting_create)
+                    .await
+                    .unwrap(),
+                CResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "CREATE rejects conflicting jobLeaseToken/jobLease pair for {agent_type}"
+        );
+        // A legacy-only (`jobLease`) request is honored through reconcile — it is
+        // not silently dropped — so a stale legacy token reaches the fence and
+        // 404s exactly like a stale canonical one (rather than being ignored).
+        let mut legacy_only_stale = create_body.clone();
+        legacy_only_stale.job_lease_token = None;
+        legacy_only_stale.job_lease = Some(format!("{job_lease}-stale"));
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&legacy_only_stale)
+                    .await
+                    .unwrap(),
+                CResp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(_)
+            ),
+            "CREATE honors a legacy-only jobLease for {agent_type}"
+        );
+        // An EQUAL dual-send reconciles to a single token and reaches the fence
+        // (here stale → 404), proving it is accepted rather than rejected as a
+        // conflicting pair.
+        let mut equal_dual_stale = create_body.clone();
+        equal_dual_stale.job_lease_token = Some(format!("{job_lease}-stale"));
+        equal_dual_stale.job_lease = Some(format!("{job_lease}-stale"));
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&equal_dual_stale)
+                    .await
+                    .unwrap(),
+                CResp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(_)
+            ),
+            "CREATE accepts an equal jobLeaseToken/jobLease pair for {agent_type}"
+        );
         let CResp::Status200_TheAgentInstanceWasCreated(created) = srv
             .create_agent_instance_impl(&create_body)
             .await
@@ -37216,6 +37296,50 @@ mod call_activity_hierarchy_read_model_tests {
                 UResp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(_)
             ),
             "UPDATE must reject supplied unknown job attribution for {agent_type}"
+        );
+        // Deprecation-window reconciliation on the UPDATE path (#1283). These
+        // cases carry no history, so they exercise the reconcile without
+        // mutating the instance. Conflicting names fail loudly (400); a
+        // legacy-only `jobLease` is honored through reconcile (a stale one
+        // reaches the fence and 404s rather than being silently dropped); and an
+        // equal dual-send is accepted (also reaching the fence).
+        let mut conflicting_update = upd.clone();
+        conflicting_update.history = None;
+        conflicting_update.job_lease = Some(format!("{job_lease}-legacy"));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &conflicting_update)
+                    .await
+                    .unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "UPDATE rejects conflicting jobLeaseToken/jobLease pair for {agent_type}"
+        );
+        let mut legacy_only_stale_update = upd.clone();
+        legacy_only_stale_update.history = None;
+        legacy_only_stale_update.job_lease_token = None;
+        legacy_only_stale_update.job_lease = Some(format!("{job_lease}-stale"));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &legacy_only_stale_update)
+                    .await
+                    .unwrap(),
+                UResp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(_)
+            ),
+            "UPDATE honors a legacy-only jobLease for {agent_type}"
+        );
+        let mut equal_dual_stale_update = upd.clone();
+        equal_dual_stale_update.history = None;
+        equal_dual_stale_update.job_lease_token = Some(format!("{job_lease}-stale"));
+        equal_dual_stale_update.job_lease = Some(format!("{job_lease}-stale"));
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &equal_dual_stale_update)
+                    .await
+                    .unwrap(),
+                UResp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(_)
+            ),
+            "UPDATE accepts an equal jobLeaseToken/jobLease pair for {agent_type}"
         );
         let UResp::Status200_TheAgentInstanceWasUpdatedSuccessfully(updated) = srv
             .update_agent_instance_impl(&up, &upd)

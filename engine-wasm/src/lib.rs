@@ -1132,7 +1132,8 @@ impl TestEngine {
             .map_err(|e| js_err(&format!("createAgentInstance: invalid request JSON: {e}")))?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
         let job_key = parse_key(&req.job_key)?;
-        let job_lease = req.job_lease_token;
+        let job_lease = reconcile_agent_lease_token(req.job_lease_token, req.job_lease)
+            .map_err(|e| js_err(e.message()))?;
         let history = agent_turns_from(req.history, job_key, &job_lease)?;
         let history_ids: Vec<_> = history
             .iter()
@@ -1187,7 +1188,8 @@ impl TestEngine {
             None => None,
         };
         let job_key = parse_key(&req.job_key)?;
-        let job_lease = req.job_lease_token;
+        let job_lease = reconcile_agent_lease_token(req.job_lease_token, req.job_lease)
+            .map_err(|e| js_err(e.message()))?;
         let history = agent_turns_from(req.history.unwrap_or_default(), job_key, &job_lease)?;
         let history_ids: Vec<_> = history
             .iter()
@@ -3268,14 +3270,60 @@ fn positive_loop_iteration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<i3
     Ok(value)
 }
 
+/// Why reconciling the canonical `jobLeaseToken` with its deprecated legacy
+/// alias `jobLease` failed. A plain enum (not a `JsValue`) so the reconcile rule
+/// is unit-testable on the native target; the call sites map it to a `js_err`.
+#[derive(Debug, PartialEq, Eq)]
+enum LeaseReconcileError {
+    /// Both names were supplied with differing values.
+    Conflict,
+    /// Neither name was supplied — the lease is required.
+    Missing,
+}
+
+impl LeaseReconcileError {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::Conflict => {
+                "jobLeaseToken and the deprecated legacy alias jobLease were both supplied with \
+                 different values; supply only jobLeaseToken"
+            }
+            Self::Missing => "a non-empty jobLeaseToken is required",
+        }
+    }
+}
+
+/// Reconcile the canonical `jobLeaseToken` with its deprecated pre-8.10 legacy
+/// alias `jobLease` at the WASM request boundary, mirroring the gateway's REST
+/// reconciliation (#1283): prefer the canonical name, still honor a legacy-only
+/// request (the deprecation window), accept both names when they agree, and
+/// reject a request that supplies both with *differing* values loudly rather
+/// than fencing on a stale token. A request supplying neither is rejected — the
+/// lease is required. Unlike a `#[serde(alias)]` (which folds both spellings
+/// onto one field and so rejects an equal dual-send as a duplicate field), this
+/// accepts an equal pair, keeping the WASM window consistent with REST.
+fn reconcile_agent_lease_token(
+    canonical: Option<String>,
+    legacy: Option<String>,
+) -> Result<String, LeaseReconcileError> {
+    match (canonical, legacy) {
+        (Some(c), Some(l)) if c != l => Err(LeaseReconcileError::Conflict),
+        (Some(c), _) => Ok(c),
+        (None, Some(l)) => Ok(l),
+        (None, None) => Err(LeaseReconcileError::Missing),
+    }
+}
+
 /// The `createAgentInstance` request body.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateAgentInstanceReq {
     element_instance_key: String,
     job_key: String,
-    #[serde(alias = "jobLease")]
-    job_lease_token: String,
+    #[serde(default)]
+    job_lease_token: Option<String>,
+    #[serde(default)]
+    job_lease: Option<String>,
     #[serde(deserialize_with = "nonempty_agent_history")]
     history: Vec<AgentTurnReq>,
 }
@@ -3300,8 +3348,10 @@ struct UpdateAgentInstanceReq {
     #[serde(default)]
     status: Option<String>,
     job_key: String,
-    #[serde(alias = "jobLease")]
-    job_lease_token: String,
+    #[serde(default)]
+    job_lease_token: Option<String>,
+    #[serde(default)]
+    job_lease: Option<String>,
     #[serde(default)]
     history: Option<Vec<AgentTurnReq>>,
 }
@@ -5936,8 +5986,13 @@ mod read_channel_tests {
             "elementInstanceKey":"1", "jobKey":"2", "jobLease":"opaque:token/0009",
         });
         let parsed: UpdateAgentInstanceReq = serde_json::from_value(request.clone()).unwrap();
-        assert_eq!(parsed.job_lease_token, "opaque:token/0009");
-        for key in ["elementInstanceKey", "jobKey", "jobLease"] {
+        // The legacy `jobLease` deserializes into its own field; presence and
+        // reconciliation are handler-enforced (see `reconcile_agent_lease_token`),
+        // not folded onto the canonical field by a serde alias.
+        assert_eq!(parsed.job_lease.as_deref(), Some("opaque:token/0009"));
+        assert_eq!(parsed.job_lease_token, None);
+        // The structural keys remain required at deserialize time.
+        for key in ["elementInstanceKey", "jobKey"] {
             let mut missing = request.clone();
             missing.as_object_mut().unwrap().remove(key);
             assert!(serde_json::from_value::<UpdateAgentInstanceReq>(missing).is_err());
@@ -5950,6 +6005,76 @@ mod read_channel_tests {
             old_shape[field] = J::Null;
             assert!(serde_json::from_value::<UpdateAgentInstanceReq>(old_shape).is_err());
         }
+    }
+
+    #[test]
+    fn agent_lease_reconcile_matches_rest_deprecation_window() {
+        // Canonical-only and legacy-only both resolve to their supplied token
+        // (the deprecation window keeps legacy `jobLease` working).
+        assert_eq!(
+            reconcile_agent_lease_token(Some("canon".into()), None).unwrap(),
+            "canon"
+        );
+        assert_eq!(
+            reconcile_agent_lease_token(None, Some("legacy".into())).unwrap(),
+            "legacy"
+        );
+        // An EQUAL dual-send is accepted (mirrors REST) — a serde alias would
+        // have rejected it as a duplicate field.
+        assert_eq!(
+            reconcile_agent_lease_token(Some("same".into()), Some("same".into())).unwrap(),
+            "same"
+        );
+        // A DIFFERING dual-send fails loudly rather than fencing on a stale token.
+        assert_eq!(
+            reconcile_agent_lease_token(Some("a".into()), Some("b".into())),
+            Err(LeaseReconcileError::Conflict),
+        );
+        // Neither name supplied is rejected — the lease is required.
+        assert_eq!(
+            reconcile_agent_lease_token(None, None),
+            Err(LeaseReconcileError::Missing),
+        );
+    }
+
+    #[test]
+    fn create_agent_instance_accepts_equal_dual_send() {
+        let mut eng = TestEngine::new();
+        let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
+            .replace("agentType=\"external\"", "agentType=\"aiAgentTask\"");
+        eng.deploy(&xml).unwrap();
+        eng.create_instance(
+            "external-agent-routing",
+            r#"{"route":"senior:rebase"}"#,
+            None,
+        )
+        .unwrap();
+        let jobs = parse(
+            &eng.activate_jobs("senior:rebase", 1, 60_000.0, "W", Some(true))
+                .unwrap(),
+        );
+        let job = &jobs[0];
+        let token = job["jobLeaseToken"].as_str().unwrap();
+        let history = serde_json::json!([{
+            "historyItemId": "initial-config", "loopIteration": 1,
+            "producedAt": "2026-01-02T03:04:05Z", "role": "CONFIGURATION",
+            "content": [], "model": "gpt", "provider": "openai",
+            "systemPrompt": [{"contentType":"TEXT", "text":"Be helpful"}],
+        }]);
+        // An EQUAL dual-send (both jobLeaseToken and jobLease, same value) is
+        // accepted — the alias-based shape previously rejected it as a duplicate
+        // field, making the WASM window inconsistent with REST (#1283). The
+        // conflicting/missing branches are covered by the pure-reconcile unit
+        // test above and the server REST regression suite (they return a
+        // `JsValue` error the native test target cannot construct).
+        eng.create_agent_instance(
+            &serde_json::json!({
+                "elementInstanceKey": job["elementInstanceKey"], "jobKey": job["key"],
+                "jobLeaseToken": token, "jobLease": token, "history": history,
+            })
+            .to_string(),
+        )
+        .expect("equal dual-sent lease fields are accepted");
     }
 
     #[test]
