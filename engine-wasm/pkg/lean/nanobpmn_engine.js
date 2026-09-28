@@ -400,7 +400,7 @@ export class TestEngine {
         }
     }
     /**
-     * Create an agent using `{ elementInstanceKey, jobKey, jobLease, history }`.
+     * Create an agent using `{ elementInstanceKey, jobKey, jobLeaseToken, history }`.
      * History must establish its CONFIGURATION. Returns the canonical creation
      * result with `agentInstanceKey` and positionally correlated `createdHistory`.
      * @param {string} request_json
@@ -1226,7 +1226,7 @@ export class TestEngine {
         }
     }
     /**
-     * Update an agent with `{ elementInstanceKey, jobKey, jobLease, status?, history? }`.
+     * Update an agent with `{ elementInstanceKey, jobKey, jobLeaseToken, status?, history? }`.
      * Configuration and metrics are submitted through history, never top-level fields.
      * Returns `createdHistory`; the engine owns pending/commit/discard semantics.
      * @param {string} agent_instance_key

@@ -127,7 +127,7 @@ export type AgentInstanceCreationRequest = {
      * rather than committed.
      *
      */
-    jobLease: string;
+    jobLeaseToken?: string;
     /**
      * A batch of history items to append to the agent instance's conversation
      * history, in request order. Each created item is echoed back in the
@@ -432,7 +432,7 @@ export type AgentInstanceHistoryItemResult = {
     /**
      * The lease token of the activation that produced this item.
      */
-    jobLease: string;
+    jobLeaseToken: string;
     /**
      * The loop iteration this item belongs to.
      */
@@ -807,7 +807,7 @@ export type AgentInstanceUpdateRequest = {
      * rather than committed.
      *
      */
-    jobLease: string;
+    jobLeaseToken?: string;
     /**
      * A batch of history items to append to the agent instance's conversation
      * history, in request order. Each created item is echoed back in the
@@ -5468,7 +5468,7 @@ export type ActivatedJobResult = {
      * The lease token identifying this activation. This is null when the job was activated without a lease.
      *
      */
-    leaseToken: string | null;
+    jobLeaseToken: string | null;
 };
 
 /**
@@ -5583,7 +5583,7 @@ export type JobActivationRequest = {
      */
     tenantFilter?: TenantFilterEnum;
     /**
-     * Whether to activate the jobs with a lease. When true, each activated job is assigned a distinct, opaque lease token, returned as ActivatedJobResult.leaseToken. The lease fences the complete, fail, and throw-error commands against a superseded activation of the same job. Once a job has been activated with a lease, it is served only to leasing workers of that job type. Omit or set to false to activate jobs without a lease.
+     * Whether to activate the jobs with a lease. When true, each activated job is assigned a distinct, opaque lease token, returned as ActivatedJobResult.jobLeaseToken. The lease fences the complete, fail, and throw-error commands against a superseded activation of the same job. Once a job has been activated with a lease, it is served only to leasing workers of that job type. Omit or set to false to activate jobs without a lease.
      *
      */
     withLease?: boolean | null;
@@ -5636,10 +5636,10 @@ export type JobCompletionRequest = {
     } | null;
     result?: JobResult;
     /**
-     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.jobLeaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
 };
 
 export type JobErrorRequest = {
@@ -5661,10 +5661,10 @@ export type JobErrorRequest = {
         [key: string]: unknown;
     } | null;
     /**
-     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.jobLeaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
 };
 
 export type JobFailRequest = {
@@ -5688,10 +5688,10 @@ export type JobFailRequest = {
         [key: string]: unknown;
     };
     /**
-     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.jobLeaseToken. A leased job requires its matching token; missing or stale tokens are rejected. A job activated without a lease requires no token.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
 };
 
 /**
@@ -6098,10 +6098,10 @@ export type JobUpdateRequest = {
     changeset: JobChangeset;
     operationReference?: OperationReference;
     /**
-     * The token identifying a leased job's activation, obtained from ActivatedJobResult.leaseToken. A supplied token is validated against the current lease. An update without a token applies to support operator and bulk updates, unlike complete, fail, and throw-error requests, which require a token for leased jobs.
+     * The token identifying a leased job's activation, obtained from ActivatedJobResult.jobLeaseToken. A supplied token is validated against the current lease. An update without a token applies to support operator and bulk updates, unlike complete, fail, and throw-error requests, which require a token for leased jobs.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
 };
 
 /**

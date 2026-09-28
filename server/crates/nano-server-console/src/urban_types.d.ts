@@ -3704,7 +3704,7 @@ type AgentInstanceHistoryItemRequest = {
     /**
      * Opaque lease token received from the job activation response.
      */
-    jobLease: string;
+    jobLeaseToken: string;
     /**
      * The loopIteration this item belongs to. A loopIteration is one pass through the agent
      * feedback loop: one LLM call, its tool dispatches, and their results. Omit if not grouping
@@ -3833,7 +3833,7 @@ type AgentInstanceHistoryItemResult = {
     /**
      * The lease token of the activation that produced this item.
      */
-    jobLease: string;
+    jobLeaseToken: string;
     /**
      * The loopIteration this item belongs to. A loopIteration is one pass through the agent
      * feedback loop: one LLM call, its tool dispatches, and their results.
@@ -8987,7 +8987,7 @@ type JobActivationRequest = {
      */
     tenantFilter?: TenantFilterEnum;
     /**
-     * Whether to activate the jobs with a lease. When true, each activated job is assigned a distinct, opaque lease token, returned as ActivatedJobResult.leaseToken. The lease fences the complete, fail, and throw-error commands against a superseded activation of the same job (for example, after the job timed out or failed and was re-activated by another worker): a command carrying a stale lease token is rejected rather than racing with the newer activation. Once a job has been activated with a lease, it is served only to leasing workers of that job type; a homogeneous fleet per job type is recommended. Omit or set to false to activate jobs without a lease.
+     * Whether to activate the jobs with a lease. When true, each activated job is assigned a distinct, opaque lease token, returned as ActivatedJobResult.jobLeaseToken. The lease fences the complete, fail, and throw-error commands against a superseded activation of the same job (for example, after the job timed out or failed and was re-activated by another worker): a command carrying a stale lease token is rejected rather than racing with the newer activation. Once a job has been activated with a lease, it is served only to leasing workers of that job type; a homogeneous fleet per job type is recommended. Omit or set to false to activate jobs without a lease.
      *
      */
     withLease?: boolean | null;
@@ -9100,7 +9100,7 @@ type ActivatedJobResult$1 = {
      * The lease token identifying this activation. This is `null` when the job was activated without a lease.
      *
      */
-    leaseToken: string | null;
+    jobLeaseToken: string | null;
 };
 /**
  * Contains properties of a user task.
@@ -9400,12 +9400,12 @@ type JobFailRequest = {
         [key: string]: unknown;
     };
     /**
-     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.leaseToken`.
+     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.jobLeaseToken`.
      * For a leased job, the matching token must be supplied to prove the command comes from the worker that holds the current lease; a command with no token is rejected. A command carrying a stale token is likewise rejected, fencing the job against a superseded activation (for example, after the job timed out or failed and was re-activated by another worker).
      * A job that was activated without a lease requires no token.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
 };
 type JobErrorRequest$1 = {
     /**
@@ -9426,12 +9426,12 @@ type JobErrorRequest$1 = {
         [key: string]: unknown;
     } | null;
     /**
-     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.leaseToken`.
+     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.jobLeaseToken`.
      * For a leased job, the matching token must be supplied to prove the command comes from the worker that holds the current lease; a command with no token is rejected. A command carrying a stale token is likewise rejected, fencing the job against a superseded activation (for example, after the job timed out or failed and was re-activated by another worker).
      * A job that was activated without a lease requires no token.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
 };
 type JobCompletionRequest = {
     /**
@@ -9442,12 +9442,12 @@ type JobCompletionRequest = {
     } | null;
     result?: JobResult;
     /**
-     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.leaseToken`.
+     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.jobLeaseToken`.
      * For a leased job, the matching token must be supplied to prove the command comes from the worker that holds the current lease; a command with no token is rejected. A command carrying a stale token is likewise rejected, fencing the job against a superseded activation (for example, after the job timed out or failed and was re-activated by another worker).
      * A job that was activated without a lease requires no token.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
     /**
      * An optional business id to assign to the process instance the job belongs to, as part of completing the job, letting a worker set the identifier from work it just performed.
      * The business id can only be assigned to a root process instance: if the job belongs to a child process instance (one started by a call activity), the completion is rejected. An empty business id is likewise rejected. The assignment is single and irreversible and is only accepted while business id uniqueness is disabled. Only artifacts created after the assignment carry the business id; already-existing ones are not enriched. Completing with a business id that differs from one already assigned rejects the whole completion, leaving the job open; re-sending the identical business id is an idempotent no-op.
@@ -9563,13 +9563,13 @@ type JobUpdateRequest = {
     changeset: JobChangeset;
     operationReference?: OperationReference;
     /**
-     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.leaseToken`.
+     * The token identifying a leased job's activation, obtained from `ActivatedJobResult.jobLeaseToken`.
      * For a leased job, a supplied token is validated to prove the command comes from the worker that holds the current lease; a command carrying a stale token is rejected, fencing the job against a superseded activation (for example, after the job timed out or failed and was re-activated by another worker).
      * An update without a token always applies to support operator and bulk updates of leased jobs. Note that this is different from lifecycle requests like complete, fail, and throw-error that always require a token for leased jobs.
      * A job that was activated without a lease requires no token.
      *
      */
-    leaseToken?: string | null;
+    jobLeaseToken?: string | null;
 };
 /**
  * JSON object with changed job attribute values. The job cannot be completed or failed with this endpoint, use the complete job or fail job endpoints instead.
@@ -22139,7 +22139,7 @@ declare const searchAgentInstances: <ThrowOnError extends boolean = true>(option
  * Create agent instance history item
  *
  * Appends a single history item to an agent instance's conversation history.
- * The created item has commitStatus PENDING until the job identified by jobLease
+ * The created item has commitStatus PENDING until the job identified by jobLeaseToken
  * completes successfully, at which point it transitions to COMMITTED. If the job
  * fails or is superseded by a retry, the item is marked DISCARDED.
  *
@@ -27369,7 +27369,7 @@ declare class CamundaClient {
      * Create agent instance history item
      *
      * Appends a single history item to an agent instance's conversation history.
-     * The created item has commitStatus PENDING until the job identified by jobLease
+     * The created item has commitStatus PENDING until the job identified by jobLeaseToken
      * completes successfully, at which point it transitions to COMMITTED. If the job
      * fails or is superseded by a retry, the item is marked DISCARDED.
      *
@@ -27380,7 +27380,7 @@ declare class CamundaClient {
      *   agentInstanceKey: AgentInstanceKey,
      *   elementInstanceKey: ElementInstanceKey,
      *   jobKey: JobKey,
-     *   jobLease: string
+     *   jobLeaseToken: string
      * ) {
      *   const camunda = createCamundaClient();
      *
@@ -27388,7 +27388,7 @@ declare class CamundaClient {
      *     agentInstanceKey,
      *     elementInstanceKey,
      *     jobKey,
-     *     jobLease,
+     *     jobLeaseToken,
      *     role: 'ASSISTANT',
      *     content: [{ contentType: 'TEXT', text: 'How can I help you today?' }],
      *     producedAt: new Date().toISOString(),

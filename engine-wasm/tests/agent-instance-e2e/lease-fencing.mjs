@@ -28,47 +28,47 @@ for (const variant of ["lean", "readmodel"]) {
         engine.deploy(xml);
         engine.createInstance("external-agent-routing", "{}");
         const [job] = JSON.parse(engine.activateJobs(type, 1, 100, "W", withLease));
-        assert.ok(Object.hasOwn(job, "leaseToken"), "leaseToken is required even without a lease");
-        assert.ok(!Object.hasOwn(job, "jobLease"), "activation does not expose the agent attribution name");
+        assert.ok(Object.hasOwn(job, "jobLeaseToken"), "jobLeaseToken is required even without a lease");
+        assert.ok(!Object.hasOwn(job, "leaseToken") && !Object.hasOwn(job, "jobLease"), "activation exposes only the canonical jobLeaseToken name");
         if (withLease !== true) {
-          assert.equal(job.leaseToken, null, "leasing is opt-in for every marker");
+          assert.equal(job.jobLeaseToken, null, "leasing is opt-in for every marker");
           engine.completeJob(job.key, "{}");
           continue;
         }
-        assert.equal(typeof job.leaseToken, "string");
-        assert.ok(job.leaseToken.length > 0);
-        for (const token of [undefined, `${job.leaseToken}:stale`]) {
+        assert.equal(typeof job.jobLeaseToken, "string");
+        assert.ok(job.jobLeaseToken.length > 0);
+        for (const token of [undefined, `${job.jobLeaseToken}:stale`]) {
           assert.throws(() => engine.completeJob(job.key, "{}", token));
           assert.throws(() => engine.failJob(job.key, 2, "stale", token));
           assert.throws(() => engine.throwError(job.key, "ERR", "stale", token));
         }
-        assert.throws(() => engine.updateRetries(job.key, 2, `${job.leaseToken}:stale`));
-        assert.throws(() => engine.updateTimeout(job.key, 100, `${job.leaseToken}:stale`));
+        assert.throws(() => engine.updateRetries(job.key, 2, `${job.jobLeaseToken}:stale`));
+        assert.throws(() => engine.updateTimeout(job.key, 100, `${job.jobLeaseToken}:stale`));
         for (const invalid of [1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 63, -(2 ** 64)]) {
-          assert.throws(() => engine.updateTimeout(job.key, invalid, job.leaseToken));
+          assert.throws(() => engine.updateTimeout(job.key, invalid, job.jobLeaseToken));
         }
         engine.updateTimeout(job.key, 100);
         engine.updateRetries(job.key, 3);
-        engine.failJob(job.key, 2, "retry", job.leaseToken);
+        engine.failJob(job.key, 2, "retry", job.jobLeaseToken);
         assert.deepEqual(JSON.parse(engine.activateJobs(type, 1, 100, "W", false)), [],
           "leased jobs cannot be reactivated by unleased workers");
         const [retry] = JSON.parse(engine.activateJobs(type, 1, 100, "W", true));
-        assert.equal(typeof retry.leaseToken, "string", "lease mode stays enabled after failure");
-        assert.notEqual(retry.leaseToken, job.leaseToken);
-        assert.throws(() => engine.completeJob(retry.key, "{}", job.leaseToken));
+        assert.equal(typeof retry.jobLeaseToken, "string", "lease mode stays enabled after failure");
+        assert.notEqual(retry.jobLeaseToken, job.jobLeaseToken);
+        assert.throws(() => engine.completeJob(retry.key, "{}", job.jobLeaseToken));
         engine.advanceTime(101);
         const replayed = new TestEngine();
         replayed.replayEvents(engine.events());
         assert.deepEqual(JSON.parse(engine.activateJobs(type, 1, 100, "W")), []);
         const [expired] = JSON.parse(engine.activateJobs(type, 1, 100, "W", true));
         const [replayedJob] = JSON.parse(replayed.activateJobs(type, 1, 100, "W", true));
-        assert.equal(replayedJob.leaseToken, expired.leaseToken, "event replay retains lease generation");
-        replayed.completeJob(replayedJob.key, "{}", replayedJob.leaseToken);
+        assert.equal(replayedJob.jobLeaseToken, expired.jobLeaseToken, "event replay retains lease generation");
+        replayed.completeJob(replayedJob.key, "{}", replayedJob.jobLeaseToken);
         replayed.free();
-        assert.equal(typeof expired.leaseToken, "string", "lease mode stays enabled after timeout");
-        assert.notEqual(expired.leaseToken, retry.leaseToken);
-        assert.throws(() => engine.completeJob(expired.key, "{}", retry.leaseToken));
-        engine.completeJob(expired.key, "{}", expired.leaseToken);
+        assert.equal(typeof expired.jobLeaseToken, "string", "lease mode stays enabled after timeout");
+        assert.notEqual(expired.jobLeaseToken, retry.jobLeaseToken);
+        assert.throws(() => engine.completeJob(expired.key, "{}", retry.jobLeaseToken));
+        engine.completeJob(expired.key, "{}", expired.jobLeaseToken);
       } finally {
         engine.free();
       }
@@ -79,11 +79,11 @@ for (const variant of ["lean", "readmodel"]) {
           engine.createInstance("external-agent-routing", "{}");
           engine.advanceTime(10);
           const [job] = JSON.parse(engine.activateJobs("senior:rebase", 1, 100, "W", true));
-          engine.updateTimeout(job.key, timeout, job.leaseToken);
+          engine.updateTimeout(job.key, timeout, job.jobLeaseToken);
           const snapshot = JSON.parse(engine.advanceTime(0));
           assert.equal(snapshot.jobs.find((entry) => entry.key === job.key).state,
             timeout <= 0 ? "Created" : "Activated");
-          engine.completeJob(job.key, "{}", job.leaseToken);
+          engine.completeJob(job.key, "{}", job.jobLeaseToken);
         } finally {
           engine.free();
         }

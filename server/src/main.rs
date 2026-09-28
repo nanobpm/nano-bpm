@@ -5924,9 +5924,22 @@ impl ServerImpl {
         body: &Option<models::JobCompletionRequest>,
     ) -> Result<apis::job::CompleteJobResponse, ()> {
         use apis::job::CompleteJobResponse as Resp;
-        let lease_token = body
-            .as_ref()
-            .and_then(|body| optional_lease_token(&body.lease_token));
+        let lease_token = match body.as_ref().map(|body| {
+            reconcile_lease_token(
+                optional_lease_token(&body.job_lease_token),
+                optional_lease_token(&body.lease_token),
+            )
+        }) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(token)) => token,
+            Some(Err(ConflictingLeaseTokens)) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                )));
+            }
+        };
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -6141,9 +6154,22 @@ impl ServerImpl {
         body: &Option<models::JobFailRequest>,
     ) -> Result<apis::job::FailJobResponse, ()> {
         use apis::job::FailJobResponse as Resp;
-        let lease_token = body
-            .as_ref()
-            .and_then(|body| optional_lease_token(&body.lease_token));
+        let lease_token = match body.as_ref().map(|body| {
+            reconcile_lease_token(
+                optional_lease_token(&body.job_lease_token),
+                optional_lease_token(&body.lease_token),
+            )
+        }) {
+            None | Some(Ok(None)) => None,
+            Some(Ok(token)) => token,
+            Some(Err(ConflictingLeaseTokens)) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                )));
+            }
+        };
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -6283,7 +6309,19 @@ impl ServerImpl {
         body: &models::JobErrorRequest,
     ) -> Result<apis::job::ThrowJobErrorResponse, ()> {
         use apis::job::ThrowJobErrorResponse as Resp;
-        let lease_token = optional_lease_token(&body.lease_token);
+        let lease_token = match reconcile_lease_token(
+            optional_lease_token(&body.job_lease_token),
+            optional_lease_token(&body.lease_token),
+        ) {
+            Ok(token) => token,
+            Err(ConflictingLeaseTokens) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                )));
+            }
+        };
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -6879,7 +6917,19 @@ impl ServerImpl {
         body: &models::JobUpdateRequest,
     ) -> Result<apis::job::UpdateJobResponse, ()> {
         use apis::job::UpdateJobResponse as Resp;
-        let lease_token = optional_lease_token(&body.lease_token);
+        let lease_token = match reconcile_lease_token(
+            optional_lease_token(&body.job_lease_token),
+            optional_lease_token(&body.lease_token),
+        ) {
+            Ok(token) => token,
+            Err(ConflictingLeaseTokens) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid data",
+                    400,
+                    CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                )));
+            }
+        };
 
         let job_key: u64 = match path_params.job_key.parse() {
             Ok(k) => k,
@@ -11694,9 +11744,20 @@ impl ServerImpl {
             }
         };
 
+        let job_lease_token =
+            match reconcile_lease_token(body.job_lease_token.clone(), body.job_lease.clone()) {
+                Ok(token) => token,
+                Err(ConflictingLeaseTokens) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid data",
+                        400,
+                        CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                    )));
+                }
+            };
         let (job_key, job_lease) = match parse_agent_job_attribution(
             Some(body.job_key.0.as_str()),
-            Some(body.job_lease.as_str()),
+            job_lease_token.as_deref(),
         ) {
             Ok(attribution) => attribution,
             Err((title, detail)) => {
@@ -11854,9 +11915,20 @@ impl ServerImpl {
             }
         };
 
+        let job_lease_token =
+            match reconcile_lease_token(body.job_lease_token.clone(), body.job_lease.clone()) {
+                Ok(token) => token,
+                Err(ConflictingLeaseTokens) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid data",
+                        400,
+                        CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                    )));
+                }
+            };
         let (job_key, job_lease) = match parse_agent_job_attribution(
             Some(body.job_key.0.as_str()),
-            Some(body.job_lease.as_str()),
+            job_lease_token.as_deref(),
         ) {
             Ok(attribution) => attribution,
             Err((title, detail)) => {
@@ -20245,7 +20317,7 @@ fn agent_history_item_result(
         .map(serde_json::from_str)
         .transpose()?
         .unwrap_or_default();
-    Ok(models::AgentInstanceHistoryItemResult::new(
+    let mut result = models::AgentInstanceHistoryItemResult::new(
         models::AgentHistoryItemKey(row.agent_history_key.to_string()),
         row.history_item_id.clone().unwrap_or_default(),
         models::AgentInstanceKey(row.agent_instance_key.to_string()),
@@ -20282,7 +20354,11 @@ fn agent_history_item_result(
             limits.max_tokens,
         ),
         agent_system_prompt(&row.system_prompt)?,
-    ))
+    );
+    // Deprecation window (#1283): also emit the pre-8.10 `jobLease` name so
+    // clients that still read it keep working. Mirrors jobLeaseToken exactly.
+    result.job_lease = Some(result.job_lease_token.clone());
+    Ok(result)
 }
 
 /// Builds an engine [`agent_model::AgentHistoryTurn`] from a REST history item.
@@ -20849,6 +20925,55 @@ fn job_command_with_lease(command: Command, lease_token: Option<String>) -> Comm
     command.with_lease_token(lease_token)
 }
 
+/// Count of requests that supplied a job lease token under its deprecated
+/// pre-8.10 name (`leaseToken` on job commands, `jobLease` on agent-instance
+/// requests) instead of the current `jobLeaseToken` (#1283). Lets operators see
+/// when every deployed worker has moved to the new name and it is safe to drop
+/// the transition-window aliases.
+static LEGACY_LEASE_NAME_USES: AtomicU64 = AtomicU64::new(0);
+
+/// Number of times a client has used a deprecated legacy lease-token field name
+/// (`leaseToken` / `jobLease`) instead of `jobLeaseToken` (#1283).
+#[cfg_attr(not(test), allow(dead_code))]
+fn legacy_lease_name_uses() -> u64 {
+    LEGACY_LEASE_NAME_USES.load(Ordering::Relaxed)
+}
+
+/// A request supplied both the current `jobLeaseToken` and its deprecated legacy
+/// alias (`leaseToken` / `jobLease`) with conflicting values.
+struct ConflictingLeaseTokens;
+
+/// Reconcile the canonical `jobLeaseToken` with its deprecated legacy alias for
+/// the Camunda 8.10 rename transition window (#1283). Prefers the canonical
+/// name; falls back to the legacy name (recording the use so the window can be
+/// closed later); rejects a request that supplies both names with differing
+/// values so a confused client fails loudly rather than fencing on a stale
+/// token.
+fn reconcile_lease_token(
+    canonical: Option<String>,
+    legacy: Option<String>,
+) -> Result<Option<String>, ConflictingLeaseTokens> {
+    match (canonical, legacy) {
+        (Some(c), Some(l)) if c != l => Err(ConflictingLeaseTokens),
+        (Some(c), _) => Ok(Some(c)),
+        (None, Some(l)) => {
+            LEGACY_LEASE_NAME_USES.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: "nano::lease",
+                "request used a deprecated legacy lease-token field name (leaseToken/jobLease); \
+                 prefer jobLeaseToken (#1283)"
+            );
+            Ok(Some(l))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Human-readable 400 detail for a request that supplied both `jobLeaseToken`
+/// and its deprecated legacy alias with conflicting values.
+const CONFLICTING_LEASE_TOKENS_DETAIL: &str = "jobLeaseToken and the deprecated legacy alias (leaseToken/jobLease) were both supplied \
+     with different values. Supply only jobLeaseToken.";
+
 fn activated_job_result(
     activated: ActivatedJobWithIdentity,
     fetch_variable: Option<&[String]>,
@@ -20892,7 +21017,7 @@ fn activated_job_result(
         .collect();
     let tags: Vec<models::Tag> = job.tags.iter().cloned().map(models::Tag).collect();
 
-    models::ActivatedJobResult::new(
+    let mut result = models::ActivatedJobResult::new(
         job.job_type,
         process_id,
         version,
@@ -20916,7 +21041,12 @@ fn activated_job_result(
         job.lease_token
             .map(|lease| types::Nullable::Present(lease.to_string()))
             .unwrap_or(types::Nullable::Null),
-    )
+    );
+    // Deprecation window (#1283): also emit the pre-8.10 `leaseToken` name so
+    // workers that have not yet moved to `jobLeaseToken` keep receiving their
+    // token. Mirrors jobLeaseToken exactly (null when the job is unleased).
+    result.lease_token = Some(result.job_lease_token.clone());
+    result
 }
 
 /// Converts engine variables into the generated `Object` (JSON) map used by the
@@ -30031,7 +30161,7 @@ mod clustered_startup_tests {
             if let Some(j) = jobs.into_iter().next() {
                 activation_deadline = j.deadline as u64;
                 element_instance_key = Some(j.element_instance_key);
-                lease_token = match j.lease_token {
+                lease_token = match j.job_lease_token {
                     types::Nullable::Present(token) => Some(token),
                     _ => None,
                 };
@@ -30145,7 +30275,7 @@ mod clustered_startup_tests {
                 .iter_mut()
                 .find(|job| job.job_key.0 == job_key.to_string())
                 .unwrap();
-            let renewed_token = match &renewed.lease_token {
+            let renewed_token = match &renewed.job_lease_token {
                 types::Nullable::Present(token) => Some(token.clone()),
                 _ => None,
             };
@@ -35047,6 +35177,7 @@ mod adhoc_result_mapping_tests {
     fn plain_completion_has_no_adhoc_result() {
         assert!(adhoc_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: None,
@@ -35058,6 +35189,7 @@ mod adhoc_result_mapping_tests {
     #[test]
     fn user_task_result_is_not_an_adhoc_result() {
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(
@@ -35087,6 +35219,7 @@ mod adhoc_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultAdHocSubProcess(adhoc)),
@@ -35115,6 +35248,7 @@ mod task_result_mapping_tests {
     fn plain_and_adhoc_completions_have_no_task_result() {
         assert!(task_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: None,
@@ -35128,6 +35262,7 @@ mod task_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultAdHocSubProcess(adhoc)),
@@ -35140,6 +35275,7 @@ mod task_result_mapping_tests {
     #[test]
     fn empty_user_task_result_stays_on_the_fast_path() {
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(
@@ -35160,6 +35296,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
@@ -35183,6 +35320,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
@@ -35197,6 +35335,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
@@ -35233,6 +35372,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
@@ -35272,6 +35412,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            job_lease_token: None,
             lease_token: None,
             variables: None,
             result: Some(models::JobResult::JobResultUserTask(user)),
@@ -36528,6 +36669,14 @@ mod call_activity_hierarchy_read_model_tests {
                 "leaseToken is required, nullable"
             );
             assert!(
+                job.get("jobLeaseToken").is_some(),
+                "the canonical Camunda 8.10 jobLeaseToken is required, nullable (#1283)"
+            );
+            assert_eq!(
+                job["jobLeaseToken"], job["leaseToken"],
+                "the deprecation-window dual-emit keeps both names in lockstep (#1283)"
+            );
+            assert!(
                 job.get("jobLease").is_none(),
                 "jobLease belongs to agent requests only"
             );
@@ -36620,8 +36769,195 @@ mod call_activity_hierarchy_read_model_tests {
                 ));
             } else {
                 assert!(job["leaseToken"].is_null());
+                assert!(job["jobLeaseToken"].is_null());
             }
         }
+    }
+
+    /// The Camunda 8.10 rename of the job lease token (#1283) ships a
+    /// deprecation window on every leased job command. The canonical
+    /// `jobLeaseToken` name fences the lifecycle; the pre-8.10 `leaseToken`
+    /// name is still honored (so the running fleet keeps working and is *not*
+    /// silently ignored — the defect class the reconcile guards against); and
+    /// supplying both names with different values fails loudly with 400 on
+    /// every command endpoint rather than fencing on a stale value.
+    #[tokio::test]
+    async fn rest_job_lease_token_rename_deprecation_window() {
+        let srv = build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        let xml = include_str!("../../engine-core/tests/fixtures/external-agent-job-type.bpmn")
+            .replace("<zeebe:agentDefinition agentType=\"external\"/>", "")
+            .replace(
+                "source=\"= route\"",
+                "source=\"= &quot;senior:rebase&quot;\"",
+            );
+        deploy(&srv, parse_bpmn(&xml).unwrap()).await;
+
+        // Activate one leased job per scenario, each from its own instance.
+        let mut leased: Vec<(String, String)> = Vec::new();
+        for _ in 0..6 {
+            srv.create_for_stream(
+                Some("external-agent-routing".into()),
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap();
+            let request: models::JobActivationRequest = serde_json::from_value(serde_json::json!({
+                "type": "senior:rebase", "timeout": 60000, "maxJobsToActivate": 1,
+                "requestTimeout": -1, "withLease": true,
+            }))
+            .unwrap();
+            let apis::job::ActivateJobsResponse::Status200_TheListOfActivatedJobs(result) =
+                srv.activate_jobs_impl(&request).await.unwrap()
+            else {
+                panic!("expected activated jobs");
+            };
+            assert_eq!(result.jobs.len(), 1);
+            let job = serde_json::to_value(&result.jobs[0]).unwrap();
+            let token = job["jobLeaseToken"].as_str().unwrap().to_owned();
+            assert!(!token.is_empty());
+            leased.push((result.jobs[0].job_key.0.clone(), token));
+        }
+
+        // 1. The canonical jobLeaseToken completes a leased job.
+        let (key, token) = &leased[0];
+        let path = models::CompleteJobPathParams {
+            job_key: key.clone(),
+        };
+        let body =
+            Some(serde_json::from_value(serde_json::json!({ "jobLeaseToken": token })).unwrap());
+        assert!(
+            matches!(
+                srv.complete_job_impl(&path, &body).await.unwrap(),
+                apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "the canonical jobLeaseToken fences and completes a leased job (#1283)"
+        );
+
+        // 2. The deprecated legacy leaseToken is still honored, not silently
+        //    dropped, and its use is counted so the window can be closed later.
+        let (key, token) = &leased[1];
+        let path = models::CompleteJobPathParams {
+            job_key: key.clone(),
+        };
+        let before = legacy_lease_name_uses();
+        let body =
+            Some(serde_json::from_value(serde_json::json!({ "leaseToken": token })).unwrap());
+        assert!(
+            matches!(
+                srv.complete_job_impl(&path, &body).await.unwrap(),
+                apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "the legacy leaseToken name is still honored, not silently ignored (#1283)"
+        );
+        assert!(
+            legacy_lease_name_uses() > before,
+            "using the deprecated legacy name is counted (#1283)"
+        );
+
+        // 3. Both names with conflicting values fail loudly (400), then the same
+        //    still-leased job completes once given a single correct token, and a
+        //    stale canonical token fences it (409).
+        let (key, token) = &leased[2];
+        let path = models::CompleteJobPathParams {
+            job_key: key.clone(),
+        };
+        let conflicting = Some(
+            serde_json::from_value(serde_json::json!({
+                "jobLeaseToken": token, "leaseToken": "a-different-token",
+            }))
+            .unwrap(),
+        );
+        assert!(
+            matches!(
+                srv.complete_job_impl(&path, &conflicting).await.unwrap(),
+                apis::job::CompleteJobResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "conflicting lease-token names fail loudly rather than fencing on a stale value (#1283)"
+        );
+        let stale = Some(
+            serde_json::from_value(serde_json::json!({ "jobLeaseToken": "stale-token" })).unwrap(),
+        );
+        assert!(
+            matches!(
+                srv.complete_job_impl(&path, &stale).await.unwrap(),
+                apis::job::CompleteJobResponse::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(_)
+            ),
+            "the canonical name fences a stale token (#1283)"
+        );
+        let correct =
+            Some(serde_json::from_value(serde_json::json!({ "jobLeaseToken": token })).unwrap());
+        assert!(
+            matches!(
+                srv.complete_job_impl(&path, &correct).await.unwrap(),
+                apis::job::CompleteJobResponse::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "a loud failure leaves the lease intact for the correct token (#1283)"
+        );
+
+        // 4. The reconcile is wired on every leased command endpoint: a
+        //    conflicting name pair is a 400 on update, fail, and throw-error too.
+        let (key, token) = &leased[3];
+        let update_conflict = serde_json::from_value(serde_json::json!({
+            "changeset": {"retries": 4}, "jobLeaseToken": token, "leaseToken": "other",
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                srv.update_job_impl(
+                    &models::UpdateJobPathParams {
+                        job_key: key.clone()
+                    },
+                    &update_conflict
+                )
+                .await
+                .unwrap(),
+                apis::job::UpdateJobResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "update_job reconciles the lease-token names (#1283)"
+        );
+
+        let (key, token) = &leased[4];
+        let fail_conflict = Some(
+            serde_json::from_value(serde_json::json!({
+                "retries": 1, "jobLeaseToken": token, "leaseToken": "other",
+            }))
+            .unwrap(),
+        );
+        assert!(
+            matches!(
+                srv.fail_job_impl(
+                    &models::FailJobPathParams {
+                        job_key: key.clone()
+                    },
+                    &fail_conflict
+                )
+                .await
+                .unwrap(),
+                apis::job::FailJobResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "fail_job reconciles the lease-token names (#1283)"
+        );
+
+        let (key, token) = &leased[5];
+        let error_conflict = serde_json::from_value(serde_json::json!({
+            "errorCode": "ERR", "jobLeaseToken": token, "leaseToken": "other",
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                srv.throw_job_error_impl(
+                    &models::ThrowJobErrorPathParams {
+                        job_key: key.clone()
+                    },
+                    &error_conflict
+                )
+                .await
+                .unwrap(),
+                apis::job::ThrowJobErrorResponse::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "throw_job_error reconciles the lease-token names (#1283)"
+        );
     }
 
     #[tokio::test]
@@ -36696,7 +37032,7 @@ mod call_activity_hierarchy_read_model_tests {
         let job = &activated.jobs[0];
         let element_instance_key = job.element_instance_key.0.clone();
         let activation_json = serde_json::to_value(job).unwrap();
-        let job_lease = activation_json["leaseToken"]
+        let job_lease = activation_json["jobLeaseToken"]
             .as_str()
             .expect("REST activation must expose the agent job's lease token")
             .to_string();
@@ -36723,19 +37059,32 @@ mod call_activity_hierarchy_read_model_tests {
             element_instance_key: models::ElementInstanceKey(element_instance_key.clone()),
             history: vec![configuration],
             job_key: job.job_key.clone(),
-            job_lease: job_lease.clone(),
+            job_lease_token: Some(job_lease.clone()),
+            job_lease: None,
         };
-        for omit_key in [false, true] {
-            let mut partial = serde_json::to_value(&create_body).unwrap();
-            partial
-                .as_object_mut()
-                .unwrap()
-                .remove(if omit_key { "jobKey" } else { "jobLease" });
-            assert!(
-                serde_json::from_value::<models::AgentInstanceCreationRequest>(partial).is_err(),
-                "CREATE must reject incomplete job attribution for {agent_type}"
-            );
-        }
+        // `jobKey` is schema-required: a request missing it fails to deserialize.
+        let mut without_key = serde_json::to_value(&create_body).unwrap();
+        without_key.as_object_mut().unwrap().remove("jobKey");
+        assert!(
+            serde_json::from_value::<models::AgentInstanceCreationRequest>(without_key).is_err(),
+            "CREATE must reject a request missing jobKey for {agent_type}"
+        );
+        // The lease token is handler-enforced across both the canonical and the
+        // legacy name (either deserializes to `None`): a request carrying no
+        // lease token at all is rejected with 400 rather than silently accepted
+        // under a superseded activation (#1283).
+        let mut without_lease = create_body.clone();
+        without_lease.job_lease_token = None;
+        without_lease.job_lease = None;
+        assert!(
+            matches!(
+                srv.create_agent_instance_impl(&without_lease)
+                    .await
+                    .unwrap(),
+                CResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "CREATE must reject a request with no lease token for {agent_type}"
+        );
         let mut unknown_job_create = create_body.clone();
         unknown_job_create.job_key = models::JobKey("7788990011".into());
         assert!(
@@ -36748,7 +37097,7 @@ mod call_activity_hierarchy_read_model_tests {
             "CREATE must reject supplied unknown job attribution for {agent_type}"
         );
         let mut stale_lease_create = create_body.clone();
-        stale_lease_create.job_lease = format!("{job_lease}-stale");
+        stale_lease_create.job_lease_token = Some(format!("{job_lease}-stale"));
         assert!(
             matches!(
                 srv.create_agent_instance_impl(&stale_lease_create)
@@ -36790,11 +37139,12 @@ mod call_activity_hierarchy_read_model_tests {
         // PATCH: append two history turns and advance status to THINKING.
         use apis::agent_instance::UpdateAgentInstanceResponse as UResp;
         let update_request = || {
-            models::AgentInstanceUpdateRequest::new(
+            let mut req = models::AgentInstanceUpdateRequest::new(
                 models::ElementInstanceKey(element_instance_key.clone()),
                 job.job_key.clone(),
-                job_lease.clone(),
-            )
+            );
+            req.job_lease_token = Some(job_lease.clone());
+            req
         };
         let mut upd = update_request();
         upd.status = Some(models::AgentInstanceUpdateStatusEnum::Thinking);
@@ -36817,22 +37167,36 @@ mod call_activity_hierarchy_read_model_tests {
         let up = models::UpdateAgentInstancePathParams {
             agent_instance_key: agent_key.clone(),
         };
-        for omit_key in [false, true] {
-            let mut partial = upd.clone();
-            partial.history = None;
-            let mut partial = serde_json::to_value(&partial).unwrap();
-            partial
-                .as_object_mut()
-                .unwrap()
-                .remove(if omit_key { "jobKey" } else { "jobLease" });
-            assert!(
-                serde_json::from_value::<models::AgentInstanceUpdateRequest>(partial).is_err(),
-                "UPDATE must reject incomplete job attribution even without history for {agent_type}"
-            );
-        }
+        // `jobKey` is schema-required even without history: a request missing
+        // it fails to deserialize.
+        let mut without_key = upd.clone();
+        without_key.history = None;
+        let mut without_key = serde_json::to_value(&without_key).unwrap();
+        without_key.as_object_mut().unwrap().remove("jobKey");
+        assert!(
+            serde_json::from_value::<models::AgentInstanceUpdateRequest>(without_key).is_err(),
+            "UPDATE must reject a request missing jobKey for {agent_type}"
+        );
+        // The lease token is handler-enforced (either name deserializes to
+        // `None`): an update carrying no lease token is rejected with 400 rather
+        // than silently accepted under a superseded activation (#1283).
+        let mut without_lease = upd.clone();
+        without_lease.history = None;
+        without_lease.job_lease_token = None;
+        without_lease.job_lease = None;
+        assert!(
+            matches!(
+                srv.update_agent_instance_impl(&up, &without_lease)
+                    .await
+                    .unwrap(),
+                UResp::Status400_TheProvidedDataIsNotValid(_)
+            ),
+            "UPDATE must reject a request with no lease token for {agent_type}"
+        );
         let mut unattributed_history = upd.clone();
         unattributed_history.job_key = models::JobKey("0".into());
-        unattributed_history.job_lease = String::new();
+        unattributed_history.job_lease_token = Some(String::new());
+        unattributed_history.job_lease = None;
         assert!(
             matches!(
                 srv.update_agent_instance_impl(&up, &unattributed_history)
@@ -37018,7 +37382,12 @@ mod call_activity_hierarchy_read_model_tests {
             "content round-trips the 8.10 TEXT contentType"
         );
         assert_eq!(items[1].job_key, job.job_key);
-        assert_eq!(items[1].job_lease, job_lease);
+        assert_eq!(items[1].job_lease_token, job_lease);
+        assert_eq!(
+            items[1].job_lease.as_deref(),
+            Some(job_lease.as_str()),
+            "the deprecation-window dual-emit echoes the legacy jobLease too (#1283)"
+        );
         for (field, value, expected_count) in [
             ("historyItemKey", items[0].history_item_key.0.clone(), 1),
             ("elementInstanceKey", element_instance_key.clone(), 3),

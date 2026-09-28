@@ -42,10 +42,10 @@ for (const variant of ["lean", "readmodel"]) {
       engine.createInstance("external-agent-routing", "{}");
       const [job] = JSON.parse(engine.activateJobs("senior:rebase", 1, 1000, "W", true));
       const attribution = {
-        elementInstanceKey: job.elementInstanceKey, jobKey: job.key, jobLease: job.leaseToken,
+        elementInstanceKey: job.elementInstanceKey, jobKey: job.key, jobLeaseToken: job.jobLeaseToken,
       };
       const request = { ...attribution, history: [configuration("initial")] };
-      for (const field of ["elementInstanceKey", "jobKey", "jobLease", "history"]) {
+      for (const field of ["elementInstanceKey", "jobKey", "jobLeaseToken", "history"]) {
         const missing = { ...request };
         delete missing[field];
         assert.throws(() => engine.createAgentInstance(JSON.stringify(missing)));
@@ -76,7 +76,7 @@ for (const variant of ["lean", "readmodel"]) {
         toolCalls: [{ toolCallId: "call", toolName: "lookup", elementId: null, arguments: { id: 1 } }],
       });
       const update = { ...attribution, status: "THINKING", history: [assistant] };
-      for (const field of ["elementInstanceKey", "jobKey", "jobLease"]) {
+      for (const field of ["elementInstanceKey", "jobKey", "jobLeaseToken"]) {
         const missing = { ...update };
         delete missing[field];
         assert.throws(() => engine.updateAgentInstance(key, JSON.stringify(missing)));
@@ -101,7 +101,7 @@ for (const variant of ["lean", "readmodel"]) {
         assert.deepEqual(recorded.content, assistant.content);
         assert.deepEqual(recorded.metrics, assistant.metrics);
         assert.deepEqual(recorded.toolCalls, assistant.toolCalls);
-        assert.equal(recorded.jobLease, job.leaseToken);
+        assert.equal(recorded.jobLeaseToken, job.jobLeaseToken);
         assert.equal(JSON.parse(engine.searchAgentInstanceHistory(key, JSON.stringify({
           filter: { historyItemKey: recorded.historyItemKey, commitStatus: "PENDING", jobKey: job.key },
         }))).items.length, 1);
@@ -124,20 +124,20 @@ for (const variant of ["lean", "readmodel"]) {
         });
       }
 
-      engine.failJob(job.key, 2, "retry", job.leaseToken);
+      engine.failJob(job.key, 2, "retry", job.jobLeaseToken);
       assert.deepEqual(JSON.parse(engine.activateJobs("senior:rebase", 1, 1000, "W", false)), []);
       const [retry] = JSON.parse(engine.activateJobs("senior:rebase", 1, 1000, "W", true));
-      assert.notEqual(retry.leaseToken, job.leaseToken);
+      assert.notEqual(retry.jobLeaseToken, job.jobLeaseToken);
       assert.throws(() => engine.updateAgentInstance(key, JSON.stringify(update)), "old lease is fenced");
       const winner = {
-        elementInstanceKey: retry.elementInstanceKey, jobKey: retry.key, jobLease: retry.leaseToken,
+        elementInstanceKey: retry.elementInstanceKey, jobKey: retry.key, jobLeaseToken: retry.jobLeaseToken,
         history: [
           turn("winning-config", "CONFIGURATION", { model: "new-model", tools: [] }),
           { ...assistant, historyItemId: "winning-turn" },
         ],
       };
       engine.updateAgentInstance(key, JSON.stringify(winner));
-      engine.completeJob(retry.key, "{}", retry.leaseToken);
+      engine.completeJob(retry.key, "{}", retry.jobLeaseToken);
 
       if (variant === "readmodel") {
         const agent = JSON.parse(engine.searchAgentInstances(JSON.stringify({
@@ -156,7 +156,7 @@ for (const variant of ["lean", "readmodel"]) {
         assert.equal(agent.metrics.toolCalls, 2 * assistant.toolCalls.length);
         const committed = JSON.parse(engine.searchAgentInstanceHistory(key, "{}")).items;
         assert.equal(committed.length, 2, "only the winning activation's history commits");
-        assert.ok(committed.every((item) => item.jobLease === retry.leaseToken));
+        assert.ok(committed.every((item) => item.jobLeaseToken === retry.jobLeaseToken));
         const discarded = JSON.parse(engine.searchAgentInstanceHistory(
           key, '{"commitStatus":"DISCARDED"}',
         )).items;

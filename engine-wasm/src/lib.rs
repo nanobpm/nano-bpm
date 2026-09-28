@@ -775,7 +775,7 @@ impl TestEngine {
                     "tags": j.tags,
                     "businessId": j.business_id,
                     "variables": vars_to_json(&j.variables),
-                    "leaseToken": j.lease_token,
+                    "jobLeaseToken": j.lease_token,
                 })
             })
             .collect();
@@ -1122,7 +1122,7 @@ impl TestEngine {
     // back through `searchAgentInstances` / `searchAgentInstanceHistory` (the
     // read-model surface), which serialise the same REST shapes.
 
-    /// Create an agent using `{ elementInstanceKey, jobKey, jobLease, history }`.
+    /// Create an agent using `{ elementInstanceKey, jobKey, jobLeaseToken, history }`.
     /// History must establish its CONFIGURATION. Returns the canonical creation
     /// result with `agentInstanceKey` and positionally correlated `createdHistory`.
     #[wasm_bindgen(js_name = createAgentInstance)]
@@ -1132,7 +1132,7 @@ impl TestEngine {
             .map_err(|e| js_err(&format!("createAgentInstance: invalid request JSON: {e}")))?;
         let element_instance_key = parse_key(&req.element_instance_key)?;
         let job_key = parse_key(&req.job_key)?;
-        let job_lease = req.job_lease;
+        let job_lease = req.job_lease_token;
         let history = agent_turns_from(req.history, job_key, &job_lease)?;
         let history_ids: Vec<_> = history
             .iter()
@@ -1163,7 +1163,7 @@ impl TestEngine {
         }))
     }
 
-    /// Update an agent with `{ elementInstanceKey, jobKey, jobLease, status?, history? }`.
+    /// Update an agent with `{ elementInstanceKey, jobKey, jobLeaseToken, status?, history? }`.
     /// Configuration and metrics are submitted through history, never top-level fields.
     /// Returns `createdHistory`; the engine owns pending/commit/discard semantics.
     #[wasm_bindgen(js_name = updateAgentInstance)]
@@ -1187,7 +1187,7 @@ impl TestEngine {
             None => None,
         };
         let job_key = parse_key(&req.job_key)?;
-        let job_lease = req.job_lease;
+        let job_lease = req.job_lease_token;
         let history = agent_turns_from(req.history.unwrap_or_default(), job_key, &job_lease)?;
         let history_ids: Vec<_> = history
             .iter()
@@ -2008,7 +2008,7 @@ fn agent_history_result(row: &AgentHistoryRow) -> Result<serde_json::Value, Stri
         "agentInstanceKey": row.agent_instance_key.to_string(),
         "elementInstanceKey": row.element_instance_key.to_string(),
         "jobKey": row.job_key.to_string(),
-        "jobLease": row.job_lease,
+        "jobLeaseToken": row.job_lease,
         "loopIteration": row.loop_iteration,
         "role": row.role.as_str(),
         "content": content,
@@ -3274,7 +3274,8 @@ fn positive_loop_iteration<'de, D: serde::Deserializer<'de>>(de: D) -> Result<i3
 struct CreateAgentInstanceReq {
     element_instance_key: String,
     job_key: String,
-    job_lease: String,
+    #[serde(alias = "jobLease")]
+    job_lease_token: String,
     #[serde(deserialize_with = "nonempty_agent_history")]
     history: Vec<AgentTurnReq>,
 }
@@ -3299,7 +3300,8 @@ struct UpdateAgentInstanceReq {
     #[serde(default)]
     status: Option<String>,
     job_key: String,
-    job_lease: String,
+    #[serde(alias = "jobLease")]
+    job_lease_token: String,
     #[serde(default)]
     history: Option<Vec<AgentTurnReq>>,
 }
@@ -3897,7 +3899,7 @@ mod tests {
                     .unwrap(),
             );
             let key = jobs[0]["key"].as_str().unwrap();
-            let lease = jobs[0]["leaseToken"].as_str().unwrap();
+            let lease = jobs[0]["jobLeaseToken"].as_str().unwrap();
             eng.update_timeout(key, timeout as f64, Some(lease.into()))
                 .unwrap();
             assert_eq!(
@@ -4030,7 +4032,7 @@ mod tests {
                 .create_instance("external-agent-routing", "{}", None)
                 .unwrap();
             let jobs = parse(&engine.activate_jobs(job_type, 1, 100.0, "W", None).unwrap());
-            assert!(jobs[0].get("leaseToken").unwrap().is_null());
+            assert!(jobs[0].get("jobLeaseToken").unwrap().is_null());
             assert!(jobs[0].get("jobLease").is_none());
             let key = jobs[0]["key"].as_str().unwrap();
             engine.fail_job(key, 2, "retry", None).unwrap();
@@ -4039,7 +4041,7 @@ mod tests {
                     .activate_jobs(job_type, 1, 100.0, "W", Some(true))
                     .unwrap(),
             );
-            let first = jobs[0]["leaseToken"].as_str().unwrap();
+            let first = jobs[0]["jobLeaseToken"].as_str().unwrap();
             engine
                 .fail_job(key, 2, "retry", Some(first.into()))
                 .unwrap();
@@ -4071,12 +4073,12 @@ mod tests {
                     .activate_jobs(job_type, 1, 100.0, "W", Some(true))
                     .unwrap(),
             );
-            assert_eq!(jobs[0]["leaseToken"], replayed_jobs[0]["leaseToken"]);
+            assert_eq!(jobs[0]["jobLeaseToken"], replayed_jobs[0]["jobLeaseToken"]);
             assert!(
-                jobs[0]["leaseToken"].is_string(),
+                jobs[0]["jobLeaseToken"].is_string(),
                 "{marker:?}: sticky activation lost lease: {jobs}"
             );
-            let second = jobs[0]["leaseToken"].as_str().unwrap();
+            let second = jobs[0]["jobLeaseToken"].as_str().unwrap();
             assert_ne!(first, second);
             engine.complete_job(key, "{}", Some(second.into())).unwrap();
             replayed
@@ -5816,7 +5818,7 @@ mod read_channel_tests {
             &serde_json::json!({
                 "elementInstanceKey": job["elementInstanceKey"],
                 "jobKey": job["key"],
-                "jobLease": job["leaseToken"],
+                "jobLease": job["jobLeaseToken"],
                 "history": [{
                     "historyItemId": "initial-config", "loopIteration": 1,
                     "producedAt": "2026-01-02T03:04:05Z", "role": "CONFIGURATION",
@@ -5830,7 +5832,8 @@ mod read_channel_tests {
         let mut agent = parse(&eng.search_agent_instances("{}").unwrap())["items"][0].clone();
         agent["elementInstanceKey"] = job["elementInstanceKey"].clone();
         agent["jobKey"] = job["key"].clone();
-        agent["jobLease"] = job["leaseToken"].clone();
+        agent["jobLease"] = job["jobLeaseToken"].clone();
+        agent["jobLeaseToken"] = job["jobLeaseToken"].clone();
         agent
     }
 
@@ -5923,7 +5926,7 @@ mod read_channel_tests {
                 turn["jobKey"], minted["jobKey"],
                 "each turn carries the request jobKey: {turn}"
             );
-            assert_eq!(turn["jobLease"], minted["jobLease"]);
+            assert_eq!(turn["jobLeaseToken"], minted["jobLeaseToken"]);
         }
     }
 
@@ -5933,7 +5936,7 @@ mod read_channel_tests {
             "elementInstanceKey":"1", "jobKey":"2", "jobLease":"opaque:token/0009",
         });
         let parsed: UpdateAgentInstanceReq = serde_json::from_value(request.clone()).unwrap();
-        assert_eq!(parsed.job_lease, "opaque:token/0009");
+        assert_eq!(parsed.job_lease_token, "opaque:token/0009");
         for key in ["elementInstanceKey", "jobKey", "jobLease"] {
             let mut missing = request.clone();
             missing.as_object_mut().unwrap().remove(key);
