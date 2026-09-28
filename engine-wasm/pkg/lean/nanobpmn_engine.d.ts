@@ -88,7 +88,7 @@ export class TestEngine {
      */
     correlateMessage(message_name: string, correlation_key: string, variables_json: string): string;
     /**
-     * Create an agent using `{ elementInstanceKey, jobKey, jobLease, history }`.
+     * Create an agent using `{ elementInstanceKey, jobKey, jobLeaseToken, history }`.
      * History must establish its CONFIGURATION. Returns the canonical creation
      * result with `agentInstanceKey` and positionally correlated `createdHistory`.
      */
@@ -288,7 +288,7 @@ export class TestEngine {
      */
     unassignUserTask(user_task_key: string): string;
     /**
-     * Update an agent with `{ elementInstanceKey, jobKey, jobLease, status?, history? }`.
+     * Update an agent with `{ elementInstanceKey, jobKey, jobLeaseToken, status?, history? }`.
      * Configuration and metrics are submitted through history, never top-level fields.
      * Returns `createdHistory`; the engine owns pending/commit/discard semantics.
      */

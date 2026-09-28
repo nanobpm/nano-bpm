@@ -68,7 +68,7 @@ variablesJson)` evaluates a deployed decision standalone.
 
 `activateJobs(type, maxJobs, timeoutMs, worker, withLease?)` defaults to nonleasing
 for **every** job kind and agent marker. Activated jobs always contain
-`leaseToken`: `null` without a lease, otherwise an opaque string. Never parse it
+`jobLeaseToken`: `null` without a lease, otherwise an opaque string. Never parse it
 as a number. Once a job is leased, subsequent activations must also opt in;
 nonleasing workers skip it after failures and timeouts.
 
@@ -79,14 +79,16 @@ a supplied stale value is rejected. Timeout updates accept signed millisecond
 durations; zero and negative updates make the activation immediately eligible for
 expiry on the next clock tick without discarding its current lease.
 
-Agent APIs follow the vendored stable/8.10 contract:
+Agent APIs follow the vendored stable/8.10 contract. Requests take `jobLeaseToken`
+(the Camunda 8.10 name); the pre-8.10 name `jobLease` is still accepted as a
+deprecated alias (#1283):
 
-- `createAgentInstance(JSON.stringify({elementInstanceKey, jobKey, jobLease, history}))`
-  requires nonempty history establishing CONFIGURATION. `jobLease` is the activated
-  job's `leaseToken`, unchanged. Definition, limits, tools, and metrics are history
+- `createAgentInstance(JSON.stringify({elementInstanceKey, jobKey, jobLeaseToken, history}))`
+  requires nonempty history establishing CONFIGURATION. `jobLeaseToken` is the activated
+  job's `jobLeaseToken`, unchanged. Definition, limits, tools, and metrics are history
   fields, not top-level request properties.
 - `updateAgentInstance(agentInstanceKey, JSON.stringify({elementInstanceKey, jobKey,
-  jobLease, status?, history?}))` requires all three attribution fields even without
+  jobLeaseToken, status?, history?}))` requires all three attribution fields even without
   history.
 - Both return canonical results containing positionally correlated `createdHistory`;
   CREATE also returns `agentInstanceKey`. Duplicate CREATE rejects rather than upserting.

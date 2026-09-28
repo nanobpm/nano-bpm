@@ -700,7 +700,7 @@ async fn reader_loop(
                     });
                     continue;
                 }
-                handle_client_frame(server, registry, conn, default_worker, frame).await;
+                handle_client_frame(server, registry, conn, default_worker, frame, channel).await;
             }
             Message::Binary(_) => {
                 // Protocol is JSON text; ignore binary frames.
@@ -748,6 +748,7 @@ async fn handle_client_frame(
     conn: &Arc<Connection>,
     default_worker: &str,
     frame: ClientFrame,
+    channel: Channel,
 ) {
     use std::time::Instant;
     let start = Instant::now();
@@ -1085,10 +1086,16 @@ async fn handle_client_frame(
             corr,
             job_key,
             lease_token,
+            job_lease_token,
             variables,
             adhoc_result,
             task_result,
         } => {
+            let Some(lease_token) =
+                reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
+            else {
+                return;
+            };
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
@@ -1159,9 +1166,15 @@ async fn handle_client_frame(
             corr,
             job_key,
             lease_token,
+            job_lease_token,
             retries,
             error_message,
         } => {
+            let Some(lease_token) =
+                reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
+            else {
+                return;
+            };
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
@@ -1203,10 +1216,16 @@ async fn handle_client_frame(
             corr,
             job_key,
             lease_token,
+            job_lease_token,
             error_code,
             error_message,
             variables,
         } => {
+            let Some(lease_token) =
+                reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
+            else {
+                return;
+            };
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
             };
@@ -1401,9 +1420,15 @@ async fn handle_client_frame(
             corr,
             job_key,
             lease_token,
+            job_lease_token,
             retries,
             operation_reference,
         } => {
+            let Some(lease_token) =
+                reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
+            else {
+                return;
+            };
             forward_by_key_reply(conn, corr, &job_key, |key| async move {
                 server
                     .update_job_retries_local_with_lease(
@@ -1420,9 +1445,15 @@ async fn handle_client_frame(
             corr,
             job_key,
             lease_token,
+            job_lease_token,
             timeout,
             operation_reference,
         } => {
+            let Some(lease_token) =
+                reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
+            else {
+                return;
+            };
             forward_by_key_reply(conn, corr, &job_key, |key| async move {
                 server
                     .update_job_timeout_local_with_lease(
@@ -1521,7 +1552,13 @@ async fn handle_client_frame(
             timeout,
             operation_reference,
             lease_token,
+            job_lease_token,
         } => {
+            let Some(lease_token) =
+                reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
+            else {
+                return;
+            };
             let server = server.clone();
             let conn = conn.clone();
             tokio::spawn(async move {
@@ -1900,6 +1937,43 @@ fn pipeline_job_command(
                 status,
                 body: Some(Value::String(message)),
             });
+        }
+    }
+}
+
+/// Reconcile the canonical Camunda 8.10 `jobLeaseToken` with the deprecated
+/// legacy `leaseToken` for a public Falcon job command (#1283), mirroring the
+/// REST boundary via the shared [`crate::reconcile_lease_token`]: prefer the
+/// canonical name, accept a dual-sent matching pair, count legacy-name use for
+/// the migration metric, and reply `400` on a conflicting pair (returning
+/// `None` so the caller stops). Only the public client edge reconciles and
+/// counts: a peer-forwarded frame on the intra-cluster channel always carries
+/// the legacy `leaseToken` field by wire design (byte-compat), not because a
+/// legacy *client* used it, so counting it would inflate the metric and never
+/// let it drain — the `Channel::Cluster` path therefore passes the token
+/// through untouched.
+fn reconcile_falcon_lease(
+    conn: &Arc<Connection>,
+    corr: u64,
+    channel: Channel,
+    canonical: Option<String>,
+    legacy: Option<String>,
+) -> Option<Option<String>> {
+    if channel != Channel::Client {
+        // Peer wire only ever populates the legacy field; nothing to count.
+        return Some(canonical.or(legacy));
+    }
+    match crate::reconcile_lease_token(canonical, legacy) {
+        Ok(token) => Some(token),
+        Err(_) => {
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status: 400,
+                body: Some(Value::String(
+                    crate::CONFLICTING_LEASE_TOKENS_DETAIL.to_string(),
+                )),
+            });
+            None
         }
     }
 }
@@ -2801,6 +2875,93 @@ mod registry_tests {
             last_seen_ms: AtomicU64::new(0),
             shutdown: Notify::new(),
         })
+    }
+
+    #[test]
+    fn falcon_lease_reconciliation_matches_rest_and_is_client_only() {
+        // #1283: the public `/falcon` client edge reconciles the canonical
+        // `jobLeaseToken` with the legacy `leaseToken` through the SAME shared
+        // rule as REST (`reconcile_lease_token`): a matching dual-sent pair is
+        // accepted (not rejected as a duplicate the way a `serde` alias would be),
+        // and a conflicting pair is refused with a 400. The intra-cluster peer
+        // wire always carries the legacy field by byte-compat design, so the
+        // cluster channel passes the token through WITHOUT reconciling or counting
+        // — otherwise a plain forward hop would inflate the migration metric.
+        let (tx, mut rx) = mpsc::channel::<ServerFrame>(4);
+        let conn = Arc::new(Connection {
+            id: 1,
+            tx,
+            subs: Mutex::new(HashMap::new()),
+            submission_outstanding: AtomicI64::new(0),
+            submission_window: 0,
+            create_slots: Arc::new(tokio::sync::Semaphore::new(0)),
+            closed: AtomicBool::new(false),
+            wants_redispatch: Arc::new(AtomicBool::new(false)),
+            last_seen_ms: AtomicU64::new(0),
+            shutdown: Notify::new(),
+        });
+
+        // Client edge: matching dual-send is accepted and reconciles to one token.
+        assert_eq!(
+            reconcile_falcon_lease(
+                &conn,
+                1,
+                Channel::Client,
+                Some("t".into()),
+                Some("t".into())
+            ),
+            Some(Some("t".into())),
+        );
+        // Client edge: canonical-only is accepted and preferred.
+        assert_eq!(
+            reconcile_falcon_lease(&conn, 1, Channel::Client, Some("t".into()), None),
+            Some(Some("t".into())),
+        );
+        // Client edge: legacy-only is accepted.
+        assert_eq!(
+            reconcile_falcon_lease(&conn, 1, Channel::Client, None, Some("t".into())),
+            Some(Some("t".into())),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no error reply on accepted requests"
+        );
+
+        // Client edge: a conflicting pair is rejected with a 400 and stops dispatch.
+        assert_eq!(
+            reconcile_falcon_lease(
+                &conn,
+                7,
+                Channel::Client,
+                Some("a".into()),
+                Some("b".into())
+            ),
+            None,
+        );
+        match rx.try_recv() {
+            Ok(ServerFrame::CommandResult { corr, status, .. }) => {
+                assert_eq!(corr, 7, "the 400 is addressed to the offending command");
+                assert_eq!(status, 400, "a conflicting lease pair is a bad request");
+            }
+            other => panic!("expected a 400 CommandResult, got {other:?}"),
+        }
+
+        // Cluster channel: even a (never-emitted) conflicting pair is passed
+        // through untouched — no reconciliation, no 400, no legacy-name count.
+        assert_eq!(
+            reconcile_falcon_lease(
+                &conn,
+                1,
+                Channel::Cluster,
+                Some("a".into()),
+                Some("b".into())
+            ),
+            Some(Some("a".into())),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the intra-cluster peer wire is never reconciled or rejected"
+        );
     }
 
     #[test]

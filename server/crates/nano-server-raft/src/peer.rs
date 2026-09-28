@@ -543,6 +543,7 @@ impl PeerLink {
             corr,
             job_key,
             lease_token,
+            job_lease_token: None,
             variables,
             adhoc_result,
             task_result,
@@ -704,6 +705,7 @@ impl PeerLink {
             corr,
             job_key,
             lease_token,
+            job_lease_token: None,
             retries: Some(retries),
             error_message: Some(error_message),
         })
@@ -723,6 +725,7 @@ impl PeerLink {
             corr,
             job_key,
             lease_token,
+            job_lease_token: None,
             error_code,
             error_message: Some(error_message),
             variables,
@@ -799,6 +802,7 @@ impl PeerLink {
                 corr,
                 job_key,
                 lease_token,
+                job_lease_token: None,
                 retries,
                 operation_reference,
             }
@@ -820,6 +824,7 @@ impl PeerLink {
                 corr,
                 job_key,
                 lease_token,
+                job_lease_token: None,
                 timeout,
                 operation_reference,
             }
@@ -842,6 +847,7 @@ impl PeerLink {
             timeout,
             operation_reference,
             lease_token,
+            job_lease_token: None,
         })
         .await
     }

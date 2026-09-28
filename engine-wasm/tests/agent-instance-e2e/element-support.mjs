@@ -43,7 +43,7 @@ for (const variant of ["lean", "readmodel"]) {
     const jobs = JSON.parse(engine.activateJobs("notifier", 1, 1000, "W", true));
     assert.equal(jobs.length, 1, `${variant}: sendTask must activate one 'notifier' job`);
     assert.equal(jobs[0].elementId, "send", `${variant}: sendTask job carries its element id`);
-    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].leaseToken ?? null));
+    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].jobLeaseToken ?? null));
     const inst = snap.instances.find((i) => i.processId === "notify");
     assert.equal(inst?.state, "Completed",
       `${variant}: completing the sendTask job must drive the instance to Completed`);
@@ -60,7 +60,7 @@ for (const variant of ["lean", "readmodel"]) {
     engine.createInstance("review", JSON.stringify({ go: true }));
     const jobs = JSON.parse(engine.activateJobs("ta", 1, 1000, "W", true));
     assert.equal(jobs.length, 1, `${variant}: inclusiveGateway must route the conditional branch`);
-    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].leaseToken ?? null));
+    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].jobLeaseToken ?? null));
     const inst = snap.instances.find((i) => i.processId === "review");
     assert.equal(inst?.state, "Completed",
       `${variant}: the inclusive join must synchronise and complete the instance`);
@@ -86,7 +86,7 @@ for (const variant of ["lean", "readmodel"]) {
       `${variant}: the interrupting escalation boundary must arm one 'handle' handler job`);
     assert.equal(jobs[0].elementId, "handle",
       `${variant}: the escalation handler job carries its element id`);
-    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].leaseToken ?? null));
+    const snap = JSON.parse(engine.completeJob(jobs[0].key, "{}", jobs[0].jobLeaseToken ?? null));
     const inst = snap.instances.find((i) => i.processId === "escalate");
     assert.equal(inst?.state, "Completed",
       `${variant}: completing the escalation handler job must drive the instance to Completed`);

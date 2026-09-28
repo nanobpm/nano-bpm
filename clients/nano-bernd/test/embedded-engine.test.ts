@@ -106,7 +106,7 @@ describe('EmbeddedEngine (nano_engine.wasm FFI)', () => {
       elementId: 'agent',
       worker: 'w1',
       deadline: 31000,
-      leaseToken: null,
+      jobLeaseToken: null,
     });
     host.completeJob(jobs[0]!.key);
     expect(host.isCompleted(processInstanceKey)).toBe(true);

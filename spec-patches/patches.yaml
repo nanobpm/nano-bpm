@@ -103,3 +103,105 @@
   merge:
     nano:
       $ref: '#/components/schemas/NanoEngineInfo'
+
+# --- job lease token rename (#1283): legacy-name deprecation window --------
+#
+# Camunda 8.10 renamed the job lease token at the API boundary to `jobLeaseToken`
+# everywhere (leaseToken on job commands/activation; jobLease on agent-instance
+# requests/history). The vendored spec/ now carries the new `jobLeaseToken` name,
+# matching upstream. To avoid a hard cutover that would break workers still on the
+# pre-rename names (notably c8ctl-plugin-nano on the running fleets), these
+# overlays re-add the OLD names as OPTIONAL, deprecated aliases for a transition
+# window. The server accepts either name on requests (both supplied and differing
+# => 400) and emits both on responses so old clients keep receiving their token.
+# Remove these overlays once every deployed worker has moved to jobLeaseToken.
+- file: jobs.yaml
+  target: components.schemas.ActivatedJobResult.properties
+  merge:
+    leaseToken:
+      type: string
+      nullable: true
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Emitted
+        alongside `jobLeaseToken` during the rename transition window so workers
+        that still read `leaseToken` keep functioning. Read `jobLeaseToken`
+        instead.
+- file: jobs.yaml
+  target: components.schemas.JobCompletionRequest.properties
+  merge:
+    leaseToken:
+      type: string
+      nullable: true
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
+        during the rename transition window. Supply `jobLeaseToken` instead. If
+        both are supplied and differ, the request is rejected with 400.
+- file: jobs.yaml
+  target: components.schemas.JobFailRequest.properties
+  merge:
+    leaseToken:
+      type: string
+      nullable: true
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
+        during the rename transition window. Supply `jobLeaseToken` instead. If
+        both are supplied and differ, the request is rejected with 400.
+- file: jobs.yaml
+  target: components.schemas.JobErrorRequest.properties
+  merge:
+    leaseToken:
+      type: string
+      nullable: true
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
+        during the rename transition window. Supply `jobLeaseToken` instead. If
+        both are supplied and differ, the request is rejected with 400.
+- file: jobs.yaml
+  target: components.schemas.JobUpdateRequest.properties
+  merge:
+    leaseToken:
+      type: string
+      nullable: true
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
+        during the rename transition window. Supply `jobLeaseToken` instead. If
+        both are supplied and differ, the request is rejected with 400.
+- file: agent-instances.yaml
+  target: components.schemas.AgentInstanceCreationRequest.properties
+  merge:
+    jobLease:
+      type: string
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
+        during the rename transition window. Supply `jobLeaseToken` instead.
+        At least one of `jobLeaseToken` or `jobLease` must be present; both may
+        be supplied when their values match, and if both are supplied and differ
+        the request is rejected with 400.
+- file: agent-instances.yaml
+  target: components.schemas.AgentInstanceUpdateRequest.properties
+  merge:
+    jobLease:
+      type: string
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Accepted
+        during the rename transition window. Supply `jobLeaseToken` instead.
+        At least one of `jobLeaseToken` or `jobLease` must be present; both may
+        be supplied when their values match, and if both are supplied and differ
+        the request is rejected with 400.
+- file: agent-instances.yaml
+  target: components.schemas.AgentInstanceHistoryItemResult.properties
+  merge:
+    jobLease:
+      type: string
+      deprecated: true
+      description: >
+        Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Emitted
+        alongside `jobLeaseToken` during the rename transition window. Read
+        `jobLeaseToken` instead.

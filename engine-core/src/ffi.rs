@@ -330,7 +330,7 @@ unsafe fn emit_owned(bytes: &[u8], out_ptr: *mut *mut u8, out_len: *mut usize) {
 /// [
 ///   { "key": "…", "type": "…", "instanceKey": "…", "elementInstanceKey": "…",
 ///     "elementId": "…", "worker": "…", "deadline": 12345, "retries": 3,
-///     "jobLease": "…" (only for external-agent jobs, #1106),
+///     "jobLeaseToken": "…" (only for leased jobs, #1106/#1283),
 ///     "variables": { … } }
 /// ]
 /// ```
@@ -401,10 +401,10 @@ pub unsafe extern "C" fn nbpmn_activate_jobs(
             let _ = write!(json, "{}", job.deadline);
         }
         if let Some(lease) = &job.lease_token {
-            json.push_str(",\"leaseToken\":");
+            json.push_str(",\"jobLeaseToken\":");
             write_json_string(&mut json, lease);
         } else {
-            json.push_str(",\"leaseToken\":null");
+            json.push_str(",\"jobLeaseToken\":null");
         }
         json.push_str(",\"retries\":");
         {

@@ -57,11 +57,11 @@ for (const variant of ["lean", "readmodel"]) {
         assert.equal(resolved.resourceId, "prompt.md");
         assert.equal(resolved.version, 2);
       }
-      assert.equal(typeof job.leaseToken, "string");
+      assert.equal(typeof job.jobLeaseToken, "string");
       const request = {
         elementInstanceKey: job.elementInstanceKey,
         jobKey: job.key,
-        jobLease: job.leaseToken,
+        jobLeaseToken: job.jobLeaseToken,
         history: [{
           historyItemId: "configuration", loopIteration: 1,
           producedAt: "2026-01-02T03:04:05Z", role: "CONFIGURATION",
@@ -71,9 +71,23 @@ for (const variant of ["lean", "readmodel"]) {
       };
       assert.throws(() => engine.createAgentInstance(JSON.stringify({
         ...request,
-        jobLease: `${job.leaseToken}:stale`,
+        jobLeaseToken: `${job.jobLeaseToken}:stale`,
       })));
-      const created = JSON.parse(engine.createAgentInstance(JSON.stringify(request)));
+      // #1283 deprecation window: a CONFLICTING dual-send (canonical + legacy
+      // with different values) is rejected loudly rather than fencing on a
+      // stale token.
+      assert.throws(() => engine.createAgentInstance(JSON.stringify({
+        ...request,
+        jobLease: `${job.jobLeaseToken}:legacy`,
+      })), "conflicting jobLeaseToken/jobLease pair must be rejected");
+      // An EQUAL dual-send (both names, same value) is ACCEPTED — the previous
+      // serde-alias shape folded both onto one field and rejected an equal
+      // dual-send as a duplicate field, making the WASM window inconsistent
+      // with REST. Exercise the successful create through the dual-send path.
+      const created = JSON.parse(engine.createAgentInstance(JSON.stringify({
+        ...request,
+        jobLease: job.jobLeaseToken,
+      })));
       assert.equal(created.createdHistory.length, 1);
       if (variant === "readmodel") {
         const agents = JSON.parse(engine.searchAgentInstances("{}")).items;
@@ -81,7 +95,7 @@ for (const variant of ["lean", "readmodel"]) {
         assert.deepEqual(agents[0].elementInstanceKeys, [job.elementInstanceKey]);
         const update = {
           elementInstanceKey: job.elementInstanceKey,
-          jobKey: job.key, jobLease: job.leaseToken,
+          jobKey: job.key, jobLeaseToken: job.jobLeaseToken,
         };
         assert.throws(() => engine.updateAgentInstance(created.agentInstanceKey, JSON.stringify({
           ...update,
@@ -89,10 +103,21 @@ for (const variant of ["lean", "readmodel"]) {
         })), "supplied unknown job attribution must not be ignored");
         assert.throws(() => engine.updateAgentInstance(created.agentInstanceKey, JSON.stringify({
           ...update,
-          jobLease: `${job.leaseToken}:stale`,
+          jobLeaseToken: `${job.jobLeaseToken}:stale`,
         })), "supplied stale lease must not be ignored");
+        // #1283: conflicting dual-send on UPDATE is rejected loudly.
+        assert.throws(() => engine.updateAgentInstance(created.agentInstanceKey, JSON.stringify({
+          ...update,
+          jobLease: `${job.jobLeaseToken}:legacy`,
+        })), "conflicting update jobLeaseToken/jobLease pair must be rejected");
+        // A legacy-only `jobLease` is honored through reconcile — a stale one
+        // reaches the fence and is rejected, proving it is not silently dropped.
+        assert.throws(() => engine.updateAgentInstance(created.agentInstanceKey, JSON.stringify({
+          elementInstanceKey: job.elementInstanceKey, jobKey: job.key,
+          jobLease: `${job.jobLeaseToken}:stale`,
+        })), "legacy-only jobLease is honored (a stale one is rejected, not ignored)");
       }
-      const completed = JSON.parse(engine.completeJob(job.key, "{}", job.leaseToken));
+      const completed = JSON.parse(engine.completeJob(job.key, "{}", job.jobLeaseToken));
       assert.equal(completed.instances[0].state, "Completed");
       if (variant === "readmodel") {
         assert.equal(JSON.parse(engine.searchAgentInstances("{}")).items[0].status, "COMPLETED");

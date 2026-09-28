@@ -383,6 +383,20 @@ components:
           $ref: '#/components/schemas/Corr'
         jobKey:
           $ref: '#/components/schemas/Key'
+        leaseToken:
+          type: string
+          nullable: true
+          description: >
+            Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name),
+            accepted during the rename transition window. Supply `jobLeaseToken`
+            instead. If both are supplied and differ the command is rejected with
+            a 400 `commandResult`; a matching pair is accepted.
+        jobLeaseToken:
+          type: string
+          nullable: true
+          description: >
+            Opaque lease token from the job activation (canonical Camunda 8.10
+            spelling). Fences this command to the activation's current lease.
         variables:
           type: object
           additionalProperties: true
@@ -400,6 +414,20 @@ components:
           $ref: '#/components/schemas/Corr'
         jobKey:
           $ref: '#/components/schemas/Key'
+        leaseToken:
+          type: string
+          nullable: true
+          description: >
+            Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name),
+            accepted during the rename transition window. Supply `jobLeaseToken`
+            instead. If both are supplied and differ the command is rejected with
+            a 400 `commandResult`; a matching pair is accepted.
+        jobLeaseToken:
+          type: string
+          nullable: true
+          description: >
+            Opaque lease token from the job activation (canonical Camunda 8.10
+            spelling). Fences this command to the activation's current lease.
         retries:
           type: integer
           format: int32
@@ -420,6 +448,20 @@ components:
           $ref: '#/components/schemas/Corr'
         jobKey:
           $ref: '#/components/schemas/Key'
+        leaseToken:
+          type: string
+          nullable: true
+          description: >
+            Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name),
+            accepted during the rename transition window. Supply `jobLeaseToken`
+            instead. If both are supplied and differ the command is rejected with
+            a 400 `commandResult`; a matching pair is accepted.
+        jobLeaseToken:
+          type: string
+          nullable: true
+          description: >
+            Opaque lease token from the job activation (canonical Camunda 8.10
+            spelling). Fences this command to the activation's current lease.
         errorCode:
           type: string
         errorMessage:

@@ -141,24 +141,34 @@ alignment uses [revision 04530c058589e3ea3f7873bb469ae2c0d7cc6003](https://githu
 
 Activation creates the job, **not** an AgentInstance. Job leasing is independent
 of the agent marker: a worker requests `withLease: true` to receive a fresh,
-opaque `leaseToken`. Omission, `null`, or `false` selects non-leasing activation,
-whose response contains `leaseToken: null`. This applies to all job kinds,
-including execution and task listeners. Once leased, a job remains eligible only
-for leasing workers, including after failure or timeout.
+opaque `jobLeaseToken`. Omission, `null`, or `false` selects non-leasing
+activation, whose response contains `jobLeaseToken: null`. This applies to all
+job kinds, including execution and task listeners. Once leased, a job remains
+eligible only for leasing workers, including after failure or timeout.
 
 For a leased job, completion, failure, and error commands require its matching
-`leaseToken`; missing or stale tokens are rejected with HTTP 409. Job property
+`jobLeaseToken`; missing or stale tokens are rejected with HTTP 409. Job property
 updates may omit the token for operator updates, but a supplied token is checked.
 Expiry alone does not supersede the token: the previous worker can finish until
 a subsequent activation replaces it.
 
-Agent CREATE requires `elementInstanceKey`, `jobKey`, `jobLease`, and nonempty
-`history`. CONFIGURATION history establishes the definition and limits; there
-are no top-level CREATE definition/limits fields. Repeated CREATE is a conflict,
-not an upsert. UPDATE requires the three attribution fields and permits status
-and history changes, rather than top-level metric/tool patches. The agent
-request's `jobLease` carries the activation's opaque token; it is not a deadline
-or a client-parsed number.
+> **Naming (Camunda 8.10 rename, #1283).** Upstream renamed the job lease token
+> at the API boundary to `jobLeaseToken` everywhere (previously `leaseToken` on
+> job activation/commands and `jobLease` on agent-instance requests/history).
+> Nano now implements the `jobLeaseToken` name. During a transition window, the
+> pre-8.10 names are still accepted on requests and emitted alongside the new
+> name on responses, so workers that have not yet migrated keep working. If a
+> request supplies both the new and the legacy name with different values it is
+> rejected with HTTP 400. Migrate to `jobLeaseToken`; the legacy aliases will be
+> removed once every deployed worker has moved.
+
+Agent CREATE requires `elementInstanceKey`, `jobKey`, `jobLeaseToken`, and
+nonempty `history`. CONFIGURATION history establishes the definition and limits;
+there are no top-level CREATE definition/limits fields. Repeated CREATE is a
+conflict, not an upsert. UPDATE requires the three attribution fields and permits
+status and history changes, rather than top-level metric/tool patches. The agent
+request's `jobLeaseToken` carries the activation's opaque token; it is not a
+deadline or a client-parsed number.
 
 History remains pending until job resolution. Completion commits the winning
 attempt and discards superseded attempts; failure and timeout do not themselves

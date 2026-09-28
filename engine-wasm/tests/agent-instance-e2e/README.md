@@ -3,7 +3,7 @@
 These probes exercise real `@nanobpm/engine-wasm` lean and read-model artifacts:
 
 - `lease-fencing.mjs`: opt-in leasing for ordinary/agent-marked service jobs and
-  execution listeners; required nullable `leaseToken`; opaque-token lifecycle
+  execution listeners; required nullable `jobLeaseToken`; opaque-token lifecycle
   fencing; optional update tokens; sticky leased-job eligibility after failure
   and timeout; event replay.
 - `verify.mjs`: required CREATE/UPDATE attribution, history-based configuration,
