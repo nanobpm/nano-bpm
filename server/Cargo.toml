@@ -1,6 +1,6 @@
 [package]
 name = "nanobpm-gateway-rest-server"
-version = "0.0.23"
+version = "0.0.24"
 edition = "2024"
 publish = false
 description = "NanoBPM gateway: stub server for the generated Camunda 8 Orchestration Cluster v2 REST layer, wired to the embedded nanobpmn engine."

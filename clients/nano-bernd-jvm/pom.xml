@@ -6,7 +6,7 @@
 
   <groupId>io.github.jwulf</groupId>
   <artifactId>nano-bernd</artifactId>
-  <version>0.2.2</version>
+  <version>0.3.0</version>
   <packaging>jar</packaging>
 
   <name>nano-bernd</name>

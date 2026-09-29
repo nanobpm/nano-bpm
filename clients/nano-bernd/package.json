@@ -1,6 +1,6 @@
 {
   "name": "@nanobpm/nano-bernd",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "Bernd — Nano BPMN's embedded engine. A universal FFI wrapper around the Nano engine compiled to wasm32. Zero runtime dependencies, no wasm-bindgen — a plain WebAssembly.instantiate host that works in Node, Deno, and browsers, and mirrors the same C-ABI the JVM/Chicory and Python/Go/.NET embedded hosts consume. Named after Bernd Ruecker; see ADR 0005.",
   "type": "module",
   "main": "dist/index.cjs",
