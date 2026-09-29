@@ -1,27 +1,50 @@
-// Web Worker for the data SDK cross-connection concurrency test
-// (data_sdk_test.ts, #1287). Each worker is a separate isolate, so it opens its
-// OWN SQLite connection through the SDK — exactly like two concurrent data-op
-// processes (e.g. a webhook enqueue racing an inbox poll) hitting one project DB.
-// It hammers DDL + writes and reports how many operations failed.
+// Web Worker for the data SDK cross-connection lock test (data_sdk_test.ts,
+// #1287). Each worker is a separate isolate, so it opens its OWN SQLite
+// connection through the SDK — exactly like two concurrent data-op processes
+// (e.g. a webhook enqueue racing an inbox poll) hitting one project DB.
+//
+// Protocol (deterministic — no reliance on scheduler interleaving):
+//   { role: "holder", cwd } -> takes the write lock (BEGIN IMMEDIATE), replies
+//                              "locked"; on "release" it COMMITs, replies "released".
+//   { role: "writer", cwd } -> performs one write while the lock is held, replies
+//                              { ok, error, waitedMs }.
 
-import { openDataSource } from "./data_sdk.ts";
+import { type DataSource, openDataSource } from "./data_sdk.ts";
 
-self.onmessage = async (e: MessageEvent<{ cwd: string; id: number; n: number }>) => {
-  const { cwd, id, n } = e.data;
-  let failures = 0;
-  let firstError = "";
-  const db = await openDataSource("app", { cwd });
-  for (let i = 0; i < n; i++) {
-    try {
-      // DDL on every iteration mirrors `ensure_inbox`, which runs before every
-      // inbox read — the write lock is contended even by "readers".
-      await db.exec("CREATE TABLE IF NOT EXISTS hits (id INTEGER PRIMARY KEY, who TEXT)");
-      await db.exec("INSERT INTO hits (who) VALUES (?)", [`${id}-${i}`]);
-    } catch (err) {
-      failures++;
-      if (!firstError) firstError = String((err as Error).message ?? err);
-    }
+type Msg =
+  | { role: "holder"; cwd: string }
+  | { role: "writer"; cwd: string }
+  | "release";
+
+let held: DataSource | undefined;
+
+self.onmessage = async (e: MessageEvent<Msg>) => {
+  const m = e.data;
+  if (m === "release") {
+    await held!.exec("COMMIT");
+    held!.close();
+    self.postMessage("released");
+    return;
   }
-  db.close();
-  self.postMessage({ failures, firstError });
+  const db = await openDataSource("app", { cwd: m.cwd });
+  if (m.role === "holder") {
+    await db.exec("BEGIN IMMEDIATE");
+    await db.exec("INSERT INTO hits (who) VALUES ('holder')");
+    held = db;
+    self.postMessage("locked");
+    return;
+  }
+  const t0 = performance.now();
+  try {
+    await db.exec("INSERT INTO hits (who) VALUES ('writer')");
+    self.postMessage({ ok: true, error: "", waitedMs: performance.now() - t0 });
+  } catch (err) {
+    self.postMessage({
+      ok: false,
+      error: String((err as Error).message ?? err),
+      waitedMs: performance.now() - t0,
+    });
+  } finally {
+    db.close();
+  }
 };
