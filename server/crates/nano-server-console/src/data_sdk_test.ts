@@ -12,6 +12,7 @@ import {
   openDataSource,
   resolveEnvTemplate,
   resolveSource,
+  SQLITE_BUSY_TIMEOUT_MS,
   sqlitePath,
 } from "./data_sdk.ts";
 
@@ -210,4 +211,65 @@ Deno.test("isReadStatement: leading SQL comments don't hide the verb", () => {
   assertEquals(isReadStatement("/* note */ WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c"), false, "commented CTE write");
   // An input that is only a comment is not a read.
   assertEquals(isReadStatement("-- just a comment"), false, "comment-only");
+});
+
+// --- concurrent connections (#1287) -----------------------------------------
+//
+// Every data op is its own process with its own SQLite connection, so a project
+// DB routinely sees concurrent writers (a webhook enqueue racing an inbox poll).
+// With no busy timeout, node:sqlite fails the loser immediately with
+// "database is locked" — which silently dropped trigger-inbox events.
+
+async function tempSqliteProject(): Promise<string> {
+  const root = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${root}/nano.app.json`,
+    JSON.stringify({
+      data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
+    }),
+  );
+  return root;
+}
+
+Deno.test("openDataSource: SQLite connections wait on a lock instead of failing (busy_timeout)", async () => {
+  const root = await tempSqliteProject();
+  const db = await openDataSource("app", { cwd: root });
+  const rows = await db.query("PRAGMA busy_timeout");
+  const ms = Number(Object.values(rows[0] ?? {})[0] ?? 0);
+  db.close();
+  await Deno.remove(root, { recursive: true });
+  assertEquals(ms === SQLITE_BUSY_TIMEOUT_MS && ms > 0, true, `busy_timeout is ${ms}ms; a contended write must wait, not fail`);
+});
+
+Deno.test("openDataSource: concurrent connections writing one DB never fail with 'database is locked'", async () => {
+  const root = await tempSqliteProject();
+  const WORKERS = 4;
+  const N = 150;
+  const url = new URL("./data_sdk_concurrency_worker.ts", import.meta.url);
+  const results = await Promise.all(
+    Array.from({ length: WORKERS }, (_, id) =>
+      new Promise<{ failures: number; firstError: string }>((resolve, reject) => {
+        const w = new Worker(url, { type: "module" });
+        w.onmessage = (e) => {
+          w.terminate();
+          resolve(e.data);
+        };
+        w.onerror = (e) => {
+          w.terminate();
+          reject(e.error ?? new Error(e.message));
+        };
+        w.postMessage({ cwd: root, id, n: N });
+      })),
+  );
+  const db = await openDataSource("app", { cwd: root });
+  const [{ n }] = await db.query("SELECT COUNT(*) AS n FROM hits");
+  db.close();
+  await Deno.remove(root, { recursive: true });
+  const failures = results.reduce((s, r) => s + r.failures, 0);
+  assertEquals(
+    failures,
+    0,
+    `${failures} concurrent writes failed (first: ${results.find((r) => r.firstError)?.firstError})`,
+  );
+  assertEquals(Number(n), WORKERS * N);
 });
