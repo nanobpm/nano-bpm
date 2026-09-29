@@ -250,29 +250,46 @@ Deno.test("openDataSource: a write contended by another connection's lock waits,
   const url = new URL("./data_sdk_concurrency_worker.ts", import.meta.url);
   const holder = new Worker(url, { type: "module" });
   const writer = new Worker(url, { type: "module" });
-  const next = (w: Worker) =>
-    new Promise<unknown>((resolve, reject) => {
-      w.onmessage = (e) => resolve(e.data);
-      w.onerror = (e) => reject(e.error ?? new Error(e.message));
-    });
+  // Per-worker message queue: a worker may post several messages (the writer
+  // sends "ready" then its result), and none may be lost between awaits.
+  const inbox = (w: Worker) => {
+    const queued: unknown[] = [];
+    const waiters: Array<{ resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
+    w.onmessage = (e) => {
+      const waiter = waiters.shift();
+      if (waiter) waiter.resolve(e.data);
+      else queued.push(e.data);
+    };
+    w.onerror = (e) => {
+      e.preventDefault();
+      const err = e.error ?? new Error(e.message);
+      for (const waiter of waiters.splice(0)) waiter.reject(err);
+    };
+    return () =>
+      queued.length > 0
+        ? Promise.resolve(queued.shift())
+        : new Promise<unknown>((resolve, reject) => waiters.push({ resolve, reject }));
+  };
+  const fromHolder = inbox(holder);
+  const fromWriter = inbox(writer);
   const HOLD_MS = 300;
   try {
     // 1. Another connection takes the write lock — contention is now guaranteed.
-    const locked = next(holder);
     holder.postMessage({ role: "holder", cwd: root });
-    assertEquals(await locked, "locked");
+    assertEquals(await fromHolder(), "locked");
 
-    // 2. A second connection writes while the lock is held.
-    const result = next(writer) as Promise<{ ok: boolean; error: string; waitedMs: number }>;
+    // 2. A second connection writes while the lock is held. "ready" is posted
+    //    in the same synchronous turn as the write, so the hold timer below
+    //    cannot start before the write is attempted.
     writer.postMessage({ role: "writer", cwd: root });
+    assertEquals(await fromWriter(), "ready");
 
     // 3. Release well inside the busy timeout.
     await new Promise((r) => setTimeout(r, HOLD_MS));
-    const released = next(holder);
     holder.postMessage("release");
-    assertEquals(await released, "released");
+    assertEquals(await fromHolder(), "released");
 
-    const r = await result;
+    const r = await fromWriter() as { ok: boolean; error: string; waitedMs: number };
     assertEquals(r.ok, true, `contended write failed after ${r.waitedMs}ms: ${r.error}`);
     // It really waited for the lock (not an uncontended fast path).
     assertEquals(r.waitedMs >= HOLD_MS / 2, true, `write only waited ${r.waitedMs}ms`);

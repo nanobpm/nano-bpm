@@ -6,8 +6,11 @@
 // Protocol (deterministic — no reliance on scheduler interleaving):
 //   { role: "holder", cwd } -> takes the write lock (BEGIN IMMEDIATE), replies
 //                              "locked"; on "release" it COMMITs, replies "released".
-//   { role: "writer", cwd } -> performs one write while the lock is held, replies
-//                              { ok, error, waitedMs }.
+//   { role: "writer", cwd } -> opens its connection, replies "ready", then
+//                              IMMEDIATELY (same synchronous turn) performs one
+//                              write, replying { ok, error, waitedMs }. The test
+//                              starts its hold timer only on "ready", so the write
+//                              is guaranteed to be attempted while the lock is held.
 
 import { type DataSource, openDataSource } from "./data_sdk.ts";
 
@@ -34,6 +37,7 @@ self.onmessage = async (e: MessageEvent<Msg>) => {
     self.postMessage("locked");
     return;
   }
+  self.postMessage("ready");
   const t0 = performance.now();
   try {
     await db.exec("INSERT INTO hits (who) VALUES ('writer')");
