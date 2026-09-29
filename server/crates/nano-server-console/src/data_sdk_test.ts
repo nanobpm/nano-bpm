@@ -12,6 +12,7 @@ import {
   openDataSource,
   resolveEnvTemplate,
   resolveSource,
+  SQLITE_BUSY_TIMEOUT_MS,
   sqlitePath,
 } from "./data_sdk.ts";
 
@@ -210,4 +211,96 @@ Deno.test("isReadStatement: leading SQL comments don't hide the verb", () => {
   assertEquals(isReadStatement("/* note */ WITH c AS (SELECT 1) INSERT INTO t SELECT * FROM c"), false, "commented CTE write");
   // An input that is only a comment is not a read.
   assertEquals(isReadStatement("-- just a comment"), false, "comment-only");
+});
+
+// --- concurrent connections (#1287) -----------------------------------------
+//
+// Every data op is its own process with its own SQLite connection, so a project
+// DB routinely sees concurrent writers (a webhook enqueue racing an inbox poll).
+// With no busy timeout, node:sqlite fails the loser immediately with
+// "database is locked" — which silently dropped trigger-inbox events.
+
+async function tempSqliteProject(): Promise<string> {
+  const root = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${root}/nano.app.json`,
+    JSON.stringify({
+      data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
+    }),
+  );
+  return root;
+}
+
+Deno.test("openDataSource: SQLite connections wait on a lock instead of failing (busy_timeout)", async () => {
+  const root = await tempSqliteProject();
+  const db = await openDataSource("app", { cwd: root });
+  const rows = await db.query("PRAGMA busy_timeout");
+  const ms = Number(Object.values(rows[0] ?? {})[0] ?? 0);
+  db.close();
+  await Deno.remove(root, { recursive: true });
+  assertEquals(ms === SQLITE_BUSY_TIMEOUT_MS && ms > 0, true, `busy_timeout is ${ms}ms; a contended write must wait, not fail`);
+});
+
+Deno.test("openDataSource: a write contended by another connection's lock waits, then succeeds", async () => {
+  const root = await tempSqliteProject();
+  const setup = await openDataSource("app", { cwd: root });
+  await setup.exec("CREATE TABLE hits (id INTEGER PRIMARY KEY, who TEXT)");
+  setup.close();
+
+  const url = new URL("./data_sdk_concurrency_worker.ts", import.meta.url);
+  const holder = new Worker(url, { type: "module" });
+  const writer = new Worker(url, { type: "module" });
+  // Per-worker message queue: a worker may post several messages (the writer
+  // sends "ready" then its result), and none may be lost between awaits.
+  const inbox = (w: Worker) => {
+    const queued: unknown[] = [];
+    const waiters: Array<{ resolve: (v: unknown) => void; reject: (e: unknown) => void }> = [];
+    w.onmessage = (e) => {
+      const waiter = waiters.shift();
+      if (waiter) waiter.resolve(e.data);
+      else queued.push(e.data);
+    };
+    w.onerror = (e) => {
+      e.preventDefault();
+      const err = e.error ?? new Error(e.message);
+      for (const waiter of waiters.splice(0)) waiter.reject(err);
+    };
+    return () =>
+      queued.length > 0
+        ? Promise.resolve(queued.shift())
+        : new Promise<unknown>((resolve, reject) => waiters.push({ resolve, reject }));
+  };
+  const fromHolder = inbox(holder);
+  const fromWriter = inbox(writer);
+  const HOLD_MS = 300;
+  try {
+    // 1. Another connection takes the write lock — contention is now guaranteed.
+    holder.postMessage({ role: "holder", cwd: root });
+    assertEquals(await fromHolder(), "locked");
+
+    // 2. A second connection writes while the lock is held. "ready" is posted
+    //    in the same synchronous turn as the write, so the hold timer below
+    //    cannot start before the write is attempted.
+    writer.postMessage({ role: "writer", cwd: root });
+    assertEquals(await fromWriter(), "ready");
+
+    // 3. Release well inside the busy timeout.
+    await new Promise((r) => setTimeout(r, HOLD_MS));
+    holder.postMessage("release");
+    assertEquals(await fromHolder(), "released");
+
+    const r = await fromWriter() as { ok: boolean; error: string; waitedMs: number };
+    assertEquals(r.ok, true, `contended write failed after ${r.waitedMs}ms: ${r.error}`);
+    // It really waited for the lock (not an uncontended fast path).
+    assertEquals(r.waitedMs >= HOLD_MS / 2, true, `write only waited ${r.waitedMs}ms`);
+  } finally {
+    holder.terminate();
+    writer.terminate();
+  }
+
+  const db = await openDataSource("app", { cwd: root });
+  const rows = await db.query("SELECT who FROM hits ORDER BY id");
+  db.close();
+  await Deno.remove(root, { recursive: true });
+  assertEquals(rows.map((x) => x.who), ["holder", "writer"]);
 });

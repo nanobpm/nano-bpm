@@ -331,6 +331,9 @@ export function sqlitePath(url: string, root: string): string {
 
 import { DatabaseSync } from "node:sqlite";
 
+/** How long a connection waits for a contended SQLite lock before failing (#1287). */
+export const SQLITE_BUSY_TIMEOUT_MS = 5000;
+
 function quoteIdent(name: string): string {
   return `"${name.replaceAll('"', '""')}"`;
 }
@@ -461,6 +464,13 @@ class SqliteDataSource implements DataSource {
 
   constructor(path: string, onClose?: () => void) {
     this.#db = new DatabaseSync(path);
+    // Every data op runs in its own process with its own connection, so a
+    // project DB routinely has concurrent writers (a webhook enqueue racing an
+    // inbox poll). node:sqlite's default busy timeout is 0, which fails the
+    // loser immediately with "database is locked" and dropped trigger events
+    // (#1287). Wait for the lock instead. Set FIRST: the WAL switch below
+    // itself contends for the lock.
+    this.#db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS};`);
     if (path !== ":memory:") this.#db.exec("PRAGMA journal_mode = WAL;");
     this.#db.exec("PRAGMA foreign_keys = ON;");
     this.#onClose = onClose;
