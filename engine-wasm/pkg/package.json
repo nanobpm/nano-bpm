@@ -1,6 +1,6 @@
 {
   "name": "@nanobpm/engine-wasm",
-  "version": "0.9.3",
+  "version": "0.10.0",
   "description": "The nanobpmn engine (engine-core) compiled to WebAssembly for in-browser BPMN execution: deploy a diagram, start instances, activate/complete jobs, and read live snapshots/traces. Published as two subpath entrypoints — a lean baseline engine (default) and a read-model engine (the gateway's C8-style REST read surface). The substrate for the Bojtos demo framework (ADR 0043) and the console test-run panel.",
   "type": "module",
   "license": "Apache-2.0",
