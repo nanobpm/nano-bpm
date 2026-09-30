@@ -37,6 +37,12 @@ nanobpmn-read-model = { path = "../read-model", default-features = false, featur
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 nanobpmn-read-model = { path = "../read-model", default-features = false, features = ["native"], optional = true }
 
+[dev-dependencies]
+# Test-only: parses the vendored Camunda REST spec (`spec/*.yaml`) so the
+# read-model DTOs the facade hand-builds are checked against the spec's
+# `required` lists (the source the published `readmodel-types` derive from).
+serde_yaml = "0.9"
+
 [features]
 # Off-by-default. When enabled, `TestEngine` holds an in-memory `ReadStore` fed
 # from the same event log and exposes the REST read methods (`getFormByKey`,

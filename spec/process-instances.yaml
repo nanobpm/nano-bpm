@@ -7,6 +7,8 @@ paths:
       tags:
         - Process instance
       operationId: createProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: CREATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -15,6 +17,8 @@ paths:
         Creates and starts an instance of the specified process.
         The process definition to use to create the instance can be specified either using its unique key
         (as returned by Deploy resources), or using the BPMN process id and a version.
+        If only the process definition id is given, the latest ACTIVE version is used.
+        If no ACTIVE version exists, the request is rejected as not found.
 
         Waits for the completion of the process instance before returning a result
         when awaitCompletion is enabled.
@@ -70,6 +74,7 @@ paths:
               schema:
                 $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}:
     get:
@@ -77,6 +82,8 @@ paths:
       tags:
         - Process instance
       operationId: getProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -111,6 +118,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/sequence-flows:
     get:
@@ -118,6 +126,8 @@ paths:
       tags:
         - Process instance
       operationId: getProcessInstanceSequenceFlows
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -146,6 +156,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/statistics/element-instances:
     get:
@@ -153,6 +164,9 @@ paths:
       tags:
         - Process instance
       operationId: getProcessInstanceStatistics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -181,6 +195,46 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
+
+  /process-instances/{processInstanceKey}/statistics/wait-states:
+    get:
+      x-eventually-consistent: true
+      tags:
+        - Process instance
+      operationId: getProcessInstanceWaitStateStatistics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
+      security:
+        - bearerAuth: []
+        - basicAuth: []
+      summary: Get wait state statistics
+      description: Get statistics about waiting element instances by the process instance key, grouped by element id.
+      parameters:
+        - name: processInstanceKey
+          in: path
+          required: true
+          description: The assigned key of the process instance, which acts as a unique identifier for this process instance.
+          schema:
+            $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'
+      responses:
+        "200":
+          description: The process instance wait state statistics result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProcessInstanceWaitStateStatisticsQueryResult'
+        "400":
+          $ref: 'common-responses.yaml#/components/responses/InvalidData'
+        "401":
+          $ref: 'common-responses.yaml#/components/responses/Unauthorized'
+        "403":
+          $ref: 'common-responses.yaml#/components/responses/Forbidden'
+        "500":
+          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
+      x-added-in-version: "8.10"
+      x-scope: physical-tenant
 
   /process-instances/search:
     post:
@@ -188,6 +242,9 @@ paths:
       tags:
         - Process instance
       operationId: searchProcessInstances
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -215,6 +272,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/incidents/search:
     post:
@@ -222,6 +280,8 @@ paths:
       tags:
         - Process instance
       operationId: searchProcessInstanceIncidents
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -268,6 +328,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/incident-resolution:
     post:
@@ -275,6 +336,8 @@ paths:
       tags:
         - Process instance
       operationId: resolveProcessInstanceIncidents
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -309,6 +372,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/cancellation:
     post:
@@ -316,6 +380,8 @@ paths:
       tags:
         - Process instance
       operationId: cancelProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: CANCEL_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -357,87 +423,7 @@ paths:
         "504":
           $ref: 'common-responses.yaml#/components/responses/GatewayTimeoutTaskListenerBlocking'
       x-added-in-version: "8.6"
-
-  /process-instances/{processInstanceKey}/suspension:
-    post:
-      x-eventually-consistent: false
-      tags:
-        - Process instance
-      operationId: suspendProcessInstance
-      security:
-        - bearerAuth: []
-        - basicAuth: []
-      summary: Suspend process instance
-      description: >
-        Suspends a running process instance. While suspended the instance makes no
-        progress: its jobs are not activatable and its timers and other triggers do
-        not fire, but it retains all of its runtime state. Only an active instance can
-        be suspended (ACTIVE and SUSPENDED are the only valid live transitions); an
-        already-suspended instance is an idempotent no-op, and an instance in a
-        terminal state is rejected. Resume with the resumption endpoint.
-      parameters:
-        - name: processInstanceKey
-          in: path
-          required: true
-          description: The key of the process instance to suspend.
-          schema:
-            $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'
-      responses:
-        "204":
-          description: The process instance is suspended.
-        "400":
-          $ref: 'common-responses.yaml#/components/responses/InvalidData'
-        "404":
-          description: The process instance is not found.
-          content:
-            application/problem+json:
-              schema:
-                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
-        "500":
-          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
-        "503":
-          $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
-      x-added-in-version: "8.9"
-
-  /process-instances/{processInstanceKey}/resumption:
-    post:
-      x-eventually-consistent: false
-      tags:
-        - Process instance
-      operationId: resumeProcessInstance
-      security:
-        - bearerAuth: []
-        - basicAuth: []
-      summary: Resume process instance
-      description: >
-        Resumes a suspended process instance, returning it to the ACTIVE state with its
-        exact prior running state so its jobs and timers become live again and its
-        suspendedDate reverts to null. Only a suspended instance can be resumed (ACTIVE
-        and SUSPENDED are the only valid live transitions); an already-active instance is
-        an idempotent no-op, and an instance in a terminal state is rejected.
-      parameters:
-        - name: processInstanceKey
-          in: path
-          required: true
-          description: The key of the process instance to resume.
-          schema:
-            $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'
-      responses:
-        "204":
-          description: The process instance is resumed.
-        "400":
-          $ref: 'common-responses.yaml#/components/responses/InvalidData'
-        "404":
-          description: The process instance is not found.
-          content:
-            application/problem+json:
-              schema:
-                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
-        "500":
-          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
-        "503":
-          $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
-      x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /process-instances/cancellation:
     post:
@@ -445,13 +431,17 @@ paths:
       tags:
         - Process instance
       operationId: cancelProcessInstancesBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_CANCEL_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
       summary: Cancel process instances (batch)
       description: |
-        Cancels multiple running process instances.
-        Since only ACTIVE root instances can be cancelled, any given filters for state and
+        Cancels multiple active or suspended process instances.
+        Since only ACTIVE and SUSPENDED root instances can be cancelled, any given filters for state and
         parentProcessInstanceKey are ignored and overridden during this batch operation.
         This is done asynchronously, the progress can be tracked using the batchOperationKey from the response and the batch operation status endpoint (/batch-operations/{batchOperationKey}).
       requestBody:
@@ -482,6 +472,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /process-instances/incident-resolution:
     post:
@@ -489,6 +480,10 @@ paths:
       tags:
         - Process instance
       operationId: resolveIncidentsBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_RESOLVE_INCIDENT }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -526,6 +521,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /process-instances/migration:
     post:
@@ -533,6 +529,10 @@ paths:
       tags:
         - Process instance
       operationId: migrateProcessInstancesBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_MIGRATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -570,6 +570,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /process-instances/modification:
     post:
@@ -577,6 +578,10 @@ paths:
       tags:
         - Process instance
       operationId: modifyProcessInstancesBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_MODIFY_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -616,6 +621,109 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
+
+  /process-instances/suspension:
+    post:
+      x-eventually-consistent: false
+      tags:
+        - Process instance
+      operationId: suspendProcessInstancesBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_SUSPEND_PROCESS_INSTANCE }
+      security:
+        - bearerAuth: []
+        - basicAuth: []
+      summary: Suspend process instances (batch)
+      description: |
+        Suspends multiple running process instances.
+        Any given filter for state or parentProcessInstanceKey is ignored and overridden, as only
+        ACTIVE process instances can be suspended and suspension does not cascade between parent
+        and child instances, so child instances are suspended independently of their parent or
+        root instance.
+        This is done asynchronously, the progress can be tracked using the batchOperationKey from the response and the batch operation status endpoint (/batch-operations/{batchOperationKey}).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: 'batch-operations.yaml#/components/schemas/ProcessInstanceSuspensionBatchOperationRequest'
+      responses:
+        "200":
+          description: The batch operation request was created.
+          content:
+            application/json:
+              schema:
+                $ref: 'batch-operations.yaml#/components/schemas/BatchOperationCreatedResult'
+        "400":
+          description: >
+            The process instance batch operation failed.
+            More details are provided in the response body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "401":
+          $ref: 'common-responses.yaml#/components/responses/Unauthorized'
+        "403":
+          $ref: 'common-responses.yaml#/components/responses/Forbidden'
+        "500":
+          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
+      x-added-in-version: "8.10"
+      x-scope: physical-tenant
+
+  /process-instances/resumption:
+    post:
+      x-eventually-consistent: false
+      tags:
+        - Process instance
+      operationId: resumeProcessInstancesBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_SUSPEND_PROCESS_INSTANCE }
+      security:
+        - bearerAuth: []
+        - basicAuth: []
+      summary: Resume process instances (batch)
+      description: |
+        Resumes multiple suspended process instances.
+        Any given filter for state or parentProcessInstanceKey is ignored and overridden, as only
+        SUSPENDED process instances can be resumed and resumption does not cascade between parent
+        and child instances, so child instances are resumed independently of their parent or root
+        instance.
+        This is done asynchronously, the progress can be tracked using the batchOperationKey from the response and the batch operation status endpoint (/batch-operations/{batchOperationKey}).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: 'batch-operations.yaml#/components/schemas/ProcessInstanceResumptionBatchOperationRequest'
+      responses:
+        "200":
+          description: The batch operation request was created.
+          content:
+            application/json:
+              schema:
+                $ref: 'batch-operations.yaml#/components/schemas/BatchOperationCreatedResult'
+        "400":
+          description: >
+            The process instance batch operation failed.
+            More details are provided in the response body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "401":
+          $ref: 'common-responses.yaml#/components/responses/Unauthorized'
+        "403":
+          $ref: 'common-responses.yaml#/components/responses/Forbidden'
+        "500":
+          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
+      x-added-in-version: "8.10"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/deletion:
     post:
@@ -623,6 +731,8 @@ paths:
       tags:
         - Process instance
       operationId: deleteProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: DELETE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -665,6 +775,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /process-instances/deletion:
     post:
@@ -672,6 +783,10 @@ paths:
       tags:
         - Process instance
       operationId: deleteProcessInstancesBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_DELETE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -708,6 +823,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/migration:
     post:
@@ -715,6 +831,8 @@ paths:
       tags:
         - Process instance
       operationId: migrateProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -764,6 +882,69 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
+
+  /process-instances/{processInstanceKey}/business-id-assignment:
+    post:
+      x-eventually-consistent: false
+      tags:
+        - Process instance
+      operationId: assignProcessInstanceBusinessId
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
+      security:
+        - bearerAuth: []
+        - basicAuth: []
+      summary: Assign business id to process instance
+      description: |
+        Assigns a business id to an already-running process instance that currently has none.
+
+        The assignment is single and irreversible: only artifacts created after the assignment
+        (for example future jobs, user tasks, decision instances, and message subscriptions) carry
+        the business id, while existing artifacts are not retroactively enriched. Re-sending the
+        same business id succeeds as a no-op. This endpoint is only useful while business id
+        uniqueness enforcement is disabled; when it is enabled, the request is rejected with a 409
+        response.
+      parameters:
+        - name: processInstanceKey
+          in: path
+          required: true
+          description: The key of the process instance to assign the business id to.
+          schema:
+            $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProcessInstanceBusinessIdAssignmentInstruction'
+      responses:
+        "204":
+          description: The business id is assigned to the process instance.
+        "400":
+          $ref: 'common-responses.yaml#/components/responses/InvalidData'
+        "404":
+          description: The process instance is not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "409":
+          description: >
+            The business id assignment failed because the process instance is not eligible,
+            for example it already has a different business id, it is a call-activity child, or
+            business id uniqueness enforcement is enabled.
+            More details are provided in the response body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "500":
+          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
+        "503":
+          $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
+      x-added-in-version: "8.10"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/modification:
     post:
@@ -771,6 +952,8 @@ paths:
       tags:
         - Process instance
       operationId: modifyProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: MODIFY_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -811,6 +994,119 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
+
+  /process-instances/{processInstanceKey}/suspension:
+    post:
+      x-eventually-consistent: false
+      tags:
+        - Process instance
+      operationId: suspendProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: SUSPEND_PROCESS_INSTANCE }
+      security:
+        - bearerAuth: []
+        - basicAuth: []
+      summary: Suspend process instance
+      description: |
+        Suspends a running process instance, pausing further processing until it is resumed.
+        Only process instances in the ACTIVE state can be suspended.
+        A child process instance can be suspended independently of its parent or root process
+        instance; suspension does not cascade to or from related instances.
+      parameters:
+        - name: processInstanceKey
+          in: path
+          required: true
+          description: The key of the process instance to suspend.
+          schema:
+            $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuspendProcessInstanceRequest'
+      responses:
+        "204":
+          description: The process instance is suspended.
+        "400":
+          $ref: 'common-responses.yaml#/components/responses/InvalidData'
+        "404":
+          description: The process instance is not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "409":
+          description: |
+            The process instance is not in the ACTIVE state and cannot be suspended.
+            More details are provided in the response body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "500":
+          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
+        "503":
+          $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
+      x-added-in-version: "8.10"
+      x-scope: physical-tenant
+
+  /process-instances/{processInstanceKey}/resumption:
+    post:
+      x-eventually-consistent: false
+      tags:
+        - Process instance
+      operationId: resumeProcessInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: SUSPEND_PROCESS_INSTANCE }
+      security:
+        - bearerAuth: []
+        - basicAuth: []
+      summary: Resume process instance
+      description: |
+        Resumes a suspended process instance, returning it to the ACTIVE state and continuing processing.
+        Only process instances in the SUSPENDED state can be resumed.
+        A child process instance can be resumed independently of its parent or root process
+        instance; resumption does not cascade to or from related instances.
+      parameters:
+        - name: processInstanceKey
+          in: path
+          required: true
+          description: The key of the process instance to resume.
+          schema:
+            $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResumeProcessInstanceRequest'
+      responses:
+        "204":
+          description: The process instance is resumed.
+        "400":
+          $ref: 'common-responses.yaml#/components/responses/InvalidData'
+        "404":
+          description: The process instance is not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "409":
+          description: |
+            The process instance is not in the SUSPENDED state and cannot be resumed.
+            More details are provided in the response body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+        "500":
+          $ref: 'common-responses.yaml#/components/responses/InternalServerError'
+        "503":
+          $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
+      x-added-in-version: "8.10"
+      x-scope: physical-tenant
 
   /process-instances/{processInstanceKey}/call-hierarchy:
     get:
@@ -818,6 +1114,8 @@ paths:
       tags:
         - Process instance
       operationId: getProcessInstanceCallHierarchy
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -854,6 +1152,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
 ## Schema definitions
 
@@ -882,7 +1181,7 @@ components:
             - $ref: 'identifiers.yaml#/components/schemas/ProcessDefinitionId'
         processDefinitionVersion:
           description: |
-            The version of the process. By default, the latest version of the process is used.
+            The version of the process. If omitted, the latest active version is used.
           type: integer
           format: int32
           default: -1
@@ -1164,6 +1463,7 @@ components:
             - parentElementInstanceKey
             - startDate
             - endDate
+            - suspendedDate
             - state
             - hasIncident
             - tenantId
@@ -1209,6 +1509,12 @@ components:
         hasIncident:
           type: boolean
           description: Whether this process instance has a related incident or not.
+        suspendedDate:
+          allOf:
+            - $ref: 'filters.yaml#/components/schemas/DateTimeFilterProperty'
+          description: |
+            The time this process instance most recently entered the SUSPENDED state.
+            This is cleared (null) again once the process instance is resumed.
         tenantId:
           allOf:
             - $ref: 'filters.yaml#/components/schemas/StringFilterProperty'
@@ -1280,6 +1586,8 @@ components:
           addedInVersion: "8.8"
         - propertyName: hasIncident
           addedInVersion: "8.8"
+        - propertyName: suspendedDate
+          addedInVersion: "8.10"
         - propertyName: tenantId
           addedInVersion: "8.6"
         - propertyName: variables
@@ -1294,6 +1602,7 @@ components:
           addedInVersion: "8.6"
         - propertyName: batchOperationKey
           addedInVersion: "8.8"
+          addedInVersionOverride: "8.8"
         - propertyName: errorMessage
           addedInVersion: "8.6"
         - propertyName: hasRetriesLeft
@@ -1461,6 +1770,7 @@ components:
         - startDate
         - endDate
         - state
+        - suspendedDate
         - hasIncident
         - tenantId
         - processInstanceKey
@@ -1470,7 +1780,6 @@ components:
         - rootProcessInstanceKey
         - tags
         - businessId
-        - suspendedDate
       properties:
         processDefinitionId:
           $ref: 'identifiers.yaml#/components/schemas/ProcessDefinitionId'
@@ -1497,6 +1806,13 @@ components:
           format: date-time
         state:
           $ref: '#/components/schemas/ProcessInstanceStateEnum'
+        suspendedDate:
+          description: |
+            The time this process instance most recently entered the `SUSPENDED` state.
+            This is `null` if the process instance is not currently suspended.
+          nullable: true
+          type: string
+          format: date-time
         hasIncident:
           type: boolean
           description: Whether this process instance has a related incident or not.
@@ -1535,14 +1851,6 @@ components:
           nullable: true
           allOf:
             - $ref: 'identifiers.yaml#/components/schemas/BusinessId'
-        suspendedDate:
-          description: >
-            The date-time at which this process instance most recently entered the
-            SUSPENDED state, or null when the instance is not currently suspended.
-            Always present.
-          nullable: true
-          type: string
-          format: date-time
       x-properties-added-in-version:
         - propertyName: processDefinitionId
           addedInVersion: "8.8"
@@ -1558,6 +1866,8 @@ components:
           addedInVersion: "8.6"
         - propertyName: state
           addedInVersion: "8.6"
+        - propertyName: suspendedDate
+          addedInVersion: "8.10"
         - propertyName: hasIncident
           addedInVersion: "8.8"
         - propertyName: tenantId
@@ -1576,8 +1886,6 @@ components:
           addedInVersion: "8.8"
         - propertyName: businessId
           addedInVersion: "8.9"
-        - propertyName: suspendedDate
-          addedInVersion: "8.9"
 
     CancelProcessInstanceRequest:
       type: object
@@ -1588,6 +1896,22 @@ components:
           $ref: 'keys.yaml#/components/schemas/OperationReference'
 
     DeleteProcessInstanceRequest:
+      type: object
+      nullable: true
+      additionalProperties: false
+      properties:
+        operationReference:
+          $ref: 'keys.yaml#/components/schemas/OperationReference'
+
+    SuspendProcessInstanceRequest:
+      type: object
+      nullable: true
+      additionalProperties: false
+      properties:
+        operationReference:
+          $ref: 'keys.yaml#/components/schemas/OperationReference'
+
+    ResumeProcessInstanceRequest:
       type: object
       nullable: true
       additionalProperties: false
@@ -1683,6 +2007,34 @@ components:
           items:
             $ref: 'process-definitions.yaml#/components/schemas/ProcessElementStatisticsResult'
 
+    ProcessInstanceWaitStateStatisticsQueryResult:
+      description: Process instance wait state statistics query response.
+      required:
+        - items
+      type: object
+      properties:
+        items:
+          description: The wait state statistics.
+          type: array
+          items:
+            $ref: '#/components/schemas/ProcessInstanceWaitStateStatisticsResult'
+
+    ProcessInstanceWaitStateStatisticsResult:
+      description: Process instance wait state statistics response item.
+      type: object
+      required:
+        - elementId
+        - waitingCount
+      properties:
+        elementId:
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/ElementId'
+          description: The element id for which the wait states are aggregated.
+        waitingCount:
+          description: The total number of waiting instances of the element.
+          type: integer
+          format: int64
+
     ProcessInstanceMigrationInstruction:
       type: object
       additionalProperties: false
@@ -1725,6 +2077,17 @@ components:
           addedInVersion: "8.6"
         - propertyName: targetElementId
           addedInVersion: "8.6"
+
+    ProcessInstanceBusinessIdAssignmentInstruction:
+      type: object
+      additionalProperties: false
+      description: |
+        The instruction describing the business id to assign to a running process instance.
+      properties:
+        businessId:
+          $ref: 'identifiers.yaml#/components/schemas/BusinessId'
+      required:
+        - businessId
 
     ProcessInstanceModificationInstruction:
       type: object
@@ -1973,8 +2336,8 @@ components:
       enum:
         - ACTIVE
         - COMPLETED
-        - TERMINATED
         - SUSPENDED
+        - TERMINATED
 
     ## Filters
 

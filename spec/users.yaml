@@ -7,6 +7,8 @@ paths:
       tags:
         - User
       operationId: createUser
+      x-required-permissions:
+        - { resourceType: USER, permissionType: CREATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -46,6 +48,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /users/search:
     post:
@@ -53,6 +56,9 @@ paths:
       tags:
         - User
       operationId: searchUsers
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: USER, permissionType: READ }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -79,6 +85,8 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-added-in-version-override: "8.8"
+      x-scope: physical-tenant
 
   /users/{username}:
     get:
@@ -86,6 +94,8 @@ paths:
       tags:
         - User
       operationId: getUser
+      x-required-permissions:
+        - { resourceType: USER, permissionType: READ }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -122,12 +132,15 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
     put:
       x-eventually-consistent: false
       tags:
         - User
       operationId: updateUser
+      x-required-permissions:
+        - { resourceType: USER, permissionType: UPDATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -172,12 +185,15 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
     delete:
       x-eventually-consistent: false
       tags:
         - User
       operationId: deleteUser
+      x-required-permissions:
+        - { resourceType: USER, permissionType: DELETE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -210,6 +226,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
 ## Schema definitions
 
@@ -310,6 +327,13 @@ components:
         - username
         - name
         - email
+      x-properties-added-in-version:
+        - propertyName: "username"
+          addedInVersionOverride: "8.8"
+        - propertyName: "name"
+          addedInVersionOverride: "8.8"
+        - propertyName: "email"
+          addedInVersionOverride: "8.8"
 
     UserSearchQuerySortRequest:
       type: object
@@ -325,6 +349,11 @@ components:
           $ref: 'search-models.yaml#/components/schemas/SortOrderEnum'
       required:
         - field
+      x-properties-added-in-version:
+        - propertyName: "field"
+          addedInVersionOverride: "8.8"
+        - propertyName: "order"
+          addedInVersionOverride: "8.8"
 
     UserSearchQueryRequest:
       allOf:
@@ -341,9 +370,14 @@ components:
           allOf:
             - $ref: '#/components/schemas/UserFilter'
           description: The user search filters.
+      x-properties-added-in-version:
+        - propertyName: "sort"
+          addedInVersionOverride: "8.8"
+        - propertyName: "filter"
+          addedInVersionOverride: "8.8"
 
-    UserFilter:
-      description: User search filter.
+    UserFilterFields:
+      description: User search filter fields.
       type: object
       properties:
         username:
@@ -358,6 +392,46 @@ components:
           description: The email of the user.
           allOf:
             - $ref: "filters.yaml#/components/schemas/StringFilterProperty"
+      x-properties-added-in-version:
+        - propertyName: "username"
+          addedInVersionOverride: "8.8"
+        - propertyName: "name"
+          addedInVersionOverride: "8.8"
+        - propertyName: "email"
+          addedInVersionOverride: "8.8"
+
+    UserFilter:
+      description: User search filter.
+      allOf:
+        - $ref: '#/components/schemas/UserFilterFields'
+        - type: object
+          properties:
+            $or:
+              description: |
+                Defines a list of alternative filter groups combined using OR logic. Each object in the array is evaluated independently, and the filter matches if any one of them is satisfied.
+
+                Top-level fields and the `$or` clause are combined using AND logic — meaning: (top-level filters) AND (any of the `$or` filters) must match.
+                <br>
+                <em>Example:</em>
+
+                ```json
+                {
+                  "$or": [
+                    { "username": "user-1" },
+                    { "username": "user-2" }
+                  ]
+                }
+                ```
+                This matches users whose <code>username</code> is <em>user-1</em> or <em>user-2</em>.
+                <br>
+                <p>Note: Using complex <code>$or</code> conditions may impact performance, use with caution in high-volume environments.
+              type: array
+              nullable: true
+              items:
+                $ref: '#/components/schemas/UserFilterFields'
+          x-properties-added-in-version:
+            - propertyName: "$or"
+              addedInVersion: "8.10"
 
     UserSearchResult:
       type: object
@@ -371,3 +445,6 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/UserResult'
+      x-properties-added-in-version:
+        - propertyName: "items"
+          addedInVersionOverride: "8.8"

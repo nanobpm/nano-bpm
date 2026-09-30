@@ -458,12 +458,14 @@ fn cluster_variable_scope(
 /// `ClusterVariableResult` (always the full, untruncated value).
 fn cluster_variable_result(v: &StoredClusterVariable) -> models::ClusterVariableResult {
     let (scope, tenant_id) = cluster_variable_scope(&v.tenant_id);
-    models::ClusterVariableResult::new(
-        v.name.clone(),
+    models::ClusterVariableResult {
+        name: v.name.clone(),
         scope,
         tenant_id,
-        cluster_variable_value_string(&v.value),
-    )
+        metadata: std::collections::HashMap::new(),
+        kind: models::ClusterVariableKindEnum::Json,
+        value: cluster_variable_value_string(&v.value),
+    }
 }
 
 /// Projects a stored cluster variable into a `ClusterVariableSearchResult`,
@@ -474,7 +476,33 @@ fn cluster_variable_search_result(
 ) -> models::ClusterVariableSearchResult {
     let (scope, tenant_id) = cluster_variable_scope(&v.tenant_id);
     let (value, is_truncated) = truncate_value(&cluster_variable_value_string(&v.value), truncate);
-    models::ClusterVariableSearchResult::new(v.name.clone(), scope, tenant_id, value, is_truncated)
+    models::ClusterVariableSearchResult {
+        name: v.name.clone(),
+        scope,
+        tenant_id,
+        metadata: std::collections::HashMap::new(),
+        kind: models::ClusterVariableKindEnum::Json,
+        value,
+        is_truncated,
+    }
+}
+
+/// Nano stores cluster variables as plain JSON values only (Camunda 8.10
+/// `kind: JSON`; results always report that kind with empty `metadata`). It has
+/// no secret stores, so a `SECRET_REFERENCE` variable is rejected rather than
+/// silently stored as JSON — which would hand the reference string to FEEL as a
+/// literal value.
+fn reject_unsupported_cluster_variable_kind(
+    kind: Option<&models::ClusterVariableKindEnum>,
+) -> Option<models::ProblemDetail> {
+    match kind {
+        None | Some(models::ClusterVariableKindEnum::Json) => None,
+        Some(other) => Some(problem(
+            "Unsupported cluster variable kind",
+            400,
+            format!("Cluster variable kind '{other}' is not supported by Nano; only JSON is."),
+        )),
+    }
 }
 
 impl ServerImpl {
@@ -485,6 +513,9 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateGlobalClusterVariableResponse as Resp;
+        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
+        }
         let value = json_to_value(&body.value.0);
         if self.cluster_variables.create(None, &body.name, value) {
             let stored = self
@@ -517,6 +548,9 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateTenantClusterVariableResponse as Resp;
+        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
+        }
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
         if self
@@ -6521,11 +6555,11 @@ impl ServerImpl {
             .collect()
     }
 
-    async fn batch_update_jobs_impl(
+    async fn update_jobs_batch_operation_impl(
         &self,
-        body: &models::JobUpdateBatchOperationRequest,
-    ) -> Result<apis::job::BatchUpdateJobsResponse, ()> {
-        use apis::job::BatchUpdateJobsResponse as Resp;
+        body: &models::JobBatchUpdateRequest,
+    ) -> Result<apis::job::UpdateJobsBatchOperationResponse, ()> {
+        use apis::job::UpdateJobsBatchOperationResponse as Resp;
 
         let changeset = &body.changeset;
         let priority = match changeset.priority.as_ref() {
@@ -6536,34 +6570,57 @@ impl ServerImpl {
             Some(types::Nullable::Present(r)) => Some(*r),
             _ => None,
         };
+        let timeout = match changeset.timeout.as_ref() {
+            Some(types::Nullable::Present(t)) => Some(*t),
+            _ => None,
+        };
 
-        if priority.is_none() && retries.is_none() {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+        if priority.is_none() && retries.is_none() && timeout.is_none() {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
                 "Invalid changeset",
                 400,
-                "The changeset must set at least one of `priority` or `retries`.".to_string(),
+                "The changeset must set at least one of `priority`, `retries` or `timeout`."
+                    .to_string(),
             )));
         }
         if let Some(p) = priority
             && !(0..=100).contains(&p)
         {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
                 "Invalid priority",
                 400,
                 format!("Job priority must be between 0 and 100, got {p}."),
             )));
         }
-        // `retries` is a non-negative integer at the schema/type level (its
-        // generated type is unsigned), so a negative value can never reach here.
+        // The upstream `JobChangeset` types retries/timeout as signed integers,
+        // so a negative value reaches the handler and must be rejected here.
+        if let Some(r) = retries
+            && r < 0
+        {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
+                "Invalid retries",
+                400,
+                format!("Job retries must not be negative, got {r}."),
+            )));
+        }
+        if let Some(t) = timeout
+            && t < 0
+        {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
+                "Invalid timeout",
+                400,
+                format!("Job timeout must not be negative, got {t}."),
+            )));
+        }
 
         // Minting a trackable batch-operation key is the contract this endpoint
         // owes its caller; durable execution/tracking of the batch is a separate
         // slice (#905) and deliberately out of scope here.
         let key = mint_batch_operation_key();
         Ok(Resp::Status200_TheBatchOperationWasCreated(
-            models::JobBatchUpdateResult {
+            models::BatchOperationCreatedResult {
                 batch_operation_key: key.to_string(),
-                batch_operation_type: "UPDATE_JOB".to_string(),
+                batch_operation_type: models::BatchOperationTypeEnum::UpdateJob,
             },
         ))
     }
@@ -7724,10 +7781,15 @@ impl ServerImpl {
                             "follower".to_string()
                         },
                         health: "healthy".to_string(),
+                        // Every replica Nano reports is serving; there is no
+                        // joining/leaving/learner phase to advertise.
+                        state: "active".to_string(),
                     })
                     .collect();
                 let (host, port) = host_port(node);
                 models::BrokerInfo {
+                    // Unzoned cluster: the broker id is the node id as a string.
+                    broker_id: node.to_string(),
                     node_id: node as i32,
                     host,
                     port,
@@ -8481,6 +8543,7 @@ impl ServerImpl {
                     serde_json::to_value(user_task_result(
                         t,
                         &readstore::RootResolver::new(|k| self.store.process_instance(k)),
+                        self.business_id_of(t.instance_key),
                     ))
                 }),
             ReadKind::Variable => self
@@ -10089,10 +10152,9 @@ impl ServerImpl {
             element_id: String,
             element_type: String,
             tenant_id: String,
-            wait_state_type: models::WaitStateTypeEnum,
-            job: Option<models::JobWaitStateDetails>,
-            message: Option<models::MessageWaitStateDetails>,
-            user_task: Option<models::UserTaskWaitStateDetails>,
+            /// The discriminated wait-state details; the wait-state type is
+            /// derived from it (`wait_state_type_of`), never stored alongside.
+            details: models::WaitStateDetails,
         }
 
         let mut states: Vec<WaitState> = Vec::new();
@@ -10137,16 +10199,14 @@ impl ServerImpl {
                 element_id,
                 element_type,
                 tenant_id,
-                wait_state_type: models::WaitStateTypeEnum::Job,
-                job: Some(models::JobWaitStateDetails::new(
+                details: models::JobWaitStateDetails::new(
                     models::JobKey(job.key.to_string()),
                     job.job_type.clone(),
                     job_kind,
                     listener_event_type,
                     types::Nullable::Present(job.retries),
-                )),
-                message: None,
-                user_task: None,
+                )
+                .into(),
             });
         }
 
@@ -10172,13 +10232,11 @@ impl ServerImpl {
                 element_id,
                 element_type,
                 tenant_id,
-                wait_state_type: models::WaitStateTypeEnum::Message,
-                job: None,
-                message: Some(models::MessageWaitStateDetails::new(
+                details: models::MessageWaitStateDetails::new(
                     sub.message_name.clone(),
                     correlation_key,
-                )),
-                user_task: None,
+                )
+                .into(),
             });
         }
 
@@ -10222,10 +10280,7 @@ impl ServerImpl {
                 element_id,
                 element_type,
                 tenant_id,
-                wait_state_type: models::WaitStateTypeEnum::UserTask,
-                job: None,
-                message: None,
-                user_task: Some(details),
+                details: details.into(),
             });
         }
 
@@ -10263,7 +10318,7 @@ impl ServerImpl {
                         && query::match_wait_state_element_type(&f.element_type, &ws.element_type)
                         && query::match_wait_state_type(
                             &f.wait_state_type,
-                            &ws.wait_state_type.to_string(),
+                            wait_state_type_of(&ws.details),
                         )
                 }
             })
@@ -10281,8 +10336,14 @@ impl ServerImpl {
             .items
             .into_iter()
             .map(|ws| {
+                // `bpmnProcessId` is the owning instance's process id; resolved
+                // only for the returned page, like the root key above.
+                let bpmn_process_id = self
+                    .store
+                    .process_instance(ws.process_instance_key)
+                    .map(|pi| pi.process_id)
+                    .unwrap_or_default();
                 models::ElementInstanceWaitStateResult::new(
-                    ws.wait_state_type,
                     types::Nullable::Present(models::ProcessInstanceKey(
                         roots
                             .root_process_instance_key(ws.process_instance_key)
@@ -10293,18 +10354,8 @@ impl ServerImpl {
                     ws.element_id,
                     wait_state_element_type(&ws.element_type),
                     ws.tenant_id,
-                    match ws.job {
-                        Some(d) => types::Nullable::Present(d),
-                        None => types::Nullable::Null,
-                    },
-                    match ws.message {
-                        Some(d) => types::Nullable::Present(d),
-                        None => types::Nullable::Null,
-                    },
-                    match ws.user_task {
-                        Some(d) => types::Nullable::Present(d),
-                        None => types::Nullable::Null,
-                    },
+                    bpmn_process_id,
+                    ws.details,
                 )
             })
             .collect();
@@ -10326,7 +10377,7 @@ impl ServerImpl {
         let key = &path_params.decision_evaluation_instance_key;
         match self.store.decision_instance(key) {
             Some(row) => Ok(Resp::Status200_TheDecisionInstanceIsSuccessfullyReturned(
-                decision_instance_get_result(&row),
+                decision_instance_get_result(&row, self.business_id_of(row.instance_key)),
             )),
             None => Ok(
                 Resp::Status404_TheDecisionInstanceWithTheGivenKeyWasNotFound(problem(
@@ -10514,7 +10565,10 @@ impl ServerImpl {
         let items: Vec<models::DecisionInstanceResult> = page
             .items
             .into_iter()
-            .map(decision_instance_result)
+            .map(|row| {
+                let business_id = self.business_id_of(row.instance_key);
+                decision_instance_result(row, business_id)
+            })
             .collect();
 
         Ok(Resp::Status200_TheDecisionInstanceSearchResult(
@@ -11309,36 +11363,42 @@ impl ServerImpl {
                     e.last_updated_ms as i64,
                 )
                 .unwrap_or_else(epoch);
-                models::MessageSubscriptionResult::new(
-                    models::MessageSubscriptionKey(e.subscription_key.to_string()),
-                    e.process_definition_id,
-                    match e.process_definition_key {
+                let business_id = self.business_id_of(e.process_instance_key);
+                // Named fields, not the positional `::new`: an upstream field
+                // insertion must fail to compile, not silently shift arguments.
+                models::MessageSubscriptionResult {
+                    business_id,
+                    message_subscription_key: models::MessageSubscriptionKey(
+                        e.subscription_key.to_string(),
+                    ),
+                    process_definition_id: e.process_definition_id,
+                    process_definition_key: match e.process_definition_key {
                         Some(k) => types::Nullable::Present(models::ProcessDefinitionKey(k)),
                         None => types::Nullable::Null,
                     },
-                    types::Nullable::Present(models::ProcessInstanceKey(
+                    process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
                         e.process_instance_key.to_string(),
                     )),
-                    types::Nullable::Null,
-                    e.element_id,
-                    types::Nullable::Present(models::ElementInstanceKey(
+                    root_process_instance_key: types::Nullable::Null,
+                    element_id: e.element_id,
+                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
                         e.element_instance_key.to_string(),
                     )),
-                    models::MessageSubscriptionStateEnum::Created,
-                    last_updated,
-                    e.message_name,
-                    types::Nullable::Present(e.correlation_key),
-                    models::MessageSubscriptionTypeEnum::ProcessEvent,
-                    std::collections::HashMap::new(),
-                    types::Nullable::Null,
-                    match e.process_definition_version {
+                    message_subscription_state: models::MessageSubscriptionStateEnum::Created,
+                    last_updated_date: last_updated,
+                    message_name: e.message_name,
+                    correlation_key: types::Nullable::Present(e.correlation_key),
+                    message_subscription_type: models::MessageSubscriptionTypeEnum::ProcessEvent,
+                    tool_properties: std::collections::HashMap::new(),
+                    process_definition_name: types::Nullable::Null,
+                    process_definition_version: match e.process_definition_version {
                         Some(v) => types::Nullable::Present(v),
                         None => types::Nullable::Null,
                     },
-                    types::Nullable::Null,
-                    types::Nullable::Null,
-                    "<default>".to_string(),
-                )
+                    tool_name: types::Nullable::Null,
+                    inbound_connector_type: types::Nullable::Null,
+                    tenant_id: "<default>".to_string(),
+                }
             })
             .collect();
 
@@ -11499,23 +11559,30 @@ impl ServerImpl {
                     e.correlation_time_ms as i64,
                 )
                 .unwrap_or_else(epoch);
-                models::CorrelatedMessageSubscriptionResult::new(
-                    types::Nullable::Present(e.correlation_key),
+                models::CorrelatedMessageSubscriptionResult {
+                    business_id: self.business_id_of(e.process_instance_key),
+                    correlation_key: types::Nullable::Present(e.correlation_key),
                     correlation_time,
-                    e.element_id,
-                    types::Nullable::Present(models::ElementInstanceKey(
+                    element_id: e.element_id,
+                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
                         e.element_instance_key.to_string(),
                     )),
-                    models::MessageKey(e.message_key.to_string()),
-                    e.message_name,
-                    e.partition_id,
-                    e.process_definition_id,
-                    models::ProcessDefinitionKey(e.process_definition_key.unwrap_or_default()),
-                    models::ProcessInstanceKey(e.process_instance_key.to_string()),
-                    types::Nullable::Null,
-                    models::MessageSubscriptionKey(e.subscription_key.to_string()),
-                    "<default>".to_string(),
-                )
+                    message_key: models::MessageKey(e.message_key.to_string()),
+                    message_name: e.message_name,
+                    partition_id: e.partition_id,
+                    process_definition_id: e.process_definition_id,
+                    process_definition_key: models::ProcessDefinitionKey(
+                        e.process_definition_key.unwrap_or_default(),
+                    ),
+                    process_instance_key: models::ProcessInstanceKey(
+                        e.process_instance_key.to_string(),
+                    ),
+                    root_process_instance_key: types::Nullable::Null,
+                    subscription_key: models::MessageSubscriptionKey(
+                        e.subscription_key.to_string(),
+                    ),
+                    tenant_id: "<default>".to_string(),
+                }
             })
             .collect();
 
@@ -11524,6 +11591,16 @@ impl ServerImpl {
                 models::CorrelatedMessageSubscriptionSearchQueryResult::new(page.response, items),
             ),
         )
+    }
+
+    /// The `businessId` of a process instance (Camunda 8.10), as surfaced on
+    /// results that belong to one — message subscriptions, correlations, jobs,
+    /// user tasks, …. `null` when the instance has none or is unknown.
+    fn business_id_of(&self, process_instance_key: u64) -> types::Nullable<String> {
+        self.store
+            .process_instance(process_instance_key)
+            .and_then(|pi| pi.business_id)
+            .map_or(types::Nullable::Null, types::Nullable::Present)
     }
 
     async fn search_jobs_impl(
@@ -11581,8 +11658,11 @@ impl ServerImpl {
         let sorted: Vec<(u64, &readstore::JobRow)> =
             matched.into_iter().map(|job| (job.key, job)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::JobSearchResult> =
-            page.items.into_iter().map(job_search_result).collect();
+        let items: Vec<models::JobSearchResult> = page
+            .items
+            .into_iter()
+            .map(|job| job_search_result(job, self.business_id_of(job.instance_key)))
+            .collect();
 
         Ok(Resp::Status200_TheJobSearchResult(
             models::JobSearchQueryResult::new(page.response, items),
@@ -12393,7 +12473,7 @@ impl ServerImpl {
         let items: Vec<models::UserTaskResult> = page
             .items
             .into_iter()
-            .map(|task| user_task_result(task, &roots))
+            .map(|task| user_task_result(task, &roots, self.business_id_of(task.instance_key)))
             .collect();
 
         Ok(Resp::Status200_TheUserTaskSearchResult(
@@ -12647,6 +12727,7 @@ impl ServerImpl {
                 user_task_result(
                     task,
                     &readstore::RootResolver::new(|k| self.store.process_instance(k)),
+                    self.business_id_of(task.instance_key),
                 ),
             )),
             None => {
@@ -19104,7 +19185,7 @@ fn batch_operation_response(rec: &BatchOperationRecord) -> models::BatchOperatio
     models::BatchOperationResponse {
         batch_operation_key: rec.key.to_string(),
         state: rec.state,
-        batch_operation_type: rec.op_type,
+        batch_operation_type: types::Nullable::Present(rec.op_type),
         start_date: batch_ms_to_datetime(Some(rec.start_date_ms)),
         end_date: batch_ms_to_datetime(rec.end_date_ms),
         actor_type: types::Nullable::Null,
@@ -19188,11 +19269,14 @@ impl ServerImpl {
 
         match nanobpmn_engine_core::feel::eval(&body.expression, &ctx) {
             Ok(value) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
-                models::ExpressionEvaluationResult::new(
-                    body.expression.clone(),
-                    types::Nullable::Present(types::Object(value_to_json(&value))),
-                    Vec::new(),
-                ),
+                models::ExpressionEvaluationResult {
+                    expression: body.expression.clone(),
+                    result: types::Nullable::Present(types::Object(value_to_json(&value))),
+                    warnings: Vec::new(),
+                    // Nano has no secret stores, so no `camunda.secrets.*`
+                    // reference can ever resolve from a trusted source.
+                    referenced_secrets: Vec::new(),
+                },
             )),
             Err(err) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "INVALID_ARGUMENT",
@@ -19453,6 +19537,7 @@ fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
 
 fn decision_instance_result(
     row: &readstore::DecisionInstanceRow,
+    business_id: types::Nullable<String>,
 ) -> models::DecisionInstanceResult {
     let evaluation_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
@@ -19468,80 +19553,92 @@ fn decision_instance_result(
         Some(f) => types::Nullable::Present(f.clone()),
         None => types::Nullable::Null,
     };
-    models::DecisionInstanceResult::new(
-        row.decision_id.clone(),
-        models::DecisionDefinitionKey(row.decision_key.to_string()),
-        row.decision_name.clone(),
-        row.decision_type
+    models::DecisionInstanceResult {
+        business_id,
+        decision_definition_id: row.decision_id.clone(),
+        decision_definition_key: models::DecisionDefinitionKey(row.decision_key.to_string()),
+        decision_definition_name: row.decision_name.clone(),
+        decision_definition_type: row
+            .decision_type
             .parse()
             .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
-        row.version,
-        row.eval_instance_key.clone(),
-        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
-        types::Nullable::Present(models::ElementInstanceKey(
+        decision_definition_version: row.version,
+        decision_evaluation_instance_key: row.eval_instance_key.clone(),
+        decision_evaluation_key: models::DecisionEvaluationKey(
+            row.decision_evaluation_key.to_string(),
+        ),
+        element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
             row.element_instance_key.to_string(),
         )),
         evaluation_date,
         evaluation_failure,
         process_definition_key,
-        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
-        row.result_json.clone(),
-        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
-        types::Nullable::Null,
-        row.state
+        process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
+            row.instance_key.to_string(),
+        )),
+        result: row.result_json.clone(),
+        root_decision_definition_key: models::DecisionDefinitionKey(
+            row.root_decision_key.to_string(),
+        ),
+        root_process_instance_key: types::Nullable::Null,
+        state: row
+            .state
             .parse()
             .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
-        row.tenant_id.clone(),
-    )
+        tenant_id: row.tenant_id.clone(),
+    }
 }
 
 /// Projects a [`DecisionInstanceRow`] into the generated
-/// `DecisionInstanceGetQueryResult` (adds the evaluated-input/matched-rule audit
-/// to the search-result shape).
+/// `DecisionInstanceGetQueryResult`: the search-result shape
+/// ([`decision_instance_result`], the single projection of the shared fields)
+/// plus the evaluated-input/matched-rule audit.
 fn decision_instance_get_result(
     row: &readstore::DecisionInstanceRow,
+    business_id: types::Nullable<String>,
 ) -> models::DecisionInstanceGetQueryResult {
-    let evaluation_date =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
-            .unwrap_or_else(epoch);
-    let process_definition_key = if row.process_definition_key.is_empty() {
-        types::Nullable::Null
-    } else {
-        types::Nullable::Present(models::ProcessDefinitionKey(
-            row.process_definition_key.clone(),
-        ))
-    };
-    let evaluation_failure = match &row.evaluation_failure {
-        Some(f) => types::Nullable::Present(f.clone()),
-        None => types::Nullable::Null,
-    };
-    models::DecisionInstanceGetQueryResult::new(
-        row.decision_id.clone(),
-        models::DecisionDefinitionKey(row.decision_key.to_string()),
-        row.decision_name.clone(),
-        row.decision_type
-            .parse()
-            .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
-        row.version,
-        row.eval_instance_key.clone(),
-        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
-        types::Nullable::Present(models::ElementInstanceKey(
-            row.element_instance_key.to_string(),
-        )),
+    let models::DecisionInstanceResult {
+        business_id,
+        decision_definition_id,
+        decision_definition_key,
+        decision_definition_name,
+        decision_definition_type,
+        decision_definition_version,
+        decision_evaluation_instance_key,
+        decision_evaluation_key,
+        element_instance_key,
         evaluation_date,
         evaluation_failure,
         process_definition_key,
-        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
-        row.result_json.clone(),
-        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
-        types::Nullable::Null,
-        row.state
-            .parse()
-            .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
-        row.tenant_id.clone(),
-        decision_instance_inputs(&row.inputs_json),
-        decision_instance_rules(&row.rules_json),
-    )
+        process_instance_key,
+        result,
+        root_decision_definition_key,
+        root_process_instance_key,
+        state,
+        tenant_id,
+    } = decision_instance_result(row, business_id);
+    models::DecisionInstanceGetQueryResult {
+        business_id,
+        decision_definition_id,
+        decision_definition_key,
+        decision_definition_name,
+        decision_definition_type,
+        decision_definition_version,
+        decision_evaluation_instance_key,
+        decision_evaluation_key,
+        element_instance_key,
+        evaluation_date,
+        evaluation_failure,
+        process_definition_key,
+        process_instance_key,
+        result,
+        root_decision_definition_key,
+        root_process_instance_key,
+        state,
+        tenant_id,
+        evaluated_inputs: decision_instance_inputs(&row.inputs_json),
+        matched_rules: decision_instance_rules(&row.rules_json),
+    }
 }
 
 /// Evaluates a process-instance `variables` filter against an instance's
@@ -19610,29 +19707,29 @@ fn process_instance_result(
         None => types::Nullable::Null,
     };
 
-    models::ProcessInstanceResult::new(
+    models::ProcessInstanceResult {
         process_definition_id,
-        types::Nullable::Null,
-        version,
-        types::Nullable::Null,
+        process_definition_name: types::Nullable::Null,
+        process_definition_version: version,
+        process_definition_version_tag: types::Nullable::Null,
         start_date,
-        types::Nullable::Null,
-        state_enum,
-        instance.has_incident,
-        "<default>".to_string(),
-        models::ProcessInstanceKey(instance.key.to_string()),
-        models::ProcessDefinitionKey(process_definition_key),
+        end_date: types::Nullable::Null,
+        state: state_enum,
+        suspended_date,
+        has_incident: instance.has_incident,
+        tenant_id: "<default>".to_string(),
+        process_instance_key: models::ProcessInstanceKey(instance.key.to_string()),
+        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
         parent_process_instance_key,
         parent_element_instance_key,
         root_process_instance_key,
-        instance.tags.clone().into_iter().map(models::Tag).collect(),
-        instance
+        tags: instance.tags.clone().into_iter().map(models::Tag).collect(),
+        business_id: instance
             .business_id
             .clone()
             .map(types::Nullable::Present)
             .unwrap_or(types::Nullable::Null),
-        suspended_date,
-    )
+    }
 }
 
 /// A synthesized resource (file) name for a process id. The engine does not
@@ -19655,16 +19752,19 @@ fn process_definition_result(
         Some(n) => types::Nullable::Present(n.clone()),
         None => types::Nullable::Null,
     };
-    models::ProcessDefinitionResult::new(
+    models::ProcessDefinitionResult {
         name,
-        resource_name(&id),
-        deployed.version,
-        types::Nullable::Null,
-        id,
-        "<default>".to_string(),
-        models::ProcessDefinitionKey(deployed.key.to_string()),
-        false,
-    )
+        resource_name: resource_name(&id),
+        version: deployed.version,
+        version_tag: types::Nullable::Null,
+        process_definition_id: id,
+        tenant_id: "<default>".to_string(),
+        process_definition_key: models::ProcessDefinitionKey(deployed.key.to_string()),
+        has_start_form: false,
+        // Nano has no process-definition deletion, so no definition is ever
+        // `DRAINING` or `DELETED`.
+        state: "ACTIVE".to_string(),
+    }
 }
 
 /// The byte length beyond which a variable value is truncated in search results
@@ -20159,34 +20259,38 @@ fn agent_tool_call_from(c: &models::AgentInstanceToolCall) -> agent_model::Agent
 }
 
 /// Maps engine per-turn metrics to the REST `AgentInstanceHistoryItemMetrics`
-/// (the canonical 8.10 subset: input/output tokens + duration).
+/// (every 8.10 per-turn counter; each is null when the turn did not report it).
 fn agent_history_metrics_result(
     m: &agent_model::AgentHistoryMetrics,
 ) -> models::AgentInstanceHistoryItemMetrics {
-    models::AgentInstanceHistoryItemMetrics::new(
-        m.input_tokens
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-        m.output_tokens
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-        m.duration_ms
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-    )
+    let n = |v: Option<i64>| v.map_or(types::Nullable::Null, types::Nullable::Present);
+    models::AgentInstanceHistoryItemMetrics {
+        input_tokens: n(m.input_tokens),
+        output_tokens: n(m.output_tokens),
+        reasoning_token_count: n(m.reasoning_token_count),
+        cache_creation_token_count: n(m.cache_creation_token_count),
+        cache_read_token_count: n(m.cache_read_token_count),
+        duration_ms: n(m.duration_ms),
+    }
 }
 
-/// Maps a REST per-turn metrics block to the engine metrics (the extra token
-/// counters the engine carries are not part of the 8.10 request, so default to 0).
+/// Maps a REST per-turn metrics block to the engine metrics. An absent or
+/// explicit-null counter is `None`. No `..Default::default()`: a counter the
+/// engine gains must be mapped here, not silently zeroed.
 fn agent_history_metrics_from(
-    m: &models::AgentInstanceHistoryItemMetrics,
+    m: &models::AgentInstanceHistoryItemMetricsRequest,
 ) -> agent_model::AgentHistoryMetrics {
-    let val = |n: &types::Nullable<i64>| match n {
-        types::Nullable::Present(v) => Some(*v),
-        types::Nullable::Null => None,
+    let val = |n: &Option<types::Nullable<i64>>| match n {
+        Some(types::Nullable::Present(v)) => Some(*v),
+        Some(types::Nullable::Null) | None => None,
     };
     agent_model::AgentHistoryMetrics {
         input_tokens: val(&m.input_tokens),
         output_tokens: val(&m.output_tokens),
+        reasoning_token_count: val(&m.reasoning_token_count),
+        cache_creation_token_count: val(&m.cache_creation_token_count),
+        cache_read_token_count: val(&m.cache_read_token_count),
         duration_ms: val(&m.duration_ms),
-        ..Default::default()
     }
 }
 
@@ -20227,12 +20331,15 @@ fn agent_instance_result(
             row.provider.clone().unwrap_or_default(),
             agent_system_prompt(&row.system_prompt)?,
         ),
-        models::AgentInstanceMetrics::new(
-            row.input_tokens,
-            row.output_tokens,
-            row.model_calls as i32,
-            row.tool_calls as i32,
-        ),
+        models::AgentInstanceMetrics {
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            reasoning_token_count: row.reasoning_token_count,
+            cache_creation_token_count: row.cache_creation_token_count,
+            cache_read_token_count: row.cache_read_token_count,
+            model_calls: row.model_calls as i32,
+            tool_calls: row.tool_calls as i32,
+        },
         models::AgentInstanceLimits::new(
             row.max_model_calls as i32,
             row.max_tool_calls as i32,
@@ -20765,7 +20872,10 @@ fn job_kind_enums(
 
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
 /// process-definition identity is denormalized onto the row at projection time.
-fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
+fn job_search_result(
+    job: &readstore::JobRow,
+    business_id: types::Nullable<String>,
+) -> models::JobSearchResult {
     let process_definition_id = job.process_definition_id.clone();
     let process_definition_key = job.process_definition_key.clone();
 
@@ -20778,33 +20888,35 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
 
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
-    let mut result = models::JobSearchResult::new(
-        std::collections::HashMap::new(),
+    let mut result = models::JobSearchResult {
+        custom_headers: std::collections::HashMap::new(),
         deadline,
-        types::Nullable::Null,
-        types::Nullable::Present(job.element_id.clone()),
-        models::ElementInstanceKey(job.element_instance_key.to_string()),
-        types::Nullable::Null,
-        types::Nullable::Null,
-        types::Nullable::Null,
-        false,
-        types::Nullable::Null,
-        models::JobKey(job.key.to_string()),
-        job_kind_enum,
-        job_listener_event_type_enum,
+        denied_reason: types::Nullable::Null,
+        element_id: types::Nullable::Present(job.element_id.clone()),
+        element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
+        end_time: types::Nullable::Null,
+        error_code: types::Nullable::Null,
+        error_message: types::Nullable::Null,
+        has_failed_with_retries_left: false,
+        is_denied: types::Nullable::Null,
+        job_key: models::JobKey(job.key.to_string()),
+        kind: job_kind_enum,
+        listener_event_type: job_listener_event_type_enum,
         process_definition_id,
-        models::ProcessDefinitionKey(process_definition_key),
-        models::ProcessInstanceKey(job.instance_key.to_string()),
-        types::Nullable::Null,
-        job.retries,
-        job_state_enum(job.state),
-        "<default>".to_string(),
-        job.job_type.clone(),
-        job.worker.clone().unwrap_or_default(),
-        types::Nullable::Null,
-        types::Nullable::Null,
-        0,
-    );
+        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
+        process_instance_key: models::ProcessInstanceKey(job.instance_key.to_string()),
+        root_process_instance_key: types::Nullable::Null,
+        business_id,
+        retries: job.retries,
+        state: job_state_enum(job.state),
+        tenant_id: "<default>".to_string(),
+        r_type: job.job_type.clone(),
+        worker: job.worker.clone().unwrap_or_default(),
+        creation_time: types::Nullable::Null,
+        last_update_time: types::Nullable::Null,
+        priority: 0,
+        fetched_variables: None,
+    };
     // nano extension (#986): surface the declared read-set recorded on the durable
     // `JobActivated`. Omitted (`Null`) when the activation declared none, so a
     // fetch-all / undeclared activation reads as `null` rather than "[]".
@@ -20836,6 +20948,7 @@ fn user_task_state_enum(state: nanobpmn_engine_core::UserTaskState) -> models::U
 fn user_task_result(
     task: &readstore::UserTaskRow,
     roots: &readstore::RootResolver,
+    business_id: types::Nullable<String>,
 ) -> models::UserTaskResult {
     let creation_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
@@ -20851,46 +20964,46 @@ fn user_task_result(
         }
     };
 
-    let mut result = models::UserTaskResult::new(
-        types::Nullable::Null,
-        user_task_state_enum(task.state),
-        match &task.assignee {
+    models::UserTaskResult {
+        name: types::Nullable::Null,
+        state: user_task_state_enum(task.state),
+        assignee: match &task.assignee {
             Some(a) => types::Nullable::Present(a.clone()),
             None => types::Nullable::Null,
         },
-        task.element_id.clone(),
-        task.candidate_groups.clone(),
-        task.candidate_users.clone(),
-        task.process_definition_id.clone(),
+        element_id: task.element_id.clone(),
+        candidate_groups: task.candidate_groups.clone(),
+        candidate_users: task.candidate_users.clone(),
+        process_definition_id: task.process_definition_id.clone(),
         creation_date,
-        types::Nullable::Null,
-        parse_date(&task.follow_up_date),
-        parse_date(&task.due_date),
-        "<default>".to_string(),
-        match &task.external_form_reference {
+        completion_date: types::Nullable::Null,
+        follow_up_date: parse_date(&task.follow_up_date),
+        due_date: parse_date(&task.due_date),
+        tenant_id: "<default>".to_string(),
+        external_form_reference: match &task.external_form_reference {
             Some(r) => types::Nullable::Present(r.clone()),
             None => types::Nullable::Null,
         },
-        task.process_definition_version,
-        std::collections::HashMap::new(),
-        models::UserTaskKey(task.key.to_string()),
-        models::ElementInstanceKey(task.element_instance_key.to_string()),
-        types::Nullable::Null,
-        models::ProcessDefinitionKey(task.process_definition_key.clone()),
-        models::ProcessInstanceKey(task.instance_key.to_string()),
-        types::Nullable::Present(models::ProcessInstanceKey(
+        process_definition_version: task.process_definition_version,
+        custom_headers: std::collections::HashMap::new(),
+        priority: task.priority.clamp(0, 100) as u8,
+        user_task_key: models::UserTaskKey(task.key.to_string()),
+        element_instance_key: models::ElementInstanceKey(task.element_instance_key.to_string()),
+        process_name: types::Nullable::Null,
+        process_definition_key: models::ProcessDefinitionKey(task.process_definition_key.clone()),
+        process_instance_key: models::ProcessInstanceKey(task.instance_key.to_string()),
+        root_process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
             roots
                 .root_process_instance_key(task.instance_key)
                 .to_string(),
         )),
-        match task.form_key {
+        business_id,
+        form_key: match task.form_key {
             Some(k) => types::Nullable::Present(models::FormKey(k.to_string())),
             None => types::Nullable::Null,
         },
-        Vec::new(),
-    );
-    result.priority = task.priority.clamp(0, 100) as u8;
-    result
+        tags: Vec::new(),
+    }
 }
 
 /// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,
@@ -21089,10 +21202,28 @@ fn reconcile_lease_token_counted(
     Ok(token)
 }
 
+/// The `waitStateType` discriminator of a wait-state detail — the single
+/// source of a wait state's type (the detail models carry it as their tag).
+fn wait_state_type_of(details: &models::WaitStateDetails) -> &str {
+    use models::WaitStateDetails as D;
+    match details {
+        D::JobWaitStateDetails(d) => &d.wait_state_type,
+        D::MessageWaitStateDetails(d) => &d.wait_state_type,
+        D::UserTaskWaitStateDetails(d) => &d.wait_state_type,
+        D::TimerWaitStateDetails(d) => &d.wait_state_type,
+        D::SignalWaitStateDetails(d) => &d.wait_state_type,
+        D::ConditionWaitStateDetails(d) => &d.wait_state_type,
+    }
+}
+
 /// Human-readable 400 detail for a request that supplied both `jobLeaseToken`
 /// and its deprecated legacy alias with conflicting values.
 const CONFLICTING_LEASE_TOKENS_DETAIL: &str = "jobLeaseToken and the deprecated legacy alias (leaseToken/jobLease) were both supplied \
      with different values. Supply only jobLeaseToken.";
+
+/// Camunda's default physical tenant id (`PhysicalTenantIds.DEFAULT_PHYSICAL_TENANT_ID`),
+/// the one every Nano activation is served by — Nano has no physical tenants.
+const DEFAULT_PHYSICAL_TENANT_ID: &str = "default";
 
 fn activated_job_result(
     activated: ActivatedJobWithIdentity,
@@ -21137,31 +21268,38 @@ fn activated_job_result(
         .collect();
     let tags: Vec<models::Tag> = job.tags.iter().cloned().map(models::Tag).collect();
 
-    let mut result = models::ActivatedJobResult::new(
-        job.job_type,
-        process_id,
-        version,
-        job.element_id,
+    let mut result = models::ActivatedJobResult {
+        r_type: job.job_type,
+        process_definition_id: process_id,
+        process_definition_version: version,
+        element_id: job.element_id,
         custom_headers,
-        job.worker,
-        job.retries,
-        job.deadline as i64,
+        worker: job.worker,
+        retries: job.retries,
+        deadline: job.deadline as i64,
         variables,
-        "<default>".to_string(),
-        models::JobKey(job.key.to_string()),
-        models::ProcessInstanceKey(job.instance_key.to_string()),
-        models::ProcessDefinitionKey(process_definition_key),
-        models::ElementInstanceKey(job.element_instance_key.to_string()),
-        job_kind_enum,
-        job_listener_event_type_enum,
-        nanobpm_gateway_rest::types::Nullable::Null,
+        tenant_id: "<default>".to_string(),
+        // Nano has no physical tenants: every activation is served by Camunda's
+        // default one (`PhysicalTenantIds.DEFAULT_PHYSICAL_TENANT_ID`).
+        physical_tenant_id: DEFAULT_PHYSICAL_TENANT_ID.to_string(),
+        job_key: models::JobKey(job.key.to_string()),
+        process_instance_key: models::ProcessInstanceKey(job.instance_key.to_string()),
+        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
+        element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
+        kind: job_kind_enum,
+        listener_event_type: job_listener_event_type_enum,
+        user_task: types::Nullable::Null,
         tags,
-        nanobpm_gateway_rest::types::Nullable::Null,
-        job.priority,
-        job.lease_token
-            .map(|lease| types::Nullable::Present(lease.to_string()))
-            .unwrap_or(types::Nullable::Null),
-    );
+        root_process_instance_key: types::Nullable::Null,
+        business_id: job
+            .business_id
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        priority: job.priority,
+        job_lease_token: job
+            .lease_token
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        lease_token: None,
+    };
     // Deprecation window (#1283): also emit the pre-8.10 `leaseToken` name so
     // workers that have not yet moved to `jobLeaseToken` keep receiving their
     // token. Mirrors jobLeaseToken exactly (null when the job is unleased).
@@ -26369,11 +26507,11 @@ mod clustered_startup_tests {
         let items = loop_until_wait_states(&server, None, 2).await;
         let job = items
             .iter()
-            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::Job)
+            .find(|w| ws_type(w) == models::WaitStateTypeEnum::Job)
             .expect("a JOB wait state");
         let msg = items
             .iter()
-            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::Message)
+            .find(|w| ws_type(w) == models::WaitStateTypeEnum::Message)
             .expect("a MESSAGE wait state");
 
         // JOB wait state: the service-task element parked on its activatable job.
@@ -26388,7 +26526,7 @@ mod clustered_startup_tests {
             job.root_process_instance_key,
             types::Nullable::Present(models::ProcessInstanceKey(charger_key.to_string()))
         );
-        let jd = match &job.job_details {
+        let jd = match job_details(job) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("JOB wait state carries job details"),
         };
@@ -26403,7 +26541,7 @@ mod clustered_startup_tests {
             "JOB wait state carries a present, positive retries count, got {:?}",
             jd.retries
         );
-        assert!(matches!(job.message_details, types::Nullable::Null));
+        assert!(matches!(message_details(job), types::Nullable::Null));
 
         // MESSAGE wait state: the message catch parked on its open subscription.
         assert_eq!(msg.element_id, "await");
@@ -26412,7 +26550,7 @@ mod clustered_startup_tests {
             models::WaitStateElementTypeEnum::IntermediateCatchEvent
         );
         assert_eq!(msg.process_instance_key.0, waiter_key.to_string());
-        let md = match &msg.message_details {
+        let md = match message_details(msg) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("MESSAGE wait state carries message details"),
         };
@@ -26421,7 +26559,7 @@ mod clustered_startup_tests {
             md.correlation_key,
             types::Nullable::Present("A1".to_string())
         );
-        assert!(matches!(msg.job_details, types::Nullable::Null));
+        assert!(matches!(job_details(msg), types::Nullable::Null));
 
         // Filter by waitStateType = MESSAGE yields only the message wait state.
         let only_msg_filter = models::ElementInstanceWaitStateFilter {
@@ -26433,6 +26571,7 @@ mod clustered_startup_tests {
         let resp = server
             .search_element_instance_wait_states_impl(&Some(
                 models::ElementInstanceWaitStateQuery {
+                    sort: None,
                     page: None,
                     filter: Some(only_msg_filter),
                 },
@@ -26444,7 +26583,7 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(
-            result.items[0].wait_state_type,
+            ws_type(&result.items[0]),
             models::WaitStateTypeEnum::Message
         );
 
@@ -26460,6 +26599,7 @@ mod clustered_startup_tests {
         let resp = server
             .search_element_instance_wait_states_impl(&Some(
                 models::ElementInstanceWaitStateQuery {
+                    sort: None,
                     page: None,
                     filter: Some(only_charger),
                 },
@@ -26525,7 +26665,7 @@ mod clustered_startup_tests {
         let items = loop_until_wait_states(&server, Some(user_task_filter.clone()), 1).await;
         let park = items
             .iter()
-            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::UserTask)
+            .find(|w| ws_type(w) == models::WaitStateTypeEnum::UserTask)
             .expect("a USER_TASK wait state");
         assert_eq!(park.element_id, "review");
         assert_eq!(
@@ -26540,7 +26680,7 @@ mod clustered_startup_tests {
         );
         // The park carries userTaskDetails with a present taskKey (and no job or
         // message details).
-        let ud = match &park.user_task_details {
+        let ud = match user_task_details(park) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("USER_TASK wait state carries user task details"),
         };
@@ -26552,8 +26692,8 @@ mod clustered_startup_tests {
             matches!(ud.due_date, types::Nullable::Null),
             "dueDate is present-but-null for a task without a due date"
         );
-        assert!(matches!(park.job_details, types::Nullable::Null));
-        assert!(matches!(park.message_details, types::Nullable::Null));
+        assert!(matches!(job_details(park), types::Nullable::Null));
+        assert!(matches!(message_details(park), types::Nullable::Null));
 
         // Short-circuit guard (suppressed advisory, main.rs:9704): a concrete
         // `waitStateType` filter skips the read-model scans it excludes. Filtering
@@ -26569,6 +26709,7 @@ mod clustered_startup_tests {
         let message_resp = server
             .search_element_instance_wait_states_impl(&Some(
                 models::ElementInstanceWaitStateQuery {
+                    sort: None,
                     page: None,
                     filter: Some(message_filter),
                 },
@@ -26583,7 +26724,7 @@ mod clustered_startup_tests {
             message_result
                 .items
                 .iter()
-                .all(|w| w.wait_state_type == models::WaitStateTypeEnum::Message),
+                .all(|w| ws_type(w) == models::WaitStateTypeEnum::Message),
             "a MESSAGE filter surfaces only MESSAGE wait states — no USER_TASK leak"
         );
 
@@ -26611,6 +26752,7 @@ mod clustered_startup_tests {
             let resp = server
                 .search_element_instance_wait_states_impl(&Some(
                     models::ElementInstanceWaitStateQuery {
+                        sort: None,
                         page: None,
                         filter: Some(user_task_filter.clone()),
                     },
@@ -26690,11 +26832,11 @@ mod clustered_startup_tests {
         let job = items
             .iter()
             .find(|w| {
-                w.wait_state_type == models::WaitStateTypeEnum::Job
+                ws_type(w) == models::WaitStateTypeEnum::Job
                     && w.process_instance_key.0 == charger_key.to_string()
             })
             .expect("the activated service-task job is still a JOB wait state");
-        let jd = match &job.job_details {
+        let jd = match job_details(job) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("JOB wait state carries job details"),
         };
@@ -27022,6 +27164,7 @@ mod clustered_startup_tests {
         // Publish the message that correlates the open subscription.
         let correlate = server
             .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: None,
                 name: "OrderPlaced".to_string(),
                 correlation_key: Some("A1".to_string()),
                 variables: None,
@@ -27205,6 +27348,7 @@ mod clustered_startup_tests {
             let resp = server
                 .search_element_instance_wait_states_impl(&Some(
                     models::ElementInstanceWaitStateQuery {
+                        sort: None,
                         page: None,
                         filter: filter.clone(),
                     },
@@ -27225,6 +27369,47 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("wait states never reached {want} resolved items");
+    }
+
+    /// The wait state's type, derived from its discriminated `details`.
+    fn ws_type(w: &models::ElementInstanceWaitStateResult) -> models::WaitStateTypeEnum {
+        wait_state_type_of(&w.details)
+            .parse()
+            .expect("a known waitStateType")
+    }
+
+    /// `JOB` details of a wait state (`Null` for any other type).
+    fn job_details(
+        w: &models::ElementInstanceWaitStateResult,
+    ) -> types::Nullable<models::JobWaitStateDetails> {
+        match &w.details {
+            models::WaitStateDetails::JobWaitStateDetails(d) => types::Nullable::Present(d.clone()),
+            _ => types::Nullable::Null,
+        }
+    }
+
+    /// `MESSAGE` details of a wait state (`Null` for any other type).
+    fn message_details(
+        w: &models::ElementInstanceWaitStateResult,
+    ) -> types::Nullable<models::MessageWaitStateDetails> {
+        match &w.details {
+            models::WaitStateDetails::MessageWaitStateDetails(d) => {
+                types::Nullable::Present(d.clone())
+            }
+            _ => types::Nullable::Null,
+        }
+    }
+
+    /// `USER_TASK` details of a wait state (`Null` for any other type).
+    fn user_task_details(
+        w: &models::ElementInstanceWaitStateResult,
+    ) -> types::Nullable<models::UserTaskWaitStateDetails> {
+        match &w.details {
+            models::WaitStateDetails::UserTaskWaitStateDetails(d) => {
+                types::Nullable::Present(d.clone())
+            }
+            _ => types::Nullable::Null,
+        }
     }
 
     #[tokio::test]
@@ -33596,50 +33781,71 @@ mod clustered_startup_tests {
 
     #[tokio::test]
     async fn rest_batch_update_jobs_validates_and_mints_a_batch_key() {
-        use apis::job::BatchUpdateJobsResponse as Resp;
+        use apis::job::UpdateJobsBatchOperationResponse as Resp;
         let server = ServerImpl::default();
+        let request =
+            |changeset| models::JobBatchUpdateRequest::new(models::JobFilter::new(), changeset);
+        let rejected = |resp| matches!(resp, Resp::Status400_TheJobBatchUpdateOperationFailed(_));
 
-        // A valid changeset (priority within 0..=100) mints a trackable batch key.
-        let mut changeset = models::JobUpdateBatchChangeset::new();
-        changeset.priority = Some(types::Nullable::Present(50));
-        let req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), changeset);
-        let resp = server
-            .batch_update_jobs_impl(&req)
-            .await
-            .expect("handler runs");
-        let Resp::Status200_TheBatchOperationWasCreated(result) = resp else {
-            panic!("expected 200 for a valid batch update");
-        };
-        assert_eq!(result.batch_operation_type, "UPDATE_JOB");
-        assert!(
-            result.batch_operation_key.parse::<u64>().is_ok(),
-            "the minted batch-operation key is numeric"
-        );
+        // Each changeset field alone is a valid update and mints a trackable batch key.
+        for field in ["priority", "retries", "timeout"] {
+            let mut changeset = models::JobChangeset::new();
+            match field {
+                "priority" => changeset.priority = Some(types::Nullable::Present(50)),
+                "retries" => changeset.retries = Some(types::Nullable::Present(3)),
+                _ => changeset.timeout = Some(types::Nullable::Present(60_000)),
+            }
+            let resp = server
+                .update_jobs_batch_operation_impl(&request(changeset))
+                .await
+                .expect("handler runs");
+            let Resp::Status200_TheBatchOperationWasCreated(result) = resp else {
+                panic!("expected 200 for a valid `{field}` batch update");
+            };
+            assert_eq!(
+                result.batch_operation_type,
+                models::BatchOperationTypeEnum::UpdateJob
+            );
+            assert!(
+                result.batch_operation_key.parse::<u64>().is_ok(),
+                "the minted batch-operation key is numeric"
+            );
+        }
 
         // An empty changeset is a 400.
-        let empty = models::JobUpdateBatchOperationRequest::new(
-            models::JobFilter::new(),
-            models::JobUpdateBatchChangeset::new(),
-        );
         assert!(
-            matches!(
-                server.batch_update_jobs_impl(&empty).await.unwrap(),
-                Resp::Status400_TheProvidedDataIsNotValid(_)
+            rejected(
+                server
+                    .update_jobs_batch_operation_impl(&request(models::JobChangeset::new()))
+                    .await
+                    .unwrap()
             ),
             "an empty changeset must be rejected"
         );
 
-        // A priority outside 0..=100 is a 400.
-        let mut bad = models::JobUpdateBatchChangeset::new();
-        bad.priority = Some(types::Nullable::Present(200));
-        let bad_req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), bad);
-        assert!(
-            matches!(
-                server.batch_update_jobs_impl(&bad_req).await.unwrap(),
-                Resp::Status400_TheProvidedDataIsNotValid(_)
-            ),
-            "an out-of-range priority must be rejected"
-        );
+        // Out-of-range values are 400s: priority outside 0..=100, and — since the
+        // upstream schema types them as signed — negative retries/timeout.
+        let mut bad_priority = models::JobChangeset::new();
+        bad_priority.priority = Some(types::Nullable::Present(200));
+        let mut bad_retries = models::JobChangeset::new();
+        bad_retries.retries = Some(types::Nullable::Present(-1));
+        let mut bad_timeout = models::JobChangeset::new();
+        bad_timeout.timeout = Some(types::Nullable::Present(-1));
+        for (what, changeset) in [
+            ("priority", bad_priority),
+            ("retries", bad_retries),
+            ("timeout", bad_timeout),
+        ] {
+            assert!(
+                rejected(
+                    server
+                        .update_jobs_batch_operation_impl(&request(changeset))
+                        .await
+                        .unwrap()
+                ),
+                "an out-of-range {what} must be rejected"
+            );
+        }
     }
 
     /// Wait for a job of `job_type` to project into the read model, returning its
@@ -35315,6 +35521,7 @@ mod adhoc_result_mapping_tests {
     fn plain_completion_has_no_adhoc_result() {
         assert!(adhoc_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35327,6 +35534,7 @@ mod adhoc_result_mapping_tests {
     #[test]
     fn user_task_result_is_not_an_adhoc_result() {
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35357,6 +35565,7 @@ mod adhoc_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35386,6 +35595,7 @@ mod task_result_mapping_tests {
     fn plain_and_adhoc_completions_have_no_task_result() {
         assert!(task_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35400,6 +35610,7 @@ mod task_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35413,6 +35624,7 @@ mod task_result_mapping_tests {
     #[test]
     fn empty_user_task_result_stays_on_the_fast_path() {
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35434,6 +35646,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35458,6 +35671,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35473,6 +35687,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35510,6 +35725,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35550,6 +35766,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -36027,7 +36244,7 @@ mod batch_operation_tests {
         assert_eq!(got.state, models::BatchOperationStateEnum::Active);
         assert_eq!(
             got.batch_operation_type,
-            models::BatchOperationTypeEnum::CancelProcessInstance
+            types::Nullable::Present(models::BatchOperationTypeEnum::CancelProcessInstance)
         );
         assert!(got.operations_total_count >= 1);
         assert_eq!(got.operations_completed_count, 0);
@@ -38202,6 +38419,54 @@ mod call_activity_hierarchy_read_model_tests {
         );
     }
 
+    /// Defect class: rust-axum seeds a discriminated-`oneOf` member's tag with
+    /// its *schema name* (`AgentInstanceTextContent`, `JobWaitStateDetails`)
+    /// instead of the discriminator *mapping key* (`TEXT`, `JOB`) and forces it
+    /// onto the wire via `serialize_with`. Typed round-trips cannot see this, so
+    /// assert the serialized tag of members built through the generated `new()`.
+    #[test]
+    fn discriminated_union_members_serialize_their_mapping_key() {
+        let tag = |v: serde_json::Value, prop: &str| v[prop].as_str().unwrap().to_string();
+        let text = models::AgentInstanceMessageContent::AgentInstanceTextContent(
+            models::AgentInstanceTextContent::new("hi".into()),
+        );
+        assert_eq!(
+            tag(serde_json::to_value(&text).unwrap(), "contentType"),
+            "TEXT"
+        );
+        let job: models::WaitStateDetails = models::JobWaitStateDetails::new(
+            models::JobKey("1".into()),
+            "t".into(),
+            models::JobKindEnum::BpmnElement,
+            types::Nullable::Null,
+            types::Nullable::Present(1),
+        )
+        .into();
+        assert_eq!(
+            tag(serde_json::to_value(&job).unwrap(), "waitStateType"),
+            "JOB"
+        );
+        let msg: models::WaitStateDetails =
+            models::MessageWaitStateDetails::new("m".into(), types::Nullable::Null).into();
+        assert_eq!(
+            tag(serde_json::to_value(&msg).unwrap(), "waitStateType"),
+            "MESSAGE"
+        );
+        let task: models::WaitStateDetails = models::UserTaskWaitStateDetails::new(
+            models::UserTaskKey("2".into()),
+            types::Nullable::Null,
+        )
+        .into();
+        assert_eq!(
+            tag(serde_json::to_value(&task).unwrap(), "waitStateType"),
+            "USER_TASK"
+        );
+        // And the wire form deserializes back to the same member.
+        let back: models::WaitStateDetails =
+            serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
+        assert_eq!(back, job);
+    }
+
     #[test]
     fn agent_content_union_roundtrips_without_string_encoding() {
         for value in [
@@ -38254,14 +38519,29 @@ mod call_activity_hierarchy_read_model_tests {
         assert!(agent_history_turn_from(&item, 1, "").metrics.is_none());
         item.metrics = Some(types::Nullable::Null);
         assert!(agent_history_turn_from(&item, 1, "").metrics.is_none());
-        let metrics = models::AgentInstanceHistoryItemMetrics::new(
-            types::Nullable::Null,
-            types::Nullable::Present(0),
-            types::Nullable::Null,
-        );
-        item.metrics = Some(types::Nullable::Present(metrics.clone()));
+        // Every 8.10 per-turn counter survives request → engine → result; an
+        // absent (`None`) or explicit-null counter both read back as null.
+        let metrics = models::AgentInstanceHistoryItemMetricsRequest {
+            input_tokens: Some(types::Nullable::Null),
+            output_tokens: Some(types::Nullable::Present(0)),
+            reasoning_token_count: Some(types::Nullable::Present(7)),
+            cache_creation_token_count: Some(types::Nullable::Present(11)),
+            cache_read_token_count: Some(types::Nullable::Present(13)),
+            duration_ms: None,
+        };
+        item.metrics = Some(types::Nullable::Present(metrics));
         let mapped = agent_history_turn_from(&item, 1, "").metrics.unwrap();
-        assert_eq!(agent_history_metrics_result(&mapped), metrics);
+        assert_eq!(
+            agent_history_metrics_result(&mapped),
+            models::AgentInstanceHistoryItemMetrics {
+                input_tokens: types::Nullable::Null,
+                output_tokens: types::Nullable::Present(0),
+                reasoning_token_count: types::Nullable::Present(7),
+                cache_creation_token_count: types::Nullable::Present(11),
+                cache_read_token_count: types::Nullable::Present(13),
+                duration_ms: types::Nullable::Null,
+            }
+        );
     }
 
     /// Runs `search` with a `parentProcessInstanceKey` filter, returning the keys.
@@ -38411,6 +38691,7 @@ mod call_activity_hierarchy_read_model_tests {
             let resp = server
                 .search_element_instance_wait_states_impl(&Some(
                     models::ElementInstanceWaitStateQuery {
+                        sort: None,
                         page: None,
                         filter: filter.clone(),
                     },

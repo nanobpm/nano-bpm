@@ -7,6 +7,9 @@ paths:
       tags:
         - Job
       operationId: activateJobs
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -35,6 +38,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /jobs/search:
     post:
@@ -42,6 +46,9 @@ paths:
       tags:
         - Job
       operationId: searchJobs
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -69,6 +76,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /jobs/{jobKey}/failure:
     post:
@@ -76,6 +84,8 @@ paths:
       tags:
         - Job
       operationId: failJob
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -122,6 +132,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /jobs/{jobKey}/error:
     post:
@@ -129,6 +140,8 @@ paths:
       tags:
         - Job
       operationId: throwJobError
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -173,6 +186,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /jobs/{jobKey}/completion:
     post:
@@ -180,6 +194,8 @@ paths:
       tags:
         - Job
       operationId: completeJob
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -223,6 +239,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /jobs/{jobKey}:
     patch:
@@ -230,6 +247,8 @@ paths:
       tags:
         - Job
       operationId: updateJob
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -272,103 +291,61 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /jobs/batch-update:
     post:
       x-eventually-consistent: false
       tags:
         - Job
-      operationId: batchUpdateJobs
+      operationId: updateJobsBatchOperation
+      x-required-permissions:
+        - anyOf:
+            - { resourceType: BATCH, permissionType: CREATE }
+            - { resourceType: BATCH, permissionType: CREATE_BATCH_OPERATION_UPDATE_JOB }
       security:
         - bearerAuth: []
         - basicAuth: []
       summary: Update jobs (batch)
-      description: |
-        Creates a batch operation to update jobs matching the given filter. At least one
-        changeset field must be non-null. This is done asynchronously; the progress can be
-        tracked using the batchOperationKey from the response and the batch operation status
-        endpoint (`/batch-operations/{batchOperationKey}`).
+      description: >
+        Creates a batch operation to update jobs matching the given filter.
+        At least one changeset field must be non-null.
+        This is done asynchronously; the progress can be tracked using the batchOperationKey
+        from the response and the batch operation status endpoint (/batch-operations/{batchOperationKey}).
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/JobUpdateBatchOperationRequest'
+              $ref: '#/components/schemas/JobBatchUpdateRequest'
       responses:
         "200":
           description: The batch operation was created.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JobBatchUpdateResult'
+                $ref: 'batch-operations.yaml#/components/schemas/BatchOperationCreatedResult'
         "400":
-          $ref: 'common-responses.yaml#/components/responses/InvalidData'
+          description: >
+            The job batch update operation failed.
+            More details are provided in the response body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
         "401":
           $ref: 'common-responses.yaml#/components/responses/Unauthorized'
+        "403":
+          $ref: 'common-responses.yaml#/components/responses/Forbidden'
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
-        "503":
-          $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.10"
+      x-scope: physical-tenant
 
 ## Schema definitions
 
 components:
   schemas:
-    JobUpdateBatchOperationRequest:
-      description: Batch update job request selecting the jobs to update and the new values.
-      type: object
-      additionalProperties: false
-      required:
-        - filter
-        - changeset
-      properties:
-        filter:
-          allOf:
-            - $ref: '#/components/schemas/JobFilter'
-          description: Filter selecting the jobs to update.
-        changeset:
-          $ref: '#/components/schemas/JobUpdateBatchChangeset'
-        operationReference:
-          $ref: 'keys.yaml#/components/schemas/OperationReference'
-
-    JobUpdateBatchChangeset:
-      description: The changeset to apply to the matched jobs; at least one field must be non-null.
-      type: object
-      additionalProperties: false
-      properties:
-        priority:
-          description: The new job-activation priority (0..=100).
-          type: integer
-          format: int32
-          minimum: 0
-          maximum: 100
-          nullable: true
-          example: 50
-        retries:
-          description: The new number of remaining retries.
-          type: integer
-          format: int32
-          minimum: 0
-          nullable: true
-          example: 3
-
-    JobBatchUpdateResult:
-      description: The created batch operation for the job update.
-      type: object
-      required:
-        - batchOperationKey
-        - batchOperationType
-      properties:
-        batchOperationKey:
-          allOf:
-            - $ref: 'keys.yaml#/components/schemas/BatchOperationKey'
-          description: Key of the created batch operation.
-        batchOperationType:
-          description: The type of the batch operation.
-          type: string
-          example: UPDATE_JOB
-
     JobActivationRequest:
       type: object
       additionalProperties: false
@@ -428,8 +405,11 @@ components:
             Whether to activate the jobs with a lease. When true, each activated job is assigned a
             distinct, opaque lease token, returned as ActivatedJobResult.jobLeaseToken. The lease
             fences the complete, fail, and throw-error commands against a superseded activation of
-            the same job. Once a job has been activated with a lease, it is served only to leasing
-            workers of that job type. Omit or set to false to activate jobs without a lease.
+            the same job (for example, after the job timed out or failed and was re-activated by
+            another worker): a command carrying a stale lease token is rejected rather than racing
+            with the newer activation. Once a job has been activated with a lease, it is served
+            only to leasing workers of that job type; a homogeneous fleet per job type is
+            recommended. Omit or set to false to activate jobs without a lease.
           type: boolean
           nullable: true
       required:
@@ -459,6 +439,7 @@ components:
         - elementId
         - jobKey
         - elementInstanceKey
+        - jobLeaseToken
       type: object
       required:
         - type
@@ -478,10 +459,12 @@ components:
         - kind
         - listenerEventType
         - rootProcessInstanceKey
+        - businessId
         - tags
         - userTask
         - priority
         - jobLeaseToken
+        - physicalTenantId
       properties:
         type:
           description: The type of the job (should match what was requested).
@@ -527,6 +510,11 @@ components:
           allOf:
             - $ref: 'identifiers.yaml#/components/schemas/TenantId'
           description: The ID of the tenant that owns the job.
+        physicalTenantId:
+          type: string
+          description: |
+            The ID of the physical tenant that the job-activation request was routed to;
+            the default physical tenant when the request did not specify one.
         jobKey:
           allOf:
             - $ref: 'keys.yaml#/components/schemas/JobKey'
@@ -564,6 +552,14 @@ components:
           nullable: true
           allOf:
             - $ref: 'keys.yaml#/components/schemas/ProcessInstanceKey'
+        businessId:
+          description: |
+            The business ID of the owning process instance, inherited when the job was created.
+            This is `null` for jobs created before version 8.10 and for jobs whose owning process
+            instance has no business ID.
+          nullable: true
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/BusinessId'
         priority:
           description: >
             The priority of the job. Higher values indicate higher priority.
@@ -572,11 +568,17 @@ components:
           format: int32
         jobLeaseToken:
           description: >
-            The lease token identifying this activation. This is null when the job was
+            The lease token identifying this activation. This is `null` when the job was
             activated without a lease.
           nullable: true
-          type: string
+          x-present-when:
+            request: withLease
+            equals: true
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/JobLeaseToken'
       x-properties-added-in-version:
+        - propertyName: jobKey
+          addedInVersionOverride: "8.6"
         - propertyName: kind
           addedInVersion: "8.8"
         - propertyName: listenerEventType
@@ -589,7 +591,11 @@ components:
           addedInVersion: "8.9"
         - propertyName: priority
           addedInVersion: "8.10"
+        - propertyName: businessId
+          addedInVersion: "8.10"
         - propertyName: jobLeaseToken
+          addedInVersion: "8.10"
+        - propertyName: physicalTenantId
           addedInVersion: "8.10"
 
     UserTaskProperties:
@@ -679,6 +685,7 @@ components:
           description: The field to sort by.
           type: string
           enum:
+            - creationTime
             - deadline
             - deniedReason
             - elementId
@@ -804,6 +811,46 @@ components:
           allOf:
             - $ref: 'filters.yaml#/components/schemas/DateTimeFilterProperty'
       x-properties-added-in-version:
+        - propertyName: deadline
+          addedInVersion: "8.8"
+        - propertyName: deniedReason
+          addedInVersion: "8.8"
+        - propertyName: elementId
+          addedInVersion: "8.8"
+        - propertyName: elementInstanceKey
+          addedInVersion: "8.8"
+        - propertyName: endTime
+          addedInVersion: "8.8"
+        - propertyName: errorCode
+          addedInVersion: "8.8"
+        - propertyName: errorMessage
+          addedInVersion: "8.8"
+        - propertyName: hasFailedWithRetriesLeft
+          addedInVersion: "8.8"
+        - propertyName: isDenied
+          addedInVersion: "8.8"
+        - propertyName: jobKey
+          addedInVersion: "8.8"
+        - propertyName: kind
+          addedInVersion: "8.8"
+        - propertyName: listenerEventType
+          addedInVersion: "8.8"
+        - propertyName: processDefinitionId
+          addedInVersion: "8.8"
+        - propertyName: processDefinitionKey
+          addedInVersion: "8.8"
+        - propertyName: processInstanceKey
+          addedInVersion: "8.8"
+        - propertyName: retries
+          addedInVersion: "8.8"
+        - propertyName: state
+          addedInVersion: "8.8"
+        - propertyName: tenantId
+          addedInVersion: "8.8"
+        - propertyName: type
+          addedInVersion: "8.8"
+        - propertyName: worker
+          addedInVersion: "8.8"
         - propertyName: creationTime
           addedInVersion: "8.9"
         - propertyName: lastUpdateTime
@@ -845,6 +892,7 @@ components:
         - type
         - worker
         - rootProcessInstanceKey
+        - businessId
         - creationTime
         - deadline
         - deniedReason
@@ -927,6 +975,14 @@ components:
           nullable: true
           allOf:
             - $ref: "keys.yaml#/components/schemas/ProcessInstanceKey"
+        businessId:
+          description: |
+            The business ID of the owning process instance, inherited when the job was created.
+            This is `null` for jobs created before version 8.10 and for jobs whose owning process
+            instance has no business ID.
+          nullable: true
+          allOf:
+            - $ref: "identifiers.yaml#/components/schemas/BusinessId"
         retries:
           description: The amount of retries left to this job.
           type: integer
@@ -959,21 +1015,6 @@ components:
             for such jobs.
           type: integer
           format: int32
-        fetchedVariables:
-          description: >
-            nano extension (not part of the Camunda 8 API). The declared read-set —
-            the `fetchVariables` names the worker asked for on the most recent
-            durable activation of this job that declared a non-empty set — recorded
-            on the `JobActivated` event as engine-native read provenance for post-hoc
-            reification / data-dependency analysis. It is not cleared by a subsequent
-            fetch-all re-activation. `null`/absent when no durable activation has
-            declared a set (fetch-all / undeclared reads) or the activation was not
-            durably recorded (e.g. leader-local activation, which does not export
-            `JobActivated`).
-          nullable: true
-          type: array
-          items:
-            type: string
       x-properties-added-in-version:
         - propertyName: rootProcessInstanceKey
           addedInVersion: "8.9"
@@ -982,6 +1023,8 @@ components:
         - propertyName: lastUpdateTime
           addedInVersion: "8.9"
         - propertyName: priority
+          addedInVersion: "8.10"
+        - propertyName: businessId
           addedInVersion: "8.10"
 
     JobFailRequest:
@@ -1010,11 +1053,18 @@ components:
         jobLeaseToken:
           description: >
             The token identifying a leased job's activation, obtained from
-            ActivatedJobResult.jobLeaseToken. A leased job requires its matching token;
-            missing or stale tokens are rejected. A job activated without a lease
-            requires no token.
+            `ActivatedJobResult.jobLeaseToken`.
+
+            For a leased job, the matching token must be supplied to prove the command comes from
+            the worker that holds the current lease; a command with no token is rejected. A command
+            carrying a stale token is likewise rejected, fencing the job against a superseded
+            activation (for example, after the job timed out or failed and was re-activated by
+            another worker).
+
+            A job that was activated without a lease requires no token.
           nullable: true
-          type: string
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/JobLeaseToken'
       x-properties-added-in-version:
         - propertyName: jobLeaseToken
           addedInVersion: "8.10"
@@ -1041,11 +1091,18 @@ components:
         jobLeaseToken:
           description: >
             The token identifying a leased job's activation, obtained from
-            ActivatedJobResult.jobLeaseToken. A leased job requires its matching token;
-            missing or stale tokens are rejected. A job activated without a lease
-            requires no token.
+            `ActivatedJobResult.jobLeaseToken`.
+
+            For a leased job, the matching token must be supplied to prove the command comes from
+            the worker that holds the current lease; a command with no token is rejected. A command
+            carrying a stale token is likewise rejected, fencing the job against a superseded
+            activation (for example, after the job timed out or failed and was re-activated by
+            another worker).
+
+            A job that was activated without a lease requires no token.
           nullable: true
-          type: string
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/JobLeaseToken'
       required:
         - errorCode
       x-properties-added-in-version:
@@ -1066,15 +1123,39 @@ components:
         jobLeaseToken:
           description: >
             The token identifying a leased job's activation, obtained from
-            ActivatedJobResult.jobLeaseToken. A leased job requires its matching token;
-            missing or stale tokens are rejected. A job activated without a lease
-            requires no token.
+            `ActivatedJobResult.jobLeaseToken`.
+
+            For a leased job, the matching token must be supplied to prove the command comes from
+            the worker that holds the current lease; a command with no token is rejected. A command
+            carrying a stale token is likewise rejected, fencing the job against a superseded
+            activation (for example, after the job timed out or failed and was re-activated by
+            another worker).
+
+            A job that was activated without a lease requires no token.
           nullable: true
-          type: string
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/JobLeaseToken'
+        businessId:
+          nullable: true
+          description: >
+            An optional business id to assign to the process instance the job belongs to, as part
+            of completing the job, letting a worker set the identifier from work it just performed.
+
+            The business id can only be assigned to a root process instance: if the job belongs to
+            a child process instance (one started by a call activity), the completion is rejected.
+            An empty business id is likewise rejected. The assignment is single and irreversible and
+            is only accepted while business id uniqueness is disabled. Only artifacts created after
+            the assignment carry the business id; already-existing ones are not enriched. Completing
+            with a business id that differs from one already assigned rejects the whole completion,
+            leaving the job open; re-sending the identical business id is an idempotent no-op.
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/BusinessId'
       x-properties-added-in-version:
         - propertyName: result
           addedInVersion: "8.8"
         - propertyName: jobLeaseToken
+          addedInVersion: "8.10"
+        - propertyName: businessId
           addedInVersion: "8.10"
 
     JobResult:
@@ -1220,12 +1301,21 @@ components:
         jobLeaseToken:
           description: >
             The token identifying a leased job's activation, obtained from
-            ActivatedJobResult.jobLeaseToken. A supplied token is validated against
-            the current lease. An update without a token applies to support
-            operator and bulk updates, unlike complete, fail, and throw-error
-            requests, which require a token for leased jobs.
+            `ActivatedJobResult.jobLeaseToken`.
+
+            For a leased job, a supplied token is validated to prove the command comes from the
+            worker that holds the current lease; a command carrying a stale token is rejected,
+            fencing the job against a superseded activation (for example, after the job timed out or
+            failed and was re-activated by another worker).
+
+            An update without a token always applies to support operator and bulk updates of
+            leased jobs. Note that this is different from lifecycle requests like complete, fail, and
+            throw-error that always require a token for leased jobs.
+
+            A job that was activated without a lease requires no token.
           nullable: true
-          type: string
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/JobLeaseToken'
       required:
         - changeset
       x-properties-added-in-version:
@@ -1248,6 +1338,41 @@ components:
           format: int64
           description: The new timeout for the job in milliseconds.
           nullable: true
+        priority:
+          type: integer
+          format: int32
+          description: The new priority for the job. Higher values indicate higher priority.
+          nullable: true
+      x-properties-added-in-version:
+        - propertyName: retries
+          addedInVersion: "8.6"
+        - propertyName: timeout
+          addedInVersion: "8.6"
+        - propertyName: priority
+          addedInVersion: "8.10"
+
+    JobBatchUpdateRequest:
+      type: object
+      additionalProperties: false
+      description: >
+        The filter and changeset for a batch job update operation.
+        The filter defines which jobs are updated; the changeset defines what to update.
+        At least one changeset field must be non-null.
+      properties:
+        filter:
+          allOf:
+            - $ref: '#/components/schemas/JobFilter'
+          description: The job filter. At least one dimension must be set.
+        changeset:
+          allOf:
+            - $ref: '#/components/schemas/JobChangeset'
+          description: The fields to update. At least one field must be non-null.
+        operationReference:
+          $ref: 'keys.yaml#/components/schemas/OperationReference'
+      required:
+        - filter
+        - changeset
+      x-added-in-version: "8.10"
 
     ## Enums
 
@@ -1271,7 +1396,9 @@ components:
         - ERROR_THROWN
         - FAILED
         - MIGRATED
+        - PRIORITY_UPDATED
         - RETRIES_UPDATED
+        - TIMEOUT_UPDATED
         - TIMED_OUT
 
     JobKindEnum:

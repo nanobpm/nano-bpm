@@ -377,6 +377,12 @@ jobs:
           echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
       - name: Type-check engine-wasm --features read-model (wasm32)
         run: make engine-wasm-check-read-model
+      - name: Test engine-wasm on the host (--features read-model)
+        # The facade's Rust tests (incl. the read channel and the spec-required
+        # DTO guard, #1291) were compiled for wasm32 above but never *run*.
+        # `--features read-model` runs both test modules; on the host the read
+        # model uses the bundled native SQLite, so no wasm toolchain is involved.
+        run: cargo test --manifest-path engine-wasm/Cargo.toml --features read-model
 
   nano-bernd-npm:
     # Leading @ is reserved for Mergify's @github-app/check syntax.

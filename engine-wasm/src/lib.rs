@@ -1280,7 +1280,15 @@ impl TestEngine {
                 Some(w) => row.state == w,
                 None => true,
             })
-            .map(|row| user_task_result(row, &roots))
+            .map(|row| {
+                // `businessId` is the owning instance's (as the gateway's
+                // `business_id_of`), not inherited from the root.
+                let business_id = self
+                    .read_model
+                    .process_instance(row.instance_key)
+                    .and_then(|pi| pi.business_id);
+                user_task_result(row, &roots, business_id)
+            })
             .collect();
         to_json(&search_result(items))
     }
@@ -1941,6 +1949,9 @@ fn agent_instance_result(row: &AgentInstanceRow) -> Result<serde_json::Value, St
             "outputTokens": row.output_tokens,
             "modelCalls": row.model_calls,
             "toolCalls": row.tool_calls,
+            "reasoningTokenCount": row.reasoning_token_count,
+            "cacheCreationTokenCount": row.cache_creation_token_count,
+            "cacheReadTokenCount": row.cache_read_token_count,
         },
         "limits": {
             "maxTokens": row.max_tokens,
@@ -2241,7 +2252,11 @@ fn is_rfc3339_date_time(s: &str) -> bool {
 /// is one canonical root-walk and no duplicate derivation. A top-level
 /// (self-rooted) task reports its own `processInstanceKey`.
 #[cfg(feature = "read-model")]
-fn user_task_result(task: &UserTaskRow, roots: &RootResolver) -> serde_json::Value {
+fn user_task_result(
+    task: &UserTaskRow,
+    roots: &RootResolver,
+    business_id: Option<String>,
+) -> serde_json::Value {
     serde_json::json!({
         "name": serde_json::Value::Null,
         "state": user_task_state_rest(task.state),
@@ -2267,6 +2282,7 @@ fn user_task_result(task: &UserTaskRow, roots: &RootResolver) -> serde_json::Val
         "formKey": task.form_key.map(|k| k.to_string()),
         "priority": task.priority.clamp(0, 100),
         "tags": Vec::<String>::new(),
+        "businessId": business_id,
     })
 }
 
@@ -5220,6 +5236,151 @@ mod read_channel_tests {
         );
         let done = parse(&eng.search_user_tasks(r#"{"state":"COMPLETED"}"#).unwrap());
         assert_eq!(done["items"].as_array().unwrap().len(), 1);
+    }
+
+    /// `required` property names of the spec schema `name`, following `allOf`
+    /// `$ref`s. Loads every `spec/*.yaml` component schema (refs across files are
+    /// `other.yaml#/components/schemas/X`, so the last path segment names it).
+    fn spec_required(name: &str) -> std::collections::BTreeSet<String> {
+        use serde_yaml::Value as Y;
+        fn schemas() -> std::collections::BTreeMap<String, Y> {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../spec");
+            let mut all = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(&dir).expect("spec/ dir") {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let doc: Y = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                if let Some(Y::Mapping(m)) = doc.get("components").and_then(|c| c.get("schemas")) {
+                    for (k, v) in m {
+                        all.insert(k.as_str().unwrap().to_string(), v.clone());
+                    }
+                }
+            }
+            all
+        }
+        fn walk(
+            all: &std::collections::BTreeMap<String, Y>,
+            s: &Y,
+            out: &mut std::collections::BTreeSet<String>,
+        ) {
+            if let Some(r) = s.get("$ref").and_then(Y::as_str) {
+                let target = r.rsplit('/').next().unwrap();
+                walk(
+                    all,
+                    all.get(target).unwrap_or_else(|| panic!("unresolved {r}")),
+                    out,
+                );
+            }
+            if let Some(Y::Sequence(req)) = s.get("required") {
+                out.extend(req.iter().filter_map(Y::as_str).map(str::to_string));
+            }
+            if let Some(Y::Sequence(parts)) = s.get("allOf") {
+                for p in parts {
+                    walk(all, p, out);
+                }
+            }
+        }
+        let all = schemas();
+        let mut out = std::collections::BTreeSet::new();
+        walk(
+            &all,
+            all.get(name).unwrap_or_else(|| panic!("no schema {name}")),
+            &mut out,
+        );
+        assert!(
+            !out.is_empty(),
+            "{name} declares no required fields — wrong schema?"
+        );
+        out
+    }
+
+    /// Guard (defect class: hand-built read DTOs drifting from the spec the
+    /// published `@nanobpm/engine-wasm/readmodel-types` are generated from). The
+    /// facade builds each read result with `json!`, so nothing forces it to
+    /// track a spec re-sync: #1291's upstream bump made `UserTaskResult.businessId`
+    /// required while the facade kept omitting it — a type that lies to TS
+    /// consumers. Every exported read is exercised against real engine state and
+    /// must carry every spec-`required` key (present, possibly `null`).
+    #[test]
+    fn read_results_carry_every_spec_required_field() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        eng.create_instance("p", r#"{"amount":1}"#, None).unwrap();
+        let form = parse(&eng.deploy_form(r#"{"id":"f","components":[]}"#).unwrap());
+        let resource = parse(&eng.deploy_resource("r.md", "x").unwrap());
+
+        let first = |v: J| v["items"][0].clone();
+        let cases = [
+            (
+                "UserTaskResult",
+                first(parse(&eng.search_user_tasks("").unwrap())),
+            ),
+            (
+                "ProcessInstanceResult",
+                first(parse(&eng.search_process_instances("").unwrap())),
+            ),
+            (
+                "VariableSearchResult",
+                first(parse(&eng.search_variables("").unwrap())),
+            ),
+            (
+                "FormResult",
+                parse(
+                    &eng.get_form_by_key(form["formKey"].as_str().unwrap())
+                        .unwrap(),
+                ),
+            ),
+            (
+                "ResourceResult",
+                parse(
+                    &eng.get_resource_by_key(resource["resourceKey"].as_str().unwrap())
+                        .unwrap(),
+                ),
+            ),
+        ];
+        for (schema, got) in cases {
+            let obj = got
+                .as_object()
+                .unwrap_or_else(|| panic!("{schema}: not an object: {got}"));
+            let missing: Vec<_> = spec_required(schema)
+                .into_iter()
+                .filter(|k| !obj.contains_key(k))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{schema} is missing spec-required {missing:?}: {got}"
+            );
+        }
+    }
+
+    /// `UserTaskResult.businessId` is the owning instance's business id (the
+    /// same source as the gateway's `business_id_of`), `null` when unset.
+    #[test]
+    fn search_user_tasks_surfaces_the_instance_business_id() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        eng.apply(Command::CreateInstance {
+            process_id: "p".into(),
+            variables: Default::default(),
+            tags: Vec::new(),
+            business_id: Some("order-42".into()),
+            process_definition_key: None,
+            version: None,
+        })
+        .unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        let items = parse(&eng.search_user_tasks("").unwrap())["items"].clone();
+        let mut ids: Vec<J> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["businessId"].clone())
+            .collect();
+        ids.sort_by_key(|v| v.to_string());
+        assert_eq!(ids, vec![J::String("order-42".into()), J::Null]);
     }
 
     #[test]

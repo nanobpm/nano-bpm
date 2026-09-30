@@ -7,6 +7,9 @@ paths:
       tags:
         - Element instance
       operationId: searchElementInstances
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -34,6 +37,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /element-instances/wait-states/search:
     post:
@@ -41,6 +45,9 @@ paths:
       tags:
         - Element instance
       operationId: searchElementInstanceWaitStates
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -69,6 +76,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.10"
+      x-scope: physical-tenant
 
   /element-instances/{elementInstanceKey}:
     get:
@@ -76,6 +84,8 @@ paths:
       tags:
         - Element instance
       operationId: getElementInstance
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -112,6 +122,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /element-instances/{elementInstanceKey}/variables:
     put:
@@ -119,6 +130,8 @@ paths:
       tags:
         - Element instance
       operationId: createElementInstanceVariables
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -158,6 +171,8 @@ paths:
         "504":
           $ref: 'common-responses.yaml#/components/responses/GatewayTimeoutTaskListenerBlocking'
       x-added-in-version: "8.6"
+      x-added-in-version-override: "8.6"
+      x-scope: physical-tenant
 
   /element-instances/{elementInstanceKey}/incidents/search:
     post:
@@ -165,6 +180,8 @@ paths:
       tags:
         - Element instance
       operationId: searchElementInstanceIncidents
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -212,6 +229,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /element-instances/ad-hoc-activities/{adHocSubProcessInstanceKey}/activation:
     post:
@@ -219,6 +237,8 @@ paths:
       tags:
         - Ad-hoc sub-process
       operationId: activateAdHocSubProcessActivities
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: UPDATE_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -261,6 +281,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
 ## Schema definitions
 
@@ -285,6 +306,22 @@ components:
             - state
             - incidentKey
             - tenantId
+        order:
+          $ref: 'search-models.yaml#/components/schemas/SortOrderEnum'
+      required:
+        - field
+
+    ElementInstanceWaitStateQuerySortRequest:
+      type: object
+      properties:
+        field:
+          description: The field to sort by.
+          type: string
+          enum:
+            - elementInstanceKey
+            - processInstanceKey
+            - rootProcessInstanceKey
+            - elementId
         order:
           $ref: 'search-models.yaml#/components/schemas/SortOrderEnum'
       required:
@@ -624,6 +661,11 @@ components:
       allOf:
         - $ref: 'search-models.yaml#/components/schemas/SearchQueryRequest'
       properties:
+        sort:
+          description: Sort field criteria.
+          type: array
+          items:
+            $ref: '#/components/schemas/ElementInstanceWaitStateQuerySortRequest'
         filter:
           description: Filter criteria for the inspection.
           allOf:
@@ -775,21 +817,15 @@ components:
       description: An element instance waiting state.
       type: object
       required:
-        - waitStateType
         - processInstanceKey
         - elementInstanceKey
         - elementId
         - elementType
         - tenantId
         - rootProcessInstanceKey
-        - jobDetails
-        - messageDetails
-        - userTaskDetails
+        - bpmnProcessId
+        - details
       properties:
-        waitStateType:
-          description: The type of waiting state an element instance is in.
-          allOf:
-            - $ref: '#/components/schemas/WaitStateTypeEnum'
         rootProcessInstanceKey:
           description: Key of the root process instance.
           nullable: true
@@ -815,21 +851,33 @@ components:
           description: The tenant ID of the element instance.
           allOf:
             - $ref: 'identifiers.yaml#/components/schemas/TenantId'
-        jobDetails:
-          description: Job details, present when waitStateType is JOB.
-          nullable: true
+        bpmnProcessId:
+          description: The BPMN process ID of the process definition associated to this element instance.
+          type: string
+        details:
+          description: Wait-state-specific details, resolved by waitStateType.
           allOf:
-            - $ref: '#/components/schemas/JobWaitStateDetails'
-        messageDetails:
-          description: Message details, present when waitStateType is MESSAGE.
-          nullable: true
-          allOf:
-            - $ref: '#/components/schemas/MessageWaitStateDetails'
-        userTaskDetails:
-          description: User task details, present when waitStateType is USER_TASK.
-          nullable: true
-          allOf:
-            - $ref: '#/components/schemas/UserTaskWaitStateDetails'
+            - $ref: '#/components/schemas/WaitStateDetails'
+
+    WaitStateDetails:
+      x-polymorphic-schema: true
+      description: Wait-state-specific details of an element instance.
+      discriminator:
+        propertyName: waitStateType
+        mapping:
+          JOB: '#/components/schemas/JobWaitStateDetails'
+          MESSAGE: '#/components/schemas/MessageWaitStateDetails'
+          USER_TASK: '#/components/schemas/UserTaskWaitStateDetails'
+          TIMER: '#/components/schemas/TimerWaitStateDetails'
+          SIGNAL: '#/components/schemas/SignalWaitStateDetails'
+          CONDITION: '#/components/schemas/ConditionWaitStateDetails'
+      oneOf:
+        - $ref: '#/components/schemas/JobWaitStateDetails'
+        - $ref: '#/components/schemas/MessageWaitStateDetails'
+        - $ref: '#/components/schemas/UserTaskWaitStateDetails'
+        - $ref: '#/components/schemas/TimerWaitStateDetails'
+        - $ref: '#/components/schemas/SignalWaitStateDetails'
+        - $ref: '#/components/schemas/ConditionWaitStateDetails'
 
     WaitStateTypeEnum:
       description: The type of waiting state an element instance is in.
@@ -838,6 +886,19 @@ components:
         - JOB
         - MESSAGE
         - USER_TASK
+        - TIMER
+        - SIGNAL
+        - CONDITION
+
+    BaseWaitStateDetails:
+      description: Common fields shared by all wait-state details variants.
+      type: object
+      required:
+        - waitStateType
+      properties:
+        waitStateType:
+          description: The wait state type discriminator.
+          type: string
 
     JobWaitStateDetails:
       type: object
@@ -847,6 +908,8 @@ components:
         - jobKind
         - listenerEventType
         - retries
+      allOf:
+        - $ref: '#/components/schemas/BaseWaitStateDetails'
       properties:
         jobKey:
           allOf:
@@ -875,6 +938,8 @@ components:
       required:
         - messageName
         - correlationKey
+      allOf:
+        - $ref: '#/components/schemas/BaseWaitStateDetails'
       properties:
         messageName:
           description: The name of the message being awaited.
@@ -889,6 +954,8 @@ components:
       required:
         - taskKey
         - dueDate
+      allOf:
+        - $ref: '#/components/schemas/BaseWaitStateDetails'
       properties:
         taskKey:
           allOf:
@@ -899,6 +966,57 @@ components:
           nullable: true
           type: string
           format: date-time
+
+    TimerWaitStateDetails:
+      type: object
+      required:
+        - dueDate
+        - repetitions
+      allOf:
+        - $ref: '#/components/schemas/BaseWaitStateDetails'
+      properties:
+        dueDate:
+          description: When the timer is due, as a UNIX epoch timestamp in milliseconds.
+          nullable: true
+          type: integer
+          format: int64
+        repetitions:
+          description: The number of remaining timer repetitions (-1 for infinite, 0 for non-repeating).
+          nullable: true
+          type: integer
+          format: int32
+
+    SignalWaitStateDetails:
+      type: object
+      required:
+        - signalName
+      allOf:
+        - $ref: '#/components/schemas/BaseWaitStateDetails'
+      properties:
+        signalName:
+          description: The name of the signal being awaited.
+          type: string
+      x-added-in-version: "8.10"
+
+    ConditionWaitStateDetails:
+      type: object
+      required:
+        - expression
+        - events
+      allOf:
+        - $ref: '#/components/schemas/BaseWaitStateDetails'
+      properties:
+        expression:
+          description: The condition expression that must evaluate to true to proceed.
+          type: string
+        events:
+          description: The variable events that trigger condition re-evaluation. Empty means all events.
+          type: array
+          items:
+            type: string
+            enum:
+              - create
+              - update
 
     AdHocSubProcessActivateActivityReference:
       type: object

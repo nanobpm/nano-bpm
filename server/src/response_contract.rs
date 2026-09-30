@@ -932,22 +932,21 @@ mod tests {
             "page": {"totalItems": 1, "hasMoreTotalItems": false,
                      "startCursor": null, "endCursor": null},
             "items": [{
-                "waitStateType": "JOB",
                 "processInstanceKey": "1",
                 "elementInstanceKey": "2",
                 "elementId": "task",
                 "elementType": "SERVICE_TASK",
                 "tenantId": "<default>",
                 "rootProcessInstanceKey": "1",
-                "jobDetails": {
+                "bpmnProcessId": "proc",
+                "details": {
+                    "waitStateType": "JOB",
                     "jobKey": "9",
                     "jobType": "worker-a",
                     "jobKind": "BPMN_ELEMENT",
                     "listenerEventType": null,
                     "retries": 3
-                },
-                "messageDetails": null,
-                "userTaskDetails": null
+                }
             }]
         });
         assert!(
@@ -957,7 +956,7 @@ mod tests {
 
         // Force-blank jobType -> the exact drift from #1010.
         let mut drifted = conformant.clone();
-        drifted["items"][0]["jobDetails"]
+        drifted["items"][0]["details"]
             .as_object_mut()
             .unwrap()
             .remove("jobType");
@@ -1028,22 +1027,21 @@ mod middleware_tests {
             "page": {"totalItems": 1, "hasMoreTotalItems": false,
                      "startCursor": null, "endCursor": null},
             "items": [{
-                "waitStateType": "JOB",
                 "processInstanceKey": "1",
                 "elementInstanceKey": "2",
                 "elementId": "task",
                 "elementType": "SERVICE_TASK",
                 "tenantId": "<default>",
                 "rootProcessInstanceKey": "1",
-                "jobDetails": {
+                "bpmnProcessId": "proc",
+                "details": {
+                    "waitStateType": "JOB",
                     "jobKey": "9",
                     "jobType": "worker-a",
                     "jobKind": "BPMN_ELEMENT",
                     "listenerEventType": null,
                     "retries": 3
-                },
-                "messageDetails": null,
-                "userTaskDetails": null
+                }
             }]
         })
     }
@@ -1090,7 +1088,7 @@ mod middleware_tests {
     #[tokio::test]
     async fn missing_required_field_returns_500() {
         let mut body = conformant_wait_state_body();
-        body["items"][0]["jobDetails"]
+        body["items"][0]["details"]
             .as_object_mut()
             .unwrap()
             .remove("jobType");
@@ -1128,7 +1126,7 @@ mod middleware_tests {
     #[tokio::test]
     async fn lenient_mode_passes_violation_through() {
         let mut body = conformant_wait_state_body();
-        body["items"][0]["jobDetails"]
+        body["items"][0]["details"]
             .as_object_mut()
             .unwrap()
             .remove("jobType");
@@ -1208,7 +1206,7 @@ mod middleware_tests {
     #[tokio::test]
     async fn oversized_content_length_passes_through_unvalidated() {
         let mut body = conformant_wait_state_body();
-        body["items"][0]["jobDetails"]
+        body["items"][0]["details"]
             .as_object_mut()
             .unwrap()
             .remove("jobType");
