@@ -16,14 +16,23 @@ Currently sanitized:
     (RustAxumServerCodegen.java:1014). An empty, schema-less media type carries
     no payload contract, so the media type is dropped; if a requestBody ends up
     with no content it is removed entirely (equivalent to "no body").
+  * Request bodies whose schema is a `$ref` to a closed, property-less object
+    (`type: object`, `additionalProperties: false`, no properties/composition),
+    e.g. upstream's reserved `SecretListRequest`. rust-axum classifies any
+    property-less object as "free-form" and never emits the model, yet still
+    references it from the operation, so the crate fails to compile
+    (`cannot find type SecretListRequest in module models`). Such a body admits
+    only `{}` and carries no payload contract, exactly like a schema-less media
+    type, so it gets the same treatment (upstream documents these bodies as
+    optional). The schema itself is kept.
 
 Local overlays (spec-patches/patches.yaml):
   In addition to sanitizing, this script applies a small set of *local* additions
   to the build copy of the spec. These live in `spec-patches/patches.yaml` so the
   upstream `spec/` tree stays byte-for-byte identical to the Camunda release it
   tracks. Each patch targets a file under spec/ and a dotted path inside it, and
-  either deep-`merge`s a mapping or `append`s items to a list (e.g. a `required`
-  array). This is how project-specific schema extensions (such as the
+  either deep-`merge`s a mapping, `append`s items to a list (e.g. a `required`
+  array) or `remove`s items from a list (failing if an item is absent). This is how project-specific schema extensions (such as the
   `processCompleted` field on `CreateProcessInstanceResult`) are introduced
   without forking the upstream spec.
 
@@ -39,13 +48,54 @@ from pathlib import Path
 import yaml
 
 
+_COMPOSITION_KEYS = ("properties", "allOf", "oneOf", "anyOf", "$ref", "items")
+
+
+def is_closed_empty_object(schema: object) -> bool:
+    """`{type: object, additionalProperties: false}` with no properties or
+    composition: a schema that admits only `{}`."""
+    return (
+        isinstance(schema, dict)
+        and schema.get("type") == "object"
+        and schema.get("additionalProperties") is False
+        and not any(k in schema for k in _COMPOSITION_KEYS)
+    )
+
+
+def closed_empty_schema_refs(documents: dict[str, object]) -> set[str]:
+    """Canonical refs (`file.yaml#/components/schemas/Name`) of every closed,
+    property-less object schema across the spec tree."""
+    refs: set[str] = set()
+    for rel, document in documents.items():
+        schemas = ((document or {}).get("components") or {}).get("schemas") or {}
+        for name, schema in schemas.items():
+            if is_closed_empty_object(schema):
+                refs.add(f"{rel}#/components/schemas/{name}")
+    return refs
+
+
+def _canonical_ref(ref: str, current_file: str) -> str:
+    """Resolve a local (`#/...`) or sibling-file (`other.yaml#/...`) ref."""
+    return f"{current_file}{ref}" if ref.startswith("#") else ref
+
+
+# Set per document by `main()`; consulted by `_is_empty_media_type`.
+_EMPTY_BODY_REFS: set[str] = set()
+_CURRENT_FILE = ""
+
+
 def _is_empty_media_type(value: object) -> bool:
-    """A media type with no schema (None or an empty mapping) carries no
-    payload contract and trips up the rust-axum generator."""
+    """A media type with no payload contract trips up the rust-axum generator:
+    no schema (None or an empty mapping), or a schema that is a `$ref` to a
+    closed, property-less object."""
     if value is None:
         return True
     if isinstance(value, dict) and not value:
         return True
+    if isinstance(value, dict):
+        ref = (value.get("schema") or {}).get("$ref") if isinstance(value.get("schema"), dict) else None
+        if isinstance(ref, str) and _canonical_ref(ref, _CURRENT_FILE) in _EMPTY_BODY_REFS:
+            return True
     return False
 
 
@@ -163,8 +213,24 @@ def _apply_patch(document: object, patch: dict) -> bool:
             if item not in node:
                 node.append(item)
                 changed = True
+    elif "remove" in patch:
+        # Remove items from a list (e.g. relax an upstream `required` entry).
+        # Fails loudly when an item is absent: after an upstream re-sync a
+        # removal that no longer matches is stale and must be revisited, not
+        # silently ignored.
+        items = patch["remove"]
+        if not isinstance(items, list):
+            raise ValueError(f"'remove' for target '{target}' must be a list")
+        node = parent.get(last)
+        if not isinstance(node, list):
+            raise ValueError(f"cannot remove from non-list at target '{target}'")
+        for item in items:
+            if item not in node:
+                raise ValueError(f"stale patch: {item!r} not present at target '{target}'")
+            node.remove(item)
+            changed = True
     else:
-        raise ValueError(f"patch for target '{target}' has neither 'merge' nor 'append'")
+        raise ValueError(f"patch for target '{target}' has none of 'merge', 'append', 'remove'")
 
     return changed
 
@@ -221,6 +287,15 @@ def main(argv: list[str]) -> int:
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True)
 
+    # Pre-scan: closed, property-less object schemas can be referenced across
+    # files, so collect them from the whole tree before sanitizing any body.
+    global _EMPTY_BODY_REFS, _CURRENT_FILE
+    all_documents = {}
+    for src in sorted(source_dir.rglob("*.y*ml")):
+        with src.open("r", encoding="utf-8") as fh:
+            all_documents[src.relative_to(source_dir).as_posix()] = yaml.safe_load(fh)
+    _EMPTY_BODY_REFS = closed_empty_schema_refs(all_documents)
+
     modified_files: list[str] = []
     patched_files: list[str] = []
     for src in sorted(source_dir.rglob("*")):
@@ -239,6 +314,7 @@ def main(argv: list[str]) -> int:
             document = yaml.safe_load(fh)
 
         changed = False
+        _CURRENT_FILE = rel.as_posix()
         if document is not None and _sanitize(document):
             changed = True
 

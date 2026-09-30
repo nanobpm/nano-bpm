@@ -2439,3 +2439,218 @@ fn declaration_free_job_activated_is_byte_identical() {
     let back: Event = serde_json::from_str(&json).unwrap();
     assert_eq!(back, declared);
 }
+
+// ---- Camunda 8.10 `JobCompletionRequest.businessId` (#1291) ----------------
+
+/// start -> work(svc "work") -> end, deployed, one instance created with the
+/// given business id and its job activated. Returns (engine, instance, job).
+fn job_parked_instance(business_id: Option<&str>) -> (Engine, Key, Key) {
+    let proc = ProcessBuilder::new("biz")
+        .start_event("s")
+        .service_task("work", "work")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_full(
+            "biz",
+            HashMap::new(),
+            Vec::new(),
+            business_id.map(str::to_string),
+        ))
+        .unwrap();
+    let instance = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let job = engine
+        .activate_jobs("work", "w", 1, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("job activates")
+        .key;
+    (engine, instance, job)
+}
+
+#[test]
+fn completing_a_job_assigns_the_business_id_to_its_root_instance() {
+    let (mut engine, instance, job) = job_parked_instance(None);
+    let events = engine
+        .apply_command(Command::complete_job(job).with_business_id(Some("order-9".into())))
+        .unwrap();
+    let assigned = events
+        .iter()
+        .position(|e| {
+            *e == Event::ProcessInstanceBusinessIdAssigned {
+                instance_key: instance,
+                business_id: "order-9".into(),
+            }
+        })
+        .expect("the assignment is journaled");
+    let completed = events
+        .iter()
+        .position(|e| matches!(e, Event::JobCompleted { .. }))
+        .expect("the job completes");
+    assert!(assigned < completed, "assignment precedes the completion");
+    assert_eq!(
+        engine.state().instances[&instance].business_id.as_deref(),
+        Some("order-9")
+    );
+}
+
+#[test]
+fn re_sending_the_assigned_business_id_is_an_idempotent_no_op() {
+    let (mut engine, _instance, job) = job_parked_instance(Some("order-9"));
+    let events = engine
+        .apply_command(Command::complete_job(job).with_business_id(Some("order-9".into())))
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::JobCompleted { .. })));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceBusinessIdAssigned { .. })));
+}
+
+#[test]
+fn a_different_business_id_rejects_the_whole_completion() {
+    let (mut engine, instance, job) = job_parked_instance(Some("order-9"));
+    let err = engine
+        .apply_command(Command::complete_job(job).with_business_id(Some("other".into())))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::BusinessIdAlreadyAssigned {
+            instance_key: instance
+        }
+    );
+    assert!(
+        !matches!(engine.state().jobs[&job].state, state::JobState::Completed),
+        "the job stays open after a rejected completion"
+    );
+    assert_eq!(
+        engine.state().instances[&instance].business_id.as_deref(),
+        Some("order-9")
+    );
+}
+
+#[test]
+fn an_empty_business_id_rejects_the_completion() {
+    let (mut engine, instance, job) = job_parked_instance(None);
+    let err = engine
+        .apply_command(Command::complete_job(job).with_business_id(Some(String::new())))
+        .unwrap_err();
+    let _ = instance;
+    assert_eq!(err, EngineError::BusinessIdInvalid { chars: 0 });
+    assert!(!matches!(
+        engine.state().jobs[&job].state,
+        state::JobState::Completed
+    ));
+}
+
+#[test]
+fn a_child_instance_business_id_rejects_the_completion() {
+    let leaf = ProcessBuilder::new("leaf")
+        .start_event("ls")
+        .service_task("leaf_work", "leaf-job")
+        .end_event("le")
+        .connect("ls", "leaf_work")
+        .connect("leaf_work", "le")
+        .build()
+        .unwrap();
+    let root = ProcessBuilder::new("root")
+        .start_event("s")
+        .call_activity("c1", "leaf")
+        .end_event("e")
+        .connect("s", "c1")
+        .connect("c1", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(leaf)).unwrap();
+    engine.apply_command(Command::DeployProcess(root)).unwrap();
+    engine
+        .apply_command(Command::create_instance("root"))
+        .unwrap();
+    let job = engine
+        .activate_jobs("leaf-job", "w", 1, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("the child's job activates");
+    let err = engine
+        .apply_command(Command::complete_job(job.key).with_business_id(Some("x".into())))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::BusinessIdOnChildInstance {
+            instance_key: job.instance_key
+        }
+    );
+    assert!(!matches!(
+        engine.state().jobs[&job.key].state,
+        state::JobState::Completed
+    ));
+}
+
+/// The spec's `BusinessId` range (1..=256 characters) is enforced in the
+/// engine for every command that carries one, so non-REST surfaces (Falcon,
+/// wasm) cannot persist an out-of-range id (#1295 review). Characters, not
+/// bytes: 256 multi-byte characters are accepted.
+#[test]
+fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
+    let max = "é".repeat(crate::BUSINESS_ID_MAX_CHARS);
+    let over = "x".repeat(crate::BUSINESS_ID_MAX_CHARS + 1);
+    let too_long = EngineError::BusinessIdInvalid {
+        chars: crate::BUSINESS_ID_MAX_CHARS + 1,
+    };
+
+    // Job completion (assignment).
+    let (mut engine, instance, job) = job_parked_instance(None);
+    let err = engine
+        .apply_command(Command::complete_job(job).with_business_id(Some(over.clone())))
+        .unwrap_err();
+    assert_eq!(err, too_long);
+    assert_eq!(engine.state().instances[&instance].business_id, None);
+    engine
+        .apply_command(Command::complete_job(job).with_business_id(Some(max.clone())))
+        .expect("256 characters is within range");
+    assert_eq!(
+        engine.state().instances[&instance].business_id.as_deref(),
+        Some(max.as_str())
+    );
+
+    // Instance creation.
+    let (mut engine, _, _) = job_parked_instance(None);
+    let before = engine.state().instances.len();
+    for (id, want) in [
+        (over.clone(), too_long.clone()),
+        (String::new(), EngineError::BusinessIdInvalid { chars: 0 }),
+    ] {
+        let err = engine
+            .apply_command(Command::create_instance_full(
+                "biz",
+                HashMap::new(),
+                Vec::new(),
+                Some(id),
+            ))
+            .unwrap_err();
+        assert_eq!(err, want);
+    }
+    assert_eq!(
+        engine.state().instances.len(),
+        before,
+        "no instance created"
+    );
+
+    // Message publish / correlate.
+    let err = engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            variables: HashMap::new(),
+            business_id: Some(over),
+        })
+        .unwrap_err();
+    assert_eq!(err, too_long);
+}

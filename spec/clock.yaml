@@ -7,6 +7,8 @@ paths:
       tags:
         - Clock
       operationId: pinClock
+      x-required-permissions:
+        - { resourceType: SYSTEM, permissionType: UPDATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -34,6 +36,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /clock/reset:
     post:
@@ -41,6 +44,8 @@ paths:
       tags:
         - Clock
       operationId: resetClock
+      x-required-permissions:
+        - { resourceType: SYSTEM, permissionType: UPDATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -60,6 +65,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
 ## Schema definitions
 

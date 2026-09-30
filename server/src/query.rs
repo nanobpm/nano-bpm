@@ -422,6 +422,123 @@ pub fn match_cluster_variable_scope(
     }
 }
 
+/// Matches a `ClusterVariableKindFilterProperty` (bare enum or advanced)
+/// against a kind's wire spelling (`JSON`/`SECRET_REFERENCE`).
+pub fn match_cluster_variable_kind(
+    filter: &Option<models::ClusterVariableKindFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::ClusterVariableKindFilterProperty::ClusterVariableKindEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::ClusterVariableKindFilterProperty::AdvancedClusterVariableKindFilter(a)) => {
+            ops!(
+                a,
+                |e: &models::ClusterVariableKindEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
+        }
+    }
+}
+
+/// A metadata scalar, borrowed from any of the generated string-or-number
+/// unions (stored value, `$eq`, `$neq`, `$in` item). Comparison is type-strict:
+/// the string `"30"` is not the number `30`.
+#[derive(Clone, Copy, PartialEq)]
+enum MetaScalar<'a> {
+    Str(&'a str),
+    Num(f64),
+}
+
+impl<'a> From<&'a models::ClusterVariableResultBaseMetadataValue> for MetaScalar<'a> {
+    fn from(v: &'a models::ClusterVariableResultBaseMetadataValue) -> Self {
+        match v {
+            models::ClusterVariableResultBaseMetadataValue::String(s) => Self::Str(s),
+            models::ClusterVariableResultBaseMetadataValue::F64(n) => Self::Num(*n),
+        }
+    }
+}
+
+impl<'a> From<&'a models::AdvancedMetadataValueFilterEq> for MetaScalar<'a> {
+    fn from(v: &'a models::AdvancedMetadataValueFilterEq) -> Self {
+        match v {
+            models::AdvancedMetadataValueFilterEq::String(s) => Self::Str(s),
+            models::AdvancedMetadataValueFilterEq::F64(n) => Self::Num(*n),
+        }
+    }
+}
+
+impl<'a> From<&'a models::AdvancedMetadataValueFilterNeq> for MetaScalar<'a> {
+    fn from(v: &'a models::AdvancedMetadataValueFilterNeq) -> Self {
+        match v {
+            models::AdvancedMetadataValueFilterNeq::String(s) => Self::Str(s),
+            models::AdvancedMetadataValueFilterNeq::F64(n) => Self::Num(*n),
+        }
+    }
+}
+
+/// Matches one metadata entry (absent = `None`) against its
+/// `AdvancedMetadataValueFilter`. Absent-value semantics mirror [`Ops`]: only
+/// `$exists: false` (or no value operator at all) matches a missing key. Range
+/// operators match numbers only; `$like` matches strings only.
+fn metadata_value_matches(
+    f: &models::AdvancedMetadataValueFilter,
+    value: Option<&models::ClusterVariableResultBaseMetadataValue>,
+) -> bool {
+    if matches!(f.dollar_exists, Some(e) if e != value.is_some()) {
+        return false;
+    }
+    let Some(v) = value.map(MetaScalar::from) else {
+        return f.dollar_eq.is_none()
+            && f.dollar_neq.is_none()
+            && f.dollar_gt.is_none()
+            && f.dollar_gte.is_none()
+            && f.dollar_lt.is_none()
+            && f.dollar_lte.is_none()
+            && f.dollar_in.is_none()
+            && f.dollar_like.is_none();
+    };
+    let num = match v {
+        MetaScalar::Num(n) => Some(n),
+        MetaScalar::Str(_) => None,
+    };
+    let range = |bound: Option<f64>, ok: fn(f64, f64) -> bool| {
+        bound.is_none_or(|b| num.is_some_and(|n| ok(n, b)))
+    };
+    f.dollar_eq
+        .as_ref()
+        .is_none_or(|eq| v == MetaScalar::from(eq))
+        && f.dollar_neq
+            .as_ref()
+            .is_none_or(|neq| v != MetaScalar::from(neq))
+        && range(f.dollar_gt, |n, b| n > b)
+        && range(f.dollar_gte, |n, b| n >= b)
+        && range(f.dollar_lt, |n, b| n < b)
+        && range(f.dollar_lte, |n, b| n <= b)
+        && f.dollar_in
+            .as_ref()
+            .is_none_or(|in_| in_.iter().any(|x| v == MetaScalar::from(x)))
+        && f.dollar_like.as_deref().is_none_or(|like| match v {
+            MetaScalar::Str(s) => like_matches(like, s),
+            MetaScalar::Num(_) => false,
+        })
+}
+
+/// Matches a cluster variable's metadata bag against a per-key filter map:
+/// every filtered key must match (AND).
+pub fn match_cluster_variable_metadata(
+    filter: &Option<std::collections::HashMap<String, models::AdvancedMetadataValueFilter>>,
+    metadata: &std::collections::HashMap<String, models::ClusterVariableResultBaseMetadataValue>,
+) -> bool {
+    filter
+        .iter()
+        .flatten()
+        .all(|(key, f)| metadata_value_matches(f, metadata.get(key)))
+}
+
 /// Matches a `BasicStringFilterProperty` (bare string or basic filter — no
 /// `$like`) against a value.
 pub fn match_basic_string(filter: &Option<models::BasicStringFilterProperty>, value: &str) -> bool {
@@ -1053,15 +1170,16 @@ pub fn paginate<T, K: CursorKey>(
 ) -> Page<T> {
     let total = sorted.len() as i64;
 
-    // Per the search spec every `limit` defaults to 100 and is bounded to
-    // [1, 10000]; clamp so a missing, zero, or oversized limit can never
+    // Per the search spec every `limit` defaults to 100 when absent and is
+    // bounded to [0, 10000]: an explicit 0 is a count-only query (empty page,
+    // `totalItems` retained); clamp so an oversized limit can never
     // materialize an unbounded page. The generated `limit` fields differ in
     // width across pagination variants, so accept anything convertible to u64.
     let default_limit = 100usize;
     const MAX_LIMIT: u64 = 10_000;
     fn clamp_limit<T: Into<u64>>(limit: Option<T>, default: usize) -> usize {
         match limit {
-            Some(l) => (l.into().clamp(1, MAX_LIMIT)) as usize,
+            Some(l) => (l.into().min(MAX_LIMIT)) as usize,
             None => default,
         }
     }
@@ -1247,6 +1365,42 @@ mod tests {
         let p = paginate(big, Some(&req));
         assert_eq!(p.items.len(), 10_000);
         assert_eq!(p.response.total_items, 20_000);
+    }
+
+    #[test]
+    fn paginate_honours_an_explicit_zero_limit_in_every_variant() {
+        // The 8.10 spec lowered every `limit` minimum to 0: an explicit zero is
+        // a count-only query (empty page, `totalItems` retained), not a request
+        // for the default or a single item. Only an absent limit defaults.
+        let rows: Vec<(u64, u64)> = (0..5).map(|k| (k, k)).collect();
+        let variants = [
+            models::SearchQueryPageRequest::LimitPagination(models::LimitPagination {
+                limit: Some(0),
+            }),
+            models::SearchQueryPageRequest::OffsetPagination(models::OffsetPagination {
+                from: Some(1),
+                limit: Some(0),
+            }),
+            models::SearchQueryPageRequest::CursorForwardPagination(
+                models::CursorForwardPagination {
+                    after: Some(encode_cursor(1)),
+                    limit: Some(0),
+                },
+            ),
+            models::SearchQueryPageRequest::CursorBackwardPagination(
+                models::CursorBackwardPagination {
+                    before: Some(encode_cursor(4)),
+                    limit: Some(0),
+                },
+            ),
+        ];
+        for req in &variants {
+            let p = paginate(rows.clone(), Some(req));
+            assert!(p.items.is_empty(), "limit 0 yields no items: {req:?}");
+            assert_eq!(p.response.total_items, 5, "total retained: {req:?}");
+            assert_eq!(p.response.start_cursor, types::Nullable::Null);
+            assert_eq!(p.response.end_cursor, types::Nullable::Null);
+        }
     }
 
     #[test]

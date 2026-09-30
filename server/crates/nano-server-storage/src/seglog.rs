@@ -2323,6 +2323,20 @@ pub fn catch_up_shard(
     let exported = shard.exported_position() as u64;
     match plan_catch_up(exported, floor, surviving.len() as u64) {
         CatchUpPlan::Resume { skip } => {
+            // A store migrated from before `event_waits` (schema v9) has no rows
+            // for waits armed before the upgrade: backfill them from the engine
+            // snapshot BEFORE replaying the tail it already reflects (a replayed
+            // `*Created` is then a no-op and a replayed settle deletes the row).
+            if let Some(state) = reseed_state
+                && shard
+                    .backfill_pending_event_waits(state)
+                    .expect("backfill event waits from engine snapshot")
+            {
+                tracing::info!(
+                    "backfilled open timer/signal/conditional waits from the engine snapshot \
+                     after the read-model schema upgrade"
+                );
+            }
             if skip < surviving.len() {
                 shard
                     .export(&surviving[skip..])

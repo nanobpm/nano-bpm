@@ -188,6 +188,57 @@ def fix_default_tenant_xss_false_positive(models: str) -> tuple[str, int]:
     return models.replace(needle, needle + guard, 1), 1
 
 
+def fix_discriminator_mapping_values(models: str) -> tuple[str, list[str]]:
+    """Make each discriminated-`oneOf` member emit its discriminator *mapping key*.
+
+    For a `oneOf` with `discriminator.mapping` (e.g. `WaitStateDetails`, keyed
+    `JOB` → `JobWaitStateDetails`), rust-axum seeds every member struct's tag
+    helper `_name_for_<prop>()` with the member's *schema name*
+    (`"JobWaitStateDetails"`) and forces that value onto the wire through
+    `serialize_with`. The spec's wire value is the mapping key (`"JOB"`), so
+    every serialized member carried a wrong discriminator.
+
+    The correct key is derived from the generated code itself (no second source
+    of truth): the tagged enum lists each member as
+    `#[serde(alias = "<key>")] <Variant>(models::<Struct>)`. Rewrite each member's
+    `_name_for_<prop>` body to return that key. Fails closed when a member struct
+    is claimed under two different keys, or when its helper cannot be found (a
+    generator change must be looked at, not silently skipped).
+    """
+    enum_re = re.compile(
+        r'#\[serde\(tag = "(?P<prop>[^"]+)"\)\]\n(?:#\[[^\n]*\]\n)*'
+        r"pub enum (?P<enum>\w+) \{(?P<body>.*?)\n\}",
+        re.S,
+    )
+    member_re = re.compile(
+        r'#\[serde\(alias = "(?P<key>[^"]+)"\)\]\s*\w+\(models::(?P<struct>\w+)\),'
+    )
+    keys: dict[str, str] = {}
+    for enum in enum_re.finditer(models):
+        for member in member_re.finditer(enum.group("body")):
+            struct, key = member.group("struct"), member.group("key")
+            if keys.get(struct, key) != key:
+                raise SystemExit(
+                    f"discriminator: {struct} is mapped to both "
+                    f"{keys[struct]!r} and {key!r}; cannot pick one wire tag"
+                )
+            keys[struct] = key
+
+    applied: list[str] = []
+    for struct, key in sorted(keys.items()):
+        helper = re.compile(
+            rf"(impl {struct} \{{\n    fn _name_for_\w+\(\) -> String \{{\n"
+            rf'        String::from\(")[^"]*("\))'
+        )
+        models, n = helper.subn(rf"\g<1>{key}\g<2>", models)
+        if n != 1:
+            raise SystemExit(
+                f"discriminator: expected one _name_for_ helper on {struct}, found {n}"
+            )
+        applied.append(f"{struct}={key}")
+    return models, applied
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         print(f"usage: {argv[0]} <generated-crate-dir>", file=sys.stderr)
@@ -203,6 +254,7 @@ def main(argv: list[str]) -> int:
 
     models, datetime_count = fix_oneof_datetime_variant(models)
     models, optional_props = fix_optional_discriminators(models)
+    models, discriminator_keys = fix_discriminator_mapping_values(models)
     models, pagination_structs = fix_pagination_disambiguation(models)
     models, regex_count = fix_html_escaped_regex_patterns(models)
     models, xss_count = fix_default_tenant_xss_false_positive(models)
@@ -219,6 +271,7 @@ def main(argv: list[str]) -> int:
         print(f"  pagination structs disambiguated: {', '.join(pagination_structs)}")
     else:
         print("  pagination structs disambiguated: none")
+    print(f"  discriminator mapping keys applied: {len(discriminator_keys)}")
     print(f"  HTML-escaped regex patterns unescaped: {regex_count}")
     print(f"  default-tenant XSS false positive fixed: {xss_count}")
     return 0

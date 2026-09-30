@@ -117,7 +117,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("agent_instance", "search_agent_instance_history"): "self.search_agent_instance_history_impl(path_params, body).await",
     # --- END issue-984 agent-instances (S5) delegations ---
     # --- BEGIN issue-907 jobs & job-statistics delegations ---
-    ("job", "batch_update_jobs"): "self.batch_update_jobs_impl(body).await",
+    ("job", "update_jobs_batch_operation"): "self.update_jobs_batch_operation_impl(body).await",
     ("job", "get_global_job_statistics"): "self.get_global_job_statistics_impl(query_params).await",
     ("job", "get_job_type_statistics"): "self.get_job_type_statistics_impl(body).await",
     ("job", "get_job_worker_statistics"): "self.get_job_worker_statistics_impl(body).await",

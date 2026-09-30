@@ -706,6 +706,16 @@ pub enum Event {
     /// replay-safe new variant.
     ProcessInstanceResumed { instance_key: Key },
 
+    /// A business id was assigned to a root process instance as part of a job
+    /// completion (Camunda 8.10 `JobCompletionRequest.businessId`). Emitted at
+    /// most once per instance, immediately before the completing
+    /// [`Event::JobCompleted`]; only artifacts created afterwards carry it.
+    /// Additive, replay-safe new variant.
+    ProcessInstanceBusinessIdAssigned {
+        instance_key: Key,
+        business_id: String,
+    },
+
     /// A process instance was migrated to a target process definition (Zeebe
     /// process-instance migration). Carries the full remapping the applier needs
     /// to rewrite state deterministically on replay: `target_process_id` is the
@@ -1325,6 +1335,7 @@ impl Event {
             Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
             Event::ProcessInstanceSuspended { instance_key, .. } => Some(*instance_key),
             Event::ProcessInstanceResumed { instance_key } => Some(*instance_key),
+            Event::ProcessInstanceBusinessIdAssigned { instance_key, .. } => Some(*instance_key),
             Event::ProcessInstanceMigrated { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceCreated { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceUpdated { instance_key, .. }

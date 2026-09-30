@@ -566,6 +566,7 @@ impl TestEngine {
             variables,
             adhoc_result: None,
             task_listener_result: None,
+            business_id: None,
         })
         .map_err(|e| js_err(&format!("complete error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -611,6 +612,7 @@ impl TestEngine {
             variables,
             adhoc_result: Some(adhoc_result),
             task_listener_result: None,
+            business_id: None,
         })
         .map_err(|e| js_err(&format!("complete agent job error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -660,6 +662,7 @@ impl TestEngine {
             message_name: message_name.to_string(),
             correlation_key: correlation_key.to_string(),
             variables,
+            business_id: None,
         })
         .map_err(|e| js_err(&format!("correlate error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -1941,6 +1944,9 @@ fn agent_instance_result(row: &AgentInstanceRow) -> Result<serde_json::Value, St
             "outputTokens": row.output_tokens,
             "modelCalls": row.model_calls,
             "toolCalls": row.tool_calls,
+            "reasoningTokenCount": row.reasoning_token_count,
+            "cacheCreationTokenCount": row.cache_creation_token_count,
+            "cacheReadTokenCount": row.cache_read_token_count,
         },
         "limits": {
             "maxTokens": row.max_tokens,
@@ -2036,10 +2042,22 @@ fn agent_metrics_result(
     metrics
         .as_ref()
         .map(|metrics| {
+            // Exhaustive destructure: a new engine counter must be surfaced.
+            let nanobpmn_engine_core::AgentHistoryMetrics {
+                input_tokens,
+                output_tokens,
+                reasoning_token_count,
+                cache_creation_token_count,
+                cache_read_token_count,
+                duration_ms,
+            } = metrics;
             serde_json::json!({
-                "inputTokens": metrics.input_tokens,
-                "outputTokens": metrics.output_tokens,
-                "durationMs": metrics.duration_ms,
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "reasoningTokenCount": reasoning_token_count,
+                "cacheCreationTokenCount": cache_creation_token_count,
+                "cacheReadTokenCount": cache_read_token_count,
+                "durationMs": duration_ms,
             })
         })
         .unwrap_or(serde_json::Value::Null)
@@ -2242,6 +2260,9 @@ fn is_rfc3339_date_time(s: &str) -> bool {
 /// (self-rooted) task reports its own `processInstanceKey`.
 #[cfg(feature = "read-model")]
 fn user_task_result(task: &UserTaskRow, roots: &RootResolver) -> serde_json::Value {
+    // The owning instance's business id snapshotted at the task's creation
+    // (mirrors the gateway): a later assignment never enriches it.
+    let business_id = task.business_id.clone();
     serde_json::json!({
         "name": serde_json::Value::Null,
         "state": user_task_state_rest(task.state),
@@ -2267,6 +2288,7 @@ fn user_task_result(task: &UserTaskRow, roots: &RootResolver) -> serde_json::Val
         "formKey": task.form_key.map(|k| k.to_string()),
         "priority": task.priority.clamp(0, 100),
         "tags": Vec::<String>::new(),
+        "businessId": business_id,
     })
 }
 
@@ -3242,22 +3264,34 @@ struct AgentTurnReq {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// `AgentInstanceHistoryItemMetricsRequest`: every counter is optional (an
+/// omitted counter is `null`).
 struct AgentMetricsReq {
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
     input_tokens: Option<i64>,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
     output_tokens: Option<i64>,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
+    reasoning_token_count: Option<i64>,
+    #[serde(default)]
+    cache_creation_token_count: Option<i64>,
+    #[serde(default)]
+    cache_read_token_count: Option<i64>,
+    #[serde(default)]
     duration_ms: Option<i64>,
 }
 
 impl From<AgentMetricsReq> for nanobpmn_engine_core::AgentHistoryMetrics {
+    // Exhaustive (no `..Default::default()`): a counter added to the engine
+    // type fails to compile here instead of being silently dropped.
     fn from(metrics: AgentMetricsReq) -> Self {
         Self {
             input_tokens: metrics.input_tokens,
             output_tokens: metrics.output_tokens,
+            reasoning_token_count: metrics.reasoning_token_count,
+            cache_creation_token_count: metrics.cache_creation_token_count,
+            cache_read_token_count: metrics.cache_read_token_count,
             duration_ms: metrics.duration_ms,
-            ..Self::default()
         }
     }
 }
@@ -4751,45 +4785,61 @@ mod tests {
         }
     }
 
+    /// Every `AgentInstanceHistoryItemMetrics` counter round-trips (value, zero,
+    /// negative, explicit null), and — per the request schema, where every
+    /// counter is optional — an omitted counter surfaces as `null`, the
+    /// response schema requiring all six keys.
     #[test]
     fn agent_history_metrics_preserve_nullable_values() {
+        const COUNTERS: [&str; 6] = [
+            "inputTokens",
+            "outputTokens",
+            "reasoningTokenCount",
+            "cacheCreationTokenCount",
+            "cacheReadTokenCount",
+            "durationMs",
+        ];
         let request = serde_json::json!({
             "historyItemId":"metrics", "loopIteration":1, "producedAt":"2026-01-02T03:04:05Z",
             "role":"ASSISTANT", "content":[],
-            "metrics":{"inputTokens":2,"outputTokens":null,"durationMs":7},
+            "metrics":{"inputTokens":2,"outputTokens":null,"reasoningTokenCount":3,
+                       "cacheCreationTokenCount":4,"cacheReadTokenCount":5,"durationMs":7},
         });
-        let turn = agent_turn_from(
-            serde_json::from_value(request.clone()).unwrap(),
-            42,
-            "opaque",
-        )
-        .unwrap();
-        assert_eq!(agent_metrics_result(&turn.metrics), request["metrics"]);
-        let mut zero = request.clone();
-        zero["metrics"] = serde_json::json!({"inputTokens":0,"outputTokens":0,"durationMs":0});
-        let turn =
-            agent_turn_from(serde_json::from_value(zero.clone()).unwrap(), 42, "opaque").unwrap();
-        assert_eq!(agent_metrics_result(&turn.metrics), zero["metrics"]);
+        let round_trip = |metrics: &J| {
+            let mut req = request.clone();
+            req["metrics"] = metrics.clone();
+            let turn = agent_turn_from(serde_json::from_value(req).unwrap(), 42, "opaque").unwrap();
+            agent_metrics_result(&turn.metrics)
+        };
+        let uniform = |v: J| {
+            J::Object(
+                COUNTERS
+                    .iter()
+                    .map(|c| (c.to_string(), v.clone()))
+                    .collect(),
+            )
+        };
         for metrics in [
-            serde_json::json!({"inputTokens":null,"outputTokens":null,"durationMs":null}),
-            serde_json::json!({"inputTokens":-1,"outputTokens":-2,"durationMs":-1}),
+            request["metrics"].clone(),
+            uniform(serde_json::json!(0)),
+            uniform(J::Null),
+            uniform(serde_json::json!(-1)),
         ] {
-            let mut present = request.clone();
-            present["metrics"] = metrics.clone();
-            let turn =
-                agent_turn_from(serde_json::from_value(present).unwrap(), 42, "opaque").unwrap();
-            assert_eq!(agent_metrics_result(&turn.metrics), metrics);
+            assert_eq!(round_trip(&metrics), metrics);
         }
         let mut omitted = request.clone();
         omitted.as_object_mut().unwrap().remove("metrics");
         let turn = agent_turn_from(serde_json::from_value(omitted).unwrap(), 42, "opaque").unwrap();
-        assert_eq!(agent_metrics_result(&turn.metrics), serde_json::Value::Null);
-        for missing in ["inputTokens", "outputTokens", "durationMs"] {
-            let mut invalid = request.clone();
-            invalid["metrics"].as_object_mut().unwrap().remove(missing);
-            assert!(
-                serde_json::from_value::<AgentTurnReq>(invalid).is_err(),
-                "{missing}"
+        assert_eq!(agent_metrics_result(&turn.metrics), J::Null);
+        for missing in COUNTERS {
+            let mut partial = request["metrics"].clone();
+            partial.as_object_mut().unwrap().remove(missing);
+            let mut expected = request["metrics"].clone();
+            expected[missing] = J::Null;
+            assert_eq!(
+                round_trip(&partial),
+                expected,
+                "{missing} omitted surfaces as null"
             );
         }
     }
@@ -5220,6 +5270,212 @@ mod read_channel_tests {
         );
         let done = parse(&eng.search_user_tasks(r#"{"state":"COMPLETED"}"#).unwrap());
         assert_eq!(done["items"].as_array().unwrap().len(), 1);
+    }
+
+    /// `required` property names of the spec schema `name`, following `allOf`
+    /// `$ref`s. Loads every `spec/*.yaml` component schema (refs across files are
+    /// `other.yaml#/components/schemas/X`, so the last path segment names it).
+    fn spec_required(name: &str) -> std::collections::BTreeSet<String> {
+        use serde_yaml::Value as Y;
+        fn schemas() -> std::collections::BTreeMap<String, Y> {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../spec");
+            let mut all = std::collections::BTreeMap::new();
+            for entry in std::fs::read_dir(&dir).expect("spec/ dir") {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                    continue;
+                }
+                let doc: Y = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+                if let Some(Y::Mapping(m)) = doc.get("components").and_then(|c| c.get("schemas")) {
+                    for (k, v) in m {
+                        all.insert(k.as_str().unwrap().to_string(), v.clone());
+                    }
+                }
+            }
+            all
+        }
+        fn walk(
+            all: &std::collections::BTreeMap<String, Y>,
+            s: &Y,
+            out: &mut std::collections::BTreeSet<String>,
+        ) {
+            if let Some(r) = s.get("$ref").and_then(Y::as_str) {
+                let target = r.rsplit('/').next().unwrap();
+                walk(
+                    all,
+                    all.get(target).unwrap_or_else(|| panic!("unresolved {r}")),
+                    out,
+                );
+            }
+            if let Some(Y::Sequence(req)) = s.get("required") {
+                out.extend(req.iter().filter_map(Y::as_str).map(str::to_string));
+            }
+            if let Some(Y::Sequence(parts)) = s.get("allOf") {
+                for p in parts {
+                    walk(all, p, out);
+                }
+            }
+        }
+        let all = schemas();
+        let mut out = std::collections::BTreeSet::new();
+        walk(
+            &all,
+            all.get(name).unwrap_or_else(|| panic!("no schema {name}")),
+            &mut out,
+        );
+        assert!(
+            !out.is_empty(),
+            "{name} declares no required fields — wrong schema?"
+        );
+        out
+    }
+
+    /// Guard (defect class: hand-built read DTOs drifting from the spec the
+    /// published `@nanobpm/engine-wasm/readmodel-types` are generated from). The
+    /// facade builds each read result with `json!`, so nothing forces it to
+    /// track a spec re-sync: #1291's upstream bump made `UserTaskResult.businessId`
+    /// required while the facade kept omitting it — a type that lies to TS
+    /// consumers. Every exported read is exercised against real engine state and
+    /// must carry every spec-`required` key (present, possibly `null`).
+    #[test]
+    fn read_results_carry_every_spec_required_field() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        eng.create_instance("p", r#"{"amount":1}"#, None).unwrap();
+        let form = parse(&eng.deploy_form(r#"{"id":"f","components":[]}"#).unwrap());
+        let resource = parse(&eng.deploy_resource("r.md", "x").unwrap());
+
+        let first = |v: J| v["items"][0].clone();
+        let cases = [
+            (
+                "UserTaskResult",
+                first(parse(&eng.search_user_tasks("").unwrap())),
+            ),
+            (
+                "ProcessInstanceResult",
+                first(parse(&eng.search_process_instances("").unwrap())),
+            ),
+            (
+                "VariableSearchResult",
+                first(parse(&eng.search_variables("").unwrap())),
+            ),
+            (
+                "FormResult",
+                parse(
+                    &eng.get_form_by_key(form["formKey"].as_str().unwrap())
+                        .unwrap(),
+                ),
+            ),
+            (
+                "ResourceResult",
+                parse(
+                    &eng.get_resource_by_key(resource["resourceKey"].as_str().unwrap())
+                        .unwrap(),
+                ),
+            ),
+        ];
+        for (schema, got) in cases {
+            let obj = got
+                .as_object()
+                .unwrap_or_else(|| panic!("{schema}: not an object: {got}"));
+            let missing: Vec<_> = spec_required(schema)
+                .into_iter()
+                .filter(|k| !obj.contains_key(k))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{schema} is missing spec-required {missing:?}: {got}"
+            );
+        }
+    }
+
+    /// `UserTaskResult.businessId` is the owning instance's business id at the
+    /// task's creation, `null` when unset.
+    #[test]
+    fn search_user_tasks_surfaces_the_instance_business_id() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        eng.apply(Command::CreateInstance {
+            process_id: "p".into(),
+            variables: Default::default(),
+            tags: Vec::new(),
+            business_id: Some("order-42".into()),
+            process_definition_key: None,
+            version: None,
+        })
+        .unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        let items = parse(&eng.search_user_tasks("").unwrap())["items"].clone();
+        let mut ids: Vec<J> = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["businessId"].clone())
+            .collect();
+        ids.sort_by_key(|v| v.to_string());
+        assert_eq!(ids, vec![J::String("order-42".into()), J::Null]);
+    }
+
+    /// A user task snapshots the business id current at its creation: an id
+    /// assigned later (here by completing a parallel job) must not enrich it
+    /// (Camunda 8.10 contract; mirrors the gateway, #1295 review).
+    #[test]
+    fn search_user_tasks_reports_the_creation_time_business_id_snapshot() {
+        const XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:serviceTask id="svc">
+            <bpmn:extensionElements><zeebe:taskDefinition type="t" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e1" />
+          <bpmn:endEvent id="e2" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="b" sourceRef="fork" targetRef="review" />
+          <bpmn:sequenceFlow id="c" sourceRef="fork" targetRef="svc" />
+          <bpmn:sequenceFlow id="d" sourceRef="review" targetRef="e1" />
+          <bpmn:sequenceFlow id="f" sourceRef="svc" targetRef="e2" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+        let mut eng = TestEngine::new();
+        eng.deploy(XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        let jobs = parse(&eng.activate_jobs("t", 1, 60_000.0, "w", None).unwrap());
+        let job_key: u64 = jobs[0]["key"].as_str().unwrap().parse().unwrap();
+        eng.apply(Command::CompleteJob {
+            job_key,
+            lease_token: None,
+            variables: Default::default(),
+            adhoc_result: None,
+            task_listener_result: None,
+            business_id: Some("order-1".into()),
+        })
+        .unwrap();
+        let task = parse(&eng.search_user_tasks("").unwrap())["items"][0].clone();
+        let instance_key: u64 = task["processInstanceKey"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            eng.read_model
+                .process_instance(instance_key)
+                .and_then(|pi| pi.business_id)
+                .as_deref(),
+            Some("order-1"),
+            "the instance itself carries the assigned id"
+        );
+        assert_eq!(
+            task["businessId"],
+            J::Null,
+            "the pre-existing task is not enriched"
+        );
     }
 
     #[test]

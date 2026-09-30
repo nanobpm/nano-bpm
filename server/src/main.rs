@@ -19,6 +19,8 @@ mod falcon;
 #[cfg(feature = "console")]
 mod provisioning;
 mod query;
+#[cfg(test)]
+mod request_field_guard;
 mod response_contract;
 mod stub_impls;
 
@@ -320,6 +322,17 @@ struct ClusterVariableEntries {
     next_id: u64,
 }
 
+/// A cluster variable's Camunda 8.10 metadata bag: string/number values keyed by
+/// name. Opaque to the engine (never overlaid into FEEL); stored and projected
+/// verbatim for the REST surface.
+type ClusterVariableMetadata =
+    std::collections::HashMap<String, models::ClusterVariableResultBaseMetadataValue>;
+
+/// Camunda's default cap on a metadata bag's serialized (UTF-8 JSON) size: 100
+/// entries of a maximum-length name (256) plus a maximum-length value (8192), per
+/// the spec's `CreateClusterVariableRequest.metadata` description.
+const CLUSTER_VARIABLE_MAX_METADATA_BYTES: usize = 100 * (256 + 8192);
+
 /// One stored cluster variable. `value` is the engine [`Value`] (source of truth
 /// for both the FEEL overlay and the REST projection); `id` gives search a stable
 /// pagination cursor.
@@ -329,6 +342,7 @@ struct StoredClusterVariable {
     name: String,
     tenant_id: Option<String>,
     value: Value,
+    metadata: ClusterVariableMetadata,
 }
 
 impl ClusterVariableStore {
@@ -360,7 +374,13 @@ impl ClusterVariableStore {
 
     /// Creates a new variable. Returns `false` (creating nothing) when one
     /// already exists for `(tenant, name)` — the caller maps that to 409.
-    fn create(&self, tenant: Option<&str>, name: &str, value: Value) -> bool {
+    fn create(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+        value: Value,
+        metadata: ClusterVariableMetadata,
+    ) -> bool {
         let key = (tenant.map(str::to_string), name.to_string());
         {
             let mut e = self.write();
@@ -376,6 +396,7 @@ impl ClusterVariableStore {
                     name: name.to_string(),
                     tenant_id: tenant.map(str::to_string),
                     value,
+                    metadata,
                 },
             );
         }
@@ -383,15 +404,25 @@ impl ClusterVariableStore {
         true
     }
 
-    /// Updates an existing variable's value in place, preserving its id. Returns
-    /// `false` when none exists for `(tenant, name)` — the caller maps that to
-    /// 404.
-    fn update(&self, tenant: Option<&str>, name: &str, value: Value) -> bool {
+    /// Updates an existing variable's value and metadata in place, preserving
+    /// its id. The metadata bag is REPLACED, not merged (Camunda: an update that
+    /// omits it clears it). Returns `false` when none exists for `(tenant, name)`
+    /// — the caller maps that to 404.
+    fn update(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+        value: Value,
+        metadata: ClusterVariableMetadata,
+    ) -> bool {
         let key = (tenant.map(str::to_string), name.to_string());
         {
             let mut e = self.write();
             match e.by_key.get_mut(&key) {
-                Some(entry) => entry.value = value,
+                Some(entry) => {
+                    entry.value = value;
+                    entry.metadata = metadata;
+                }
                 None => return false,
             }
         }
@@ -462,12 +493,14 @@ fn cluster_variable_scope(
 /// `ClusterVariableResult` (always the full, untruncated value).
 fn cluster_variable_result(v: &StoredClusterVariable) -> models::ClusterVariableResult {
     let (scope, tenant_id) = cluster_variable_scope(&v.tenant_id);
-    models::ClusterVariableResult::new(
-        v.name.clone(),
+    models::ClusterVariableResult {
+        name: v.name.clone(),
         scope,
         tenant_id,
-        cluster_variable_value_string(&v.value),
-    )
+        metadata: v.metadata.clone(),
+        kind: cluster_variable_kind(v),
+        value: cluster_variable_value_string(&v.value),
+    }
 }
 
 /// Projects a stored cluster variable into a `ClusterVariableSearchResult`,
@@ -478,7 +511,62 @@ fn cluster_variable_search_result(
 ) -> models::ClusterVariableSearchResult {
     let (scope, tenant_id) = cluster_variable_scope(&v.tenant_id);
     let (value, is_truncated) = truncate_value(&cluster_variable_value_string(&v.value), truncate);
-    models::ClusterVariableSearchResult::new(v.name.clone(), scope, tenant_id, value, is_truncated)
+    models::ClusterVariableSearchResult {
+        name: v.name.clone(),
+        scope,
+        tenant_id,
+        metadata: v.metadata.clone(),
+        kind: cluster_variable_kind(v),
+        value,
+        is_truncated,
+    }
+}
+
+/// A stored variable's kind: the single source for the results' `kind` and the
+/// search `kind` filter. Always `JSON` — [`reject_unsupported_cluster_variable_kind`]
+/// refuses anything else at create time.
+fn cluster_variable_kind(_v: &StoredClusterVariable) -> models::ClusterVariableKindEnum {
+    models::ClusterVariableKindEnum::Json
+}
+
+/// Validates a create/update metadata bag against the serialized-size cap
+/// ([`CLUSTER_VARIABLE_MAX_METADATA_BYTES`]); the 100-entry cap is enforced by
+/// the generated `maxProperties` validator before the handler runs. An omitted
+/// bag is empty.
+fn cluster_variable_metadata(
+    metadata: &Option<ClusterVariableMetadata>,
+) -> Result<ClusterVariableMetadata, models::ProblemDetail> {
+    let metadata = metadata.clone().unwrap_or_default();
+    let size = serde_json::to_vec(&metadata).map_or(usize::MAX, |b| b.len());
+    if size > CLUSTER_VARIABLE_MAX_METADATA_BYTES {
+        return Err(problem(
+            "INVALID_ARGUMENT",
+            400,
+            format!(
+                "The provided metadata exceeds the maximum serialized size of \
+                 {CLUSTER_VARIABLE_MAX_METADATA_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(metadata)
+}
+
+/// Nano stores cluster variables as plain JSON values only (Camunda 8.10
+/// `kind: JSON`). It has
+/// no secret stores, so a `SECRET_REFERENCE` variable is rejected rather than
+/// silently stored as JSON — which would hand the reference string to FEEL as a
+/// literal value.
+fn reject_unsupported_cluster_variable_kind(
+    kind: Option<&models::ClusterVariableKindEnum>,
+) -> Option<models::ProblemDetail> {
+    match kind {
+        None | Some(models::ClusterVariableKindEnum::Json) => None,
+        Some(other) => Some(problem(
+            "Unsupported cluster variable kind",
+            400,
+            format!("Cluster variable kind '{other}' is not supported by Nano; only JSON is."),
+        )),
+    }
 }
 
 impl ServerImpl {
@@ -489,8 +577,18 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateGlobalClusterVariableResponse as Resp;
+        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
+        }
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let value = json_to_value(&body.value.0);
-        if self.cluster_variables.create(None, &body.name, value) {
+        if self
+            .cluster_variables
+            .create(None, &body.name, value, metadata)
+        {
             let stored = self
                 .cluster_variables
                 .get(None, &body.name)
@@ -521,11 +619,18 @@ impl ServerImpl {
         body: &models::CreateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::CreateTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::CreateTenantClusterVariableResponse as Resp;
+        if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
+        }
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
         if self
             .cluster_variables
-            .create(Some(tenant), &body.name, value)
+            .create(Some(tenant), &body.name, value, metadata)
         {
             let stored = self
                 .cluster_variables
@@ -558,10 +663,14 @@ impl ServerImpl {
         body: &models::UpdateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::UpdateGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Resp;
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let value = json_to_value(&body.value.0);
         if self
             .cluster_variables
-            .update(None, &path_params.name, value)
+            .update(None, &path_params.name, value, metadata)
         {
             let stored = self
                 .cluster_variables
@@ -588,11 +697,15 @@ impl ServerImpl {
         body: &models::UpdateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::UpdateTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::UpdateTenantClusterVariableResponse as Resp;
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
         if self
             .cluster_variables
-            .update(Some(tenant), &path_params.name, value)
+            .update(Some(tenant), &path_params.name, value, metadata)
         {
             let stored = self
                 .cluster_variables
@@ -729,6 +842,11 @@ impl ServerImpl {
                         && query::match_cluster_variable_scope(&f.scope, &scope_enum.to_string())
                         && f.is_truncated
                             .is_none_or(|want| want == CLUSTER_VARIABLE_STORED_TRUNCATED)
+                        && query::match_cluster_variable_kind(
+                            &f.kind,
+                            &cluster_variable_kind(v).to_string(),
+                        )
+                        && query::match_cluster_variable_metadata(&f.metadata, &v.metadata)
                 }
             })
             .collect();
@@ -786,9 +904,19 @@ mod cluster_variable_tests {
     #[test]
     fn create_rejects_a_duplicate_scope_and_name() {
         let s = store();
-        assert!(s.create(None, "region", val(json!("EMEA"))));
+        assert!(s.create(
+            None,
+            "region",
+            val(json!("EMEA")),
+            ClusterVariableMetadata::new()
+        ));
         // Same (scope, name) again -> false, which the handler maps to 409.
-        assert!(!s.create(None, "region", val(json!("APAC"))));
+        assert!(!s.create(
+            None,
+            "region",
+            val(json!("APAC")),
+            ClusterVariableMetadata::new()
+        ));
         // The rejected create left the stored value untouched.
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -799,8 +927,18 @@ mod cluster_variable_tests {
     #[test]
     fn global_and_tenant_scopes_are_isolated() {
         let s = store();
-        assert!(s.create(None, "region", val(json!("global"))));
-        assert!(s.create(Some("acme"), "region", val(json!("acme"))));
+        assert!(s.create(
+            None,
+            "region",
+            val(json!("global")),
+            ClusterVariableMetadata::new()
+        ));
+        assert!(s.create(
+            Some("acme"),
+            "region",
+            val(json!("acme")),
+            ClusterVariableMetadata::new()
+        ));
         assert_eq!(s.all().len(), 2);
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -818,9 +956,9 @@ mod cluster_variable_tests {
     fn update_requires_an_existing_entry() {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
-        assert!(!s.update(None, "ghost", val(json!(1))));
-        assert!(s.create(None, "ghost", val(json!(1))));
-        assert!(s.update(None, "ghost", val(json!(2))));
+        assert!(!s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
+        assert!(s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
+        assert!(s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new()));
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
             "2"
@@ -831,7 +969,12 @@ mod cluster_variable_tests {
     fn delete_reports_absence() {
         let s = store();
         assert!(!s.delete(None, "nope"));
-        assert!(s.create(None, "nope", val(json!(true))));
+        assert!(s.create(
+            None,
+            "nope",
+            val(json!(true)),
+            ClusterVariableMetadata::new()
+        ));
         assert!(s.delete(None, "nope"));
         assert!(s.get(None, "nope").is_none());
     }
@@ -839,7 +982,7 @@ mod cluster_variable_tests {
     #[test]
     fn empty_object_value_round_trips() {
         let s = store();
-        assert!(s.create(None, "cfg", val(json!({}))));
+        assert!(s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new()));
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
             "{}"
@@ -850,8 +993,18 @@ mod cluster_variable_tests {
     fn mutations_sync_the_shared_runtime_snapshot() {
         let runtime = ClusterVariables::default();
         let s = ClusterVariableStore::new(runtime.clone());
-        s.create(None, "region", val(json!("EMEA")));
-        s.create(Some(DEFAULT_TENANT), "tier", val(json!(2)));
+        s.create(
+            None,
+            "region",
+            val(json!("EMEA")),
+            ClusterVariableMetadata::new(),
+        );
+        s.create(
+            Some(DEFAULT_TENANT),
+            "tier",
+            val(json!(2)),
+            ClusterVariableMetadata::new(),
+        );
         {
             let snap = runtime.read().unwrap();
             assert_eq!(snap.global.get("region"), Some(&val(json!("EMEA"))));
@@ -867,8 +1020,13 @@ mod cluster_variable_tests {
     #[test]
     fn result_projection_reports_scope_and_tenant() {
         let s = store();
-        s.create(None, "g", val(json!("x")));
-        s.create(Some("acme"), "t", val(json!("y")));
+        s.create(None, "g", val(json!("x")), ClusterVariableMetadata::new());
+        s.create(
+            Some("acme"),
+            "t",
+            val(json!("y")),
+            ClusterVariableMetadata::new(),
+        );
         let g = cluster_variable_result(&s.get(None, "g").unwrap());
         assert_eq!(g.scope, models::ClusterVariableScopeEnum::Global);
         assert_eq!(g.tenant_id, types::Nullable::Null);
@@ -882,7 +1040,12 @@ mod cluster_variable_tests {
     fn search_result_truncates_long_values() {
         let s = store();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        s.create(None, "big", val(json!(long)));
+        s.create(
+            None,
+            "big",
+            val(json!(long)),
+            ClusterVariableMetadata::new(),
+        );
         let stored = s.get(None, "big").unwrap();
         assert!(cluster_variable_search_result(&stored, true).is_truncated);
         assert!(!cluster_variable_search_result(&stored, false).is_truncated);
@@ -925,18 +1088,241 @@ mod cluster_variable_tests {
         result.items.iter().map(|i| i.name.clone()).collect()
     }
 
+    fn meta(j: serde_json::Value) -> ClusterVariableMetadata {
+        serde_json::from_value(j).expect("valid metadata bag")
+    }
+
+    fn create_req(
+        name: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> models::CreateClusterVariableRequest {
+        models::CreateClusterVariableRequest {
+            name: name.to_string(),
+            value: types::Object(json!("v")),
+            metadata: metadata.map(meta),
+            kind: None,
+        }
+    }
+
+    fn update_req(metadata: Option<serde_json::Value>) -> models::UpdateClusterVariableRequest {
+        models::UpdateClusterVariableRequest {
+            value: types::Object(json!("v2")),
+            metadata: metadata.map(meta),
+        }
+    }
+
+    /// Camunda 8.10 metadata bag: stored on create and projected on every
+    /// result; an update REPLACES it (an omitted bag clears it — upstream
+    /// `UpdateClusterVariableTest.shouldOnlyPreserveKindFromStoredStateOnUpdate`).
+    #[tokio::test]
+    async fn metadata_round_trips_and_update_replaces_it() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::GetGlobalClusterVariableResponse as Get;
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Update;
+        let server = ServerImpl::default();
+        let Create::Status200_ClusterVariableCreated(created) = server
+            .create_global_cluster_variable_impl(&create_req(
+                "creds",
+                Some(json!({"owner": "team-a", "ttl": 30})),
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(
+            created.metadata,
+            meta(json!({"owner": "team-a", "ttl": 30}))
+        );
+        let path = |n: &str| models::GetGlobalClusterVariablePathParams {
+            name: n.to_string(),
+        };
+        let Get::Status200_ClusterVariableFound(got) = server
+            .get_global_cluster_variable_impl(&path("creds"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(got.metadata, created.metadata);
+
+        let upd = models::UpdateGlobalClusterVariablePathParams {
+            name: "creds".to_string(),
+        };
+        let Update::Status200_ClusterVariableUpdatedSuccessfully(r) = server
+            .update_global_cluster_variable_impl(
+                &upd,
+                &update_req(Some(json!({"owner": "team-b"}))),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(
+            r.metadata,
+            meta(json!({"owner": "team-b"})),
+            "update replaces the bag"
+        );
+        let Update::Status200_ClusterVariableUpdatedSuccessfully(r) = server
+            .update_global_cluster_variable_impl(&upd, &update_req(None))
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert!(r.metadata.is_empty(), "an omitted bag clears it");
+    }
+
+    /// The serialized-size cap (Camunda's default: 100 entries of a max-length
+    /// name plus a max-length value) is enforced on create and update; the
+    /// 100-entry cap is the generated `maxProperties` validator's.
+    #[tokio::test]
+    async fn oversized_metadata_is_rejected() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Update;
+        let server = ServerImpl::default();
+        let big = json!({"blob": "x".repeat(CLUSTER_VARIABLE_MAX_METADATA_BYTES)});
+        assert!(matches!(
+            server
+                .create_global_cluster_variable_impl(&create_req("big", Some(big.clone())))
+                .await
+                .unwrap(),
+            Create::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert!(
+            server.cluster_variables.get(None, "big").is_none(),
+            "nothing stored"
+        );
+        assert!(matches!(
+            server
+                .create_global_cluster_variable_impl(&create_req("small", None))
+                .await
+                .unwrap(),
+            Create::Status200_ClusterVariableCreated(_)
+        ));
+        let upd = models::UpdateGlobalClusterVariablePathParams {
+            name: "small".to_string(),
+        };
+        assert!(matches!(
+            server
+                .update_global_cluster_variable_impl(&upd, &update_req(Some(big)))
+                .await
+                .unwrap(),
+            Update::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert_eq!(
+            cluster_variable_value_string(
+                &server.cluster_variables.get(None, "small").unwrap().value
+            ),
+            "\"v\"",
+            "a rejected update leaves the variable untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_kind_and_metadata() {
+        let server = ServerImpl::default();
+        server.cluster_variables.create(
+            None,
+            "a",
+            val(json!(1)),
+            meta(json!({"owner": "team-a", "ttl": 30})),
+        );
+        server.cluster_variables.create(
+            None,
+            "b",
+            val(json!(2)),
+            meta(json!({"owner": "team-b", "ttl": "30"})),
+        );
+        server
+            .cluster_variables
+            .create(None, "c", val(json!(3)), ClusterVariableMetadata::new());
+
+        let kind =
+            |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
+                kind: Some(models::ClusterVariableKindFilterProperty::ClusterVariableKindEnum(k)),
+                ..models::ClusterVariableSearchQueryFilterRequest::new()
+            };
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::Json)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.page.total_items, 3, "every Nano variable is JSON");
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::SecretReference)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.page.total_items, 0);
+
+        let by_meta = |key: &str, f: serde_json::Value| {
+            let server = &server;
+            let key = key.to_string();
+            async move {
+                let filter = models::ClusterVariableSearchQueryFilterRequest {
+                    metadata: Some(std::collections::HashMap::from([(
+                        key,
+                        serde_json::from_value::<models::AdvancedMetadataValueFilter>(f)
+                            .expect("valid metadata filter"),
+                    )])),
+                    ..models::ClusterVariableSearchQueryFilterRequest::new()
+                };
+                let mut n = names(&run_search(server, None, Some(filter), None, None).await);
+                n.sort();
+                n
+            }
+        };
+        assert_eq!(by_meta("owner", json!({"$eq": "team-a"})).await, vec!["a"]);
+        assert_eq!(by_meta("owner", json!({"$neq": "team-a"})).await, vec!["b"]);
+        assert_eq!(
+            by_meta("owner", json!({"$like": "team-*"})).await,
+            vec!["a", "b"]
+        );
+        assert_eq!(by_meta("owner", json!({"$exists": false})).await, vec!["c"]);
+        assert_eq!(
+            by_meta("owner", json!({"$in": ["team-b", "x"]})).await,
+            vec!["b"]
+        );
+        // Type-strict: the number 30 is not the string "30", and numeric
+        // ranges only match numbers.
+        assert_eq!(by_meta("ttl", json!({"$eq": 30})).await, vec!["a"]);
+        assert_eq!(by_meta("ttl", json!({"$eq": "30"})).await, vec!["b"]);
+        assert_eq!(
+            by_meta("ttl", json!({"$gt": 29, "$lte": 30})).await,
+            vec!["a"]
+        );
+        assert!(by_meta("ttl", json!({"$lt": 30})).await.is_empty());
+    }
+
     #[tokio::test]
     async fn search_filters_by_scope_and_tenant() {
         let server = ServerImpl::default();
-        server
-            .cluster_variables
-            .create(None, "region", val(json!("global")));
-        server
-            .cluster_variables
-            .create(Some("acme"), "region", val(json!("acme")));
-        server
-            .cluster_variables
-            .create(Some("beta"), "tier", val(json!(2)));
+        server.cluster_variables.create(
+            None,
+            "region",
+            val(json!("global")),
+            ClusterVariableMetadata::new(),
+        );
+        server.cluster_variables.create(
+            Some("acme"),
+            "region",
+            val(json!("acme")),
+            ClusterVariableMetadata::new(),
+        );
+        server.cluster_variables.create(
+            Some("beta"),
+            "tier",
+            val(json!(2)),
+            ClusterVariableMetadata::new(),
+        );
 
         // scope = GLOBAL matches only the global-scoped variable.
         let global_only = models::ClusterVariableSearchQueryFilterRequest {
@@ -985,12 +1371,18 @@ mod cluster_variable_tests {
     async fn search_is_truncated_filter_is_independent_of_truncate_values() {
         let server = ServerImpl::default();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        server
-            .cluster_variables
-            .create(None, "big", val(json!(long)));
-        server
-            .cluster_variables
-            .create(None, "small", val(json!("x")));
+        server.cluster_variables.create(
+            None,
+            "big",
+            val(json!(long)),
+            ClusterVariableMetadata::new(),
+        );
+        server.cluster_variables.create(
+            None,
+            "small",
+            val(json!("x")),
+            ClusterVariableMetadata::new(),
+        );
 
         // The `isTruncated` filter is a *storage* characteristic (spec), so it
         // must not depend on the response-only `truncateValues`. This in-memory
@@ -1038,7 +1430,9 @@ mod cluster_variable_tests {
     async fn search_sorts_and_paginates_with_a_stable_cursor() {
         let server = ServerImpl::default();
         for n in ["charlie", "alpha", "bravo"] {
-            server.cluster_variables.create(None, n, val(json!(n)));
+            server
+                .cluster_variables
+                .create(None, n, val(json!(n)), ClusterVariableMetadata::new());
         }
 
         let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {
@@ -5988,6 +6382,16 @@ impl ServerImpl {
             )));
         }
 
+        // Camunda 8.10: an optional business id assigned to the job's root
+        // instance as part of the completion (length validated by the model).
+        let business_id = body
+            .as_ref()
+            .and_then(|b| b.business_id.clone())
+            .and_then(|v| match v {
+                types::Nullable::Present(id) => Some(id),
+                types::Nullable::Null => None,
+            });
+
         // Cluster: if a peer owns the job's partition, forward over the command
         // stream and map its answer back (single-node always owns every key).
         if let Some(node) = self.route_by_leader(job_key) {
@@ -5999,21 +6403,28 @@ impl ServerImpl {
                     types::Nullable::Null => None,
                 });
             return Ok(self
-                .forward_complete_job(node, job_key, lease_token, wire, adhoc_result, task_result)
+                .forward_complete_job(
+                    node,
+                    job_key,
+                    JobCompletion {
+                        lease_token,
+                        variables: wire,
+                        adhoc_result,
+                        task_result,
+                        business_id,
+                    },
+                )
                 .await);
         }
 
-        let command = match (task_result, adhoc_result) {
-            // A user-task-listener result and an ad-hoc result are mutually
-            // exclusive (a job is one kind or the other). Task-listener jobs
-            // reject variables engine-side, so none are threaded here.
-            (Some(task_listener_result), _) => {
-                Command::complete_job_with_task_result(job_key, task_listener_result)
-            }
-            (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
-            (None, None) => Command::complete_job_with(job_key, variables),
-        };
-        let command = job_command_with_lease(command, lease_token);
+        let command = completion_command(
+            job_key,
+            variables,
+            adhoc_result,
+            task_result,
+            lease_token,
+            business_id,
+        );
         if !self.raft.is_empty() {
             let metadata = self.job_worker_metadata(job_key).await;
             return Ok(match self.propose_job_for_stream(job_key, command).await {
@@ -6142,13 +6553,21 @@ impl ServerImpl {
                     ),
                 )))
             }
-            Err(e) => Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Internal error",
-                    500,
-                    e.to_string(),
-                )),
-            ),
+            Err(e) => {
+                Ok(match business_id_rejection_status(&e) {
+                    Some(400) => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid business id",
+                        400,
+                        e.to_string(),
+                    )),
+                    Some(_) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(
+                        problem("Business id assignment rejected", 409, e.to_string()),
+                    ),
+                    None => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Internal error", 500, e.to_string()),
+                    ),
+                })
+            }
         }
     }
 
@@ -6525,11 +6944,11 @@ impl ServerImpl {
             .collect()
     }
 
-    async fn batch_update_jobs_impl(
+    async fn update_jobs_batch_operation_impl(
         &self,
-        body: &models::JobUpdateBatchOperationRequest,
-    ) -> Result<apis::job::BatchUpdateJobsResponse, ()> {
-        use apis::job::BatchUpdateJobsResponse as Resp;
+        body: &models::JobBatchUpdateRequest,
+    ) -> Result<apis::job::UpdateJobsBatchOperationResponse, ()> {
+        use apis::job::UpdateJobsBatchOperationResponse as Resp;
 
         let changeset = &body.changeset;
         let priority = match changeset.priority.as_ref() {
@@ -6540,34 +6959,57 @@ impl ServerImpl {
             Some(types::Nullable::Present(r)) => Some(*r),
             _ => None,
         };
+        let timeout = match changeset.timeout.as_ref() {
+            Some(types::Nullable::Present(t)) => Some(*t),
+            _ => None,
+        };
 
-        if priority.is_none() && retries.is_none() {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+        if priority.is_none() && retries.is_none() && timeout.is_none() {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
                 "Invalid changeset",
                 400,
-                "The changeset must set at least one of `priority` or `retries`.".to_string(),
+                "The changeset must set at least one of `priority`, `retries` or `timeout`."
+                    .to_string(),
             )));
         }
         if let Some(p) = priority
             && !(0..=100).contains(&p)
         {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
                 "Invalid priority",
                 400,
                 format!("Job priority must be between 0 and 100, got {p}."),
             )));
         }
-        // `retries` is a non-negative integer at the schema/type level (its
-        // generated type is unsigned), so a negative value can never reach here.
+        // The upstream `JobChangeset` types retries/timeout as signed integers,
+        // so a negative value reaches the handler and must be rejected here.
+        if let Some(r) = retries
+            && r < 0
+        {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
+                "Invalid retries",
+                400,
+                format!("Job retries must not be negative, got {r}."),
+            )));
+        }
+        if let Some(t) = timeout
+            && t < 0
+        {
+            return Ok(Resp::Status400_TheJobBatchUpdateOperationFailed(problem(
+                "Invalid timeout",
+                400,
+                format!("Job timeout must not be negative, got {t}."),
+            )));
+        }
 
         // Minting a trackable batch-operation key is the contract this endpoint
         // owes its caller; durable execution/tracking of the batch is a separate
         // slice (#905) and deliberately out of scope here.
         let key = mint_batch_operation_key();
         Ok(Resp::Status200_TheBatchOperationWasCreated(
-            models::JobBatchUpdateResult {
+            models::BatchOperationCreatedResult {
                 batch_operation_key: key.to_string(),
-                batch_operation_type: "UPDATE_JOB".to_string(),
+                batch_operation_type: models::BatchOperationTypeEnum::UpdateJob,
             },
         ))
     }
@@ -7728,10 +8170,15 @@ impl ServerImpl {
                             "follower".to_string()
                         },
                         health: "healthy".to_string(),
+                        // Every replica Nano reports is serving; there is no
+                        // joining/leaving/learner phase to advertise.
+                        state: "active".to_string(),
                     })
                     .collect();
                 let (host, port) = host_port(node);
                 models::BrokerInfo {
+                    // Unzoned cluster: the broker id is the node id as a string.
+                    broker_id: node.to_string(),
                     node_id: node as i32,
                     host,
                     port,
@@ -7785,7 +8232,13 @@ impl ServerImpl {
         name: String,
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
-    ) -> Vec<Event> {
+        business_id: Option<String>,
+    ) -> Result<Vec<Event>, EngineError> {
+        // Reject an out-of-range business id before touching any partition, with
+        // the engine's own rule: one partition must not apply the publish while
+        // another rejects it. It is `CorrelateMessage`'s only failure mode, so
+        // the per-partition apply below cannot fail.
+        nanobpmn_engine_core::check_business_id(business_id.as_deref())?;
         let num_partitions = self.engine.topology().num_partitions;
         // The (deduplicated) partitions that can own a matching subscription: the
         // correlation-key hash partition (catch/boundary) + partition 0 (starts).
@@ -7806,14 +8259,20 @@ impl ServerImpl {
             let name = name.clone();
             let correlation_key = correlation_key.clone();
             let variables = variables.clone();
+            let business_id = business_id.clone();
             let (events, commit) = handle
                 .with(move |engine| {
                     engine
                         .apply_command_at(
-                            Command::correlate_message_with(name, correlation_key, variables),
+                            Command::CorrelateMessage {
+                                message_name: name,
+                                correlation_key,
+                                variables,
+                                business_id,
+                            },
                             now_millis(),
                         )
-                        .expect("CorrelateMessage never fails")
+                        .expect("CorrelateMessage fails only on a business id, checked above")
                 })
                 .await;
             commit.wait().await;
@@ -7827,7 +8286,7 @@ impl ServerImpl {
             self.drive_subscription_routing(Self::routable_events(&all_events))
                 .await;
         }
-        all_events
+        Ok(all_events)
     }
 
     /// Correlates a message across this node's owned partitions and returns the
@@ -7840,10 +8299,11 @@ impl ServerImpl {
         name: String,
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
-    ) -> (u64, Option<u64>) {
+        business_id: Option<String>,
+    ) -> Result<(u64, Option<u64>), EngineError> {
         let events = self
-            .correlate_message_everywhere(name, correlation_key, variables)
-            .await;
+            .correlate_message_everywhere(name, correlation_key, variables, business_id)
+            .await?;
         let message_key = message_key_of(&events);
         let instance = events.iter().find_map(|e| match e {
             Event::MessageCorrelated { instance_key, .. } => Some(*instance_key),
@@ -7854,7 +8314,7 @@ impl ServerImpl {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
-        (message_key, instance)
+        Ok((message_key, instance))
     }
 
     /// Correlates a message across the **whole cluster**: this node's own
@@ -7871,7 +8331,8 @@ impl ServerImpl {
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
-    ) -> (u64, Option<u64>) {
+        business_id: Option<String>,
+    ) -> Result<(u64, Option<u64>), EngineError> {
         let engine_vars: std::collections::HashMap<String, Value> = variables
             .as_ref()
             .map(|m| {
@@ -7881,8 +8342,13 @@ impl ServerImpl {
             })
             .unwrap_or_default();
         let (message_key, mut instance) = self
-            .correlate_message_local(name.clone(), correlation_key.clone(), engine_vars)
-            .await;
+            .correlate_message_local(
+                name.clone(),
+                correlation_key.clone(),
+                engine_vars,
+                business_id.clone(),
+            )
+            .await?;
 
         if self.peers.has_peers() {
             let topology = self.engine.topology();
@@ -7904,7 +8370,12 @@ impl ServerImpl {
                 }
                 match self.peers.link(node).await {
                     Ok(link) => match link
-                        .publish_message(name.clone(), correlation_key.clone(), variables.clone())
+                        .publish_message(
+                            name.clone(),
+                            correlation_key.clone(),
+                            variables.clone(),
+                            business_id.clone(),
+                        )
                         .await
                     {
                         Ok(res) if res.status == 200 => {
@@ -7926,7 +8397,7 @@ impl ServerImpl {
                 }
             }
         }
-        (message_key, instance)
+        Ok((message_key, instance))
     }
 
     // ---- Cross-partition subscription routing (stage 2, s2-subindex) -------
@@ -8823,11 +9294,15 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
-        lease_token: Option<String>,
-        variables: Option<serde_json::Map<String, serde_json::Value>>,
-        adhoc_result: Option<AdHocJobResult>,
-        task_result: Option<TaskListenerJobResult>,
+        completion: JobCompletion,
     ) -> apis::job::CompleteJobResponse {
+        let JobCompletion {
+            lease_token,
+            variables,
+            adhoc_result,
+            task_result,
+            business_id,
+        } = completion;
         use apis::job::CompleteJobResponse as Resp;
         let res =
             match self.peer_link(node).await {
@@ -8838,6 +9313,7 @@ impl ServerImpl {
                         variables,
                         adhoc_result,
                         task_result,
+                        business_id,
                     )
                     .await
                 }
@@ -8861,6 +9337,13 @@ impl ServerImpl {
                     peer_detail(&r),
                 ))
             }
+            // The owner rejected the completion as invalid (bad ad-hoc result,
+            // empty business id, ...): relay the 400 instead of masking it as 500.
+            Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid data",
+                400,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -8985,11 +9468,15 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
-        lease_token: Option<String>,
-        variables: Option<serde_json::Map<String, serde_json::Value>>,
-        adhoc_result: Option<AdHocJobResult>,
-        task_result: Option<TaskListenerJobResult>,
+        completion: JobCompletion,
     ) -> (u16, Option<serde_json::Value>) {
+        let JobCompletion {
+            lease_token,
+            variables,
+            adhoc_result,
+            task_result,
+            business_id,
+        } = completion;
         match self.peer_link(node).await {
             Ok(link) => match link
                 .complete_job(
@@ -8998,6 +9485,7 @@ impl ServerImpl {
                     variables,
                     adhoc_result,
                     task_result,
+                    business_id,
                 )
                 .await
             {
@@ -9695,9 +10183,25 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
-        let (message_key, _instance) = self
-            .correlate_message_cluster(body_name, correlation_key, variables)
-            .await;
+        let (message_key, _instance) = match self
+            .correlate_message_cluster(
+                body_name,
+                correlation_key,
+                variables,
+                body.business_id.clone(),
+            )
+            .await
+        {
+            Ok(correlated) => correlated,
+            // An out-of-range businessId (the only correlation failure).
+            Err(e) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    e.to_string(),
+                )));
+            }
+        };
 
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
@@ -9723,9 +10227,25 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
-        let (message_key, correlated_instance) = self
-            .correlate_message_cluster(body_name, correlation_key, variables)
-            .await;
+        let (message_key, correlated_instance) = match self
+            .correlate_message_cluster(
+                body_name,
+                correlation_key,
+                variables,
+                body.business_id.clone(),
+            )
+            .await
+        {
+            Ok(correlated) => correlated,
+            // An out-of-range businessId (the only correlation failure).
+            Err(e) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    e.to_string(),
+                )));
+            }
+        };
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
         // instance (ProcessInstanceCreated). Either way it correlated to an
@@ -10089,14 +10609,19 @@ impl ServerImpl {
 
         struct WaitState {
             element_instance_key: u64,
+            /// The key of the wait's own source (job / subscription / user task /
+            /// timer), all from one engine key space. An element instance can
+            /// hold several waits (a job plus its boundary timer), so the
+            /// tiebreak and the pagination cursor are `(element_instance_key,
+            /// source_key)` — unique per row, as `query::paginate` requires.
+            source_key: u64,
             process_instance_key: u64,
             element_id: String,
             element_type: String,
             tenant_id: String,
-            wait_state_type: models::WaitStateTypeEnum,
-            job: Option<models::JobWaitStateDetails>,
-            message: Option<models::MessageWaitStateDetails>,
-            user_task: Option<models::UserTaskWaitStateDetails>,
+            /// The discriminated wait-state details; the wait-state type is
+            /// derived from it (`wait_state_type_of`), never stored alongside.
+            details: models::WaitStateDetails,
         }
 
         let mut states: Vec<WaitState> = Vec::new();
@@ -10137,20 +10662,19 @@ impl ServerImpl {
             };
             states.push(WaitState {
                 element_instance_key: job.element_instance_key,
+                source_key: job.key,
                 process_instance_key: job.instance_key,
                 element_id,
                 element_type,
                 tenant_id,
-                wait_state_type: models::WaitStateTypeEnum::Job,
-                job: Some(models::JobWaitStateDetails::new(
+                details: models::JobWaitStateDetails::new(
                     models::JobKey(job.key.to_string()),
                     job.job_type.clone(),
                     job_kind,
                     listener_event_type,
                     types::Nullable::Present(job.retries),
-                )),
-                message: None,
-                user_task: None,
+                )
+                .into(),
             });
         }
 
@@ -10172,17 +10696,16 @@ impl ServerImpl {
             };
             states.push(WaitState {
                 element_instance_key: sub.element_instance_key,
+                source_key: sub.subscription_key,
                 process_instance_key: sub.instance_key,
                 element_id,
                 element_type,
                 tenant_id,
-                wait_state_type: models::WaitStateTypeEnum::Message,
-                job: None,
-                message: Some(models::MessageWaitStateDetails::new(
+                details: models::MessageWaitStateDetails::new(
                     sub.message_name.clone(),
                     correlation_key,
-                )),
-                user_task: None,
+                )
+                .into(),
             });
         }
 
@@ -10222,14 +10745,54 @@ impl ServerImpl {
             );
             states.push(WaitState {
                 element_instance_key: task.element_instance_key,
+                source_key: task.key,
                 process_instance_key: task.instance_key,
                 element_id,
                 element_type,
                 tenant_id,
-                wait_state_type: models::WaitStateTypeEnum::UserTask,
-                job: None,
-                message: None,
-                user_task: Some(details),
+                details: details.into(),
+            });
+        }
+
+        // TIMER / SIGNAL / CONDITION wait states: an element instance parked on
+        // (or guarded by a boundary for) an armed timer or an open signal /
+        // conditional subscription. Engine timers are one-shot (no cycles), so
+        // `repetitions` is always null; a conditional fires on any change to a
+        // variable it references, so `events` is empty (= all events).
+        let event_waits = if wants(models::WaitStateTypeEnum::Timer)
+            || wants(models::WaitStateTypeEnum::Signal)
+            || wants(models::WaitStateTypeEnum::Condition)
+        {
+            self.store.event_waits()
+        } else {
+            Vec::new()
+        };
+        for wait in event_waits {
+            let details: models::WaitStateDetails = match wait.wait_type {
+                readstore::EventWaitType::Timer => models::TimerWaitStateDetails::new(
+                    wait.due_at_ms
+                        .map(|d| types::Nullable::Present(d as i64))
+                        .unwrap_or(types::Nullable::Null),
+                    types::Nullable::Null,
+                )
+                .into(),
+                readstore::EventWaitType::Signal => {
+                    models::SignalWaitStateDetails::new(wait.detail.clone()).into()
+                }
+                readstore::EventWaitType::Condition => {
+                    models::ConditionWaitStateDetails::new(wait.detail.clone(), Vec::new()).into()
+                }
+            };
+            let (element_type, tenant_id, element_id) =
+                resolve(wait.element_instance_key, &wait.element_id);
+            states.push(WaitState {
+                element_instance_key: wait.element_instance_key,
+                source_key: wait.wait_key,
+                process_instance_key: wait.instance_key,
+                element_id,
+                element_type,
+                tenant_id,
+                details,
             });
         }
 
@@ -10267,26 +10830,49 @@ impl ServerImpl {
                         && query::match_wait_state_element_type(&f.element_type, &ws.element_type)
                         && query::match_wait_state_type(
                             &f.wait_state_type,
-                            &ws.wait_state_type.to_string(),
+                            wait_state_type_of(&ws.details),
                         )
                 }
             })
             .collect();
 
-        // No sort field on the wait-state query; order by element instance key
-        // for stable cursor pagination.
-        matched.sort_by_key(|ws| ws.element_instance_key);
-        let sorted: Vec<(u64, WaitState)> = matched
+        // Sort by the requested fields (the shared search sort); the element
+        // instance key tiebreaks, so the default (no sort) order is unchanged
+        // and cursor pagination stays stable.
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::ElementInstanceWaitStateQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |ws, field| match field {
+                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i64),
+                "rootProcessInstanceKey" => query::SortVal::Num(
+                    roots.root_process_instance_key(ws.process_instance_key) as i64,
+                ),
+                "elementId" => query::SortVal::Str(ws.element_id.clone()),
+                _ => query::SortVal::Num(ws.element_instance_key as i64),
+            },
+            |ws| (ws.element_instance_key, ws.source_key),
+        );
+        let sorted: Vec<((u64, u64), WaitState)> = matched
             .into_iter()
-            .map(|ws| (ws.element_instance_key, ws))
+            .map(|ws| ((ws.element_instance_key, ws.source_key), ws))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
         let items: Vec<models::ElementInstanceWaitStateResult> = page
             .items
             .into_iter()
             .map(|ws| {
+                // `bpmnProcessId` is the owning instance's process id; resolved
+                // only for the returned page, like the root key above.
+                let bpmn_process_id = self
+                    .store
+                    .process_instance(ws.process_instance_key)
+                    .map(|pi| pi.process_id)
+                    .unwrap_or_default();
                 models::ElementInstanceWaitStateResult::new(
-                    ws.wait_state_type,
                     types::Nullable::Present(models::ProcessInstanceKey(
                         roots
                             .root_process_instance_key(ws.process_instance_key)
@@ -10297,18 +10883,8 @@ impl ServerImpl {
                     ws.element_id,
                     wait_state_element_type(&ws.element_type),
                     ws.tenant_id,
-                    match ws.job {
-                        Some(d) => types::Nullable::Present(d),
-                        None => types::Nullable::Null,
-                    },
-                    match ws.message {
-                        Some(d) => types::Nullable::Present(d),
-                        None => types::Nullable::Null,
-                    },
-                    match ws.user_task {
-                        Some(d) => types::Nullable::Present(d),
-                        None => types::Nullable::Null,
-                    },
+                    bpmn_process_id,
+                    ws.details,
                 )
             })
             .collect();
@@ -10473,6 +11049,9 @@ impl ServerImpl {
                             &f.decision_requirements_key,
                             &row.decision_requirements_key.to_string(),
                         )
+                        // The business id snapshotted at evaluation (a standalone
+                        // evaluation has none, so it matches as an absent value).
+                        && query::match_string_opt(&f.business_id, row.business_id.as_deref())
                 }
             })
             .collect();
@@ -10505,6 +11084,7 @@ impl ServerImpl {
                 "decisionEvaluationInstanceKey" => {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
+                "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(entity_key(row) as i64),
             },
             |row| entity_key(row),
@@ -11130,6 +11710,7 @@ impl ServerImpl {
                     query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
                 }
                 "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
+                "businessId" => query::SortVal::Str(inst.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(inst.key as i64),
             },
             |inst| inst.key,
@@ -11191,6 +11772,9 @@ impl ServerImpl {
             message_name: String,
             correlation_key: String,
             process_definition_version: Option<i32>,
+            /// The owning instance's business id (joined, like the definition
+            /// attributes): the single source for both filter and result.
+            business_id: Option<String>,
         }
 
         let entries: Vec<MsgSubEntry> = subs
@@ -11215,6 +11799,7 @@ impl ServerImpl {
                     message_name: sub.message_name,
                     correlation_key: sub.correlation_key,
                     process_definition_version: Some(inst.version),
+                    business_id: sub.business_id,
                 })
             })
             .collect();
@@ -11267,6 +11852,7 @@ impl ServerImpl {
                         && query::match_string_opt(&f.process_definition_name, None)
                         && query::match_string_opt(&f.tool_name, None)
                         && query::match_string_opt(&f.inbound_connector_type, None)
+                        && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                 }
             })
             .collect();
@@ -11295,6 +11881,7 @@ impl ServerImpl {
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
                 "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
                 "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
+                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(e.subscription_key as i64),
             },
             |e| e.subscription_key,
@@ -11313,36 +11900,42 @@ impl ServerImpl {
                     e.last_updated_ms as i64,
                 )
                 .unwrap_or_else(epoch);
-                models::MessageSubscriptionResult::new(
-                    models::MessageSubscriptionKey(e.subscription_key.to_string()),
-                    e.process_definition_id,
-                    match e.process_definition_key {
+                let business_id = nullable_business_id(e.business_id);
+                // Named fields, not the positional `::new`: an upstream field
+                // insertion must fail to compile, not silently shift arguments.
+                models::MessageSubscriptionResult {
+                    business_id,
+                    message_subscription_key: models::MessageSubscriptionKey(
+                        e.subscription_key.to_string(),
+                    ),
+                    process_definition_id: e.process_definition_id,
+                    process_definition_key: match e.process_definition_key {
                         Some(k) => types::Nullable::Present(models::ProcessDefinitionKey(k)),
                         None => types::Nullable::Null,
                     },
-                    types::Nullable::Present(models::ProcessInstanceKey(
+                    process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
                         e.process_instance_key.to_string(),
                     )),
-                    types::Nullable::Null,
-                    e.element_id,
-                    types::Nullable::Present(models::ElementInstanceKey(
+                    root_process_instance_key: types::Nullable::Null,
+                    element_id: e.element_id,
+                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
                         e.element_instance_key.to_string(),
                     )),
-                    models::MessageSubscriptionStateEnum::Created,
-                    last_updated,
-                    e.message_name,
-                    types::Nullable::Present(e.correlation_key),
-                    models::MessageSubscriptionTypeEnum::ProcessEvent,
-                    std::collections::HashMap::new(),
-                    types::Nullable::Null,
-                    match e.process_definition_version {
+                    message_subscription_state: models::MessageSubscriptionStateEnum::Created,
+                    last_updated_date: last_updated,
+                    message_name: e.message_name,
+                    correlation_key: types::Nullable::Present(e.correlation_key),
+                    message_subscription_type: models::MessageSubscriptionTypeEnum::ProcessEvent,
+                    tool_properties: std::collections::HashMap::new(),
+                    process_definition_name: types::Nullable::Null,
+                    process_definition_version: match e.process_definition_version {
                         Some(v) => types::Nullable::Present(v),
                         None => types::Nullable::Null,
                     },
-                    types::Nullable::Null,
-                    types::Nullable::Null,
-                    "<default>".to_string(),
-                )
+                    tool_name: types::Nullable::Null,
+                    inbound_connector_type: types::Nullable::Null,
+                    tenant_id: "<default>".to_string(),
+                }
             })
             .collect();
 
@@ -11387,6 +11980,8 @@ impl ServerImpl {
             correlation_key: String,
             correlation_time_ms: u64,
             partition_id: i32,
+            /// The owning instance's business id (joined): filter + result source.
+            business_id: Option<String>,
         }
 
         let entries: Vec<CorrEntry> = rows
@@ -11412,6 +12007,7 @@ impl ServerImpl {
                     correlation_key: row.correlation_key,
                     correlation_time_ms: row.correlation_time_ms,
                     partition_id: row.partition_id,
+                    business_id: row.business_id,
                 })
             })
             .collect();
@@ -11425,6 +12021,7 @@ impl ServerImpl {
                 Some(f) => {
                     query::match_string(&f.correlation_key, &e.correlation_key)
                         && query::match_integer(&f.partition_id, Some(i64::from(e.partition_id)))
+                        && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                         && query::match_date_time_ms(
                             &f.correlation_time,
                             Some(e.correlation_time_ms as i64),
@@ -11480,6 +12077,7 @@ impl ServerImpl {
                 "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
                 "subscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
+                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(e.message_key as i64),
             },
             // A single published message can fan out to multiple subscriptions,
@@ -11503,23 +12101,30 @@ impl ServerImpl {
                     e.correlation_time_ms as i64,
                 )
                 .unwrap_or_else(epoch);
-                models::CorrelatedMessageSubscriptionResult::new(
-                    types::Nullable::Present(e.correlation_key),
+                models::CorrelatedMessageSubscriptionResult {
+                    business_id: nullable_business_id(e.business_id.clone()),
+                    correlation_key: types::Nullable::Present(e.correlation_key),
                     correlation_time,
-                    e.element_id,
-                    types::Nullable::Present(models::ElementInstanceKey(
+                    element_id: e.element_id,
+                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
                         e.element_instance_key.to_string(),
                     )),
-                    models::MessageKey(e.message_key.to_string()),
-                    e.message_name,
-                    e.partition_id,
-                    e.process_definition_id,
-                    models::ProcessDefinitionKey(e.process_definition_key.unwrap_or_default()),
-                    models::ProcessInstanceKey(e.process_instance_key.to_string()),
-                    types::Nullable::Null,
-                    models::MessageSubscriptionKey(e.subscription_key.to_string()),
-                    "<default>".to_string(),
-                )
+                    message_key: models::MessageKey(e.message_key.to_string()),
+                    message_name: e.message_name,
+                    partition_id: e.partition_id,
+                    process_definition_id: e.process_definition_id,
+                    process_definition_key: models::ProcessDefinitionKey(
+                        e.process_definition_key.unwrap_or_default(),
+                    ),
+                    process_instance_key: models::ProcessInstanceKey(
+                        e.process_instance_key.to_string(),
+                    ),
+                    root_process_instance_key: types::Nullable::Null,
+                    subscription_key: models::MessageSubscriptionKey(
+                        e.subscription_key.to_string(),
+                    ),
+                    tenant_id: "<default>".to_string(),
+                }
             })
             .collect();
 
@@ -11527,6 +12132,18 @@ impl ServerImpl {
             Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(
                 models::CorrelatedMessageSubscriptionSearchQueryResult::new(page.response, items),
             ),
+        )
+    }
+
+    /// The CURRENT `businessId` of a process instance (Camunda 8.10). Test-only:
+    /// artifact results surface the id snapshotted on their own row at
+    /// creation, never this live value (#1295 review).
+    #[cfg(test)]
+    fn business_id_of(&self, process_instance_key: u64) -> types::Nullable<String> {
+        nullable_business_id(
+            self.store
+                .process_instance(process_instance_key)
+                .and_then(|pi| pi.business_id),
         )
     }
 
@@ -12346,29 +12963,7 @@ impl ServerImpl {
 
         let mut matched: Vec<&readstore::UserTaskRow> = tasks
             .iter()
-            .filter(|task| match filter {
-                None => true,
-                Some(f) => {
-                    let assignee = task.assignee.clone().unwrap_or_default();
-                    f.user_task_key
-                        .as_ref()
-                        .is_none_or(|k| k.0 == task.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &task.instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &task.process_definition_key,
-                        )
-                        && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
-                        && query::match_string(&f.assignee, &assignee)
-                        && query::match_user_task_state(
-                            &f.state,
-                            &user_task_state_enum(task.state).to_string(),
-                        )
-                }
-            })
+            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f)))
             .collect();
 
         let sort = query::sort_keys(
@@ -12383,6 +12978,7 @@ impl ServerImpl {
                 "elementId" => query::SortVal::Str(task.element_id.clone()),
                 "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
                 "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
+                "businessId" => query::SortVal::Str(task.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(task.key as i64),
             },
             |task| task.key,
@@ -13210,6 +13806,18 @@ impl ServerImpl {
         use apis::process_definition::SearchProcessDefinitionsResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        if let Some(state) = filter.and_then(|f| f.state.as_deref())
+            && !PROCESS_DEFINITION_STATES.contains(&state)
+        {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "INVALID_ARGUMENT",
+                400,
+                format!(
+                    "unknown process definition state '{state}'; expected one of {}",
+                    PROCESS_DEFINITION_STATES.join(", ")
+                ),
+            )));
+        }
         let definitions = self.store.process_definitions();
 
         let mut matched: Vec<&readstore::ProcessDefinitionRow> = definitions
@@ -13238,6 +13846,9 @@ impl ServerImpl {
                         // filters to the highest version per id (computed by the
                         // read store).
                         && f.is_latest_version.is_none_or(|want| want == d.is_latest)
+                        && f.state
+                            .as_deref()
+                            .is_none_or(|want| want == process_definition_state(d))
                 }
             })
             .collect();
@@ -16925,7 +17536,10 @@ impl ServerImpl {
                 e @ (EngineError::JobNotActivated { .. } | EngineError::JobLeaseMismatch { .. }),
             ) => Err((409, e.to_string())),
             Err(e @ EngineError::JobUpdateInvalid { .. }) => Err((400, e.to_string())),
-            Err(e) => Err((500, e.to_string())),
+            Err(e) => Err((
+                business_id_rejection_status(&e).unwrap_or(500),
+                e.to_string(),
+            )),
         }
     }
 
@@ -17770,8 +18384,15 @@ impl ServerImpl {
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
-        self.complete_job_for_stream_with_lease(job_key, None, variables, adhoc_result, task_result)
-            .await
+        self.complete_job_for_stream_with_lease(
+            job_key,
+            None,
+            variables,
+            adhoc_result,
+            task_result,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn complete_job_for_stream_with_lease(
@@ -17781,6 +18402,7 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
+        business_id: Option<String>,
     ) -> Result<Commit, (u16, String)> {
         // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
         // task-listener result cannot carry variables. Reject here rather than
@@ -17788,14 +18410,14 @@ impl ServerImpl {
         if let Some(err) = reject_task_result_with_variables(&task_result, &variables) {
             return Err(err);
         }
-        let command = match (task_result, adhoc_result) {
-            (Some(task_listener_result), _) => {
-                Command::complete_job_with_task_result(job_key, task_listener_result)
-            }
-            (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
-            (None, None) => Command::complete_job_with(job_key, variables),
-        };
-        let command = job_command_with_lease(command, lease_token);
+        let command = completion_command(
+            job_key,
+            variables,
+            adhoc_result,
+            task_result,
+            lease_token,
+            business_id,
+        );
         if !self.raft.is_empty() {
             return self.propose_job_for_stream(job_key, command).await;
         }
@@ -19150,7 +19772,7 @@ fn batch_operation_response(rec: &BatchOperationRecord) -> models::BatchOperatio
     models::BatchOperationResponse {
         batch_operation_key: rec.key.to_string(),
         state: rec.state,
-        batch_operation_type: rec.op_type,
+        batch_operation_type: types::Nullable::Present(rec.op_type),
         start_date: batch_ms_to_datetime(Some(rec.start_date_ms)),
         end_date: batch_ms_to_datetime(rec.end_date_ms),
         actor_type: types::Nullable::Null,
@@ -19234,11 +19856,14 @@ impl ServerImpl {
 
         match nanobpmn_engine_core::feel::eval(&body.expression, &ctx) {
             Ok(value) => Ok(Resp::Status200_ExpressionEvaluatedSuccessfully(
-                models::ExpressionEvaluationResult::new(
-                    body.expression.clone(),
-                    types::Nullable::Present(types::Object(value_to_json(&value))),
-                    Vec::new(),
-                ),
+                models::ExpressionEvaluationResult {
+                    expression: body.expression.clone(),
+                    result: types::Nullable::Present(types::Object(value_to_json(&value))),
+                    warnings: Vec::new(),
+                    // Nano has no secret stores, so no `camunda.secrets.*`
+                    // reference can ever resolve from a trusted source.
+                    referenced_secrets: Vec::new(),
+                },
             )),
             Err(err) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "INVALID_ARGUMENT",
@@ -19500,6 +20125,8 @@ fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
 fn decision_instance_result(
     row: &readstore::DecisionInstanceRow,
 ) -> models::DecisionInstanceResult {
+    // The business id snapshotted when the decision was evaluated.
+    let business_id = nullable_business_id(row.business_id.clone());
     let evaluation_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
             .unwrap_or_else(epoch);
@@ -19514,80 +20141,91 @@ fn decision_instance_result(
         Some(f) => types::Nullable::Present(f.clone()),
         None => types::Nullable::Null,
     };
-    models::DecisionInstanceResult::new(
-        row.decision_id.clone(),
-        models::DecisionDefinitionKey(row.decision_key.to_string()),
-        row.decision_name.clone(),
-        row.decision_type
+    models::DecisionInstanceResult {
+        business_id,
+        decision_definition_id: row.decision_id.clone(),
+        decision_definition_key: models::DecisionDefinitionKey(row.decision_key.to_string()),
+        decision_definition_name: row.decision_name.clone(),
+        decision_definition_type: row
+            .decision_type
             .parse()
             .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
-        row.version,
-        row.eval_instance_key.clone(),
-        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
-        types::Nullable::Present(models::ElementInstanceKey(
+        decision_definition_version: row.version,
+        decision_evaluation_instance_key: row.eval_instance_key.clone(),
+        decision_evaluation_key: models::DecisionEvaluationKey(
+            row.decision_evaluation_key.to_string(),
+        ),
+        element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
             row.element_instance_key.to_string(),
         )),
         evaluation_date,
         evaluation_failure,
         process_definition_key,
-        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
-        row.result_json.clone(),
-        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
-        types::Nullable::Null,
-        row.state
+        process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
+            row.instance_key.to_string(),
+        )),
+        result: row.result_json.clone(),
+        root_decision_definition_key: models::DecisionDefinitionKey(
+            row.root_decision_key.to_string(),
+        ),
+        root_process_instance_key: types::Nullable::Null,
+        state: row
+            .state
             .parse()
             .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
-        row.tenant_id.clone(),
-    )
+        tenant_id: row.tenant_id.clone(),
+    }
 }
 
 /// Projects a [`DecisionInstanceRow`] into the generated
-/// `DecisionInstanceGetQueryResult` (adds the evaluated-input/matched-rule audit
-/// to the search-result shape).
+/// `DecisionInstanceGetQueryResult`: the search-result shape
+/// ([`decision_instance_result`], the single projection of the shared fields)
+/// plus the evaluated-input/matched-rule audit.
 fn decision_instance_get_result(
     row: &readstore::DecisionInstanceRow,
 ) -> models::DecisionInstanceGetQueryResult {
-    let evaluation_date =
-        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
-            .unwrap_or_else(epoch);
-    let process_definition_key = if row.process_definition_key.is_empty() {
-        types::Nullable::Null
-    } else {
-        types::Nullable::Present(models::ProcessDefinitionKey(
-            row.process_definition_key.clone(),
-        ))
-    };
-    let evaluation_failure = match &row.evaluation_failure {
-        Some(f) => types::Nullable::Present(f.clone()),
-        None => types::Nullable::Null,
-    };
-    models::DecisionInstanceGetQueryResult::new(
-        row.decision_id.clone(),
-        models::DecisionDefinitionKey(row.decision_key.to_string()),
-        row.decision_name.clone(),
-        row.decision_type
-            .parse()
-            .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
-        row.version,
-        row.eval_instance_key.clone(),
-        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
-        types::Nullable::Present(models::ElementInstanceKey(
-            row.element_instance_key.to_string(),
-        )),
+    let models::DecisionInstanceResult {
+        business_id,
+        decision_definition_id,
+        decision_definition_key,
+        decision_definition_name,
+        decision_definition_type,
+        decision_definition_version,
+        decision_evaluation_instance_key,
+        decision_evaluation_key,
+        element_instance_key,
         evaluation_date,
         evaluation_failure,
         process_definition_key,
-        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
-        row.result_json.clone(),
-        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
-        types::Nullable::Null,
-        row.state
-            .parse()
-            .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
-        row.tenant_id.clone(),
-        decision_instance_inputs(&row.inputs_json),
-        decision_instance_rules(&row.rules_json),
-    )
+        process_instance_key,
+        result,
+        root_decision_definition_key,
+        root_process_instance_key,
+        state,
+        tenant_id,
+    } = decision_instance_result(row);
+    models::DecisionInstanceGetQueryResult {
+        business_id,
+        decision_definition_id,
+        decision_definition_key,
+        decision_definition_name,
+        decision_definition_type,
+        decision_definition_version,
+        decision_evaluation_instance_key,
+        decision_evaluation_key,
+        element_instance_key,
+        evaluation_date,
+        evaluation_failure,
+        process_definition_key,
+        process_instance_key,
+        result,
+        root_decision_definition_key,
+        root_process_instance_key,
+        state,
+        tenant_id,
+        evaluated_inputs: decision_instance_inputs(&row.inputs_json),
+        matched_rules: decision_instance_rules(&row.rules_json),
+    }
 }
 
 /// Evaluates a process-instance `variables` filter against an instance's
@@ -19656,29 +20294,29 @@ fn process_instance_result(
         None => types::Nullable::Null,
     };
 
-    models::ProcessInstanceResult::new(
+    models::ProcessInstanceResult {
         process_definition_id,
-        types::Nullable::Null,
-        version,
-        types::Nullable::Null,
+        process_definition_name: types::Nullable::Null,
+        process_definition_version: version,
+        process_definition_version_tag: types::Nullable::Null,
         start_date,
-        types::Nullable::Null,
-        state_enum,
-        instance.has_incident,
-        "<default>".to_string(),
-        models::ProcessInstanceKey(instance.key.to_string()),
-        models::ProcessDefinitionKey(process_definition_key),
+        end_date: types::Nullable::Null,
+        state: state_enum,
+        suspended_date,
+        has_incident: instance.has_incident,
+        tenant_id: "<default>".to_string(),
+        process_instance_key: models::ProcessInstanceKey(instance.key.to_string()),
+        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
         parent_process_instance_key,
         parent_element_instance_key,
         root_process_instance_key,
-        instance.tags.clone().into_iter().map(models::Tag).collect(),
-        instance
+        tags: instance.tags.clone().into_iter().map(models::Tag).collect(),
+        business_id: instance
             .business_id
             .clone()
             .map(types::Nullable::Present)
             .unwrap_or(types::Nullable::Null),
-        suspended_date,
-    )
+    }
 }
 
 /// A synthesized resource (file) name for a process id. The engine does not
@@ -19701,16 +20339,27 @@ fn process_definition_result(
         Some(n) => types::Nullable::Present(n.clone()),
         None => types::Nullable::Null,
     };
-    models::ProcessDefinitionResult::new(
+    models::ProcessDefinitionResult {
         name,
-        resource_name(&id),
-        deployed.version,
-        types::Nullable::Null,
-        id,
-        "<default>".to_string(),
-        models::ProcessDefinitionKey(deployed.key.to_string()),
-        false,
-    )
+        resource_name: resource_name(&id),
+        version: deployed.version,
+        version_tag: types::Nullable::Null,
+        process_definition_id: id,
+        tenant_id: "<default>".to_string(),
+        process_definition_key: models::ProcessDefinitionKey(deployed.key.to_string()),
+        has_start_form: false,
+        state: process_definition_state(deployed).to_string(),
+    }
+}
+
+/// The `ProcessDefinitionStateEnum` values the spec admits on the filter.
+const PROCESS_DEFINITION_STATES: [&str; 3] = ["ACTIVE", "DRAINING", "DELETED"];
+
+/// A definition's lifecycle state: the single source for both the result's
+/// `state` and the search `state` filter. Nano has no process-definition
+/// deletion, so no definition is ever `DRAINING` or `DELETED`.
+fn process_definition_state(_deployed: &readstore::ProcessDefinitionRow) -> &'static str {
+    PROCESS_DEFINITION_STATES[0]
 }
 
 /// The byte length beyond which a variable value is truncated in search results
@@ -19839,6 +20488,90 @@ fn match_element_instance_fields(
         })
 }
 
+/// The user-task filter predicate over one AND-group of fields, shared by the
+/// top-level filter and each `$or` clause so the two cannot drift.
+fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
+    let assignee = task.assignee.clone().unwrap_or_default();
+    f.user_task_key
+        .as_ref()
+        .is_none_or(|k| k.0 == task.key.to_string())
+        && query::match_process_instance_key(
+            &f.process_instance_key,
+            &task.instance_key.to_string(),
+        )
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &task.process_definition_key,
+        )
+        && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
+        && query::match_string(&f.assignee, &assignee)
+        && query::match_user_task_state(&f.state, &user_task_state_enum(task.state).to_string())
+}
+
+/// Copies every field of a top-level `UserTaskFilter` except `$or` into a
+/// `UserTaskFilterFields`, so the base match reuses the `$or`-clause predicate.
+fn user_task_filter_base(f: &models::UserTaskFilter) -> models::UserTaskFilterFields {
+    let models::UserTaskFilter {
+        state,
+        assignee,
+        business_id,
+        priority,
+        element_id,
+        name,
+        candidate_group,
+        candidate_user,
+        tenant_id,
+        process_definition_id,
+        creation_date,
+        completion_date,
+        follow_up_date,
+        due_date,
+        process_instance_variables,
+        local_variables,
+        user_task_key,
+        process_definition_key,
+        process_instance_key,
+        element_instance_key,
+        tags,
+        dollar_or: _,
+    } = f.clone();
+    models::UserTaskFilterFields {
+        state,
+        assignee,
+        business_id,
+        priority,
+        element_id,
+        name,
+        candidate_group,
+        candidate_user,
+        tenant_id,
+        process_definition_id,
+        creation_date,
+        completion_date,
+        follow_up_date,
+        due_date,
+        process_instance_variables,
+        local_variables,
+        user_task_key,
+        process_definition_key,
+        process_instance_key,
+        element_instance_key,
+        tags,
+    }
+}
+
+/// Full user-task filter match: every top-level field AND, when a non-empty
+/// `$or` list is present, at least one clause (each an AND of its fields).
+fn match_user_task_filter(task: &readstore::UserTaskRow, f: &models::UserTaskFilter) -> bool {
+    match_user_task_fields(task, &user_task_filter_base(f))
+        && match &f.dollar_or {
+            Some(clauses) if !clauses.is_empty() => {
+                clauses.iter().any(|c| match_user_task_fields(task, c))
+            }
+            _ => true,
+        }
+}
+
 /// Copies the shared filter fields out of a top-level `ElementInstanceFilter`
 /// into an `ElementInstanceFilterFields` so the top-level base match reuses the
 /// same predicate as each `$or` clause. `startDate`/`endDate` date-time filters
@@ -19880,6 +20613,11 @@ fn match_element_instance_filter(
         }
         _ => true,
     }
+}
+
+/// A read-model business id (`None` when unset) as the REST `Nullable`.
+fn nullable_business_id(id: Option<String>) -> types::Nullable<String> {
+    id.map_or(types::Nullable::Null, types::Nullable::Present)
 }
 
 /// Maps a read-model [`readstore::ElementInstanceState`] to the REST element
@@ -20205,34 +20943,38 @@ fn agent_tool_call_from(c: &models::AgentInstanceToolCall) -> agent_model::Agent
 }
 
 /// Maps engine per-turn metrics to the REST `AgentInstanceHistoryItemMetrics`
-/// (the canonical 8.10 subset: input/output tokens + duration).
+/// (every 8.10 per-turn counter; each is null when the turn did not report it).
 fn agent_history_metrics_result(
     m: &agent_model::AgentHistoryMetrics,
 ) -> models::AgentInstanceHistoryItemMetrics {
-    models::AgentInstanceHistoryItemMetrics::new(
-        m.input_tokens
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-        m.output_tokens
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-        m.duration_ms
-            .map_or(types::Nullable::Null, types::Nullable::Present),
-    )
+    let n = |v: Option<i64>| v.map_or(types::Nullable::Null, types::Nullable::Present);
+    models::AgentInstanceHistoryItemMetrics {
+        input_tokens: n(m.input_tokens),
+        output_tokens: n(m.output_tokens),
+        reasoning_token_count: n(m.reasoning_token_count),
+        cache_creation_token_count: n(m.cache_creation_token_count),
+        cache_read_token_count: n(m.cache_read_token_count),
+        duration_ms: n(m.duration_ms),
+    }
 }
 
-/// Maps a REST per-turn metrics block to the engine metrics (the extra token
-/// counters the engine carries are not part of the 8.10 request, so default to 0).
+/// Maps a REST per-turn metrics block to the engine metrics. An absent or
+/// explicit-null counter is `None`. No `..Default::default()`: a counter the
+/// engine gains must be mapped here, not silently zeroed.
 fn agent_history_metrics_from(
-    m: &models::AgentInstanceHistoryItemMetrics,
+    m: &models::AgentInstanceHistoryItemMetricsRequest,
 ) -> agent_model::AgentHistoryMetrics {
-    let val = |n: &types::Nullable<i64>| match n {
-        types::Nullable::Present(v) => Some(*v),
-        types::Nullable::Null => None,
+    let val = |n: &Option<types::Nullable<i64>>| match n {
+        Some(types::Nullable::Present(v)) => Some(*v),
+        Some(types::Nullable::Null) | None => None,
     };
     agent_model::AgentHistoryMetrics {
         input_tokens: val(&m.input_tokens),
         output_tokens: val(&m.output_tokens),
+        reasoning_token_count: val(&m.reasoning_token_count),
+        cache_creation_token_count: val(&m.cache_creation_token_count),
+        cache_read_token_count: val(&m.cache_read_token_count),
         duration_ms: val(&m.duration_ms),
-        ..Default::default()
     }
 }
 
@@ -20273,12 +21015,15 @@ fn agent_instance_result(
             row.provider.clone().unwrap_or_default(),
             agent_system_prompt(&row.system_prompt)?,
         ),
-        models::AgentInstanceMetrics::new(
-            row.input_tokens,
-            row.output_tokens,
-            row.model_calls as i32,
-            row.tool_calls as i32,
-        ),
+        models::AgentInstanceMetrics {
+            input_tokens: row.input_tokens,
+            output_tokens: row.output_tokens,
+            reasoning_token_count: row.reasoning_token_count,
+            cache_creation_token_count: row.cache_creation_token_count,
+            cache_read_token_count: row.cache_read_token_count,
+            model_calls: row.model_calls as i32,
+            tool_calls: row.tool_calls as i32,
+        },
         models::AgentInstanceLimits::new(
             row.max_model_calls as i32,
             row.max_tool_calls as i32,
@@ -20812,6 +21557,8 @@ fn job_kind_enums(
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
 /// process-definition identity is denormalized onto the row at projection time.
 fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
+    // The business id snapshotted when the job was created.
+    let business_id = nullable_business_id(job.business_id.clone());
     let process_definition_id = job.process_definition_id.clone();
     let process_definition_key = job.process_definition_key.clone();
 
@@ -20824,33 +21571,35 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
 
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
-    let mut result = models::JobSearchResult::new(
-        std::collections::HashMap::new(),
+    let mut result = models::JobSearchResult {
+        custom_headers: std::collections::HashMap::new(),
         deadline,
-        types::Nullable::Null,
-        types::Nullable::Present(job.element_id.clone()),
-        models::ElementInstanceKey(job.element_instance_key.to_string()),
-        types::Nullable::Null,
-        types::Nullable::Null,
-        types::Nullable::Null,
-        false,
-        types::Nullable::Null,
-        models::JobKey(job.key.to_string()),
-        job_kind_enum,
-        job_listener_event_type_enum,
+        denied_reason: types::Nullable::Null,
+        element_id: types::Nullable::Present(job.element_id.clone()),
+        element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
+        end_time: types::Nullable::Null,
+        error_code: types::Nullable::Null,
+        error_message: types::Nullable::Null,
+        has_failed_with_retries_left: false,
+        is_denied: types::Nullable::Null,
+        job_key: models::JobKey(job.key.to_string()),
+        kind: job_kind_enum,
+        listener_event_type: job_listener_event_type_enum,
         process_definition_id,
-        models::ProcessDefinitionKey(process_definition_key),
-        models::ProcessInstanceKey(job.instance_key.to_string()),
-        types::Nullable::Null,
-        job.retries,
-        job_state_enum(job.state),
-        "<default>".to_string(),
-        job.job_type.clone(),
-        job.worker.clone().unwrap_or_default(),
-        types::Nullable::Null,
-        types::Nullable::Null,
-        0,
-    );
+        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
+        process_instance_key: models::ProcessInstanceKey(job.instance_key.to_string()),
+        root_process_instance_key: types::Nullable::Null,
+        business_id,
+        retries: job.retries,
+        state: job_state_enum(job.state),
+        tenant_id: "<default>".to_string(),
+        r_type: job.job_type.clone(),
+        worker: job.worker.clone().unwrap_or_default(),
+        creation_time: types::Nullable::Null,
+        last_update_time: types::Nullable::Null,
+        priority: 0,
+        fetched_variables: None,
+    };
     // nano extension (#986): surface the declared read-set recorded on the durable
     // `JobActivated`. Omitted (`Null`) when the activation declared none, so a
     // fetch-all / undeclared activation reads as `null` rather than "[]".
@@ -20883,6 +21632,8 @@ fn user_task_result(
     task: &readstore::UserTaskRow,
     roots: &readstore::RootResolver,
 ) -> models::UserTaskResult {
+    // The business id snapshotted when the user task was created.
+    let business_id = nullable_business_id(task.business_id.clone());
     let creation_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
             .unwrap_or_else(chrono::Utc::now);
@@ -20897,46 +21648,46 @@ fn user_task_result(
         }
     };
 
-    let mut result = models::UserTaskResult::new(
-        types::Nullable::Null,
-        user_task_state_enum(task.state),
-        match &task.assignee {
+    models::UserTaskResult {
+        name: types::Nullable::Null,
+        state: user_task_state_enum(task.state),
+        assignee: match &task.assignee {
             Some(a) => types::Nullable::Present(a.clone()),
             None => types::Nullable::Null,
         },
-        task.element_id.clone(),
-        task.candidate_groups.clone(),
-        task.candidate_users.clone(),
-        task.process_definition_id.clone(),
+        element_id: task.element_id.clone(),
+        candidate_groups: task.candidate_groups.clone(),
+        candidate_users: task.candidate_users.clone(),
+        process_definition_id: task.process_definition_id.clone(),
         creation_date,
-        types::Nullable::Null,
-        parse_date(&task.follow_up_date),
-        parse_date(&task.due_date),
-        "<default>".to_string(),
-        match &task.external_form_reference {
+        completion_date: types::Nullable::Null,
+        follow_up_date: parse_date(&task.follow_up_date),
+        due_date: parse_date(&task.due_date),
+        tenant_id: "<default>".to_string(),
+        external_form_reference: match &task.external_form_reference {
             Some(r) => types::Nullable::Present(r.clone()),
             None => types::Nullable::Null,
         },
-        task.process_definition_version,
-        std::collections::HashMap::new(),
-        models::UserTaskKey(task.key.to_string()),
-        models::ElementInstanceKey(task.element_instance_key.to_string()),
-        types::Nullable::Null,
-        models::ProcessDefinitionKey(task.process_definition_key.clone()),
-        models::ProcessInstanceKey(task.instance_key.to_string()),
-        types::Nullable::Present(models::ProcessInstanceKey(
+        process_definition_version: task.process_definition_version,
+        custom_headers: std::collections::HashMap::new(),
+        priority: task.priority.clamp(0, 100) as u8,
+        user_task_key: models::UserTaskKey(task.key.to_string()),
+        element_instance_key: models::ElementInstanceKey(task.element_instance_key.to_string()),
+        process_name: types::Nullable::Null,
+        process_definition_key: models::ProcessDefinitionKey(task.process_definition_key.clone()),
+        process_instance_key: models::ProcessInstanceKey(task.instance_key.to_string()),
+        root_process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
             roots
                 .root_process_instance_key(task.instance_key)
                 .to_string(),
         )),
-        match task.form_key {
+        business_id,
+        form_key: match task.form_key {
             Some(k) => types::Nullable::Present(models::FormKey(k.to_string())),
             None => types::Nullable::Null,
         },
-        Vec::new(),
-    );
-    result.priority = task.priority.clamp(0, 100) as u8;
-    result
+        tags: Vec::new(),
+    }
 }
 
 /// Maps an engine [`ActivatedJob`] into the generated `ActivatedJobResult`,
@@ -21047,6 +21798,54 @@ fn job_command_with_lease(command: Command, lease_token: Option<String>) -> Comm
     command.with_lease_token(lease_token)
 }
 
+/// The single canonical builder of a `CompleteJob` engine command, shared by
+/// the REST handler and the Falcon stream path so the two cannot drift. A
+/// user-task-listener result and an ad-hoc result are mutually exclusive (a
+/// job is one kind or the other); task-listener jobs reject variables
+/// engine-side, so none are threaded for them.
+/// The payload of a job completion forwarded to the peer that owns the job
+/// (REST and Falcon share it, so the two forwarding paths cannot drift).
+#[derive(Default)]
+pub(crate) struct JobCompletion {
+    pub(crate) lease_token: Option<String>,
+    pub(crate) variables: Option<serde_json::Map<String, serde_json::Value>>,
+    pub(crate) adhoc_result: Option<AdHocJobResult>,
+    pub(crate) task_result: Option<TaskListenerJobResult>,
+    /// Camunda 8.10 `businessId` to assign to the job's root instance.
+    pub(crate) business_id: Option<String>,
+}
+
+fn completion_command(
+    job_key: u64,
+    variables: std::collections::HashMap<String, Value>,
+    adhoc_result: Option<AdHocJobResult>,
+    task_result: Option<TaskListenerJobResult>,
+    lease_token: Option<String>,
+    business_id: Option<String>,
+) -> Command {
+    let command = match (task_result, adhoc_result) {
+        (Some(task_listener_result), _) => {
+            Command::complete_job_with_task_result(job_key, task_listener_result)
+        }
+        (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
+        (None, None) => Command::complete_job_with(job_key, variables),
+    };
+    job_command_with_lease(command, lease_token).with_business_id(business_id)
+}
+
+/// HTTP status for a job-completion business-id rejection (Camunda 8.10
+/// `JobCompletionRequest.businessId`), or `None` for any other error. Shared by
+/// the REST and stream mappings: an empty id is INVALID_ARGUMENT (400); a
+/// child instance or a differing already-assigned id is INVALID_STATE (409).
+fn business_id_rejection_status(e: &EngineError) -> Option<u16> {
+    match e {
+        EngineError::BusinessIdInvalid { .. } => Some(400),
+        EngineError::BusinessIdOnChildInstance { .. }
+        | EngineError::BusinessIdAlreadyAssigned { .. } => Some(409),
+        _ => None,
+    }
+}
+
 /// Count of requests that supplied a job lease token under its deprecated
 /// pre-8.10 name (`leaseToken` on job commands, `jobLease` on agent-instance
 /// requests) instead of the current `jobLeaseToken` (#1283). Lets operators see
@@ -21135,10 +21934,28 @@ fn reconcile_lease_token_counted(
     Ok(token)
 }
 
+/// The `waitStateType` discriminator of a wait-state detail — the single
+/// source of a wait state's type (the detail models carry it as their tag).
+fn wait_state_type_of(details: &models::WaitStateDetails) -> &str {
+    use models::WaitStateDetails as D;
+    match details {
+        D::JobWaitStateDetails(d) => &d.wait_state_type,
+        D::MessageWaitStateDetails(d) => &d.wait_state_type,
+        D::UserTaskWaitStateDetails(d) => &d.wait_state_type,
+        D::TimerWaitStateDetails(d) => &d.wait_state_type,
+        D::SignalWaitStateDetails(d) => &d.wait_state_type,
+        D::ConditionWaitStateDetails(d) => &d.wait_state_type,
+    }
+}
+
 /// Human-readable 400 detail for a request that supplied both `jobLeaseToken`
 /// and its deprecated legacy alias with conflicting values.
 const CONFLICTING_LEASE_TOKENS_DETAIL: &str = "jobLeaseToken and the deprecated legacy alias (leaseToken/jobLease) were both supplied \
      with different values. Supply only jobLeaseToken.";
+
+/// Camunda's default physical tenant id (`PhysicalTenantIds.DEFAULT_PHYSICAL_TENANT_ID`),
+/// the one every Nano activation is served by — Nano has no physical tenants.
+const DEFAULT_PHYSICAL_TENANT_ID: &str = "default";
 
 fn activated_job_result(
     activated: ActivatedJobWithIdentity,
@@ -21183,31 +22000,38 @@ fn activated_job_result(
         .collect();
     let tags: Vec<models::Tag> = job.tags.iter().cloned().map(models::Tag).collect();
 
-    let mut result = models::ActivatedJobResult::new(
-        job.job_type,
-        process_id,
-        version,
-        job.element_id,
+    let mut result = models::ActivatedJobResult {
+        r_type: job.job_type,
+        process_definition_id: process_id,
+        process_definition_version: version,
+        element_id: job.element_id,
         custom_headers,
-        job.worker,
-        job.retries,
-        job.deadline as i64,
+        worker: job.worker,
+        retries: job.retries,
+        deadline: job.deadline as i64,
         variables,
-        "<default>".to_string(),
-        models::JobKey(job.key.to_string()),
-        models::ProcessInstanceKey(job.instance_key.to_string()),
-        models::ProcessDefinitionKey(process_definition_key),
-        models::ElementInstanceKey(job.element_instance_key.to_string()),
-        job_kind_enum,
-        job_listener_event_type_enum,
-        nanobpm_gateway_rest::types::Nullable::Null,
+        tenant_id: "<default>".to_string(),
+        // Nano has no physical tenants: every activation is served by Camunda's
+        // default one (`PhysicalTenantIds.DEFAULT_PHYSICAL_TENANT_ID`).
+        physical_tenant_id: DEFAULT_PHYSICAL_TENANT_ID.to_string(),
+        job_key: models::JobKey(job.key.to_string()),
+        process_instance_key: models::ProcessInstanceKey(job.instance_key.to_string()),
+        process_definition_key: models::ProcessDefinitionKey(process_definition_key),
+        element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
+        kind: job_kind_enum,
+        listener_event_type: job_listener_event_type_enum,
+        user_task: types::Nullable::Null,
         tags,
-        nanobpm_gateway_rest::types::Nullable::Null,
-        job.priority,
-        job.lease_token
-            .map(|lease| types::Nullable::Present(lease.to_string()))
-            .unwrap_or(types::Nullable::Null),
-    );
+        root_process_instance_key: types::Nullable::Null,
+        business_id: job
+            .business_id
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        priority: job.priority,
+        job_lease_token: job
+            .lease_token
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        lease_token: None,
+    };
     // Deprecation window (#1283): also emit the pre-8.10 `leaseToken` name so
     // workers that have not yet moved to `jobLeaseToken` keep receiving their
     // token. Mirrors jobLeaseToken exactly (null when the job is unleased).
@@ -25876,15 +26700,32 @@ mod clustered_startup_tests {
 
         // Publishing at node 1 fans out to node 0, whose message-start
         // subscription fires and creates a new instance on partition 0.
+        // The message's businessId rides the fan-out and is stamped on the
+        // message-start instance the owner creates.
         let (_message_key, instance) = node1
-            .correlate_message_cluster("order-placed".into(), String::new(), None)
-            .await;
+            .correlate_message_cluster(
+                "order-placed".into(),
+                String::new(),
+                None,
+                Some("order-7".into()),
+            )
+            .await
+            .expect("correlation with a valid business id");
         let instance = instance.expect("message-start must create an instance via fan-out");
         assert_eq!(
             nanobpmn_engine_core::partition_of(instance),
             0,
             "the message-start instance lives on the owner's partition 0"
         );
+        let mut stamped = types::Nullable::Null;
+        for _ in 0..200 {
+            stamped = node0.business_id_of(instance);
+            if stamped != types::Nullable::Null {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stamped, types::Nullable::Present("order-7".to_string()));
     }
 
     #[tokio::test]
@@ -25991,8 +26832,9 @@ mod clustered_startup_tests {
         // 1), so the publish fans to node 1, which correlates and routes the
         // continuation back to node 0 to advance the parked token.
         let (_message_key, correlated) = node0
-            .correlate_message_cluster("payment-received".into(), order.clone(), None)
-            .await;
+            .correlate_message_cluster("payment-received".into(), order.clone(), None, None)
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated,
             Some(instance_key),
@@ -26174,6 +27016,620 @@ mod clustered_startup_tests {
         );
     }
 
+    /// Camunda 8.10 `JobCompletionRequest.businessId` over REST: assigned to
+    /// the job's root instance; empty → 400; a differing id → 409 with the job
+    /// left open; the identical id → idempotent 204.
+    #[tokio::test]
+    async fn complete_job_assigns_business_id_and_maps_rejections() {
+        use apis::job::CompleteJobResponse as R;
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("two-steps")
+            .start_event("s")
+            .service_task("t1", "step")
+            .service_task("t2", "step")
+            .end_event("e")
+            .connect("s", "t1")
+            .connect("t1", "t2")
+            .connect("t2", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("two-steps".to_string(), "two.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let (instance, _) = server
+            .create_for_stream(Some("two-steps".into()), None, Default::default())
+            .await
+            .expect("instance created");
+        let complete = |job_key: String, business_id: &str| {
+            let server = server.clone();
+            let body: models::JobCompletionRequest =
+                serde_json::from_value(serde_json::json!({ "businessId": business_id }))
+                    .expect("valid completion body");
+            async move {
+                server
+                    .complete_job_impl(&models::CompleteJobPathParams { job_key }, &Some(body))
+                    .await
+                    .expect("handler returns Ok")
+            }
+        };
+        let activate = || async {
+            server
+                .activate_for_stream("step", "w", 1, 60_000, None)
+                .await
+                .into_iter()
+                .next()
+                .expect("a job activates")
+                .job_key
+                .0
+        };
+
+        let first = activate().await;
+        let first_key = first.clone();
+        assert!(matches!(
+            complete(first.clone(), "").await,
+            R::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert!(matches!(
+            complete(first, "order-1").await,
+            R::Status204_TheJobWasCompletedSuccessfully
+        ));
+        let mut stamped = types::Nullable::Null;
+        for _ in 0..200 {
+            stamped = server.business_id_of(instance);
+            if stamped != types::Nullable::Null {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stamped, types::Nullable::Present("order-1".to_string()));
+
+        let second = activate().await;
+        // Each job snapshots the business id current at its creation: the first
+        // job predates the assignment, the second was created after it.
+        let job_bid = |key: &str| {
+            let key: u64 = key.parse().expect("numeric job key");
+            server
+                .store
+                .jobs()
+                .into_iter()
+                .find(|j| j.key == key)
+                .expect("job row projected")
+                .business_id
+        };
+        assert_eq!(job_bid(&first_key), None);
+        assert_eq!(job_bid(&second).as_deref(), Some("order-1"));
+        assert!(matches!(
+            complete(second.clone(), "order-2").await,
+            R::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(_)
+        ));
+        assert!(
+            matches!(
+                complete(second, "order-1").await,
+                R::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "the rejected completion left the job open; the identical id completes it"
+        );
+    }
+
+    /// Camunda 8.10 `businessId` on publish/correlate (upstream #1291
+    /// re-sync): both REST paths stamp it on the instance a message start
+    /// event creates.
+    #[tokio::test]
+    async fn publish_and_correlate_stamp_business_id_on_message_start_instances() {
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("order-flow")
+            .message_start_event("start", "order-placed")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("order-flow".to_string(), "order.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(r) = server
+            .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: Some("via-correlate".to_string()),
+                name: "order-placed".to_string(),
+                correlation_key: None,
+                variables: None,
+                tenant_id: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected the message start to correlate");
+        };
+        let correlated: u64 = r.process_instance_key.0.parse().unwrap();
+
+        let publish: models::MessagePublicationRequest =
+            serde_json::from_value(serde_json::json!({
+            "name": "order-placed", "businessId": "via-publish"}))
+            .expect("valid publication");
+        assert!(matches!(
+            server.publish_message_impl(&publish).await.unwrap(),
+            apis::message::PublishMessageResponse::Status200_TheMessageWasPublished(_)
+        ));
+
+        let mut stamped = Vec::new();
+        for _ in 0..200 {
+            stamped = server
+                .store
+                .process_instances()
+                .into_iter()
+                .map(|pi| (pi.key, pi.business_id))
+                .collect();
+            if stamped.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        stamped.sort();
+        assert_eq!(stamped.len(), 2, "both messages started an instance");
+        assert!(stamped.contains(&(correlated, Some("via-correlate".to_string()))));
+        assert!(
+            stamped
+                .iter()
+                .any(|(_, b)| b.as_deref() == Some("via-publish"))
+        );
+    }
+
+    /// `ProcessDefinitionFilter.state` (upstream #1291 re-sync): Nano never
+    /// drains or deletes a definition, so `ACTIVE` matches every definition,
+    /// `DRAINING`/`DELETED` match none, and an out-of-enum value is a 400.
+    #[tokio::test]
+    async fn process_definition_search_honours_state_filter() {
+        use apis::process_definition::SearchProcessDefinitionsResponse as Resp;
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("p")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("p".to_string(), "p.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        // The read-model projection is asynchronous: wait until the deployed
+        // definition is projected, or the unfiltered baseline below can race
+        // the projection and undercount (seen under full-suite load).
+        let mut projected = false;
+        for _ in 0..300 {
+            if server
+                .store
+                .process_definitions()
+                .iter()
+                .any(|pd| pd.process_id == "p")
+            {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(projected, "the deployed definition is projected");
+        let search = |state: &str| {
+            let server = &server;
+            let state = state.to_string();
+            async move {
+                server
+                    .search_process_definitions_impl(&Some(models::ProcessDefinitionSearchQuery {
+                        page: None,
+                        sort: None,
+                        filter: Some(models::ProcessDefinitionFilter {
+                            state: Some(state),
+                            ..models::ProcessDefinitionFilter::new()
+                        }),
+                    }))
+                    .await
+                    .unwrap()
+            }
+        };
+        let count = |r: Resp| match r {
+            Resp::Status200_TheProcessDefinitionSearchResult(r) => r.items.len(),
+            other => panic!("expected 200, got {other:?}"),
+        };
+        let all = count(server.search_process_definitions_impl(&None).await.unwrap());
+        assert!(all >= 1, "the deployed definition is searchable");
+        assert_eq!(
+            count(search("ACTIVE").await),
+            all,
+            "every definition is ACTIVE"
+        );
+        assert_eq!(count(search("DRAINING").await), 0);
+        assert_eq!(count(search("DELETED").await), 0);
+        assert!(matches!(
+            search("BOGUS").await,
+            Resp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+    }
+
+    /// `businessId` filters on the message-subscription, correlated
+    /// message-subscription and decision-instance searches (upstream #1291
+    /// re-sync). The id is the owning process instance's, so each filter must
+    /// select exactly the rows of the tagged instance.
+    #[tokio::test]
+    async fn business_id_filters_select_rows_of_the_tagged_instance() {
+        use apis::decision_instance::SearchDecisionInstancesResponse as DecResp;
+        use apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse as CorrResp;
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as SubResp;
+        let server = ServerImpl::default();
+
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+          <decision id="farewell" name="Farewell">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i2"><inputExpression id="e2" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o2" name="result" typeRef="string" />
+              <rule id="r2"><inputEntry id="ie2"><text>"en"</text></inputEntry>
+                <outputEntry id="oe2"><text>"bye"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+        // Tagged and untagged instances evaluate *different* decisions: repeat
+        // evaluations of one decision currently collide in the read model
+        // (#1292), which would hide the untagged row this test must exclude.
+        let parter = ProcessBuilder::new("parter")
+            .start_event("s")
+            .business_rule_task("decide", "farewell", Some("farewell".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let greeter = ProcessBuilder::new("greeter")
+            .start_event("s")
+            .business_rule_task("decide", "greeting", Some("greeting".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("greeter".to_string(), "greeter.bpmn".to_string());
+        names.insert("parter".to_string(), "parter.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![greeter, parter, waiter],
+                &names,
+                vec![drg],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let create = |body: serde_json::Value| {
+            let server = &server;
+            async move {
+                let body: models::ProcessInstanceCreationInstruction =
+                    serde_json::from_value(body).expect("valid creation instruction");
+                let apis::process_instance::CreateProcessInstanceResponse::Status200_TheProcessInstanceWasCreated(r) =
+                    server.create_process_instance_impl(&body).await.unwrap()
+                else {
+                    panic!("create failed");
+                };
+                r.process_instance_key.0
+            }
+        };
+        let tagged_waiter = create(serde_json::json!({
+            "processDefinitionId": "waiter", "businessId": "biz-A",
+            "variables": {"orderId": "A1"}}))
+        .await;
+        let untagged_waiter = create(serde_json::json!({
+            "processDefinitionId": "waiter", "variables": {"orderId": "B1"}}))
+        .await;
+        let tagged_greeter = create(serde_json::json!({
+            "processDefinitionId": "greeter", "businessId": "biz-G",
+            "variables": {"lang": "en"}}))
+        .await;
+        let untagged_parter = create(serde_json::json!({
+            "processDefinitionId": "parter", "variables": {"lang": "en"}}))
+        .await;
+
+        let biz = |v: &str| Some(models::StringFilterProperty::String(v.to_string()));
+        let subs = |b: &str| {
+            let server = &server;
+            let b = b.to_string();
+            async move {
+                let q = models::MessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(models::MessageSubscriptionFilter {
+                        business_id: biz(&b),
+                        ..models::MessageSubscriptionFilter::new()
+                    }),
+                };
+                let SubResp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let decisions = |b: &str| {
+            let server = &server;
+            let b = b.to_string();
+            async move {
+                let q = models::DecisionInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(models::DecisionInstanceFilter {
+                        business_id: biz(&b),
+                        ..models::DecisionInstanceFilter::new()
+                    }),
+                };
+                let DecResp::Status200_TheDecisionInstanceSearchResult(r) = server
+                    .search_decision_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        // Wait until both subscriptions and both decision instances project.
+        for _ in 0..200 {
+            let all_subs = match server
+                .search_message_subscriptions_impl(&None)
+                .await
+                .unwrap()
+            {
+                SubResp::Status200_TheMessageSubscriptionSearchResult(r) => r.items.len(),
+                _ => 0,
+            };
+            let all_dec = match server.search_decision_instances_impl(&None).await.unwrap() {
+                DecResp::Status200_TheDecisionInstanceSearchResult(r) => r.items.len(),
+                _ => 0,
+            };
+            if all_subs == 2 && all_dec == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(subs("biz-A").await, vec![tagged_waiter.clone()]);
+        assert!(subs("nope").await.is_empty());
+        assert_eq!(decisions("biz-G").await, vec![tagged_greeter.clone()]);
+        assert!(decisions("nope").await.is_empty());
+
+        // `businessId` sort (new upstream sort value): an absent id sorts as
+        // empty, so ASC puts untagged rows first — the reverse of the key order
+        // (tagged instances were created first), which a wildcard fallback
+        // would return.
+        let by_business_id =
+            |order: &str| serde_json::json!({"sort": [{"field": "businessId", "order": order}]});
+        let sorted_subs = |order: &str| {
+            let q: models::MessageSubscriptionSearchQuery =
+                serde_json::from_value(by_business_id(order)).expect("valid query");
+            let server = &server;
+            async move {
+                let SubResp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            sorted_subs("ASC").await,
+            vec![untagged_waiter.clone(), tagged_waiter.clone()]
+        );
+        assert_eq!(
+            sorted_subs("DESC").await,
+            vec![tagged_waiter.clone(), untagged_waiter.clone()]
+        );
+        let sorted_decisions = |order: &str| {
+            let q: models::DecisionInstanceSearchQuery =
+                serde_json::from_value(by_business_id(order)).expect("valid query");
+            let server = &server;
+            async move {
+                let DecResp::Status200_TheDecisionInstanceSearchResult(r) = server
+                    .search_decision_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            sorted_decisions("ASC").await,
+            vec![untagged_parter.clone(), tagged_greeter.clone()]
+        );
+        assert_eq!(
+            sorted_decisions("DESC").await,
+            vec![tagged_greeter.clone(), untagged_parter.clone()]
+        );
+        let pis: models::ProcessInstanceSearchQuery =
+            serde_json::from_value(by_business_id("ASC")).expect("valid query");
+        let apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r) =
+            server.search_process_instances_impl(&Some(pis)).await.unwrap()
+        else {
+            panic!("expected 200");
+        };
+        let pi_order: Vec<String> = r
+            .items
+            .into_iter()
+            .map(|i| i.process_instance_key.0)
+            .collect();
+        assert_eq!(
+            pi_order,
+            vec![
+                untagged_waiter.clone(),
+                untagged_parter.clone(),
+                tagged_waiter.clone(),
+                tagged_greeter.clone()
+            ],
+            "null ids first (key tie-break), then biz-A < biz-G"
+        );
+
+        // Correlate both waiters; only the tagged one matches the filter.
+        for key in ["A1", "B1"] {
+            let resp = server
+                .correlate_message_impl(&models::MessageCorrelationRequest {
+                    business_id: None,
+                    name: "OrderPlaced".to_string(),
+                    correlation_key: Some(key.to_string()),
+                    variables: None,
+                    tenant_id: None,
+                })
+                .await
+                .expect("correlate returns");
+            assert!(matches!(
+                resp,
+                apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(_)
+            ));
+        }
+        let corr = |b: &str| {
+            let server = &server;
+            let b = b.to_string();
+            async move {
+                let q = models::CorrelatedMessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(models::CorrelatedMessageSubscriptionFilter {
+                        business_id: biz(&b),
+                        ..models::CorrelatedMessageSubscriptionFilter::new()
+                    }),
+                };
+                let CorrResp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) = server
+                    .search_correlated_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| i.process_instance_key.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        for _ in 0..200 {
+            if match server
+                .search_correlated_message_subscriptions_impl(&None)
+                .await
+                .unwrap()
+            {
+                CorrResp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) => {
+                    r.items.len()
+                }
+                _ => 0,
+            } == 2
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(corr("biz-A").await, vec![tagged_waiter.clone()]);
+        assert!(corr("nope").await.is_empty());
+        let sorted_corr = |order: &str| {
+            let q: models::CorrelatedMessageSubscriptionSearchQuery =
+                serde_json::from_value(by_business_id(order)).expect("valid query");
+            let server = &server;
+            async move {
+                let CorrResp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) = server
+                    .search_correlated_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| i.process_instance_key.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            sorted_corr("ASC").await,
+            vec![untagged_waiter.clone(), tagged_waiter.clone()]
+        );
+        assert_eq!(
+            sorted_corr("DESC").await,
+            vec![tagged_waiter, untagged_waiter]
+        );
+    }
+
     #[tokio::test]
     async fn business_rule_task_records_a_decision_instance_in_the_read_model() {
         // Phase 5 parity: a `businessRuleTask` evaluation emits a `DecisionEvaluated`
@@ -26300,6 +27756,111 @@ mod clustered_startup_tests {
         );
     }
 
+    /// `UserTaskFilter.$or` (upstream #1291 re-sync): top-level fields AND any
+    /// one `$or` clause (each clause an AND of its own fields). Previously the
+    /// clause list was silently ignored, so the search returned a superset.
+    #[tokio::test]
+    async fn user_task_search_honours_or_clauses() {
+        use apis::user_task::SearchUserTasksResponse as Search;
+        let server = ServerImpl::default();
+        let def = ProcessBuilder::new("approve")
+            .start_event("s")
+            .user_task("review")
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("approve".to_string(), "approve.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![def],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let mut instances = Vec::new();
+        for _ in 0..3 {
+            let (k, _) = server
+                .create_for_stream(Some("approve".into()), None, Default::default())
+                .await
+                .expect("create instance");
+            instances.push(k);
+        }
+        let search = |filter: Option<models::UserTaskFilter>| {
+            let server = &server;
+            async move {
+                let q = models::UserTaskSearchQuery {
+                    sort: None,
+                    page: None,
+                    filter,
+                };
+                let Search::Status200_TheUserTaskSearchResult(r) =
+                    server.search_user_tasks_impl(&Some(q)).await.unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+            }
+        };
+        for _ in 0..200 {
+            if search(None).await.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let pik = |k: u64| {
+            Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(k.to_string()),
+                ),
+            )
+        };
+        let clause = |k: u64| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.process_instance_key = pik(k);
+            c
+        };
+        let or_filter = |top: Option<u64>, clauses: Vec<models::UserTaskFilterFields>| {
+            let mut f = models::UserTaskFilter::new();
+            f.process_instance_key = top.and_then(pik);
+            f.dollar_or = Some(clauses);
+            Some(f)
+        };
+        let instance_keys = |items: Vec<models::UserTaskResult>| {
+            let mut ks: Vec<u64> = items
+                .iter()
+                .map(|t| t.process_instance_key.0.parse().unwrap())
+                .collect();
+            ks.sort_unstable();
+            ks
+        };
+
+        // Any one clause matches → the union of the two instances.
+        let either = search(or_filter(
+            None,
+            vec![clause(instances[0]), clause(instances[1])],
+        ))
+        .await;
+        assert_eq!(instance_keys(either), vec![instances[0], instances[1]]);
+
+        // Top-level fields AND the $or: only the overlap survives.
+        let overlap = search(or_filter(
+            Some(instances[1]),
+            vec![clause(instances[0]), clause(instances[1])],
+        ))
+        .await;
+        assert_eq!(instance_keys(overlap), vec![instances[1]]);
+
+        // An empty $or list places no constraint.
+        let empty = search(or_filter(None, vec![])).await;
+        assert_eq!(empty.len(), 3);
+    }
+
     #[tokio::test]
     async fn user_task_element_instance_is_queryable_via_search_and_get() {
         // Element-instance parity: the engine's per-element lifecycle events are
@@ -26407,6 +27968,107 @@ mod clustered_startup_tests {
         ));
     }
 
+    /// `ElementInstanceWaitStateQuery.sort` (upstream #1291 re-sync) orders
+    /// results by the requested field/direction instead of the fixed
+    /// element-instance-key order.
+    #[tokio::test]
+    async fn wait_state_search_honours_sort() {
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+        let charger = ProcessBuilder::new("charger")
+            .start_event("s")
+            .service_task("charge", "pay")
+            .end_event("e")
+            .connect("s", "charge")
+            .connect("charge", "e")
+            .build()
+            .expect("valid service-task process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("charger".to_string(), "charger.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![charger, waiter],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        for _ in 0..3 {
+            server
+                .create_for_stream(Some("charger".into()), None, Default::default())
+                .await
+                .expect("create charger");
+        }
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+        loop_until_wait_states(&server, None, 4).await;
+
+        let search = |field: &str, order: models::SortOrderEnum| {
+            let q = models::ElementInstanceWaitStateQuery {
+                sort: Some(vec![models::ElementInstanceWaitStateQuerySortRequest {
+                    field: field.to_string(),
+                    order: Some(order),
+                }]),
+                page: None,
+                filter: None,
+            };
+            let server = &server;
+            async move {
+                let Resp::Status200_TheElementInstanceWaitStateSearchResult(r) = server
+                    .search_element_instance_wait_states_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+            }
+        };
+        let num = |k: &str| k.parse::<u64>().unwrap();
+
+        let desc = search("processInstanceKey", models::SortOrderEnum::Desc).await;
+        let keys: Vec<u64> = desc
+            .iter()
+            .map(|w| num(&w.process_instance_key.0))
+            .collect();
+        let mut expected = keys.clone();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(keys, expected, "processInstanceKey DESC");
+        assert_eq!(keys.len(), 4);
+
+        let by_id = search("elementId", models::SortOrderEnum::Asc).await;
+        let ids: Vec<&str> = by_id.iter().map(|w| w.element_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["await", "charge", "charge", "charge"],
+            "elementId ASC"
+        );
+
+        let eik_desc = search("elementInstanceKey", models::SortOrderEnum::Desc).await;
+        let eiks: Vec<u64> = eik_desc
+            .iter()
+            .map(|w| num(&w.element_instance_key.0))
+            .collect();
+        let mut expected = eiks.clone();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(eiks, expected, "elementInstanceKey DESC");
+    }
+
     #[tokio::test]
     async fn wait_states_surface_parked_jobs_and_message_subscriptions() {
         // Element-instance parity: searchElementInstanceWaitStates reports element
@@ -26465,11 +28127,11 @@ mod clustered_startup_tests {
         let items = loop_until_wait_states(&server, None, 2).await;
         let job = items
             .iter()
-            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::Job)
+            .find(|w| ws_type(w) == models::WaitStateTypeEnum::Job)
             .expect("a JOB wait state");
         let msg = items
             .iter()
-            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::Message)
+            .find(|w| ws_type(w) == models::WaitStateTypeEnum::Message)
             .expect("a MESSAGE wait state");
 
         // JOB wait state: the service-task element parked on its activatable job.
@@ -26484,7 +28146,7 @@ mod clustered_startup_tests {
             job.root_process_instance_key,
             types::Nullable::Present(models::ProcessInstanceKey(charger_key.to_string()))
         );
-        let jd = match &job.job_details {
+        let jd = match job_details(job) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("JOB wait state carries job details"),
         };
@@ -26499,7 +28161,7 @@ mod clustered_startup_tests {
             "JOB wait state carries a present, positive retries count, got {:?}",
             jd.retries
         );
-        assert!(matches!(job.message_details, types::Nullable::Null));
+        assert!(matches!(message_details(job), types::Nullable::Null));
 
         // MESSAGE wait state: the message catch parked on its open subscription.
         assert_eq!(msg.element_id, "await");
@@ -26508,7 +28170,7 @@ mod clustered_startup_tests {
             models::WaitStateElementTypeEnum::IntermediateCatchEvent
         );
         assert_eq!(msg.process_instance_key.0, waiter_key.to_string());
-        let md = match &msg.message_details {
+        let md = match message_details(msg) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("MESSAGE wait state carries message details"),
         };
@@ -26517,7 +28179,7 @@ mod clustered_startup_tests {
             md.correlation_key,
             types::Nullable::Present("A1".to_string())
         );
-        assert!(matches!(msg.job_details, types::Nullable::Null));
+        assert!(matches!(job_details(msg), types::Nullable::Null));
 
         // Filter by waitStateType = MESSAGE yields only the message wait state.
         let only_msg_filter = models::ElementInstanceWaitStateFilter {
@@ -26529,6 +28191,7 @@ mod clustered_startup_tests {
         let resp = server
             .search_element_instance_wait_states_impl(&Some(
                 models::ElementInstanceWaitStateQuery {
+                    sort: None,
                     page: None,
                     filter: Some(only_msg_filter),
                 },
@@ -26540,7 +28203,7 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(
-            result.items[0].wait_state_type,
+            ws_type(&result.items[0]),
             models::WaitStateTypeEnum::Message
         );
 
@@ -26556,6 +28219,7 @@ mod clustered_startup_tests {
         let resp = server
             .search_element_instance_wait_states_impl(&Some(
                 models::ElementInstanceWaitStateQuery {
+                    sort: None,
                     page: None,
                     filter: Some(only_charger),
                 },
@@ -26567,6 +28231,192 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    /// One element instance can hold several wait states (here a job and its
+    /// boundary timer), so the pagination cursor must identify the wait state,
+    /// not the element instance: forward paging with `limit: 1` visits each
+    /// wait state exactly once, then ends (#1295 review).
+    #[tokio::test]
+    async fn wait_state_cursor_pages_each_wait_of_one_element_instance_once() {
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("guarded")
+            .start_event("s")
+            .service_task("work", "w")
+            .timer_boundary_event("deadline", "work", 3_600_000)
+            .end_event("e")
+            .end_event("late")
+            .connect("s", "work")
+            .connect("work", "e")
+            .connect("deadline", "late")
+            .build()
+            .expect("valid boundary-timer process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("guarded".to_string(), "guarded.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        server
+            .create_for_stream(Some("guarded".into()), None, Default::default())
+            .await
+            .expect("create instance");
+        let all = loop_until_wait_states(&server, None, 2).await;
+        assert_eq!(all.len(), 2, "a JOB and a TIMER wait: {all:?}");
+        assert_eq!(
+            all[0].element_instance_key, all[1].element_instance_key,
+            "both waits belong to the one service-task instance"
+        );
+
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..5 {
+            let mut page = serde_json::json!({"limit": 1});
+            if let Some(a) = &after {
+                page["after"] = serde_json::json!(a);
+            }
+            let q: models::ElementInstanceWaitStateQuery =
+                serde_json::from_value(serde_json::json!({ "page": page })).expect("valid query");
+            let Resp::Status200_TheElementInstanceWaitStateSearchResult(r) = server
+                .search_element_instance_wait_states_impl(&Some(q))
+                .await
+                .expect("wait-state search returns")
+            else {
+                panic!("expected 200");
+            };
+            if r.items.is_empty() {
+                break;
+            }
+            seen.extend(r.items.iter().map(ws_type));
+            after = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => break,
+            };
+        }
+        seen.sort_by_key(|t| t.to_string());
+        assert_eq!(
+            seen,
+            vec![
+                models::WaitStateTypeEnum::Job,
+                models::WaitStateTypeEnum::Timer
+            ],
+            "each wait state paged exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_states_surface_timer_signal_and_condition_waits() {
+        // The TIMER / SIGNAL / CONDITION variants of the wait-state API: an
+        // element instance parked on an armed timer, an open signal subscription
+        // or an open conditional subscription (#1295 review).
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+        let one = |b: ProcessBuilder| {
+            b.end_event("e")
+                .connect("s", "wait")
+                .connect("wait", "e")
+                .build()
+                .expect("valid catch process")
+        };
+        let timer = one(ProcessBuilder::new("timed")
+            .start_event("s")
+            .timer_intermediate_catch_event("wait", 3_600_000));
+        let signal = one(ProcessBuilder::new("signalled")
+            .start_event("s")
+            .signal_intermediate_catch_event("wait", "go"));
+        let cond = one(ProcessBuilder::new("gated")
+            .start_event("s")
+            .conditional_intermediate_catch_event("wait", "=approved = true"));
+        let names: std::collections::HashMap<String, String> = ["timed", "signalled", "gated"]
+            .into_iter()
+            .map(|p| (p.to_string(), format!("{p}.bpmn")))
+            .collect();
+        server
+            .deploy_resources_locally(
+                vec![timer, signal, cond],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let mut keys = std::collections::HashMap::new();
+        for id in ["timed", "signalled", "gated"] {
+            // `approved = false` keeps the conditional catch parked.
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("approved".to_string(), Value::Bool(false));
+            let (key, _) = server
+                .create_for_stream(Some(id.into()), None, vars)
+                .await
+                .expect("create instance");
+            keys.insert(id, key);
+        }
+
+        let items = loop_until_wait_states(&server, None, 3).await;
+        let by_type = |t: models::WaitStateTypeEnum| {
+            items
+                .iter()
+                .find(|w| ws_type(w) == t)
+                .unwrap_or_else(|| panic!("a {t} wait state"))
+        };
+        let tw = by_type(models::WaitStateTypeEnum::Timer);
+        assert_eq!(tw.process_instance_key.0, keys["timed"].to_string());
+        assert_eq!(tw.element_id, "wait");
+        assert_eq!(
+            tw.element_type,
+            models::WaitStateElementTypeEnum::IntermediateCatchEvent
+        );
+        let models::WaitStateDetails::TimerWaitStateDetails(td) = &tw.details else {
+            panic!("TIMER details, got {:?}", tw.details);
+        };
+        assert!(matches!(td.due_date, types::Nullable::Present(d) if d > 0));
+        assert_eq!(td.repetitions, types::Nullable::Null);
+
+        let sw = by_type(models::WaitStateTypeEnum::Signal);
+        assert_eq!(sw.process_instance_key.0, keys["signalled"].to_string());
+        let models::WaitStateDetails::SignalWaitStateDetails(sd) = &sw.details else {
+            panic!("SIGNAL details, got {:?}", sw.details);
+        };
+        assert_eq!(sd.signal_name, "go");
+
+        let cw = by_type(models::WaitStateTypeEnum::Condition);
+        assert_eq!(cw.process_instance_key.0, keys["gated"].to_string());
+        let models::WaitStateDetails::ConditionWaitStateDetails(cd) = &cw.details else {
+            panic!("CONDITION details, got {:?}", cw.details);
+        };
+        assert_eq!(cd.expression, "=approved = true");
+        assert!(cd.events.is_empty(), "empty events = all events");
+
+        // `waitStateType` isolates each new type.
+        let only_signal = models::ElementInstanceWaitStateFilter {
+            wait_state_type: Some(models::WaitStateTypeFilterProperty::WaitStateTypeEnum(
+                models::WaitStateTypeEnum::Signal,
+            )),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let resp = server
+            .search_element_instance_wait_states_impl(&Some(
+                models::ElementInstanceWaitStateQuery {
+                    sort: None,
+                    page: None,
+                    filter: Some(only_signal),
+                },
+            ))
+            .await
+            .expect("filtered search returns");
+        let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(ws_type(&result.items[0]), models::WaitStateTypeEnum::Signal);
     }
 
     #[tokio::test]
@@ -26621,7 +28471,7 @@ mod clustered_startup_tests {
         let items = loop_until_wait_states(&server, Some(user_task_filter.clone()), 1).await;
         let park = items
             .iter()
-            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::UserTask)
+            .find(|w| ws_type(w) == models::WaitStateTypeEnum::UserTask)
             .expect("a USER_TASK wait state");
         assert_eq!(park.element_id, "review");
         assert_eq!(
@@ -26636,7 +28486,7 @@ mod clustered_startup_tests {
         );
         // The park carries userTaskDetails with a present taskKey (and no job or
         // message details).
-        let ud = match &park.user_task_details {
+        let ud = match user_task_details(park) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("USER_TASK wait state carries user task details"),
         };
@@ -26648,8 +28498,8 @@ mod clustered_startup_tests {
             matches!(ud.due_date, types::Nullable::Null),
             "dueDate is present-but-null for a task without a due date"
         );
-        assert!(matches!(park.job_details, types::Nullable::Null));
-        assert!(matches!(park.message_details, types::Nullable::Null));
+        assert!(matches!(job_details(park), types::Nullable::Null));
+        assert!(matches!(message_details(park), types::Nullable::Null));
 
         // Short-circuit guard (suppressed advisory, main.rs:9704): a concrete
         // `waitStateType` filter skips the read-model scans it excludes. Filtering
@@ -26665,6 +28515,7 @@ mod clustered_startup_tests {
         let message_resp = server
             .search_element_instance_wait_states_impl(&Some(
                 models::ElementInstanceWaitStateQuery {
+                    sort: None,
                     page: None,
                     filter: Some(message_filter),
                 },
@@ -26679,7 +28530,7 @@ mod clustered_startup_tests {
             message_result
                 .items
                 .iter()
-                .all(|w| w.wait_state_type == models::WaitStateTypeEnum::Message),
+                .all(|w| ws_type(w) == models::WaitStateTypeEnum::Message),
             "a MESSAGE filter surfaces only MESSAGE wait states — no USER_TASK leak"
         );
 
@@ -26707,6 +28558,7 @@ mod clustered_startup_tests {
             let resp = server
                 .search_element_instance_wait_states_impl(&Some(
                     models::ElementInstanceWaitStateQuery {
+                        sort: None,
                         page: None,
                         filter: Some(user_task_filter.clone()),
                     },
@@ -26786,11 +28638,11 @@ mod clustered_startup_tests {
         let job = items
             .iter()
             .find(|w| {
-                w.wait_state_type == models::WaitStateTypeEnum::Job
+                ws_type(w) == models::WaitStateTypeEnum::Job
                     && w.process_instance_key.0 == charger_key.to_string()
             })
             .expect("the activated service-task job is still a JOB wait state");
-        let jd = match &job.job_details {
+        let jd = match job_details(job) {
             types::Nullable::Present(d) => d,
             types::Nullable::Null => panic!("JOB wait state carries job details"),
         };
@@ -27118,6 +28970,7 @@ mod clustered_startup_tests {
         // Publish the message that correlates the open subscription.
         let correlate = server
             .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: None,
                 name: "OrderPlaced".to_string(),
                 correlation_key: Some("A1".to_string()),
                 variables: None,
@@ -27301,6 +29154,7 @@ mod clustered_startup_tests {
             let resp = server
                 .search_element_instance_wait_states_impl(&Some(
                     models::ElementInstanceWaitStateQuery {
+                        sort: None,
                         page: None,
                         filter: filter.clone(),
                     },
@@ -27321,6 +29175,65 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("wait states never reached {want} resolved items");
+    }
+
+    /// The wait state's type, derived from its discriminated `details`. Also
+    /// pins the generated wire form: the serialized details carry exactly one
+    /// `waitStateType` key whose value is the discriminator MAPPING key (`JOB`,
+    /// …), never the member schema name (#1295 review of the postprocessor).
+    fn ws_type(w: &models::ElementInstanceWaitStateResult) -> models::WaitStateTypeEnum {
+        let wire = serde_json::to_string(&w.details).expect("details serialize");
+        assert_eq!(
+            wire.matches("\"waitStateType\"").count(),
+            1,
+            "exactly one discriminator on the wire: {wire}"
+        );
+        let tag: serde_json::Value = serde_json::from_str(&wire).expect("valid JSON");
+        assert_eq!(
+            tag["waitStateType"].as_str(),
+            Some(wait_state_type_of(&w.details)),
+            "wire tag is the mapping key: {wire}"
+        );
+        let back: models::WaitStateDetails =
+            serde_json::from_str(&wire).expect("the wire form deserializes");
+        assert_eq!(back, w.details, "wire form round-trips to the same variant");
+        wait_state_type_of(&w.details)
+            .parse()
+            .expect("a known waitStateType")
+    }
+
+    /// `JOB` details of a wait state (`Null` for any other type).
+    fn job_details(
+        w: &models::ElementInstanceWaitStateResult,
+    ) -> types::Nullable<models::JobWaitStateDetails> {
+        match &w.details {
+            models::WaitStateDetails::JobWaitStateDetails(d) => types::Nullable::Present(d.clone()),
+            _ => types::Nullable::Null,
+        }
+    }
+
+    /// `MESSAGE` details of a wait state (`Null` for any other type).
+    fn message_details(
+        w: &models::ElementInstanceWaitStateResult,
+    ) -> types::Nullable<models::MessageWaitStateDetails> {
+        match &w.details {
+            models::WaitStateDetails::MessageWaitStateDetails(d) => {
+                types::Nullable::Present(d.clone())
+            }
+            _ => types::Nullable::Null,
+        }
+    }
+
+    /// `USER_TASK` details of a wait state (`Null` for any other type).
+    fn user_task_details(
+        w: &models::ElementInstanceWaitStateResult,
+    ) -> types::Nullable<models::UserTaskWaitStateDetails> {
+        match &w.details {
+            models::WaitStateDetails::UserTaskWaitStateDetails(d) => {
+                types::Nullable::Present(d.clone())
+            }
+            _ => types::Nullable::Null,
+        }
     }
 
     #[tokio::test]
@@ -29021,8 +30934,9 @@ mod clustered_startup_tests {
         // instance round-robin across all four partitions (1 & 3 on node 1).
         for i in 0..16u32 {
             node0
-                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None)
-                .await;
+                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None, None)
+                .await
+                .expect("correlation with a valid business id");
         }
 
         let count_instances = |server: ServerImpl| async move {
@@ -29063,7 +30977,7 @@ mod clustered_startup_tests {
         // node-0-owned partition. node 1 (a different gateway) must forward the
         // completion back to node 0.
         let node0 = clustered_node(0);
-        let (_instance, _) = node0
+        let (instance, _) = node0
             .create_for_stream(Some("demo".into()), None, Default::default())
             .await
             .expect("owner creates the demo instance");
@@ -29098,18 +31012,36 @@ mod clustered_startup_tests {
 
         // Forward the completion to node 0 over the wire and map its answer back.
         use apis::job::CompleteJobResponse as R;
+        // The completion carries a Camunda 8.10 businessId, which must ride
+        // the forward and be assigned on the owner.
         let resp = node1
-            .forward_complete_job(owner, job_key, None, None, None, None)
+            .forward_complete_job(
+                owner,
+                job_key,
+                JobCompletion {
+                    business_id: Some("fwd-1".into()),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(
             matches!(resp, R::Status204_TheJobWasCompletedSuccessfully),
             "the forwarded completion should succeed (204)"
         );
+        let mut stamped = types::Nullable::Null;
+        for _ in 0..200 {
+            stamped = node0.business_id_of(instance);
+            if stamped != types::Nullable::Null {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stamped, types::Nullable::Present("fwd-1".to_string()));
 
         // The completion really mutated node 0's state: completing the same job
         // again is rejected (it is no longer an activated job).
         let again = node1
-            .forward_complete_job(owner, job_key, None, None, None, None)
+            .forward_complete_job(owner, job_key, JobCompletion::default())
             .await;
         assert!(
             !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
@@ -29659,7 +31591,7 @@ mod clustered_startup_tests {
             .expect("the job's partition is owned by node 0");
         assert_eq!(owner, 0);
         let (status, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None, None, None)
+            .forward_complete_job_stream(owner, job_key, JobCompletion::default())
             .await;
         assert!(
             is_ok_status(status),
@@ -29668,7 +31600,7 @@ mod clustered_startup_tests {
 
         // Re-completing the same job is rejected — proof it mutated node 0's state.
         let (again, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None, None, None)
+            .forward_complete_job_stream(owner, job_key, JobCompletion::default())
             .await;
         assert!(
             !is_ok_status(again),
@@ -33692,50 +35624,71 @@ mod clustered_startup_tests {
 
     #[tokio::test]
     async fn rest_batch_update_jobs_validates_and_mints_a_batch_key() {
-        use apis::job::BatchUpdateJobsResponse as Resp;
+        use apis::job::UpdateJobsBatchOperationResponse as Resp;
         let server = ServerImpl::default();
+        let request =
+            |changeset| models::JobBatchUpdateRequest::new(models::JobFilter::new(), changeset);
+        let rejected = |resp| matches!(resp, Resp::Status400_TheJobBatchUpdateOperationFailed(_));
 
-        // A valid changeset (priority within 0..=100) mints a trackable batch key.
-        let mut changeset = models::JobUpdateBatchChangeset::new();
-        changeset.priority = Some(types::Nullable::Present(50));
-        let req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), changeset);
-        let resp = server
-            .batch_update_jobs_impl(&req)
-            .await
-            .expect("handler runs");
-        let Resp::Status200_TheBatchOperationWasCreated(result) = resp else {
-            panic!("expected 200 for a valid batch update");
-        };
-        assert_eq!(result.batch_operation_type, "UPDATE_JOB");
-        assert!(
-            result.batch_operation_key.parse::<u64>().is_ok(),
-            "the minted batch-operation key is numeric"
-        );
+        // Each changeset field alone is a valid update and mints a trackable batch key.
+        for field in ["priority", "retries", "timeout"] {
+            let mut changeset = models::JobChangeset::new();
+            match field {
+                "priority" => changeset.priority = Some(types::Nullable::Present(50)),
+                "retries" => changeset.retries = Some(types::Nullable::Present(3)),
+                _ => changeset.timeout = Some(types::Nullable::Present(60_000)),
+            }
+            let resp = server
+                .update_jobs_batch_operation_impl(&request(changeset))
+                .await
+                .expect("handler runs");
+            let Resp::Status200_TheBatchOperationWasCreated(result) = resp else {
+                panic!("expected 200 for a valid `{field}` batch update");
+            };
+            assert_eq!(
+                result.batch_operation_type,
+                models::BatchOperationTypeEnum::UpdateJob
+            );
+            assert!(
+                result.batch_operation_key.parse::<u64>().is_ok(),
+                "the minted batch-operation key is numeric"
+            );
+        }
 
         // An empty changeset is a 400.
-        let empty = models::JobUpdateBatchOperationRequest::new(
-            models::JobFilter::new(),
-            models::JobUpdateBatchChangeset::new(),
-        );
         assert!(
-            matches!(
-                server.batch_update_jobs_impl(&empty).await.unwrap(),
-                Resp::Status400_TheProvidedDataIsNotValid(_)
+            rejected(
+                server
+                    .update_jobs_batch_operation_impl(&request(models::JobChangeset::new()))
+                    .await
+                    .unwrap()
             ),
             "an empty changeset must be rejected"
         );
 
-        // A priority outside 0..=100 is a 400.
-        let mut bad = models::JobUpdateBatchChangeset::new();
-        bad.priority = Some(types::Nullable::Present(200));
-        let bad_req = models::JobUpdateBatchOperationRequest::new(models::JobFilter::new(), bad);
-        assert!(
-            matches!(
-                server.batch_update_jobs_impl(&bad_req).await.unwrap(),
-                Resp::Status400_TheProvidedDataIsNotValid(_)
-            ),
-            "an out-of-range priority must be rejected"
-        );
+        // Out-of-range values are 400s: priority outside 0..=100, and — since the
+        // upstream schema types them as signed — negative retries/timeout.
+        let mut bad_priority = models::JobChangeset::new();
+        bad_priority.priority = Some(types::Nullable::Present(200));
+        let mut bad_retries = models::JobChangeset::new();
+        bad_retries.retries = Some(types::Nullable::Present(-1));
+        let mut bad_timeout = models::JobChangeset::new();
+        bad_timeout.timeout = Some(types::Nullable::Present(-1));
+        for (what, changeset) in [
+            ("priority", bad_priority),
+            ("retries", bad_retries),
+            ("timeout", bad_timeout),
+        ] {
+            assert!(
+                rejected(
+                    server
+                        .update_jobs_batch_operation_impl(&request(changeset))
+                        .await
+                        .unwrap()
+                ),
+                "an out-of-range {what} must be rejected"
+            );
+        }
     }
 
     /// Wait for a job of `job_type` to project into the read model, returning its
@@ -34768,8 +36721,10 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated,
             Some(instance_key),
@@ -34839,8 +36794,10 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated, None,
             "the publish correlates nothing after the remote subscription is disarmed"
@@ -34910,8 +36867,10 @@ mod subscription_placement_tests {
                 "abort-order".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated,
             Some(instance_key),
@@ -34964,8 +36923,10 @@ mod subscription_placement_tests {
                     "order-placed".into(),
                     format!("order-{i}"),
                     std::collections::HashMap::new(),
+                    None,
                 )
-                .await;
+                .await
+                .expect("correlation with a valid business id");
         }
 
         // Count the parked instances per partition directly from each engine.
@@ -35077,8 +37038,10 @@ mod subscription_placement_tests {
                     "payment-received".into(),
                     order.clone(),
                     std::collections::HashMap::new(),
+                    None,
                 )
-                .await;
+                .await
+                .expect("correlation with a valid business id");
             if c == Some(instance_key) {
                 correlated = c;
                 break;
@@ -35136,8 +37099,14 @@ mod subscription_placement_tests {
             .expect("a non-zero-hashing key exists");
 
         let (_message_key, instance) = server
-            .correlate_message_local("order-placed".into(), key, std::collections::HashMap::new())
-            .await;
+            .correlate_message_local(
+                "order-placed".into(),
+                key,
+                std::collections::HashMap::new(),
+                None,
+            )
+            .await
+            .expect("correlation with a valid business id");
         let instance_key = instance.expect("the message-start created an instance on p0");
         assert_eq!(
             nanobpmn_engine_core::partition_of(instance_key),
@@ -35173,8 +37142,10 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 "order-x".into(),
                 std::collections::HashMap::new(),
+                None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(correlated, Some(instance_key));
 
         let (_vars, completed) = server
@@ -35411,6 +37382,7 @@ mod adhoc_result_mapping_tests {
     fn plain_completion_has_no_adhoc_result() {
         assert!(adhoc_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35423,6 +37395,7 @@ mod adhoc_result_mapping_tests {
     #[test]
     fn user_task_result_is_not_an_adhoc_result() {
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35453,6 +37426,7 @@ mod adhoc_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35482,6 +37456,7 @@ mod task_result_mapping_tests {
     fn plain_and_adhoc_completions_have_no_task_result() {
         assert!(task_result_from_completion(&None).is_none());
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35496,6 +37471,7 @@ mod task_result_mapping_tests {
             r_type: Some("adHocSubProcess".to_string()),
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35509,6 +37485,7 @@ mod task_result_mapping_tests {
     #[test]
     fn empty_user_task_result_stays_on_the_fast_path() {
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35530,6 +37507,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35554,6 +37532,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35569,6 +37548,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35606,6 +37586,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -35646,6 +37627,7 @@ mod task_result_mapping_tests {
             r_type: None,
         };
         let body = models::JobCompletionRequest {
+            business_id: None,
             job_lease_token: None,
             lease_token: None,
             variables: None,
@@ -36123,7 +38105,7 @@ mod batch_operation_tests {
         assert_eq!(got.state, models::BatchOperationStateEnum::Active);
         assert_eq!(
             got.batch_operation_type,
-            models::BatchOperationTypeEnum::CancelProcessInstance
+            types::Nullable::Present(models::BatchOperationTypeEnum::CancelProcessInstance)
         );
         assert!(got.operations_total_count >= 1);
         assert_eq!(got.operations_completed_count, 0);
@@ -38185,6 +40167,7 @@ mod call_activity_hierarchy_read_model_tests {
             Default::default(),
             None,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -38298,6 +40281,54 @@ mod call_activity_hierarchy_read_model_tests {
         );
     }
 
+    /// Defect class: rust-axum seeds a discriminated-`oneOf` member's tag with
+    /// its *schema name* (`AgentInstanceTextContent`, `JobWaitStateDetails`)
+    /// instead of the discriminator *mapping key* (`TEXT`, `JOB`) and forces it
+    /// onto the wire via `serialize_with`. Typed round-trips cannot see this, so
+    /// assert the serialized tag of members built through the generated `new()`.
+    #[test]
+    fn discriminated_union_members_serialize_their_mapping_key() {
+        let tag = |v: serde_json::Value, prop: &str| v[prop].as_str().unwrap().to_string();
+        let text = models::AgentInstanceMessageContent::AgentInstanceTextContent(
+            models::AgentInstanceTextContent::new("hi".into()),
+        );
+        assert_eq!(
+            tag(serde_json::to_value(&text).unwrap(), "contentType"),
+            "TEXT"
+        );
+        let job: models::WaitStateDetails = models::JobWaitStateDetails::new(
+            models::JobKey("1".into()),
+            "t".into(),
+            models::JobKindEnum::BpmnElement,
+            types::Nullable::Null,
+            types::Nullable::Present(1),
+        )
+        .into();
+        assert_eq!(
+            tag(serde_json::to_value(&job).unwrap(), "waitStateType"),
+            "JOB"
+        );
+        let msg: models::WaitStateDetails =
+            models::MessageWaitStateDetails::new("m".into(), types::Nullable::Null).into();
+        assert_eq!(
+            tag(serde_json::to_value(&msg).unwrap(), "waitStateType"),
+            "MESSAGE"
+        );
+        let task: models::WaitStateDetails = models::UserTaskWaitStateDetails::new(
+            models::UserTaskKey("2".into()),
+            types::Nullable::Null,
+        )
+        .into();
+        assert_eq!(
+            tag(serde_json::to_value(&task).unwrap(), "waitStateType"),
+            "USER_TASK"
+        );
+        // And the wire form deserializes back to the same member.
+        let back: models::WaitStateDetails =
+            serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
+        assert_eq!(back, job);
+    }
+
     #[test]
     fn agent_content_union_roundtrips_without_string_encoding() {
         for value in [
@@ -38350,14 +40381,29 @@ mod call_activity_hierarchy_read_model_tests {
         assert!(agent_history_turn_from(&item, 1, "").metrics.is_none());
         item.metrics = Some(types::Nullable::Null);
         assert!(agent_history_turn_from(&item, 1, "").metrics.is_none());
-        let metrics = models::AgentInstanceHistoryItemMetrics::new(
-            types::Nullable::Null,
-            types::Nullable::Present(0),
-            types::Nullable::Null,
-        );
-        item.metrics = Some(types::Nullable::Present(metrics.clone()));
+        // Every 8.10 per-turn counter survives request → engine → result; an
+        // absent (`None`) or explicit-null counter both read back as null.
+        let metrics = models::AgentInstanceHistoryItemMetricsRequest {
+            input_tokens: Some(types::Nullable::Null),
+            output_tokens: Some(types::Nullable::Present(0)),
+            reasoning_token_count: Some(types::Nullable::Present(7)),
+            cache_creation_token_count: Some(types::Nullable::Present(11)),
+            cache_read_token_count: Some(types::Nullable::Present(13)),
+            duration_ms: None,
+        };
+        item.metrics = Some(types::Nullable::Present(metrics));
         let mapped = agent_history_turn_from(&item, 1, "").metrics.unwrap();
-        assert_eq!(agent_history_metrics_result(&mapped), metrics);
+        assert_eq!(
+            agent_history_metrics_result(&mapped),
+            models::AgentInstanceHistoryItemMetrics {
+                input_tokens: types::Nullable::Null,
+                output_tokens: types::Nullable::Present(0),
+                reasoning_token_count: types::Nullable::Present(7),
+                cache_creation_token_count: types::Nullable::Present(11),
+                cache_read_token_count: types::Nullable::Present(13),
+                duration_ms: types::Nullable::Null,
+            }
+        );
     }
 
     /// Runs `search` with a `parentProcessInstanceKey` filter, returning the keys.
@@ -38507,6 +40553,7 @@ mod call_activity_hierarchy_read_model_tests {
             let resp = server
                 .search_element_instance_wait_states_impl(&Some(
                     models::ElementInstanceWaitStateQuery {
+                        sort: None,
                         page: None,
                         filter: filter.clone(),
                     },

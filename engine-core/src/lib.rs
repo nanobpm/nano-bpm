@@ -115,7 +115,9 @@ pub use engine::EngineSnapshot;
 pub use engine::SNAPSHOT_FORMAT_VERSION;
 mod lease;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};
-pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError};
+pub use engine::{
+    check_business_id, ActivatedJob, DecisionEvaluation, Engine, EngineError, BUSINESS_ID_MAX_CHARS,
+};
 pub use engine::{BreakCondition, DebugSession};
 #[cfg(feature = "serde")]
 pub use event::decode_event_json;
@@ -132,10 +134,11 @@ pub use model::{
 };
 pub use read_query::ReadQuery;
 pub use state::{
-    compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,
-    Incident, IncidentKind, IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind,
-    JobState, Key, MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
-    MessageSubscriptionState, ProcessInstance, ProcessInstanceState, SignalSubscription,
-    StartTimer, State, Timer, TimerKind, TimerState, UserTask, UserTaskState, DEFAULT_JOB_PRIORITY,
-    DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID, PARTITION_BITS,
+    compose_key, local_of, partition_of, stable_hash, subscription_partition,
+    ConditionalSubscription, DeployedProcess, Incident, IncidentKind, IncidentState,
+    InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobState, Key, MessageStartSubscription,
+    MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
+    ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
+    UserTask, UserTaskState, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK,
+    MAX_PARTITION_ID, PARTITION_BITS,
 };

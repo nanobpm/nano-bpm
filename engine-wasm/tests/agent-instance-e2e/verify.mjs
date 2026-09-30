@@ -72,7 +72,10 @@ for (const variant of ["lean", "readmodel"]) {
             },
           },
         ],
-        metrics: { inputTokens: 2, outputTokens: null, durationMs: 7 },
+        metrics: {
+          inputTokens: 2, outputTokens: null, reasoningTokenCount: 3,
+          cacheCreationTokenCount: 4, cacheReadTokenCount: 5, durationMs: 7,
+        },
         toolCalls: [{ toolCallId: "call", toolName: "lookup", elementId: null, arguments: { id: 1 } }],
       });
       const update = { ...attribution, status: "THINKING", history: [assistant] };
@@ -107,11 +110,16 @@ for (const variant of ["lean", "readmodel"]) {
         }))).items.length, 1);
       }
 
+      // Every AgentInstanceHistoryItemMetrics counter (the response requires all six).
+      const uniformMetrics = (v) => ({
+        inputTokens: v, outputTokens: v, reasoningTokenCount: v,
+        cacheCreationTokenCount: v, cacheReadTokenCount: v, durationMs: v,
+      });
       const metricShapes = [
         null,
-        { inputTokens: null, outputTokens: null, durationMs: null },
-        { inputTokens: -1, outputTokens: -2, durationMs: -1 },
-        { inputTokens: 0, outputTokens: 0, durationMs: 0 },
+        uniformMetrics(null),
+        uniformMetrics(-1),
+        uniformMetrics(0),
       ];
       engine.updateAgentInstance(key, JSON.stringify({
         ...attribution,

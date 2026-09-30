@@ -201,6 +201,10 @@ pub enum ClientFrame {
         /// `None`/skipped for ordinary completions (byte-unchanged hot path).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_result: Option<nanobpmn_engine_core::TaskListenerJobResult>,
+        /// Camunda 8.10 `businessId` to assign to the job's root process
+        /// instance on completion. `None`/skipped for ordinary completions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        business_id: Option<String>,
     },
     /// Fail an activated job (unmetered drain).
     #[serde(rename_all = "camelCase")]
@@ -301,6 +305,11 @@ pub enum ClientFrame {
         correlation_key: String,
         #[serde(default)]
         variables: Option<Map<String, Value>>,
+        /// The message's `businessId`, stamped on a message-start-created
+        /// instance. Defaulted: a frame from a peer predating it decodes as
+        /// `None`.
+        #[serde(default)]
+        business_id: Option<String>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// cancellation to the peer that owns the instance's partition. Answered by a
