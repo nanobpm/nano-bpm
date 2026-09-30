@@ -152,7 +152,12 @@ fn rest_retained(p: &RestPoll, now: u64, evict: u64) -> bool {
 /// first pruning dead entries) so a caller pumping unique `(type, worker)` pairs
 /// cannot grow this map without bound; upserts to existing consumers always
 /// proceed, so live workers are never dropped by the cap.
-pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) {
+///
+/// Returns `true` when the registration was **admitted** (recorded) and so must
+/// later be balanced by [`complete_rest_poll`], `false` when a new key was
+/// refused at the cardinality cap (nothing recorded — completing it would
+/// decrement a *different*, genuinely-admitted poll's shared counter).
+pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) -> bool {
     let now = now_ms();
     let key = (job_type.to_string(), worker.to_string());
     let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
@@ -176,7 +181,7 @@ pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) {
         live_until_ms,
         in_flight: in_flight.saturating_add(1),
     };
-    upsert_rest_poll(&mut polls, key, entry, now, rest_evict_ms(), rest_max());
+    upsert_rest_poll(&mut polls, key, entry, now, rest_evict_ms(), rest_max())
 }
 
 /// Marks one of `worker`'s in-flight `activateJobs` for `job_type` as **returned**,
@@ -245,12 +250,19 @@ pub struct RestPollGuard {
 impl RestPollGuard {
     /// Records one in-flight poll (see [`record_rest_poll`]) and returns the guard
     /// that releases it on drop.
-    pub fn record(job_type: &str, worker: &str, long_poll_ms: u64) -> Self {
-        record_rest_poll(job_type, worker, long_poll_ms);
-        Self {
+    ///
+    /// Returns `None` — **no guard** — when the registration was refused at the
+    /// cardinality cap (a new `(job_type, worker)` key while the map is at
+    /// [`rest_max`]). Nothing was recorded in that case, so there is nothing to
+    /// complete: arming a guard anyway would make its `Drop` call
+    /// [`complete_rest_poll`] and decrement a *different*, genuinely-admitted
+    /// in-flight poll's shared counter for the same key — a false zero-worker
+    /// signal. `None` carries no `Drop`, so a refused poll is a clean no-op.
+    pub fn record(job_type: &str, worker: &str, long_poll_ms: u64) -> Option<Self> {
+        record_rest_poll(job_type, worker, long_poll_ms).then(|| Self {
             job_type: job_type.to_string(),
             worker: worker.to_string(),
-        }
+        })
     }
 }
 
@@ -266,6 +278,13 @@ impl Drop for RestPollGuard {
 /// refused so best-effort observability can't become an OOM vector. Pure over
 /// its inputs so the cap logic is unit-testable without the process-global map
 /// or env overrides.
+///
+/// Returns `true` when the entry was inserted/updated (the registration is
+/// **admitted** and must later be completed), `false` when a new key was refused
+/// at the cap (nothing was recorded, so there is nothing to complete). Callers
+/// that balance the registration with [`complete_rest_poll`] must arm that
+/// completion only on `true` — completing a refused poll would decrement a
+/// *different*, genuinely-admitted in-flight poll's shared counter.
 fn upsert_rest_poll(
     polls: &mut HashMap<(String, String), RestPoll>,
     key: (String, String),
@@ -273,14 +292,15 @@ fn upsert_rest_poll(
     now: u64,
     evict: u64,
     max: usize,
-) {
+) -> bool {
     if !polls.contains_key(&key) && polls.len() >= max {
         polls.retain(|_, p| rest_retained(p, now, evict));
         if polls.len() >= max {
-            return;
+            return false;
         }
     }
     polls.insert(key, entry);
+    true
 }
 
 /// One live job consumer surfaced to the console panel.
@@ -1016,6 +1036,47 @@ mod tests {
             "dead entry reclaimed to make room"
         );
         assert_eq!(polls.len(), 2);
+    }
+
+    #[test]
+    fn upsert_rest_poll_reports_admission_so_a_refused_poll_arms_no_guard() {
+        // Rejected-poll regression (Copilot review): `record_rest_poll` can
+        // silently refuse a new key at the cap, but `RestPollGuard::record` used to
+        // return an *armed* guard regardless — whose `Drop` calls
+        // `complete_rest_poll`. If capacity later freed and a fresh request for the
+        // same key was admitted before the rejected one finished, the rejected
+        // request's `Drop` would decrement/close the *newer* registration — a
+        // false zero-worker signal. The upsert must report admission (`true` =
+        // recorded, arm a guard; `false` = refused, arm nothing) so the guard is
+        // only ever armed for a registration that actually exists.
+        let now = now_ms();
+        let evict = rest_evict_ms();
+        let live = RestPoll {
+            last_seen_ms: now,
+            live_until_ms: now,
+            in_flight: 1,
+        };
+        let mut polls: HashMap<(String, String), RestPoll> = HashMap::new();
+        assert!(
+            upsert_rest_poll(&mut polls, ("a".into(), "w".into()), live, now, evict, 2),
+            "first key admitted"
+        );
+        assert!(
+            upsert_rest_poll(&mut polls, ("b".into(), "w".into()), live, now, evict, 2),
+            "second key admitted (fills the cap)"
+        );
+        // A third distinct key with nothing dead to reclaim is refused — and the
+        // caller is told, so it arms no completion guard for it.
+        assert!(
+            !upsert_rest_poll(&mut polls, ("c".into(), "w".into()), live, now, evict, 2),
+            "refused key reports not-admitted so no guard is armed"
+        );
+        assert!(!polls.contains_key(&("c".to_string(), "w".to_string())));
+        // An existing key still updates (admitted) even at the cap.
+        assert!(
+            upsert_rest_poll(&mut polls, ("a".into(), "w".into()), live, now, evict, 2),
+            "an existing key is admitted (refreshed) despite the cap"
+        );
     }
 
     #[test]

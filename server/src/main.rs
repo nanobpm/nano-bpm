@@ -16362,14 +16362,24 @@ impl ServerImpl {
         // leak — leaving the requested deadline in place and a phantom worker that
         // suppresses `Starved`. The guard's `Drop` balances the count on every exit
         // path, normal return *and* cancellation.
+        //
+        // `RestPollGuard::record` returns `None` when the registration was refused
+        // at the cardinality cap (a brand-new `(job_type, worker)` key while the map
+        // is full): nothing was recorded, so there is no count to balance and no
+        // guard to arm — arming one anyway would make its `Drop` decrement a
+        // *different*, admitted poll's shared counter for the same key. `flatten`
+        // collapses the `Option<Option<_>>` so `_poll_guard` is `Some(guard)` only
+        // for a genuinely-admitted registration.
         let recorded = max_jobs > 0;
-        let _poll_guard = recorded.then(|| {
-            crate::consumers::RestPollGuard::record(
-                &job_type,
-                &worker,
-                long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
-            )
-        });
+        let _poll_guard = recorded
+            .then(|| {
+                crate::consumers::RestPollGuard::record(
+                    &job_type,
+                    &worker,
+                    long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
+                )
+            })
+            .flatten();
 
         // Remote nodes to draw the shortfall from once local partitions are
         // drained (REST job aggregation, the analog of the stream dispatcher's

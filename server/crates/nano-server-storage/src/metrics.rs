@@ -1628,10 +1628,20 @@ pub fn provisioning_signals() -> ProvisioningSignals {
             per_type.entry(jt).or_default().workers = metric.get_gauge().get_value() as i64;
         }
     }
+    // The dispatched counter is cumulative and is NOT removed by
+    // `remove_job_type_provisioning` (unlike the activatable/worker gauges), so it
+    // keeps a series for every historically-dispatched type. Folding it in with
+    // `entry(...).or_default()` would re-add each such dead type as a zero-backlog
+    // sample; if the type later becomes active again, the advisor diffs against
+    // that stale sample instead of returning `Warming` and can immediately report
+    // false backlog growth / under-provisioning. Apply the counter only to job
+    // types the current activatable/worker gauges already introduced (`get_mut`),
+    // so a type with no live backlog/worker signal contributes no sample at all.
     for metric in m.job_type_dispatched_total.collect()[0].get_metric() {
-        if let Some(jt) = job_type_of(metric) {
-            per_type.entry(jt).or_default().dispatched_total =
-                metric.get_counter().get_value() as u64;
+        if let Some(jt) = job_type_of(metric)
+            && let Some(entry) = per_type.get_mut(&jt)
+        {
+            entry.dispatched_total = metric.get_counter().get_value() as u64;
         }
     }
 
@@ -1994,5 +2004,50 @@ mod tests {
         // Removal is not a tombstone: a type that reappears re-creates its series.
         set_job_type_provisioning(jt, 2, 0);
         assert!(gather().contains("nanobpm_job_type_activatable{job_type=\"test-remove-type\"} 2"));
+    }
+
+    #[test]
+    fn provisioning_signals_skip_a_dispatched_counter_with_no_live_type() {
+        // Stale-counter regression (Copilot review): the dispatched counter is
+        // cumulative and is NOT removed by `remove_job_type_provisioning`, so it
+        // keeps a series for every historically-dispatched type. Folding it in
+        // unconditionally would re-add each dead type as a zero-backlog sample in
+        // `PREV`; if the type later reactivates, the advisor diffs against that
+        // stale sample instead of returning `Warming` and reports false backlog
+        // growth. The narrow read must apply the counter only to types the live
+        // activatable/worker gauges already introduced.
+        let jt = "test-stale-dispatch-type";
+        // A dispatched counter exists for a type that has NO live gauges (it left
+        // the active set after dispatching). Unique label isolates the assertion.
+        record_jobs_dispatched(jt, 7);
+        assert!(
+            gather().contains(
+                "nanobpm_job_type_dispatched_total{job_type=\"test-stale-dispatch-type\"} 7"
+            ),
+            "the cumulative counter series persists after the type leaves the active set"
+        );
+
+        let sig = provisioning_signals();
+        assert!(
+            !sig.per_type.iter().any(|(t, _)| t == jt),
+            "a dispatched counter with no live activatable/worker gauge contributes no sample"
+        );
+
+        // Once the type is live again its counter folds in normally.
+        set_job_type_provisioning(jt, 3, 1);
+        let sig = provisioning_signals();
+        let sample = sig
+            .per_type
+            .iter()
+            .find(|(t, _)| t == jt)
+            .map(|(_, s)| *s)
+            .expect("live type present");
+        assert_eq!(sample.activatable, 3);
+        assert_eq!(sample.workers, 1);
+        assert_eq!(
+            sample.dispatched_total, 7,
+            "the live type picks up its cumulative counter"
+        );
+        remove_job_type_provisioning(jt);
     }
 }
