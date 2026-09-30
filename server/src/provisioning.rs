@@ -76,8 +76,9 @@ pub fn latest() -> Advice {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nano_provisioning_advisor::{Class, Confidence, Recommendation};
+
+    use super::*;
 
     /// A minimal `/metrics` exposition for one job type plus the global
     /// server-saturation signals the advisor reads.
