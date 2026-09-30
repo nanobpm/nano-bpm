@@ -28,6 +28,46 @@ We do not tolerate warnings, errors, or test failures in this project.
 
 There are no pre-existing failures or warnings, and you will not allow any to enter the codebase. Thank you.
 
+## Formatting: pinned nightly rustfmt (never bare `cargo fmt`)
+
+The canonical Rust style relies on **unstable** rustfmt options — `rustfmt.toml`
+sets `group_imports = "StdExternalCrate"`. Stable rustfmt **silently ignores**
+that option (only a stderr warning), so a bare `cargo fmt` / `rustfmt` *appears*
+to work but produces import-ordering drift that fails the
+`rustfmt (pinned nightly)` CI gate. There is no `rust-toolchain.toml`, so the
+default toolchain on your machine decides what `cargo fmt` does — never rely on
+it. Always format through the pinned nightly:
+
+- **Format:** `make fmt`
+- **Verify (the CI gate):** `make fmt-check`
+
+Both run `rustup run $(FMT_TOOLCHAIN) cargo fmt` with
+`FMT_TOOLCHAIN := nightly-2026-06-26` (Makefile) over `engine-core`, `server`,
+`processos`, `engine-wasm`, and `read-model` — the same invocation CI uses, so a
+local `make fmt-check` pass is exactly what the gate checks. If the toolchain is
+missing, install it once:
+`rustup toolchain install nightly-2026-06-26 --component rustfmt`.
+
+`cargo fmt` runs `cargo metadata` over the `server` workspace, so the gitignored
+codegen inputs must exist on disk first. In a fresh (unbuilt) clone, generate
+the throwaway parse-only stubs before formatting — `make fmt` / `make fmt-check`
+do **not** do this for you:
+
+```bash
+./scripts/fmt-stub-codegen.sh           # create stubs (never clobbers real files)
+./scripts/fmt-stub-codegen.sh --cleanup # remove the stubs it created
+```
+
+**Install the git hooks** so the same gate runs locally before every push —
+catching drift before it reaches CI:
+
+```bash
+make install-hooks   # sets core.hooksPath -> .githooks (pre-push runs `make fmt-check`)
+```
+
+The pre-push hook creates and cleans up the codegen stubs automatically. Bypass
+in an emergency with `git push --no-verify`.
+
 ## BPMN Models need DI
 
 All BPMN Models need DI for rendering for humans.
