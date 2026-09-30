@@ -407,26 +407,36 @@ pub struct ConsumersResponse {
 /// A worker is counted while it is **live** (its long-poll window is open, or it
 /// re-polled within the stale grace) — the same liveness notion the consumers panel
 /// shows — so a worker that has actually stopped polling stops counting and a
-/// genuinely unserved type can still surface as starved. Distinct `worker` names are
-/// counted per job type (a single worker polling twice counts once), mirroring the
-/// Falcon roster width. Pure over `REST_POLLS`; a cheap map fold off the hot path.
+/// genuinely unserved type can still surface as starved.
+///
+/// The count measures **concurrent poll slots**, not distinct `worker` *names*.
+/// `worker` is optional and "mostly used for logging" (`spec/jobs.yaml`); an
+/// omitted name is normalized to `"default"`, so a fleet of N REST worker processes
+/// that omit or share a name collapses to a single `(job_type, worker)` map entry.
+/// Keying the count on distinct names would report that fleet as **one** worker and
+/// badly underestimate capacity. Instead, each live entry contributes
+/// `max(in_flight, 1)`: a worker between sequential polls (`in_flight == 0`, held
+/// live by its window/grace) counts once, while N processes concurrently long-polling
+/// under a shared name drive that entry's `in_flight` to N and so count N — the
+/// admitted-poll-slot signal that survives name collisions. Distinct names still
+/// occupy distinct entries, preserving the Falcon roster width (`workers_per_type`)
+/// for fleets that do name themselves. Pure over `REST_POLLS`; a cheap map fold off
+/// the hot path.
 pub fn rest_workers_per_type() -> HashMap<String, usize> {
     let now = now_ms();
     let stale = rest_stale_ms();
     let polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
-    let mut by_type: HashMap<String, std::collections::HashSet<&str>> = HashMap::new();
-    for ((job_type, worker), p) in polls.iter() {
+    let mut by_type: HashMap<String, usize> = HashMap::new();
+    for ((job_type, _worker), p) in polls.iter() {
         if rest_live(p, now, stale) {
-            by_type
-                .entry(job_type.clone())
-                .or_default()
-                .insert(worker.as_str());
+            // `in_flight` counts overlapping polls on this entry — i.e. concurrent
+            // pollers sharing the `(job_type, worker)` key. `max(.., 1)` keeps a
+            // live-but-idle-between-polls worker (in_flight == 0) counted once.
+            let slots = (p.in_flight as usize).max(1);
+            *by_type.entry(job_type.clone()).or_insert(0) += slots;
         }
     }
     by_type
-        .into_iter()
-        .map(|(jt, workers)| (jt, workers.len()))
-        .collect()
 }
 
 /// Builds the consumers snapshot: pruned REST polls + live Falcon subscriptions,
@@ -680,6 +690,52 @@ mod tests {
             "two distinct live REST workers, deduped, idle excluded"
         );
         clear("t-rw:");
+    }
+
+    #[test]
+    fn rest_workers_per_type_counts_concurrent_pollers_sharing_a_name() {
+        // The fleet-sizing fix (issue #1294, review finding): `worker` is optional
+        // and normalized to "default" when omitted, so a fleet of N REST worker
+        // processes that omit (or share) a name collapses to ONE `(job_type,
+        // worker)` map entry. Counting distinct names would report that fleet as a
+        // single worker and underestimate capacity. The count must instead measure
+        // concurrent poll slots: N processes concurrently long-polling under the
+        // shared name drive the entry's `in_flight` to N and so count N.
+        let jt = "t-rwfleet:review";
+        clear("t-rwfleet:");
+        // Three distinct worker processes, all omitting a name → all map to the
+        // shared ("…", "default") key. Each holds an overlapping in-flight long
+        // poll (recorded, not yet returned), so the shared entry's in_flight is 3.
+        let g1 = RestPollGuard::record(jt, "default", 30_000).expect("admitted");
+        let g2 = RestPollGuard::record(jt, "default", 30_000).expect("admitted");
+        let g3 = RestPollGuard::record(jt, "default", 30_000).expect("admitted");
+        {
+            let polls = REST_POLLS.lock().unwrap();
+            assert_eq!(
+                polls
+                    .get(&(jt.to_string(), "default".to_string()))
+                    .map(|p| p.in_flight),
+                Some(3),
+                "three concurrent polls on the shared name share one entry"
+            );
+        }
+        let counts = rest_workers_per_type();
+        assert_eq!(
+            counts.get(jt).copied(),
+            Some(3),
+            "three concurrent pollers sharing an omitted/default name count as three workers, not one"
+        );
+        // As each poller returns, the shared in_flight drains and the count drops.
+        drop(g1);
+        drop(g2);
+        let counts = rest_workers_per_type();
+        assert_eq!(
+            counts.get(jt).copied(),
+            Some(1),
+            "after two of three pollers return, one in-flight worker remains"
+        );
+        drop(g3);
+        clear("t-rwfleet:");
     }
 
     #[test]
