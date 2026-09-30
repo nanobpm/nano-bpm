@@ -266,6 +266,14 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Release-tagging script (one tag per push, derived tags, workflow drift)
+        # scripts/release-tags.mjs is the canonical way to cut release tags
+        # (RELEASE.md, #1289). Its tests pin the one-tag-per-push rule (GitHub
+        # drops tag push events when >3 tags share one push, which silently
+        # skipped every workflow at v0.0.24) and fail if a release workflow's tag
+        # trigger drifts from the train table. Lives in this REQUIRED job so a
+        # regression in the release tooling blocks the merge.
+        run: node --test scripts/release-tags.test.mjs
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -909,13 +917,6 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
-      - name: Release-tagging script (one tag per push, derived tags, workflow drift)
-        # scripts/release-tags.mjs is the canonical way to cut release tags
-        # (RELEASE.md, #1289). Its tests pin the one-tag-per-push rule (GitHub
-        # drops tag push events when >3 tags share one push, which silently
-        # skipped every workflow at v0.0.24) and fail if a release workflow's tag
-        # trigger drifts from the train table.
-        run: node --test scripts/release-tags.test.mjs
       - name: Require a pending engine-wasm bump when the engine has changed
         # Mode-1 (staleness) guard. @nanobpm/engine-wasm is a wasm build of
         # engine-core, published only on a hand-pushed `bojtos-npm-v*` tag — so an

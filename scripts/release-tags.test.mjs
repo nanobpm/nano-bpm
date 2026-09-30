@@ -10,6 +10,7 @@ import {
   GITHUB_MAX_TAGS_PER_PUSH,
   TRAINS,
   cargoPackageVersion,
+  hasNewRun,
   parseLsRemoteTags,
   planTags,
   pomProjectVersion,
@@ -74,6 +75,27 @@ test("--only restricts to named trains and rejects unknown ones", () => {
   const plan = planTags({ read: fakeRepo(), existingTags: [], only: ["engine-wasm"] });
   assert.deepEqual(plan.map((p) => p.tag), ["bojtos-npm-v0.10.0"]);
   assert.throws(() => planTags({ read: fakeRepo(), existingTags: [], only: ["nope"] }), /unknown train/);
+});
+
+test("--only can't split the nano-bernd hosts: one alone is rejected, both together are fine", () => {
+  for (const one of ["nano-bernd-npm", "nano-bernd-jvm"]) {
+    assert.throws(() => planTags({ read: fakeRepo(), existingTags: [], only: [one] }), /must always release together/);
+    assert.throws(
+      () => planTags({ read: fakeRepo(), existingTags: [], only: [one, "gateway"] }),
+      /must always release together/,
+    );
+  }
+  const both = planTags({ read: fakeRepo(), existingTags: [], only: ["nano-bernd-npm", "nano-bernd-jvm"] });
+  assert.deepEqual(both.map((p) => p.tag), ["nano-bernd-npm-v0.3.0", "nano-bernd-jvm-v0.3.0"]);
+});
+
+test("a run left over from an earlier push of the same tag does not count as started", () => {
+  // The delete-and-re-push recovery: tag v0.0.24 already has run 101 from the
+  // first push. If the re-push event is dropped, no NEW run appears.
+  assert.equal(hasNewRun([101], [101]), false);
+  assert.equal(hasNewRun([101], [202, 101]), true);
+  assert.equal(hasNewRun([], []), false);
+  assert.equal(hasNewRun([], [303]), true);
 });
 
 test("nano-bernd npm and JVM versions must match", () => {

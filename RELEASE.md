@@ -96,7 +96,7 @@ Typical durations:
 
 ## Releasing only some trains
 
-`make release-tags` cuts only the trains whose version is bumped and not yet tagged, so a partial release needs no special handling. Just bump what you're releasing. To restrict explicitly, run `node scripts/release-tags.mjs --only engine-wasm,gateway --push`. `make release-engine-wasm` is shorthand for `--only engine-wasm --push`.
+`make release-tags` cuts only the trains whose version is bumped and not yet tagged, so a partial release needs no special handling. Just bump what you're releasing. To restrict explicitly, run `node scripts/release-tags.mjs --only engine-wasm,gateway --push`. Selecting just one nano-bernd host is rejected: name both or neither. `make release-engine-wasm` is shorthand for `--only engine-wasm --push`.
 
 - Engine bugfix that affects the gateway only → bump the gateway only. If `engine-core` changed, CI also requires an engine-wasm bump.
 - Host-side fix in `EmbeddedEngine` (either language) → bump the nano-bernd patch version in **both** hosts. They must stay in sync, and the script refuses to run if they differ.

@@ -95,6 +95,9 @@ export const TRAINS = [
   },
 ];
 
+/** Trains that wrap the same wasm blob and must always be tagged together. */
+export const BERND_TRAINS = ["nano-bernd-npm", "nano-bernd-jvm"];
+
 /** The npm and JVM nano-bernd hosts wrap the same wasm and must share a version. */
 function berndVersion(read) {
   const npm = packageJsonVersion(read("clients/nano-bernd/package.json"));
@@ -115,6 +118,14 @@ export function planTags({ read, existingTags, only = null }) {
   const known = new Set(TRAINS.map((t) => t.id));
   for (const id of only ?? []) {
     if (!known.has(id)) throw new Error(`unknown train "${id}" (known: ${[...known].join(", ")})`);
+  }
+  if (only) {
+    const bernd = only.filter((id) => BERND_TRAINS.includes(id));
+    if (bernd.length === 1) {
+      throw new Error(
+        `--only ${bernd[0]}: the nano-bernd npm and JVM hosts must always release together — select both (${BERND_TRAINS.join(",")})`,
+      );
+    }
   }
   const existing = new Set(existingTags);
   return TRAINS.filter((t) => !only || only.includes(t.id)).map((t) => {
@@ -163,14 +174,28 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Wait until `workflow` has a run for `tag`; return false on timeout. */
-async function workflowStarted(workflow, tag, waitSeconds) {
+/**
+ * Did THIS push start a run? Runs outlive tag deletion, so a re-pushed tag can
+ * already have runs from an earlier push; only a run id absent from the
+ * pre-push snapshot counts (#1289).
+ */
+export function hasNewRun(beforeIds, afterIds) {
+  const before = new Set(beforeIds);
+  return afterIds.some((id) => !before.has(id));
+}
+
+function runIds(workflow, tag) {
+  const out = sh("gh", [
+    "run", "list", "--workflow", workflow, "--branch", tag, "--limit", "50", "--json", "databaseId",
+  ]);
+  return JSON.parse(out || "[]").map((r) => r.databaseId);
+}
+
+/** Wait until `workflow` has a run for `tag` that wasn't in `beforeIds`. */
+async function workflowStarted(workflow, tag, beforeIds, waitSeconds) {
   const deadline = Date.now() + waitSeconds * 1000;
   while (Date.now() < deadline) {
-    const out = sh("gh", [
-      "run", "list", "--workflow", workflow, "--branch", tag, "--limit", "1", "--json", "databaseId",
-    ]);
-    if (JSON.parse(out || "[]").length > 0) return true;
+    if (hasNewRun(beforeIds, runIds(workflow, tag))) return true;
     await sleep(10_000);
   }
   return false;
@@ -216,6 +241,7 @@ async function main() {
     } else {
       git("tag", p.tag, head);
     }
+    const before = Object.fromEntries(p.workflows.map((wf) => [wf, runIds(wf, p.tag)]));
     try {
       sh(cmds[i][0], cmds[i].slice(1), { cwd: root });
     } catch (e) {
@@ -224,7 +250,7 @@ async function main() {
     }
     console.log(`pushed ${p.tag}`);
     for (const wf of p.workflows) {
-      if (await workflowStarted(wf, p.tag, opts.waitSeconds)) console.log(`  ✓ ${wf} started`);
+      if (await workflowStarted(wf, p.tag, before[wf], opts.waitSeconds)) console.log(`  ✓ ${wf} started`);
       else failed.push(`${wf} did not start for ${p.tag}`);
     }
   }
