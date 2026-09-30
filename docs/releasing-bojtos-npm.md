@@ -45,16 +45,17 @@ After that, tagged releases publish automatically with no secret.
 2. `make console-wasm` — rebuilds the wasm so the committed artifact matches the
    new version.
 3. Commit, open a PR, merge to `main`.
-4. Tag from `main` and push — use the helper (verifies the template and built
-   versions agree and that the tag is new, then tags `HEAD` and pushes):
+4. Tag from `main` and push with the helper. It is a thin wrapper over the
+   canonical `scripts/release-tags.mjs` (see [`RELEASE.md`](../RELEASE.md)). It
+   checks that the template and built versions agree, that the tag is new on the
+   remote, and that `HEAD` is a clean `origin/main`. It then tags, pushes the tag
+   on its own, and confirms `release-bojtos-npm` started:
    ```bash
    make release-engine-wasm
    ```
-   or by hand:
-   ```bash
-   git tag bojtos-npm-v0.3.1
-   git push origin bojtos-npm-v0.3.1
-   ```
+   When cutting several trains together, use `make release-tags PUSH=1` instead.
+   Never push release tags in one batch: GitHub skips workflows for pushes of
+   more than three tags.
 5. The `release-bojtos-npm` workflow builds the wasm from source, verifies the
    tag matches the package version, and publishes via OIDC.
 6. Verify on npmjs.com:
