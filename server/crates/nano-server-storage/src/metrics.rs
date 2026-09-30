@@ -1387,6 +1387,27 @@ pub fn set_job_type_provisioning(job_type: &str, activatable: i64, workers: i64)
         .set(starved);
 }
 
+/// Removes every per-`job_type` provisioning series (`activatable` / `workers` /
+/// `starved`) for a type that has left the active set, rather than merely zeroing
+/// it. `with_label_values` *creates* a child the first time a label is seen, so
+/// zeroing alone leaves the series in the registry forever: because `activateJobs`
+/// is unauthenticated, a client rotating unique job types would otherwise grow the
+/// registry (and every `/metrics` scrape) without bound. The caller still zeroes a
+/// disappeared type for one tick *before* removing it (so a scrape racing the
+/// removal never sees a stale non-zero value), then calls this to free the label.
+///
+/// A type that reappears simply re-creates its series on the next
+/// [`set_job_type_provisioning`] — removal is not a tombstone. `remove_label_values`
+/// only fails when the label set is absent (already removed), which is fine to
+/// ignore: the goal "no series for this type" is met either way.
+pub fn remove_job_type_provisioning(job_type: &str) {
+    let _ = METRICS
+        .job_type_activatable
+        .remove_label_values(&[job_type]);
+    let _ = METRICS.job_type_workers.remove_label_values(&[job_type]);
+    let _ = METRICS.job_type_starved.remove_label_values(&[job_type]);
+}
+
 /// Records `n` jobs dispatched to a worker for `job_type` — the per-type drain
 /// throughput. Called once per stream dispatch pass (with the jobs sent to the
 /// socket) and once per REST activation (with the jobs returned), so a job is
@@ -1947,5 +1968,31 @@ mod tests {
             .ceiling_hits_total
             .with_label_values(&[ceiling])
             .get()
+    }
+
+    #[test]
+    fn remove_job_type_provisioning_frees_the_label_series() {
+        // Cardinality regression (Copilot review): a disappeared job type must have
+        // its provisioning series *removed*, not merely zeroed — `with_label_values`
+        // creates the child permanently, so zeroing alone leaves an unauthenticated
+        // `activateJobs` caller free to grow the registry by rotating unique types.
+        // Unique label keeps the assertion isolated from the shared registry.
+        let jt = "test-remove-type";
+        set_job_type_provisioning(jt, 5, 1);
+        assert!(
+            gather().contains("nanobpm_job_type_activatable{job_type=\"test-remove-type\"}"),
+            "series present while the type is active"
+        );
+
+        remove_job_type_provisioning(jt);
+        let text = gather();
+        assert!(
+            !text.contains("test-remove-type"),
+            "activatable/workers/starved series are all removed once the type leaves the active set"
+        );
+
+        // Removal is not a tombstone: a type that reappears re-creates its series.
+        set_job_type_provisioning(jt, 2, 0);
+        assert!(gather().contains("nanobpm_job_type_activatable{job_type=\"test-remove-type\"} 2"));
     }
 }

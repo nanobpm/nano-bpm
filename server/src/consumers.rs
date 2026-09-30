@@ -731,6 +731,50 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecorded_zero_capacity_poll_must_not_complete_a_real_poll() {
+        // Zero-capacity regression (Copilot review): a `max_jobs_to_activate <= 0`
+        // request is *not* recorded (it can drain nothing, so it is not a worker),
+        // but the handler's completion path used to call `complete_rest_poll`
+        // unconditionally. Because the entry is keyed by `(job_type, worker)`, that
+        // unmatched completion found a *different*, genuinely-recorded in-flight
+        // poll and decremented its shared counter — closing a real worker's live
+        // window and publishing a false starvation signal. The handler now only
+        // completes a window it actually opened (`recorded`). This pins the defect
+        // mechanism at the primitive level: an unmatched `complete_rest_poll` (what
+        // the un-guarded handler issued for a zero-capacity request) disturbs a
+        // real poll, so the `recorded` guard is load-bearing, and a matched
+        // record+complete pair is balanced.
+        let jt = "t-zerocap:review";
+        clear("t-zerocap:");
+        let key = (jt.to_string(), "agent-zc".to_string());
+
+        // A real worker opens a 60s poll (in_flight 1, window open 60s).
+        record_rest_poll(jt, "agent-zc", 60_000);
+        let open = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(open.in_flight, 1);
+        assert!(rest_live(&open, now_ms(), rest_stale_ms()));
+
+        // Defect mechanism: an *unmatched* complete (the old zero-capacity path)
+        // decrements the real poll's counter and closes its open window.
+        complete_rest_poll(jt, "agent-zc");
+        let closed = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(closed.in_flight, 0, "the unmatched complete stole the poll");
+        assert!(
+            closed.live_until_ms < open.live_until_ms,
+            "the open 60s window was closed early — the false-starvation defect"
+        );
+
+        // The guarded handler never issues that unmatched complete. A balanced
+        // record + complete pair (a real poll that returns) stays correct.
+        clear("t-zerocap:");
+        record_rest_poll(jt, "agent-zc", 60_000);
+        complete_rest_poll(jt, "agent-zc");
+        let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(p.in_flight, 0, "the matched pair balances");
+        clear("t-zerocap:");
+    }
+
+    #[test]
     fn complete_after_a_long_poll_still_grants_the_post_return_grace() {
         // Long-poll regression (Copilot review): a poll that runs longer than the
         // stale grace must still get its post-return grace. Closing the window to

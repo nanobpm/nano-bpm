@@ -16346,7 +16346,16 @@ impl ServerImpl {
         // A `max_jobs_to_activate <= 0` request can drain nothing, so it is not a
         // worker for provisioning purposes — skip recording it rather than let a
         // zero-capacity poll inflate the live-worker count and mask starvation.
-        if max_jobs > 0 {
+        //
+        // `recorded` tracks whether *this* request opened a liveness window, so the
+        // completion paths below only close a window they actually opened. The entry
+        // is keyed by `(job_type, worker)`, so an unrecorded zero-capacity request
+        // that called `complete_rest_poll` unconditionally would decrement a
+        // *different*, genuinely-recorded in-flight poll's shared counter — and with
+        // a negative `requestTimeout` (no wait) could close a real worker's live
+        // window and publish a false starvation signal.
+        let recorded = max_jobs > 0;
+        if recorded {
             crate::consumers::record_rest_poll(
                 &job_type,
                 &worker,
@@ -16407,8 +16416,11 @@ impl ServerImpl {
                 // The poll returned with jobs, possibly long before its requested
                 // long-poll window closed: close the liveness window now so a
                 // drained-and-gone one-shot client doesn't keep counting as a live
-                // worker until timeout + grace (masking starvation).
-                crate::consumers::complete_rest_poll(&job_type, &worker);
+                // worker until timeout + grace (masking starvation). Only close a
+                // window this request actually opened (`recorded`).
+                if recorded {
+                    crate::consumers::complete_rest_poll(&job_type, &worker);
+                }
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
                 ));
@@ -16418,7 +16430,9 @@ impl ServerImpl {
             // wait until either new jobs are signalled or the window elapses.
             match deadline {
                 None => {
-                    crate::consumers::complete_rest_poll(&job_type, &worker);
+                    if recorded {
+                        crate::consumers::complete_rest_poll(&job_type, &worker);
+                    }
                     return Ok(Resp::Status200_TheListOfActivatedJobs(
                         models::JobActivationResult::new(Vec::new()),
                     ));
@@ -16426,7 +16440,9 @@ impl ServerImpl {
                 Some(deadline) => {
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
-                        crate::consumers::complete_rest_poll(&job_type, &worker);
+                        if recorded {
+                            crate::consumers::complete_rest_poll(&job_type, &worker);
+                        }
                         return Ok(Resp::Status200_TheListOfActivatedJobs(
                             models::JobActivationResult::new(Vec::new()),
                         ));
@@ -24246,9 +24262,18 @@ async fn main() {
                     crate::metrics::set_job_type_provisioning(job_type, waiting, workers);
                 }
                 // Zero out job types that disappeared this tick so their gauges
-                // don't linger at a stale value.
+                // don't linger at a stale value, then *remove* their series:
+                // `set_job_type_provisioning` creates a Prometheus child per label
+                // the first time a type is seen, so zeroing alone would leave the
+                // series in the registry forever. Because `activateJobs` is
+                // unauthenticated, a client rotating unique job types could
+                // otherwise grow the registry (and every `/metrics` scrape) without
+                // bound. Zeroing first covers a scrape that races the removal (it
+                // never sees a stale non-zero); removal then frees the label. A type
+                // that reappears re-creates its series on the next tick.
                 for job_type in seen_job_types.difference(&current) {
                     crate::metrics::set_job_type_provisioning(job_type, 0, 0);
+                    crate::metrics::remove_job_type_provisioning(job_type);
                 }
                 seen_job_types = current;
 
