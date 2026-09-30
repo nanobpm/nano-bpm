@@ -388,22 +388,25 @@ impl Snapshot {
 /// unknown and types are reported as `Warming` (except unambiguous hard starvation).
 pub fn advise(prev: &Snapshot, cur: &Snapshot) -> Advice {
     let window_s = (cur.ts_ms.saturating_sub(prev.ts_ms)) as f64 / 1000.0;
-    // A default/empty `prev` (the first scrape for this instance) carries no series,
-    // so its epoch-sized `window_s` is meaningless — treat it as no window.
-    let has_window = window_s > 0.0 && !prev.per_type.is_empty();
-    let window_s = if has_window { window_s } else { 0.0 };
-
-    // Whether a *real* earlier scrape exists — tracked separately from the per-type
-    // window gate above. The monitor seeds `prev` with `Snapshot::default()`
-    // (ts_ms 0, no series, zeroed cumulative counters); a genuine prior sample
-    // carries a real epoch-ms timestamp (or, before any job type is registered, at
-    // least captured series). Without one, the writer-duty and shed subtractions
-    // below would difference this scrape's *process-lifetime* cumulative counters
-    // against zero and report them as a single interval — a false server-bound
-    // banner (a lifetime duty ratio while `window_s` is 0) and a lifetime shed
-    // count masquerading as this tick's delta. The instantaneous ceiling flag is a
-    // point-in-time gauge, not an interval derivative, so it is retained regardless.
+    // Whether a *real* earlier scrape exists. The monitor seeds `prev` with
+    // `Snapshot::default()` (ts_ms 0, no series, zeroed cumulative counters); a
+    // genuine prior sample carries a real epoch-ms timestamp (or, before any job
+    // type is registered, at least captured series). Without one, the writer-duty
+    // and shed subtractions below would difference this scrape's *process-lifetime*
+    // cumulative counters against zero and report them as a single interval — a
+    // false server-bound banner (a lifetime duty ratio while `window_s` is 0) and a
+    // lifetime shed count masquerading as this tick's delta. The instantaneous
+    // ceiling flag is a point-in-time gauge, not an interval derivative, so it is
+    // retained regardless.
     let has_prev_sample = prev.ts_ms > 0 || !prev.per_type.is_empty();
+    // A default/empty `prev` (the first scrape for this instance) carries no real
+    // timestamp, so its epoch-sized `window_s` is meaningless — treat it as no
+    // window. Gate on `has_prev_sample`, not on `prev.per_type`: a genuine earlier
+    // scrape may legitimately capture no job-type series (an idle gateway), and
+    // forcing `window_s` to 0 there would pair the interval-derived globals below
+    // (`writer_busy_ratio`, `shed_delta`) with a zero-length window.
+    let has_window = window_s > 0.0 && has_prev_sample;
+    let window_s = if has_window { window_s } else { 0.0 };
 
     // Journal-writer duty cycle over the window (busy fraction).
     let busy_d = (cur.writer_busy_seconds - prev.writer_busy_seconds).max(0.0);
@@ -895,6 +898,45 @@ nanobpm_admission_shed_total{reason="mem_watermark"} 2
         let a = advise(&Snapshot::default(), &cur);
         // Empty prev ⇒ no window; growing backlog but workers present ⇒ warming.
         assert_eq!(rec(&a, "x").class, Class::Warming);
+    }
+
+    /// Idle-previous-scrape regression (Copilot review): a real earlier scrape may
+    /// legitimately carry no job types (an idle gateway before any job type is
+    /// registered). Gating the elapsed window on `prev.per_type` then forces
+    /// `window_s` to 0 while `has_prev_sample` still computes `writer_busy_ratio`
+    /// and `shed_delta` over the real elapsed interval — pairing interval-derived
+    /// globals with a zero-length window. The window must be gated on the presence
+    /// of a real previous sample, not on whether that sample happened to capture
+    /// any job-type series.
+    #[test]
+    fn idle_previous_scrape_still_yields_real_window() {
+        // A genuine prior scrape at t=1000ms with NO job types registered (idle
+        // gateway) but real cumulative writer counters.
+        let mut prev = Snapshot {
+            ts_ms: 1000,
+            ..Default::default()
+        };
+        prev.writer_busy_seconds = 0.5;
+        prev.writer_idle_seconds = 0.5;
+        prev.admission_shed_total = 2;
+        // A second scrape 1s later, still no job types, counters advanced.
+        let mut cur = Snapshot {
+            ts_ms: 2000,
+            ..Default::default()
+        };
+        cur.writer_busy_seconds = 1.5;
+        cur.writer_idle_seconds = 1.5;
+        cur.admission_shed_total = 5;
+        let a = advise(&prev, &cur);
+        // The elapsed window is real (1s), not collapsed to 0 just because the
+        // previous scrape captured no job-type series.
+        assert_eq!(
+            a.window_s, 1.0,
+            "an idle previous scrape still spans a real elapsed window"
+        );
+        // Interval-derived globals stay consistent with that window.
+        assert_eq!(a.writer_busy_ratio, 0.5);
+        assert_eq!(a.shed_delta, 3);
     }
 
     #[test]
