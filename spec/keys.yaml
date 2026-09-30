@@ -155,15 +155,6 @@ components:
       format: int64
       minimum: 1
 
-    AgentInstanceKey:
-      description: System-generated key for an agent instance.
-      format: AgentInstanceKey
-      x-semantic-type: AgentInstanceKey
-      example: "4503599627370496"
-      type: string
-      allOf:
-        - $ref: '#/components/schemas/LongKey'
-
     AgentDefinitionKey:
       description: System-generated key for an agent definition.
       format: AgentDefinitionKey
@@ -173,20 +164,20 @@ components:
       allOf:
         - $ref: '#/components/schemas/LongKey'
 
+    AgentInstanceKey:
+      description: System-generated key for an agent instance.
+      format: AgentInstanceKey
+      x-semantic-type: AgentInstanceKey
+      example: "4503599627370496"
+      type: string
+      allOf:
+        - $ref: '#/components/schemas/LongKey'
+
     AgentHistoryItemKey:
       description: System-generated key for an agent history item.
       format: AgentHistoryItemKey
       x-semantic-type: AgentHistoryItemKey
       example: "6755399441055744"
-      type: string
-      allOf:
-        - $ref: '#/components/schemas/LongKey'
-
-    AgentHistoryKey:
-      description: System-generated key for an agent instance history item.
-      format: AgentHistoryKey
-      x-semantic-type: AgentHistoryKey
-      example: "4503599627370496"
       type: string
       allOf:
         - $ref: '#/components/schemas/LongKey'
@@ -574,7 +565,7 @@ components:
           title: Exact match
           description: Matches the value exactly.
           allOf:
-            - $ref: '#/components/schemas/AgentDefinitionKey'
+            - $ref: "#/components/schemas/AgentDefinitionKey"
         - $ref: '#/components/schemas/AdvancedAgentDefinitionKeyFilter'
 
     AdvancedAgentDefinitionKeyFilter:
@@ -585,11 +576,11 @@ components:
         $eq:
           description: Checks for equality with the provided value.
           allOf:
-            - $ref: '#/components/schemas/AgentDefinitionKey'
+            - $ref: "#/components/schemas/AgentDefinitionKey"
         $neq:
           description: Checks for inequality with the provided value.
           allOf:
-            - $ref: '#/components/schemas/AgentDefinitionKey'
+            - $ref: "#/components/schemas/AgentDefinitionKey"
         $exists:
           description: Checks if the current property exists.
           type: boolean
@@ -597,49 +588,12 @@ components:
           description: Checks if the property matches any of the provided values.
           type: array
           items:
-            $ref: '#/components/schemas/AgentDefinitionKey'
+            $ref: "#/components/schemas/AgentDefinitionKey"
         $notIn:
           description: Checks if the property matches none of the provided values.
           type: array
           items:
-            $ref: '#/components/schemas/AgentDefinitionKey'
-
-    AgentHistoryItemKeyFilterProperty:
-      description: AgentHistoryItemKey property with full advanced search capabilities.
-      oneOf:
-        - type: string
-          title: Exact match
-          description: Matches the value exactly.
-          allOf:
-            - $ref: '#/components/schemas/AgentHistoryItemKey'
-        - $ref: '#/components/schemas/AdvancedAgentHistoryItemKeyFilter'
-
-    AdvancedAgentHistoryItemKeyFilter:
-      title: Advanced filter
-      description: Advanced AgentHistoryItemKey filter.
-      type: object
-      properties:
-        $eq:
-          description: Checks for equality with the provided value.
-          allOf:
-            - $ref: '#/components/schemas/AgentHistoryItemKey'
-        $neq:
-          description: Checks for inequality with the provided value.
-          allOf:
-            - $ref: '#/components/schemas/AgentHistoryItemKey'
-        $exists:
-          description: Checks if the current property exists.
-          type: boolean
-        $in:
-          description: Checks if the property matches any of the provided values.
-          type: array
-          items:
-            $ref: '#/components/schemas/AgentHistoryItemKey'
-        $notIn:
-          description: Checks if the property matches none of the provided values.
-          type: array
-          items:
-            $ref: '#/components/schemas/AgentHistoryItemKey'
+            $ref: "#/components/schemas/AgentDefinitionKey"
 
     AgentInstanceKeyFilterProperty:
       description: AgentInstanceKey property with full advanced search capabilities.
@@ -677,6 +631,43 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/AgentInstanceKey"
+
+    AgentHistoryItemKeyFilterProperty:
+      description: AgentHistoryItemKey property with full advanced search capabilities.
+      oneOf:
+        - type: string
+          title: Exact match
+          description: Matches the value exactly.
+          allOf:
+            - $ref: "#/components/schemas/AgentHistoryItemKey"
+        - $ref: '#/components/schemas/AdvancedAgentHistoryItemKeyFilter'
+
+    AdvancedAgentHistoryItemKeyFilter:
+      title: Advanced filter
+      description: Advanced AgentHistoryItemKey filter.
+      type: object
+      properties:
+        $eq:
+          description: Checks for equality with the provided value.
+          allOf:
+            - $ref: "#/components/schemas/AgentHistoryItemKey"
+        $neq:
+          description: Checks for inequality with the provided value.
+          allOf:
+            - $ref: "#/components/schemas/AgentHistoryItemKey"
+        $exists:
+          description: Checks if the current property exists.
+          type: boolean
+        $in:
+          description: Checks if the property matches any of the provided values.
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentHistoryItemKey"
+        $notIn:
+          description: Checks if the property matches none of the provided values.
+          type: array
+          items:
+            $ref: "#/components/schemas/AgentHistoryItemKey"
 
     AuditLogKeyFilterProperty:
       description: AuditLogKey property with full advanced search capabilities.

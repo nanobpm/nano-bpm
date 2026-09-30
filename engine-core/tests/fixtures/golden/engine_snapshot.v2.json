@@ -148,7 +148,7 @@
         "adhoc_instances": {},
         "agent_history": {},
         "agent_instances": {},
-        "business_id": null,
+        "business_id": "order-A",
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000001,

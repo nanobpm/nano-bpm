@@ -288,9 +288,16 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
     journal.extend(activated_a);
     let mut result_a = HashMap::new();
     result_a.insert("approved".to_string(), Value::Bool(true));
+    // The completion assigns a Camunda 8.10 business id to root instance A,
+    // pinning the additive `ProcessInstanceBusinessIdAssigned` frame and the
+    // snapshot's assigned `business_id`.
     journal.extend(
         engine
-            .apply_command_at(Command::complete_job_with(job_a, result_a), T0 + 3)
+            .apply_command_at(
+                Command::complete_job_with(job_a, result_a)
+                    .with_business_id(Some("order-A".to_string())),
+                T0 + 3,
+            )
             .expect("complete job A"),
     );
 

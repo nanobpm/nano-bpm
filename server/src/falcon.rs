@@ -1134,6 +1134,7 @@ async fn handle_client_frame(
             variables,
             adhoc_result,
             task_result,
+            business_id,
         } => {
             let Some(lease_token) =
                 reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
@@ -1154,10 +1155,13 @@ async fn handle_client_frame(
                         .forward_complete_job_stream(
                             node,
                             key,
-                            lease_token,
-                            variables,
-                            adhoc_result,
-                            task_result,
+                            crate::JobCompletion {
+                                lease_token,
+                                variables,
+                                adhoc_result,
+                                task_result,
+                                business_id,
+                            },
                         )
                         .await;
                     crate::metrics::record_complete_outcome(if outcome.0 < 300 {
@@ -1182,6 +1186,7 @@ async fn handle_client_frame(
                                 vars,
                                 adhoc_result,
                                 task_result,
+                                business_id,
                             )
                             .await,
                     );
@@ -1199,6 +1204,7 @@ async fn handle_client_frame(
                                 vars,
                                 adhoc_result,
                                 task_result,
+                                business_id,
                             )
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
@@ -1391,11 +1397,25 @@ async fn handle_client_frame(
             name,
             correlation_key,
             variables,
+            business_id,
         } => {
             let vars = to_engine_vars(variables);
-            let (message_key, instance) = server
-                .correlate_message_local(name, correlation_key, vars)
-                .await;
+            let (message_key, instance) = match server
+                .correlate_message_local(name, correlation_key, vars, business_id)
+                .await
+            {
+                Ok(correlated) => correlated,
+                Err(e) => {
+                    // No generated validator guards Falcon frames: the engine's
+                    // business-id check is the gate (#1295 review).
+                    conn.send(ServerFrame::CommandResult {
+                        corr,
+                        status: crate::business_id_rejection_status(&e).unwrap_or(400),
+                        body: Some(Value::String(e.to_string())),
+                    });
+                    return;
+                }
+            };
             // Correlation may have advanced a token onto a service task on one of
             // this peer's partitions, creating an activatable job: wake pollers.
             server.signal_jobs_available();
@@ -3237,6 +3257,51 @@ mod registry_tests {
             shutdown: Notify::new(),
         });
         (conn, rx)
+    }
+
+    /// Falcon frames have no generated request validator, so an out-of-range
+    /// `businessId` on a `PublishMessage` reaches the engine's check and must
+    /// come back as a 400 `CommandResult` rather than panicking the
+    /// correlation path (#1295 review). The 256-character boundary is accepted.
+    #[tokio::test]
+    async fn publish_message_with_an_out_of_range_business_id_is_a_400() {
+        let server = ServerImpl::default();
+        let registry = Registry::new();
+        let (conn, mut rx) = test_connection_with_rx(7, 8);
+        let publish = |corr: u64, business_id: String| ClientFrame::PublishMessage {
+            corr,
+            name: "m".into(),
+            correlation_key: "k".into(),
+            variables: None,
+            business_id: Some(business_id),
+        };
+        let status_of = |frame: Option<ServerFrame>| match frame {
+            Some(ServerFrame::CommandResult { status, .. }) => status,
+            other => panic!("expected a CommandResult, got {other:?}"),
+        };
+
+        for (corr, id) in [(1, "x".repeat(257)), (2, String::new())] {
+            handle_client_frame(
+                &server,
+                &registry,
+                &conn,
+                "w",
+                publish(corr, id),
+                Channel::Cluster,
+            )
+            .await;
+            assert_eq!(status_of(rx.try_recv().ok()), 400);
+        }
+        handle_client_frame(
+            &server,
+            &registry,
+            &conn,
+            "w",
+            publish(3, "x".repeat(256)),
+            Channel::Cluster,
+        )
+        .await;
+        assert_eq!(status_of(rx.try_recv().ok()), 200);
     }
 
     #[test]

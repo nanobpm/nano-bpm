@@ -7,6 +7,9 @@ paths:
       tags:
         - System
       operationId: getUsageMetrics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: SYSTEM, permissionType: READ_USAGE_METRIC }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -81,11 +84,13 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
   /system/configuration:
     get:
       tags:
         - System
       operationId: getSystemConfiguration
+      x-required-permissions: []
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -118,10 +123,12 @@ paths:
                       active: ["operate", "tasklist"]
                     deployment:
                       isMultiTenancyEnabled: false
+                      isTenantsApiEnabled: false
                       maxRequestSize: 4194304
                     authentication:
                       canLogout: true
                       isLoginDelegated: false
+                      isCamundaGroupsEnabled: true
                     cloud:
                       stage: "prod"
         "401":
@@ -129,6 +136,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
 
 ## Schema definitions
@@ -267,10 +275,15 @@ components:
       type: object
       required:
         - isMultiTenancyEnabled
+        - isTenantsApiEnabled
         - maxRequestSize
       properties:
         isMultiTenancyEnabled:
           description: Whether multi-tenancy is enabled.
+          type: boolean
+          example: false
+        isTenantsApiEnabled:
+          description: Whether the tenants management API and UI are enabled.
           type: boolean
           example: false
         maxRequestSize:
@@ -285,6 +298,7 @@ components:
       required:
         - canLogout
         - isLoginDelegated
+        - isCamundaGroupsEnabled
       properties:
         canLogout:
           description: Whether users can log out (false for SaaS deployments).
@@ -294,6 +308,10 @@ components:
           description: Whether login is delegated to an external identity provider.
           type: boolean
           example: false
+        isCamundaGroupsEnabled:
+          description: Whether Camunda manages group membership locally, as opposed to delegating it to the identity provider via a groups claim.
+          type: boolean
+          example: true
 
     CloudConfigurationResponse:
       description: Configuration for SaaS/cloud-specific settings.

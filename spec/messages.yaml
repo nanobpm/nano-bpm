@@ -7,6 +7,8 @@ paths:
       tags:
         - Message
       operationId: publishMessage
+      x-required-permissions:
+        - { resourceType: MESSAGE, permissionType: CREATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -37,6 +39,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /messages/correlation:
     post:
@@ -44,6 +47,9 @@ paths:
       tags:
         - Message
       operationId: correlateMessage
+      x-required-permissions:
+        - dynamic: true
+          note: Resolved from the matched subscription — CREATE_PROCESS_INSTANCE (start-event) or UPDATE_PROCESS_INSTANCE (intermediate) on PROCESS_DEFINITION.
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -81,6 +87,7 @@ paths:
         "503":
           $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /message-subscriptions/search:
     post:
@@ -88,6 +95,9 @@ paths:
       tags:
         - Message subscription
       operationId: searchMessageSubscriptions
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -128,6 +138,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
   /correlated-message-subscriptions/search:
     post:
@@ -135,6 +146,9 @@ paths:
       tags:
         - Message subscription
       operationId: searchCorrelatedMessageSubscriptions
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -162,6 +176,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.8"
+      x-scope: physical-tenant
 
 ## Schema definitions
 
@@ -190,6 +205,18 @@ components:
           description: the tenant for which the message is published
           allOf:
             - $ref: 'identifiers.yaml#/components/schemas/TenantId'
+        businessId:
+          description: |
+            An optional business id used to enforce uniqueness of the process instance that a
+            message start event would create. If provided and uniqueness enforcement is enabled,
+            the engine rejects starting a new process instance when another root process instance
+            with the same business id is already active for the same process definition. It has no
+            effect when the message correlates to a catch, boundary, or intermediate event.
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/BusinessId'
+      x-properties-added-in-version:
+        - propertyName: businessId
+          addedInVersion: "8.10"
 
     MessageCorrelationResult:
       description: |
@@ -246,8 +273,20 @@ components:
           description: The tenant of the message sender.
           allOf:
             - $ref: 'identifiers.yaml#/components/schemas/TenantId'
+        businessId:
+          description: |
+            An optional business id used to enforce uniqueness of the process instance that a
+            message start event would create. If provided and uniqueness enforcement is enabled,
+            the engine rejects starting a new process instance when another root process instance
+            with the same business id is already active for the same process definition. It has no
+            effect when the message correlates to a catch, boundary, or intermediate event.
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/BusinessId'
       required:
         - name
+      x-properties-added-in-version:
+        - propertyName: businessId
+          addedInVersion: "8.10"
 
     MessagePublicationResult:
       description: The message key of the published message.
@@ -283,6 +322,7 @@ components:
     MessageSubscriptionResult:
       type: object
       required:
+        - businessId
         - rootProcessInstanceKey
         - correlationKey
         - elementId
@@ -302,6 +342,14 @@ components:
         - tenantId
         - toolName
       properties:
+        businessId:
+          description: |
+            The business id inherited from the subscribing process instance when this message
+            subscription was opened. It is `null` when the process instance has no business id, and
+            for message start event subscriptions, which are not tied to a process instance.
+          nullable: true
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/BusinessId'
         messageSubscriptionKey:
           allOf:
             - $ref: '#/components/schemas/MessageSubscriptionKey'
@@ -402,6 +450,8 @@ components:
           addedInVersion: "8.10"
         - propertyName: inboundConnectorType
           addedInVersion: "8.10"
+        - propertyName: businessId
+          addedInVersion: "8.10"
 
     MessageSubscriptionSearchQuerySortRequest:
       type: object
@@ -410,6 +460,7 @@ components:
           description: The field to sort by.
           type: string
           enum:
+            - businessId
             - messageSubscriptionKey
             - processDefinitionId
             - processDefinitionName
@@ -450,6 +501,13 @@ components:
       description: Message subscription search filter.
       type: object
       properties:
+        businessId:
+          allOf:
+            - $ref: 'filters.yaml#/components/schemas/StringFilterProperty'
+          description: |
+            Filter by the business id inherited from the subscribing process instance when the
+            subscription was opened. Supports advanced string filtering, including `$like` with
+            `*`/`?` wildcards.
         messageSubscriptionKey:
           allOf:
             - $ref: '#/components/schemas/MessageSubscriptionKeyFilterProperty'
@@ -550,6 +608,8 @@ components:
           addedInVersion: "8.10"
         - propertyName: inboundConnectorType
           addedInVersion: "8.10"
+        - propertyName: businessId
+          addedInVersion: "8.10"
 
     CorrelatedMessageSubscriptionSearchQueryResult:
       required:
@@ -567,6 +627,7 @@ components:
     CorrelatedMessageSubscriptionResult:
       type: object
       required:
+        - businessId
         - correlationKey
         - correlationTime
         - elementId
@@ -581,6 +642,17 @@ components:
         - elementInstanceKey
         - processDefinitionKey
       properties:
+        businessId:
+          description: |
+            The business id associated with this correlated message subscription. For a message
+            start event correlation, it is the business id carried by the correlating message that
+            was stamped on the started process instance to enforce its uniqueness. For a catch,
+            boundary, or intermediate event correlation, it is the business id of the subscribing
+            process instance, captured when the subscription was opened. It is `null` when the
+            relevant process instance has no business id.
+          nullable: true
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/BusinessId'
         correlationKey:
           description: The correlation key of the message.
           nullable: true
@@ -591,7 +663,8 @@ components:
           format: date-time
         elementId:
           description: The element ID that received the message.
-          type: string
+          allOf:
+            - $ref: 'identifiers.yaml#/components/schemas/ElementId'
         elementInstanceKey:
           allOf:
             - $ref: 'keys.yaml#/components/schemas/ElementInstanceKey'
@@ -641,6 +714,8 @@ components:
       x-properties-added-in-version:
         - propertyName: rootProcessInstanceKey
           addedInVersion: "8.9"
+        - propertyName: businessId
+          addedInVersion: "8.10"
 
     CorrelatedMessageSubscriptionSearchQuery:
       type: object
@@ -665,6 +740,7 @@ components:
           description: The field to sort by.
           type: string
           enum:
+            - businessId
             - correlationKey
             - correlationTime
             - elementId
@@ -685,7 +761,12 @@ components:
     ## Enums
 
     MessageSubscriptionStateEnum:
-      description: The state of message subscription.
+      description: |
+        The state of message subscription.
+
+        **Note for `START_EVENT` subscriptions:** The `CORRELATED` and `MIGRATED` states are not
+        tracked for these subscriptions. To query correlation history for process start events,
+        use the `/correlated-message-subscriptions/search` endpoint.
       type: string
       enum:
         - CORRELATED
@@ -711,6 +792,14 @@ components:
       description: Correlated message subscriptions search filter.
       type: object
       properties:
+        businessId:
+          allOf:
+            - $ref: 'filters.yaml#/components/schemas/StringFilterProperty'
+          description: |
+            Filter by the business id stored on the correlated message subscription — for message
+            start event correlations the correlating message's business id, and for catch, boundary,
+            or intermediate event correlations the subscribing process instance's business id.
+            Supports advanced string filtering, including `$like` with `*`/`?` wildcards.
         correlationKey:
           allOf:
             - $ref: 'filters.yaml#/components/schemas/StringFilterProperty'
@@ -759,6 +848,9 @@ components:
           allOf:
             - $ref: 'filters.yaml#/components/schemas/StringFilterProperty'
           description: The tenant ID associated with this correlated message subscription.
+      x-properties-added-in-version:
+        - propertyName: businessId
+          addedInVersion: "8.10"
 
     MessageSubscriptionTypeFilterProperty:
       description: MessageSubscriptionTypeEnum with full advanced search capabilities.

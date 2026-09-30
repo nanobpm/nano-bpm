@@ -366,7 +366,11 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y llvm clang
+          # mold: the host-test step below links host binaries, and the repo's
+          # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu
+          # (the wasm32 type-check escapes it only because `--target` keeps
+          # target rustflags off host build scripts).
+          sudo apt-get install -y llvm clang mold
           cc_bin=""
           for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
             if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
@@ -382,6 +386,12 @@ jobs:
           echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
       - name: Type-check engine-wasm --features read-model (wasm32)
         run: make engine-wasm-check-read-model
+      - name: Test engine-wasm on the host (--features read-model)
+        # The facade's Rust tests (incl. the read channel and the spec-required
+        # DTO guard, #1291) were compiled for wasm32 above but never *run*.
+        # `--features read-model` runs both test modules; on the host the read
+        # model uses the bundled native SQLite, so no wasm toolchain is involved.
+        run: cargo test --manifest-path engine-wasm/Cargo.toml --features read-model
 
   nano-bernd-npm:
     # Leading @ is reserved for Mergify's @github-app/check syntax.
@@ -739,6 +749,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Vendored spec/ equals the pinned upstream (drift guard)
+        # spec/ must be byte-identical to camunda/camunda at the commit pinned in
+        # spec-patches/upstream.json (#1291); local changes live in
+        # spec-patches/patches.yaml. Sparse shallow fetch of the pinned path,
+        # then a byte-compare — seconds, not a full clone.
+        run: |
+          node --test scripts/vendor-spec.test.mjs
+          node scripts/vendor-spec.mjs --check
       - uses: actions/setup-java@v5
         with:
           distribution: temurin

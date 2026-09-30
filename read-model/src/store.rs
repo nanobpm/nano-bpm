@@ -38,7 +38,11 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
+/// The schema version that introduced `event_waits`.
+const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
+/// `meta` key flagging that `event_waits` awaits an engine-state backfill.
+const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -48,7 +52,7 @@ const SCHEMA_VERSION: i64 = 8;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -5764138655528766412;
+const SCHEMA_FINGERPRINT: i64 = 3791592609797233212;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -118,6 +122,7 @@ CREATE TABLE process_instances (
     suspended_date_ms INTEGER
 );
 CREATE TABLE jobs (
+    business_id            TEXT,
     key                    INTEGER PRIMARY KEY,
     instance_key           INTEGER NOT NULL,
     element_instance_key   INTEGER NOT NULL,
@@ -157,6 +162,7 @@ CREATE TABLE incidents (
 );
 CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
 CREATE TABLE user_tasks (
+    business_id            TEXT,
     key                    INTEGER PRIMARY KEY,
     instance_key           INTEGER NOT NULL,
     element_instance_key   INTEGER NOT NULL,
@@ -204,6 +210,7 @@ CREATE TABLE decision_definitions (
     decision_requirements_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE decision_instances (
+    business_id            TEXT,
     eval_instance_key         TEXT PRIMARY KEY,
     decision_evaluation_key   INTEGER NOT NULL,
     idx                       INTEGER NOT NULL,
@@ -251,6 +258,7 @@ CREATE TABLE element_instances (
 );
 CREATE INDEX idx_element_instances_instance ON element_instances(instance_key);
 CREATE TABLE message_subscriptions (
+    business_id            TEXT,
     subscription_key       INTEGER PRIMARY KEY,
     instance_key           INTEGER NOT NULL,
     element_instance_key   INTEGER NOT NULL,
@@ -261,7 +269,19 @@ CREATE TABLE message_subscriptions (
     non_interrupting       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
+CREATE TABLE event_waits (
+    wait_key               INTEGER PRIMARY KEY,
+    wait_type              TEXT NOT NULL,
+    instance_key           INTEGER NOT NULL,
+    element_instance_key   INTEGER NOT NULL,
+    element_id             TEXT NOT NULL,
+    detail                 TEXT NOT NULL,
+    due_at_ms              INTEGER,
+    non_interrupting       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_event_waits_instance ON event_waits(instance_key);
 CREATE TABLE correlated_message_subscriptions (
+    business_id            TEXT,
     message_key            INTEGER NOT NULL,
     subscription_key       INTEGER NOT NULL,
     instance_key           INTEGER NOT NULL,
@@ -1314,6 +1334,9 @@ pub struct JobRow {
     /// leader-local activation, which does not export `JobActivated`).
     pub read_set: Vec<String>,
     pub lease_token: Option<String>,
+    /// The owning process instance's `businessId` as it stood when this
+    /// artifact was created (snapshot — a later assignment does not enrich it).
+    pub business_id: Option<String>,
 }
 
 pub struct UserTaskRow {
@@ -1334,6 +1357,9 @@ pub struct UserTaskRow {
     pub process_definition_version: i32,
     pub form_key: Option<Key>,
     pub external_form_reference: Option<String>,
+    /// The owning process instance's `businessId` as it stood when this
+    /// artifact was created (snapshot — a later assignment does not enrich it).
+    pub business_id: Option<String>,
 }
 
 pub struct IncidentRow {
@@ -1397,6 +1423,56 @@ pub struct MessageSubscriptionRow {
     /// Projection-time timestamp (ms since epoch) of when this subscription row
     /// was first materialised; surfaces as `lastUpdatedDate` in the search API.
     pub created_at_ms: u64,
+    /// The owning process instance's `businessId` as it stood when this
+    /// artifact was created (snapshot — a later assignment does not enrich it).
+    pub business_id: Option<String>,
+}
+
+/// The kind of a non-job, non-message event wait (the TIMER / SIGNAL /
+/// CONDITION variants of the element-instance wait-state API).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventWaitType {
+    Timer,
+    Signal,
+    Condition,
+}
+
+impl EventWaitType {
+    /// The stored `wait_type` code (also the spec's `waitStateType` value).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timer => "TIMER",
+            Self::Signal => "SIGNAL",
+            Self::Condition => "CONDITION",
+        }
+    }
+
+    fn parse(code: &str) -> Option<Self> {
+        [Self::Timer, Self::Signal, Self::Condition]
+            .into_iter()
+            .find(|t| t.as_str() == code)
+    }
+}
+
+/// A projected open timer / signal / conditional wait: a running element
+/// instance parked on (or guarded by a boundary for) a timer, a signal
+/// subscription or a conditional subscription. Materialized from
+/// `TimerCreated` / `SignalSubscriptionCreated` /
+/// `ConditionalSubscriptionCreated`; dropped when it settles (fires, correlates
+/// or is cancelled) or its instance ends. A non-interrupting boundary signal or
+/// condition stays open after firing, mirroring the engine (it can fire again).
+pub struct EventWaitRow {
+    /// The timer key or subscription key (one engine key space).
+    pub wait_key: Key,
+    pub wait_type: EventWaitType,
+    pub instance_key: Key,
+    pub element_instance_key: Key,
+    pub element_id: String,
+    /// The signal name (SIGNAL) or condition expression (CONDITION); empty for
+    /// a TIMER.
+    pub detail: String,
+    /// When a TIMER is due (ms since epoch); `None` for the other types.
+    pub due_at_ms: Option<u64>,
 }
 
 /// A projected *correlated* message subscription: the historical record of a
@@ -1417,6 +1493,9 @@ pub struct CorrelatedMessageSubscriptionRow {
     pub correlation_time_ms: u64,
     /// The id of the partition that correlated the message.
     pub partition_id: i32,
+    /// The owning process instance's `businessId` as it stood when this
+    /// artifact was created (snapshot — a later assignment does not enrich it).
+    pub business_id: Option<String>,
 }
 
 pub struct ProcessDefinitionRow {
@@ -1473,6 +1552,9 @@ pub struct DecisionInstanceRow {
     /// Serialized `Vec<MatchedRule>` (engine-core DMN audit).
     pub rules_json: String,
     pub tenant_id: String,
+    /// The owning process instance's `businessId` as it stood when this
+    /// artifact was created (snapshot — a later assignment does not enrich it).
+    pub business_id: Option<String>,
 }
 
 /// A projected decision-requirements-graph (one per DRG id, latest version).
@@ -1823,6 +1905,16 @@ impl ReadStore {
         // newer binary) and keep the fingerprint row in sync for tooling. Seed
         // `exported_position` only if absent — a warm database keeps its cursor,
         // so the projection is never reset below the compaction floor.
+        // `event_waits` (v9) is projected from `*Created` events only, so a store
+        // migrated from before v9 has no rows for waits armed before the upgrade.
+        // Flag it; the boot catch-up backfills them from the engine snapshot
+        // (`backfill_pending_event_waits`) before replaying the journal tail.
+        if stored_version.is_none_or(|v| v < EVENT_WAITS_SCHEMA_VERSION) {
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
+                params![EVENT_WAITS_BACKFILL_KEY],
+            )?;
+        }
         let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
         conn.execute(
             "INSERT INTO meta (k, v) VALUES ('schema_version', ?1) \
@@ -2084,6 +2176,41 @@ impl ReadStore {
         })();
         let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
         restored
+    }
+
+    /// Backfills `event_waits` from the boot engine `state` if this store was
+    /// migrated from a schema predating it (see [`Self::ensure_schema_on`]),
+    /// then clears the pending flag. Call it BEFORE replaying the journal tail
+    /// the `state` already reflects: replaying a `*Created` for a backfilled
+    /// wait is a no-op and a later settle event deletes it, so the result
+    /// matches a full projection. Returns whether a backfill ran.
+    pub fn backfill_pending_event_waits(
+        &self,
+        state: &nanobpmn_engine_core::State,
+    ) -> rusqlite::Result<bool> {
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("read store write lock poisoned");
+        let mut conn = self.conn.lock().expect("read store poisoned");
+        let tx = conn.transaction()?;
+        let pending = tx
+            .query_row(
+                "SELECT v FROM meta WHERE k = ?1",
+                params![EVENT_WAITS_BACKFILL_KEY],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if pending {
+            project_event_waits_from_state(&tx, state)?;
+            tx.execute(
+                "DELETE FROM meta WHERE k = ?1",
+                params![EVENT_WAITS_BACKFILL_KEY],
+            )?;
+        }
+        tx.commit()?;
+        Ok(pending)
     }
 
     /// Rebuilds this (reset) shard's rows from a boot engine [`State`] snapshot,
@@ -2533,8 +2660,8 @@ impl ReadStore {
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms, read_set, CAST(lease_token AS TEXT) \
-                 FROM jobs",
+                 job_kind, listener_event_type, created_at_ms, read_set, CAST(lease_token AS TEXT), \
+                 business_id FROM jobs",
             )
             .expect("prepare jobs");
         let rows = stmt.query_map([], map_job).expect("query jobs");
@@ -2544,13 +2671,7 @@ impl ReadStore {
     pub fn user_tasks(&self) -> Vec<UserTaskRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
-            .prepare(
-                "SELECT key, instance_key, element_instance_key, element_id, state, \
-                 assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
-                 priority, created_at_ms, process_definition_id, process_definition_key, \
-                 process_definition_version, form_key, external_form_reference \
-                 FROM user_tasks",
-            )
+            .prepare(&format!("SELECT {USER_TASK_COLS} FROM user_tasks"))
             .expect("prepare user_tasks");
         let rows = stmt.query_map([], map_user_task).expect("query user_tasks");
         rows.filter_map(Result::ok).collect()
@@ -2559,11 +2680,7 @@ impl ReadStore {
     pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         conn.query_row(
-            "SELECT key, instance_key, element_instance_key, element_id, state, \
-             assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
-             priority, created_at_ms, process_definition_id, process_definition_key, \
-             process_definition_version, form_key, external_form_reference \
-             FROM user_tasks WHERE key = ?1",
+            &format!("SELECT {USER_TASK_COLS} FROM user_tasks WHERE key = ?1"),
             params![key as i64],
             map_user_task,
         )
@@ -2661,6 +2778,35 @@ impl ReadStore {
             .query_map([], map_message_subscription)
             .expect("query message_subscriptions");
         rows.filter_map(Result::ok).collect()
+    }
+
+    /// All open timer / signal / conditional waits in this shard.
+    pub fn event_waits(&self) -> Vec<EventWaitRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT wait_key, wait_type, instance_key, element_instance_key, element_id, \
+                 detail, due_at_ms FROM event_waits",
+            )
+            .expect("prepare event_waits");
+        let rows = stmt
+            .query_map([], |r| {
+                let code: String = r.get(1)?;
+                let Some(wait_type) = EventWaitType::parse(&code) else {
+                    return Ok(None);
+                };
+                Ok(Some(EventWaitRow {
+                    wait_key: r.get::<_, i64>(0)? as Key,
+                    wait_type,
+                    instance_key: r.get::<_, i64>(2)? as Key,
+                    element_instance_key: r.get::<_, i64>(3)? as Key,
+                    element_id: r.get(4)?,
+                    detail: r.get(5)?,
+                    due_at_ms: r.get::<_, Option<i64>>(6)?.map(|v| v.max(0) as u64),
+                }))
+            })
+            .expect("query event_waits");
+        rows.filter_map(|r| r.ok().flatten()).collect()
     }
 
     /// All correlated (historical) message subscriptions in this shard.
@@ -3061,8 +3207,15 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         // degrades to an empty read-set rather than failing the whole row map.
         read_set: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(14)?).unwrap_or_default(),
         lease_token: r.get(15)?,
+        business_id: r.get(16)?,
     })
 }
+
+/// Column list for `user_tasks` selects, shared by scan and point lookup.
+const USER_TASK_COLS: &str = "key, instance_key, element_instance_key, element_id, state, \
+     assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
+     priority, created_at_ms, process_definition_id, process_definition_key, \
+     process_definition_version, form_key, external_form_reference, business_id";
 
 fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
     let candidate_groups: String = r.get(6)?;
@@ -3085,6 +3238,7 @@ fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
         process_definition_version: r.get(14)?,
         form_key: r.get::<_, Option<i64>>(15)?.map(|k| k as Key),
         external_form_reference: r.get(16)?,
+        business_id: r.get(17)?,
     })
 }
 
@@ -3142,7 +3296,7 @@ fn map_element_instance(r: &rusqlite::Row) -> rusqlite::Result<ElementInstanceRo
 
 /// Column list for `message_subscriptions` selects.
 const MESSAGE_SUBSCRIPTION_COLS: &str = "subscription_key, instance_key, element_instance_key, \
-     element_id, message_name, correlation_key, created_at_ms";
+     element_id, message_name, correlation_key, created_at_ms, business_id";
 
 fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscriptionRow> {
     Ok(MessageSubscriptionRow {
@@ -3153,12 +3307,13 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
         message_name: r.get(4)?,
         correlation_key: r.get(5)?,
         created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
+        business_id: r.get(7)?,
     })
 }
 
 /// Column list for `correlated_message_subscriptions` selects.
 const CORRELATED_MESSAGE_SUBSCRIPTION_COLS: &str = "message_key, subscription_key, instance_key, element_instance_key, element_id, \
-     message_name, correlation_key, correlation_time_ms, partition_id";
+     message_name, correlation_key, correlation_time_ms, partition_id, business_id";
 
 fn map_correlated_message_subscription(
     r: &rusqlite::Row,
@@ -3173,6 +3328,7 @@ fn map_correlated_message_subscription(
         correlation_key: r.get(6)?,
         correlation_time_ms: r.get::<_, i64>(7)? as u64,
         partition_id: r.get::<_, i64>(8)? as i32,
+        business_id: r.get(9)?,
     })
 }
 
@@ -3181,7 +3337,7 @@ const DECISION_INSTANCE_COLS: &str = "eval_instance_key, decision_evaluation_key
      decision_key, decision_name, decision_type, version, decision_requirements_id, \
      decision_requirements_key, root_decision_key, instance_key, element_instance_key, \
      process_definition_key, state, evaluation_failure, evaluation_date_ms, result_json, \
-     inputs_json, rules_json, tenant_id";
+     inputs_json, rules_json, tenant_id, business_id";
 
 fn map_decision_instance(r: &rusqlite::Row) -> rusqlite::Result<DecisionInstanceRow> {
     Ok(DecisionInstanceRow {
@@ -3206,6 +3362,7 @@ fn map_decision_instance(r: &rusqlite::Row) -> rusqlite::Result<DecisionInstance
         inputs_json: r.get(18)?,
         rules_json: r.get(19)?,
         tenant_id: r.get(20)?,
+        business_id: r.get(21)?,
     })
 }
 
@@ -3777,8 +3934,9 @@ fn project_engine_state(
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-             job_kind, listener_event_type, lease_token) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+             job_kind, listener_event_type, lease_token, business_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+             (SELECT business_id FROM process_instances WHERE key = ?2)) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
              worker = excluded.worker, deadline_ms = excluded.deadline_ms, lease_token = excluded.lease_token",
             params![
@@ -3852,8 +4010,9 @@ fn project_engine_state(
             "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
              state, assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
              priority, created_at_ms, process_definition_id, process_definition_key, \
-             process_definition_version, form_key, external_form_reference) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+             process_definition_version, form_key, external_form_reference, business_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+             (SELECT business_id FROM process_instances WHERE key = ?2)) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state",
             params![
                 ut.key as i64,
@@ -3895,8 +4054,8 @@ fn project_engine_state(
             tx.cexecute(
                 "INSERT INTO message_subscriptions (subscription_key, instance_key, \
                  element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
-                 non_interrupting) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 non_interrupting, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, (SELECT business_id FROM process_instances WHERE key = ?2)) \
                  ON CONFLICT(subscription_key) DO UPDATE SET \
                  element_instance_key = excluded.element_instance_key, \
                  element_id = excluded.element_id, \
@@ -3917,6 +4076,69 @@ fn project_engine_state(
         }
     }
 
+    project_event_waits_from_state(tx, state)
+}
+
+/// Projects every open timer / signal / conditional wait held by the live engine
+/// `state` into `event_waits` — row-for-row what [`project`] produces from the
+/// `*Created` events. Shared by the #732 reseed and the schema-v9 upgrade
+/// backfill ([`ReadStore::backfill_pending_event_waits`]); idempotent.
+fn project_event_waits_from_state(
+    tx: &rusqlite::Transaction,
+    state: &nanobpmn_engine_core::State,
+) -> rusqlite::Result<()> {
+    use nanobpmn_engine_core::{MessageSubscriptionState, TimerKind, TimerState};
+    let open = |s: MessageSubscriptionState| {
+        matches!(
+            s,
+            MessageSubscriptionState::Open | MessageSubscriptionState::Opening
+        )
+    };
+    for t in state.timers.values() {
+        if t.state == TimerState::Created {
+            insert_event_wait(
+                tx,
+                t.key,
+                EventWaitType::Timer,
+                t.instance_key,
+                t.element_instance_key,
+                &t.element_id,
+                "",
+                Some(t.due_at),
+                matches!(t.kind, TimerKind::NonInterruptingBoundary { .. }),
+            )?;
+        }
+    }
+    for sub in state.signal_subscriptions.values() {
+        if open(sub.state) {
+            insert_event_wait(
+                tx,
+                sub.key,
+                EventWaitType::Signal,
+                sub.instance_key,
+                sub.element_instance_key,
+                &sub.element_id,
+                &sub.signal_name,
+                None,
+                is_non_interrupting(&sub.kind),
+            )?;
+        }
+    }
+    for sub in state.conditional_subscriptions.values() {
+        if open(sub.state) {
+            insert_event_wait(
+                tx,
+                sub.key,
+                EventWaitType::Condition,
+                sub.instance_key,
+                sub.element_instance_key,
+                &sub.element_id,
+                &sub.condition,
+                None,
+                is_non_interrupting(&sub.kind),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -3929,6 +4151,45 @@ fn project_engine_state(
 /// events; this guard keeps the projection correct when *replaying* any event
 /// persisted before that normalization existed, and when *seeding* from a
 /// pre-normalization snapshot in `project_engine_state`.
+fn is_non_interrupting(kind: &nanobpmn_engine_core::MessageSubscriptionKind) -> bool {
+    matches!(
+        kind,
+        nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
+    )
+}
+
+/// Upserts one open timer / signal / conditional wait row — the single insert
+/// shared by the event projector and the engine-state seed/backfill.
+#[allow(clippy::too_many_arguments)]
+fn insert_event_wait(
+    tx: &rusqlite::Transaction,
+    wait_key: Key,
+    wait_type: EventWaitType,
+    instance_key: Key,
+    element_instance_key: Key,
+    element_id: &str,
+    detail: &str,
+    due_at_ms: Option<u64>,
+    non_interrupting: bool,
+) -> rusqlite::Result<()> {
+    tx.cexecute(
+        "INSERT INTO event_waits (wait_key, wait_type, instance_key, element_instance_key, \
+         element_id, detail, due_at_ms, non_interrupting) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+         ON CONFLICT(wait_key) DO NOTHING",
+        params![
+            wait_key as i64,
+            wait_type.as_str(),
+            instance_key as i64,
+            element_instance_key as i64,
+            element_id,
+            detail,
+            due_at_ms.map(|d| d as i64),
+            non_interrupting as i64,
+        ],
+    )?;
+    Ok(())
+}
+
 fn worker_attribution(worker: Option<&str>) -> Option<&str> {
     worker.filter(|w| !w.is_empty())
 }
@@ -4084,6 +4345,10 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 "DELETE FROM message_subscriptions WHERE instance_key = ?1",
                 params![*instance_key as i64],
             )?;
+            tx.cexecute(
+                "DELETE FROM event_waits WHERE instance_key = ?1",
+                params![*instance_key as i64],
+            )?;
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
@@ -4125,6 +4390,10 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // A terminated instance holds no open message subscriptions.
             tx.cexecute(
                 "DELETE FROM message_subscriptions WHERE instance_key = ?1",
+                params![*instance_key as i64],
+            )?;
+            tx.cexecute(
+                "DELETE FROM event_waits WHERE instance_key = ?1",
                 params![*instance_key as i64],
             )?;
         }
@@ -4204,6 +4473,98 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        // --- Timer / signal / conditional waits (TIMER/SIGNAL/CONDITION) -----
+        Event::TimerCreated {
+            timer_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            due_at,
+            kind,
+        } => insert_event_wait(
+            tx,
+            *timer_key,
+            EventWaitType::Timer,
+            *instance_key,
+            *element_instance_key,
+            element_id,
+            "",
+            Some(*due_at),
+            matches!(
+                kind,
+                nanobpmn_engine_core::TimerKind::NonInterruptingBoundary { .. }
+            ),
+        )?,
+        Event::SignalSubscriptionCreated {
+            subscription_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            signal_name,
+            kind,
+        } => insert_event_wait(
+            tx,
+            *subscription_key,
+            EventWaitType::Signal,
+            *instance_key,
+            *element_instance_key,
+            element_id,
+            signal_name,
+            None,
+            is_non_interrupting(kind),
+        )?,
+        Event::ConditionalSubscriptionCreated {
+            subscription_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            condition,
+            kind,
+            ..
+        } => insert_event_wait(
+            tx,
+            *subscription_key,
+            EventWaitType::Condition,
+            *instance_key,
+            *element_instance_key,
+            element_id,
+            condition,
+            None,
+            is_non_interrupting(kind),
+        )?,
+        // A timer fires once (the engine has no cycle timers), so it always
+        // settles; cancellation settles every kind.
+        Event::TimerTriggered { timer_key: key, .. }
+        | Event::TimerCanceled { timer_key: key, .. }
+        | Event::SignalSubscriptionCanceled {
+            subscription_key: key,
+            ..
+        }
+        | Event::ConditionalSubscriptionCanceled {
+            subscription_key: key,
+            ..
+        } => {
+            tx.cexecute(
+                "DELETE FROM event_waits WHERE wait_key = ?1",
+                params![*key as i64],
+            )?;
+        }
+        // A non-interrupting boundary signal/condition stays open in the engine
+        // (it can fire again); anything else settles on firing.
+        Event::SignalCorrelated {
+            subscription_key: key,
+            ..
+        }
+        | Event::ConditionalTriggered {
+            subscription_key: key,
+            ..
+        } => {
+            tx.cexecute(
+                "DELETE FROM event_waits WHERE wait_key = ?1 AND non_interrupting = 0",
+                params![*key as i64],
+            )?;
+        }
+
         // --- Message subscriptions (MESSAGE wait states) ---------------------
         // Only instance-scoped subscriptions (a running element instance parked
         // on a message catch) are tracked; message-*start* subscriptions carry
@@ -4225,8 +4586,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 tx.cexecute(
                     "INSERT INTO message_subscriptions (subscription_key, instance_key, \
                      element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
-                     non_interrupting) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                     non_interrupting, business_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, (SELECT business_id FROM process_instances WHERE key = ?2)) \
                      ON CONFLICT(subscription_key) DO UPDATE SET \
                      element_instance_key = excluded.element_instance_key, \
                      element_id = excluded.element_id, \
@@ -4292,8 +4653,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     tx.cexecute(
                         "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
                          instance_key, element_instance_key, element_id, message_name, correlation_key, \
-                         correlation_time_ms, partition_id) \
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                         correlation_time_ms, partition_id, business_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, (SELECT business_id FROM process_instances WHERE key = ?3)) \
                          ON CONFLICT(message_key, subscription_key) DO NOTHING",
                         params![
                             *message_key as i64,
@@ -4350,8 +4711,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10) \
+                 created_at_ms, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, \
+                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
                  worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
                 params![
@@ -4389,8 +4751,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12) \
+                 job_kind, listener_event_type, created_at_ms, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, \
+                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
                  worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
                 params![
@@ -4601,8 +4964,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
                  state, assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
                  priority, created_at_ms, process_definition_id, process_definition_key, \
-                 process_definition_version, form_key, external_form_reference) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+                 process_definition_version, form_key, external_form_reference, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state",
                 params![
                     *user_task_key as i64,
@@ -5020,9 +5384,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                       decision_name, decision_type, version, decision_requirements_id, \
                       decision_requirements_key, root_decision_key, instance_key, \
                       element_instance_key, process_definition_key, state, evaluation_failure, \
-                      evaluation_date_ms, result_json, inputs_json, rules_json, tenant_id) \
+                      evaluation_date_ms, result_json, inputs_json, rules_json, tenant_id, business_id) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-                      ?16, ?17, ?18, ?19, ?20, ?21) \
+                      ?16, ?17, ?18, ?19, ?20, ?21, (SELECT business_id FROM process_instances WHERE key = ?12)) \
                      ON CONFLICT(eval_instance_key) DO NOTHING",
                     params![
                         eval_instance_key,
@@ -5304,8 +5668,60 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
-        // Events with no queryable read-model projection.
-        _ => {}
+        Event::ProcessInstanceBusinessIdAssigned {
+            instance_key,
+            business_id,
+        } => {
+            // Camunda 8.10 business-id assignment on job completion: the row's
+            // `business_id` is the single source every derived `businessId`
+            // (instance, and artifacts created afterwards) reads from.
+            tx.cexecute(
+                "UPDATE process_instances SET business_id = ?2 WHERE key = ?1",
+                params![*instance_key as i64, business_id],
+            )?;
+        }
+
+        // Events with no queryable read-model projection. Listed explicitly
+        // (no `_` catch-all) so a NEW `Event` variant fails to compile here
+        // until someone decides whether the read model must project it — a
+        // wildcard silently dropped new variants from every query surface.
+        Event::AdHocActivated { .. }
+        | Event::AdHocCompleted { .. }
+        | Event::AdHocCompletionConditionFulfilled { .. }
+        | Event::AdHocIterated { .. }
+        | Event::AdHocToolActivated { .. }
+        | Event::AdHocToolCompleted { .. }
+        | Event::AgentHistoryDeduplicated { .. }
+        | Event::CompensationHandlerCompleted { .. }
+        | Event::CompensationSubscriptionCreated { .. }
+        | Event::CompensationTriggered { .. }
+        | Event::DeploymentCreated { .. }
+        | Event::ElementCompleting { .. }
+        | Event::MessagePublished { .. }
+        | Event::MessageStartSubscriptionCreated { .. }
+        | Event::MessageSubscriptionClosing { .. }
+        | Event::MessageSubscriptionOpening { .. }
+        | Event::MultiInstanceActivated { .. }
+        | Event::MultiInstanceChildActivated { .. }
+        | Event::MultiInstanceChildCompleted { .. }
+        | Event::MultiInstanceCompleted { .. }
+        | Event::ParallelJoinFired { .. }
+        | Event::ParallelJoinOpened { .. }
+        | Event::ParallelJoinReset { .. }
+        | Event::ParallelJoinTokenArrived { .. }
+        | Event::ProcessInstanceTerminating { .. }
+        | Event::ProcessStartTimerArmed { .. }
+        | Event::ProcessStartTimerFired { .. }
+        | Event::ScopedCompensationCleared { .. }
+        | Event::SequenceFlowTaken { .. }
+        | Event::SignalBroadcast { .. }
+        | Event::StartInstanceDispatched { .. }
+        | Event::TaskListenerJobCreated { .. }
+        | Event::UserTaskCorrectionsApplied { .. }
+        | Event::UserTaskTransitionDeferred { .. }
+        | Event::UserTaskTransitionResolved { .. }
+        | Event::VariableScopeCreated { .. }
+        | Event::VariableScopeDestroyed { .. } => {}
     }
     Ok(delta)
 }
@@ -6784,6 +7200,230 @@ mod definition_xml_tests {
     }
 
     #[test]
+    fn business_id_assignment_projects_onto_the_instance_row() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&created_event(7)]).unwrap();
+        assert_eq!(store.process_instance(7).unwrap().business_id, None);
+        let out = store
+            .export(&[&Event::ProcessInstanceBusinessIdAssigned {
+                instance_key: 7,
+                business_id: "order-9".into(),
+            }])
+            .unwrap();
+        assert_eq!(out.inflight_delta, 0);
+        assert_eq!(
+            store.process_instance(7).unwrap().business_id.as_deref(),
+            Some("order-9")
+        );
+    }
+
+    #[test]
+    fn timer_signal_and_conditional_waits_project_open_rows_until_they_settle() {
+        use nanobpmn_engine_core::{Key, MessageSubscriptionKind as SubKind, TimerKind};
+
+        use super::EventWaitType;
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&created_event(7)]).unwrap();
+        let waits = |store: &ReadStore| {
+            let mut w: Vec<(Key, EventWaitType)> = store
+                .event_waits()
+                .into_iter()
+                .map(|w| (w.wait_key, w.wait_type))
+                .collect();
+            w.sort_by_key(|(k, _)| *k);
+            w
+        };
+        let ni = SubKind::NonInterruptingBoundary {
+            boundary_element_id: "b".into(),
+        };
+        store
+            .export(&[
+                &Event::TimerCreated {
+                    timer_key: 10,
+                    instance_key: 7,
+                    element_instance_key: 20,
+                    element_id: "wait".into(),
+                    due_at: 5_000,
+                    kind: TimerKind::IntermediateCatch,
+                },
+                &Event::SignalSubscriptionCreated {
+                    subscription_key: 11,
+                    instance_key: 7,
+                    element_instance_key: 21,
+                    element_id: "sig".into(),
+                    signal_name: "go".into(),
+                    kind: SubKind::IntermediateCatch,
+                },
+                &Event::ConditionalSubscriptionCreated {
+                    subscription_key: 12,
+                    instance_key: 7,
+                    element_instance_key: 22,
+                    element_id: "cond".into(),
+                    condition: "= x > 1".into(),
+                    referenced_vars: vec!["x".into()],
+                    kind: ni.clone(),
+                },
+                &Event::SignalSubscriptionCreated {
+                    subscription_key: 13,
+                    instance_key: 7,
+                    element_instance_key: 23,
+                    element_id: "sig-ni".into(),
+                    signal_name: "tick".into(),
+                    kind: ni,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            waits(&store),
+            vec![
+                (10, EventWaitType::Timer),
+                (11, EventWaitType::Signal),
+                (12, EventWaitType::Condition),
+                (13, EventWaitType::Signal),
+            ]
+        );
+        let rows = store.event_waits();
+        let timer = rows.iter().find(|w| w.wait_key == 10).unwrap();
+        assert_eq!(
+            (timer.due_at_ms, timer.element_instance_key),
+            (Some(5_000), 20)
+        );
+        let cond = rows.iter().find(|w| w.wait_key == 12).unwrap();
+        assert_eq!(cond.detail, "= x > 1");
+
+        // Firing settles a timer / interrupting signal; a non-interrupting
+        // conditional or signal boundary stays open (it can fire again).
+        store
+            .export(&[
+                &Event::TimerTriggered {
+                    timer_key: 10,
+                    instance_key: 7,
+                    element_instance_key: 20,
+                    element_id: "wait".into(),
+                },
+                &Event::SignalCorrelated {
+                    subscription_key: 11,
+                    signal_key: 99,
+                    instance_key: 7,
+                    element_instance_key: 21,
+                    element_id: "sig".into(),
+                },
+                &Event::ConditionalTriggered {
+                    subscription_key: 12,
+                    instance_key: 7,
+                    element_instance_key: 22,
+                    element_id: "cond".into(),
+                },
+                &Event::SignalCorrelated {
+                    subscription_key: 13,
+                    signal_key: 99,
+                    instance_key: 7,
+                    element_instance_key: 23,
+                    element_id: "sig-ni".into(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            waits(&store),
+            vec![(12, EventWaitType::Condition), (13, EventWaitType::Signal)]
+        );
+
+        // Cancellation settles; instance termination clears whatever remains.
+        store
+            .export(&[&Event::ConditionalSubscriptionCanceled {
+                subscription_key: 12,
+                instance_key: 7,
+                element_instance_key: 22,
+                element_id: "cond".into(),
+            }])
+            .unwrap();
+        assert_eq!(waits(&store), vec![(13, EventWaitType::Signal)]);
+        store
+            .export(&[&Event::ProcessInstanceTerminated { instance_key: 7 }])
+            .unwrap();
+        assert!(waits(&store).is_empty());
+    }
+
+    #[test]
+    fn upgrading_from_before_event_waits_backfills_live_waits_from_the_engine_state() {
+        use nanobpmn_engine_core::{
+            ConditionalSubscription, MessageSubscriptionKind, MessageSubscriptionState, State,
+            Timer, TimerKind, TimerState,
+        };
+
+        use super::EventWaitType;
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-event-waits-backfill-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // A fresh store never needs the backfill.
+        let store = ReadStore::open(Some(&path)).unwrap();
+        assert!(
+            !store
+                .backfill_pending_event_waits(&State::default())
+                .unwrap()
+        );
+        // Wind it back to a v8 store (no `event_waits` table).
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TABLE event_waits; UPDATE meta SET v = 8 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        let mut state = State::default();
+        let timer = |key, state| Timer {
+            key,
+            instance_key: 7,
+            element_instance_key: 20,
+            element_id: "wait".into(),
+            due_at: 5_000,
+            state,
+            kind: TimerKind::IntermediateCatch,
+        };
+        state.timers.insert(10, timer(10, TimerState::Created));
+        state.timers.insert(11, timer(11, TimerState::Triggered));
+        state.conditional_subscriptions.insert(
+            12,
+            ConditionalSubscription {
+                key: 12,
+                instance_key: 7,
+                element_instance_key: 22,
+                element_id: "cond".into(),
+                condition: "= x > 1".into(),
+                referenced_vars: vec!["x".into()],
+                state: MessageSubscriptionState::Open,
+                kind: MessageSubscriptionKind::IntermediateCatch,
+            },
+        );
+        assert!(store.backfill_pending_event_waits(&state).unwrap());
+        let mut got: Vec<_> = store
+            .event_waits()
+            .into_iter()
+            .map(|w| (w.wait_key, w.wait_type, w.due_at_ms))
+            .collect();
+        got.sort_by_key(|w| w.0);
+        assert_eq!(
+            got,
+            vec![
+                (10, EventWaitType::Timer, Some(5_000)),
+                (12, EventWaitType::Condition, None),
+            ]
+        );
+        // The flag is cleared: the backfill runs once.
+        assert!(!store.backfill_pending_event_waits(&state).unwrap());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn export_inflight_delta_sums_a_mixed_batch() {
         let store = ReadStore::open(None).unwrap();
         // Two creates + one completion in one batch => net +1.
@@ -7830,6 +8470,147 @@ mod decision_deletion_tests {
             evaluated_decisions,
             evaluated_at: 123,
         }
+    }
+
+    /// Every artifact snapshots the owning instance's `businessId` when it is
+    /// created: a later assignment must NOT retroactively enrich artifacts that
+    /// already existed (Camunda 8.10 contract, #1295 review).
+    #[test]
+    fn artifacts_snapshot_the_business_id_current_at_their_creation() {
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        let store = ReadStore::open(None).unwrap();
+        let job = |job_key| Event::JobCreated {
+            job_key,
+            instance_key: 7,
+            element_instance_key: 70,
+            element_id: "task".into(),
+            job_type: "t".into(),
+            created_at: 0,
+            priority: 0,
+            retries: 3,
+        };
+        let task = |user_task_key| Event::UserTaskCreated {
+            user_task_key,
+            instance_key: 7,
+            element_instance_key: 71,
+            element_id: "ut".into(),
+            created_at: 0,
+            assignee: None,
+            candidate_groups: Vec::new(),
+            candidate_users: Vec::new(),
+            due_date: None,
+            follow_up_date: None,
+            priority: 50,
+            form_key: None,
+            external_form_reference: None,
+        };
+        let sub = |subscription_key| Event::MessageSubscriptionCreated {
+            subscription_key,
+            instance_key: 7,
+            element_instance_key: 72,
+            element_id: "catch".into(),
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            kind: MessageSubscriptionKind::IntermediateCatch,
+        };
+        let correlate = |subscription_key, message_key| Event::MessageCorrelated {
+            subscription_key,
+            message_key,
+            instance_key: 7,
+            element_instance_key: 72,
+            element_id: "catch".into(),
+        };
+        let created = Event::ProcessInstanceCreated {
+            instance_key: 7,
+            process_id: "p".into(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        // Before the assignment: one of each artifact, plus a correlation.
+        store
+            .export(&[
+                &created,
+                &job(1),
+                &task(2),
+                &sub(3),
+                &sub(4),
+                &correlate(3, 30),
+                &evaluated_event(7, 100, 1),
+            ])
+            .unwrap();
+        store
+            .export(&[&Event::ProcessInstanceBusinessIdAssigned {
+                instance_key: 7,
+                business_id: "order-9".into(),
+            }])
+            .unwrap();
+        // After it: one more of each.
+        store
+            .export(&[
+                &job(11),
+                &task(12),
+                &sub(13),
+                &correlate(4, 40),
+                &evaluated_event(7, 200, 1),
+            ])
+            .unwrap();
+
+        let bid = |v: Option<String>| v;
+        let order = Some("order-9".to_string());
+        let jobs = store.jobs();
+        let job_bid = |k| {
+            bid(jobs
+                .iter()
+                .find(|j| j.key == k)
+                .unwrap()
+                .business_id
+                .clone())
+        };
+        assert_eq!((job_bid(1), job_bid(11)), (None, order.clone()));
+        let tasks = store.user_tasks();
+        let task_bid = |k| {
+            bid(tasks
+                .iter()
+                .find(|t| t.key == k)
+                .unwrap()
+                .business_id
+                .clone())
+        };
+        assert_eq!((task_bid(2), task_bid(12)), (None, order.clone()));
+        let subs = store.message_subscriptions();
+        let sub_bid = |k| {
+            bid(subs
+                .iter()
+                .find(|s| s.subscription_key == k)
+                .unwrap()
+                .business_id
+                .clone())
+        };
+        // Sub 4 was opened before the assignment (it correlated after it).
+        assert_eq!((sub_bid(13), subs.len()), (order.clone(), 1));
+        let corr = store.correlated_message_subscriptions();
+        let corr_bid = |k| {
+            bid(corr
+                .iter()
+                .find(|c| c.message_key == k)
+                .unwrap()
+                .business_id
+                .clone())
+        };
+        // A correlation record is created when the message correlates.
+        assert_eq!((corr_bid(30), corr_bid(40)), (None, order.clone()));
+        let dec_bid = |k| {
+            store.decision_instances_by_evaluation_key(k)[0]
+                .business_id
+                .clone()
+        };
+        assert_eq!((dec_bid(100), dec_bid(200)), (None, order));
     }
 
     #[test]

@@ -608,6 +608,7 @@ pub fn replay_instance_with_mocks(
                             message_name,
                             correlation_key,
                             variables: input.vars,
+                            business_id: None,
                         },
                         clock,
                     );

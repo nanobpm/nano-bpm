@@ -119,6 +119,16 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         task_listener_result: Option<TaskListenerJobResult>,
+        /// Camunda 8.10 `JobCompletionRequest.businessId`: assign this business
+        /// id to the job's (root) process instance as part of the completion.
+        /// A child instance, an empty id, or an id differing from one already
+        /// assigned rejects the whole completion; re-sending the assigned id is
+        /// a no-op. `None`/skipped for ordinary completions (byte-unchanged).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        business_id: Option<String>,
     },
     /// Assign a user task to `assignee`. The task must be in the `Created` state.
     /// When `allow_override` is `false` and the task already has an assignee, the
@@ -321,6 +331,11 @@ pub enum Command {
         message_name: String,
         correlation_key: String,
         variables: HashMap<String, Value>,
+        /// Camunda 8.10 `businessId`: stamped on the instance a **message start
+        /// event** creates; no effect on a catch/boundary correlation. Defaulted
+        /// so commands serialized before the field existed still decode.
+        #[cfg_attr(feature = "serde", serde(default))]
+        business_id: Option<String>,
     },
     /// Broadcast a signal and correlate it to **every** open subscription whose
     /// signal name matches, across all instances. A signal intermediate catch
@@ -866,6 +881,7 @@ impl Command {
             variables: HashMap::new(),
             adhoc_result: None,
             task_listener_result: None,
+            business_id: None,
         }
     }
 
@@ -881,6 +897,7 @@ impl Command {
             variables: HashMap::new(),
             adhoc_result: None,
             task_listener_result: Some(task_listener_result),
+            business_id: None,
         }
     }
 
@@ -892,6 +909,7 @@ impl Command {
             variables,
             adhoc_result: None,
             task_listener_result: None,
+            business_id: None,
         }
     }
 
@@ -908,6 +926,7 @@ impl Command {
             variables,
             adhoc_result: Some(adhoc_result),
             task_listener_result: None,
+            business_id: None,
         }
     }
 
@@ -1178,6 +1197,16 @@ impl Command {
         self
     }
 
+    /// Set the business id a `CompleteJob` assigns to its process instance
+    /// (Camunda 8.10 `JobCompletionRequest.businessId`).
+    pub fn with_business_id(mut self, id: Option<String>) -> Self {
+        match &mut self {
+            Self::CompleteJob { business_id, .. } => *business_id = id,
+            _ => panic!("with_business_id requires a CompleteJob command"),
+        }
+        self
+    }
+
     /// Convenience constructor for a `CorrelateMessage` with no variables.
     pub fn correlate_message(
         message_name: impl Into<String>,
@@ -1187,6 +1216,7 @@ impl Command {
             message_name: message_name.into(),
             correlation_key: correlation_key.into(),
             variables: HashMap::new(),
+            business_id: None,
         }
     }
 
@@ -1201,6 +1231,7 @@ impl Command {
             message_name: message_name.into(),
             correlation_key: correlation_key.into(),
             variables,
+            business_id: None,
         }
     }
 
@@ -1260,6 +1291,7 @@ mod kind_tests {
                 variables: HashMap::new(),
                 adhoc_result: None,
                 task_listener_result: None,
+                business_id: None,
             }
             .kind(),
             "complete_job"

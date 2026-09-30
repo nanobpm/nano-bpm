@@ -7,6 +7,9 @@ paths:
       tags:
         - Job
       operationId: getGlobalJobStatistics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: SYSTEM, permissionType: READ_JOB_METRIC }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -55,6 +58,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /jobs/statistics/by-types:
     post:
@@ -62,6 +66,9 @@ paths:
       tags:
         - Job
       operationId: getJobTypeStatistics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: SYSTEM, permissionType: READ_JOB_METRIC }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -90,6 +97,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /jobs/statistics/by-workers:
     post:
@@ -97,6 +105,9 @@ paths:
       tags:
         - Job
       operationId: getJobWorkerStatistics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: SYSTEM, permissionType: READ_JOB_METRIC }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -125,6 +136,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /jobs/statistics/time-series:
     post:
@@ -132,6 +144,9 @@ paths:
       tags:
         - Job
       operationId: getJobTimeSeriesStatistics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: SYSTEM, permissionType: READ_JOB_METRIC }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -162,6 +177,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
   /jobs/statistics/errors:
     post:
@@ -169,6 +185,9 @@ paths:
       tags:
         - Job
       operationId: getJobErrorStatistics
+      x-permission-enforcement: filter
+      x-required-permissions:
+        - { resourceType: PROCESS_DEFINITION, permissionType: READ_PROCESS_INSTANCE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -197,6 +216,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.9"
+      x-scope: physical-tenant
 
 ## Schema definitions
 
@@ -283,7 +303,6 @@ components:
       description: Job type statistics query result.
       type: object
       required:
-        - page
         - items
       allOf:
         - $ref: "search-models.yaml#/components/schemas/SearchQueryResponse"
@@ -362,7 +381,6 @@ components:
       description: Job worker statistics query result.
       type: object
       required:
-        - page
         - items
       allOf:
         - $ref: "search-models.yaml#/components/schemas/SearchQueryResponse"
@@ -441,7 +459,6 @@ components:
       description: Job time-series statistics query result.
       type: object
       required:
-        - page
         - items
       allOf:
         - $ref: "search-models.yaml#/components/schemas/SearchQueryResponse"
@@ -523,7 +540,6 @@ components:
       description: Job error statistics query result.
       type: object
       required:
-        - page
         - items
       allOf:
         - $ref: "search-models.yaml#/components/schemas/SearchQueryResponse"

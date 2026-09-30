@@ -195,6 +195,19 @@
         At least one of `jobLeaseToken` or `jobLease` must be present; both may
         be supplied when their values match, and if both are supplied and differ
         the request is rejected with 400.
+# Upstream (50d5d404) makes `jobLeaseToken` REQUIRED on the agent-instance
+# requests. During the alias window a legacy client sends only `jobLease`, which
+# a required field would reject at deserialization, before the handler's
+# "at least one of jobLeaseToken/jobLease" check. Relax it for as long as the
+# alias lives; remove these two entries together with the aliases above.
+- file: agent-instances.yaml
+  target: components.schemas.AgentInstanceCreationRequest.required
+  remove:
+    - jobLeaseToken
+- file: agent-instances.yaml
+  target: components.schemas.AgentInstanceUpdateRequest.required
+  remove:
+    - jobLeaseToken
 - file: agent-instances.yaml
   target: components.schemas.AgentInstanceHistoryItemResult.properties
   merge:
@@ -205,3 +218,48 @@
         Deprecated legacy alias for `jobLeaseToken` (the pre-8.10 name). Emitted
         alongside `jobLeaseToken` during the rename transition window. Read
         `jobLeaseToken` instead.
+
+# --- pagination disambiguation (684c4583): codegen correctness ---------------
+#
+# SearchQueryPageRequest is an untagged oneOf of four all-optional pagination
+# shapes. Without additionalProperties: false (which postprocess-generated.py
+# turns into #[serde(deny_unknown_fields)]), serde matches the first variant
+# (limit) for any object containing `limit`, silently dropping after/before/from.
+# Originally a hand edit to spec/search-models.yaml; kept here since #1291 so
+# spec/ stays byte-identical to the pinned upstream commit.
+- file: search-models.yaml
+  target: components.schemas.LimitPagination
+  merge:
+    additionalProperties: false
+- file: search-models.yaml
+  target: components.schemas.OffsetPagination
+  merge:
+    additionalProperties: false
+- file: search-models.yaml
+  target: components.schemas.CursorForwardPagination
+  merge:
+    additionalProperties: false
+- file: search-models.yaml
+  target: components.schemas.CursorBackwardPagination
+  merge:
+    additionalProperties: false
+
+# --- fetch-declared read-set on job search (#986) -----------------------------
+- file: jobs.yaml
+  target: components.schemas.JobSearchResult.properties
+  merge:
+    fetchedVariables:
+      description: >
+        nano extension (not part of the Camunda 8 API). The declared read-set —
+        the `fetchVariables` names the worker asked for on the most recent
+        durable activation of this job that declared a non-empty set — recorded
+        on the `JobActivated` event as engine-native read provenance for post-hoc
+        reification / data-dependency analysis. It is not cleared by a subsequent
+        fetch-all re-activation. `null`/absent when no durable activation has
+        declared a set (fetch-all / undeclared reads) or the activation was not
+        durably recorded (e.g. leader-local activation, which does not export
+        `JobActivated`).
+      nullable: true
+      type: array
+      items:
+        type: string

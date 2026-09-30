@@ -135,9 +135,17 @@ its task-definition routing, retries, priority, custom headers and linked
 resources (including prompts). An `aiAgentSubProcess` marker likewise does not
 replace the ad-hoc container's ordinary job-worker behavior.
 
-The canonical public contract is the REST specification on Camunda's
-`stable/8.10` branch, not the asynchronously published documentation. This
-alignment uses [revision 04530c058589e3ea3f7873bb469ae2c0d7cc6003](https://github.com/camunda/camunda/tree/04530c058589e3ea3f7873bb469ae2c0d7cc6003/zeebe/gateway-protocol/src/main/proto/v2).
+The canonical public contract is Camunda's REST specification source, not the
+asynchronously published documentation. The vendored copy in `spec/` is
+byte-identical to the upstream tree at the commit pinned in
+[`spec-patches/upstream.json`](../spec-patches/upstream.json) (currently
+camunda/camunda `main`, the 8.10 line); Nano's local additions are applied at
+build time from `spec-patches/patches.yaml`. CI verifies the pin with
+`node scripts/vendor-spec.mjs --check`, and re-vendoring is
+`node scripts/vendor-spec.mjs <commit>`. Every request field of a served
+operation is triaged in `spec-patches/request-fields.txt` (guarded by
+`server/src/request_field_guard.rs`), so fields Nano accepts but does not yet
+act on are listed there as `unhonoured #<issue>`.
 
 Activation creates the job, **not** an AgentInstance. Job leasing is independent
 of the agent marker: a worker requests `withLease: true` to receive a fresh,

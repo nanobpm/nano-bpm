@@ -7,6 +7,8 @@ paths:
       tags:
         - Document
       operationId: createDocument
+      x-required-permissions:
+        - { resourceType: DOCUMENT, permissionType: CREATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -60,6 +62,7 @@ paths:
         "415":
           $ref: 'common-responses.yaml#/components/responses/UnsupportedMediaType'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /documents/batch:
     post:
@@ -67,6 +70,8 @@ paths:
       tags:
         - Document
       operationId: createDocuments
+      x-required-permissions:
+        - { resourceType: DOCUMENT, permissionType: CREATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -146,6 +151,7 @@ paths:
         "415":
           $ref: 'common-responses.yaml#/components/responses/UnsupportedMediaType'
       x-added-in-version: "8.7"
+      x-scope: physical-tenant
 
   /documents/{documentId}:
     get:
@@ -153,6 +159,8 @@ paths:
       tags:
         - Document
       operationId: getDocument
+      x-required-permissions:
+        - { resourceType: DOCUMENT, permissionType: READ }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -200,12 +208,15 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
     delete:
       x-eventually-consistent: false
       tags:
         - Document
       operationId: deleteDocument
+      x-required-permissions:
+        - { resourceType: DOCUMENT, permissionType: DELETE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -239,6 +250,7 @@ paths:
         "500":
           $ref: 'common-responses.yaml#/components/responses/InternalServerError'
       x-added-in-version: "8.6"
+      x-scope: physical-tenant
 
   /documents/{documentId}/links:
     post:
@@ -246,6 +258,8 @@ paths:
       tags:
         - Document
       operationId: createDocumentLink
+      x-required-permissions:
+        - { resourceType: DOCUMENT, permissionType: CREATE }
       security:
         - bearerAuth: []
         - basicAuth: []
@@ -292,6 +306,7 @@ paths:
         "400":
           $ref: 'common-responses.yaml#/components/responses/InvalidData'
       x-added-in-version: "8.7"
+      x-scope: physical-tenant
 
 ## Schema definitions
 
@@ -364,6 +379,10 @@ components:
           addedInVersion: "8.9"
         - propertyName: title
           addedInVersion: "8.9"
+        - propertyName: fileName
+          addedInVersionOverride: "8.7"
+        - propertyName: detail
+          addedInVersionOverride: "8.7"
 
     DocumentCreationBatchResponse:
       allOf:
@@ -382,6 +401,11 @@ components:
               description: Documents that failed creation.
               items:
                 $ref: '#/components/schemas/DocumentReference'
+          x-properties-added-in-version:
+            - propertyName: "createdDocuments"
+              addedInVersionOverride: "8.7"
+            - propertyName: "failedDocuments"
+              addedInVersionOverride: "8.7"
 
     DocumentMetadata:
       description: Information about the document.
