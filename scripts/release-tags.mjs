@@ -235,6 +235,7 @@ async function main() {
   const cmds = pushCommands(todo.map((p) => p.tag));
   for (const [i, p] of todo.entries()) {
     const local = sh("git", ["tag", "--list", p.tag], { cwd: root });
+    const created = !local;
     if (local) {
       const at = git("rev-list", "-n", "1", p.tag);
       if (at !== head) throw new Error(`local tag ${p.tag} points at ${at.slice(0, 8)}, not HEAD — delete it locally first`);
@@ -245,8 +246,11 @@ async function main() {
     try {
       sh(cmds[i][0], cmds[i].slice(1), { cwd: root });
     } catch (e) {
-      git("tag", "-d", p.tag);
-      throw new Error(`push of ${p.tag} failed (local tag removed, rerun is safe): ${e.message}`);
+      // Only remove a tag this run created; never delete a pre-existing one.
+      if (created) git("tag", "-d", p.tag);
+      throw new Error(
+        `push of ${p.tag} failed (${created ? "local tag removed" : "pre-existing local tag kept"}, rerun is safe): ${e.message}`,
+      );
     }
     console.log(`pushed ${p.tag}`);
     for (const wf of p.workflows) {

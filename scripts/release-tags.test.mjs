@@ -145,14 +145,19 @@ test("the real repo's versions parse for every train", () => {
   for (const p of plan) assert.match(p.tag, /\d+\.\d+\.\d+/);
 });
 
-test("each train's workflows exist and trigger on that train's tag prefix", () => {
+test("each train's workflows exist and trigger on exactly the registered tag prefixes", () => {
   for (const t of TRAINS) {
     for (const wf of t.workflows) {
       const yml = readRepo(`.github/workflows/${wf}`);
       const tags = workflowTagPatterns(yml);
-      assert.ok(
-        tags.includes(`${t.tagPrefix}*`),
-        `${wf} must trigger on '${t.tagPrefix}*' (found: ${tags.join(", ") || "none"})`,
+      // Exactly the prefixes of the trains that own this workflow: a missing
+      // one means the train's tag publishes nothing; an extra, unregistered
+      // one means a tag the script doesn't know about can publish.
+      const expected = TRAINS.filter((o) => o.workflows.includes(wf)).map((o) => `${o.tagPrefix}*`);
+      assert.deepEqual(
+        [...tags].sort(),
+        [...expected].sort(),
+        `${wf} tag triggers must be exactly ${expected.join(", ")} (found: ${tags.join(", ") || "none"})`,
       );
     }
   }
