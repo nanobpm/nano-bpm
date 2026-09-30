@@ -5304,8 +5304,69 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
-        // Events with no queryable read-model projection.
-        _ => {}
+        Event::ProcessInstanceBusinessIdAssigned {
+            instance_key,
+            business_id,
+        } => {
+            // Camunda 8.10 business-id assignment on job completion: the row's
+            // `business_id` is the single source every derived `businessId`
+            // (instance, and artifacts created afterwards) reads from.
+            tx.cexecute(
+                "UPDATE process_instances SET business_id = ?2 WHERE key = ?1",
+                params![*instance_key as i64, business_id],
+            )?;
+        }
+
+        // Events with no queryable read-model projection. Listed explicitly
+        // (no `_` catch-all) so a NEW `Event` variant fails to compile here
+        // until someone decides whether the read model must project it — a
+        // wildcard silently dropped new variants from every query surface.
+        Event::AdHocActivated { .. }
+        | Event::AdHocCompleted { .. }
+        | Event::AdHocCompletionConditionFulfilled { .. }
+        | Event::AdHocIterated { .. }
+        | Event::AdHocToolActivated { .. }
+        | Event::AdHocToolCompleted { .. }
+        | Event::AgentHistoryDeduplicated { .. }
+        | Event::CompensationHandlerCompleted { .. }
+        | Event::CompensationSubscriptionCreated { .. }
+        | Event::CompensationTriggered { .. }
+        | Event::ConditionalSubscriptionCanceled { .. }
+        | Event::ConditionalSubscriptionCreated { .. }
+        | Event::ConditionalTriggered { .. }
+        | Event::DeploymentCreated { .. }
+        | Event::ElementCompleting { .. }
+        | Event::MessagePublished { .. }
+        | Event::MessageStartSubscriptionCreated { .. }
+        | Event::MessageSubscriptionClosing { .. }
+        | Event::MessageSubscriptionOpening { .. }
+        | Event::MultiInstanceActivated { .. }
+        | Event::MultiInstanceChildActivated { .. }
+        | Event::MultiInstanceChildCompleted { .. }
+        | Event::MultiInstanceCompleted { .. }
+        | Event::ParallelJoinFired { .. }
+        | Event::ParallelJoinOpened { .. }
+        | Event::ParallelJoinReset { .. }
+        | Event::ParallelJoinTokenArrived { .. }
+        | Event::ProcessInstanceTerminating { .. }
+        | Event::ProcessStartTimerArmed { .. }
+        | Event::ProcessStartTimerFired { .. }
+        | Event::ScopedCompensationCleared { .. }
+        | Event::SequenceFlowTaken { .. }
+        | Event::SignalBroadcast { .. }
+        | Event::SignalCorrelated { .. }
+        | Event::SignalSubscriptionCanceled { .. }
+        | Event::SignalSubscriptionCreated { .. }
+        | Event::StartInstanceDispatched { .. }
+        | Event::TaskListenerJobCreated { .. }
+        | Event::TimerCanceled { .. }
+        | Event::TimerCreated { .. }
+        | Event::TimerTriggered { .. }
+        | Event::UserTaskCorrectionsApplied { .. }
+        | Event::UserTaskTransitionDeferred { .. }
+        | Event::UserTaskTransitionResolved { .. }
+        | Event::VariableScopeCreated { .. }
+        | Event::VariableScopeDestroyed { .. } => {}
     }
     Ok(delta)
 }
@@ -6780,6 +6841,24 @@ mod definition_xml_tests {
         assert_eq!(
             store.process_instance(7).map(|r| r.state),
             Some(ProcessInstanceState::Completed)
+        );
+    }
+
+    #[test]
+    fn business_id_assignment_projects_onto_the_instance_row() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&created_event(7)]).unwrap();
+        assert_eq!(store.process_instance(7).unwrap().business_id, None);
+        let out = store
+            .export(&[&Event::ProcessInstanceBusinessIdAssigned {
+                instance_key: 7,
+                business_id: "order-9".into(),
+            }])
+            .unwrap();
+        assert_eq!(out.inflight_delta, 0);
+        assert_eq!(
+            store.process_instance(7).unwrap().business_id.as_deref(),
+            Some("order-9")
         );
     }
 

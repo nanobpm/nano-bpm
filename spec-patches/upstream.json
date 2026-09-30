@@ -1,0 +1,6 @@
+{
+  "_comment": "Single source of truth for the vendored spec/ tree: spec/ must be byte-identical to `path` of `repository` at `commit` (local changes go through spec-patches/patches.yaml). Re-vendor with `node scripts/vendor-spec.mjs <commit>`; CI verifies with `--check`.",
+  "repository": "https://github.com/camunda/camunda.git",
+  "commit": "50d5d404f1c444927282bee2a7329bfd86b2f609",
+  "path": "zeebe/gateway-protocol/src/main/proto/v2"
+}

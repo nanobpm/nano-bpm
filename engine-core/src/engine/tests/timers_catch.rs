@@ -794,6 +794,76 @@ fn should_create_an_instance_when_a_message_start_correlates() {
     assert!(engine.state().instances[&instance_key].variables.is_empty());
 }
 
+/// Camunda 8.10 `businessId` on publish/correlate: it is stamped on the
+/// instance a message start event creates (carried on the durable
+/// `ProcessInstanceCreated`), and has no effect on a catch correlation.
+#[test]
+fn message_start_stamps_the_message_business_id_on_the_new_instance() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let fired = engine
+        .apply_command_at(
+            Command::CorrelateMessage {
+                message_name: "order-placed".into(),
+                correlation_key: String::new(),
+                variables: HashMap::new(),
+                business_id: Some("order-42".into()),
+            },
+            0,
+        )
+        .unwrap();
+    let stamped = fired.iter().find_map(|e| match e {
+        Event::ProcessInstanceCreated { business_id, .. } => Some(business_id.clone()),
+        _ => None,
+    });
+    assert_eq!(stamped, Some(Some("order-42".to_string())));
+
+    // A catch correlation leaves the waiting instance's business id untouched.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_catch()))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "await-payment",
+            vars(&[("orderId", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let instance_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        })
+        .unwrap();
+    let fired = engine
+        .apply_command_at(
+            Command::CorrelateMessage {
+                message_name: "payment-received".into(),
+                correlation_key: "A".into(),
+                variables: HashMap::new(),
+                business_id: Some("ignored".into()),
+            },
+            0,
+        )
+        .unwrap();
+    assert!(
+        fired.iter().any(
+            |e| matches!(e, Event::MessageCorrelated { instance_key: k, .. } if *k == instance_key)
+        ),
+        "the catch correlates"
+    );
+    assert!(
+        !fired
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCreated { .. })),
+        "a catch correlation starts nothing"
+    );
+    assert_eq!(engine.state().instances[&instance_key].business_id, None);
+}
+
 #[test]
 fn feel_message_start_name_resolves_at_deploy() {
     // A message-start-event name expression is evaluated at deploy time against

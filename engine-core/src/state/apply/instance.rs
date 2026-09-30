@@ -314,6 +314,15 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             }
         }
 
+        Event::ProcessInstanceBusinessIdAssigned {
+            instance_key,
+            business_id,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.business_id = Some(business_id.clone());
+            }
+        }
+
         Event::ProcessInstanceMigrated {
             instance_key,
             target_process_id,

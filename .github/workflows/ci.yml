@@ -740,6 +740,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Vendored spec/ equals the pinned upstream (drift guard)
+        # spec/ must be byte-identical to camunda/camunda at the commit pinned in
+        # spec-patches/upstream.json (#1291); local changes live in
+        # spec-patches/patches.yaml. Sparse shallow fetch of the pinned path,
+        # then a byte-compare — seconds, not a full clone.
+        run: |
+          node --test scripts/vendor-spec.test.mjs
+          node scripts/vendor-spec.mjs --check
       - uses: actions/setup-java@v5
         with:
           distribution: temurin

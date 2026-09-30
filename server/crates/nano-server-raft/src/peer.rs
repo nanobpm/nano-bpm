@@ -538,6 +538,7 @@ impl PeerLink {
         variables: Option<serde_json::Map<String, Value>>,
         adhoc_result: Option<nanobpmn_engine_core::AdHocJobResult>,
         task_result: Option<nanobpmn_engine_core::TaskListenerJobResult>,
+        business_id: Option<String>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::CompleteJob {
             corr,
@@ -547,6 +548,7 @@ impl PeerLink {
             variables,
             adhoc_result,
             task_result,
+            business_id,
         })
         .await
     }
@@ -683,12 +685,14 @@ impl PeerLink {
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, Value>>,
+        business_id: Option<String>,
     ) -> Result<PeerResult, PeerError> {
         self.request(|corr| ClientFrame::PublishMessage {
             corr,
             name,
             correlation_key,
             variables,
+            business_id,
         })
         .await
     }

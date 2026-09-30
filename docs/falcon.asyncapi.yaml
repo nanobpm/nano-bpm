@@ -397,6 +397,15 @@ components:
           description: >
             Opaque lease token from the job activation (canonical Camunda 8.10
             spelling). Fences this command to the activation's current lease.
+        businessId:
+          type: string
+          nullable: true
+          description: >
+            Camunda 8.10 business id to assign to the job's root process
+            instance. Rejected (400 `commandResult`) when empty; rejected (409)
+            when the job belongs to a child instance or the root instance
+            already has a different business id. Re-sending the identical id is
+            a no-op.
         variables:
           type: object
           additionalProperties: true

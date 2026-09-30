@@ -566,6 +566,7 @@ impl TestEngine {
             variables,
             adhoc_result: None,
             task_listener_result: None,
+            business_id: None,
         })
         .map_err(|e| js_err(&format!("complete error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -611,6 +612,7 @@ impl TestEngine {
             variables,
             adhoc_result: Some(adhoc_result),
             task_listener_result: None,
+            business_id: None,
         })
         .map_err(|e| js_err(&format!("complete agent job error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -660,6 +662,7 @@ impl TestEngine {
             message_name: message_name.to_string(),
             correlation_key: correlation_key.to_string(),
             variables,
+            business_id: None,
         })
         .map_err(|e| js_err(&format!("correlate error: {e}")))?;
         to_json(&self.snapshot_value(None))

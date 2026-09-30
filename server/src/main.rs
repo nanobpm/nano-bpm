@@ -15,6 +15,8 @@ mod console_api;
 mod consumers;
 mod falcon;
 mod query;
+#[cfg(test)]
+mod request_field_guard;
 mod response_contract;
 mod stub_impls;
 
@@ -316,6 +318,17 @@ struct ClusterVariableEntries {
     next_id: u64,
 }
 
+/// A cluster variable's Camunda 8.10 metadata bag: string/number values keyed by
+/// name. Opaque to the engine (never overlaid into FEEL); stored and projected
+/// verbatim for the REST surface.
+type ClusterVariableMetadata =
+    std::collections::HashMap<String, models::ClusterVariableResultBaseMetadataValue>;
+
+/// Camunda's default cap on a metadata bag's serialized (UTF-8 JSON) size: 100
+/// entries of a maximum-length name (256) plus a maximum-length value (8192), per
+/// the spec's `CreateClusterVariableRequest.metadata` description.
+const CLUSTER_VARIABLE_MAX_METADATA_BYTES: usize = 100 * (256 + 8192);
+
 /// One stored cluster variable. `value` is the engine [`Value`] (source of truth
 /// for both the FEEL overlay and the REST projection); `id` gives search a stable
 /// pagination cursor.
@@ -325,6 +338,7 @@ struct StoredClusterVariable {
     name: String,
     tenant_id: Option<String>,
     value: Value,
+    metadata: ClusterVariableMetadata,
 }
 
 impl ClusterVariableStore {
@@ -356,7 +370,13 @@ impl ClusterVariableStore {
 
     /// Creates a new variable. Returns `false` (creating nothing) when one
     /// already exists for `(tenant, name)` — the caller maps that to 409.
-    fn create(&self, tenant: Option<&str>, name: &str, value: Value) -> bool {
+    fn create(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+        value: Value,
+        metadata: ClusterVariableMetadata,
+    ) -> bool {
         let key = (tenant.map(str::to_string), name.to_string());
         {
             let mut e = self.write();
@@ -372,6 +392,7 @@ impl ClusterVariableStore {
                     name: name.to_string(),
                     tenant_id: tenant.map(str::to_string),
                     value,
+                    metadata,
                 },
             );
         }
@@ -379,15 +400,25 @@ impl ClusterVariableStore {
         true
     }
 
-    /// Updates an existing variable's value in place, preserving its id. Returns
-    /// `false` when none exists for `(tenant, name)` — the caller maps that to
-    /// 404.
-    fn update(&self, tenant: Option<&str>, name: &str, value: Value) -> bool {
+    /// Updates an existing variable's value and metadata in place, preserving
+    /// its id. The metadata bag is REPLACED, not merged (Camunda: an update that
+    /// omits it clears it). Returns `false` when none exists for `(tenant, name)`
+    /// — the caller maps that to 404.
+    fn update(
+        &self,
+        tenant: Option<&str>,
+        name: &str,
+        value: Value,
+        metadata: ClusterVariableMetadata,
+    ) -> bool {
         let key = (tenant.map(str::to_string), name.to_string());
         {
             let mut e = self.write();
             match e.by_key.get_mut(&key) {
-                Some(entry) => entry.value = value,
+                Some(entry) => {
+                    entry.value = value;
+                    entry.metadata = metadata;
+                }
                 None => return false,
             }
         }
@@ -462,8 +493,8 @@ fn cluster_variable_result(v: &StoredClusterVariable) -> models::ClusterVariable
         name: v.name.clone(),
         scope,
         tenant_id,
-        metadata: std::collections::HashMap::new(),
-        kind: models::ClusterVariableKindEnum::Json,
+        metadata: v.metadata.clone(),
+        kind: cluster_variable_kind(v),
         value: cluster_variable_value_string(&v.value),
     }
 }
@@ -480,15 +511,44 @@ fn cluster_variable_search_result(
         name: v.name.clone(),
         scope,
         tenant_id,
-        metadata: std::collections::HashMap::new(),
-        kind: models::ClusterVariableKindEnum::Json,
+        metadata: v.metadata.clone(),
+        kind: cluster_variable_kind(v),
         value,
         is_truncated,
     }
 }
 
+/// A stored variable's kind: the single source for the results' `kind` and the
+/// search `kind` filter. Always `JSON` — [`reject_unsupported_cluster_variable_kind`]
+/// refuses anything else at create time.
+fn cluster_variable_kind(_v: &StoredClusterVariable) -> models::ClusterVariableKindEnum {
+    models::ClusterVariableKindEnum::Json
+}
+
+/// Validates a create/update metadata bag against the serialized-size cap
+/// ([`CLUSTER_VARIABLE_MAX_METADATA_BYTES`]); the 100-entry cap is enforced by
+/// the generated `maxProperties` validator before the handler runs. An omitted
+/// bag is empty.
+fn cluster_variable_metadata(
+    metadata: &Option<ClusterVariableMetadata>,
+) -> Result<ClusterVariableMetadata, models::ProblemDetail> {
+    let metadata = metadata.clone().unwrap_or_default();
+    let size = serde_json::to_vec(&metadata).map_or(usize::MAX, |b| b.len());
+    if size > CLUSTER_VARIABLE_MAX_METADATA_BYTES {
+        return Err(problem(
+            "INVALID_ARGUMENT",
+            400,
+            format!(
+                "The provided metadata exceeds the maximum serialized size of \
+                 {CLUSTER_VARIABLE_MAX_METADATA_BYTES} bytes"
+            ),
+        ));
+    }
+    Ok(metadata)
+}
+
 /// Nano stores cluster variables as plain JSON values only (Camunda 8.10
-/// `kind: JSON`; results always report that kind with empty `metadata`). It has
+/// `kind: JSON`). It has
 /// no secret stores, so a `SECRET_REFERENCE` variable is rejected rather than
 /// silently stored as JSON — which would hand the reference string to FEEL as a
 /// literal value.
@@ -516,8 +576,15 @@ impl ServerImpl {
         if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
             return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
         }
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let value = json_to_value(&body.value.0);
-        if self.cluster_variables.create(None, &body.name, value) {
+        if self
+            .cluster_variables
+            .create(None, &body.name, value, metadata)
+        {
             let stored = self
                 .cluster_variables
                 .get(None, &body.name)
@@ -551,11 +618,15 @@ impl ServerImpl {
         if let Some(p) = reject_unsupported_cluster_variable_kind(body.kind.as_ref()) {
             return Ok(Resp::Status400_TheProvidedDataIsNotValid(p));
         }
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
         if self
             .cluster_variables
-            .create(Some(tenant), &body.name, value)
+            .create(Some(tenant), &body.name, value, metadata)
         {
             let stored = self
                 .cluster_variables
@@ -588,10 +659,14 @@ impl ServerImpl {
         body: &models::UpdateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::UpdateGlobalClusterVariableResponse, ()> {
         use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Resp;
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let value = json_to_value(&body.value.0);
         if self
             .cluster_variables
-            .update(None, &path_params.name, value)
+            .update(None, &path_params.name, value, metadata)
         {
             let stored = self
                 .cluster_variables
@@ -618,11 +693,15 @@ impl ServerImpl {
         body: &models::UpdateClusterVariableRequest,
     ) -> Result<apis::cluster_variable::UpdateTenantClusterVariableResponse, ()> {
         use apis::cluster_variable::UpdateTenantClusterVariableResponse as Resp;
+        let metadata = match cluster_variable_metadata(&body.metadata) {
+            Ok(m) => m,
+            Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
+        };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
         if self
             .cluster_variables
-            .update(Some(tenant), &path_params.name, value)
+            .update(Some(tenant), &path_params.name, value, metadata)
         {
             let stored = self
                 .cluster_variables
@@ -759,6 +838,11 @@ impl ServerImpl {
                         && query::match_cluster_variable_scope(&f.scope, &scope_enum.to_string())
                         && f.is_truncated
                             .is_none_or(|want| want == CLUSTER_VARIABLE_STORED_TRUNCATED)
+                        && query::match_cluster_variable_kind(
+                            &f.kind,
+                            &cluster_variable_kind(v).to_string(),
+                        )
+                        && query::match_cluster_variable_metadata(&f.metadata, &v.metadata)
                 }
             })
             .collect();
@@ -816,9 +900,19 @@ mod cluster_variable_tests {
     #[test]
     fn create_rejects_a_duplicate_scope_and_name() {
         let s = store();
-        assert!(s.create(None, "region", val(json!("EMEA"))));
+        assert!(s.create(
+            None,
+            "region",
+            val(json!("EMEA")),
+            ClusterVariableMetadata::new()
+        ));
         // Same (scope, name) again -> false, which the handler maps to 409.
-        assert!(!s.create(None, "region", val(json!("APAC"))));
+        assert!(!s.create(
+            None,
+            "region",
+            val(json!("APAC")),
+            ClusterVariableMetadata::new()
+        ));
         // The rejected create left the stored value untouched.
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -829,8 +923,18 @@ mod cluster_variable_tests {
     #[test]
     fn global_and_tenant_scopes_are_isolated() {
         let s = store();
-        assert!(s.create(None, "region", val(json!("global"))));
-        assert!(s.create(Some("acme"), "region", val(json!("acme"))));
+        assert!(s.create(
+            None,
+            "region",
+            val(json!("global")),
+            ClusterVariableMetadata::new()
+        ));
+        assert!(s.create(
+            Some("acme"),
+            "region",
+            val(json!("acme")),
+            ClusterVariableMetadata::new()
+        ));
         assert_eq!(s.all().len(), 2);
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -848,9 +952,9 @@ mod cluster_variable_tests {
     fn update_requires_an_existing_entry() {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
-        assert!(!s.update(None, "ghost", val(json!(1))));
-        assert!(s.create(None, "ghost", val(json!(1))));
-        assert!(s.update(None, "ghost", val(json!(2))));
+        assert!(!s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
+        assert!(s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
+        assert!(s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new()));
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
             "2"
@@ -861,7 +965,12 @@ mod cluster_variable_tests {
     fn delete_reports_absence() {
         let s = store();
         assert!(!s.delete(None, "nope"));
-        assert!(s.create(None, "nope", val(json!(true))));
+        assert!(s.create(
+            None,
+            "nope",
+            val(json!(true)),
+            ClusterVariableMetadata::new()
+        ));
         assert!(s.delete(None, "nope"));
         assert!(s.get(None, "nope").is_none());
     }
@@ -869,7 +978,7 @@ mod cluster_variable_tests {
     #[test]
     fn empty_object_value_round_trips() {
         let s = store();
-        assert!(s.create(None, "cfg", val(json!({}))));
+        assert!(s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new()));
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
             "{}"
@@ -880,8 +989,18 @@ mod cluster_variable_tests {
     fn mutations_sync_the_shared_runtime_snapshot() {
         let runtime = ClusterVariables::default();
         let s = ClusterVariableStore::new(runtime.clone());
-        s.create(None, "region", val(json!("EMEA")));
-        s.create(Some(DEFAULT_TENANT), "tier", val(json!(2)));
+        s.create(
+            None,
+            "region",
+            val(json!("EMEA")),
+            ClusterVariableMetadata::new(),
+        );
+        s.create(
+            Some(DEFAULT_TENANT),
+            "tier",
+            val(json!(2)),
+            ClusterVariableMetadata::new(),
+        );
         {
             let snap = runtime.read().unwrap();
             assert_eq!(snap.global.get("region"), Some(&val(json!("EMEA"))));
@@ -897,8 +1016,13 @@ mod cluster_variable_tests {
     #[test]
     fn result_projection_reports_scope_and_tenant() {
         let s = store();
-        s.create(None, "g", val(json!("x")));
-        s.create(Some("acme"), "t", val(json!("y")));
+        s.create(None, "g", val(json!("x")), ClusterVariableMetadata::new());
+        s.create(
+            Some("acme"),
+            "t",
+            val(json!("y")),
+            ClusterVariableMetadata::new(),
+        );
         let g = cluster_variable_result(&s.get(None, "g").unwrap());
         assert_eq!(g.scope, models::ClusterVariableScopeEnum::Global);
         assert_eq!(g.tenant_id, types::Nullable::Null);
@@ -912,7 +1036,12 @@ mod cluster_variable_tests {
     fn search_result_truncates_long_values() {
         let s = store();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        s.create(None, "big", val(json!(long)));
+        s.create(
+            None,
+            "big",
+            val(json!(long)),
+            ClusterVariableMetadata::new(),
+        );
         let stored = s.get(None, "big").unwrap();
         assert!(cluster_variable_search_result(&stored, true).is_truncated);
         assert!(!cluster_variable_search_result(&stored, false).is_truncated);
@@ -955,18 +1084,241 @@ mod cluster_variable_tests {
         result.items.iter().map(|i| i.name.clone()).collect()
     }
 
+    fn meta(j: serde_json::Value) -> ClusterVariableMetadata {
+        serde_json::from_value(j).expect("valid metadata bag")
+    }
+
+    fn create_req(
+        name: &str,
+        metadata: Option<serde_json::Value>,
+    ) -> models::CreateClusterVariableRequest {
+        models::CreateClusterVariableRequest {
+            name: name.to_string(),
+            value: types::Object(json!("v")),
+            metadata: metadata.map(meta),
+            kind: None,
+        }
+    }
+
+    fn update_req(metadata: Option<serde_json::Value>) -> models::UpdateClusterVariableRequest {
+        models::UpdateClusterVariableRequest {
+            value: types::Object(json!("v2")),
+            metadata: metadata.map(meta),
+        }
+    }
+
+    /// Camunda 8.10 metadata bag: stored on create and projected on every
+    /// result; an update REPLACES it (an omitted bag clears it — upstream
+    /// `UpdateClusterVariableTest.shouldOnlyPreserveKindFromStoredStateOnUpdate`).
+    #[tokio::test]
+    async fn metadata_round_trips_and_update_replaces_it() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::GetGlobalClusterVariableResponse as Get;
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Update;
+        let server = ServerImpl::default();
+        let Create::Status200_ClusterVariableCreated(created) = server
+            .create_global_cluster_variable_impl(&create_req(
+                "creds",
+                Some(json!({"owner": "team-a", "ttl": 30})),
+            ))
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(
+            created.metadata,
+            meta(json!({"owner": "team-a", "ttl": 30}))
+        );
+        let path = |n: &str| models::GetGlobalClusterVariablePathParams {
+            name: n.to_string(),
+        };
+        let Get::Status200_ClusterVariableFound(got) = server
+            .get_global_cluster_variable_impl(&path("creds"))
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(got.metadata, created.metadata);
+
+        let upd = models::UpdateGlobalClusterVariablePathParams {
+            name: "creds".to_string(),
+        };
+        let Update::Status200_ClusterVariableUpdatedSuccessfully(r) = server
+            .update_global_cluster_variable_impl(
+                &upd,
+                &update_req(Some(json!({"owner": "team-b"}))),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(
+            r.metadata,
+            meta(json!({"owner": "team-b"})),
+            "update replaces the bag"
+        );
+        let Update::Status200_ClusterVariableUpdatedSuccessfully(r) = server
+            .update_global_cluster_variable_impl(&upd, &update_req(None))
+            .await
+            .unwrap()
+        else {
+            panic!("expected 200");
+        };
+        assert!(r.metadata.is_empty(), "an omitted bag clears it");
+    }
+
+    /// The serialized-size cap (Camunda's default: 100 entries of a max-length
+    /// name plus a max-length value) is enforced on create and update; the
+    /// 100-entry cap is the generated `maxProperties` validator's.
+    #[tokio::test]
+    async fn oversized_metadata_is_rejected() {
+        use apis::cluster_variable::CreateGlobalClusterVariableResponse as Create;
+        use apis::cluster_variable::UpdateGlobalClusterVariableResponse as Update;
+        let server = ServerImpl::default();
+        let big = json!({"blob": "x".repeat(CLUSTER_VARIABLE_MAX_METADATA_BYTES)});
+        assert!(matches!(
+            server
+                .create_global_cluster_variable_impl(&create_req("big", Some(big.clone())))
+                .await
+                .unwrap(),
+            Create::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert!(
+            server.cluster_variables.get(None, "big").is_none(),
+            "nothing stored"
+        );
+        assert!(matches!(
+            server
+                .create_global_cluster_variable_impl(&create_req("small", None))
+                .await
+                .unwrap(),
+            Create::Status200_ClusterVariableCreated(_)
+        ));
+        let upd = models::UpdateGlobalClusterVariablePathParams {
+            name: "small".to_string(),
+        };
+        assert!(matches!(
+            server
+                .update_global_cluster_variable_impl(&upd, &update_req(Some(big)))
+                .await
+                .unwrap(),
+            Update::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert_eq!(
+            cluster_variable_value_string(
+                &server.cluster_variables.get(None, "small").unwrap().value
+            ),
+            "\"v\"",
+            "a rejected update leaves the variable untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_filters_by_kind_and_metadata() {
+        let server = ServerImpl::default();
+        server.cluster_variables.create(
+            None,
+            "a",
+            val(json!(1)),
+            meta(json!({"owner": "team-a", "ttl": 30})),
+        );
+        server.cluster_variables.create(
+            None,
+            "b",
+            val(json!(2)),
+            meta(json!({"owner": "team-b", "ttl": "30"})),
+        );
+        server
+            .cluster_variables
+            .create(None, "c", val(json!(3)), ClusterVariableMetadata::new());
+
+        let kind =
+            |k: models::ClusterVariableKindEnum| models::ClusterVariableSearchQueryFilterRequest {
+                kind: Some(models::ClusterVariableKindFilterProperty::ClusterVariableKindEnum(k)),
+                ..models::ClusterVariableSearchQueryFilterRequest::new()
+            };
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::Json)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.page.total_items, 3, "every Nano variable is JSON");
+        let r = run_search(
+            &server,
+            None,
+            Some(kind(models::ClusterVariableKindEnum::SecretReference)),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(r.page.total_items, 0);
+
+        let by_meta = |key: &str, f: serde_json::Value| {
+            let server = &server;
+            let key = key.to_string();
+            async move {
+                let filter = models::ClusterVariableSearchQueryFilterRequest {
+                    metadata: Some(std::collections::HashMap::from([(
+                        key,
+                        serde_json::from_value::<models::AdvancedMetadataValueFilter>(f)
+                            .expect("valid metadata filter"),
+                    )])),
+                    ..models::ClusterVariableSearchQueryFilterRequest::new()
+                };
+                let mut n = names(&run_search(server, None, Some(filter), None, None).await);
+                n.sort();
+                n
+            }
+        };
+        assert_eq!(by_meta("owner", json!({"$eq": "team-a"})).await, vec!["a"]);
+        assert_eq!(by_meta("owner", json!({"$neq": "team-a"})).await, vec!["b"]);
+        assert_eq!(
+            by_meta("owner", json!({"$like": "team-*"})).await,
+            vec!["a", "b"]
+        );
+        assert_eq!(by_meta("owner", json!({"$exists": false})).await, vec!["c"]);
+        assert_eq!(
+            by_meta("owner", json!({"$in": ["team-b", "x"]})).await,
+            vec!["b"]
+        );
+        // Type-strict: the number 30 is not the string "30", and numeric
+        // ranges only match numbers.
+        assert_eq!(by_meta("ttl", json!({"$eq": 30})).await, vec!["a"]);
+        assert_eq!(by_meta("ttl", json!({"$eq": "30"})).await, vec!["b"]);
+        assert_eq!(
+            by_meta("ttl", json!({"$gt": 29, "$lte": 30})).await,
+            vec!["a"]
+        );
+        assert!(by_meta("ttl", json!({"$lt": 30})).await.is_empty());
+    }
+
     #[tokio::test]
     async fn search_filters_by_scope_and_tenant() {
         let server = ServerImpl::default();
-        server
-            .cluster_variables
-            .create(None, "region", val(json!("global")));
-        server
-            .cluster_variables
-            .create(Some("acme"), "region", val(json!("acme")));
-        server
-            .cluster_variables
-            .create(Some("beta"), "tier", val(json!(2)));
+        server.cluster_variables.create(
+            None,
+            "region",
+            val(json!("global")),
+            ClusterVariableMetadata::new(),
+        );
+        server.cluster_variables.create(
+            Some("acme"),
+            "region",
+            val(json!("acme")),
+            ClusterVariableMetadata::new(),
+        );
+        server.cluster_variables.create(
+            Some("beta"),
+            "tier",
+            val(json!(2)),
+            ClusterVariableMetadata::new(),
+        );
 
         // scope = GLOBAL matches only the global-scoped variable.
         let global_only = models::ClusterVariableSearchQueryFilterRequest {
@@ -1015,12 +1367,18 @@ mod cluster_variable_tests {
     async fn search_is_truncated_filter_is_independent_of_truncate_values() {
         let server = ServerImpl::default();
         let long = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 50);
-        server
-            .cluster_variables
-            .create(None, "big", val(json!(long)));
-        server
-            .cluster_variables
-            .create(None, "small", val(json!("x")));
+        server.cluster_variables.create(
+            None,
+            "big",
+            val(json!(long)),
+            ClusterVariableMetadata::new(),
+        );
+        server.cluster_variables.create(
+            None,
+            "small",
+            val(json!("x")),
+            ClusterVariableMetadata::new(),
+        );
 
         // The `isTruncated` filter is a *storage* characteristic (spec), so it
         // must not depend on the response-only `truncateValues`. This in-memory
@@ -1068,7 +1426,9 @@ mod cluster_variable_tests {
     async fn search_sorts_and_paginates_with_a_stable_cursor() {
         let server = ServerImpl::default();
         for n in ["charlie", "alpha", "bravo"] {
-            server.cluster_variables.create(None, n, val(json!(n)));
+            server
+                .cluster_variables
+                .create(None, n, val(json!(n)), ClusterVariableMetadata::new());
         }
 
         let sort_by_name_asc = vec![models::ClusterVariableSearchQuerySortRequest {
@@ -6018,6 +6378,16 @@ impl ServerImpl {
             )));
         }
 
+        // Camunda 8.10: an optional business id assigned to the job's root
+        // instance as part of the completion (length validated by the model).
+        let business_id = body
+            .as_ref()
+            .and_then(|b| b.business_id.clone())
+            .and_then(|v| match v {
+                types::Nullable::Present(id) => Some(id),
+                types::Nullable::Null => None,
+            });
+
         // Cluster: if a peer owns the job's partition, forward over the command
         // stream and map its answer back (single-node always owns every key).
         if let Some(node) = self.route_by_leader(job_key) {
@@ -6029,21 +6399,28 @@ impl ServerImpl {
                     types::Nullable::Null => None,
                 });
             return Ok(self
-                .forward_complete_job(node, job_key, lease_token, wire, adhoc_result, task_result)
+                .forward_complete_job(
+                    node,
+                    job_key,
+                    JobCompletion {
+                        lease_token,
+                        variables: wire,
+                        adhoc_result,
+                        task_result,
+                        business_id,
+                    },
+                )
                 .await);
         }
 
-        let command = match (task_result, adhoc_result) {
-            // A user-task-listener result and an ad-hoc result are mutually
-            // exclusive (a job is one kind or the other). Task-listener jobs
-            // reject variables engine-side, so none are threaded here.
-            (Some(task_listener_result), _) => {
-                Command::complete_job_with_task_result(job_key, task_listener_result)
-            }
-            (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
-            (None, None) => Command::complete_job_with(job_key, variables),
-        };
-        let command = job_command_with_lease(command, lease_token);
+        let command = completion_command(
+            job_key,
+            variables,
+            adhoc_result,
+            task_result,
+            lease_token,
+            business_id,
+        );
         if !self.raft.is_empty() {
             let metadata = self.job_worker_metadata(job_key).await;
             return Ok(match self.propose_job_for_stream(job_key, command).await {
@@ -6172,13 +6549,21 @@ impl ServerImpl {
                     ),
                 )))
             }
-            Err(e) => Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Internal error",
-                    500,
-                    e.to_string(),
-                )),
-            ),
+            Err(e) => {
+                Ok(match business_id_rejection_status(&e) {
+                    Some(400) => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid business id",
+                        400,
+                        e.to_string(),
+                    )),
+                    Some(_) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(
+                        problem("Business id assignment rejected", 409, e.to_string()),
+                    ),
+                    None => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Internal error", 500, e.to_string()),
+                    ),
+                })
+            }
         }
     }
 
@@ -7843,6 +8228,7 @@ impl ServerImpl {
         name: String,
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
+        business_id: Option<String>,
     ) -> Vec<Event> {
         let num_partitions = self.engine.topology().num_partitions;
         // The (deduplicated) partitions that can own a matching subscription: the
@@ -7864,11 +8250,17 @@ impl ServerImpl {
             let name = name.clone();
             let correlation_key = correlation_key.clone();
             let variables = variables.clone();
+            let business_id = business_id.clone();
             let (events, commit) = handle
                 .with(move |engine| {
                     engine
                         .apply_command_at(
-                            Command::correlate_message_with(name, correlation_key, variables),
+                            Command::CorrelateMessage {
+                                message_name: name,
+                                correlation_key,
+                                variables,
+                                business_id,
+                            },
                             now_millis(),
                         )
                         .expect("CorrelateMessage never fails")
@@ -7898,9 +8290,10 @@ impl ServerImpl {
         name: String,
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
+        business_id: Option<String>,
     ) -> (u64, Option<u64>) {
         let events = self
-            .correlate_message_everywhere(name, correlation_key, variables)
+            .correlate_message_everywhere(name, correlation_key, variables, business_id)
             .await;
         let message_key = message_key_of(&events);
         let instance = events.iter().find_map(|e| match e {
@@ -7929,6 +8322,7 @@ impl ServerImpl {
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
+        business_id: Option<String>,
     ) -> (u64, Option<u64>) {
         let engine_vars: std::collections::HashMap<String, Value> = variables
             .as_ref()
@@ -7939,7 +8333,12 @@ impl ServerImpl {
             })
             .unwrap_or_default();
         let (message_key, mut instance) = self
-            .correlate_message_local(name.clone(), correlation_key.clone(), engine_vars)
+            .correlate_message_local(
+                name.clone(),
+                correlation_key.clone(),
+                engine_vars,
+                business_id.clone(),
+            )
             .await;
 
         if self.peers.has_peers() {
@@ -7962,7 +8361,12 @@ impl ServerImpl {
                 }
                 match self.peers.link(node).await {
                     Ok(link) => match link
-                        .publish_message(name.clone(), correlation_key.clone(), variables.clone())
+                        .publish_message(
+                            name.clone(),
+                            correlation_key.clone(),
+                            variables.clone(),
+                            business_id.clone(),
+                        )
                         .await
                     {
                         Ok(res) if res.status == 200 => {
@@ -8882,11 +9286,15 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
-        lease_token: Option<String>,
-        variables: Option<serde_json::Map<String, serde_json::Value>>,
-        adhoc_result: Option<AdHocJobResult>,
-        task_result: Option<TaskListenerJobResult>,
+        completion: JobCompletion,
     ) -> apis::job::CompleteJobResponse {
+        let JobCompletion {
+            lease_token,
+            variables,
+            adhoc_result,
+            task_result,
+            business_id,
+        } = completion;
         use apis::job::CompleteJobResponse as Resp;
         let res =
             match self.peer_link(node).await {
@@ -8897,6 +9305,7 @@ impl ServerImpl {
                         variables,
                         adhoc_result,
                         task_result,
+                        business_id,
                     )
                     .await
                 }
@@ -8920,6 +9329,13 @@ impl ServerImpl {
                     peer_detail(&r),
                 ))
             }
+            // The owner rejected the completion as invalid (bad ad-hoc result,
+            // empty business id, ...): relay the 400 instead of masking it as 500.
+            Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid data",
+                400,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -9044,11 +9460,15 @@ impl ServerImpl {
         &self,
         node: u32,
         job_key: u64,
-        lease_token: Option<String>,
-        variables: Option<serde_json::Map<String, serde_json::Value>>,
-        adhoc_result: Option<AdHocJobResult>,
-        task_result: Option<TaskListenerJobResult>,
+        completion: JobCompletion,
     ) -> (u16, Option<serde_json::Value>) {
+        let JobCompletion {
+            lease_token,
+            variables,
+            adhoc_result,
+            task_result,
+            business_id,
+        } = completion;
         match self.peer_link(node).await {
             Ok(link) => match link
                 .complete_job(
@@ -9057,6 +9477,7 @@ impl ServerImpl {
                     variables,
                     adhoc_result,
                     task_result,
+                    business_id,
                 )
                 .await
             {
@@ -9755,7 +10176,12 @@ impl ServerImpl {
 
         let body_name = body.name.clone();
         let (message_key, _instance) = self
-            .correlate_message_cluster(body_name, correlation_key, variables)
+            .correlate_message_cluster(
+                body_name,
+                correlation_key,
+                variables,
+                body.business_id.clone(),
+            )
             .await;
 
         // Correlation may have advanced a token onto a service task, creating a
@@ -9783,7 +10209,12 @@ impl ServerImpl {
 
         let body_name = body.name.clone();
         let (message_key, correlated_instance) = self
-            .correlate_message_cluster(body_name, correlation_key, variables)
+            .correlate_message_cluster(
+                body_name,
+                correlation_key,
+                variables,
+                body.business_id.clone(),
+            )
             .await;
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
@@ -10324,9 +10755,26 @@ impl ServerImpl {
             })
             .collect();
 
-        // No sort field on the wait-state query; order by element instance key
-        // for stable cursor pagination.
-        matched.sort_by_key(|ws| ws.element_instance_key);
+        // Sort by the requested fields (the shared search sort); the element
+        // instance key tiebreaks, so the default (no sort) order is unchanged
+        // and cursor pagination stays stable.
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::ElementInstanceWaitStateQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |ws, field| match field {
+                "processInstanceKey" => query::SortVal::Num(ws.process_instance_key as i64),
+                "rootProcessInstanceKey" => query::SortVal::Num(
+                    roots.root_process_instance_key(ws.process_instance_key) as i64,
+                ),
+                "elementId" => query::SortVal::Str(ws.element_id.clone()),
+                _ => query::SortVal::Num(ws.element_instance_key as i64),
+            },
+            |ws| ws.element_instance_key,
+        );
         let sorted: Vec<(u64, WaitState)> = matched
             .into_iter()
             .map(|ws| (ws.element_instance_key, ws))
@@ -10520,6 +10968,17 @@ impl ServerImpl {
                             &f.decision_requirements_key,
                             &row.decision_requirements_key.to_string(),
                         )
+                        // The owning instance's business id; looked up only when
+                        // filtered on (a standalone evaluation has no instance,
+                        // so it matches as an absent value).
+                        && (f.business_id.is_none()
+                            || query::match_string_opt(
+                                &f.business_id,
+                                self.store
+                                    .process_instance(row.instance_key)
+                                    .and_then(|pi| pi.business_id)
+                                    .as_deref(),
+                            ))
                 }
             })
             .collect();
@@ -11241,6 +11700,9 @@ impl ServerImpl {
             message_name: String,
             correlation_key: String,
             process_definition_version: Option<i32>,
+            /// The owning instance's business id (joined, like the definition
+            /// attributes): the single source for both filter and result.
+            business_id: Option<String>,
         }
 
         let entries: Vec<MsgSubEntry> = subs
@@ -11265,6 +11727,7 @@ impl ServerImpl {
                     message_name: sub.message_name,
                     correlation_key: sub.correlation_key,
                     process_definition_version: Some(inst.version),
+                    business_id: inst.business_id.clone(),
                 })
             })
             .collect();
@@ -11317,6 +11780,7 @@ impl ServerImpl {
                         && query::match_string_opt(&f.process_definition_name, None)
                         && query::match_string_opt(&f.tool_name, None)
                         && query::match_string_opt(&f.inbound_connector_type, None)
+                        && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                 }
             })
             .collect();
@@ -11363,7 +11827,7 @@ impl ServerImpl {
                     e.last_updated_ms as i64,
                 )
                 .unwrap_or_else(epoch);
-                let business_id = self.business_id_of(e.process_instance_key);
+                let business_id = nullable_business_id(e.business_id);
                 // Named fields, not the positional `::new`: an upstream field
                 // insertion must fail to compile, not silently shift arguments.
                 models::MessageSubscriptionResult {
@@ -11443,6 +11907,8 @@ impl ServerImpl {
             correlation_key: String,
             correlation_time_ms: u64,
             partition_id: i32,
+            /// The owning instance's business id (joined): filter + result source.
+            business_id: Option<String>,
         }
 
         let entries: Vec<CorrEntry> = rows
@@ -11468,6 +11934,7 @@ impl ServerImpl {
                     correlation_key: row.correlation_key,
                     correlation_time_ms: row.correlation_time_ms,
                     partition_id: row.partition_id,
+                    business_id: inst.business_id.clone(),
                 })
             })
             .collect();
@@ -11481,6 +11948,7 @@ impl ServerImpl {
                 Some(f) => {
                     query::match_string(&f.correlation_key, &e.correlation_key)
                         && query::match_integer(&f.partition_id, Some(i64::from(e.partition_id)))
+                        && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                         && query::match_date_time_ms(
                             &f.correlation_time,
                             Some(e.correlation_time_ms as i64),
@@ -11560,7 +12028,7 @@ impl ServerImpl {
                 )
                 .unwrap_or_else(epoch);
                 models::CorrelatedMessageSubscriptionResult {
-                    business_id: self.business_id_of(e.process_instance_key),
+                    business_id: nullable_business_id(e.business_id.clone()),
                     correlation_key: types::Nullable::Present(e.correlation_key),
                     correlation_time,
                     element_id: e.element_id,
@@ -11597,10 +12065,11 @@ impl ServerImpl {
     /// results that belong to one — message subscriptions, correlations, jobs,
     /// user tasks, …. `null` when the instance has none or is unknown.
     fn business_id_of(&self, process_instance_key: u64) -> types::Nullable<String> {
-        self.store
-            .process_instance(process_instance_key)
-            .and_then(|pi| pi.business_id)
-            .map_or(types::Nullable::Null, types::Nullable::Present)
+        nullable_business_id(
+            self.store
+                .process_instance(process_instance_key)
+                .and_then(|pi| pi.business_id),
+        )
     }
 
     async fn search_jobs_impl(
@@ -12422,29 +12891,7 @@ impl ServerImpl {
 
         let mut matched: Vec<&readstore::UserTaskRow> = tasks
             .iter()
-            .filter(|task| match filter {
-                None => true,
-                Some(f) => {
-                    let assignee = task.assignee.clone().unwrap_or_default();
-                    f.user_task_key
-                        .as_ref()
-                        .is_none_or(|k| k.0 == task.key.to_string())
-                        && query::match_process_instance_key(
-                            &f.process_instance_key,
-                            &task.instance_key.to_string(),
-                        )
-                        && query::match_process_definition_key(
-                            &f.process_definition_key,
-                            &task.process_definition_key,
-                        )
-                        && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
-                        && query::match_string(&f.assignee, &assignee)
-                        && query::match_user_task_state(
-                            &f.state,
-                            &user_task_state_enum(task.state).to_string(),
-                        )
-                }
-            })
+            .filter(|task| filter.is_none_or(|f| match_user_task_filter(task, f)))
             .collect();
 
         let sort = query::sort_keys(
@@ -13287,6 +13734,18 @@ impl ServerImpl {
         use apis::process_definition::SearchProcessDefinitionsResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        if let Some(state) = filter.and_then(|f| f.state.as_deref())
+            && !PROCESS_DEFINITION_STATES.contains(&state)
+        {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "INVALID_ARGUMENT",
+                400,
+                format!(
+                    "unknown process definition state '{state}'; expected one of {}",
+                    PROCESS_DEFINITION_STATES.join(", ")
+                ),
+            )));
+        }
         let definitions = self.store.process_definitions();
 
         let mut matched: Vec<&readstore::ProcessDefinitionRow> = definitions
@@ -13315,6 +13774,9 @@ impl ServerImpl {
                         // filters to the highest version per id (computed by the
                         // read store).
                         && f.is_latest_version.is_none_or(|want| want == d.is_latest)
+                        && f.state
+                            .as_deref()
+                            .is_none_or(|want| want == process_definition_state(d))
                 }
             })
             .collect();
@@ -16960,7 +17422,10 @@ impl ServerImpl {
                 e @ (EngineError::JobNotActivated { .. } | EngineError::JobLeaseMismatch { .. }),
             ) => Err((409, e.to_string())),
             Err(e @ EngineError::JobUpdateInvalid { .. }) => Err((400, e.to_string())),
-            Err(e) => Err((500, e.to_string())),
+            Err(e) => Err((
+                business_id_rejection_status(&e).unwrap_or(500),
+                e.to_string(),
+            )),
         }
     }
 
@@ -17805,8 +18270,15 @@ impl ServerImpl {
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
-        self.complete_job_for_stream_with_lease(job_key, None, variables, adhoc_result, task_result)
-            .await
+        self.complete_job_for_stream_with_lease(
+            job_key,
+            None,
+            variables,
+            adhoc_result,
+            task_result,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn complete_job_for_stream_with_lease(
@@ -17816,6 +18288,7 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
+        business_id: Option<String>,
     ) -> Result<Commit, (u16, String)> {
         // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
         // task-listener result cannot carry variables. Reject here rather than
@@ -17823,14 +18296,14 @@ impl ServerImpl {
         if let Some(err) = reject_task_result_with_variables(&task_result, &variables) {
             return Err(err);
         }
-        let command = match (task_result, adhoc_result) {
-            (Some(task_listener_result), _) => {
-                Command::complete_job_with_task_result(job_key, task_listener_result)
-            }
-            (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
-            (None, None) => Command::complete_job_with(job_key, variables),
-        };
-        let command = job_command_with_lease(command, lease_token);
+        let command = completion_command(
+            job_key,
+            variables,
+            adhoc_result,
+            task_result,
+            lease_token,
+            business_id,
+        );
         if !self.raft.is_empty() {
             return self.propose_job_for_stream(job_key, command).await;
         }
@@ -19761,10 +20234,18 @@ fn process_definition_result(
         tenant_id: "<default>".to_string(),
         process_definition_key: models::ProcessDefinitionKey(deployed.key.to_string()),
         has_start_form: false,
-        // Nano has no process-definition deletion, so no definition is ever
-        // `DRAINING` or `DELETED`.
-        state: "ACTIVE".to_string(),
+        state: process_definition_state(deployed).to_string(),
     }
+}
+
+/// The `ProcessDefinitionStateEnum` values the spec admits on the filter.
+const PROCESS_DEFINITION_STATES: [&str; 3] = ["ACTIVE", "DRAINING", "DELETED"];
+
+/// A definition's lifecycle state: the single source for both the result's
+/// `state` and the search `state` filter. Nano has no process-definition
+/// deletion, so no definition is ever `DRAINING` or `DELETED`.
+fn process_definition_state(_deployed: &readstore::ProcessDefinitionRow) -> &'static str {
+    PROCESS_DEFINITION_STATES[0]
 }
 
 /// The byte length beyond which a variable value is truncated in search results
@@ -19893,6 +20374,90 @@ fn match_element_instance_fields(
         })
 }
 
+/// The user-task filter predicate over one AND-group of fields, shared by the
+/// top-level filter and each `$or` clause so the two cannot drift.
+fn match_user_task_fields(task: &readstore::UserTaskRow, f: &models::UserTaskFilterFields) -> bool {
+    let assignee = task.assignee.clone().unwrap_or_default();
+    f.user_task_key
+        .as_ref()
+        .is_none_or(|k| k.0 == task.key.to_string())
+        && query::match_process_instance_key(
+            &f.process_instance_key,
+            &task.instance_key.to_string(),
+        )
+        && query::match_process_definition_key(
+            &f.process_definition_key,
+            &task.process_definition_key,
+        )
+        && f.element_id.as_ref().is_none_or(|e| e == &task.element_id)
+        && query::match_string(&f.assignee, &assignee)
+        && query::match_user_task_state(&f.state, &user_task_state_enum(task.state).to_string())
+}
+
+/// Copies every field of a top-level `UserTaskFilter` except `$or` into a
+/// `UserTaskFilterFields`, so the base match reuses the `$or`-clause predicate.
+fn user_task_filter_base(f: &models::UserTaskFilter) -> models::UserTaskFilterFields {
+    let models::UserTaskFilter {
+        state,
+        assignee,
+        business_id,
+        priority,
+        element_id,
+        name,
+        candidate_group,
+        candidate_user,
+        tenant_id,
+        process_definition_id,
+        creation_date,
+        completion_date,
+        follow_up_date,
+        due_date,
+        process_instance_variables,
+        local_variables,
+        user_task_key,
+        process_definition_key,
+        process_instance_key,
+        element_instance_key,
+        tags,
+        dollar_or: _,
+    } = f.clone();
+    models::UserTaskFilterFields {
+        state,
+        assignee,
+        business_id,
+        priority,
+        element_id,
+        name,
+        candidate_group,
+        candidate_user,
+        tenant_id,
+        process_definition_id,
+        creation_date,
+        completion_date,
+        follow_up_date,
+        due_date,
+        process_instance_variables,
+        local_variables,
+        user_task_key,
+        process_definition_key,
+        process_instance_key,
+        element_instance_key,
+        tags,
+    }
+}
+
+/// Full user-task filter match: every top-level field AND, when a non-empty
+/// `$or` list is present, at least one clause (each an AND of its fields).
+fn match_user_task_filter(task: &readstore::UserTaskRow, f: &models::UserTaskFilter) -> bool {
+    match_user_task_fields(task, &user_task_filter_base(f))
+        && match &f.dollar_or {
+            Some(clauses) if !clauses.is_empty() => {
+                clauses.iter().any(|c| match_user_task_fields(task, c))
+            }
+            _ => true,
+        }
+}
+
 /// Copies the shared filter fields out of a top-level `ElementInstanceFilter`
 /// into an `ElementInstanceFilterFields` so the top-level base match reuses the
 /// same predicate as each `$or` clause. `startDate`/`endDate` date-time filters
@@ -19934,6 +20499,11 @@ fn match_element_instance_filter(
         }
         _ => true,
     }
+}
+
+/// A read-model business id (`None` when unset) as the REST `Nullable`.
+fn nullable_business_id(id: Option<String>) -> types::Nullable<String> {
+    id.map_or(types::Nullable::Null, types::Nullable::Present)
 }
 
 /// Maps a read-model [`readstore::ElementInstanceState`] to the REST element
@@ -21112,6 +21682,54 @@ fn optional_lease_token(token: &Option<types::Nullable<String>>) -> Option<Strin
 
 fn job_command_with_lease(command: Command, lease_token: Option<String>) -> Command {
     command.with_lease_token(lease_token)
+}
+
+/// The single canonical builder of a `CompleteJob` engine command, shared by
+/// the REST handler and the Falcon stream path so the two cannot drift. A
+/// user-task-listener result and an ad-hoc result are mutually exclusive (a
+/// job is one kind or the other); task-listener jobs reject variables
+/// engine-side, so none are threaded for them.
+/// The payload of a job completion forwarded to the peer that owns the job
+/// (REST and Falcon share it, so the two forwarding paths cannot drift).
+#[derive(Default)]
+pub(crate) struct JobCompletion {
+    pub(crate) lease_token: Option<String>,
+    pub(crate) variables: Option<serde_json::Map<String, serde_json::Value>>,
+    pub(crate) adhoc_result: Option<AdHocJobResult>,
+    pub(crate) task_result: Option<TaskListenerJobResult>,
+    /// Camunda 8.10 `businessId` to assign to the job's root instance.
+    pub(crate) business_id: Option<String>,
+}
+
+fn completion_command(
+    job_key: u64,
+    variables: std::collections::HashMap<String, Value>,
+    adhoc_result: Option<AdHocJobResult>,
+    task_result: Option<TaskListenerJobResult>,
+    lease_token: Option<String>,
+    business_id: Option<String>,
+) -> Command {
+    let command = match (task_result, adhoc_result) {
+        (Some(task_listener_result), _) => {
+            Command::complete_job_with_task_result(job_key, task_listener_result)
+        }
+        (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
+        (None, None) => Command::complete_job_with(job_key, variables),
+    };
+    job_command_with_lease(command, lease_token).with_business_id(business_id)
+}
+
+/// HTTP status for a job-completion business-id rejection (Camunda 8.10
+/// `JobCompletionRequest.businessId`), or `None` for any other error. Shared by
+/// the REST and stream mappings: an empty id is INVALID_ARGUMENT (400); a
+/// child instance or a differing already-assigned id is INVALID_STATE (409).
+fn business_id_rejection_status(e: &EngineError) -> Option<u16> {
+    match e {
+        EngineError::BusinessIdEmpty { .. } => Some(400),
+        EngineError::BusinessIdOnChildInstance { .. }
+        | EngineError::BusinessIdAlreadyAssigned { .. } => Some(409),
+        _ => None,
+    }
 }
 
 /// Count of requests that supplied a job lease token under its deprecated
@@ -25918,8 +26536,15 @@ mod clustered_startup_tests {
 
         // Publishing at node 1 fans out to node 0, whose message-start
         // subscription fires and creates a new instance on partition 0.
+        // The message's businessId rides the fan-out and is stamped on the
+        // message-start instance the owner creates.
         let (_message_key, instance) = node1
-            .correlate_message_cluster("order-placed".into(), String::new(), None)
+            .correlate_message_cluster(
+                "order-placed".into(),
+                String::new(),
+                None,
+                Some("order-7".into()),
+            )
             .await;
         let instance = instance.expect("message-start must create an instance via fan-out");
         assert_eq!(
@@ -25927,6 +26552,15 @@ mod clustered_startup_tests {
             0,
             "the message-start instance lives on the owner's partition 0"
         );
+        let mut stamped = types::Nullable::Null;
+        for _ in 0..200 {
+            stamped = node0.business_id_of(instance);
+            if stamped != types::Nullable::Null {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stamped, types::Nullable::Present("order-7".to_string()));
     }
 
     #[tokio::test]
@@ -26033,7 +26667,7 @@ mod clustered_startup_tests {
         // 1), so the publish fans to node 1, which correlates and routes the
         // continuation back to node 0 to advance the parked token.
         let (_message_key, correlated) = node0
-            .correlate_message_cluster("payment-received".into(), order.clone(), None)
+            .correlate_message_cluster("payment-received".into(), order.clone(), None, None)
             .await;
         assert_eq!(
             correlated,
@@ -26216,6 +26850,492 @@ mod clustered_startup_tests {
         );
     }
 
+    /// Camunda 8.10 `JobCompletionRequest.businessId` over REST: assigned to
+    /// the job's root instance; empty → 400; a differing id → 409 with the job
+    /// left open; the identical id → idempotent 204.
+    #[tokio::test]
+    async fn complete_job_assigns_business_id_and_maps_rejections() {
+        use apis::job::CompleteJobResponse as R;
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("two-steps")
+            .start_event("s")
+            .service_task("t1", "step")
+            .service_task("t2", "step")
+            .end_event("e")
+            .connect("s", "t1")
+            .connect("t1", "t2")
+            .connect("t2", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("two-steps".to_string(), "two.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let (instance, _) = server
+            .create_for_stream(Some("two-steps".into()), None, Default::default())
+            .await
+            .expect("instance created");
+        let complete = |job_key: String, business_id: &str| {
+            let server = server.clone();
+            let body: models::JobCompletionRequest =
+                serde_json::from_value(serde_json::json!({ "businessId": business_id }))
+                    .expect("valid completion body");
+            async move {
+                server
+                    .complete_job_impl(&models::CompleteJobPathParams { job_key }, &Some(body))
+                    .await
+                    .expect("handler returns Ok")
+            }
+        };
+        let activate = || async {
+            server
+                .activate_for_stream("step", "w", 1, 60_000, None)
+                .await
+                .into_iter()
+                .next()
+                .expect("a job activates")
+                .job_key
+                .0
+        };
+
+        let first = activate().await;
+        assert!(matches!(
+            complete(first.clone(), "").await,
+            R::Status400_TheProvidedDataIsNotValid(_)
+        ));
+        assert!(matches!(
+            complete(first, "order-1").await,
+            R::Status204_TheJobWasCompletedSuccessfully
+        ));
+        let mut stamped = types::Nullable::Null;
+        for _ in 0..200 {
+            stamped = server.business_id_of(instance);
+            if stamped != types::Nullable::Null {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stamped, types::Nullable::Present("order-1".to_string()));
+
+        let second = activate().await;
+        assert!(matches!(
+            complete(second.clone(), "order-2").await,
+            R::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(_)
+        ));
+        assert!(
+            matches!(
+                complete(second, "order-1").await,
+                R::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "the rejected completion left the job open; the identical id completes it"
+        );
+    }
+
+    /// Camunda 8.10 `businessId` on publish/correlate (upstream #1291
+    /// re-sync): both REST paths stamp it on the instance a message start
+    /// event creates.
+    #[tokio::test]
+    async fn publish_and_correlate_stamp_business_id_on_message_start_instances() {
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("order-flow")
+            .message_start_event("start", "order-placed")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("order-flow".to_string(), "order.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(r) = server
+            .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: Some("via-correlate".to_string()),
+                name: "order-placed".to_string(),
+                correlation_key: None,
+                variables: None,
+                tenant_id: None,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected the message start to correlate");
+        };
+        let correlated: u64 = r.process_instance_key.0.parse().unwrap();
+
+        let publish: models::MessagePublicationRequest =
+            serde_json::from_value(serde_json::json!({
+            "name": "order-placed", "businessId": "via-publish"}))
+            .expect("valid publication");
+        assert!(matches!(
+            server.publish_message_impl(&publish).await.unwrap(),
+            apis::message::PublishMessageResponse::Status200_TheMessageWasPublished(_)
+        ));
+
+        let mut stamped = Vec::new();
+        for _ in 0..200 {
+            stamped = server
+                .store
+                .process_instances()
+                .into_iter()
+                .map(|pi| (pi.key, pi.business_id))
+                .collect();
+            if stamped.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        stamped.sort();
+        assert_eq!(stamped.len(), 2, "both messages started an instance");
+        assert!(stamped.contains(&(correlated, Some("via-correlate".to_string()))));
+        assert!(
+            stamped
+                .iter()
+                .any(|(_, b)| b.as_deref() == Some("via-publish"))
+        );
+    }
+
+    /// `ProcessDefinitionFilter.state` (upstream #1291 re-sync): Nano never
+    /// drains or deletes a definition, so `ACTIVE` matches every definition,
+    /// `DRAINING`/`DELETED` match none, and an out-of-enum value is a 400.
+    #[tokio::test]
+    async fn process_definition_search_honours_state_filter() {
+        use apis::process_definition::SearchProcessDefinitionsResponse as Resp;
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("p")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("p".to_string(), "p.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        // The read-model projection is asynchronous: wait until the deployed
+        // definition is projected, or the unfiltered baseline below can race
+        // the projection and undercount (seen under full-suite load).
+        let mut projected = false;
+        for _ in 0..300 {
+            if server
+                .store
+                .process_definitions()
+                .iter()
+                .any(|pd| pd.process_id == "p")
+            {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(projected, "the deployed definition is projected");
+        let search = |state: &str| {
+            let server = &server;
+            let state = state.to_string();
+            async move {
+                server
+                    .search_process_definitions_impl(&Some(models::ProcessDefinitionSearchQuery {
+                        page: None,
+                        sort: None,
+                        filter: Some(models::ProcessDefinitionFilter {
+                            state: Some(state),
+                            ..models::ProcessDefinitionFilter::new()
+                        }),
+                    }))
+                    .await
+                    .unwrap()
+            }
+        };
+        let count = |r: Resp| match r {
+            Resp::Status200_TheProcessDefinitionSearchResult(r) => r.items.len(),
+            other => panic!("expected 200, got {other:?}"),
+        };
+        let all = count(server.search_process_definitions_impl(&None).await.unwrap());
+        assert!(all >= 1, "the deployed definition is searchable");
+        assert_eq!(
+            count(search("ACTIVE").await),
+            all,
+            "every definition is ACTIVE"
+        );
+        assert_eq!(count(search("DRAINING").await), 0);
+        assert_eq!(count(search("DELETED").await), 0);
+        assert!(matches!(
+            search("BOGUS").await,
+            Resp::Status400_TheProvidedDataIsNotValid(_)
+        ));
+    }
+
+    /// `businessId` filters on the message-subscription, correlated
+    /// message-subscription and decision-instance searches (upstream #1291
+    /// re-sync). The id is the owning process instance's, so each filter must
+    /// select exactly the rows of the tagged instance.
+    #[tokio::test]
+    async fn business_id_filters_select_rows_of_the_tagged_instance() {
+        use apis::decision_instance::SearchDecisionInstancesResponse as DecResp;
+        use apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse as CorrResp;
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as SubResp;
+        let server = ServerImpl::default();
+
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+          <decision id="farewell" name="Farewell">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i2"><inputExpression id="e2" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o2" name="result" typeRef="string" />
+              <rule id="r2"><inputEntry id="ie2"><text>"en"</text></inputEntry>
+                <outputEntry id="oe2"><text>"bye"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+        // Tagged and untagged instances evaluate *different* decisions: repeat
+        // evaluations of one decision currently collide in the read model
+        // (#1292), which would hide the untagged row this test must exclude.
+        let parter = ProcessBuilder::new("parter")
+            .start_event("s")
+            .business_rule_task("decide", "farewell", Some("farewell".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let greeter = ProcessBuilder::new("greeter")
+            .start_event("s")
+            .business_rule_task("decide", "greeting", Some("greeting".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("greeter".to_string(), "greeter.bpmn".to_string());
+        names.insert("parter".to_string(), "parter.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![greeter, parter, waiter],
+                &names,
+                vec![drg],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let create = |body: serde_json::Value| {
+            let server = &server;
+            async move {
+                let body: models::ProcessInstanceCreationInstruction =
+                    serde_json::from_value(body).expect("valid creation instruction");
+                let apis::process_instance::CreateProcessInstanceResponse::Status200_TheProcessInstanceWasCreated(r) =
+                    server.create_process_instance_impl(&body).await.unwrap()
+                else {
+                    panic!("create failed");
+                };
+                r.process_instance_key.0
+            }
+        };
+        let tagged_waiter = create(serde_json::json!({
+            "processDefinitionId": "waiter", "businessId": "biz-A",
+            "variables": {"orderId": "A1"}}))
+        .await;
+        create(serde_json::json!({
+            "processDefinitionId": "waiter", "variables": {"orderId": "B1"}}))
+        .await;
+        let tagged_greeter = create(serde_json::json!({
+            "processDefinitionId": "greeter", "businessId": "biz-G",
+            "variables": {"lang": "en"}}))
+        .await;
+        create(serde_json::json!({
+            "processDefinitionId": "parter", "variables": {"lang": "en"}}))
+        .await;
+
+        let biz = |v: &str| Some(models::StringFilterProperty::String(v.to_string()));
+        let subs = |b: &str| {
+            let server = &server;
+            let b = b.to_string();
+            async move {
+                let q = models::MessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(models::MessageSubscriptionFilter {
+                        business_id: biz(&b),
+                        ..models::MessageSubscriptionFilter::new()
+                    }),
+                };
+                let SubResp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        let decisions = |b: &str| {
+            let server = &server;
+            let b = b.to_string();
+            async move {
+                let q = models::DecisionInstanceSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(models::DecisionInstanceFilter {
+                        business_id: biz(&b),
+                        ..models::DecisionInstanceFilter::new()
+                    }),
+                };
+                let DecResp::Status200_TheDecisionInstanceSearchResult(r) = server
+                    .search_decision_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        // Wait until both subscriptions and both decision instances project.
+        for _ in 0..200 {
+            let all_subs = match server
+                .search_message_subscriptions_impl(&None)
+                .await
+                .unwrap()
+            {
+                SubResp::Status200_TheMessageSubscriptionSearchResult(r) => r.items.len(),
+                _ => 0,
+            };
+            let all_dec = match server.search_decision_instances_impl(&None).await.unwrap() {
+                DecResp::Status200_TheDecisionInstanceSearchResult(r) => r.items.len(),
+                _ => 0,
+            };
+            if all_subs == 2 && all_dec == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(subs("biz-A").await, vec![tagged_waiter.clone()]);
+        assert!(subs("nope").await.is_empty());
+        assert_eq!(decisions("biz-G").await, vec![tagged_greeter.clone()]);
+        assert!(decisions("nope").await.is_empty());
+
+        // Correlate both waiters; only the tagged one matches the filter.
+        for key in ["A1", "B1"] {
+            let resp = server
+                .correlate_message_impl(&models::MessageCorrelationRequest {
+                    business_id: None,
+                    name: "OrderPlaced".to_string(),
+                    correlation_key: Some(key.to_string()),
+                    variables: None,
+                    tenant_id: None,
+                })
+                .await
+                .expect("correlate returns");
+            assert!(matches!(
+                resp,
+                apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(_)
+            ));
+        }
+        let corr = |b: &str| {
+            let server = &server;
+            let b = b.to_string();
+            async move {
+                let q = models::CorrelatedMessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(models::CorrelatedMessageSubscriptionFilter {
+                        business_id: biz(&b),
+                        ..models::CorrelatedMessageSubscriptionFilter::new()
+                    }),
+                };
+                let CorrResp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) = server
+                    .search_correlated_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| i.process_instance_key.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        for _ in 0..200 {
+            if match server
+                .search_correlated_message_subscriptions_impl(&None)
+                .await
+                .unwrap()
+            {
+                CorrResp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) => {
+                    r.items.len()
+                }
+                _ => 0,
+            } == 2
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(corr("biz-A").await, vec![tagged_waiter]);
+        assert!(corr("nope").await.is_empty());
+    }
+
     #[tokio::test]
     async fn business_rule_task_records_a_decision_instance_in_the_read_model() {
         // Phase 5 parity: a `businessRuleTask` evaluation emits a `DecisionEvaluated`
@@ -26342,6 +27462,111 @@ mod clustered_startup_tests {
         );
     }
 
+    /// `UserTaskFilter.$or` (upstream #1291 re-sync): top-level fields AND any
+    /// one `$or` clause (each clause an AND of its own fields). Previously the
+    /// clause list was silently ignored, so the search returned a superset.
+    #[tokio::test]
+    async fn user_task_search_honours_or_clauses() {
+        use apis::user_task::SearchUserTasksResponse as Search;
+        let server = ServerImpl::default();
+        let def = ProcessBuilder::new("approve")
+            .start_event("s")
+            .user_task("review")
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("approve".to_string(), "approve.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![def],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let mut instances = Vec::new();
+        for _ in 0..3 {
+            let (k, _) = server
+                .create_for_stream(Some("approve".into()), None, Default::default())
+                .await
+                .expect("create instance");
+            instances.push(k);
+        }
+        let search = |filter: Option<models::UserTaskFilter>| {
+            let server = &server;
+            async move {
+                let q = models::UserTaskSearchQuery {
+                    sort: None,
+                    page: None,
+                    filter,
+                };
+                let Search::Status200_TheUserTaskSearchResult(r) =
+                    server.search_user_tasks_impl(&Some(q)).await.unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+            }
+        };
+        for _ in 0..200 {
+            if search(None).await.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let pik = |k: u64| {
+            Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(k.to_string()),
+                ),
+            )
+        };
+        let clause = |k: u64| {
+            let mut c = models::UserTaskFilterFields::new();
+            c.process_instance_key = pik(k);
+            c
+        };
+        let or_filter = |top: Option<u64>, clauses: Vec<models::UserTaskFilterFields>| {
+            let mut f = models::UserTaskFilter::new();
+            f.process_instance_key = top.and_then(pik);
+            f.dollar_or = Some(clauses);
+            Some(f)
+        };
+        let instance_keys = |items: Vec<models::UserTaskResult>| {
+            let mut ks: Vec<u64> = items
+                .iter()
+                .map(|t| t.process_instance_key.0.parse().unwrap())
+                .collect();
+            ks.sort_unstable();
+            ks
+        };
+
+        // Any one clause matches → the union of the two instances.
+        let either = search(or_filter(
+            None,
+            vec![clause(instances[0]), clause(instances[1])],
+        ))
+        .await;
+        assert_eq!(instance_keys(either), vec![instances[0], instances[1]]);
+
+        // Top-level fields AND the $or: only the overlap survives.
+        let overlap = search(or_filter(
+            Some(instances[1]),
+            vec![clause(instances[0]), clause(instances[1])],
+        ))
+        .await;
+        assert_eq!(instance_keys(overlap), vec![instances[1]]);
+
+        // An empty $or list places no constraint.
+        let empty = search(or_filter(None, vec![])).await;
+        assert_eq!(empty.len(), 3);
+    }
+
     #[tokio::test]
     async fn user_task_element_instance_is_queryable_via_search_and_get() {
         // Element-instance parity: the engine's per-element lifecycle events are
@@ -26447,6 +27672,107 @@ mod clustered_startup_tests {
             resp,
             GetResp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(_)
         ));
+    }
+
+    /// `ElementInstanceWaitStateQuery.sort` (upstream #1291 re-sync) orders
+    /// results by the requested field/direction instead of the fixed
+    /// element-instance-key order.
+    #[tokio::test]
+    async fn wait_state_search_honours_sort() {
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+        let charger = ProcessBuilder::new("charger")
+            .start_event("s")
+            .service_task("charge", "pay")
+            .end_event("e")
+            .connect("s", "charge")
+            .connect("charge", "e")
+            .build()
+            .expect("valid service-task process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("charger".to_string(), "charger.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![charger, waiter],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        for _ in 0..3 {
+            server
+                .create_for_stream(Some("charger".into()), None, Default::default())
+                .await
+                .expect("create charger");
+        }
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+        loop_until_wait_states(&server, None, 4).await;
+
+        let search = |field: &str, order: models::SortOrderEnum| {
+            let q = models::ElementInstanceWaitStateQuery {
+                sort: Some(vec![models::ElementInstanceWaitStateQuerySortRequest {
+                    field: field.to_string(),
+                    order: Some(order),
+                }]),
+                page: None,
+                filter: None,
+            };
+            let server = &server;
+            async move {
+                let Resp::Status200_TheElementInstanceWaitStateSearchResult(r) = server
+                    .search_element_instance_wait_states_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+            }
+        };
+        let num = |k: &str| k.parse::<u64>().unwrap();
+
+        let desc = search("processInstanceKey", models::SortOrderEnum::Desc).await;
+        let keys: Vec<u64> = desc
+            .iter()
+            .map(|w| num(&w.process_instance_key.0))
+            .collect();
+        let mut expected = keys.clone();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(keys, expected, "processInstanceKey DESC");
+        assert_eq!(keys.len(), 4);
+
+        let by_id = search("elementId", models::SortOrderEnum::Asc).await;
+        let ids: Vec<&str> = by_id.iter().map(|w| w.element_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["await", "charge", "charge", "charge"],
+            "elementId ASC"
+        );
+
+        let eik_desc = search("elementInstanceKey", models::SortOrderEnum::Desc).await;
+        let eiks: Vec<u64> = eik_desc
+            .iter()
+            .map(|w| num(&w.element_instance_key.0))
+            .collect();
+        let mut expected = eiks.clone();
+        expected.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(eiks, expected, "elementInstanceKey DESC");
     }
 
     #[tokio::test]
@@ -29110,7 +30436,7 @@ mod clustered_startup_tests {
         // instance round-robin across all four partitions (1 & 3 on node 1).
         for i in 0..16u32 {
             node0
-                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None)
+                .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None, None)
                 .await;
         }
 
@@ -29152,7 +30478,7 @@ mod clustered_startup_tests {
         // node-0-owned partition. node 1 (a different gateway) must forward the
         // completion back to node 0.
         let node0 = clustered_node(0);
-        let (_instance, _) = node0
+        let (instance, _) = node0
             .create_for_stream(Some("demo".into()), None, Default::default())
             .await
             .expect("owner creates the demo instance");
@@ -29187,18 +30513,36 @@ mod clustered_startup_tests {
 
         // Forward the completion to node 0 over the wire and map its answer back.
         use apis::job::CompleteJobResponse as R;
+        // The completion carries a Camunda 8.10 businessId, which must ride
+        // the forward and be assigned on the owner.
         let resp = node1
-            .forward_complete_job(owner, job_key, None, None, None, None)
+            .forward_complete_job(
+                owner,
+                job_key,
+                JobCompletion {
+                    business_id: Some("fwd-1".into()),
+                    ..Default::default()
+                },
+            )
             .await;
         assert!(
             matches!(resp, R::Status204_TheJobWasCompletedSuccessfully),
             "the forwarded completion should succeed (204)"
         );
+        let mut stamped = types::Nullable::Null;
+        for _ in 0..200 {
+            stamped = node0.business_id_of(instance);
+            if stamped != types::Nullable::Null {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stamped, types::Nullable::Present("fwd-1".to_string()));
 
         // The completion really mutated node 0's state: completing the same job
         // again is rejected (it is no longer an activated job).
         let again = node1
-            .forward_complete_job(owner, job_key, None, None, None, None)
+            .forward_complete_job(owner, job_key, JobCompletion::default())
             .await;
         assert!(
             !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
@@ -29748,7 +31092,7 @@ mod clustered_startup_tests {
             .expect("the job's partition is owned by node 0");
         assert_eq!(owner, 0);
         let (status, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None, None, None)
+            .forward_complete_job_stream(owner, job_key, JobCompletion::default())
             .await;
         assert!(
             is_ok_status(status),
@@ -29757,7 +31101,7 @@ mod clustered_startup_tests {
 
         // Re-completing the same job is rejected — proof it mutated node 0's state.
         let (again, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None, None, None)
+            .forward_complete_job_stream(owner, job_key, JobCompletion::default())
             .await;
         assert!(
             !is_ok_status(again),
@@ -34878,6 +36222,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
             )
             .await;
         assert_eq!(
@@ -34949,6 +36294,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
             )
             .await;
         assert_eq!(
@@ -35020,6 +36366,7 @@ mod subscription_placement_tests {
                 "abort-order".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
             )
             .await;
         assert_eq!(
@@ -35074,6 +36421,7 @@ mod subscription_placement_tests {
                     "order-placed".into(),
                     format!("order-{i}"),
                     std::collections::HashMap::new(),
+                    None,
                 )
                 .await;
         }
@@ -35187,6 +36535,7 @@ mod subscription_placement_tests {
                     "payment-received".into(),
                     order.clone(),
                     std::collections::HashMap::new(),
+                    None,
                 )
                 .await;
             if c == Some(instance_key) {
@@ -35246,7 +36595,12 @@ mod subscription_placement_tests {
             .expect("a non-zero-hashing key exists");
 
         let (_message_key, instance) = server
-            .correlate_message_local("order-placed".into(), key, std::collections::HashMap::new())
+            .correlate_message_local(
+                "order-placed".into(),
+                key,
+                std::collections::HashMap::new(),
+                None,
+            )
             .await;
         let instance_key = instance.expect("the message-start created an instance on p0");
         assert_eq!(
@@ -35283,6 +36637,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 "order-x".into(),
                 std::collections::HashMap::new(),
+                None,
             )
             .await;
         assert_eq!(correlated, Some(instance_key));
@@ -38304,6 +39659,7 @@ mod call_activity_hierarchy_read_model_tests {
             job.job_key.0.parse().unwrap(),
             Some(job_lease),
             Default::default(),
+            None,
             None,
             None,
         )

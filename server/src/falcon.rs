@@ -1090,6 +1090,7 @@ async fn handle_client_frame(
             variables,
             adhoc_result,
             task_result,
+            business_id,
         } => {
             let Some(lease_token) =
                 reconcile_falcon_lease(conn, corr, channel, job_lease_token, lease_token)
@@ -1110,10 +1111,13 @@ async fn handle_client_frame(
                         .forward_complete_job_stream(
                             node,
                             key,
-                            lease_token,
-                            variables,
-                            adhoc_result,
-                            task_result,
+                            crate::JobCompletion {
+                                lease_token,
+                                variables,
+                                adhoc_result,
+                                task_result,
+                                business_id,
+                            },
                         )
                         .await;
                     crate::metrics::record_complete_outcome(if outcome.0 < 300 {
@@ -1138,6 +1142,7 @@ async fn handle_client_frame(
                                 vars,
                                 adhoc_result,
                                 task_result,
+                                business_id,
                             )
                             .await,
                     );
@@ -1155,6 +1160,7 @@ async fn handle_client_frame(
                                 vars,
                                 adhoc_result,
                                 task_result,
+                                business_id,
                             )
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
@@ -1347,10 +1353,11 @@ async fn handle_client_frame(
             name,
             correlation_key,
             variables,
+            business_id,
         } => {
             let vars = to_engine_vars(variables);
             let (message_key, instance) = server
-                .correlate_message_local(name, correlation_key, vars)
+                .correlate_message_local(name, correlation_key, vars, business_id)
                 .await;
             // Correlation may have advanced a token onto a service task on one of
             // this peer's partitions, creating an activatable job: wake pollers.

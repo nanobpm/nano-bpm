@@ -609,6 +609,12 @@
     }
   },
   {
+    "ProcessInstanceBusinessIdAssigned": {
+      "business_id": "order-A",
+      "instance_key": 7
+    }
+  },
+  {
     "JobCompleted": {
       "created_at": 1700000000001,
       "instance_key": 7,

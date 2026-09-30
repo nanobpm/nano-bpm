@@ -422,6 +422,123 @@ pub fn match_cluster_variable_scope(
     }
 }
 
+/// Matches a `ClusterVariableKindFilterProperty` (bare enum or advanced)
+/// against a kind's wire spelling (`JSON`/`SECRET_REFERENCE`).
+pub fn match_cluster_variable_kind(
+    filter: &Option<models::ClusterVariableKindFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::ClusterVariableKindFilterProperty::ClusterVariableKindEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::ClusterVariableKindFilterProperty::AdvancedClusterVariableKindFilter(a)) => {
+            ops!(
+                a,
+                |e: &models::ClusterVariableKindEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
+        }
+    }
+}
+
+/// A metadata scalar, borrowed from any of the generated string-or-number
+/// unions (stored value, `$eq`, `$neq`, `$in` item). Comparison is type-strict:
+/// the string `"30"` is not the number `30`.
+#[derive(Clone, Copy, PartialEq)]
+enum MetaScalar<'a> {
+    Str(&'a str),
+    Num(f64),
+}
+
+impl<'a> From<&'a models::ClusterVariableResultBaseMetadataValue> for MetaScalar<'a> {
+    fn from(v: &'a models::ClusterVariableResultBaseMetadataValue) -> Self {
+        match v {
+            models::ClusterVariableResultBaseMetadataValue::String(s) => Self::Str(s),
+            models::ClusterVariableResultBaseMetadataValue::F64(n) => Self::Num(*n),
+        }
+    }
+}
+
+impl<'a> From<&'a models::AdvancedMetadataValueFilterEq> for MetaScalar<'a> {
+    fn from(v: &'a models::AdvancedMetadataValueFilterEq) -> Self {
+        match v {
+            models::AdvancedMetadataValueFilterEq::String(s) => Self::Str(s),
+            models::AdvancedMetadataValueFilterEq::F64(n) => Self::Num(*n),
+        }
+    }
+}
+
+impl<'a> From<&'a models::AdvancedMetadataValueFilterNeq> for MetaScalar<'a> {
+    fn from(v: &'a models::AdvancedMetadataValueFilterNeq) -> Self {
+        match v {
+            models::AdvancedMetadataValueFilterNeq::String(s) => Self::Str(s),
+            models::AdvancedMetadataValueFilterNeq::F64(n) => Self::Num(*n),
+        }
+    }
+}
+
+/// Matches one metadata entry (absent = `None`) against its
+/// `AdvancedMetadataValueFilter`. Absent-value semantics mirror [`Ops`]: only
+/// `$exists: false` (or no value operator at all) matches a missing key. Range
+/// operators match numbers only; `$like` matches strings only.
+fn metadata_value_matches(
+    f: &models::AdvancedMetadataValueFilter,
+    value: Option<&models::ClusterVariableResultBaseMetadataValue>,
+) -> bool {
+    if matches!(f.dollar_exists, Some(e) if e != value.is_some()) {
+        return false;
+    }
+    let Some(v) = value.map(MetaScalar::from) else {
+        return f.dollar_eq.is_none()
+            && f.dollar_neq.is_none()
+            && f.dollar_gt.is_none()
+            && f.dollar_gte.is_none()
+            && f.dollar_lt.is_none()
+            && f.dollar_lte.is_none()
+            && f.dollar_in.is_none()
+            && f.dollar_like.is_none();
+    };
+    let num = match v {
+        MetaScalar::Num(n) => Some(n),
+        MetaScalar::Str(_) => None,
+    };
+    let range = |bound: Option<f64>, ok: fn(f64, f64) -> bool| {
+        bound.is_none_or(|b| num.is_some_and(|n| ok(n, b)))
+    };
+    f.dollar_eq
+        .as_ref()
+        .is_none_or(|eq| v == MetaScalar::from(eq))
+        && f.dollar_neq
+            .as_ref()
+            .is_none_or(|neq| v != MetaScalar::from(neq))
+        && range(f.dollar_gt, |n, b| n > b)
+        && range(f.dollar_gte, |n, b| n >= b)
+        && range(f.dollar_lt, |n, b| n < b)
+        && range(f.dollar_lte, |n, b| n <= b)
+        && f.dollar_in
+            .as_ref()
+            .is_none_or(|in_| in_.iter().any(|x| v == MetaScalar::from(x)))
+        && f.dollar_like.as_deref().is_none_or(|like| match v {
+            MetaScalar::Str(s) => like_matches(like, s),
+            MetaScalar::Num(_) => false,
+        })
+}
+
+/// Matches a cluster variable's metadata bag against a per-key filter map:
+/// every filtered key must match (AND).
+pub fn match_cluster_variable_metadata(
+    filter: &Option<std::collections::HashMap<String, models::AdvancedMetadataValueFilter>>,
+    metadata: &std::collections::HashMap<String, models::ClusterVariableResultBaseMetadataValue>,
+) -> bool {
+    filter
+        .iter()
+        .flatten()
+        .all(|(key, f)| metadata_value_matches(f, metadata.get(key)))
+}
+
 /// Matches a `BasicStringFilterProperty` (bare string or basic filter — no
 /// `$like`) against a value.
 pub fn match_basic_string(filter: &Option<models::BasicStringFilterProperty>, value: &str) -> bool {
