@@ -28964,8 +28964,26 @@ mod clustered_startup_tests {
         panic!("wait states never reached {want} resolved items");
     }
 
-    /// The wait state's type, derived from its discriminated `details`.
+    /// The wait state's type, derived from its discriminated `details`. Also
+    /// pins the generated wire form: the serialized details carry exactly one
+    /// `waitStateType` key whose value is the discriminator MAPPING key (`JOB`,
+    /// …), never the member schema name (#1295 review of the postprocessor).
     fn ws_type(w: &models::ElementInstanceWaitStateResult) -> models::WaitStateTypeEnum {
+        let wire = serde_json::to_string(&w.details).expect("details serialize");
+        assert_eq!(
+            wire.matches("\"waitStateType\"").count(),
+            1,
+            "exactly one discriminator on the wire: {wire}"
+        );
+        let tag: serde_json::Value = serde_json::from_str(&wire).expect("valid JSON");
+        assert_eq!(
+            tag["waitStateType"].as_str(),
+            Some(wait_state_type_of(&w.details)),
+            "wire tag is the mapping key: {wire}"
+        );
+        let back: models::WaitStateDetails =
+            serde_json::from_str(&wire).expect("the wire form deserializes");
+        assert_eq!(back, w.details, "wire form round-trips to the same variant");
         wait_state_type_of(&w.details)
             .parse()
             .expect("a known waitStateType")
