@@ -1283,15 +1283,7 @@ impl TestEngine {
                 Some(w) => row.state == w,
                 None => true,
             })
-            .map(|row| {
-                // `businessId` is the owning instance's (as the gateway's
-                // `business_id_of`), not inherited from the root.
-                let business_id = self
-                    .read_model
-                    .process_instance(row.instance_key)
-                    .and_then(|pi| pi.business_id);
-                user_task_result(row, &roots, business_id)
-            })
+            .map(|row| user_task_result(row, &roots))
             .collect();
         to_json(&search_result(items))
     }
@@ -2255,11 +2247,10 @@ fn is_rfc3339_date_time(s: &str) -> bool {
 /// is one canonical root-walk and no duplicate derivation. A top-level
 /// (self-rooted) task reports its own `processInstanceKey`.
 #[cfg(feature = "read-model")]
-fn user_task_result(
-    task: &UserTaskRow,
-    roots: &RootResolver,
-    business_id: Option<String>,
-) -> serde_json::Value {
+fn user_task_result(task: &UserTaskRow, roots: &RootResolver) -> serde_json::Value {
+    // The owning instance's business id snapshotted at the task's creation
+    // (mirrors the gateway): a later assignment never enriches it.
+    let business_id = task.business_id.clone();
     serde_json::json!({
         "name": serde_json::Value::Null,
         "state": user_task_state_rest(task.state),
@@ -5359,8 +5350,8 @@ mod read_channel_tests {
         }
     }
 
-    /// `UserTaskResult.businessId` is the owning instance's business id (the
-    /// same source as the gateway's `business_id_of`), `null` when unset.
+    /// `UserTaskResult.businessId` is the owning instance's business id at the
+    /// task's creation, `null` when unset.
     #[test]
     fn search_user_tasks_surfaces_the_instance_business_id() {
         let mut eng = TestEngine::new();
@@ -5384,6 +5375,67 @@ mod read_channel_tests {
             .collect();
         ids.sort_by_key(|v| v.to_string());
         assert_eq!(ids, vec![J::String("order-42".into()), J::Null]);
+    }
+
+    /// A user task snapshots the business id current at its creation: an id
+    /// assigned later (here by completing a parallel job) must not enrich it
+    /// (Camunda 8.10 contract; mirrors the gateway, #1295 review).
+    #[test]
+    fn search_user_tasks_reports_the_creation_time_business_id_snapshot() {
+        const XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:serviceTask id="svc">
+            <bpmn:extensionElements><zeebe:taskDefinition type="t" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e1" />
+          <bpmn:endEvent id="e2" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="b" sourceRef="fork" targetRef="review" />
+          <bpmn:sequenceFlow id="c" sourceRef="fork" targetRef="svc" />
+          <bpmn:sequenceFlow id="d" sourceRef="review" targetRef="e1" />
+          <bpmn:sequenceFlow id="f" sourceRef="svc" targetRef="e2" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+        let mut eng = TestEngine::new();
+        eng.deploy(XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        let jobs = parse(&eng.activate_jobs("t", 1, 60_000.0, "w", None).unwrap());
+        let job_key: u64 = jobs[0]["key"].as_str().unwrap().parse().unwrap();
+        eng.apply(Command::CompleteJob {
+            job_key,
+            lease_token: None,
+            variables: Default::default(),
+            adhoc_result: None,
+            task_listener_result: None,
+            business_id: Some("order-1".into()),
+        })
+        .unwrap();
+        let task = parse(&eng.search_user_tasks("").unwrap())["items"][0].clone();
+        let instance_key: u64 = task["processInstanceKey"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            eng.read_model
+                .process_instance(instance_key)
+                .and_then(|pi| pi.business_id)
+                .as_deref(),
+            Some("order-1"),
+            "the instance itself carries the assigned id"
+        );
+        assert_eq!(
+            task["businessId"],
+            J::Null,
+            "the pre-existing task is not enriched"
+        );
     }
 
     #[test]
