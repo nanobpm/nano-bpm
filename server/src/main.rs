@@ -11043,6 +11043,7 @@ impl ServerImpl {
                 "decisionEvaluationInstanceKey" => {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
+                "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(entity_key(row) as i64),
             },
             |row| entity_key(row),
@@ -11668,6 +11669,7 @@ impl ServerImpl {
                     query::SortVal::Num(inst.process_definition_key.parse().unwrap_or(0))
                 }
                 "state" => query::SortVal::Str(process_instance_state_enum(inst.state).to_string()),
+                "businessId" => query::SortVal::Str(inst.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(inst.key as i64),
             },
             |inst| inst.key,
@@ -11838,6 +11840,7 @@ impl ServerImpl {
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
                 "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
                 "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
+                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(e.subscription_key as i64),
             },
             |e| e.subscription_key,
@@ -12033,6 +12036,7 @@ impl ServerImpl {
                 "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
                 "subscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
+                "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(e.message_key as i64),
             },
             // A single published message can fan out to multiple subscriptions,
@@ -12933,6 +12937,7 @@ impl ServerImpl {
                 "elementId" => query::SortVal::Str(task.element_id.clone()),
                 "state" => query::SortVal::Str(user_task_state_enum(task.state).to_string()),
                 "creationDate" => query::SortVal::Num(task.created_at_ms as i64),
+                "businessId" => query::SortVal::Str(task.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(task.key as i64),
             },
             |task| task.key,
@@ -27223,14 +27228,14 @@ mod clustered_startup_tests {
             "processDefinitionId": "waiter", "businessId": "biz-A",
             "variables": {"orderId": "A1"}}))
         .await;
-        create(serde_json::json!({
+        let untagged_waiter = create(serde_json::json!({
             "processDefinitionId": "waiter", "variables": {"orderId": "B1"}}))
         .await;
         let tagged_greeter = create(serde_json::json!({
             "processDefinitionId": "greeter", "businessId": "biz-G",
             "variables": {"lang": "en"}}))
         .await;
-        create(serde_json::json!({
+        let untagged_parter = create(serde_json::json!({
             "processDefinitionId": "parter", "variables": {"lang": "en"}}))
         .await;
 
@@ -27315,6 +27320,93 @@ mod clustered_startup_tests {
         assert_eq!(decisions("biz-G").await, vec![tagged_greeter.clone()]);
         assert!(decisions("nope").await.is_empty());
 
+        // `businessId` sort (new upstream sort value): an absent id sorts as
+        // empty, so ASC puts untagged rows first — the reverse of the key order
+        // (tagged instances were created first), which a wildcard fallback
+        // would return.
+        let by_business_id =
+            |order: &str| serde_json::json!({"sort": [{"field": "businessId", "order": order}]});
+        let sorted_subs = |order: &str| {
+            let q: models::MessageSubscriptionSearchQuery =
+                serde_json::from_value(by_business_id(order)).expect("valid query");
+            let server = &server;
+            async move {
+                let SubResp::Status200_TheMessageSubscriptionSearchResult(r) = server
+                    .search_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            sorted_subs("ASC").await,
+            vec![untagged_waiter.clone(), tagged_waiter.clone()]
+        );
+        assert_eq!(
+            sorted_subs("DESC").await,
+            vec![tagged_waiter.clone(), untagged_waiter.clone()]
+        );
+        let sorted_decisions = |order: &str| {
+            let q: models::DecisionInstanceSearchQuery =
+                serde_json::from_value(by_business_id(order)).expect("valid query");
+            let server = &server;
+            async move {
+                let DecResp::Status200_TheDecisionInstanceSearchResult(r) = server
+                    .search_decision_instances_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| match i.process_instance_key {
+                        types::Nullable::Present(k) => k.0,
+                        types::Nullable::Null => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            sorted_decisions("ASC").await,
+            vec![untagged_parter.clone(), tagged_greeter.clone()]
+        );
+        assert_eq!(
+            sorted_decisions("DESC").await,
+            vec![tagged_greeter.clone(), untagged_parter.clone()]
+        );
+        let pis: models::ProcessInstanceSearchQuery =
+            serde_json::from_value(by_business_id("ASC")).expect("valid query");
+        let apis::process_instance::SearchProcessInstancesResponse::Status200_TheProcessInstanceSearchResult(r) =
+            server.search_process_instances_impl(&Some(pis)).await.unwrap()
+        else {
+            panic!("expected 200");
+        };
+        let pi_order: Vec<String> = r
+            .items
+            .into_iter()
+            .map(|i| i.process_instance_key.0)
+            .collect();
+        assert_eq!(
+            pi_order,
+            vec![
+                untagged_waiter.clone(),
+                untagged_parter.clone(),
+                tagged_waiter.clone(),
+                tagged_greeter.clone()
+            ],
+            "null ids first (key tie-break), then biz-A < biz-G"
+        );
+
         // Correlate both waiters; only the tagged one matches the filter.
         for key in ["A1", "B1"] {
             let resp = server
@@ -27373,8 +27465,34 @@ mod clustered_startup_tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        assert_eq!(corr("biz-A").await, vec![tagged_waiter]);
+        assert_eq!(corr("biz-A").await, vec![tagged_waiter.clone()]);
         assert!(corr("nope").await.is_empty());
+        let sorted_corr = |order: &str| {
+            let q: models::CorrelatedMessageSubscriptionSearchQuery =
+                serde_json::from_value(by_business_id(order)).expect("valid query");
+            let server = &server;
+            async move {
+                let CorrResp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) = server
+                    .search_correlated_message_subscriptions_impl(&Some(q))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("expected 200");
+                };
+                r.items
+                    .into_iter()
+                    .map(|i| i.process_instance_key.0)
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(
+            sorted_corr("ASC").await,
+            vec![untagged_waiter.clone(), tagged_waiter.clone()]
+        );
+        assert_eq!(
+            sorted_corr("DESC").await,
+            vec![tagged_waiter, untagged_waiter]
+        );
     }
 
     #[tokio::test]

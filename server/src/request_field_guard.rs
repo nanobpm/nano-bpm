@@ -156,6 +156,24 @@ fn walk(
                 .to_string();
             let path = format!("{name}.{prop}");
             fields.insert(path.clone());
+            // A sort request's `field` values are request surface too: each is
+            // listed as `Schema.field=value`, so an upstream-added sort value
+            // cannot silently fall through a dispatcher's wildcard arm.
+            if name.ends_with("SortRequest") && prop == "field" {
+                let target = match sub.get("$ref").and_then(Value::as_str) {
+                    Some(r) => spec.resolve(r, cur).0,
+                    None => sub.clone(),
+                };
+                for value in target
+                    .get("enum")
+                    .and_then(Value::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    fields.insert(format!("{path}={value}"));
+                }
+            }
             walk(spec, &sub, cur, &path, fields, visited);
         }
     }

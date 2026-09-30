@@ -2042,10 +2042,22 @@ fn agent_metrics_result(
     metrics
         .as_ref()
         .map(|metrics| {
+            // Exhaustive destructure: a new engine counter must be surfaced.
+            let nanobpmn_engine_core::AgentHistoryMetrics {
+                input_tokens,
+                output_tokens,
+                reasoning_token_count,
+                cache_creation_token_count,
+                cache_read_token_count,
+                duration_ms,
+            } = metrics;
             serde_json::json!({
-                "inputTokens": metrics.input_tokens,
-                "outputTokens": metrics.output_tokens,
-                "durationMs": metrics.duration_ms,
+                "inputTokens": input_tokens,
+                "outputTokens": output_tokens,
+                "reasoningTokenCount": reasoning_token_count,
+                "cacheCreationTokenCount": cache_creation_token_count,
+                "cacheReadTokenCount": cache_read_token_count,
+                "durationMs": duration_ms,
             })
         })
         .unwrap_or(serde_json::Value::Null)
@@ -3252,22 +3264,34 @@ struct AgentTurnReq {
 
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// `AgentInstanceHistoryItemMetricsRequest`: every counter is optional (an
+/// omitted counter is `null`).
 struct AgentMetricsReq {
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
     input_tokens: Option<i64>,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
     output_tokens: Option<i64>,
-    #[serde(deserialize_with = "required_nullable")]
+    #[serde(default)]
+    reasoning_token_count: Option<i64>,
+    #[serde(default)]
+    cache_creation_token_count: Option<i64>,
+    #[serde(default)]
+    cache_read_token_count: Option<i64>,
+    #[serde(default)]
     duration_ms: Option<i64>,
 }
 
 impl From<AgentMetricsReq> for nanobpmn_engine_core::AgentHistoryMetrics {
+    // Exhaustive (no `..Default::default()`): a counter added to the engine
+    // type fails to compile here instead of being silently dropped.
     fn from(metrics: AgentMetricsReq) -> Self {
         Self {
             input_tokens: metrics.input_tokens,
             output_tokens: metrics.output_tokens,
+            reasoning_token_count: metrics.reasoning_token_count,
+            cache_creation_token_count: metrics.cache_creation_token_count,
+            cache_read_token_count: metrics.cache_read_token_count,
             duration_ms: metrics.duration_ms,
-            ..Self::default()
         }
     }
 }
@@ -4761,45 +4785,61 @@ mod tests {
         }
     }
 
+    /// Every `AgentInstanceHistoryItemMetrics` counter round-trips (value, zero,
+    /// negative, explicit null), and — per the request schema, where every
+    /// counter is optional — an omitted counter surfaces as `null`, the
+    /// response schema requiring all six keys.
     #[test]
     fn agent_history_metrics_preserve_nullable_values() {
+        const COUNTERS: [&str; 6] = [
+            "inputTokens",
+            "outputTokens",
+            "reasoningTokenCount",
+            "cacheCreationTokenCount",
+            "cacheReadTokenCount",
+            "durationMs",
+        ];
         let request = serde_json::json!({
             "historyItemId":"metrics", "loopIteration":1, "producedAt":"2026-01-02T03:04:05Z",
             "role":"ASSISTANT", "content":[],
-            "metrics":{"inputTokens":2,"outputTokens":null,"durationMs":7},
+            "metrics":{"inputTokens":2,"outputTokens":null,"reasoningTokenCount":3,
+                       "cacheCreationTokenCount":4,"cacheReadTokenCount":5,"durationMs":7},
         });
-        let turn = agent_turn_from(
-            serde_json::from_value(request.clone()).unwrap(),
-            42,
-            "opaque",
-        )
-        .unwrap();
-        assert_eq!(agent_metrics_result(&turn.metrics), request["metrics"]);
-        let mut zero = request.clone();
-        zero["metrics"] = serde_json::json!({"inputTokens":0,"outputTokens":0,"durationMs":0});
-        let turn =
-            agent_turn_from(serde_json::from_value(zero.clone()).unwrap(), 42, "opaque").unwrap();
-        assert_eq!(agent_metrics_result(&turn.metrics), zero["metrics"]);
+        let round_trip = |metrics: &J| {
+            let mut req = request.clone();
+            req["metrics"] = metrics.clone();
+            let turn = agent_turn_from(serde_json::from_value(req).unwrap(), 42, "opaque").unwrap();
+            agent_metrics_result(&turn.metrics)
+        };
+        let uniform = |v: J| {
+            J::Object(
+                COUNTERS
+                    .iter()
+                    .map(|c| (c.to_string(), v.clone()))
+                    .collect(),
+            )
+        };
         for metrics in [
-            serde_json::json!({"inputTokens":null,"outputTokens":null,"durationMs":null}),
-            serde_json::json!({"inputTokens":-1,"outputTokens":-2,"durationMs":-1}),
+            request["metrics"].clone(),
+            uniform(serde_json::json!(0)),
+            uniform(J::Null),
+            uniform(serde_json::json!(-1)),
         ] {
-            let mut present = request.clone();
-            present["metrics"] = metrics.clone();
-            let turn =
-                agent_turn_from(serde_json::from_value(present).unwrap(), 42, "opaque").unwrap();
-            assert_eq!(agent_metrics_result(&turn.metrics), metrics);
+            assert_eq!(round_trip(&metrics), metrics);
         }
         let mut omitted = request.clone();
         omitted.as_object_mut().unwrap().remove("metrics");
         let turn = agent_turn_from(serde_json::from_value(omitted).unwrap(), 42, "opaque").unwrap();
-        assert_eq!(agent_metrics_result(&turn.metrics), serde_json::Value::Null);
-        for missing in ["inputTokens", "outputTokens", "durationMs"] {
-            let mut invalid = request.clone();
-            invalid["metrics"].as_object_mut().unwrap().remove(missing);
-            assert!(
-                serde_json::from_value::<AgentTurnReq>(invalid).is_err(),
-                "{missing}"
+        assert_eq!(agent_metrics_result(&turn.metrics), J::Null);
+        for missing in COUNTERS {
+            let mut partial = request["metrics"].clone();
+            partial.as_object_mut().unwrap().remove(missing);
+            let mut expected = request["metrics"].clone();
+            expected[missing] = J::Null;
+            assert_eq!(
+                round_trip(&partial),
+                expected,
+                "{missing} omitted surfaces as null"
             );
         }
     }
