@@ -486,6 +486,11 @@
           "type": "string",
           "default": "app",
           "description": "Name of the data[] source the page runtime reads (cross-reference rule, ADR 0027 §4)."
+        },
+        "gridLayout": {
+          "enum": ["auto", "cards"],
+          "default": "auto",
+          "description": "How every dataGrid lays out (nanobpm/nano-ide#572). \"auto\": a table, flipping to a stacked card list below the mobile breakpoint. \"cards\": the card list at every width, so wide grids are never clipped by a fixed-max-width shell."
         }
       }
     },

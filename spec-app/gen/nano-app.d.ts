@@ -409,6 +409,10 @@ export interface PagesSurface {
    * Name of the data[] source the page runtime reads (cross-reference rule, ADR 0027 §4).
    */
   sourceName?: string;
+  /**
+   * How every dataGrid lays out (nanobpm/nano-ide#572). "auto": a table, flipping to a stacked card list below the mobile breakpoint. "cards": the card list at every width, so wide grids are never clipped by a fixed-max-width shell.
+   */
+  gridLayout?: "auto" | "cards";
 }
 /**
  * An app-authored action handler override (ADR 0055 §3): binds a route to a handler module that default-exports an ActionHandler.
