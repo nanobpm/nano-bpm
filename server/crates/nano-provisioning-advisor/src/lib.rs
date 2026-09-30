@@ -260,10 +260,39 @@ fn each_series<'a>(text: &'a str, name: &'a str) -> impl Iterator<Item = (&'a st
         }
         let rest = line.strip_prefix(name)?;
         let rest = rest.strip_prefix('{')?;
-        let (labels, tail) = rest.split_once('}')?;
+        let close = label_set_close(rest)?;
+        let labels = &rest[..close];
+        let tail = &rest[close + 1..];
         let value = tail.trim().parse::<f64>().ok()?;
         Some((labels, value))
     })
+}
+
+/// Returns the byte index of the `}` that closes a label set, honouring the
+/// quoted-string grammar: a `}` inside a quoted label value (e.g.
+/// `job_type="a}b"`) is content, not the delimiter, and `\"` / `\\` escapes keep
+/// a quote from toggling the in-value state. A naive `split_once('}')` splits at
+/// the first brace — truncating `job_type="a}b"` to an unterminated value and
+/// dropping the whole series — so the delimiter is scanned quote-aware. Returns
+/// `None` when no closing brace exists outside a quoted value (malformed).
+fn label_set_close(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut in_value = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_value => {
+                // Skip the escaped char so `\"` doesn't close the value.
+                i += 2;
+                continue;
+            }
+            b'"' => in_value = !in_value,
+            b'}' if !in_value => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parses the raw Prometheus exposition text into the advisor's [`Snapshot`].
@@ -583,6 +612,24 @@ nanobpm_admission_shed_total{reason="mem_watermark"} 2
         assert_eq!(s.per_type.get("q\"z").map(|j| j.workers), Some(7));
         assert_eq!(s.per_type.get("back\\slash").map(|j| j.workers), Some(11));
         assert_eq!(s.per_type.len(), 5, "no truncated/merged job types");
+    }
+
+    /// A `}` inside a quoted label value is content, not the label-set
+    /// delimiter. Splitting at the first `}` truncates `job_type="a}b"` to an
+    /// unterminated value and drops the whole series, so the closing brace must
+    /// be found quote-aware.
+    #[test]
+    fn label_values_with_braces_parse_correctly() {
+        let text = "nanobpm_job_type_workers{job_type=\"a}b\"} 2\n\
+                    nanobpm_job_type_workers{job_type=\"open{\"} 5\n\
+                    nanobpm_job_type_workers{job_type=\"both{}\"} 3\n\
+                    nanobpm_job_type_workers{job_type=\"esc\\\"}still\"} 7\n";
+        let s = parse_snapshot(text, 1000);
+        assert_eq!(s.per_type.get("a}b").map(|j| j.workers), Some(2));
+        assert_eq!(s.per_type.get("open{").map(|j| j.workers), Some(5));
+        assert_eq!(s.per_type.get("both{}").map(|j| j.workers), Some(3));
+        assert_eq!(s.per_type.get("esc\"}still").map(|j| j.workers), Some(7));
+        assert_eq!(s.per_type.len(), 4, "no brace-truncated job types");
     }
 
     /// A malformed series (unterminated quote) is skipped, never misparsed into
