@@ -220,6 +220,46 @@ pub fn complete_rest_poll(job_type: &str, worker: &str) {
     }
 }
 
+/// RAII guard that balances one [`record_rest_poll`] registration, making the
+/// in-flight count **cancellation-safe**.
+///
+/// The `activateJobs` handler awaits a long-poll window
+/// (`tokio::time::timeout(wait, notified).await`). If Axum drops the handler future
+/// while it is suspended at that await — the client disconnected, or the server is
+/// shutting down — no explicit [`complete_rest_poll`] call runs, so `in_flight`
+/// would stay elevated forever. Later polls for the same `(job_type, worker)`
+/// inherit the leaked count, their own completions never reach zero, the requested
+/// deadline stays in place, and a phantom worker suppresses the per-type `Starved`
+/// signal. Holding this guard across the await closes the window on **every** exit
+/// path — normal return *and* future cancellation — because `Drop` runs either way.
+///
+/// Construct with [`RestPollGuard::record`]. The guard owns an owned copy of the
+/// `(job_type, worker)` key so it can release the registration without borrowing
+/// the request.
+#[derive(Debug)]
+pub struct RestPollGuard {
+    job_type: String,
+    worker: String,
+}
+
+impl RestPollGuard {
+    /// Records one in-flight poll (see [`record_rest_poll`]) and returns the guard
+    /// that releases it on drop.
+    pub fn record(job_type: &str, worker: &str, long_poll_ms: u64) -> Self {
+        record_rest_poll(job_type, worker, long_poll_ms);
+        Self {
+            job_type: job_type.to_string(),
+            worker: worker.to_string(),
+        }
+    }
+}
+
+impl Drop for RestPollGuard {
+    fn drop(&mut self) {
+        complete_rest_poll(&self.job_type, &self.worker);
+    }
+}
+
 /// Insert or refresh a REST consumer, enforcing the cardinality cap. Existing
 /// keys always update (a live worker is never dropped); a new key is admitted
 /// only if the map is under `max` after pruning dead entries — otherwise it is
@@ -772,6 +812,94 @@ mod tests {
         let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
         assert_eq!(p.in_flight, 0, "the matched pair balances");
         clear("t-zerocap:");
+    }
+
+    #[test]
+    fn a_dropped_poll_guard_balances_the_in_flight_count() {
+        // Cancellation regression (Copilot review): the `activateJobs` handler
+        // awaits a long-poll window, and if Axum drops that future mid-await
+        // (client disconnect / shutdown) no explicit `complete_rest_poll` runs.
+        // Without a guard the registration leaks — `in_flight` stays elevated, the
+        // requested deadline stays in place, and a phantom worker suppresses the
+        // per-type `Starved` signal. `RestPollGuard`'s `Drop` must close the window
+        // on every exit path, so a dropped (cancelled) poll balances exactly like a
+        // returned one.
+        let jt = "t-cancel:review";
+        clear("t-cancel:");
+        let key = (jt.to_string(), "agent-cx".to_string());
+
+        // Open a 60s long poll via the guard, then drop it (the cancellation path:
+        // the handler future is dropped at the await, running only `Drop`).
+        let open_window = {
+            let _guard = RestPollGuard::record(jt, "agent-cx", 60_000);
+            let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+            assert_eq!(p.in_flight, 1, "the poll is in flight while held");
+            assert!(
+                p.live_until_ms > now_ms(),
+                "the requested 60s window is open while the poll is in flight"
+            );
+            p.live_until_ms
+            // `_guard` drops here — the cancellation path.
+        };
+
+        // After the drop the registration is balanced: the count returns to zero
+        // and the open window is closed to the drop instant (not left at the
+        // requested deadline), so no phantom worker lingers.
+        let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(
+            p.in_flight, 0,
+            "a dropped guard balances the in-flight count (no leak)"
+        );
+        assert!(
+            p.live_until_ms < open_window,
+            "the leaked 60s window is closed at the drop, not left open"
+        );
+        assert!(
+            p.live_until_ms <= now_ms(),
+            "the window closes now, not at the requested timeout"
+        );
+        clear("t-cancel:");
+    }
+
+    #[test]
+    fn an_aborted_long_poll_does_not_leak_into_a_later_short_poll() {
+        // Abort-then-short-poll regression (Copilot review): a long poll that is
+        // cancelled mid-await must not leave its registration behind for a later
+        // poll of the same `(job_type, worker)` to inherit. If it leaked, the later
+        // short poll's completion would only bring the count down to the leaked
+        // level (never zero), so its window would never close and the phantom
+        // worker would keep suppressing `Starved`.
+        let jt = "t-abort:review";
+        clear("t-abort:");
+        let key = (jt.to_string(), "agent-ab".to_string());
+
+        // A long poll is cancelled mid-await (its guard drops without a return).
+        {
+            let _guard = RestPollGuard::record(jt, "agent-ab", 60_000);
+        }
+        let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(p.in_flight, 0, "the aborted poll left nothing in flight");
+
+        // A later short poll for the same worker starts from a clean slate: it is
+        // the only poll in flight, and its own completion closes the window fully.
+        {
+            let _guard = RestPollGuard::record(jt, "agent-ab", 0);
+            let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+            assert_eq!(
+                p.in_flight, 1,
+                "the short poll is the only one in flight — no leaked count inherited"
+            );
+        }
+        let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(
+            p.in_flight, 0,
+            "the short poll's completion reaches zero (the leaked count is gone)"
+        );
+        assert!(
+            p.live_until_ms <= now_ms(),
+            "the short poll's window closes on completion (no phantom worker)"
+        );
+        clear("t-abort:");
     }
 
     #[test]

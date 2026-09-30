@@ -16354,14 +16354,22 @@ impl ServerImpl {
         // *different*, genuinely-recorded in-flight poll's shared counter — and with
         // a negative `requestTimeout` (no wait) could close a real worker's live
         // window and publish a false starvation signal.
+        //
+        // The registration is held in an RAII guard (`_poll_guard`) rather than
+        // closed by the explicit `complete_rest_poll` calls below: if Axum drops
+        // this handler future while it is suspended at the long-poll await (client
+        // disconnect / shutdown), no explicit completion runs and `in_flight` would
+        // leak — leaving the requested deadline in place and a phantom worker that
+        // suppresses `Starved`. The guard's `Drop` balances the count on every exit
+        // path, normal return *and* cancellation.
         let recorded = max_jobs > 0;
-        if recorded {
-            crate::consumers::record_rest_poll(
+        let _poll_guard = recorded.then(|| {
+            crate::consumers::RestPollGuard::record(
                 &job_type,
                 &worker,
                 long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
-            );
-        }
+            )
+        });
 
         // Remote nodes to draw the shortfall from once local partitions are
         // drained (REST job aggregation, the analog of the stream dispatcher's
@@ -16414,13 +16422,10 @@ impl ServerImpl {
             if !jobs.is_empty() {
                 crate::metrics::record_jobs_dispatched(&job_type, jobs.len() as u64);
                 // The poll returned with jobs, possibly long before its requested
-                // long-poll window closed: close the liveness window now so a
+                // long-poll window closed. The liveness window is closed by
+                // `_poll_guard`'s `Drop` on return (and on cancellation), so a
                 // drained-and-gone one-shot client doesn't keep counting as a live
-                // worker until timeout + grace (masking starvation). Only close a
-                // window this request actually opened (`recorded`).
-                if recorded {
-                    crate::consumers::complete_rest_poll(&job_type, &worker);
-                }
+                // worker until timeout + grace (masking starvation).
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
                 ));
@@ -16430,9 +16435,6 @@ impl ServerImpl {
             // wait until either new jobs are signalled or the window elapses.
             match deadline {
                 None => {
-                    if recorded {
-                        crate::consumers::complete_rest_poll(&job_type, &worker);
-                    }
                     return Ok(Resp::Status200_TheListOfActivatedJobs(
                         models::JobActivationResult::new(Vec::new()),
                     ));
@@ -16440,9 +16442,6 @@ impl ServerImpl {
                 Some(deadline) => {
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
-                        if recorded {
-                            crate::consumers::complete_rest_poll(&job_type, &worker);
-                        }
                         return Ok(Resp::Status200_TheListOfActivatedJobs(
                             models::JobActivationResult::new(Vec::new()),
                         ));
