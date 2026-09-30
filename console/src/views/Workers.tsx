@@ -622,8 +622,8 @@ function ProvisioningPanel() {
       </div>
       <p className="mb-3 text-xs text-fg-muted">
         Per job type: waiting jobs, subscribed workers (stream and REST) and the
-        drain rate, with a hint when a type is starved of workers, falling behind,
-        or capped by the server itself.
+        drain rate, with a hint when a type is starved of workers, falling
+        behind, or capped by the server itself.
       </p>
       {data?.serverBound && (
         <div

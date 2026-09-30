@@ -582,11 +582,7 @@ export async function getConsumers(): Promise<ConsumersResponse> {
 /// - `adequate`: backlog small or shrinking.
 /// - `warming`: not enough history yet (first scrape) to judge rates.
 export type ProvisioningClass =
-  | "starved"
-  | "under-provisioned"
-  | "server-bound"
-  | "adequate"
-  | "warming";
+  "starved" | "under-provisioned" | "server-bound" | "adequate" | "warming";
 
 /// Confidence in a recommendation.
 export type ProvisioningConfidence = "high" | "medium" | "low";

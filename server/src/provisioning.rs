@@ -24,7 +24,7 @@
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nano_provisioning_advisor::{advise, parse_snapshot, Advice, Snapshot};
+use nano_provisioning_advisor::{Advice, Snapshot, advise, parse_snapshot};
 
 /// The previous scrape, held so the next tick has an earlier sample to diff
 /// against (the backlog-slope / drain-rate window). Empty until the first tick,
@@ -71,10 +71,7 @@ pub fn tick() {
 /// The latest per-job-type provisioning advice for the console endpoint. Clones
 /// the small stored [`Advice`] so the lock is held only for the copy.
 pub fn latest() -> Advice {
-    LATEST
-        .lock()
-        .expect("provisioning latest poisoned")
-        .clone()
+    LATEST.lock().expect("provisioning latest poisoned").clone()
 }
 
 #[cfg(test)]

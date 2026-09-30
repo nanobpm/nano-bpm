@@ -44,7 +44,10 @@ test("under-provisioned folds a multi-worker suggestion into the badge", () => {
     rec({ class: "under-provisioned", suggestWorkerDelta: 3 }),
   );
   assert.equal(label, "Under-provisioned · +3 workers");
-  assert.equal(PROVISIONING_BADGE["under-provisioned"]?.label, "Under-provisioned");
+  assert.equal(
+    PROVISIONING_BADGE["under-provisioned"]?.label,
+    "Under-provisioned",
+  );
 });
 
 test("server-bound shows its badge but never suggests scaling workers", () => {

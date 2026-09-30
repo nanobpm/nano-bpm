@@ -13,9 +13,9 @@
 mod console_api;
 #[cfg(feature = "console")]
 mod consumers;
+mod falcon;
 #[cfg(feature = "console")]
 mod provisioning;
-mod falcon;
 mod query;
 mod response_contract;
 mod stub_impls;
