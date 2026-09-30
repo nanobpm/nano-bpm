@@ -1617,15 +1617,23 @@ pub fn provisioning_signals() -> ProvisioningSignals {
             .find(|l| l.get_name() == "job_type")
             .map(|l| l.get_value().to_string())
     }
-    // `Collector::collect` on a `*Vec` yields its single `MetricFamily`; take it.
-    for metric in m.job_type_activatable.collect()[0].get_metric() {
-        if let Some(jt) = job_type_of(metric) {
-            per_type.entry(jt).or_default().activatable = metric.get_gauge().get_value() as i64;
+    // `Collector::collect` on a `*Vec` yields exactly one `MetricFamily`, whose
+    // metric list is empty until a labeled child exists. Iterate the returned
+    // families rather than indexing `[0]` so an idle gateway (no labeled children
+    // yet) reads an empty snapshot by construction instead of relying on the
+    // collector always returning a length-one vector.
+    for family in m.job_type_activatable.collect() {
+        for metric in family.get_metric() {
+            if let Some(jt) = job_type_of(metric) {
+                per_type.entry(jt).or_default().activatable = metric.get_gauge().get_value() as i64;
+            }
         }
     }
-    for metric in m.job_type_workers.collect()[0].get_metric() {
-        if let Some(jt) = job_type_of(metric) {
-            per_type.entry(jt).or_default().workers = metric.get_gauge().get_value() as i64;
+    for family in m.job_type_workers.collect() {
+        for metric in family.get_metric() {
+            if let Some(jt) = job_type_of(metric) {
+                per_type.entry(jt).or_default().workers = metric.get_gauge().get_value() as i64;
+            }
         }
     }
     // The dispatched counter is cumulative and is NOT removed by
@@ -1637,11 +1645,13 @@ pub fn provisioning_signals() -> ProvisioningSignals {
     // false backlog growth / under-provisioning. Apply the counter only to job
     // types the current activatable/worker gauges already introduced (`get_mut`),
     // so a type with no live backlog/worker signal contributes no sample at all.
-    for metric in m.job_type_dispatched_total.collect()[0].get_metric() {
-        if let Some(jt) = job_type_of(metric)
-            && let Some(entry) = per_type.get_mut(&jt)
-        {
-            entry.dispatched_total = metric.get_counter().get_value() as u64;
+    for family in m.job_type_dispatched_total.collect() {
+        for metric in family.get_metric() {
+            if let Some(jt) = job_type_of(metric)
+                && let Some(entry) = per_type.get_mut(&jt)
+            {
+                entry.dispatched_total = metric.get_counter().get_value() as u64;
+            }
         }
     }
 
@@ -2049,5 +2059,34 @@ mod tests {
             "the live type picks up its cumulative counter"
         );
         remove_job_type_provisioning(jt);
+    }
+
+    #[test]
+    fn collecting_a_label_vector_with_no_children_yields_one_empty_family() {
+        // Panic-surface guard (Copilot review): `provisioning_signals` iterates the
+        // families returned by `*Vec::collect()`. An idle console-enabled gateway
+        // has no labeled children on its first provisioning tick, so this pins the
+        // invariant the reader relies on — `collect()` returns exactly one
+        // `MetricFamily` whose metric list is empty, never a zero-length vector that
+        // would make the old `collect()[0]` indexing panic. If a future prometheus
+        // bump ever changed that shape, this fails instead of the reader panicking
+        // in production.
+        let v =
+            prometheus::IntGaugeVec::new(prometheus::Opts::new("test_empty_vec", "guard"), &["k"])
+                .expect("vec builds");
+        let families = prometheus::core::Collector::collect(&v);
+        assert_eq!(families.len(), 1, "a label vector collects to one family");
+        assert!(
+            families[0].get_metric().is_empty(),
+            "no labeled children -> the family carries zero metrics"
+        );
+        // And iterating it (as the reader does) simply runs the body zero times.
+        let mut seen = 0;
+        for family in prometheus::core::Collector::collect(&v) {
+            for _metric in family.get_metric() {
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 0, "an empty label vector contributes no samples");
     }
 }
