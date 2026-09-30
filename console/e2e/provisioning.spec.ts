@@ -154,6 +154,41 @@ test.describe("worker provisioning panel", () => {
     noCrash();
   });
 
+  test("writer-only saturation says throughput-bound, not the ceiling", async ({
+    page,
+  }) => {
+    const noCrash = assertNoPageCrash(page);
+    // serverBound tripped on writer-duty saturation alone (writerBusyRatio >
+    // 0.85) with the throughput-ceiling LED NOT lit — the notice must not claim
+    // the ceiling is active.
+    await stubProvisioning(page, {
+      ...baseAdvice,
+      serverBound: true,
+      writerBusyRatio: 0.9,
+      ceilingThroughput: false,
+      recommendations: [
+        rec({
+          jobType: "enrich:crm",
+          class: "server-bound",
+          backlog: 300,
+          backlogSlopePerS: 200,
+          drainPerS: 50,
+          workers: 4,
+          suggestWorkerDelta: 0,
+          rationale: "server throughput-bound (writer saturated).",
+        }),
+      ],
+    });
+    await page.goto("workers");
+
+    const note = page.getByTestId("provisioning-server-bound-note");
+    await expect(note).toBeVisible();
+    await expect(note).toContainText("throughput-bound");
+    await expect(note).not.toContainText("throughput ceiling");
+    await expect(note).toContainText("90% busy");
+    noCrash();
+  });
+
   test("shows the empty state when no job type has a live signal", async ({
     page,
   }) => {

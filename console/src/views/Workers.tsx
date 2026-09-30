@@ -630,9 +630,14 @@ function ProvisioningPanel() {
           className="mb-3 rounded border border-warn/30 bg-warn/10 px-3 py-2 text-xs text-warn"
           data-testid="provisioning-server-bound-note"
         >
-          The server is at its throughput ceiling (writer{" "}
-          {Math.round(data.writerBusyRatio * 100)}% busy) — adding workers won't
-          raise aggregate throughput; relieve the server instead.
+          {data.ceilingThroughput
+            ? // The throughput-ceiling LED is actually lit — name it.
+              "The server is at its throughput ceiling"
+            : // Writer-duty saturation alone tripped serverBound — the ceiling LED
+              // is not active, so use the broader "throughput-bound" wording.
+              "The server is throughput-bound (writer saturated)"}{" "}
+          (writer {Math.round(data.writerBusyRatio * 100)}% busy) — adding workers
+          won't raise aggregate throughput; relieve the server instead.
         </div>
       )}
       {error && (

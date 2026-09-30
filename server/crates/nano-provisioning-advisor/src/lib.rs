@@ -429,6 +429,7 @@ pub fn advise(prev: &Snapshot, cur: &Snapshot) -> Advice {
             backlog_slope_per_s,
             drain_per_s,
             server_bound,
+            cur.ceiling_throughput,
             writer_busy_ratio,
             p.is_some() && has_window,
         );
@@ -472,6 +473,7 @@ fn classify(
     slope: f64,
     drain: f64,
     server_bound: bool,
+    ceiling_throughput: bool,
     writer_ratio: f64,
     have_rates: bool,
 ) -> (Class, Confidence, i64, String) {
@@ -502,13 +504,23 @@ fn classify(
     // 2. Server-bound: this type is falling behind but the wall is the single-writer
     //    server, not the workers. Scaling workers won't raise aggregate throughput.
     if server_bound && backlog > MIN_BACKLOG && slope > MIN_SLOPE_PER_S {
+        // `server_bound` is the OR of the throughput-ceiling LED and writer-duty
+        // saturation (`writer_busy_ratio > WRITER_SATURATED`). Only the former means
+        // the ceiling LED is actually lit, so claim "at its throughput ceiling"
+        // solely then; for writer-only saturation use the broader "throughput-bound"
+        // wording so the rationale never asserts a ceiling that is not active.
+        let wall = if ceiling_throughput {
+            "the server is at its throughput ceiling"
+        } else {
+            "the server is throughput-bound (writer saturated)"
+        };
         return (
             Class::ServerBound,
             Confidence::High,
             0,
             format!(
-                "backlog {backlog} growing at {:.0}/s, but the server is at its throughput \
-                 ceiling (writer {:.0}% busy) — more workers won't raise aggregate throughput; \
+                "backlog {backlog} growing at {:.0}/s, but {wall} (writer {:.0}% busy) — \
+                 more workers won't raise aggregate throughput; \
                  relieve the server (admission/shed, more partitions, or lower the create rate).",
                 slope,
                 writer_ratio * 100.0
@@ -774,6 +786,12 @@ nanobpm_admission_shed_total{reason="mem_watermark"} 2
         let r = rec(&a, "enrich");
         assert_eq!(r.class, Class::ServerBound);
         assert_eq!(r.suggest_worker_delta, 0);
+        // Ceiling LED is lit ⇒ the rationale may claim the throughput ceiling.
+        assert!(
+            r.rationale.contains("throughput ceiling"),
+            "ceiling-lit rationale should name the ceiling: {}",
+            r.rationale
+        );
     }
 
     #[test]
@@ -786,7 +804,20 @@ nanobpm_admission_shed_total{reason="mem_watermark"} 2
         cur.writer_idle_seconds = 0.05;
         let a = advise(&prev, &cur);
         assert!(a.server_bound);
-        assert_eq!(rec(&a, "enrich").class, Class::ServerBound);
+        let r = rec(&a, "enrich");
+        assert_eq!(r.class, Class::ServerBound);
+        // Writer-only saturation (ceiling LED NOT lit) must not claim the
+        // throughput ceiling is active — it is merely throughput-bound.
+        assert!(
+            !r.rationale.contains("throughput ceiling"),
+            "writer-only saturation must not claim the ceiling: {}",
+            r.rationale
+        );
+        assert!(
+            r.rationale.contains("throughput-bound"),
+            "writer-only saturation should say throughput-bound: {}",
+            r.rationale
+        );
     }
 
     #[test]
