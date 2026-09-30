@@ -132,9 +132,26 @@ function workflowTagPatterns(yml) {
   return out;
 }
 
-test("ls-remote parsing keeps each tag once, peeled or not", () => {
+test("ls-remote parsing maps each tag to its commit, preferring the peeled commit", () => {
   const out = "aaa\trefs/tags/v0.0.24\nbbb\trefs/tags/v0.0.24^{}\nccc\trefs/tags/bojtos-npm-v0.10.0\n";
-  assert.deepEqual(parseLsRemoteTags(out), ["v0.0.24", "bojtos-npm-v0.10.0"]);
+  assert.deepEqual([...parseLsRemoteTags(out)], [["v0.0.24", "bbb"], ["bojtos-npm-v0.10.0", "ccc"]]);
+});
+
+test("an interrupted nano-bernd release (one half tagged) fails closed and names the commit to use", () => {
+  const remote = new Map([["nano-bernd-npm-v0.3.0", "abc12345"]]);
+  assert.throws(
+    () => planTags({ read: fakeRepo(), existingTags: remote }),
+    /partial nano-bernd release: nano-bernd-npm-v0\.3\.0 exists.*git tag nano-bernd-jvm-v0\.3\.0 abc12345/,
+  );
+  const jvmOnly = new Map([["nano-bernd-jvm-v0.3.0", "def67890"]]);
+  assert.throws(() => planTags({ read: fakeRepo(), existingTags: jvmOnly }), /partial nano-bernd release/);
+});
+
+test("nano-bernd tags pointing at different commits fail closed", () => {
+  const remote = new Map([["nano-bernd-npm-v0.3.0", "aaaaaaaa"], ["nano-bernd-jvm-v0.3.0", "bbbbbbbb"]]);
+  assert.throws(() => planTags({ read: fakeRepo(), existingTags: remote }), /point at different commits/);
+  const same = new Map([["nano-bernd-npm-v0.3.0", "aaaaaaaa"], ["nano-bernd-jvm-v0.3.0", "aaaaaaaa"]]);
+  assert.equal(planTags({ read: fakeRepo(), existingTags: same }).filter((p) => p.exists).length, 2);
 });
 
 // --- drift guards against the real repo ---------------------------------------

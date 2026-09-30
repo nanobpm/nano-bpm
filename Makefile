@@ -390,7 +390,8 @@ engine-wasm-check-read-model: ## Type-check engine-wasm with the off-by-default 
 
 .PHONY: release-tags
 release-tags: ## Cut release tags for every train whose version is bumped but untagged (dry run; PUSH=1 to tag origin/main HEAD and push). One tag per push + confirms each release workflow started — see RELEASE.md.
-	node $(PROJECT_ROOT)/scripts/release-tags.mjs $(if $(PUSH),--push)
+	@case "$(PUSH)" in ""|1) ;; *) echo "PUSH must be 1 (push) or unset (dry run), got '$(PUSH)'" >&2; exit 1;; esac
+	node $(PROJECT_ROOT)/scripts/release-tags.mjs $(if $(filter 1,$(PUSH)),--push)
 
 .PHONY: release-engine-wasm
 release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on origin/main HEAD and push it (CI OIDC-publishes). Thin wrapper over scripts/release-tags.mjs.

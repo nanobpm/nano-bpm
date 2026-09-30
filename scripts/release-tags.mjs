@@ -115,6 +115,9 @@ function berndVersion(read) {
  * `only` restricts to the named train ids.
  */
 export function planTags({ read, existingTags, only = null }) {
+  // existingTags: Map<tag, commit> of REMOTE tags (an array of names is accepted
+  // where commits don't matter).
+  const remote = existingTags instanceof Map ? existingTags : new Map([...existingTags].map((t) => [t, null]));
   const known = new Set(TRAINS.map((t) => t.id));
   for (const id of only ?? []) {
     if (!known.has(id)) throw new Error(`unknown train "${id}" (known: ${[...known].join(", ")})`);
@@ -127,21 +130,46 @@ export function planTags({ read, existingTags, only = null }) {
       );
     }
   }
-  const existing = new Set(existingTags);
-  return TRAINS.filter((t) => !only || only.includes(t.id)).map((t) => {
+  const plan = TRAINS.filter((t) => !only || only.includes(t.id)).map((t) => {
     const tag = `${t.tagPrefix}${t.version(read)}`;
-    return { train: t.id, tag, workflows: t.workflows, exists: existing.has(tag) };
+    return { train: t.id, tag, workflows: t.workflows, exists: remote.has(tag), commit: remote.get(tag) ?? null };
   });
+  // Fail closed on a split nano-bernd pair (e.g. an interrupted release: npm
+  // pushed, JVM push failed, main moved on). Tagging the missing half at the
+  // current HEAD would publish one version from two different wasm commits.
+  const pair = plan.filter((p) => BERND_TRAINS.includes(p.train));
+  if (pair.length === 2) {
+    const [a, b] = pair;
+    if (a.exists !== b.exists) {
+      const [have, missing] = a.exists ? [a, b] : [b, a];
+      throw new Error(
+        `partial nano-bernd release: ${have.tag} exists on the remote but ${missing.tag} does not. ` +
+          `Tag the missing half at the SAME commit by hand, then push it alone: ` +
+          `git tag ${missing.tag} ${have.commit ?? "<commit of " + have.tag + ">"} && git push origin refs/tags/${missing.tag}`,
+      );
+    }
+    if (a.exists && a.commit && b.commit && a.commit !== b.commit) {
+      throw new Error(
+        `${a.tag} (${a.commit.slice(0, 8)}) and ${b.tag} (${b.commit.slice(0, 8)}) point at different commits — ` +
+          `the nano-bernd hosts must ship the same wasm; fix the tags before releasing`,
+      );
+    }
+  }
+  return plan;
 }
 
-/** Tag names from `git ls-remote --tags` output (peeled `^{}` entries collapsed). */
+/**
+ * Remote tags from `git ls-remote --tags` output as `Map<tag, commit>`. An
+ * annotated tag's peeled `^{}` line (the commit) wins over the tag object id.
+ */
 export function parseLsRemoteTags(out) {
-  const tags = new Set();
+  const tags = new Map();
   for (const line of out.split("\n")) {
-    const m = line.match(/\trefs\/tags\/(.+?)(\^\{\})?$/);
-    if (m) tags.add(m[1]);
+    const m = line.match(/^([0-9a-f]+)\trefs\/tags\/(.+?)(\^\{\})?$/);
+    if (!m) continue;
+    if (m[3] || !tags.has(m[2])) tags.set(m[2], m[1]);
   }
-  return [...tags];
+  return tags;
 }
 
 /**
