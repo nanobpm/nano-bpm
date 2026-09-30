@@ -205,6 +205,43 @@ pub struct ConsumersResponse {
     pub consumers: Vec<Consumer>,
 }
 
+/// Live subscribed-worker count per job type contributed by the **REST** transport
+/// (`activateJobs` long-pollers), the transport `falcon::Registry::workers_per_type`
+/// cannot see.
+///
+/// Why this exists (issue #1294): the worker-provisioning monitor flags a job type
+/// as *starved* when jobs are waiting but the subscribed-worker count is zero. That
+/// count came only from the Falcon registry (persistent WebSocket subscribers), so a
+/// fleet that serves a job type purely over REST long-polling — which holds no
+/// subscription the registry can enumerate — read as **zero workers** and was
+/// falsely reported as starved even while actively draining. Folding the live REST
+/// consumers into the count closes that false-positive.
+///
+/// A worker is counted while it is **live** (its long-poll window is open, or it
+/// re-polled within the stale grace) — the same liveness notion the consumers panel
+/// shows — so a worker that has actually stopped polling stops counting and a
+/// genuinely unserved type can still surface as starved. Distinct `worker` names are
+/// counted per job type (a single worker polling twice counts once), mirroring the
+/// Falcon roster width. Pure over `REST_POLLS`; a cheap map fold off the hot path.
+pub fn rest_workers_per_type() -> HashMap<String, usize> {
+    let now = now_ms();
+    let stale = rest_stale_ms();
+    let polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    let mut by_type: HashMap<String, std::collections::HashSet<&str>> = HashMap::new();
+    for ((job_type, worker), p) in polls.iter() {
+        if rest_live(p, now, stale) {
+            by_type
+                .entry(job_type.clone())
+                .or_default()
+                .insert(worker.as_str());
+        }
+    }
+    by_type
+        .into_iter()
+        .map(|(jt, workers)| (jt, workers.len()))
+        .collect()
+}
+
 /// Builds the consumers snapshot: pruned REST polls + live Falcon subscriptions,
 /// each tagged with a transport-appropriate live/idle status. Prunes evicted
 /// REST entries as a side effect (read is the natural sweep point).
@@ -424,6 +461,33 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "live", "re-poll refreshes to live");
         clear("t-refresh:");
+    }
+
+    #[test]
+    fn rest_workers_per_type_counts_live_distinct_pollers() {
+        // The open-question fix (issue #1294): a job type served purely over REST
+        // long-polling must contribute to the worker count so it is not falsely
+        // read as starved. Two distinct live workers ⇒ 2; a repeat name counts
+        // once; a stale (idle) poller does not count.
+        let jt = "t-rw:review";
+        clear("t-rw:");
+        let now = now_ms();
+        // Two distinct live workers (open long-poll windows).
+        insert_poll(jt, "agent-a", now, now + 30_000);
+        insert_poll(jt, "agent-b", now, now + 30_000);
+        // Same name as agent-a re-polling ⇒ must not double-count.
+        insert_poll(jt, "agent-a", now, now + 30_000);
+        // A poller gone past the stale window with a closed window ⇒ not live.
+        let aged = now.saturating_sub(rest_stale_ms() + 1_000);
+        insert_poll(jt, "agent-idle", aged, aged);
+
+        let counts = rest_workers_per_type();
+        assert_eq!(
+            counts.get(jt).copied(),
+            Some(2),
+            "two distinct live REST workers, deduped, idle excluded"
+        );
+        clear("t-rw:");
     }
 
     #[test]

@@ -27,10 +27,19 @@ import {
 import {
   exportWorkersApp,
   getConsumers,
+  getProvisioning,
   type Consumer,
   type ConsumerTransport,
+  type ProvisioningRecommendation,
   type WorkerLogLine,
 } from "../lib/api";
+import {
+  hasProvisioningSignal,
+  PROVISIONING_BADGE,
+  provisioningBadgeLabel,
+  provisioningTrend,
+  provisioningTrendLabel,
+} from "../lib/provisioning";
 import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
 import { Button, PageHeader, SectionLabel } from "../components/ui";
@@ -465,6 +474,7 @@ function RunningTab({
 }) {
   return (
     <div className="min-h-0 flex-1 overflow-auto p-6">
+      <ProvisioningPanel />
       <LiveConsumersPanel />
       <table className="w-full text-left text-sm">
         <thead className="text-xs uppercase tracking-wide text-fg-faint">
@@ -578,6 +588,133 @@ const TRANSPORTS: {
     hint: "command-stream WebSocket",
   },
 ];
+
+/**
+ * Per-job-type worker-provisioning panel (issue #1294). Surfaces the fleet-sizing
+ * hint the engine already computes but never exposed to a human: for each job
+ * type, waiting jobs, subscribed workers, drain rate and a trend, plus a badge —
+ * **Starved** (jobs waiting, zero workers), **Under-provisioned** (backlog growing
+ * with server headroom, with the suggested worker count) or **Server-bound** (the
+ * throughput ceiling is engaged, so adding workers wouldn't help). The
+ * classification and worker sizing come straight from the shared advisor over the
+ * `/console/api/provisioning` endpoint — the thresholds are never reimplemented
+ * here. Polls every 2s to build the rate window and stay current.
+ */
+function ProvisioningPanel() {
+  const { data, error } = useQuery({
+    queryKey: ["provisioning"],
+    queryFn: getProvisioning,
+    refetchInterval: 2000,
+  });
+
+  // Sort is server-side (most actionable first); only surface job types that
+  // have a live signal (waiting jobs, workers, or an actionable class) so an
+  // idle instance shows an empty, not noisy, panel.
+  const recs = (data?.recommendations ?? []).filter(hasProvisioningSignal);
+
+  return (
+    <section className="mb-6" data-testid="provisioning-panel">
+      <div className="mb-2 flex items-baseline justify-between">
+        <SectionLabel>Job type provisioning</SectionLabel>
+        <span className="text-xs text-fg-faint">
+          fleet-sizing hint · refreshes every 2s
+        </span>
+      </div>
+      <p className="mb-3 text-xs text-fg-muted">
+        Per job type: waiting jobs, subscribed workers (stream and REST) and the
+        drain rate, with a hint when a type is starved of workers, falling behind,
+        or capped by the server itself.
+      </p>
+      {data?.serverBound && (
+        <div
+          className="mb-3 rounded border border-warn/30 bg-warn/10 px-3 py-2 text-xs text-warn"
+          data-testid="provisioning-server-bound-note"
+        >
+          The server is at its throughput ceiling (writer{" "}
+          {Math.round(data.writerBusyRatio * 100)}% busy) — adding workers won't
+          raise aggregate throughput; relieve the server instead.
+        </div>
+      )}
+      {error && (
+        <div className="mb-3 rounded border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+          Couldn't load provisioning: {(error as Error).message}
+        </div>
+      )}
+      <div className="rounded border border-edge bg-raised/40">
+        {recs.length === 0 ? (
+          <div className="px-3 py-4 text-xs text-fg-faint">
+            No job types with waiting work or connected workers right now.
+          </div>
+        ) : (
+          <table className="w-full text-left text-sm">
+            <thead className="text-xs uppercase tracking-wide text-fg-faint">
+              <tr className="border-b border-edge/60">
+                <th className="py-1.5 pl-3 pr-4">Job type</th>
+                <th className="py-1.5 pr-4 text-right">Waiting</th>
+                <th className="py-1.5 pr-4 text-right">Workers</th>
+                <th className="py-1.5 pr-4 text-right">Drain/s</th>
+                <th className="py-1.5 pr-4 text-right">Trend</th>
+                <th className="py-1.5 pr-3">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recs.map((r) => (
+                <ProvisioningRow key={r.jobType} rec={r} />
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/// Visual treatment for each provisioning class lives in `../lib/provisioning`
+/// (pure + unit-tested); the row below only lays it out.
+
+function ProvisioningRow({ rec }: { rec: ProvisioningRecommendation }) {
+  const badgeLabel = provisioningBadgeLabel(rec);
+  const badgeClass = PROVISIONING_BADGE[rec.class]?.className;
+  const trend = provisioningTrend(rec.backlogSlopePerS);
+  const trendClass =
+    trend === "growing"
+      ? "text-warn"
+      : trend === "draining"
+        ? "text-ok"
+        : "text-fg-faint";
+  return (
+    <tr
+      className="border-b border-edge/40 align-top last:border-0"
+      data-testid={`provisioning-row-${rec.jobType}`}
+      data-class={rec.class}
+    >
+      <td className="py-1.5 pl-3 pr-4 font-mono text-xs">{rec.jobType}</td>
+      <td className="py-1.5 pr-4 text-right tabular-nums">{rec.backlog}</td>
+      <td className="py-1.5 pr-4 text-right tabular-nums">{rec.workers}</td>
+      <td className="py-1.5 pr-4 text-right tabular-nums">
+        {rec.drainPerS.toFixed(1)}
+      </td>
+      <td className={`py-1.5 pr-4 text-right tabular-nums ${trendClass}`}>
+        {provisioningTrendLabel(rec.backlogSlopePerS)}
+      </td>
+      <td className="py-1.5 pr-3">
+        {badgeLabel ? (
+          <span className="inline-flex flex-col gap-1">
+            <span
+              className={`inline-block w-fit rounded border px-1.5 py-0.5 text-xs font-medium ${badgeClass}`}
+              data-testid={`provisioning-badge-${rec.jobType}`}
+            >
+              {badgeLabel}
+            </span>
+            <span className="text-xs text-fg-faint">{rec.rationale}</span>
+          </span>
+        ) : (
+          <span className="text-xs text-fg-faint">{rec.rationale}</span>
+        )}
+      </td>
+    </tr>
+  );
+}
 
 /**
  * Live "who is polling what" panel (issue #404). The table above lists

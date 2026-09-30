@@ -13,6 +13,8 @@
 mod console_api;
 #[cfg(feature = "console")]
 mod consumers;
+#[cfg(feature = "console")]
+mod provisioning;
 mod falcon;
 mod query;
 mod response_contract;
@@ -22239,6 +22241,7 @@ mod console_observe_guard_tests {
             "/console/api/cluster/health",
             "/console/api/cluster/metrics",
             "/console/api/metrics",
+            "/console/api/provisioning",
             "/console/api/instances",
             "/console/api/instances/42",
             "/console/api/traces",
@@ -23694,6 +23697,18 @@ async fn main() {
                     }),
                 );
             }
+            // Per-job-type worker-provisioning advice (issue #1294): the fleet-sizing
+            // hint — waiting jobs, subscribed workers, drain rate, and a
+            // starved / under-provisioned / server-bound classification with a
+            // suggested worker count. Derived from the same gauges the monitor tick
+            // publishes and the shared advisor the ProcessOS cockpit uses, so the
+            // thresholds are computed once (never in TypeScript). A GET
+            // observability read, served in observe (read-only) mode too, gated by
+            // the console feature + `console_enabled()` like the other reads.
+            console = console.route(
+                "/console/api/provisioning",
+                axum::routing::get(|| async { axum::Json(crate::provisioning::latest()) }),
+            );
             // "Stop the app before updating it" gate (issue #889): a single
             // server-side chokepoint that refuses project-mutating requests with
             // 409 `app_running` while the project is running. Layered over the
@@ -24182,14 +24197,33 @@ async fn main() {
                     prev_tier2_pressured = now_pressured;
                 }
                 let workers = monitor_registry.workers_per_type();
+                // Fold in the REST long-poll transport (issue #1294): the Falcon
+                // registry only enumerates persistent WebSocket subscribers, so a
+                // job type served purely over `activateJobs` long-polling would show
+                // zero workers and be *falsely* flagged starved while actively
+                // draining. `rest_workers_per_type` contributes the live REST
+                // consumers so the provisioning signal counts both transports.
+                #[cfg(feature = "console")]
+                let rest_workers = crate::consumers::rest_workers_per_type();
+                #[cfg(not(feature = "console"))]
+                let rest_workers: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
                 let mut current: std::collections::HashSet<String> =
-                    std::collections::HashSet::with_capacity(activatable.len() + workers.len());
-                for job_type in activatable.keys().chain(workers.keys()) {
+                    std::collections::HashSet::with_capacity(
+                        activatable.len() + workers.len() + rest_workers.len(),
+                    );
+                for job_type in activatable
+                    .keys()
+                    .chain(workers.keys())
+                    .chain(rest_workers.keys())
+                {
                     current.insert(job_type.clone());
                 }
                 for job_type in &current {
                     let waiting = *activatable.get(job_type).unwrap_or(&0) as i64;
-                    let workers = *workers.get(job_type).unwrap_or(&0) as i64;
+                    let workers = (*workers.get(job_type).unwrap_or(&0)
+                        + *rest_workers.get(job_type).unwrap_or(&0))
+                        as i64;
                     crate::metrics::set_job_type_provisioning(job_type, waiting, workers);
                 }
                 // Zero out job types that disappeared this tick so their gauges
@@ -24198,6 +24232,15 @@ async fn main() {
                     crate::metrics::set_job_type_provisioning(job_type, 0, 0);
                 }
                 seen_job_types = current;
+
+                // Recompute the per-job-type provisioning advice from the freshly
+                // published gauges for the console's fleet-sizing panel (#1294):
+                // diff this scrape against the previous one to size the drain/backlog
+                // rate window, reusing the shared advisor's classification so the
+                // starved / under-provisioned / server-bound thresholds live in one
+                // place (never reimplemented in TypeScript). Console builds only.
+                #[cfg(feature = "console")]
+                crate::provisioning::tick();
 
                 // Engine-actor (deepthi) heartbeat per owned partition: the
                 // dead/wedged/idle discriminator for the sustained-load

@@ -570,3 +570,71 @@ export async function getConsumers(): Promise<ConsumersResponse> {
   }
   return (await res.json()) as ConsumersResponse;
 }
+
+// --- Worker-provisioning advice panel (issue #1294) -------------------------
+
+/// Per-job-type provisioning classification from the shared worker-scaling
+/// advisor. Kebab-case on the wire (Rust `serde(rename_all = "kebab-case")`):
+/// - `starved`: jobs waiting, zero workers subscribed — no drain capacity.
+/// - `under-provisioned`: workers present but backlog growing with server headroom.
+/// - `server-bound`: backlog growing but the server is at its throughput ceiling —
+///   more workers won't help.
+/// - `adequate`: backlog small or shrinking.
+/// - `warming`: not enough history yet (first scrape) to judge rates.
+export type ProvisioningClass =
+  | "starved"
+  | "under-provisioned"
+  | "server-bound"
+  | "adequate"
+  | "warming";
+
+/// Confidence in a recommendation.
+export type ProvisioningConfidence = "high" | "medium" | "low";
+
+/// One job type's provisioning recommendation, as reported by the engine's
+/// `/console/api/provisioning` endpoint.
+export interface ProvisioningRecommendation {
+  jobType: string;
+  class: ProvisioningClass;
+  confidence: ProvisioningConfidence;
+  /** Jobs waiting for pickup right now. */
+  backlog: number;
+  /** Backlog growth over the window (jobs/s; negative = draining). */
+  backlogSlopePerS: number;
+  /** Jobs handed to workers over the window (jobs/s) — the drain rate. */
+  drainPerS: number;
+  /** Subscribed workers (both stream and REST long-poll transports). */
+  workers: number;
+  /** Suggested change to the worker count (0 = leave alone). */
+  suggestWorkerDelta: number;
+  /** Human-readable explanation of the classification. */
+  rationale: string;
+}
+
+/// The advisor's whole-instance provisioning verdict for the latest window.
+export interface ProvisioningAdvice {
+  /** True when the server itself is the bottleneck — scaling workers won't help. */
+  serverBound: boolean;
+  /** Journal-writer duty cycle over the window (busy fraction, 0..1). */
+  writerBusyRatio: number;
+  /** The throughput-ceiling clipping LED. */
+  ceilingThroughput: boolean;
+  pendingCreateQueue: number;
+  /** Admissions shed over the window (delta). */
+  shedDelta: number;
+  /** Seconds between the two samples this advice was computed over. */
+  windowS: number;
+  recommendations: ProvisioningRecommendation[];
+}
+
+/// Fetches the latest per-job-type worker-provisioning advice. Hand-written (not
+/// spec-first) for the same reason as `getConsumers`: it reads a gateway-level
+/// engine endpoint, not the console's own CRUD API.
+export async function getProvisioning(): Promise<ProvisioningAdvice> {
+  const res = await fetch("/console/api/provisioning");
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `provisioning → HTTP ${res.status}`);
+  }
+  return (await res.json()) as ProvisioningAdvice;
+}
