@@ -148,21 +148,107 @@ fn parse_scalar(text: &str, name: &str) -> Option<f64> {
     None
 }
 
-/// Extracts the string value of a single label from a Prometheus label set body
-/// (the text between `{` and `}`), e.g. `job_type="foo",worker="w"` → for `job_type`,
-/// `Some("foo")`.
-fn label_value<'a>(labels: &'a str, key: &str) -> Option<&'a str> {
-    for pair in labels.split(',') {
-        let pair = pair.trim();
-        if let Some(rest) = pair.strip_prefix(key) {
-            let rest = rest.trim_start();
-            if let Some(rest) = rest.strip_prefix('=') {
-                let rest = rest.trim().trim_matches('"');
-                return Some(rest);
+/// One parsed `key="value"` pair out of a Prometheus label set. The value is
+/// owned because escape sequences (`\\`, `\"`, `\n`) are decoded.
+#[derive(Debug, PartialEq, Eq)]
+struct LabelPair {
+    key: String,
+    value: String,
+}
+
+/// Parses a Prometheus label-set body (the text between `{` and `}`) into its
+/// pairs, honouring the exposition-format quoted-string grammar: label values
+/// are double-quoted, may legally contain `,`, `=` and `{`/`}`, and support the
+/// escape sequences `\\`, `\"` and `\n`. A naive `split(',')` truncates a value
+/// like `job_type="a,b"` at the embedded comma — merging two distinct job types
+/// into one and returning incorrect worker/backlog advice — so the pairs are
+/// scanned properly. Returns `None` on malformed input (the caller skips the
+/// series rather than misreading it).
+fn parse_labels(labels: &str) -> Option<Vec<LabelPair>> {
+    let mut pairs = Vec::new();
+    let cs: Vec<char> = labels.chars().collect();
+    let mut i = 0;
+    loop {
+        // Skip whitespace and the commas between pairs.
+        while i < cs.len() && (cs[i].is_whitespace() || cs[i] == ',') {
+            i += 1;
+        }
+        if i >= cs.len() {
+            return Some(pairs);
+        }
+        // Bare key up to `=`.
+        let mut key = String::new();
+        while i < cs.len() && cs[i] != '=' {
+            if cs[i] == '"' || cs[i] == '{' || cs[i] == '}' {
+                return None; // malformed: quote/brace inside a bare key
+            }
+            key.push(cs[i]);
+            i += 1;
+        }
+        if i >= cs.len() {
+            return None; // key with no `=`
+        }
+        i += 1; // consume `=`
+        let key = key.trim().to_string();
+        if key.is_empty() {
+            return None;
+        }
+        // Optional whitespace, then the opening quote of the value.
+        while i < cs.len() && cs[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= cs.len() || cs[i] != '"' {
+            return None; // unquoted value — not the exposition format
+        }
+        i += 1; // consume opening quote
+        // Quoted value with escape decoding; runs to the closing quote, so
+        // embedded commas and `=` are content, not separators.
+        let mut value = String::new();
+        let mut closed = false;
+        while i < cs.len() {
+            match cs[i] {
+                '"' => {
+                    closed = true;
+                    i += 1;
+                    break;
+                }
+                '\\' => {
+                    i += 1;
+                    if i >= cs.len() {
+                        return None; // dangling escape — unterminated
+                    }
+                    match cs[i] {
+                        '\\' => value.push('\\'),
+                        '"' => value.push('"'),
+                        'n' => value.push('\n'),
+                        // Unknown escape: keep it verbatim rather than dropping a char.
+                        other => {
+                            value.push('\\');
+                            value.push(other);
+                        }
+                    }
+                    i += 1;
+                }
+                c => {
+                    value.push(c);
+                    i += 1;
+                }
             }
         }
+        if !closed {
+            return None; // unterminated quoted value
+        }
+        pairs.push(LabelPair { key, value });
     }
-    None
+}
+
+/// Extracts the decoded string value of a single label from a Prometheus label
+/// set body, e.g. `job_type="foo",worker="w"` → for `job_type`, `Some("foo")`.
+fn label_value(labels: &str, key: &str) -> Option<String> {
+    parse_labels(labels)?
+        .into_iter()
+        .find(|p| p.key == key)
+        .map(|p| p.value)
 }
 
 /// Iterates `(labels, value)` for every series of `name` in the text.
@@ -199,8 +285,9 @@ pub fn parse_snapshot(text: &str, ts_ms: u64) -> Snapshot {
         upsert(labels, &|s| s.dispatched_total = v as u64);
     }
 
-    let ceiling_throughput = each_series(text, "nanobpm_ceiling_active")
-        .any(|(labels, v)| label_value(labels, "ceiling") == Some("throughput") && v != 0.0);
+    let ceiling_throughput = each_series(text, "nanobpm_ceiling_active").any(|(labels, v)| {
+        label_value(labels, "ceiling").as_deref() == Some("throughput") && v != 0.0
+    });
     let shed_total: f64 = each_series(text, "nanobpm_admission_shed_total")
         .map(|(_, v)| v)
         .sum();
@@ -476,6 +563,37 @@ nanobpm_admission_shed_total{reason="mem_watermark"} 2
         assert_eq!(s.writer_idle_seconds, 7.5);
         assert_eq!(s.pending_create_queue, 42);
         assert_eq!(s.admission_shed_total, 5);
+    }
+
+    /// Label values are quoted and may legally contain commas, `=` and braces —
+    /// a naive `split(',')` would truncate `job_type="a,b"` to `a` and merge two
+    /// distinct job types into one row of advice. The quoted-string grammar must
+    /// keep them apart.
+    #[test]
+    fn label_values_with_commas_and_escapes_parse_correctly() {
+        let text = "nanobpm_job_type_workers{job_type=\"a,b\"} 2\n\
+                    nanobpm_job_type_workers{job_type=\"a\"} 5\n\
+                    nanobpm_job_type_workers{job_type=\"x=1\"} 3\n\
+                    nanobpm_job_type_workers{job_type=\"q\\\"z\"} 7\n\
+                    nanobpm_job_type_workers{job_type=\"back\\\\slash\"} 11\n";
+        let s = parse_snapshot(text, 1000);
+        assert_eq!(s.per_type.get("a,b").map(|j| j.workers), Some(2));
+        assert_eq!(s.per_type.get("a").map(|j| j.workers), Some(5));
+        assert_eq!(s.per_type.get("x=1").map(|j| j.workers), Some(3));
+        assert_eq!(s.per_type.get("q\"z").map(|j| j.workers), Some(7));
+        assert_eq!(s.per_type.get("back\\slash").map(|j| j.workers), Some(11));
+        assert_eq!(s.per_type.len(), 5, "no truncated/merged job types");
+    }
+
+    /// A malformed series (unterminated quote) is skipped, never misparsed into
+    /// a neighbouring job type.
+    #[test]
+    fn malformed_label_series_is_skipped_not_misparsed() {
+        let text = "nanobpm_job_type_workers{job_type=\"unterminated} 9\n\
+                    nanobpm_job_type_workers{job_type=\"ok\"} 4\n";
+        let s = parse_snapshot(text, 1000);
+        assert_eq!(s.per_type.len(), 1);
+        assert_eq!(s.per_type.get("ok").map(|j| j.workers), Some(4));
     }
 
     #[test]

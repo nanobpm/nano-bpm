@@ -351,7 +351,13 @@ impl Registry {
     /// `conns` while touching `subs` and can't contend with the dispatcher /
     /// register / unregister on the hot path. The reaper independently evicts
     /// silent connections, so a reaped consumer simply stops appearing here.
-    #[cfg(feature = "console")]
+    /// Always built (not console-gated): the consumers registry it feeds is
+    /// always compiled so the REST worker count stays honest on every build —
+    /// only the console routes stay feature-gated (issue #1294). On a
+    /// non-console build nothing outside tests calls it yet, so the dead-code
+    /// lint is allowed rather than the method gated (gating would let the two
+    /// builds' registries drift).
+    #[cfg_attr(not(feature = "console"), allow(dead_code))]
     pub fn consumers(&self) -> Vec<FalconConsumer> {
         let mut out = Vec::new();
         for conn in self.all_connections() {
@@ -371,8 +377,9 @@ impl Registry {
 
 /// One live Falcon (command-stream) job consumer — a single `(connection, job
 /// type)` subscription. Returned by [`Registry::consumers`] for the console
-/// consumers panel.
-#[cfg(feature = "console")]
+/// consumers panel. Console-route-only on a non-console build — allowed, not
+/// gated, so the shape cannot drift from the always-built registry.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconConsumer {
     /// The job type this subscription pulls.
@@ -386,8 +393,10 @@ pub struct FalconConsumer {
 /// The Falcon connection-liveness deadline (millis) the reaper enforces (default
 /// [`LIVENESS_TIMEOUT_MS`], overridable via `NANOBPMN_STREAM_LIVENESS_MS`). The
 /// consumers panel reuses it so its notion of a "stale" Falcon consumer matches
-/// the engine's own reap threshold.
-#[cfg(feature = "console")]
+/// the engine's own reap threshold. Always built: the consumers registry that
+/// reads it is compiled on every build (issue #1294); console-route-only at
+/// runtime, so the lint is allowed on non-console builds rather than gated.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
 pub fn falcon_liveness_timeout_ms() -> u64 {
     liveness_timeout_ms()
 }

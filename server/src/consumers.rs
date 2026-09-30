@@ -173,6 +173,12 @@ fn upsert_rest_poll(
 }
 
 /// One live job consumer surfaced to the console panel.
+///
+/// Only the console `/console/api/consumers` route (and tests) constructs or
+/// serializes this; the always-built REST tracker above never does, so on a
+/// non-console build it is legitimately dead — allowed, not gated, so the
+/// payload definition cannot drift from the always-built tracker.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Consumer {
@@ -192,6 +198,8 @@ pub struct Consumer {
 
 /// The consumers panel payload: the live consumer rows plus the windows used to
 /// compute their status, so the console can label the thresholds it is showing.
+/// Console-route-only on a non-console build — see [`Consumer`].
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsumersResponse {
@@ -244,7 +252,9 @@ pub fn rest_workers_per_type() -> HashMap<String, usize> {
 
 /// Builds the consumers snapshot: pruned REST polls + live Falcon subscriptions,
 /// each tagged with a transport-appropriate live/idle status. Prunes evicted
-/// REST entries as a side effect (read is the natural sweep point).
+/// REST entries as a side effect (read is the natural sweep point). Only the
+/// console route calls this — see [`Consumer`].
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
 pub fn snapshot(registry: &Registry) -> ConsumersResponse {
     let now = now_ms();
     let stale = rest_stale_ms();

@@ -11,7 +11,9 @@
 
 #[cfg(feature = "console")]
 mod console_api;
-#[cfg(feature = "console")]
+// Always built (not console-gated): the REST poll registry feeds the published
+// `nanobpm_job_type_workers` gauge on every build — only the console *routes*
+// that render the data stay feature-gated (issue #1294).
 mod consumers;
 mod falcon;
 #[cfg(feature = "console")]
@@ -16329,13 +16331,17 @@ impl ServerImpl {
         };
         let deadline = long_poll_until.map(|d| tokio::time::Instant::now() + d);
 
-        // Record this poll for the console's live consumers panel (issue #404).
-        // Best-effort observability only, and only in console builds: a single
-        // map upsert that never affects activation. REST is stateless, so this
-        // poll — carrying the effective long-poll window so an in-flight long
-        // poll reads "live", not "idle" — is the only signal that a worker is
-        // connected and pulling this job type.
-        #[cfg(feature = "console")]
+        // Record this poll for the live consumers panel (issue #404) and the
+        // per-job-type worker count (issue #1294). Best-effort observability
+        // only: a single map upsert that never affects activation. REST is
+        // stateless, so this poll — carrying the effective long-poll window so
+        // an in-flight long poll reads "live", not "idle" — is the only signal
+        // that a worker is connected and pulling this job type. Always built
+        // (not console-gated): the `nanobpm_job_type_workers` gauge folds these
+        // live REST consumers in on every build, so a default-feature gateway
+        // never publishes a false zero-worker starvation signal for a REST-only
+        // fleet — a signal the ProcessOS advisor reads straight off `/metrics`.
+        // Only the console *routes* that render the data stay feature-gated.
         crate::consumers::record_rest_poll(
             &job_type,
             &worker,
@@ -24203,11 +24209,11 @@ async fn main() {
                 // zero workers and be *falsely* flagged starved while actively
                 // draining. `rest_workers_per_type` contributes the live REST
                 // consumers so the provisioning signal counts both transports.
-                #[cfg(feature = "console")]
+                // Always built (not console-gated): the published
+                // `nanobpm_job_type_workers` gauge is a public `/metrics` contract
+                // the ProcessOS advisor reads on any build, so it must not report
+                // 0 for an active REST-only fleet on a default-feature gateway.
                 let rest_workers = crate::consumers::rest_workers_per_type();
-                #[cfg(not(feature = "console"))]
-                let rest_workers: std::collections::HashMap<String, usize> =
-                    std::collections::HashMap::new();
                 let mut current: std::collections::HashSet<String> =
                     std::collections::HashSet::with_capacity(
                         activatable.len() + workers.len() + rest_workers.len(),
@@ -38950,5 +38956,92 @@ mod call_activity_hierarchy_read_model_tests {
             "an out-of-i64-range epoch stamp must clamp to the epoch, not wrap negative"
         );
         assert_eq!(ms_to_datetime(u64::MAX), epoch());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "console")]
+mod provisioning_endpoint_tests {
+    //! Issue #1294: the console's TypeScript contract for
+    //! `/console/api/provisioning` (`console/src/lib/api.ts`) is hand-written, so
+    //! a serde rename on the Rust side would silently drift the wire shape the
+    //! panel parses. The `provisioning.rs` unit tests call `compute` directly
+    //! and never exercise the route or its serialized body — this test drives
+    //! the actual axum route and pins the serialized field names: camelCase on
+    //! the advice/recommendation fields, kebab-case on the class/confidence
+    //! enums.
+    use nano_provisioning_advisor::{Advice, Class, Confidence, Recommendation};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn provisioning_endpoint_serializes_the_documented_contract() {
+        let app = axum::Router::new().route(
+            "/console/api/provisioning",
+            axum::routing::get(|| async {
+                axum::Json(Advice {
+                    server_bound: true,
+                    writer_busy_ratio: 0.93,
+                    ceiling_throughput: true,
+                    pending_create_queue: 7,
+                    shed_delta: 2,
+                    window_s: 1.0,
+                    recommendations: vec![Recommendation {
+                        job_type: "pay:invoices".to_string(),
+                        class: Class::UnderProvisioned,
+                        confidence: Confidence::High,
+                        backlog: 200,
+                        backlog_slope_per_s: 100.0,
+                        drain_per_s: 200.0,
+                        workers: 4,
+                        suggest_worker_delta: 2,
+                        rationale: "backlog growing; add ~2 workers.".to_string(),
+                    }],
+                })
+            }),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/console/api/provisioning")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("route responds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+
+        // camelCase top-level advice fields — the exact names the hand-written
+        // `ProvisioningAdvice` interface in console/src/lib/api.ts reads.
+        assert_eq!(body["serverBound"], true);
+        assert_eq!(body["writerBusyRatio"], 0.93);
+        assert_eq!(body["ceilingThroughput"], true);
+        assert_eq!(body["pendingCreateQueue"], 7);
+        assert_eq!(body["shedDelta"], 2);
+        assert_eq!(body["windowS"], 1.0);
+        assert!(
+            body.get("server_bound").is_none(),
+            "snake_case leak — serde rename_all camelCase must hold"
+        );
+
+        // camelCase recommendation fields + kebab-case enums.
+        let rec = &body["recommendations"][0];
+        assert_eq!(rec["jobType"], "pay:invoices");
+        assert_eq!(rec["class"], "under-provisioned");
+        assert_eq!(rec["confidence"], "high");
+        assert_eq!(rec["backlog"], 200);
+        assert_eq!(rec["backlogSlopePerS"], 100.0);
+        assert_eq!(rec["drainPerS"], 200.0);
+        assert_eq!(rec["workers"], 4);
+        assert_eq!(rec["suggestWorkerDelta"], 2);
+        assert_eq!(rec["rationale"], "backlog growing; add ~2 workers.");
+        assert!(
+            rec.get("job_type").is_none() && rec.get("suggest_worker_delta").is_none(),
+            "snake_case leak in the recommendation payload"
+        );
     }
 }
