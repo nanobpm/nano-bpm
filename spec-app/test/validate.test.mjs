@@ -56,6 +56,24 @@ test("network.bind rejects an out-of-enum value with a schema pointer", () => {
   assert.deepEqual(codesFor(result, "/network/bind"), ["schema"]);
 });
 
+test("surfaces.pages.gridLayout accepts the auto/cards enum (nanobpm/nano-ide#572)", async () => {
+  const index = await buildSymbolIndex(models);
+  for (const gridLayout of ["auto", "cards"]) {
+    const m = manifest();
+    m.surfaces = { ...m.surfaces, pages: { enabled: true, gridLayout } };
+    const result = validateManifest(m, index);
+    assert.deepEqual(result.diagnostics, [], `gridLayout=${gridLayout} should validate`);
+  }
+});
+
+test("surfaces.pages.gridLayout rejects an out-of-enum value with a schema pointer", () => {
+  const m = manifest();
+  m.surfaces = { ...m.surfaces, pages: { enabled: true, gridLayout: "table" } };
+  const result = validateManifest(m);
+  assert.equal(result.ok, false);
+  assert.deepEqual(codesFor(result, "/surfaces/pages/gridLayout"), ["schema"]);
+});
+
 test("network block rejects unknown keys (additionalProperties: false)", () => {
   const m = manifest();
   m.network = { bind: "loopback", nope: true };
