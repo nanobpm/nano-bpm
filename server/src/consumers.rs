@@ -142,7 +142,11 @@ fn rest_retained(p: &RestPoll, now: u64, evict: u64) -> bool {
 ///
 /// Each call marks one more poll **in flight** (`in_flight += 1`) so a worker
 /// running overlapping `activateJobs` calls keeps reading live until the last of
-/// them returns (see [`complete_rest_poll`]).
+/// them returns (see [`complete_rest_poll`]). The shared window covers the
+/// *longest* outstanding poll: `live_until_ms` is the max of the prior window and
+/// this call's deadline, so an overlapping shorter/non-blocking poll never
+/// shrinks an already-open longer one (which would read the worker idle while the
+/// longer request is still in flight).
 ///
 /// New keys are refused once [`rest_max`] distinct consumers are retained (after
 /// first pruning dead entries) so a caller pumping unique `(type, worker)` pairs
@@ -152,10 +156,24 @@ pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) {
     let now = now_ms();
     let key = (job_type.to_string(), worker.to_string());
     let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
-    let in_flight = polls.get(&key).map(|p| p.in_flight).unwrap_or(0);
+    let prior = polls.get(&key);
+    let in_flight = prior.map(|p| p.in_flight).unwrap_or(0);
+    // Overlapping polls share one entry keyed by `(job_type, worker)`, so the
+    // window must cover the *longest* outstanding poll, not just the newest
+    // call's. Taking `max` with the prior `live_until_ms` keeps an overlapping
+    // shorter/non-blocking poll (`long_poll_ms` smaller, even 0) from shrinking
+    // an already-open longer window — which would read the worker idle once that
+    // shorter deadline + grace passed even though the longer request is still in
+    // flight (a false zero-worker / starvation signal). `complete_rest_poll`
+    // still clamps the window down to the completion instant once the *last*
+    // in-flight poll returns, so a drained-and-gone worker is not held live.
+    let live_until_ms = prior
+        .map(|p| p.live_until_ms)
+        .unwrap_or(0)
+        .max(now.saturating_add(long_poll_ms));
     let entry = RestPoll {
         last_seen_ms: now,
-        live_until_ms: now.saturating_add(long_poll_ms),
+        live_until_ms,
         in_flight: in_flight.saturating_add(1),
     };
     upsert_rest_poll(&mut polls, key, entry, now, rest_evict_ms(), rest_max());
@@ -663,6 +681,53 @@ mod tests {
             "the window closes once the last in-flight poll returns"
         );
         clear("t-overlap:");
+    }
+
+    #[test]
+    fn overlapping_short_poll_does_not_shrink_a_long_polls_window() {
+        // Deadline-replacement regression (Copilot review): a worker with a 60s
+        // `activateJobs` in flight that then issues an overlapping non-blocking /
+        // short poll shares one entry. Recording the short poll must not replace
+        // the open 60s window with the shorter deadline — otherwise, once the
+        // shorter deadline + grace passes, the worker reads idle even though the
+        // 60s request is still open (a false zero-worker / starvation signal).
+        // The window must cover the *longest* outstanding poll.
+        let jt = "t-maxwin:review";
+        clear("t-maxwin:");
+        // Poll 1 starts a 60s long poll (in_flight 1, window open 60s).
+        record_rest_poll(jt, "agent-mw", 60_000);
+        let key = (jt.to_string(), "agent-mw".to_string());
+        let long_window = REST_POLLS
+            .lock()
+            .unwrap()
+            .get(&key)
+            .expect("poll")
+            .live_until_ms;
+        // Poll 2 (non-blocking, long_poll_ms = 0) starts while poll 1 is open.
+        record_rest_poll(jt, "agent-mw", 0);
+        let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(p.in_flight, 2, "both polls are in flight");
+        assert_eq!(
+            p.live_until_ms, long_window,
+            "the overlapping non-blocking poll must not shrink the open 60s window"
+        );
+        // Even after the short poll's own (zero) window + grace would have passed,
+        // the worker is still live on the strength of the outstanding 60s poll.
+        assert!(
+            rest_live(&p, now_ms(), rest_stale_ms()),
+            "live while the longer overlapping poll is still open"
+        );
+        // The short poll returns; the 60s poll is still in flight, so the window
+        // is untouched (completion only clamps once the last poll returns).
+        complete_rest_poll(jt, "agent-mw");
+        let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert_eq!(p.in_flight, 1, "the 60s poll is still in flight");
+        assert_eq!(
+            p.live_until_ms, long_window,
+            "the surviving 60s window is preserved across the short poll's return"
+        );
+        assert!(rest_live(&p, now_ms(), rest_stale_ms()));
+        clear("t-maxwin:");
     }
 
     #[test]
