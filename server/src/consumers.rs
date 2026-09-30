@@ -146,8 +146,17 @@ fn env_u64(key: &str) -> Option<u64> {
 /// the worker to re-issue. Measuring the grace from the window close (not the
 /// poll start) keeps a long poll live for the full grace *after* it returns,
 /// rather than greying the instant a >`stale` window closes.
+///
+/// An entry with a poll still **in flight** is always live regardless of its
+/// recorded window: a no-wait request records a zero-length window
+/// (`live_until_ms = now`) yet its activation may still be awaiting locally or on
+/// a peer, so the window alone would report it idle (and eventually prune it —
+/// see [`rest_retained`]) while its [`RestPollGuard`] is still armed. Keeping it
+/// live while `in_flight > 0` also keeps it retained, so the armed guard always
+/// has its own registration to release — it can never decrement a *different*,
+/// later-admitted registration for the same key.
 fn rest_live(p: &RestPoll, now: u64, stale: u64) -> bool {
-    now < p.live_until_ms.saturating_add(stale)
+    p.in_flight > 0 || now < p.live_until_ms.saturating_add(stale)
 }
 
 /// Whether a poll should still be retained (live or merely idle) at `now`: kept
@@ -155,8 +164,14 @@ fn rest_live(p: &RestPoll, now: u64, stale: u64) -> bool {
 /// (not `last_seen_ms`) for the same reason as [`rest_live`] — a worker that
 /// just finished a long poll longer than `evict` still gets the eviction grace
 /// to re-issue before its row vanishes.
+///
+/// An entry with a poll still **in flight** is always retained, even past the
+/// eviction grace: its [`RestPollGuard`] is still armed and must find its own
+/// registration to release on completion. Pruning it would let a re-admitted
+/// `(job_type, worker)` key register a *fresh* `in_flight` that the orphaned
+/// guard then decrements on drop — a false zero-worker signal.
 fn rest_retained(p: &RestPoll, now: u64, evict: u64) -> bool {
-    now < p.live_until_ms.saturating_add(evict)
+    p.in_flight > 0 || now < p.live_until_ms.saturating_add(evict)
 }
 
 /// Records that `worker` polled `job_type` over REST (an `activateJobs` call)
@@ -1168,5 +1183,73 @@ mod tests {
             falcon::falcon_liveness_timeout_ms()
         );
         assert!(resp.now_ms > 0);
+    }
+
+    #[test]
+    fn an_in_flight_entry_stays_live_and_retained_past_its_deadline() {
+        // In-flight regression (Copilot review): a no-wait poll records a
+        // zero-length window (`live_until_ms = now`), so once the stale/eviction
+        // grace passes the entry would read idle and be pruned — while its guard
+        // is still armed. A re-admitted `(job_type, worker)` key would then get a
+        // fresh `in_flight` that the orphaned guard decrements on drop. An entry
+        // must stay live and retained while `in_flight > 0`, however far past its
+        // deadline it is.
+        let jt = "t-inflight:review";
+        clear("t-inflight:");
+        let key = (jt.to_string(), "agent-if".to_string());
+        let stale = rest_stale_ms();
+        let evict = rest_evict_ms();
+
+        // Record a no-wait poll (zero-length window) and keep its guard armed.
+        let guard = RestPollGuard::record(jt, "agent-if", 0).expect("admitted");
+        // Backdate the window so its deadline is already past both graces.
+        {
+            let mut polls = REST_POLLS.lock().unwrap();
+            let p = polls.get_mut(&key).expect("poll present");
+            p.live_until_ms = now_ms().saturating_sub(evict + 5_000);
+            p.last_seen_ms = p.live_until_ms;
+        }
+
+        // Still in flight: live and retained even though the deadline is long past.
+        {
+            let polls = REST_POLLS.lock().unwrap();
+            let p = polls.get(&key).expect("poll present");
+            assert_eq!(p.in_flight, 1, "the poll is still in flight");
+            assert!(
+                rest_live(p, now_ms(), stale),
+                "an in-flight entry is live even past its deadline + stale grace"
+            );
+            assert!(
+                rest_retained(p, now_ms(), evict),
+                "an in-flight entry is retained even past its deadline + eviction grace"
+            );
+        }
+        // A snapshot sweep must not prune the armed entry.
+        let reg = falcon::Registry::new();
+        let _ = snapshot(&reg);
+        assert!(
+            REST_POLLS.lock().unwrap().contains_key(&key),
+            "snapshot does not evict an entry whose guard is still armed"
+        );
+        // It still counts as a live worker (no false starve while activation awaits).
+        let counts = rest_workers_per_type();
+        assert_eq!(counts.get(jt).copied(), Some(1));
+
+        // Once the guard drops (the poll returns/cancels), the entry is no longer
+        // held live by in_flight. Completion clamps the window to the completion
+        // instant (never the backdated start), so it reads live through the
+        // post-return grace and then idles/evicts on the normal schedule.
+        drop(guard);
+        {
+            let polls = REST_POLLS.lock().unwrap();
+            let p = polls.get(&key).expect("poll present");
+            assert_eq!(p.in_flight, 0, "the dropped guard released the poll");
+            assert_eq!(
+                p.live_until_ms,
+                now_ms(),
+                "completion clamps the window to the completion instant, not the backdated start"
+            );
+        }
+        clear("t-inflight:");
     }
 }
