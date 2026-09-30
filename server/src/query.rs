@@ -1170,15 +1170,16 @@ pub fn paginate<T, K: CursorKey>(
 ) -> Page<T> {
     let total = sorted.len() as i64;
 
-    // Per the search spec every `limit` defaults to 100 and is bounded to
-    // [1, 10000]; clamp so a missing, zero, or oversized limit can never
+    // Per the search spec every `limit` defaults to 100 when absent and is
+    // bounded to [0, 10000]: an explicit 0 is a count-only query (empty page,
+    // `totalItems` retained); clamp so an oversized limit can never
     // materialize an unbounded page. The generated `limit` fields differ in
     // width across pagination variants, so accept anything convertible to u64.
     let default_limit = 100usize;
     const MAX_LIMIT: u64 = 10_000;
     fn clamp_limit<T: Into<u64>>(limit: Option<T>, default: usize) -> usize {
         match limit {
-            Some(l) => (l.into().clamp(1, MAX_LIMIT)) as usize,
+            Some(l) => (l.into().min(MAX_LIMIT)) as usize,
             None => default,
         }
     }
@@ -1364,6 +1365,42 @@ mod tests {
         let p = paginate(big, Some(&req));
         assert_eq!(p.items.len(), 10_000);
         assert_eq!(p.response.total_items, 20_000);
+    }
+
+    #[test]
+    fn paginate_honours_an_explicit_zero_limit_in_every_variant() {
+        // The 8.10 spec lowered every `limit` minimum to 0: an explicit zero is
+        // a count-only query (empty page, `totalItems` retained), not a request
+        // for the default or a single item. Only an absent limit defaults.
+        let rows: Vec<(u64, u64)> = (0..5).map(|k| (k, k)).collect();
+        let variants = [
+            models::SearchQueryPageRequest::LimitPagination(models::LimitPagination {
+                limit: Some(0),
+            }),
+            models::SearchQueryPageRequest::OffsetPagination(models::OffsetPagination {
+                from: Some(1),
+                limit: Some(0),
+            }),
+            models::SearchQueryPageRequest::CursorForwardPagination(
+                models::CursorForwardPagination {
+                    after: Some(encode_cursor(1)),
+                    limit: Some(0),
+                },
+            ),
+            models::SearchQueryPageRequest::CursorBackwardPagination(
+                models::CursorBackwardPagination {
+                    before: Some(encode_cursor(4)),
+                    limit: Some(0),
+                },
+            ),
+        ];
+        for req in &variants {
+            let p = paginate(rows.clone(), Some(req));
+            assert!(p.items.is_empty(), "limit 0 yields no items: {req:?}");
+            assert_eq!(p.response.total_items, 5, "total retained: {req:?}");
+            assert_eq!(p.response.start_cursor, types::Nullable::Null);
+            assert_eq!(p.response.end_cursor, types::Nullable::Null);
+        }
     }
 
     #[test]

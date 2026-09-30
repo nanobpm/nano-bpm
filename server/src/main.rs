@@ -8947,7 +8947,6 @@ impl ServerImpl {
                     serde_json::to_value(user_task_result(
                         t,
                         &readstore::RootResolver::new(|k| self.store.process_instance(k)),
-                        self.business_id_of(t.instance_key),
                     ))
                 }),
             ReadKind::Variable => self
@@ -10715,6 +10714,47 @@ impl ServerImpl {
             });
         }
 
+        // TIMER / SIGNAL / CONDITION wait states: an element instance parked on
+        // (or guarded by a boundary for) an armed timer or an open signal /
+        // conditional subscription. Engine timers are one-shot (no cycles), so
+        // `repetitions` is always null; a conditional fires on any change to a
+        // variable it references, so `events` is empty (= all events).
+        let event_waits = if wants(models::WaitStateTypeEnum::Timer)
+            || wants(models::WaitStateTypeEnum::Signal)
+            || wants(models::WaitStateTypeEnum::Condition)
+        {
+            self.store.event_waits()
+        } else {
+            Vec::new()
+        };
+        for wait in event_waits {
+            let details: models::WaitStateDetails = match wait.wait_type {
+                readstore::EventWaitType::Timer => models::TimerWaitStateDetails::new(
+                    wait.due_at_ms
+                        .map(|d| types::Nullable::Present(d as i64))
+                        .unwrap_or(types::Nullable::Null),
+                    types::Nullable::Null,
+                )
+                .into(),
+                readstore::EventWaitType::Signal => {
+                    models::SignalWaitStateDetails::new(wait.detail.clone()).into()
+                }
+                readstore::EventWaitType::Condition => {
+                    models::ConditionWaitStateDetails::new(wait.detail.clone(), Vec::new()).into()
+                }
+            };
+            let (element_type, tenant_id, element_id) =
+                resolve(wait.element_instance_key, &wait.element_id);
+            states.push(WaitState {
+                element_instance_key: wait.element_instance_key,
+                process_instance_key: wait.instance_key,
+                element_id,
+                element_type,
+                tenant_id,
+                details,
+            });
+        }
+
         // One memoised root resolver for both the filter and projection passes,
         // so a wait state's root chain is walked once even though the two passes
         // each ask for it.
@@ -10825,7 +10865,7 @@ impl ServerImpl {
         let key = &path_params.decision_evaluation_instance_key;
         match self.store.decision_instance(key) {
             Some(row) => Ok(Resp::Status200_TheDecisionInstanceIsSuccessfullyReturned(
-                decision_instance_get_result(&row, self.business_id_of(row.instance_key)),
+                decision_instance_get_result(&row),
             )),
             None => Ok(
                 Resp::Status404_TheDecisionInstanceWithTheGivenKeyWasNotFound(problem(
@@ -10968,17 +11008,9 @@ impl ServerImpl {
                             &f.decision_requirements_key,
                             &row.decision_requirements_key.to_string(),
                         )
-                        // The owning instance's business id; looked up only when
-                        // filtered on (a standalone evaluation has no instance,
-                        // so it matches as an absent value).
-                        && (f.business_id.is_none()
-                            || query::match_string_opt(
-                                &f.business_id,
-                                self.store
-                                    .process_instance(row.instance_key)
-                                    .and_then(|pi| pi.business_id)
-                                    .as_deref(),
-                            ))
+                        // The business id snapshotted at evaluation (a standalone
+                        // evaluation has none, so it matches as an absent value).
+                        && query::match_string_opt(&f.business_id, row.business_id.as_deref())
                 }
             })
             .collect();
@@ -11024,10 +11056,7 @@ impl ServerImpl {
         let items: Vec<models::DecisionInstanceResult> = page
             .items
             .into_iter()
-            .map(|row| {
-                let business_id = self.business_id_of(row.instance_key);
-                decision_instance_result(row, business_id)
-            })
+            .map(decision_instance_result)
             .collect();
 
         Ok(Resp::Status200_TheDecisionInstanceSearchResult(
@@ -11727,7 +11756,7 @@ impl ServerImpl {
                     message_name: sub.message_name,
                     correlation_key: sub.correlation_key,
                     process_definition_version: Some(inst.version),
-                    business_id: inst.business_id.clone(),
+                    business_id: sub.business_id,
                 })
             })
             .collect();
@@ -11934,7 +11963,7 @@ impl ServerImpl {
                     correlation_key: row.correlation_key,
                     correlation_time_ms: row.correlation_time_ms,
                     partition_id: row.partition_id,
-                    business_id: inst.business_id.clone(),
+                    business_id: row.business_id,
                 })
             })
             .collect();
@@ -12061,9 +12090,10 @@ impl ServerImpl {
         )
     }
 
-    /// The `businessId` of a process instance (Camunda 8.10), as surfaced on
-    /// results that belong to one — message subscriptions, correlations, jobs,
-    /// user tasks, …. `null` when the instance has none or is unknown.
+    /// The CURRENT `businessId` of a process instance (Camunda 8.10). Test-only:
+    /// artifact results surface the id snapshotted on their own row at
+    /// creation, never this live value (#1295 review).
+    #[cfg(test)]
     fn business_id_of(&self, process_instance_key: u64) -> types::Nullable<String> {
         nullable_business_id(
             self.store
@@ -12127,11 +12157,8 @@ impl ServerImpl {
         let sorted: Vec<(u64, &readstore::JobRow)> =
             matched.into_iter().map(|job| (job.key, job)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::JobSearchResult> = page
-            .items
-            .into_iter()
-            .map(|job| job_search_result(job, self.business_id_of(job.instance_key)))
-            .collect();
+        let items: Vec<models::JobSearchResult> =
+            page.items.into_iter().map(job_search_result).collect();
 
         Ok(Resp::Status200_TheJobSearchResult(
             models::JobSearchQueryResult::new(page.response, items),
@@ -12920,7 +12947,7 @@ impl ServerImpl {
         let items: Vec<models::UserTaskResult> = page
             .items
             .into_iter()
-            .map(|task| user_task_result(task, &roots, self.business_id_of(task.instance_key)))
+            .map(|task| user_task_result(task, &roots))
             .collect();
 
         Ok(Resp::Status200_TheUserTaskSearchResult(
@@ -13174,7 +13201,6 @@ impl ServerImpl {
                 user_task_result(
                     task,
                     &readstore::RootResolver::new(|k| self.store.process_instance(k)),
-                    self.business_id_of(task.instance_key),
                 ),
             )),
             None => {
@@ -20010,8 +20036,9 @@ fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
 
 fn decision_instance_result(
     row: &readstore::DecisionInstanceRow,
-    business_id: types::Nullable<String>,
 ) -> models::DecisionInstanceResult {
+    // The business id snapshotted when the decision was evaluated.
+    let business_id = nullable_business_id(row.business_id.clone());
     let evaluation_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
             .unwrap_or_else(epoch);
@@ -20068,7 +20095,6 @@ fn decision_instance_result(
 /// plus the evaluated-input/matched-rule audit.
 fn decision_instance_get_result(
     row: &readstore::DecisionInstanceRow,
-    business_id: types::Nullable<String>,
 ) -> models::DecisionInstanceGetQueryResult {
     let models::DecisionInstanceResult {
         business_id,
@@ -20089,7 +20115,7 @@ fn decision_instance_get_result(
         root_process_instance_key,
         state,
         tenant_id,
-    } = decision_instance_result(row, business_id);
+    } = decision_instance_result(row);
     models::DecisionInstanceGetQueryResult {
         business_id,
         decision_definition_id,
@@ -21442,10 +21468,9 @@ fn job_kind_enums(
 
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
 /// process-definition identity is denormalized onto the row at projection time.
-fn job_search_result(
-    job: &readstore::JobRow,
-    business_id: types::Nullable<String>,
-) -> models::JobSearchResult {
+fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
+    // The business id snapshotted when the job was created.
+    let business_id = nullable_business_id(job.business_id.clone());
     let process_definition_id = job.process_definition_id.clone();
     let process_definition_key = job.process_definition_key.clone();
 
@@ -21518,8 +21543,9 @@ fn user_task_state_enum(state: nanobpmn_engine_core::UserTaskState) -> models::U
 fn user_task_result(
     task: &readstore::UserTaskRow,
     roots: &readstore::RootResolver,
-    business_id: types::Nullable<String>,
 ) -> models::UserTaskResult {
+    // The business id snapshotted when the user task was created.
+    let business_id = nullable_business_id(task.business_id.clone());
     let creation_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(task.created_at_ms as i64)
             .unwrap_or_else(chrono::Utc::now);
@@ -26907,6 +26933,7 @@ mod clustered_startup_tests {
         };
 
         let first = activate().await;
+        let first_key = first.clone();
         assert!(matches!(
             complete(first.clone(), "").await,
             R::Status400_TheProvidedDataIsNotValid(_)
@@ -26926,6 +26953,20 @@ mod clustered_startup_tests {
         assert_eq!(stamped, types::Nullable::Present("order-1".to_string()));
 
         let second = activate().await;
+        // Each job snapshots the business id current at its creation: the first
+        // job predates the assignment, the second was created after it.
+        let job_bid = |key: &str| {
+            let key: u64 = key.parse().expect("numeric job key");
+            server
+                .store
+                .jobs()
+                .into_iter()
+                .find(|j| j.key == key)
+                .expect("job row projected")
+                .business_id
+        };
+        assert_eq!(job_bid(&first_key), None);
+        assert_eq!(job_bid(&second).as_deref(), Some("order-1"));
         assert!(matches!(
             complete(second.clone(), "order-2").await,
             R::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(_)
@@ -27937,6 +27978,114 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    #[tokio::test]
+    async fn wait_states_surface_timer_signal_and_condition_waits() {
+        // The TIMER / SIGNAL / CONDITION variants of the wait-state API: an
+        // element instance parked on an armed timer, an open signal subscription
+        // or an open conditional subscription (#1295 review).
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+        let one = |b: ProcessBuilder| {
+            b.end_event("e")
+                .connect("s", "wait")
+                .connect("wait", "e")
+                .build()
+                .expect("valid catch process")
+        };
+        let timer = one(ProcessBuilder::new("timed")
+            .start_event("s")
+            .timer_intermediate_catch_event("wait", 3_600_000));
+        let signal = one(ProcessBuilder::new("signalled")
+            .start_event("s")
+            .signal_intermediate_catch_event("wait", "go"));
+        let cond = one(ProcessBuilder::new("gated")
+            .start_event("s")
+            .conditional_intermediate_catch_event("wait", "=approved = true"));
+        let names: std::collections::HashMap<String, String> = ["timed", "signalled", "gated"]
+            .into_iter()
+            .map(|p| (p.to_string(), format!("{p}.bpmn")))
+            .collect();
+        server
+            .deploy_resources_locally(
+                vec![timer, signal, cond],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let mut keys = std::collections::HashMap::new();
+        for id in ["timed", "signalled", "gated"] {
+            // `approved = false` keeps the conditional catch parked.
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("approved".to_string(), Value::Bool(false));
+            let (key, _) = server
+                .create_for_stream(Some(id.into()), None, vars)
+                .await
+                .expect("create instance");
+            keys.insert(id, key);
+        }
+
+        let items = loop_until_wait_states(&server, None, 3).await;
+        let by_type = |t: models::WaitStateTypeEnum| {
+            items
+                .iter()
+                .find(|w| ws_type(w) == t)
+                .unwrap_or_else(|| panic!("a {t} wait state"))
+        };
+        let tw = by_type(models::WaitStateTypeEnum::Timer);
+        assert_eq!(tw.process_instance_key.0, keys["timed"].to_string());
+        assert_eq!(tw.element_id, "wait");
+        assert_eq!(
+            tw.element_type,
+            models::WaitStateElementTypeEnum::IntermediateCatchEvent
+        );
+        let models::WaitStateDetails::TimerWaitStateDetails(td) = &tw.details else {
+            panic!("TIMER details, got {:?}", tw.details);
+        };
+        assert!(matches!(td.due_date, types::Nullable::Present(d) if d > 0));
+        assert_eq!(td.repetitions, types::Nullable::Null);
+
+        let sw = by_type(models::WaitStateTypeEnum::Signal);
+        assert_eq!(sw.process_instance_key.0, keys["signalled"].to_string());
+        let models::WaitStateDetails::SignalWaitStateDetails(sd) = &sw.details else {
+            panic!("SIGNAL details, got {:?}", sw.details);
+        };
+        assert_eq!(sd.signal_name, "go");
+
+        let cw = by_type(models::WaitStateTypeEnum::Condition);
+        assert_eq!(cw.process_instance_key.0, keys["gated"].to_string());
+        let models::WaitStateDetails::ConditionWaitStateDetails(cd) = &cw.details else {
+            panic!("CONDITION details, got {:?}", cw.details);
+        };
+        assert_eq!(cd.expression, "=approved = true");
+        assert!(cd.events.is_empty(), "empty events = all events");
+
+        // `waitStateType` isolates each new type.
+        let only_signal = models::ElementInstanceWaitStateFilter {
+            wait_state_type: Some(models::WaitStateTypeFilterProperty::WaitStateTypeEnum(
+                models::WaitStateTypeEnum::Signal,
+            )),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let resp = server
+            .search_element_instance_wait_states_impl(&Some(
+                models::ElementInstanceWaitStateQuery {
+                    sort: None,
+                    page: None,
+                    filter: Some(only_signal),
+                },
+            ))
+            .await
+            .expect("filtered search returns");
+        let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(ws_type(&result.items[0]), models::WaitStateTypeEnum::Signal);
     }
 
     #[tokio::test]

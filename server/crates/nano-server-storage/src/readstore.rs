@@ -495,6 +495,12 @@ impl ReadModel {
             .collect()
     }
 
+    /// Every open timer / signal / conditional wait across all shards
+    /// (TIMER / SIGNAL / CONDITION wait states).
+    pub fn event_waits(&self) -> Vec<EventWaitRow> {
+        self.shards.iter().flat_map(|s| s.event_waits()).collect()
+    }
+
     /// Every correlated (historical) message subscription across all shards.
     pub fn correlated_message_subscriptions(&self) -> Vec<CorrelatedMessageSubscriptionRow> {
         self.shards
