@@ -311,8 +311,22 @@ pub fn parse_snapshot(text: &str, ts_ms: u64) -> Snapshot {
     for (labels, v) in each_series(text, "nanobpm_job_type_workers") {
         upsert(labels, &|s| s.workers = v as i64);
     }
+    // The dispatched counter is cumulative and is NOT removed when a job type's
+    // activatable/worker gauges disappear, so the text keeps a series for every
+    // historically-dispatched type. Folding it in with `upsert` (which does
+    // `entry(...).or_default()`) would re-add each such dead type as a zero-backlog
+    // sample in `prev`; if the type later reappears, `advise` diffs against that
+    // stale sample instead of returning `Warming` and can immediately report false
+    // backlog growth / under-provisioning. Apply the counter only to a job type a
+    // live activatable/worker gauge already introduced (`get_mut`), matching the
+    // native reader (`metrics.rs::provisioning_signals`), so a type with no live
+    // backlog/worker signal contributes no sample at all.
     for (labels, v) in each_series(text, "nanobpm_job_type_dispatched_total") {
-        upsert(labels, &|s| s.dispatched_total = v as u64);
+        if let Some(jt) = label_value(labels, "job_type")
+            && let Some(sample) = per_type.get_mut(&jt)
+        {
+            sample.dispatched_total = v as u64;
+        }
     }
 
     let ceiling_throughput = each_series(text, "nanobpm_ceiling_active").any(|(labels, v)| {
@@ -675,6 +689,31 @@ nanobpm_admission_shed_total{reason="mem_watermark"} 2
         let s = parse_snapshot(text, 1000);
         assert_eq!(s.per_type.len(), 1);
         assert_eq!(s.per_type.get("ok").map(|j| j.workers), Some(4));
+    }
+
+    /// Stale-dispatch-counter regression (Copilot review): the cumulative
+    /// `dispatched_total` counter is not removed when a job type's activatable/
+    /// worker gauges disappear, so the text keeps a series for every
+    /// historically-dispatched type. Folding it in unconditionally would re-add
+    /// each such dead type as a zero-backlog sample; if the type later reappears,
+    /// `advise` diffs against that stale sample instead of returning `Warming`.
+    /// The counter must apply only to a type a live gauge already introduced.
+    #[test]
+    fn dispatched_counter_with_no_live_type_contributes_no_sample() {
+        let text = "nanobpm_job_type_activatable{job_type=\"live\"} 7\n\
+                    nanobpm_job_type_workers{job_type=\"live\"} 2\n\
+                    nanobpm_job_type_dispatched_total{job_type=\"live\"} 90\n\
+                    nanobpm_job_type_dispatched_total{job_type=\"dead\"} 450\n";
+        let s = parse_snapshot(text, 1000);
+        // The live type gets its counter folded in.
+        assert_eq!(s.per_type.get("live").map(|j| j.dispatched_total), Some(90));
+        // The dead type (dispatched counter only, no live gauge) contributes no
+        // sample at all — it is not re-added to `prev` as a stale zero-backlog row.
+        assert!(
+            !s.per_type.contains_key("dead"),
+            "a dispatched counter with no live gauge must not resurrect a dead job type"
+        );
+        assert_eq!(s.per_type.len(), 1);
     }
 
     #[test]

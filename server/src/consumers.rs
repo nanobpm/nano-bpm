@@ -57,6 +57,19 @@ const REST_EVICT_MS: u64 = 60_000;
 /// consumers always proceed). Overridable via `NANOBPMN_CONSUMER_REST_MAX`.
 const MAX_REST_CONSUMERS: usize = 10_000;
 
+/// Hard cap on the **byte length** of each retained key component (`job_type` and
+/// `worker`). The cardinality cap above bounds how *many* consumers are retained,
+/// but not how *large* each retained key is: both components are unauthenticated,
+/// caller-supplied strings cloned into the map (and again into metrics/advice) for
+/// the whole eviction window, so without a per-key bound a caller could fill the
+/// 10,000 slots with multi-megabyte names and exhaust memory despite the count cap.
+/// A poll whose `job_type` or `worker` exceeds this is refused (not recorded), the
+/// same clean no-op as a refusal at the cardinality cap. Realistic job-type and
+/// worker names are a handful of bytes to a few hundred; this bound is generous
+/// headroom, not a constraint on legitimate use. Overridable via
+/// `NANOBPMN_CONSUMER_REST_KEY_MAX_BYTES`.
+const MAX_KEY_COMPONENT_BYTES: usize = 1024;
+
 /// A single REST consumer's liveness state. `activateJobs` may long-poll for a
 /// caller-chosen window (`requestTimeout`), so a worker mid-poll is legitimately
 /// silent for that whole window — we record when the poll's window closes
@@ -111,6 +124,16 @@ fn rest_max() -> usize {
         .unwrap_or(MAX_REST_CONSUMERS)
 }
 
+/// Cap on each retained key component's byte length, overridable via
+/// `NANOBPMN_CONSUMER_REST_KEY_MAX_BYTES`.
+fn key_component_max_bytes() -> usize {
+    std::env::var("NANOBPMN_CONSUMER_REST_KEY_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_KEY_COMPONENT_BYTES)
+}
+
 fn env_u64(key: &str) -> Option<u64> {
     std::env::var(key)
         .ok()
@@ -158,6 +181,16 @@ fn rest_retained(p: &RestPoll, now: u64, evict: u64) -> bool {
 /// refused at the cardinality cap (nothing recorded — completing it would
 /// decrement a *different*, genuinely-admitted poll's shared counter).
 pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) -> bool {
+    // Bound each retained key component's byte length: the cardinality cap limits
+    // how *many* consumers are retained but not how *large* each caller-supplied
+    // key is, so without this an oversized `type`/`worker` is cloned into the map
+    // (and metrics/advice) for the whole eviction window — a memory-exhaustion
+    // vector despite the count cap. Refuse the oversized poll exactly like a
+    // refusal at the cardinality cap (a clean no-op, no guard armed).
+    let max_bytes = key_component_max_bytes();
+    if job_type.len() > max_bytes || worker.len() > max_bytes {
+        return false;
+    }
     let now = now_ms();
     let key = (job_type.to_string(), worker.to_string());
     let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
@@ -1077,6 +1110,52 @@ mod tests {
             upsert_rest_poll(&mut polls, ("a".into(), "w".into()), live, now, evict, 2),
             "an existing key is admitted (refreshed) despite the cap"
         );
+    }
+
+    #[test]
+    fn record_rest_poll_refuses_an_oversized_key_component() {
+        // Oversized-key regression (Copilot review): the cardinality cap bounds how
+        // *many* consumers are retained but not how *large* each caller-supplied key
+        // is — both `job_type` and `worker` are unauthenticated, caller-controlled
+        // strings cloned into the map for the whole eviction window, so a caller
+        // could fill the slots with multi-megabyte names and exhaust memory despite
+        // the count cap. A poll whose key component exceeds the per-key byte bound
+        // must be refused (not recorded) and arm no completion guard, exactly like
+        // a refusal at the cardinality cap.
+        let huge = "k".repeat(MAX_KEY_COMPONENT_BYTES + 1);
+        // Oversized job_type.
+        assert!(
+            !record_rest_poll(&huge, "w", 0),
+            "an oversized job_type is refused"
+        );
+        assert!(
+            RestPollGuard::record(&huge, "w", 0).is_none(),
+            "an oversized job_type arms no guard"
+        );
+        // Oversized worker.
+        assert!(
+            !record_rest_poll("oversize-worker-t", &huge, 0),
+            "an oversized worker is refused"
+        );
+        assert!(
+            RestPollGuard::record("oversize-worker-t", &huge, 0).is_none(),
+            "an oversized worker arms no guard"
+        );
+        // Nothing was retained for the oversized keys.
+        {
+            let polls = REST_POLLS.lock().unwrap();
+            assert!(!polls.contains_key(&(huge.clone(), "w".to_string())));
+            assert!(!polls.contains_key(&("oversize-worker-t".to_string(), huge.clone())));
+        }
+        // A key at the bound is admitted (the bound is inclusive headroom, not a
+        // fence just under it), and its guard arms.
+        let at_bound = "k".repeat(MAX_KEY_COMPONENT_BYTES);
+        assert!(
+            record_rest_poll(&at_bound, "w", 0),
+            "a key at the byte bound is admitted"
+        );
+        assert!(RestPollGuard::record(&at_bound, "w", 0).is_some());
+        clear(&at_bound);
     }
 
     #[test]
