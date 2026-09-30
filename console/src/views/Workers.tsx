@@ -636,8 +636,8 @@ function ProvisioningPanel() {
             : // Writer-duty saturation alone tripped serverBound — the ceiling LED
               // is not active, so use the broader "throughput-bound" wording.
               "The server is throughput-bound (writer saturated)"}{" "}
-          (writer {Math.round(data.writerBusyRatio * 100)}% busy) — adding workers
-          won't raise aggregate throughput; relieve the server instead.
+          (writer {Math.round(data.writerBusyRatio * 100)}% busy) — adding
+          workers won't raise aggregate throughput; relieve the server instead.
         </div>
       )}
       {error && (
