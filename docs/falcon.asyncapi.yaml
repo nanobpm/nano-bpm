@@ -400,9 +400,13 @@ components:
         businessId:
           type: string
           nullable: true
+          minLength: 1
+          maxLength: 256
           description: >
             Camunda 8.10 business id to assign to the job's root process
-            instance. Rejected (400 `commandResult`) when empty; rejected (409)
+            instance (the REST `BusinessId` range, 1 to 256 characters, enforced
+            by the engine). Rejected (400 `commandResult`) when empty or longer
+            than 256 characters; rejected (409)
             when the job belongs to a child instance or the root instance
             already has a different business id. Re-sending the identical id is
             a no-op.

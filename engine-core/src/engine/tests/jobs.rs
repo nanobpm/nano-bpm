@@ -2541,12 +2541,8 @@ fn an_empty_business_id_rejects_the_completion() {
     let err = engine
         .apply_command(Command::complete_job(job).with_business_id(Some(String::new())))
         .unwrap_err();
-    assert_eq!(
-        err,
-        EngineError::BusinessIdEmpty {
-            instance_key: instance
-        }
-    );
+    let _ = instance;
+    assert_eq!(err, EngineError::BusinessIdInvalid { chars: 0 });
     assert!(!matches!(
         engine.state().jobs[&job].state,
         state::JobState::Completed
@@ -2595,4 +2591,66 @@ fn a_child_instance_business_id_rejects_the_completion() {
         engine.state().jobs[&job.key].state,
         state::JobState::Completed
     ));
+}
+
+/// The spec's `BusinessId` range (1..=256 characters) is enforced in the
+/// engine for every command that carries one, so non-REST surfaces (Falcon,
+/// wasm) cannot persist an out-of-range id (#1295 review). Characters, not
+/// bytes: 256 multi-byte characters are accepted.
+#[test]
+fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
+    let max = "é".repeat(crate::BUSINESS_ID_MAX_CHARS);
+    let over = "x".repeat(crate::BUSINESS_ID_MAX_CHARS + 1);
+    let too_long = EngineError::BusinessIdInvalid {
+        chars: crate::BUSINESS_ID_MAX_CHARS + 1,
+    };
+
+    // Job completion (assignment).
+    let (mut engine, instance, job) = job_parked_instance(None);
+    let err = engine
+        .apply_command(Command::complete_job(job).with_business_id(Some(over.clone())))
+        .unwrap_err();
+    assert_eq!(err, too_long);
+    assert_eq!(engine.state().instances[&instance].business_id, None);
+    engine
+        .apply_command(Command::complete_job(job).with_business_id(Some(max.clone())))
+        .expect("256 characters is within range");
+    assert_eq!(
+        engine.state().instances[&instance].business_id.as_deref(),
+        Some(max.as_str())
+    );
+
+    // Instance creation.
+    let (mut engine, _, _) = job_parked_instance(None);
+    let before = engine.state().instances.len();
+    for (id, want) in [
+        (over.clone(), too_long.clone()),
+        (String::new(), EngineError::BusinessIdInvalid { chars: 0 }),
+    ] {
+        let err = engine
+            .apply_command(Command::create_instance_full(
+                "biz",
+                HashMap::new(),
+                Vec::new(),
+                Some(id),
+            ))
+            .unwrap_err();
+        assert_eq!(err, want);
+    }
+    assert_eq!(
+        engine.state().instances.len(),
+        before,
+        "no instance created"
+    );
+
+    // Message publish / correlate.
+    let err = engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "m".into(),
+            correlation_key: "k".into(),
+            variables: HashMap::new(),
+            business_id: Some(over),
+        })
+        .unwrap_err();
+    assert_eq!(err, too_long);
 }

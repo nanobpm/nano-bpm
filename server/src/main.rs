@@ -21766,7 +21766,7 @@ fn completion_command(
 /// child instance or a differing already-assigned id is INVALID_STATE (409).
 fn business_id_rejection_status(e: &EngineError) -> Option<u16> {
     match e {
-        EngineError::BusinessIdEmpty { .. } => Some(400),
+        EngineError::BusinessIdInvalid { .. } => Some(400),
         EngineError::BusinessIdOnChildInstance { .. }
         | EngineError::BusinessIdAlreadyAssigned { .. } => Some(409),
         _ => None,

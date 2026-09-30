@@ -27,6 +27,12 @@ import { fileURLToPath } from "node:url";
 export const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 export const PIN_FILE = "spec-patches/upstream.json";
 export const SPEC_DIR = "spec";
+/**
+ * The only upstream `spec/` may be vendored from (#1291). Enforced by
+ * `readPin`, so editing the pin cannot make `--check` bless another tree.
+ */
+export const UPSTREAM_REPOSITORY = "https://github.com/camunda/camunda.git";
+export const UPSTREAM_PATH = "zeebe/gateway-protocol/src/main/proto/v2";
 
 export function readPin(root = ROOT) {
   const pin = JSON.parse(readFileSync(join(root, PIN_FILE), "utf8"));
@@ -37,6 +43,12 @@ export function readPin(root = ROOT) {
   }
   if (!/^[0-9a-f]{40}$/.test(pin.commit)) {
     throw new Error(`${PIN_FILE}: "commit" must be a full 40-hex SHA, got ${pin.commit}`);
+  }
+  if (pin.repository !== UPSTREAM_REPOSITORY || pin.path !== UPSTREAM_PATH) {
+    throw new Error(
+      `${PIN_FILE}: spec/ must be vendored from ${UPSTREAM_REPOSITORY} (${UPSTREAM_PATH}), ` +
+        `got ${pin.repository} (${pin.path})`,
+    );
   }
   return pin;
 }

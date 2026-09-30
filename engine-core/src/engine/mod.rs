@@ -1895,6 +1895,7 @@ impl Engine {
                 process_definition_key,
                 version,
             } => {
+                check_business_id(business_id.as_deref())?;
                 // Resolve the requested version to a concrete deployed
                 // definition (Zeebe parity):
                 //   * an explicit definition key selects that exact version
@@ -3275,6 +3276,7 @@ impl Engine {
                 variables,
                 business_id,
             } => {
+                check_business_id(business_id.as_deref())?;
                 // Always mint a message key (Zeebe records every published
                 // message); it is returned to the host and, carried on the
                 // MessagePublished event, restores the key generator on replay.
@@ -4278,6 +4280,7 @@ impl Engine {
                 tags,
                 business_id,
             } => {
+                check_business_id(business_id.as_deref())?;
                 // Routed from the deploy partition's StartInstanceDispatched: mint
                 // the start-triggered instance here, in this partition's namespace,
                 // so start-triggered load spreads across the cluster.
@@ -12300,9 +12303,7 @@ impl Engine {
         if instance.parent_process_instance_key.is_some() {
             return Err(EngineError::BusinessIdOnChildInstance { instance_key });
         }
-        if business_id.is_empty() {
-            return Err(EngineError::BusinessIdEmpty { instance_key });
-        }
+        check_business_id(Some(&business_id))?;
         match instance.business_id.as_deref() {
             Some(existing) if existing == business_id => Ok(None),
             Some(_) => Err(EngineError::BusinessIdAlreadyAssigned { instance_key }),
@@ -12500,8 +12501,10 @@ pub enum EngineError {
     /// `CompleteJob` tried to assign a business id to a child (call-activity)
     /// process instance; only root instances accept one (409, INVALID_STATE).
     BusinessIdOnChildInstance { instance_key: Key },
-    /// `CompleteJob` tried to assign an empty business id (400).
-    BusinessIdEmpty { instance_key: Key },
+    /// A command carried a business id outside the spec's `BusinessId` range
+    /// (1..=[`BUSINESS_ID_MAX_CHARS`] characters) — 400. Enforced in the
+    /// engine so every surface (REST, Falcon, wasm) shares one check.
+    BusinessIdInvalid { chars: usize },
     /// `CompleteJob` tried to assign a business id differing from the one the
     /// instance already carries; assignment is single and irreversible (409).
     BusinessIdAlreadyAssigned { instance_key: Key },
@@ -12778,9 +12781,9 @@ impl std::fmt::Display for EngineError {
                 f,
                 "cannot assign a business id to process instance {instance_key}: it is a child process instance; a business id can only be assigned to root process instances"
             ),
-            EngineError::BusinessIdEmpty { instance_key } => write!(
+            EngineError::BusinessIdInvalid { chars } => write!(
                 f,
-                "cannot assign a business id to process instance {instance_key}: the provided business id is empty"
+                "invalid business id: must be 1 to {BUSINESS_ID_MAX_CHARS} characters, got {chars}"
             ),
             EngineError::BusinessIdAlreadyAssigned { instance_key } => write!(
                 f,
@@ -13192,3 +13195,21 @@ fn job_activatable(job: &state::Job, now: u64) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+/// The spec's `BusinessId` maximum length (`spec/identifiers.yaml`,
+/// `maxLength: 256`), counted in characters as JSON Schema does.
+pub const BUSINESS_ID_MAX_CHARS: usize = 256;
+
+/// The single business-id range check (1..=[`BUSINESS_ID_MAX_CHARS`]
+/// characters) applied to every command that carries one. `None` is valid.
+fn check_business_id(business_id: Option<&str>) -> Result<(), EngineError> {
+    let Some(id) = business_id else {
+        return Ok(());
+    };
+    let chars = id.chars().count();
+    if (1..=BUSINESS_ID_MAX_CHARS).contains(&chars) {
+        Ok(())
+    } else {
+        Err(EngineError::BusinessIdInvalid { chars })
+    }
+}

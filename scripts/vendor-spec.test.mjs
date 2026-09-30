@@ -6,7 +6,16 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { compareTrees, formatDrift, isClean, PIN_FILE, readPin, ROOT } from "./vendor-spec.mjs";
+import {
+  compareTrees,
+  formatDrift,
+  isClean,
+  PIN_FILE,
+  readPin,
+  ROOT,
+  UPSTREAM_PATH,
+  UPSTREAM_REPOSITORY,
+} from "./vendor-spec.mjs";
 
 function tree(files) {
   const dir = mkdtempSync(join(tmpdir(), "vendor-spec-test-"));
@@ -44,7 +53,29 @@ test("a whitespace-only edit is drift (byte comparison)", () => {
 test("the committed pin is a full SHA of the camunda spec path", () => {
   const pin = readPin();
   assert.match(pin.commit, /^[0-9a-f]{40}$/);
+  assert.equal(pin.repository, "https://github.com/camunda/camunda.git");
   assert.equal(pin.path, "zeebe/gateway-protocol/src/main/proto/v2");
+});
+
+test("a pin naming any other repository or subtree is rejected", () => {
+  const sha = "a".repeat(40);
+  const pinned = (over) =>
+    tree({
+      [PIN_FILE]: JSON.stringify({
+        repository: UPSTREAM_REPOSITORY,
+        commit: sha,
+        path: UPSTREAM_PATH,
+        ...over,
+      }),
+    });
+  assert.equal(readPin(pinned({})).repository, UPSTREAM_REPOSITORY);
+  for (const over of [
+    { repository: "https://github.com/someone/camunda-fork.git" },
+    { repository: "https://github.com/camunda/camunda" },
+    { path: "zeebe/gateway-protocol/src/main/proto" },
+  ]) {
+    assert.throws(() => readPin(pinned(over)), /must be vendored from/, JSON.stringify(over));
+  }
 });
 
 test("a malformed pin is rejected", () => {
