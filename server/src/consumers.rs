@@ -70,6 +70,12 @@ struct RestPoll {
     /// Wall-clock (epoch millis) at which this poll's long-poll window closes —
     /// i.e. the worker is expected to re-issue by. Live until this + grace.
     live_until_ms: u64,
+    /// Number of `activateJobs` calls for this `(job_type, worker)` currently in
+    /// flight (recorded, not yet returned). A worker may overlap polls (a slow
+    /// long poll plus a fresh one), and the shared entry must keep reading live
+    /// until the *last* of them returns — an older poll completing must not
+    /// truncate a newer, still-open window.
+    in_flight: u32,
 }
 
 /// Per-`(jobType, worker)` REST consumer state. A process-global best-effort map
@@ -134,6 +140,10 @@ fn rest_retained(p: &RestPoll, now: u64, evict: u64) -> bool {
 /// whose long-poll window is `long_poll_ms` wide (0 for a non-blocking poll).
 /// Best-effort: a single map upsert, called off the activation-result path.
 ///
+/// Each call marks one more poll **in flight** (`in_flight += 1`) so a worker
+/// running overlapping `activateJobs` calls keeps reading live until the last of
+/// them returns (see [`complete_rest_poll`]).
+///
 /// New keys are refused once [`rest_max`] distinct consumers are retained (after
 /// first pruning dead entries) so a caller pumping unique `(type, worker)` pairs
 /// cannot grow this map without bound; upserts to existing consumers always
@@ -141,16 +151,18 @@ fn rest_retained(p: &RestPoll, now: u64, evict: u64) -> bool {
 pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) {
     let now = now_ms();
     let key = (job_type.to_string(), worker.to_string());
+    let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    let in_flight = polls.get(&key).map(|p| p.in_flight).unwrap_or(0);
     let entry = RestPoll {
         last_seen_ms: now,
         live_until_ms: now.saturating_add(long_poll_ms),
+        in_flight: in_flight.saturating_add(1),
     };
-    let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
     upsert_rest_poll(&mut polls, key, entry, now, rest_evict_ms(), rest_max());
 }
 
-/// Marks `worker`'s in-flight `activateJobs` for `job_type` as **returned**, closing
-/// its long-poll window now rather than at the requested timeout.
+/// Marks one of `worker`'s in-flight `activateJobs` for `job_type` as **returned**,
+/// closing its long-poll window now rather than at the requested timeout.
 ///
 /// [`record_rest_poll`] sets `live_until_ms` from the *requested* long-poll window
 /// before activation is attempted, but the request may return long before that
@@ -162,14 +174,31 @@ pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) {
 /// completion (the [`REST_STALE_MS`] grace still applies) makes the worker count
 /// reflect consumers that are genuinely still polling.
 ///
+/// Two details keep the close from publishing a *false* zero-worker signal:
+///
+/// * **Overlapping polls.** The entry is keyed by `(job_type, worker)`, so a worker
+///   with two `activateJobs` in flight shares one entry. This only closes the window
+///   when the *last* in-flight poll returns (`in_flight` reaches 0); an older poll
+///   completing while a newer one is still open leaves the newer window intact.
+/// * **Long polls.** The window is clamped to the *completion instant* (`now`),
+///   never back to `last_seen_ms` (the poll *start*). A poll that ran longer than
+///   the stale grace would otherwise close to a start timestamp already past the
+///   grace and read idle the instant it returned — denying the worker its
+///   post-return grace and letting a normal re-poll gap look like starvation.
+///
 /// Best-effort: a no-op when the `(job_type, worker)` key is absent (e.g. the poll
 /// was never recorded because `max_jobs_to_activate <= 0`).
 pub fn complete_rest_poll(job_type: &str, worker: &str) {
+    let now = now_ms();
     let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
     if let Some(p) = polls.get_mut(&(job_type.to_string(), worker.to_string())) {
-        // Close the window at the completion instant: the worker is live through
-        // the post-close grace, then idles/evicts on the normal schedule.
-        p.live_until_ms = p.last_seen_ms;
+        p.in_flight = p.in_flight.saturating_sub(1);
+        if p.in_flight == 0 {
+            // Close the window at the completion instant (never before the most
+            // recent poll start): the worker is live through the post-close grace,
+            // then idles/evicts on the normal schedule.
+            p.live_until_ms = now.max(p.last_seen_ms);
+        }
     }
 }
 
@@ -365,13 +394,16 @@ mod tests {
     }
 
     /// Seed a REST consumer directly (bypassing the cap/`now_ms` of the public
-    /// path) so a test can pin its `last_seen`/`live_until` timestamps.
+    /// path) so a test can pin its `last_seen`/`live_until` timestamps. The poll
+    /// is seeded already returned (`in_flight: 0`) — these fixtures describe a
+    /// consumer whose window is whatever `live_until_ms` says, not one mid-poll.
     fn insert_poll(jt: &str, worker: &str, last_seen_ms: u64, live_until_ms: u64) {
         REST_POLLS.lock().unwrap().insert(
             (jt.to_string(), worker.to_string()),
             RestPoll {
                 last_seen_ms,
                 live_until_ms,
+                in_flight: 0,
             },
         );
     }
@@ -561,18 +593,111 @@ mod tests {
         let jt = "t-close:review";
         clear("t-close:");
         let now = now_ms();
-        insert_poll(jt, "agent-lp", now, now + 60_000);
+        // Seed an in-flight poll (in_flight: 1) whose window is still open, as
+        // `record_rest_poll` leaves it on entry.
+        REST_POLLS.lock().unwrap().insert(
+            (jt.to_string(), "agent-lp".to_string()),
+            RestPoll {
+                last_seen_ms: now,
+                live_until_ms: now + 60_000,
+                in_flight: 1,
+            },
+        );
         complete_rest_poll(jt, "agent-lp");
         let p = *REST_POLLS
             .lock()
             .unwrap()
             .get(&(jt.to_string(), "agent-lp".to_string()))
             .expect("poll present");
-        assert_eq!(
-            p.live_until_ms, p.last_seen_ms,
+        assert_eq!(p.in_flight, 0, "the in-flight poll is marked returned");
+        assert!(
+            p.live_until_ms >= p.last_seen_ms,
             "completion closes the long-poll window at the completion instant"
         );
+        assert!(
+            p.live_until_ms <= now_ms(),
+            "the window closes now, not at the requested timeout"
+        );
         clear("t-close:");
+    }
+
+    #[test]
+    fn complete_of_an_older_poll_keeps_a_newer_overlapping_poll_live() {
+        // Overlap regression (Copilot review): two `activateJobs` for the same
+        // `(job_type, worker)` share one entry. If the older poll returns *after*
+        // the newer one starts, closing the shared window must not truncate the
+        // newer poll's still-open window — that would read a genuinely-polling
+        // worker as gone and publish a false zero-worker (starvation) signal.
+        let jt = "t-overlap:review";
+        clear("t-overlap:");
+        // Poll 1 starts a long poll (in_flight 1, window open 60s).
+        record_rest_poll(jt, "agent-ol", 60_000);
+        // Poll 2 starts while poll 1 is still in flight (in_flight 2).
+        record_rest_poll(jt, "agent-ol", 60_000);
+        // Poll 1 (the older) returns first.
+        complete_rest_poll(jt, "agent-ol");
+        let p = *REST_POLLS
+            .lock()
+            .unwrap()
+            .get(&(jt.to_string(), "agent-ol".to_string()))
+            .expect("poll present");
+        assert_eq!(p.in_flight, 1, "the newer poll is still in flight");
+        assert!(
+            p.live_until_ms > now_ms(),
+            "the newer poll's open window survives the older poll's completion"
+        );
+        assert!(
+            rest_live(&p, now_ms(), rest_stale_ms()),
+            "still live while the overlapping poll is open"
+        );
+        // When the newer poll also returns, the window closes.
+        complete_rest_poll(jt, "agent-ol");
+        let p = *REST_POLLS
+            .lock()
+            .unwrap()
+            .get(&(jt.to_string(), "agent-ol".to_string()))
+            .expect("poll present");
+        assert_eq!(p.in_flight, 0);
+        assert!(
+            p.live_until_ms <= now_ms(),
+            "the window closes once the last in-flight poll returns"
+        );
+        clear("t-overlap:");
+    }
+
+    #[test]
+    fn complete_after_a_long_poll_still_grants_the_post_return_grace() {
+        // Long-poll regression (Copilot review): a poll that runs longer than the
+        // stale grace must still get its post-return grace. Closing the window to
+        // the poll *start* (`last_seen_ms`, already > stale ago) would read idle
+        // the instant it returns; closing to the completion instant (`now`) keeps
+        // it live for the grace so a normal re-poll gap is not false starvation.
+        let jt = "t-longgrace:review";
+        clear("t-longgrace:");
+        // Record a poll, then simulate it staying in flight past the stale window
+        // by backdating its start (the window is still open: live_until is future).
+        record_rest_poll(jt, "agent-lg", 60_000);
+        let key = (jt.to_string(), "agent-lg".to_string());
+        let stale = rest_stale_ms();
+        {
+            let mut polls = REST_POLLS.lock().unwrap();
+            let p = polls.get_mut(&key).expect("poll present");
+            p.last_seen_ms = now_ms().saturating_sub(stale + 5_000);
+        }
+        // The long poll now returns. Completion must clamp to now, not the start.
+        complete_rest_poll(jt, "agent-lg");
+        let p = *REST_POLLS.lock().unwrap().get(&key).expect("poll present");
+        assert!(
+            rest_live(&p, now_ms(), stale),
+            "a long poll that just returned is live through the post-return grace"
+        );
+        let counts = rest_workers_per_type();
+        assert_eq!(
+            counts.get(jt).copied(),
+            Some(1),
+            "a just-returned long poll still counts as a live worker (no false starve)"
+        );
+        clear("t-longgrace:");
     }
 
     #[test]
@@ -584,6 +709,7 @@ mod tests {
         let live = RestPoll {
             last_seen_ms: now,
             live_until_ms: now,
+            in_flight: 0,
         };
         let mut polls: HashMap<(String, String), RestPoll> = HashMap::new();
         upsert_rest_poll(&mut polls, ("a".into(), "w".into()), live, now, evict, 2);
@@ -597,6 +723,7 @@ mod tests {
         let refreshed = RestPoll {
             last_seen_ms: now + 1,
             live_until_ms: now + 1,
+            in_flight: 0,
         };
         upsert_rest_poll(
             &mut polls,
@@ -624,6 +751,7 @@ mod tests {
             RestPoll {
                 last_seen_ms: now,
                 live_until_ms: now,
+                in_flight: 0,
             },
         );
         let dead = now.saturating_sub(evict + 1_000);
@@ -632,12 +760,14 @@ mod tests {
             RestPoll {
                 last_seen_ms: dead,
                 live_until_ms: dead,
+                in_flight: 0,
             },
         );
         // At the cap a new key first prunes the dead entry, then is admitted.
         let fresh = RestPoll {
             last_seen_ms: now,
             live_until_ms: now,
+            in_flight: 0,
         };
         upsert_rest_poll(&mut polls, ("new".into(), "w".into()), fresh, now, evict, 2);
         assert!(

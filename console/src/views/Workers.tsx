@@ -641,7 +641,16 @@ function ProvisioningPanel() {
         </div>
       )}
       <div className="rounded border border-edge bg-raised/40">
-        {recs.length === 0 ? (
+        {!data ? (
+          // Before the first successful load `data` is undefined, so `recs` is
+          // empty — but that is "not loaded yet", not "no job types". Never show
+          // the empty state here: on an initial fetch failure it would sit
+          // alongside the "Couldn't load provisioning" error and contradict it.
+          // The error banner above is the signal while a load is pending/failed.
+          <div className="px-3 py-4 text-xs text-fg-faint">
+            {error ? "Provisioning data unavailable." : "Loading provisioning…"}
+          </div>
+        ) : recs.length === 0 ? (
           <div className="px-3 py-4 text-xs text-fg-faint">
             No job types with waiting work or connected workers right now.
           </div>
