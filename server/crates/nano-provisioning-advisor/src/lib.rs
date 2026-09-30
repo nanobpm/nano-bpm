@@ -393,18 +393,33 @@ pub fn advise(prev: &Snapshot, cur: &Snapshot) -> Advice {
     let has_window = window_s > 0.0 && !prev.per_type.is_empty();
     let window_s = if has_window { window_s } else { 0.0 };
 
+    // Whether a *real* earlier scrape exists — tracked separately from the per-type
+    // window gate above. The monitor seeds `prev` with `Snapshot::default()`
+    // (ts_ms 0, no series, zeroed cumulative counters); a genuine prior sample
+    // carries a real epoch-ms timestamp (or, before any job type is registered, at
+    // least captured series). Without one, the writer-duty and shed subtractions
+    // below would difference this scrape's *process-lifetime* cumulative counters
+    // against zero and report them as a single interval — a false server-bound
+    // banner (a lifetime duty ratio while `window_s` is 0) and a lifetime shed
+    // count masquerading as this tick's delta. The instantaneous ceiling flag is a
+    // point-in-time gauge, not an interval derivative, so it is retained regardless.
+    let has_prev_sample = prev.ts_ms > 0 || !prev.per_type.is_empty();
+
     // Journal-writer duty cycle over the window (busy fraction).
     let busy_d = (cur.writer_busy_seconds - prev.writer_busy_seconds).max(0.0);
     let idle_d = (cur.writer_idle_seconds - prev.writer_idle_seconds).max(0.0);
-    let writer_busy_ratio = if busy_d + idle_d > 0.0 {
+    let writer_busy_ratio = if has_prev_sample && busy_d + idle_d > 0.0 {
         busy_d / (busy_d + idle_d)
     } else {
         0.0
     };
     let server_bound = cur.ceiling_throughput || writer_busy_ratio > WRITER_SATURATED;
-    let shed_delta = cur
-        .admission_shed_total
-        .saturating_sub(prev.admission_shed_total);
+    let shed_delta = if has_prev_sample {
+        cur.admission_shed_total
+            .saturating_sub(prev.admission_shed_total)
+    } else {
+        0
+    };
 
     let mut recommendations = Vec::with_capacity(cur.per_type.len());
     for (jt, s) in &cur.per_type {
@@ -818,6 +833,50 @@ nanobpm_admission_shed_total{reason="mem_watermark"} 2
             "writer-only saturation should say throughput-bound: {}",
             r.rationale
         );
+    }
+
+    #[test]
+    fn first_scrape_does_not_infer_globals_from_cumulative_counters() {
+        // The monitor seeds `prev` with `Snapshot::default()`. The very first real
+        // scrape carries process-lifetime cumulative writer counters and a lifetime
+        // shed total. Differencing those against the zeroed default must NOT treat
+        // the whole process lifetime as one interval: that would raise a false
+        // server-bound banner (from a lifetime duty ratio while `window_s` is 0) and
+        // report the lifetime shed count as this tick's delta.
+        let prev = Snapshot::default();
+        let mut cur = snap(1_700_000_000_000, &[("enrich", 300, 4, 1200)]);
+        cur.writer_busy_seconds = 950.0; // lifetime: 95% busy since process start
+        cur.writer_idle_seconds = 50.0;
+        cur.admission_shed_total = 17; // lifetime shed count
+        let a = advise(&prev, &cur);
+        assert!(
+            !a.server_bound,
+            "first scrape must not infer server-bound from a lifetime writer ratio"
+        );
+        assert_eq!(a.writer_busy_ratio, 0.0);
+        assert_eq!(
+            a.shed_delta, 0,
+            "first scrape must not report the lifetime shed count as this tick's delta"
+        );
+        assert_eq!(a.window_s, 0.0);
+    }
+
+    #[test]
+    fn first_scrape_retains_instantaneous_ceiling_flag() {
+        // The ceiling LED is a point-in-time gauge, not an interval derivative, so a
+        // first scrape may still legitimately report server-bound when it is lit —
+        // only the cumulative-counter-derived globals are suppressed.
+        let prev = Snapshot::default();
+        let mut cur = snap(1_700_000_000_000, &[("enrich", 300, 4, 1200)]);
+        cur.ceiling_throughput = true;
+        cur.writer_busy_seconds = 950.0;
+        cur.writer_idle_seconds = 50.0;
+        let a = advise(&prev, &cur);
+        assert!(
+            a.server_bound,
+            "instantaneous ceiling flag must be retained on the first scrape"
+        );
+        assert!(a.ceiling_throughput);
     }
 
     #[test]
