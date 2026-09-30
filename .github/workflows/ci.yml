@@ -361,7 +361,11 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y llvm clang
+          # mold: the host-test step below links host binaries, and the repo's
+          # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu
+          # (the wasm32 type-check escapes it only because `--target` keeps
+          # target rustflags off host build scripts).
+          sudo apt-get install -y llvm clang mold
           cc_bin=""
           for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
             if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
