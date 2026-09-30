@@ -91,6 +91,11 @@ jobs:
             processos:
               - 'processos/**'
               - 'engine-core/**'
+              # processos/Cargo.toml path-depends on (and re-exports) the
+              # worker-scaling advisor crate, so a change confined to it must
+              # still validate ProcessOS — without this it would skip the
+              # processos job entirely (see #1294).
+              - 'server/crates/nano-provisioning-advisor/**'
               - '.github/workflows/ci.yml'
             console:
               - 'console/**'

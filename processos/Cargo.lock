@@ -1258,6 +1258,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-provisioning-advisor"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "nanobpmn-engine-core"
 version = "0.1.0"
 dependencies = [
@@ -1402,6 +1409,7 @@ dependencies = [
  "axum",
  "duckdb",
  "futures-util",
+ "nano-provisioning-advisor",
  "nanobpmn-engine-core",
  "pulldown-cmark",
  "reqwest",

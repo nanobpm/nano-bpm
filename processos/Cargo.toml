@@ -39,6 +39,13 @@ tracing-subscriber = "0.3"
 # lean/zero-dependency and std-only; this is a one-way `path` dependency (Nano's
 # engine never links ProcessOS). `serde` enables natural JSON variable I/O.
 nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
+# Worker-scaling / provisioning advisor — the single source of truth for the
+# per-job-type classification (starved / under-provisioned / server-bound) and
+# the Little's-Law worker sizing. Lives on the Nano side (a `server/crates/*`
+# leaf) so the gateway's `/console/api/provisioning` endpoint reuses the *same*
+# logic without Nano ever linking ProcessOS; ProcessOS (which may link Nano
+# crates) re-exports it in `src/advisor.rs`. See #1294.
+nano-provisioning-advisor = { path = "../server/crates/nano-provisioning-advisor" }
 # Embedded analytic SQL engine for the LLM-driven data-analysis tools (querying
 # the trace corpus). The default `duckdb-bundled` feature compiles DuckDB from
 # source (one-time C++ build) so shipped binaries are self-contained with no
