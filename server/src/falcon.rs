@@ -230,6 +230,13 @@ impl Registry {
         for ids in by_type.values_mut() {
             ids.retain(|&other| other != id);
         }
+        // Drop the now-empty per-type key: leaving it would make
+        // `workers_per_type` report a zero-count entry for a job type with no
+        // remaining connections, so the provisioning monitor would keep that
+        // type "current" forever — its Prometheus series would never be removed
+        // and the 1 Hz collector would keep scanning an ever-growing historical
+        // set. Dispatch already skips empty rosters, so removal is safe there.
+        by_type.retain(|_, ids| !ids.is_empty());
         true
     }
 
@@ -2993,6 +3000,44 @@ mod registry_tests {
         assert!(
             !registry.unregister(999),
             "unregistering an unknown id is a no-op too"
+        );
+    }
+
+    #[test]
+    fn unregistering_the_last_connection_of_a_type_drops_its_zero_count_entry() {
+        // Issue #1294 review: `unregister` emptied the per-type roster but left the
+        // `by_type` key behind, so `workers_per_type` kept returning a zero-count
+        // entry for a fully-disconnected job type. Chained into the provisioning
+        // monitor's `current` set, that phantom entry kept the type "current"
+        // forever — its Prometheus series was never removed and the 1 Hz collector
+        // kept scanning an ever-growing historical set. The fix removes the key
+        // once its roster empties.
+        let registry = Registry::new();
+        let conn = test_connection(21);
+        registry.register(conn.clone());
+        registry.index("phantom-type", 21);
+        registry.index("shared-type", 21);
+        let other = test_connection(22);
+        registry.register(other.clone());
+        registry.index("shared-type", 22);
+
+        // Two types visible while both connections are live.
+        let before = registry.workers_per_type();
+        assert_eq!(before.get("phantom-type"), Some(&1));
+        assert_eq!(before.get("shared-type"), Some(&2));
+
+        // Unregistering conn 21 empties `phantom-type` (its only member) — the key
+        // must be dropped — but only *decrements* `shared-type` (conn 22 remains).
+        assert!(registry.unregister(21));
+        let after = registry.workers_per_type();
+        assert!(
+            !after.contains_key("phantom-type"),
+            "an emptied roster must not leave a zero-count entry behind"
+        );
+        assert_eq!(
+            after.get("shared-type"),
+            Some(&1),
+            "a type with a surviving connection keeps its (decremented) count"
         );
     }
 
