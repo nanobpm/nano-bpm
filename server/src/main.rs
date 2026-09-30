@@ -10578,6 +10578,12 @@ impl ServerImpl {
 
         struct WaitState {
             element_instance_key: u64,
+            /// The key of the wait's own source (job / subscription / user task /
+            /// timer), all from one engine key space. An element instance can
+            /// hold several waits (a job plus its boundary timer), so the
+            /// tiebreak and the pagination cursor are `(element_instance_key,
+            /// source_key)` — unique per row, as `query::paginate` requires.
+            source_key: u64,
             process_instance_key: u64,
             element_id: String,
             element_type: String,
@@ -10625,6 +10631,7 @@ impl ServerImpl {
             };
             states.push(WaitState {
                 element_instance_key: job.element_instance_key,
+                source_key: job.key,
                 process_instance_key: job.instance_key,
                 element_id,
                 element_type,
@@ -10658,6 +10665,7 @@ impl ServerImpl {
             };
             states.push(WaitState {
                 element_instance_key: sub.element_instance_key,
+                source_key: sub.subscription_key,
                 process_instance_key: sub.instance_key,
                 element_id,
                 element_type,
@@ -10706,6 +10714,7 @@ impl ServerImpl {
             );
             states.push(WaitState {
                 element_instance_key: task.element_instance_key,
+                source_key: task.key,
                 process_instance_key: task.instance_key,
                 element_id,
                 element_type,
@@ -10747,6 +10756,7 @@ impl ServerImpl {
                 resolve(wait.element_instance_key, &wait.element_id);
             states.push(WaitState {
                 element_instance_key: wait.element_instance_key,
+                source_key: wait.wait_key,
                 process_instance_key: wait.instance_key,
                 element_id,
                 element_type,
@@ -10813,11 +10823,11 @@ impl ServerImpl {
                 "elementId" => query::SortVal::Str(ws.element_id.clone()),
                 _ => query::SortVal::Num(ws.element_instance_key as i64),
             },
-            |ws| ws.element_instance_key,
+            |ws| (ws.element_instance_key, ws.source_key),
         );
-        let sorted: Vec<(u64, WaitState)> = matched
+        let sorted: Vec<((u64, u64), WaitState)> = matched
             .into_iter()
-            .map(|ws| (ws.element_instance_key, ws))
+            .map(|ws| ((ws.element_instance_key, ws.source_key), ws))
             .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
         let items: Vec<models::ElementInstanceWaitStateResult> = page
@@ -28096,6 +28106,84 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    /// One element instance can hold several wait states (here a job and its
+    /// boundary timer), so the pagination cursor must identify the wait state,
+    /// not the element instance: forward paging with `limit: 1` visits each
+    /// wait state exactly once, then ends (#1295 review).
+    #[tokio::test]
+    async fn wait_state_cursor_pages_each_wait_of_one_element_instance_once() {
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("guarded")
+            .start_event("s")
+            .service_task("work", "w")
+            .timer_boundary_event("deadline", "work", 3_600_000)
+            .end_event("e")
+            .end_event("late")
+            .connect("s", "work")
+            .connect("work", "e")
+            .connect("deadline", "late")
+            .build()
+            .expect("valid boundary-timer process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("guarded".to_string(), "guarded.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        server
+            .create_for_stream(Some("guarded".into()), None, Default::default())
+            .await
+            .expect("create instance");
+        let all = loop_until_wait_states(&server, None, 2).await;
+        assert_eq!(all.len(), 2, "a JOB and a TIMER wait: {all:?}");
+        assert_eq!(
+            all[0].element_instance_key, all[1].element_instance_key,
+            "both waits belong to the one service-task instance"
+        );
+
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        for _ in 0..5 {
+            let mut page = serde_json::json!({"limit": 1});
+            if let Some(a) = &after {
+                page["after"] = serde_json::json!(a);
+            }
+            let q: models::ElementInstanceWaitStateQuery =
+                serde_json::from_value(serde_json::json!({ "page": page })).expect("valid query");
+            let Resp::Status200_TheElementInstanceWaitStateSearchResult(r) = server
+                .search_element_instance_wait_states_impl(&Some(q))
+                .await
+                .expect("wait-state search returns")
+            else {
+                panic!("expected 200");
+            };
+            if r.items.is_empty() {
+                break;
+            }
+            seen.extend(r.items.iter().map(ws_type));
+            after = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => break,
+            };
+        }
+        seen.sort_by_key(|t| t.to_string());
+        assert_eq!(
+            seen,
+            vec![
+                models::WaitStateTypeEnum::Job,
+                models::WaitStateTypeEnum::Timer
+            ],
+            "each wait state paged exactly once"
+        );
     }
 
     #[tokio::test]
