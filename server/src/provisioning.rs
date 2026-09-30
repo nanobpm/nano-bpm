@@ -4,11 +4,12 @@
 //! The monitor tick already publishes the raw provisioning gauges
 //! (`nanobpm_job_type_activatable` / `_workers` / `_dispatched_total`, plus the
 //! server-saturation signals) about once a second. Those are the single source of
-//! truth. This module reads them back — via the very same `/metrics` exposition the
-//! [`crate::metrics::gather`] renders — and runs the **shared** worker-scaling
-//! advisor ([`nano_provisioning_advisor`]) over two consecutive scrapes to classify
-//! each job type (starved / under-provisioned / server-bound / adequate) and size
-//! the suggested worker delta by Little's Law.
+//! truth. This module reads them back — straight off the metric handles via
+//! [`nano_server_storage::metrics::provisioning_signals`], with no `/metrics`
+//! serialize + re-parse (see [`current_snapshot`]) — and runs the **shared**
+//! worker-scaling advisor ([`nano_provisioning_advisor`]) over two consecutive
+//! samples to classify each job type (starved / under-provisioned / server-bound
+//! / adequate) and size the suggested worker delta by Little's Law.
 //!
 //! The classification thresholds are therefore defined exactly once, in the shared
 //! advisor crate the ProcessOS cockpit also consumes — never reimplemented in the

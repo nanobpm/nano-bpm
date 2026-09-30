@@ -1295,15 +1295,23 @@ mod tests {
         // held live by in_flight. Completion clamps the window to the completion
         // instant (never the backdated start), so it reads live through the
         // post-return grace and then idles/evicts on the normal schedule.
+        //
+        // Bracket the drop with its own clock reads and assert the recorded
+        // instant lies *within* that interval rather than equal to a second,
+        // independent read: `complete_rest_poll` samples `now_ms()` internally, so
+        // an exact-equality check against a later `now_ms()` here flakes whenever
+        // the clock ticks between the two reads.
+        let before_drop_ms = now_ms();
         drop(guard);
+        let after_drop_ms = now_ms();
         {
             let polls = REST_POLLS.lock().unwrap();
             let p = polls.get(&key).expect("poll present");
             assert_eq!(p.in_flight, 0, "the dropped guard released the poll");
-            assert_eq!(
-                p.live_until_ms,
-                now_ms(),
-                "completion clamps the window to the completion instant, not the backdated start"
+            assert!(
+                (before_drop_ms..=after_drop_ms).contains(&p.live_until_ms),
+                "completion clamps the window to the completion instant ({before_drop_ms}..={after_drop_ms}), not the backdated start; got {}",
+                p.live_until_ms
             );
         }
         clear("t-inflight:");
