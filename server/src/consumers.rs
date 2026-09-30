@@ -420,12 +420,21 @@ pub struct ConsumersResponse {
 /// under a shared name drive that entry's `in_flight` to N and so count N — the
 /// admitted-poll-slot signal that survives name collisions. Distinct names still
 /// occupy distinct entries, preserving the Falcon roster width (`workers_per_type`)
-/// for fleets that do name themselves. Pure over `REST_POLLS`; a cheap map fold off
-/// the hot path.
+/// for fleets that do name themselves. Prunes evicted entries as a side effect:
+/// on a non-console build `snapshot()` (the other prune site) is never called, so
+/// this 1 Hz read is the only sweep point — without it, expired entries are
+/// retained and rescanned every tick (up to `rest_max`). A cheap map fold off the
+/// hot path.
 pub fn rest_workers_per_type() -> HashMap<String, usize> {
     let now = now_ms();
     let stale = rest_stale_ms();
-    let polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    let evict = rest_evict_ms();
+    let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    // Drop entries past the eviction window before folding, mirroring
+    // `snapshot()`'s prune. `rest_retained` keeps every armed/in-flight
+    // registration (`in_flight > 0`) and every entry still within its eviction
+    // grace, so a genuinely live or recently-closed poll is never swept.
+    polls.retain(|_, p| rest_retained(p, now, evict));
     let mut by_type: HashMap<String, usize> = HashMap::new();
     for ((job_type, _worker), p) in polls.iter() {
         if rest_live(p, now, stale) {
@@ -690,6 +699,41 @@ mod tests {
             "two distinct live REST workers, deduped, idle excluded"
         );
         clear("t-rw:");
+    }
+
+    #[test]
+    fn rest_workers_per_type_prunes_evicted_entries() {
+        // On a non-console build `snapshot()` (the other prune site) is never
+        // called, so this 1 Hz provisioning read is the ONLY sweep point. It must
+        // drop entries past the eviction window instead of retaining and
+        // rescanning them every tick (up to `rest_max`). Guards the retention/
+        // rescan leak Copilot flagged on `consumers.rs`.
+        let jt = "t-rwprune:review";
+        clear("t-rwprune:");
+        let evict = rest_evict_ms();
+        let gone = now_ms().saturating_sub(evict + 1_000);
+        // A returned (`in_flight: 0`) poll whose window closed past the grace.
+        insert_poll(jt, "agent-gone", gone, gone);
+        // A live worker on the same type so the fold still has work to do.
+        let now = now_ms();
+        insert_poll(jt, "agent-live", now, now + 30_000);
+
+        let counts = rest_workers_per_type();
+        assert_eq!(
+            counts.get(jt).copied(),
+            Some(1),
+            "only the live worker is counted; the evicted one contributes nothing"
+        );
+        // And the evicted entry is actually removed from the backing map, so the
+        // next tick does not re-walk it.
+        assert!(
+            !REST_POLLS
+                .lock()
+                .unwrap()
+                .contains_key(&(jt.to_string(), "agent-gone".to_string())),
+            "evicted key pruned from REST_POLLS by the worker-count read"
+        );
+        clear("t-rwprune:");
     }
 
     #[test]
