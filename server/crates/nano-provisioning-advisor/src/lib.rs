@@ -23,7 +23,8 @@
 //!
 //! ## The signals (all from the public `/metrics` contract)
 //! Per job type: `nanobpm_job_type_activatable` (backlog level), `job_type_workers`
-//! (subscribed stream workers), `job_type_dispatched_total` (cumulative jobs handed
+//! (live subscribed workers — the Falcon stream roster plus live REST long-poll
+//! consumers), `job_type_dispatched_total` (cumulative jobs handed
 //! to workers → the drain throughput). Global: `nanobpm_ceiling_active{ceiling="throughput"}`
 //! (the clipping LED), the journal-writer busy/idle counters (duty cycle),
 //! `pending_create_queue`, and `admission_shed_total`.
@@ -332,6 +333,39 @@ pub fn parse_snapshot(text: &str, ts_ms: u64) -> Snapshot {
         pending_create_queue: parse_scalar(text, "nanobpm_pending_create_queue").unwrap_or(0.0)
             as i64,
         admission_shed_total: shed_total as u64,
+    }
+}
+
+impl Snapshot {
+    /// Builds a snapshot directly from native signal values — the no-serialize
+    /// counterpart to [`parse_snapshot`] for callers that hold the metric handles.
+    ///
+    /// [`parse_snapshot`] recovers the signals from a rendered `/metrics` body — the
+    /// right shape for an external consumer (the ProcessOS cockpit) that only has
+    /// the text. An *internal* caller that already holds the metric handles (the
+    /// gateway's own monitor) can skip the serialize→re-parse round trip entirely:
+    /// it reads the handful of series it needs straight off the registry and builds
+    /// the [`Snapshot`] here, so the per-tick cost no longer grows with every
+    /// unrelated metric family in the registry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_signals(
+        ts_ms: u64,
+        per_type: Vec<(String, JobTypeSample)>,
+        ceiling_throughput: bool,
+        writer_busy_seconds: f64,
+        writer_idle_seconds: f64,
+        pending_create_queue: i64,
+        admission_shed_total: u64,
+    ) -> Snapshot {
+        Snapshot {
+            ts_ms,
+            per_type: per_type.into_iter().collect(),
+            ceiling_throughput,
+            writer_busy_seconds,
+            writer_idle_seconds,
+            pending_create_queue,
+            admission_shed_total,
+        }
     }
 }
 

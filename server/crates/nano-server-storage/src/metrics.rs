@@ -15,6 +15,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use prometheus::core::Collector;
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
 
 /// The process-wide metrics registry and the Phase-1 handles.
@@ -199,7 +200,9 @@ struct Metrics {
     /// Activatable (waiting) jobs per `job_type` across all owned partitions —
     /// the depth workers still have to drain.
     job_type_activatable: prometheus::IntGaugeVec,
-    /// Live subscribed stream workers per `job_type` (falcon roster).
+    /// Live subscribed workers per `job_type` — the Falcon (stream) roster plus
+    /// live REST long-poll consumers (`activateJobs`), so a REST-only fleet is not
+    /// read as zero workers.
     job_type_workers: prometheus::IntGaugeVec,
     /// Under-provisioning hint per `job_type`: 1 when jobs are waiting but no
     /// worker is subscribed to drain them (hard starvation), else 0. Pair with
@@ -713,7 +716,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let job_type_workers = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_job_type_workers",
-            "Live subscribed stream workers per job type.",
+            "Live subscribed workers per job type (Falcon stream roster plus live REST long-poll consumers).",
         ),
         &["job_type"],
     )
@@ -1526,6 +1529,104 @@ pub fn gather() -> String {
     buf
 }
 
+/// The per-job-type provisioning signals, read straight off the metric handles —
+/// the no-serialize counterpart to scraping `/metrics` for them.
+///
+/// The gateway's worker-provisioning advisor recomputes its advice on every ~1 Hz
+/// monitor tick. Routing that through [`gather`] + a text re-parse would serialize
+/// the *entire* registry (every unrelated family, including per-job-type SLA
+/// histograms) into a fresh `String` each second and then scan it for the handful
+/// of series it actually needs — continuous CPU/allocation work that grows with the
+/// whole metric surface. This reads exactly the series the advisor consumes, so the
+/// per-tick cost stays proportional to the provisioning signals, not the registry.
+///
+/// The field set mirrors the advisor's `Snapshot` one-for-one; the caller (the
+/// gateway bin, which depends on both crates) maps it into the advisor's type.
+/// Storage deliberately does **not** depend on the advisor crate — the advisor is a
+/// shared leaf that ProcessOS also links, and the one-way rule is that Nano never
+/// links back into a consumer of its metrics.
+///
+/// Only the console-gated advisor calls this; allowed (not gated) so the narrow
+/// reader cannot drift from the always-built gauges it mirrors.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+#[derive(Debug, Default)]
+pub struct ProvisioningSignals {
+    /// Per-`job_type` `(activatable, workers, dispatched_total)` triples.
+    pub per_type: Vec<(String, ProvisioningJobType)>,
+    /// Whether the throughput ceiling LED is lit.
+    pub ceiling_throughput: bool,
+    /// Cumulative journal-writer busy seconds.
+    pub writer_busy_seconds: f64,
+    /// Cumulative journal-writer idle seconds.
+    pub writer_idle_seconds: f64,
+    /// Pending create-queue depth.
+    pub pending_create_queue: i64,
+    /// Cumulative admission-shed count (summed over all rails).
+    pub admission_shed_total: u64,
+}
+
+/// One job type's provisioning counters at the read instant. Mirrors the advisor's
+/// `JobTypeSample` (kept structurally identical by the caller's mapping).
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProvisioningJobType {
+    /// Activatable (waiting) jobs — the backlog level.
+    pub activatable: i64,
+    /// Live subscribed workers (Falcon stream roster + live REST long-pollers).
+    pub workers: i64,
+    /// Cumulative jobs dispatched — the drain throughput.
+    pub dispatched_total: u64,
+}
+
+/// Reads exactly the per-job-type provisioning series the advisor consumes,
+/// straight off the metric handles. See [`ProvisioningSignals`].
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+pub fn provisioning_signals() -> ProvisioningSignals {
+    let m = &*METRICS;
+
+    // Fold the three per-type vectors into one map keyed by `job_type`. Reading
+    // each vector's collected family (rather than re-rendering text) keeps this
+    // O(series the advisor wants), not O(whole registry).
+    let mut per_type: std::collections::BTreeMap<String, ProvisioningJobType> =
+        std::collections::BTreeMap::new();
+    fn job_type_of(metric: &prometheus::proto::Metric) -> Option<String> {
+        metric
+            .get_label()
+            .iter()
+            .find(|l| l.get_name() == "job_type")
+            .map(|l| l.get_value().to_string())
+    }
+    // `Collector::collect` on a `*Vec` yields its single `MetricFamily`; take it.
+    for metric in m.job_type_activatable.collect()[0].get_metric() {
+        if let Some(jt) = job_type_of(metric) {
+            per_type.entry(jt).or_default().activatable = metric.get_gauge().get_value() as i64;
+        }
+    }
+    for metric in m.job_type_workers.collect()[0].get_metric() {
+        if let Some(jt) = job_type_of(metric) {
+            per_type.entry(jt).or_default().workers = metric.get_gauge().get_value() as i64;
+        }
+    }
+    for metric in m.job_type_dispatched_total.collect()[0].get_metric() {
+        if let Some(jt) = job_type_of(metric) {
+            per_type.entry(jt).or_default().dispatched_total =
+                metric.get_counter().get_value() as u64;
+        }
+    }
+
+    ProvisioningSignals {
+        per_type: per_type.into_iter().collect(),
+        ceiling_throughput: m.ceiling_active.with_label_values(&["throughput"]).get() != 0,
+        writer_busy_seconds: m.writer_busy_seconds.get(),
+        writer_idle_seconds: m.writer_idle_seconds.get(),
+        pending_create_queue: m.pending_create_queue.get(),
+        admission_shed_total: SHED_REASONS
+            .iter()
+            .map(|r| m.admission_shed_total.with_label_values(&[r]).get())
+            .sum(),
+    }
+}
+
 // ---- Phase 2: falcon and protocol metrics ----
 
 /// Records a falcon frame processed (by frame type).
@@ -1778,6 +1879,34 @@ mod tests {
             gather()
                 .contains("nanobpm_job_type_dispatched_total{job_type=\"test-dispatch-type\"} 8")
         );
+    }
+
+    #[test]
+    fn provisioning_signals_read_the_same_values_the_exposition_renders() {
+        // The narrow reader must agree with the `/metrics` text the advisor used to
+        // parse — otherwise the console panel and the ProcessOS cockpit would see
+        // different provisioning numbers for the same instant. Unique labels keep
+        // the assertion isolated from the shared registry.
+        set_job_type_provisioning("test-provsig-type", 9, 4);
+        record_jobs_dispatched("test-provsig-type", 17);
+
+        let sig = provisioning_signals();
+        let sample = sig
+            .per_type
+            .iter()
+            .find(|(jt, _)| jt == "test-provsig-type")
+            .map(|(_, s)| *s)
+            .expect("per-type series present in the narrow read");
+        assert_eq!(sample.activatable, 9, "backlog level matches the gauge");
+        assert_eq!(sample.workers, 4, "worker count matches the gauge");
+        assert_eq!(
+            sample.dispatched_total, 17,
+            "drain throughput matches the counter"
+        );
+        // And the same values appear in the rendered exposition (parity).
+        let text = gather();
+        assert!(text.contains("nanobpm_job_type_activatable{job_type=\"test-provsig-type\"} 9"));
+        assert!(text.contains("nanobpm_job_type_workers{job_type=\"test-provsig-type\"} 4"));
     }
 
     #[test]

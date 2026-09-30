@@ -16342,11 +16342,17 @@ impl ServerImpl {
         // never publishes a false zero-worker starvation signal for a REST-only
         // fleet — a signal the ProcessOS advisor reads straight off `/metrics`.
         // Only the console *routes* that render the data stay feature-gated.
-        crate::consumers::record_rest_poll(
-            &job_type,
-            &worker,
-            long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
-        );
+        //
+        // A `max_jobs_to_activate <= 0` request can drain nothing, so it is not a
+        // worker for provisioning purposes — skip recording it rather than let a
+        // zero-capacity poll inflate the live-worker count and mask starvation.
+        if max_jobs > 0 {
+            crate::consumers::record_rest_poll(
+                &job_type,
+                &worker,
+                long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
+            );
+        }
 
         // Remote nodes to draw the shortfall from once local partitions are
         // drained (REST job aggregation, the analog of the stream dispatcher's
@@ -16398,6 +16404,11 @@ impl ServerImpl {
 
             if !jobs.is_empty() {
                 crate::metrics::record_jobs_dispatched(&job_type, jobs.len() as u64);
+                // The poll returned with jobs, possibly long before its requested
+                // long-poll window closed: close the liveness window now so a
+                // drained-and-gone one-shot client doesn't keep counting as a live
+                // worker until timeout + grace (masking starvation).
+                crate::consumers::complete_rest_poll(&job_type, &worker);
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
                 ));
@@ -16407,6 +16418,7 @@ impl ServerImpl {
             // wait until either new jobs are signalled or the window elapses.
             match deadline {
                 None => {
+                    crate::consumers::complete_rest_poll(&job_type, &worker);
                     return Ok(Resp::Status200_TheListOfActivatedJobs(
                         models::JobActivationResult::new(Vec::new()),
                     ));
@@ -16414,6 +16426,7 @@ impl ServerImpl {
                 Some(deadline) => {
                     let now = tokio::time::Instant::now();
                     if now >= deadline {
+                        crate::consumers::complete_rest_poll(&job_type, &worker);
                         return Ok(Resp::Status200_TheListOfActivatedJobs(
                             models::JobActivationResult::new(Vec::new()),
                         ));

@@ -24,7 +24,7 @@
 use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use nano_provisioning_advisor::{Advice, Snapshot, advise, parse_snapshot};
+use nano_provisioning_advisor::{Advice, JobTypeSample, Snapshot, advise};
 
 /// The previous scrape, held so the next tick has an earlier sample to diff
 /// against (the backlog-slope / drain-rate window). Empty until the first tick,
@@ -47,23 +47,51 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Pure core: parse a `/metrics` exposition into a fresh scrape and diff it against
-/// `prev` to produce the advice, returning both the scrape (to store as the next
-/// tick's `prev`) and the advice. No global state, so it is unit-testable and
-/// parallel-safe off any exposition text and clock.
-fn compute(prev: &Snapshot, text: &str, now: u64) -> (Snapshot, Advice) {
-    let cur = parse_snapshot(text, now);
+/// Pure core: diff a fresh scrape against `prev` to produce the advice, returning
+/// both the scrape (to store as the next tick's `prev`) and the advice. No global
+/// state, so it is unit-testable and parallel-safe off any snapshot and clock.
+fn compute(prev: &Snapshot, cur: Snapshot) -> (Snapshot, Advice) {
     let advice = advise(prev, &cur);
     (cur, advice)
 }
 
-/// Recompute the advice from a freshly rendered `/metrics` exposition and the
-/// stored previous scrape, then rotate. Called ~1 Hz from the monitor tick.
+/// Reads the current provisioning signals straight off the metric handles (no
+/// `/metrics` serialize + re-parse) and builds the advisor's [`Snapshot`]. Reading
+/// only the series the advisor consumes keeps the ~1 Hz tick cost proportional to
+/// the provisioning signals rather than the whole registry — see
+/// [`nano_server_storage::metrics::provisioning_signals`].
+fn current_snapshot(now: u64) -> Snapshot {
+    let sig = nano_server_storage::metrics::provisioning_signals();
+    Snapshot::from_signals(
+        now,
+        sig.per_type
+            .into_iter()
+            .map(|(jt, s)| {
+                (
+                    jt,
+                    JobTypeSample {
+                        activatable: s.activatable,
+                        workers: s.workers,
+                        dispatched_total: s.dispatched_total,
+                    },
+                )
+            })
+            .collect(),
+        sig.ceiling_throughput,
+        sig.writer_busy_seconds,
+        sig.writer_idle_seconds,
+        sig.pending_create_queue,
+        sig.admission_shed_total,
+    )
+}
+
+/// Recompute the advice from the current provisioning signals and the stored
+/// previous scrape, then rotate. Called ~1 Hz from the monitor tick.
 pub fn tick() {
-    let text = crate::metrics::gather();
     let now = now_ms();
+    let cur = current_snapshot(now);
     let mut prev = PREV.lock().expect("provisioning prev poisoned");
-    let (cur, advice) = compute(&prev, &text, now);
+    let (cur, advice) = compute(&prev, cur);
     *prev = cur;
     *LATEST.lock().expect("provisioning latest poisoned") = advice;
 }
@@ -76,7 +104,7 @@ pub fn latest() -> Advice {
 
 #[cfg(test)]
 mod tests {
-    use nano_provisioning_advisor::{Class, Confidence, Recommendation};
+    use nano_provisioning_advisor::{Class, Confidence, Recommendation, parse_snapshot};
 
     use super::*;
 
@@ -92,6 +120,14 @@ mod tests {
         )
     }
 
+    /// Diff the advice between two exposition-text scrapes, parsing each into a
+    /// [`Snapshot`] first. The production tick builds the snapshot from the narrow
+    /// metric read instead; parsing text here keeps the advisor's verdict exercised
+    /// end-to-end from the `/metrics` contract the snapshot mirrors.
+    fn compute_text(prev: &Snapshot, text: &str, now: u64) -> (Snapshot, Advice) {
+        compute(prev, parse_snapshot(text, now))
+    }
+
     fn find<'a>(a: &'a Advice, jt: &str) -> &'a Recommendation {
         a.recommendations
             .iter()
@@ -105,8 +141,8 @@ mod tests {
     #[test]
     fn two_scrapes_produce_starved_advice() {
         let jt = "prov-test-starved:t";
-        let (prev, _) = compute(&Snapshot::default(), &expo(30, 0, 0, jt), 0);
-        let (_, a) = compute(&prev, &expo(40, 0, 0, jt), 1000);
+        let (prev, _) = compute_text(&Snapshot::default(), &expo(30, 0, 0, jt), 0);
+        let (_, a) = compute_text(&prev, &expo(40, 0, 0, jt), 1000);
         let r = find(&a, jt);
         assert_eq!(r.class, Class::Starved);
         assert_eq!(r.confidence, Confidence::High);
@@ -118,7 +154,7 @@ mod tests {
     #[test]
     fn first_scrape_is_warming() {
         let jt = "prov-test-warming:t";
-        let (_, a) = compute(&Snapshot::default(), &expo(200, 3, 500, jt), 5000);
+        let (_, a) = compute_text(&Snapshot::default(), &expo(200, 3, 500, jt), 5000);
         assert_eq!(find(&a, jt).class, Class::Warming);
     }
 
@@ -128,8 +164,8 @@ mod tests {
     fn under_provisioned_sizes_workers() {
         let jt = "prov-test-under:t";
         // 4 workers drained 200 jobs in 1s (50/worker); backlog grew 100/s ⇒ +2.
-        let (prev, _) = compute(&Snapshot::default(), &expo(100, 4, 1000, jt), 0);
-        let (_, a) = compute(&prev, &expo(200, 4, 1200, jt), 1000);
+        let (prev, _) = compute_text(&Snapshot::default(), &expo(100, 4, 1000, jt), 0);
+        let (_, a) = compute_text(&prev, &expo(200, 4, 1200, jt), 1000);
         assert!(!a.server_bound);
         let r = find(&a, jt);
         assert_eq!(r.class, Class::UnderProvisioned);
@@ -143,12 +179,12 @@ mod tests {
     fn server_bound_suppresses_worker_suggestion() {
         let jt = "prov-test-serverbound:t";
         let ceiling = "nanobpm_ceiling_active{ceiling=\"throughput\"} 1\n";
-        let (prev, _) = compute(
+        let (prev, _) = compute_text(
             &Snapshot::default(),
             &format!("{}{ceiling}", expo(100, 4, 1000, jt)),
             0,
         );
-        let (_, a) = compute(&prev, &format!("{}{ceiling}", expo(300, 4, 1050, jt)), 1000);
+        let (_, a) = compute_text(&prev, &format!("{}{ceiling}", expo(300, 4, 1050, jt)), 1000);
         assert!(a.server_bound);
         let r = find(&a, jt);
         assert_eq!(r.class, Class::ServerBound);

@@ -149,6 +149,30 @@ pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) {
     upsert_rest_poll(&mut polls, key, entry, now, rest_evict_ms(), rest_max());
 }
 
+/// Marks `worker`'s in-flight `activateJobs` for `job_type` as **returned**, closing
+/// its long-poll window now rather than at the requested timeout.
+///
+/// [`record_rest_poll`] sets `live_until_ms` from the *requested* long-poll window
+/// before activation is attempted, but the request may return long before that
+/// window elapses — jobs were available and it answered immediately, or it gave up
+/// early. Without this call the consumer keeps reading **live** until
+/// `timeout + stale` even though it has already drained and gone, so a one-shot
+/// client with a long `requestTimeout` would suppress the per-type `Starved`
+/// signal for a job type nothing is actually draining. Closing the window at
+/// completion (the [`REST_STALE_MS`] grace still applies) makes the worker count
+/// reflect consumers that are genuinely still polling.
+///
+/// Best-effort: a no-op when the `(job_type, worker)` key is absent (e.g. the poll
+/// was never recorded because `max_jobs_to_activate <= 0`).
+pub fn complete_rest_poll(job_type: &str, worker: &str) {
+    let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    if let Some(p) = polls.get_mut(&(job_type.to_string(), worker.to_string())) {
+        // Close the window at the completion instant: the worker is live through
+        // the post-close grace, then idles/evicts on the normal schedule.
+        p.live_until_ms = p.last_seen_ms;
+    }
+}
+
 /// Insert or refresh a REST consumer, enforcing the cardinality cap. Existing
 /// keys always update (a live worker is never dropped); a new key is admitted
 /// only if the map is under `max` after pruning dead entries — otherwise it is
@@ -498,6 +522,57 @@ mod tests {
             "two distinct live REST workers, deduped, idle excluded"
         );
         clear("t-rw:");
+    }
+
+    #[test]
+    fn completed_rest_poll_stops_counting_once_its_grace_elapses() {
+        // Advisory: a one-shot client with a long `requestTimeout` that returns
+        // immediately (jobs were available) must not keep the worker counted live
+        // until timeout + grace — that would suppress `Starved` for a type nothing
+        // is actually draining. `complete_rest_poll` closes the window at the
+        // completion instant, so once the post-close grace passes the worker drops
+        // out of the provisioning count.
+        let jt = "t-done:review";
+        clear("t-done:");
+        // Record a poll with a long window still open (as `activateJobs` does on
+        // entry), then complete it (as the early-return paths now do).
+        record_rest_poll(jt, "agent-oneshot", 60_000);
+        complete_rest_poll(jt, "agent-oneshot");
+        // The window is now closed at the completion instant, so the entry is live
+        // only through the stale grace — not for the full 60s window. Backdating
+        // the close past the grace (simulating "grace has now elapsed") drops it.
+        let aged = now_ms().saturating_sub(rest_stale_ms() + 1_000);
+        insert_poll(jt, "agent-oneshot", aged, aged);
+        let counts = rest_workers_per_type();
+        assert_eq!(
+            counts.get(jt).copied(),
+            None,
+            "a completed poll past its grace no longer counts as a live worker"
+        );
+        clear("t-done:");
+    }
+
+    #[test]
+    fn complete_rest_poll_closes_an_open_window() {
+        // Directly guard the window-close semantics: an open long-poll window
+        // (live_until in the future) is pulled back to the completion instant, so
+        // the consumer stops being live once the grace elapses rather than riding
+        // the full requested timeout.
+        let jt = "t-close:review";
+        clear("t-close:");
+        let now = now_ms();
+        insert_poll(jt, "agent-lp", now, now + 60_000);
+        complete_rest_poll(jt, "agent-lp");
+        let p = *REST_POLLS
+            .lock()
+            .unwrap()
+            .get(&(jt.to_string(), "agent-lp".to_string()))
+            .expect("poll present");
+        assert_eq!(
+            p.live_until_ms, p.last_seen_ms,
+            "completion closes the long-poll window at the completion instant"
+        );
+        clear("t-close:");
     }
 
     #[test]
