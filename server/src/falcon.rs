@@ -237,6 +237,14 @@ impl Registry {
         // and the 1 Hz collector would keep scanning an ever-growing historical
         // set. Dispatch already skips empty rosters, so removal is safe there.
         by_type.retain(|_, ids| !ids.is_empty());
+        // Prune the round-robin cursor for any job type whose roster just became
+        // empty. `dispatch_plan` creates an `rr` entry per subscribed job type and
+        // `Subscribe` accepts caller-supplied job types with no cardinality limit,
+        // so without this a repeated subscribe/disconnect cycle would retain one
+        // `String` per historical type indefinitely. Lock order `by_type` → `rr`
+        // matches `dispatch_plan`, so there is no lock-ordering inversion.
+        let mut rr = self.rr.lock().expect("registry poisoned");
+        rr.retain(|job_type, _| by_type.contains_key(job_type));
         true
     }
 
@@ -3038,6 +3046,46 @@ mod registry_tests {
             after.get("shared-type"),
             Some(&1),
             "a type with a surviving connection keeps its (decremented) count"
+        );
+    }
+
+    #[test]
+    fn unregistering_the_last_connection_of_a_type_prunes_its_round_robin_cursor() {
+        // Issue #1294 review: `unregister` prunes the emptied `by_type` roster but
+        // left the matching round-robin cursor in `rr`. `dispatch_plan` creates an
+        // `rr` entry for every subscribed job type, and `Subscribe` accepts
+        // caller-supplied job types with no cardinality limit, so repeated
+        // subscribe/disconnect cycles would retain one `String` per historical type
+        // indefinitely. The fix prunes `rr` against the surviving roster.
+        let registry = Registry::new();
+        let conn = test_connection(31);
+        registry.register(conn.clone());
+        registry.index("ephemeral-type", 31);
+        registry.index("durable-type", 31);
+        let other = test_connection(32);
+        registry.register(other.clone());
+        registry.index("durable-type", 32);
+
+        // Force the round-robin cursors to exist for both types.
+        let _ = registry.dispatch_plan(0);
+        {
+            let rr = registry.rr.lock().expect("registry poisoned");
+            assert!(rr.contains_key("ephemeral-type"));
+            assert!(rr.contains_key("durable-type"));
+        }
+
+        // Unregistering conn 31 removes `ephemeral-type` entirely (its only member)
+        // but leaves `durable-type` with conn 32. The stale cursor for the removed
+        // type must be pruned; the surviving type's cursor must be kept.
+        assert!(registry.unregister(31));
+        let rr = registry.rr.lock().expect("registry poisoned");
+        assert!(
+            !rr.contains_key("ephemeral-type"),
+            "a fully-disconnected job type must not retain its round-robin cursor"
+        );
+        assert!(
+            rr.contains_key("durable-type"),
+            "a type with a surviving connection keeps its round-robin cursor"
         );
     }
 
