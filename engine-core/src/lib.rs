@@ -115,7 +115,9 @@ pub use engine::EngineSnapshot;
 pub use engine::SNAPSHOT_FORMAT_VERSION;
 mod lease;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};
-pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError, BUSINESS_ID_MAX_CHARS};
+pub use engine::{
+    check_business_id, ActivatedJob, DecisionEvaluation, Engine, EngineError, BUSINESS_ID_MAX_CHARS,
+};
 pub use engine::{BreakCondition, DebugSession};
 #[cfg(feature = "serde")]
 pub use event::decode_event_json;

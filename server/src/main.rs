@@ -8229,7 +8229,12 @@ impl ServerImpl {
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
-    ) -> Vec<Event> {
+    ) -> Result<Vec<Event>, EngineError> {
+        // Reject an out-of-range business id before touching any partition, with
+        // the engine's own rule: one partition must not apply the publish while
+        // another rejects it. It is `CorrelateMessage`'s only failure mode, so
+        // the per-partition apply below cannot fail.
+        nanobpmn_engine_core::check_business_id(business_id.as_deref())?;
         let num_partitions = self.engine.topology().num_partitions;
         // The (deduplicated) partitions that can own a matching subscription: the
         // correlation-key hash partition (catch/boundary) + partition 0 (starts).
@@ -8263,7 +8268,7 @@ impl ServerImpl {
                             },
                             now_millis(),
                         )
-                        .expect("CorrelateMessage never fails")
+                        .expect("CorrelateMessage fails only on a business id, checked above")
                 })
                 .await;
             commit.wait().await;
@@ -8277,7 +8282,7 @@ impl ServerImpl {
             self.drive_subscription_routing(Self::routable_events(&all_events))
                 .await;
         }
-        all_events
+        Ok(all_events)
     }
 
     /// Correlates a message across this node's owned partitions and returns the
@@ -8291,10 +8296,10 @@ impl ServerImpl {
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
-    ) -> (u64, Option<u64>) {
+    ) -> Result<(u64, Option<u64>), EngineError> {
         let events = self
             .correlate_message_everywhere(name, correlation_key, variables, business_id)
-            .await;
+            .await?;
         let message_key = message_key_of(&events);
         let instance = events.iter().find_map(|e| match e {
             Event::MessageCorrelated { instance_key, .. } => Some(*instance_key),
@@ -8305,7 +8310,7 @@ impl ServerImpl {
             Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
             _ => None,
         });
-        (message_key, instance)
+        Ok((message_key, instance))
     }
 
     /// Correlates a message across the **whole cluster**: this node's own
@@ -8323,7 +8328,7 @@ impl ServerImpl {
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
-    ) -> (u64, Option<u64>) {
+    ) -> Result<(u64, Option<u64>), EngineError> {
         let engine_vars: std::collections::HashMap<String, Value> = variables
             .as_ref()
             .map(|m| {
@@ -8339,7 +8344,7 @@ impl ServerImpl {
                 engine_vars,
                 business_id.clone(),
             )
-            .await;
+            .await?;
 
         if self.peers.has_peers() {
             let topology = self.engine.topology();
@@ -8388,7 +8393,7 @@ impl ServerImpl {
                 }
             }
         }
-        (message_key, instance)
+        Ok((message_key, instance))
     }
 
     // ---- Cross-partition subscription routing (stage 2, s2-subindex) -------
@@ -10174,14 +10179,25 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
-        let (message_key, _instance) = self
+        let (message_key, _instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
             )
-            .await;
+            .await
+        {
+            Ok(correlated) => correlated,
+            // An out-of-range businessId (the only correlation failure).
+            Err(e) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    e.to_string(),
+                )));
+            }
+        };
 
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
@@ -10207,14 +10223,25 @@ impl ServerImpl {
         let variables = wire_variables(body.variables.as_ref());
 
         let body_name = body.name.clone();
-        let (message_key, correlated_instance) = self
+        let (message_key, correlated_instance) = match self
             .correlate_message_cluster(
                 body_name,
                 correlation_key,
                 variables,
                 body.business_id.clone(),
             )
-            .await;
+            .await
+        {
+            Ok(correlated) => correlated,
+            // An out-of-range businessId (the only correlation failure).
+            Err(e) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "INVALID_ARGUMENT",
+                    400,
+                    e.to_string(),
+                )));
+            }
+        };
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
         // instance (ProcessInstanceCreated). Either way it correlated to an
@@ -26586,7 +26613,8 @@ mod clustered_startup_tests {
                 None,
                 Some("order-7".into()),
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         let instance = instance.expect("message-start must create an instance via fan-out");
         assert_eq!(
             nanobpmn_engine_core::partition_of(instance),
@@ -26709,7 +26737,8 @@ mod clustered_startup_tests {
         // continuation back to node 0 to advance the parked token.
         let (_message_key, correlated) = node0
             .correlate_message_cluster("payment-received".into(), order.clone(), None, None)
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated,
             Some(instance_key),
@@ -30810,7 +30839,8 @@ mod clustered_startup_tests {
         for i in 0..16u32 {
             node0
                 .correlate_message_cluster("order-placed".into(), format!("order-{i}"), None, None)
-                .await;
+                .await
+                .expect("correlation with a valid business id");
         }
 
         let count_instances = |server: ServerImpl| async move {
@@ -36597,7 +36627,8 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated,
             Some(instance_key),
@@ -36669,7 +36700,8 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated, None,
             "the publish correlates nothing after the remote subscription is disarmed"
@@ -36741,7 +36773,8 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(
             correlated,
             Some(instance_key),
@@ -36796,7 +36829,8 @@ mod subscription_placement_tests {
                     std::collections::HashMap::new(),
                     None,
                 )
-                .await;
+                .await
+                .expect("correlation with a valid business id");
         }
 
         // Count the parked instances per partition directly from each engine.
@@ -36910,7 +36944,8 @@ mod subscription_placement_tests {
                     std::collections::HashMap::new(),
                     None,
                 )
-                .await;
+                .await
+                .expect("correlation with a valid business id");
             if c == Some(instance_key) {
                 correlated = c;
                 break;
@@ -36974,7 +37009,8 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         let instance_key = instance.expect("the message-start created an instance on p0");
         assert_eq!(
             nanobpmn_engine_core::partition_of(instance_key),
@@ -37012,7 +37048,8 @@ mod subscription_placement_tests {
                 std::collections::HashMap::new(),
                 None,
             )
-            .await;
+            .await
+            .expect("correlation with a valid business id");
         assert_eq!(correlated, Some(instance_key));
 
         let (_vars, completed) = server

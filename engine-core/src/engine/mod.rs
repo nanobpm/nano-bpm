@@ -13202,7 +13202,9 @@ pub const BUSINESS_ID_MAX_CHARS: usize = 256;
 
 /// The single business-id range check (1..=[`BUSINESS_ID_MAX_CHARS`]
 /// characters) applied to every command that carries one. `None` is valid.
-fn check_business_id(business_id: Option<&str>) -> Result<(), EngineError> {
+/// Public so a host fanning one command out to several partitions can reject
+/// up front (atomically) with the engine's own rule.
+pub fn check_business_id(business_id: Option<&str>) -> Result<(), EngineError> {
     let Some(id) = business_id else {
         return Ok(());
     };
