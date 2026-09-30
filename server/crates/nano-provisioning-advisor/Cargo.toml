@@ -1,0 +1,16 @@
+[package]
+name = "nano-provisioning-advisor"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Worker-scaling / per-job-type provisioning advisor: the single source of truth for the starved / under-provisioned / server-bound classification and the Little's-Law worker sizing. Consumed by the gateway's /console/api/provisioning endpoint and re-exported by ProcessOS's cockpit advisor (Nano never links ProcessOS, so the shared logic lives on the Nano side)."
+
+[dependencies]
+# The advice/recommendation types are serialized to JSON for the console API and
+# the ProcessOS cockpit; `serde` derives the wire shape.
+serde = { version = "1", features = ["derive"] }
+
+[lints.rust]
+# Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
+# warning (unused code, deprecations, future-incompat lints, etc.).
+warnings = "deny"

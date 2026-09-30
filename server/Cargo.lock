@@ -1400,6 +1400,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-provisioning-advisor"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "nano-server-console"
 version = "0.1.0"
 dependencies = [
@@ -1575,6 +1582,7 @@ dependencies = [
  "http",
  "libc",
  "nano-falcon-protocol",
+ "nano-provisioning-advisor",
  "nano-server-console",
  "nano-server-net",
  "nano-server-raft",

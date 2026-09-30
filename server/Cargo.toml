@@ -55,6 +55,13 @@ nano-trace-store = { path = "crates/nano-trace-store", optional = true }
 # wires the connect-info newtype), so it is a plain (non-optional) dependency.
 nano-server-net = { path = "crates/nano-server-net" }
 nano-server-console = { path = "crates/nano-server-console", optional = true }
+# Worker-scaling / provisioning advisor (issue #1294): the single source of truth
+# for the per-job-type starved / under-provisioned / server-bound classification
+# and Little's-Law worker sizing. Consumed by the console `/console/api/provisioning`
+# endpoint via `src/provisioning.rs`, so it is console-only and optional. The same
+# leaf crate is re-exported by ProcessOS's cockpit advisor — the shared logic lives
+# on the Nano side because Nano never links ProcessOS.
+nano-provisioning-advisor = { path = "crates/nano-provisioning-advisor", optional = true }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
@@ -120,7 +127,7 @@ nano-server-storage = { path = "crates/nano-server-storage", features = ["test-h
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:nanobpm-console-api", "dep:nano-trace-store", "tokio/process", "tokio/io-util", "nano-server-storage/console", "nano-server-runtime/console", "dep:nano-server-console"]
+console = ["dep:nanobpm-console-api", "dep:nano-trace-store", "dep:nano-provisioning-advisor", "tokio/process", "tokio/io-util", "nano-server-storage/console", "nano-server-runtime/console", "dep:nano-server-console"]
 # ADR 0034: build the console with the lean "observe" operator profile instead of
 # the full "studio" IDE. Additive over `console` — it only swaps the embedded
 # bundle from `console/dist` to `console/dist-observe` (~158KB gzip vs ~4.7MB),

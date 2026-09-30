@@ -11,9 +11,13 @@
 
 #[cfg(feature = "console")]
 mod console_api;
-#[cfg(feature = "console")]
+// Always built (not console-gated): the REST poll registry feeds the published
+// `nanobpm_job_type_workers` gauge on every build — only the console *routes*
+// that render the data stay feature-gated (issue #1294).
 mod consumers;
 mod falcon;
+#[cfg(feature = "console")]
+mod provisioning;
 mod query;
 mod response_contract;
 mod stub_impls;
@@ -16327,18 +16331,55 @@ impl ServerImpl {
         };
         let deadline = long_poll_until.map(|d| tokio::time::Instant::now() + d);
 
-        // Record this poll for the console's live consumers panel (issue #404).
-        // Best-effort observability only, and only in console builds: a single
-        // map upsert that never affects activation. REST is stateless, so this
-        // poll — carrying the effective long-poll window so an in-flight long
-        // poll reads "live", not "idle" — is the only signal that a worker is
-        // connected and pulling this job type.
-        #[cfg(feature = "console")]
-        crate::consumers::record_rest_poll(
-            &job_type,
-            &worker,
-            long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
-        );
+        // Record this poll for the live consumers panel (issue #404) and the
+        // per-job-type worker count (issue #1294). Best-effort observability
+        // only: a single map upsert that never affects activation. REST is
+        // stateless, so this poll — carrying the effective long-poll window so
+        // an in-flight long poll reads "live", not "idle" — is the only signal
+        // that a worker is connected and pulling this job type. Always built
+        // (not console-gated): the `nanobpm_job_type_workers` gauge folds these
+        // live REST consumers in on every build, so a default-feature gateway
+        // never publishes a false zero-worker starvation signal for a REST-only
+        // fleet — a signal the ProcessOS advisor reads straight off `/metrics`.
+        // Only the console *routes* that render the data stay feature-gated.
+        //
+        // A `max_jobs_to_activate <= 0` request can drain nothing, so it is not a
+        // worker for provisioning purposes — skip recording it rather than let a
+        // zero-capacity poll inflate the live-worker count and mask starvation.
+        //
+        // `recorded` tracks whether *this* request opened a liveness window, so the
+        // completion paths below only close a window they actually opened. The entry
+        // is keyed by `(job_type, worker)`, so an unrecorded zero-capacity request
+        // that called `complete_rest_poll` unconditionally would decrement a
+        // *different*, genuinely-recorded in-flight poll's shared counter — and with
+        // a negative `requestTimeout` (no wait) could close a real worker's live
+        // window and publish a false starvation signal.
+        //
+        // The registration is held in an RAII guard (`_poll_guard`) rather than
+        // closed by the explicit `complete_rest_poll` calls below: if Axum drops
+        // this handler future while it is suspended at the long-poll await (client
+        // disconnect / shutdown), no explicit completion runs and `in_flight` would
+        // leak — leaving the requested deadline in place and a phantom worker that
+        // suppresses `Starved`. The guard's `Drop` balances the count on every exit
+        // path, normal return *and* cancellation.
+        //
+        // `RestPollGuard::record` returns `None` when the registration was refused
+        // at the cardinality cap (a brand-new `(job_type, worker)` key while the map
+        // is full): nothing was recorded, so there is no count to balance and no
+        // guard to arm — arming one anyway would make its `Drop` decrement a
+        // *different*, admitted poll's shared counter for the same key. `flatten`
+        // collapses the `Option<Option<_>>` so `_poll_guard` is `Some(guard)` only
+        // for a genuinely-admitted registration.
+        let recorded = max_jobs > 0;
+        let _poll_guard = recorded
+            .then(|| {
+                crate::consumers::RestPollGuard::record(
+                    &job_type,
+                    &worker,
+                    long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
+                )
+            })
+            .flatten();
 
         // Remote nodes to draw the shortfall from once local partitions are
         // drained (REST job aggregation, the analog of the stream dispatcher's
@@ -16390,6 +16431,11 @@ impl ServerImpl {
 
             if !jobs.is_empty() {
                 crate::metrics::record_jobs_dispatched(&job_type, jobs.len() as u64);
+                // The poll returned with jobs, possibly long before its requested
+                // long-poll window closed. The liveness window is closed by
+                // `_poll_guard`'s `Drop` on return (and on cancellation), so a
+                // drained-and-gone one-shot client doesn't keep counting as a live
+                // worker until timeout + grace (masking starvation).
                 return Ok(Resp::Status200_TheListOfActivatedJobs(
                     models::JobActivationResult::new(jobs),
                 ));
@@ -22239,6 +22285,7 @@ mod console_observe_guard_tests {
             "/console/api/cluster/health",
             "/console/api/cluster/metrics",
             "/console/api/metrics",
+            "/console/api/provisioning",
             "/console/api/instances",
             "/console/api/instances/42",
             "/console/api/traces",
@@ -23694,6 +23741,18 @@ async fn main() {
                     }),
                 );
             }
+            // Per-job-type worker-provisioning advice (issue #1294): the fleet-sizing
+            // hint — waiting jobs, subscribed workers, drain rate, and a
+            // starved / under-provisioned / server-bound classification with a
+            // suggested worker count. Derived from the same gauges the monitor tick
+            // publishes and the shared advisor the ProcessOS cockpit uses, so the
+            // thresholds are computed once (never in TypeScript). A GET
+            // observability read, served in observe (read-only) mode too, gated by
+            // the console feature + `console_enabled()` like the other reads.
+            console = console.route(
+                "/console/api/provisioning",
+                axum::routing::get(|| async { axum::Json(crate::provisioning::latest()) }),
+            );
             // "Stop the app before updating it" gate (issue #889): a single
             // server-side chokepoint that refuses project-mutating requests with
             // 409 `app_running` while the project is running. Layered over the
@@ -24182,22 +24241,59 @@ async fn main() {
                     prev_tier2_pressured = now_pressured;
                 }
                 let workers = monitor_registry.workers_per_type();
+                // Fold in the REST long-poll transport (issue #1294): the Falcon
+                // registry only enumerates persistent WebSocket subscribers, so a
+                // job type served purely over `activateJobs` long-polling would show
+                // zero workers and be *falsely* flagged starved while actively
+                // draining. `rest_workers_per_type` contributes the live REST
+                // consumers so the provisioning signal counts both transports.
+                // Always built (not console-gated): the published
+                // `nanobpm_job_type_workers` gauge is a public `/metrics` contract
+                // the ProcessOS advisor reads on any build, so it must not report
+                // 0 for an active REST-only fleet on a default-feature gateway.
+                let rest_workers = crate::consumers::rest_workers_per_type();
                 let mut current: std::collections::HashSet<String> =
-                    std::collections::HashSet::with_capacity(activatable.len() + workers.len());
-                for job_type in activatable.keys().chain(workers.keys()) {
+                    std::collections::HashSet::with_capacity(
+                        activatable.len() + workers.len() + rest_workers.len(),
+                    );
+                for job_type in activatable
+                    .keys()
+                    .chain(workers.keys())
+                    .chain(rest_workers.keys())
+                {
                     current.insert(job_type.clone());
                 }
                 for job_type in &current {
                     let waiting = *activatable.get(job_type).unwrap_or(&0) as i64;
-                    let workers = *workers.get(job_type).unwrap_or(&0) as i64;
+                    let workers = (*workers.get(job_type).unwrap_or(&0)
+                        + *rest_workers.get(job_type).unwrap_or(&0))
+                        as i64;
                     crate::metrics::set_job_type_provisioning(job_type, waiting, workers);
                 }
                 // Zero out job types that disappeared this tick so their gauges
-                // don't linger at a stale value.
+                // don't linger at a stale value, then *remove* their series:
+                // `set_job_type_provisioning` creates a Prometheus child per label
+                // the first time a type is seen, so zeroing alone would leave the
+                // series in the registry forever. Because `activateJobs` is
+                // unauthenticated, a client rotating unique job types could
+                // otherwise grow the registry (and every `/metrics` scrape) without
+                // bound. Zeroing first covers a scrape that races the removal (it
+                // never sees a stale non-zero); removal then frees the label. A type
+                // that reappears re-creates its series on the next tick.
                 for job_type in seen_job_types.difference(&current) {
                     crate::metrics::set_job_type_provisioning(job_type, 0, 0);
+                    crate::metrics::remove_job_type_provisioning(job_type);
                 }
                 seen_job_types = current;
+
+                // Recompute the per-job-type provisioning advice from the freshly
+                // published gauges for the console's fleet-sizing panel (#1294):
+                // diff this scrape against the previous one to size the drain/backlog
+                // rate window, reusing the shared advisor's classification so the
+                // starved / under-provisioned / server-bound thresholds live in one
+                // place (never reimplemented in TypeScript). Console builds only.
+                #[cfg(feature = "console")]
+                crate::provisioning::tick();
 
                 // Engine-actor (deepthi) heartbeat per owned partition: the
                 // dead/wedged/idle discriminator for the sustained-load
@@ -38907,5 +39003,92 @@ mod call_activity_hierarchy_read_model_tests {
             "an out-of-i64-range epoch stamp must clamp to the epoch, not wrap negative"
         );
         assert_eq!(ms_to_datetime(u64::MAX), epoch());
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "console")]
+mod provisioning_endpoint_tests {
+    //! Issue #1294: the console's TypeScript contract for
+    //! `/console/api/provisioning` (`console/src/lib/api.ts`) is hand-written, so
+    //! a serde rename on the Rust side would silently drift the wire shape the
+    //! panel parses. The `provisioning.rs` unit tests call `compute` directly
+    //! and never exercise the route or its serialized body — this test drives
+    //! the actual axum route and pins the serialized field names: camelCase on
+    //! the advice/recommendation fields, kebab-case on the class/confidence
+    //! enums.
+    use nano_provisioning_advisor::{Advice, Class, Confidence, Recommendation};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn provisioning_endpoint_serializes_the_documented_contract() {
+        let app = axum::Router::new().route(
+            "/console/api/provisioning",
+            axum::routing::get(|| async {
+                axum::Json(Advice {
+                    server_bound: true,
+                    writer_busy_ratio: 0.93,
+                    ceiling_throughput: true,
+                    pending_create_queue: 7,
+                    shed_delta: 2,
+                    window_s: 1.0,
+                    recommendations: vec![Recommendation {
+                        job_type: "pay:invoices".to_string(),
+                        class: Class::UnderProvisioned,
+                        confidence: Confidence::High,
+                        backlog: 200,
+                        backlog_slope_per_s: 100.0,
+                        drain_per_s: 200.0,
+                        workers: 4,
+                        suggest_worker_delta: 2,
+                        rationale: "backlog growing; add ~2 workers.".to_string(),
+                    }],
+                })
+            }),
+        );
+
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/console/api/provisioning")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("route responds");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body reads");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("valid JSON");
+
+        // camelCase top-level advice fields — the exact names the hand-written
+        // `ProvisioningAdvice` interface in console/src/lib/api.ts reads.
+        assert_eq!(body["serverBound"], true);
+        assert_eq!(body["writerBusyRatio"], 0.93);
+        assert_eq!(body["ceilingThroughput"], true);
+        assert_eq!(body["pendingCreateQueue"], 7);
+        assert_eq!(body["shedDelta"], 2);
+        assert_eq!(body["windowS"], 1.0);
+        assert!(
+            body.get("server_bound").is_none(),
+            "snake_case leak — serde rename_all camelCase must hold"
+        );
+
+        // camelCase recommendation fields + kebab-case enums.
+        let rec = &body["recommendations"][0];
+        assert_eq!(rec["jobType"], "pay:invoices");
+        assert_eq!(rec["class"], "under-provisioned");
+        assert_eq!(rec["confidence"], "high");
+        assert_eq!(rec["backlog"], 200);
+        assert_eq!(rec["backlogSlopePerS"], 100.0);
+        assert_eq!(rec["drainPerS"], 200.0);
+        assert_eq!(rec["workers"], 4);
+        assert_eq!(rec["suggestWorkerDelta"], 2);
+        assert_eq!(rec["rationale"], "backlog growing; add ~2 workers.");
+        assert!(
+            rec.get("job_type").is_none() && rec.get("suggest_worker_delta").is_none(),
+            "snake_case leak in the recommendation payload"
+        );
     }
 }

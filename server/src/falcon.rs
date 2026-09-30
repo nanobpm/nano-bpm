@@ -230,11 +230,46 @@ impl Registry {
         for ids in by_type.values_mut() {
             ids.retain(|&other| other != id);
         }
+        // Drop the now-empty per-type key: leaving it would make
+        // `workers_per_type` report a zero-count entry for a job type with no
+        // remaining connections, so the provisioning monitor would keep that
+        // type "current" forever — its Prometheus series would never be removed
+        // and the 1 Hz collector would keep scanning an ever-growing historical
+        // set. Dispatch already skips empty rosters, so removal is safe there.
+        by_type.retain(|_, ids| !ids.is_empty());
+        // Prune the round-robin cursor for any job type whose roster just became
+        // empty. `dispatch_plan` creates an `rr` entry per subscribed job type and
+        // `Subscribe` accepts caller-supplied job types with no cardinality limit,
+        // so without this a repeated subscribe/disconnect cycle would retain one
+        // `String` per historical type indefinitely. Lock order `by_type` → `rr`
+        // matches `dispatch_plan`, so there is no lock-ordering inversion.
+        let mut rr = self.rr.lock().expect("registry poisoned");
+        rr.retain(|job_type, _| by_type.contains_key(job_type));
         true
     }
 
     /// Indexes `id` under `job_type` for dispatch (idempotent).
+    ///
+    /// Serialized against the reaper / `unregister`: a connection is indexed only
+    /// while it is still registered in `conns` and not yet marked `closed`. Without
+    /// this guard a `Subscribe` racing the reaper could re-index a connection the
+    /// reaper has already unregistered — the second `unregister` (from
+    /// `handle_socket`) is then a no-op (the id is already gone from `conns`), so
+    /// the phantom roster entry is never pruned and `workers_per_type` reports a
+    /// worker that does not exist, suppressing `Starved`. Holding `conns` across the
+    /// `by_type` insert serializes against `unregister` (which takes `conns` first),
+    /// so either the index lands first and `unregister` prunes it, or `unregister`
+    /// wins and the index sees the id absent and bails. Lock order `conns → by_type`
+    /// matches `dispatch_plan`, so there is no lock-ordering inversion.
     fn index(&self, job_type: &str, id: ConnId) {
+        let conns = self.conns.lock().expect("registry poisoned");
+        match conns.get(&id) {
+            // Still registered and not yet reaped: safe to index.
+            Some(conn) if !conn.closed.load(Ordering::Relaxed) => {}
+            // Absent (already unregistered) or marked closed (reap in flight): drop
+            // the index so it cannot resurrect a phantom roster entry.
+            _ => return,
+        }
         let mut by_type = self.by_type.lock().expect("registry poisoned");
         let ids = by_type.entry(job_type.to_string()).or_default();
         if !ids.contains(&id) {
@@ -351,7 +386,13 @@ impl Registry {
     /// `conns` while touching `subs` and can't contend with the dispatcher /
     /// register / unregister on the hot path. The reaper independently evicts
     /// silent connections, so a reaped consumer simply stops appearing here.
-    #[cfg(feature = "console")]
+    /// Always built (not console-gated): the consumers registry it feeds is
+    /// always compiled so the REST worker count stays honest on every build —
+    /// only the console routes stay feature-gated (issue #1294). On a
+    /// non-console build nothing outside tests calls it yet, so the dead-code
+    /// lint is allowed rather than the method gated (gating would let the two
+    /// builds' registries drift).
+    #[cfg_attr(not(feature = "console"), allow(dead_code))]
     pub fn consumers(&self) -> Vec<FalconConsumer> {
         let mut out = Vec::new();
         for conn in self.all_connections() {
@@ -371,8 +412,9 @@ impl Registry {
 
 /// One live Falcon (command-stream) job consumer — a single `(connection, job
 /// type)` subscription. Returned by [`Registry::consumers`] for the console
-/// consumers panel.
-#[cfg(feature = "console")]
+/// consumers panel. Console-route-only on a non-console build — allowed, not
+/// gated, so the shape cannot drift from the always-built registry.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconConsumer {
     /// The job type this subscription pulls.
@@ -386,8 +428,10 @@ pub struct FalconConsumer {
 /// The Falcon connection-liveness deadline (millis) the reaper enforces (default
 /// [`LIVENESS_TIMEOUT_MS`], overridable via `NANOBPMN_STREAM_LIVENESS_MS`). The
 /// consumers panel reuses it so its notion of a "stale" Falcon consumer matches
-/// the engine's own reap threshold.
-#[cfg(feature = "console")]
+/// the engine's own reap threshold. Always built: the consumers registry that
+/// reads it is compiled on every build (issue #1294); console-route-only at
+/// runtime, so the lint is allowed on non-console builds rather than gated.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
 pub fn falcon_liveness_timeout_ms() -> u64 {
     liveness_timeout_ms()
 }
@@ -2984,6 +3028,151 @@ mod registry_tests {
         assert!(
             !registry.unregister(999),
             "unregistering an unknown id is a no-op too"
+        );
+    }
+
+    #[test]
+    fn unregistering_the_last_connection_of_a_type_drops_its_zero_count_entry() {
+        // Issue #1294 review: `unregister` emptied the per-type roster but left the
+        // `by_type` key behind, so `workers_per_type` kept returning a zero-count
+        // entry for a fully-disconnected job type. Chained into the provisioning
+        // monitor's `current` set, that phantom entry kept the type "current"
+        // forever — its Prometheus series was never removed and the 1 Hz collector
+        // kept scanning an ever-growing historical set. The fix removes the key
+        // once its roster empties.
+        let registry = Registry::new();
+        let conn = test_connection(21);
+        registry.register(conn.clone());
+        registry.index("phantom-type", 21);
+        registry.index("shared-type", 21);
+        let other = test_connection(22);
+        registry.register(other.clone());
+        registry.index("shared-type", 22);
+
+        // Two types visible while both connections are live.
+        let before = registry.workers_per_type();
+        assert_eq!(before.get("phantom-type"), Some(&1));
+        assert_eq!(before.get("shared-type"), Some(&2));
+
+        // Unregistering conn 21 empties `phantom-type` (its only member) — the key
+        // must be dropped — but only *decrements* `shared-type` (conn 22 remains).
+        assert!(registry.unregister(21));
+        let after = registry.workers_per_type();
+        assert!(
+            !after.contains_key("phantom-type"),
+            "an emptied roster must not leave a zero-count entry behind"
+        );
+        assert_eq!(
+            after.get("shared-type"),
+            Some(&1),
+            "a type with a surviving connection keeps its (decremented) count"
+        );
+    }
+
+    #[test]
+    fn unregistering_the_last_connection_of_a_type_prunes_its_round_robin_cursor() {
+        // Issue #1294 review: `unregister` prunes the emptied `by_type` roster but
+        // left the matching round-robin cursor in `rr`. `dispatch_plan` creates an
+        // `rr` entry for every subscribed job type, and `Subscribe` accepts
+        // caller-supplied job types with no cardinality limit, so repeated
+        // subscribe/disconnect cycles would retain one `String` per historical type
+        // indefinitely. The fix prunes `rr` against the surviving roster.
+        let registry = Registry::new();
+        let conn = test_connection(31);
+        registry.register(conn.clone());
+        registry.index("ephemeral-type", 31);
+        registry.index("durable-type", 31);
+        let other = test_connection(32);
+        registry.register(other.clone());
+        registry.index("durable-type", 32);
+
+        // Force the round-robin cursors to exist for both types.
+        let _ = registry.dispatch_plan(0);
+        {
+            let rr = registry.rr.lock().expect("registry poisoned");
+            assert!(rr.contains_key("ephemeral-type"));
+            assert!(rr.contains_key("durable-type"));
+        }
+
+        // Unregistering conn 31 removes `ephemeral-type` entirely (its only member)
+        // but leaves `durable-type` with conn 32. The stale cursor for the removed
+        // type must be pruned; the surviving type's cursor must be kept.
+        assert!(registry.unregister(31));
+        let rr = registry.rr.lock().expect("registry poisoned");
+        assert!(
+            !rr.contains_key("ephemeral-type"),
+            "a fully-disconnected job type must not retain its round-robin cursor"
+        );
+        assert!(
+            rr.contains_key("durable-type"),
+            "a type with a surviving connection keeps its round-robin cursor"
+        );
+    }
+
+    #[test]
+    fn index_after_unregister_does_not_resurrect_a_phantom_roster_entry() {
+        // Issue #1294 review: the reaper/subscribe race. The reaper marks a silent
+        // connection closed and unregisters it (removing it from `conns` and pruning
+        // its `by_type` rosters), but a concurrent `reader_loop` may already have
+        // selected a `Subscribe` frame and be inside `handle_client_frame`, which
+        // calls `index`. If that `index` lands AFTER the reaper's prune, the second
+        // `unregister` (from `handle_socket`) is a no-op — the connection is already
+        // gone from `conns`, so it returns before the `by_type` prune — leaving a
+        // permanent phantom roster entry. `workers_per_type` then counts a worker
+        // that does not exist and the provisioning monitor suppresses `Starved`.
+        // The fix makes `index` reject a connection that is no longer registered
+        // (or already marked closed), so the late index is dropped.
+        let registry = Registry::new();
+        let conn = test_connection(41);
+        registry.register(conn.clone());
+        registry.index("race-type", 41);
+        assert_eq!(registry.workers_per_type().get("race-type"), Some(&1));
+
+        // The reaper wins: it unregisters the connection (removing it from `conns`
+        // and pruning the `race-type` roster) before the in-flight Subscribe indexes.
+        assert!(registry.unregister(41));
+        assert!(
+            !registry.workers_per_type().contains_key("race-type"),
+            "roster emptied by the reaper"
+        );
+
+        // The concurrent Subscribe's `index` now lands — after the prune. It must be
+        // rejected, not resurrect a phantom entry.
+        registry.index("race-type", 41);
+        let after = registry.workers_per_type();
+        assert!(
+            !after.contains_key("race-type"),
+            "a late index for an unregistered connection must not leave a phantom roster entry"
+        );
+
+        // The second `unregister` (handle_socket, after the reader loop returns) is a
+        // no-op and must not be relied on to clean up.
+        assert!(
+            !registry.unregister(41),
+            "already unregistered by the reaper"
+        );
+        assert!(
+            !registry.workers_per_type().contains_key("race-type"),
+            "the phantom entry stays rejected after the no-op second unregister"
+        );
+    }
+
+    #[test]
+    fn index_rejects_a_connection_marked_closed_but_not_yet_unregistered() {
+        // The reaper sets `closed` BEFORE it calls `unregister` (spawn_reaper). In
+        // that window the connection is still present in `conns`, so a presence-only
+        // check would still index it. The `closed` guard covers this window: a
+        // connection the reaper has marked dead must not be (re)indexed even while
+        // it is still registered.
+        let registry = Registry::new();
+        let conn = test_connection(42);
+        registry.register(conn.clone());
+        conn.closed.store(true, Ordering::Relaxed);
+
+        registry.index("closing-type", 42);
+        assert!(
+            !registry.workers_per_type().contains_key("closing-type"),
+            "a connection already marked closed must not be indexed"
         );
     }
 

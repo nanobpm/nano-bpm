@@ -15,6 +15,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use prometheus::core::Collector;
 use prometheus::{Histogram, HistogramOpts, IntCounter, IntGauge, Registry, TextEncoder};
 
 /// The process-wide metrics registry and the Phase-1 handles.
@@ -199,7 +200,9 @@ struct Metrics {
     /// Activatable (waiting) jobs per `job_type` across all owned partitions —
     /// the depth workers still have to drain.
     job_type_activatable: prometheus::IntGaugeVec,
-    /// Live subscribed stream workers per `job_type` (falcon roster).
+    /// Live subscribed workers per `job_type` — the Falcon (stream) roster plus
+    /// live REST long-poll consumers (`activateJobs`), so a REST-only fleet is not
+    /// read as zero workers.
     job_type_workers: prometheus::IntGaugeVec,
     /// Under-provisioning hint per `job_type`: 1 when jobs are waiting but no
     /// worker is subscribed to drain them (hard starvation), else 0. Pair with
@@ -713,7 +716,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let job_type_workers = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_job_type_workers",
-            "Live subscribed stream workers per job type.",
+            "Live subscribed workers per job type (Falcon stream roster plus live REST long-poll consumers).",
         ),
         &["job_type"],
     )
@@ -1384,6 +1387,27 @@ pub fn set_job_type_provisioning(job_type: &str, activatable: i64, workers: i64)
         .set(starved);
 }
 
+/// Removes every per-`job_type` provisioning series (`activatable` / `workers` /
+/// `starved`) for a type that has left the active set, rather than merely zeroing
+/// it. `with_label_values` *creates* a child the first time a label is seen, so
+/// zeroing alone leaves the series in the registry forever: because `activateJobs`
+/// is unauthenticated, a client rotating unique job types would otherwise grow the
+/// registry (and every `/metrics` scrape) without bound. The caller still zeroes a
+/// disappeared type for one tick *before* removing it (so a scrape racing the
+/// removal never sees a stale non-zero value), then calls this to free the label.
+///
+/// A type that reappears simply re-creates its series on the next
+/// [`set_job_type_provisioning`] — removal is not a tombstone. `remove_label_values`
+/// only fails when the label set is absent (already removed), which is fine to
+/// ignore: the goal "no series for this type" is met either way.
+pub fn remove_job_type_provisioning(job_type: &str) {
+    let _ = METRICS
+        .job_type_activatable
+        .remove_label_values(&[job_type]);
+    let _ = METRICS.job_type_workers.remove_label_values(&[job_type]);
+    let _ = METRICS.job_type_starved.remove_label_values(&[job_type]);
+}
+
 /// Records `n` jobs dispatched to a worker for `job_type` — the per-type drain
 /// throughput. Called once per stream dispatch pass (with the jobs sent to the
 /// socket) and once per REST activation (with the jobs returned), so a job is
@@ -1524,6 +1548,124 @@ pub fn gather() -> String {
         .encode_utf8(&families, &mut buf)
         .expect("encode metrics");
     buf
+}
+
+/// The per-job-type provisioning signals, read straight off the metric handles —
+/// the no-serialize counterpart to scraping `/metrics` for them.
+///
+/// The gateway's worker-provisioning advisor recomputes its advice on every ~1 Hz
+/// monitor tick. Routing that through [`gather`] + a text re-parse would serialize
+/// the *entire* registry (every unrelated family, including per-job-type SLA
+/// histograms) into a fresh `String` each second and then scan it for the handful
+/// of series it actually needs — continuous CPU/allocation work that grows with the
+/// whole metric surface. This reads exactly the series the advisor consumes, so the
+/// per-tick cost stays proportional to the provisioning signals, not the registry.
+///
+/// The field set mirrors the advisor's `Snapshot` one-for-one; the caller (the
+/// gateway bin, which depends on both crates) maps it into the advisor's type.
+/// Storage deliberately does **not** depend on the advisor crate — the advisor is a
+/// shared leaf that ProcessOS also links, and the one-way rule is that Nano never
+/// links back into a consumer of its metrics.
+///
+/// Only the console-gated advisor calls this; allowed (not gated) so the narrow
+/// reader cannot drift from the always-built gauges it mirrors.
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+#[derive(Debug, Default)]
+pub struct ProvisioningSignals {
+    /// Per-`job_type` `(activatable, workers, dispatched_total)` triples.
+    pub per_type: Vec<(String, ProvisioningJobType)>,
+    /// Whether the throughput ceiling LED is lit.
+    pub ceiling_throughput: bool,
+    /// Cumulative journal-writer busy seconds.
+    pub writer_busy_seconds: f64,
+    /// Cumulative journal-writer idle seconds.
+    pub writer_idle_seconds: f64,
+    /// Pending create-queue depth.
+    pub pending_create_queue: i64,
+    /// Cumulative admission-shed count (summed over all rails).
+    pub admission_shed_total: u64,
+}
+
+/// One job type's provisioning counters at the read instant. Mirrors the advisor's
+/// `JobTypeSample` (kept structurally identical by the caller's mapping).
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProvisioningJobType {
+    /// Activatable (waiting) jobs — the backlog level.
+    pub activatable: i64,
+    /// Live subscribed workers (Falcon stream roster + live REST long-pollers).
+    pub workers: i64,
+    /// Cumulative jobs dispatched — the drain throughput.
+    pub dispatched_total: u64,
+}
+
+/// Reads exactly the per-job-type provisioning series the advisor consumes,
+/// straight off the metric handles. See [`ProvisioningSignals`].
+#[cfg_attr(not(feature = "console"), allow(dead_code))]
+pub fn provisioning_signals() -> ProvisioningSignals {
+    let m = &*METRICS;
+
+    // Fold the three per-type vectors into one map keyed by `job_type`. Reading
+    // each vector's collected family (rather than re-rendering text) keeps this
+    // O(series the advisor wants), not O(whole registry).
+    let mut per_type: std::collections::BTreeMap<String, ProvisioningJobType> =
+        std::collections::BTreeMap::new();
+    fn job_type_of(metric: &prometheus::proto::Metric) -> Option<String> {
+        metric
+            .get_label()
+            .iter()
+            .find(|l| l.get_name() == "job_type")
+            .map(|l| l.get_value().to_string())
+    }
+    // `Collector::collect` on a `*Vec` yields exactly one `MetricFamily`, whose
+    // metric list is empty until a labeled child exists. Iterate the returned
+    // families rather than indexing `[0]` so an idle gateway (no labeled children
+    // yet) reads an empty snapshot by construction instead of relying on the
+    // collector always returning a length-one vector.
+    for family in m.job_type_activatable.collect() {
+        for metric in family.get_metric() {
+            if let Some(jt) = job_type_of(metric) {
+                per_type.entry(jt).or_default().activatable = metric.get_gauge().get_value() as i64;
+            }
+        }
+    }
+    for family in m.job_type_workers.collect() {
+        for metric in family.get_metric() {
+            if let Some(jt) = job_type_of(metric) {
+                per_type.entry(jt).or_default().workers = metric.get_gauge().get_value() as i64;
+            }
+        }
+    }
+    // The dispatched counter is cumulative and is NOT removed by
+    // `remove_job_type_provisioning` (unlike the activatable/worker gauges), so it
+    // keeps a series for every historically-dispatched type. Folding it in with
+    // `entry(...).or_default()` would re-add each such dead type as a zero-backlog
+    // sample; if the type later becomes active again, the advisor diffs against
+    // that stale sample instead of returning `Warming` and can immediately report
+    // false backlog growth / under-provisioning. Apply the counter only to job
+    // types the current activatable/worker gauges already introduced (`get_mut`),
+    // so a type with no live backlog/worker signal contributes no sample at all.
+    for family in m.job_type_dispatched_total.collect() {
+        for metric in family.get_metric() {
+            if let Some(jt) = job_type_of(metric)
+                && let Some(entry) = per_type.get_mut(&jt)
+            {
+                entry.dispatched_total = metric.get_counter().get_value() as u64;
+            }
+        }
+    }
+
+    ProvisioningSignals {
+        per_type: per_type.into_iter().collect(),
+        ceiling_throughput: m.ceiling_active.with_label_values(&["throughput"]).get() != 0,
+        writer_busy_seconds: m.writer_busy_seconds.get(),
+        writer_idle_seconds: m.writer_idle_seconds.get(),
+        pending_create_queue: m.pending_create_queue.get(),
+        admission_shed_total: SHED_REASONS
+            .iter()
+            .map(|r| m.admission_shed_total.with_label_values(&[r]).get())
+            .sum(),
+    }
 }
 
 // ---- Phase 2: falcon and protocol metrics ----
@@ -1781,6 +1923,34 @@ mod tests {
     }
 
     #[test]
+    fn provisioning_signals_read_the_same_values_the_exposition_renders() {
+        // The narrow reader must agree with the `/metrics` text the advisor used to
+        // parse — otherwise the console panel and the ProcessOS cockpit would see
+        // different provisioning numbers for the same instant. Unique labels keep
+        // the assertion isolated from the shared registry.
+        set_job_type_provisioning("test-provsig-type", 9, 4);
+        record_jobs_dispatched("test-provsig-type", 17);
+
+        let sig = provisioning_signals();
+        let sample = sig
+            .per_type
+            .iter()
+            .find(|(jt, _)| jt == "test-provsig-type")
+            .map(|(_, s)| *s)
+            .expect("per-type series present in the narrow read");
+        assert_eq!(sample.activatable, 9, "backlog level matches the gauge");
+        assert_eq!(sample.workers, 4, "worker count matches the gauge");
+        assert_eq!(
+            sample.dispatched_total, 17,
+            "drain throughput matches the counter"
+        );
+        // And the same values appear in the rendered exposition (parity).
+        let text = gather();
+        assert!(text.contains("nanobpm_job_type_activatable{job_type=\"test-provsig-type\"} 9"));
+        assert!(text.contains("nanobpm_job_type_workers{job_type=\"test-provsig-type\"} 4"));
+    }
+
+    #[test]
     fn set_sla_mode_publishes_active_series_and_clears_the_other() {
         set_sla_mode("admission");
         let g = gather();
@@ -1818,5 +1988,105 @@ mod tests {
             .ceiling_hits_total
             .with_label_values(&[ceiling])
             .get()
+    }
+
+    #[test]
+    fn remove_job_type_provisioning_frees_the_label_series() {
+        // Cardinality regression (Copilot review): a disappeared job type must have
+        // its provisioning series *removed*, not merely zeroed — `with_label_values`
+        // creates the child permanently, so zeroing alone leaves an unauthenticated
+        // `activateJobs` caller free to grow the registry by rotating unique types.
+        // Unique label keeps the assertion isolated from the shared registry.
+        let jt = "test-remove-type";
+        set_job_type_provisioning(jt, 5, 1);
+        assert!(
+            gather().contains("nanobpm_job_type_activatable{job_type=\"test-remove-type\"}"),
+            "series present while the type is active"
+        );
+
+        remove_job_type_provisioning(jt);
+        let text = gather();
+        assert!(
+            !text.contains("test-remove-type"),
+            "activatable/workers/starved series are all removed once the type leaves the active set"
+        );
+
+        // Removal is not a tombstone: a type that reappears re-creates its series.
+        set_job_type_provisioning(jt, 2, 0);
+        assert!(gather().contains("nanobpm_job_type_activatable{job_type=\"test-remove-type\"} 2"));
+    }
+
+    #[test]
+    fn provisioning_signals_skip_a_dispatched_counter_with_no_live_type() {
+        // Stale-counter regression (Copilot review): the dispatched counter is
+        // cumulative and is NOT removed by `remove_job_type_provisioning`, so it
+        // keeps a series for every historically-dispatched type. Folding it in
+        // unconditionally would re-add each dead type as a zero-backlog sample in
+        // `PREV`; if the type later reactivates, the advisor diffs against that
+        // stale sample instead of returning `Warming` and reports false backlog
+        // growth. The narrow read must apply the counter only to types the live
+        // activatable/worker gauges already introduced.
+        let jt = "test-stale-dispatch-type";
+        // A dispatched counter exists for a type that has NO live gauges (it left
+        // the active set after dispatching). Unique label isolates the assertion.
+        record_jobs_dispatched(jt, 7);
+        assert!(
+            gather().contains(
+                "nanobpm_job_type_dispatched_total{job_type=\"test-stale-dispatch-type\"} 7"
+            ),
+            "the cumulative counter series persists after the type leaves the active set"
+        );
+
+        let sig = provisioning_signals();
+        assert!(
+            !sig.per_type.iter().any(|(t, _)| t == jt),
+            "a dispatched counter with no live activatable/worker gauge contributes no sample"
+        );
+
+        // Once the type is live again its counter folds in normally.
+        set_job_type_provisioning(jt, 3, 1);
+        let sig = provisioning_signals();
+        let sample = sig
+            .per_type
+            .iter()
+            .find(|(t, _)| t == jt)
+            .map(|(_, s)| *s)
+            .expect("live type present");
+        assert_eq!(sample.activatable, 3);
+        assert_eq!(sample.workers, 1);
+        assert_eq!(
+            sample.dispatched_total, 7,
+            "the live type picks up its cumulative counter"
+        );
+        remove_job_type_provisioning(jt);
+    }
+
+    #[test]
+    fn collecting_a_label_vector_with_no_children_yields_one_empty_family() {
+        // Panic-surface guard (Copilot review): `provisioning_signals` iterates the
+        // families returned by `*Vec::collect()`. An idle console-enabled gateway
+        // has no labeled children on its first provisioning tick, so this pins the
+        // invariant the reader relies on — `collect()` returns exactly one
+        // `MetricFamily` whose metric list is empty, never a zero-length vector that
+        // would make the old `collect()[0]` indexing panic. If a future prometheus
+        // bump ever changed that shape, this fails instead of the reader panicking
+        // in production.
+        let v =
+            prometheus::IntGaugeVec::new(prometheus::Opts::new("test_empty_vec", "guard"), &["k"])
+                .expect("vec builds");
+        let families = prometheus::core::Collector::collect(&v);
+        assert_eq!(families.len(), 1, "a label vector collects to one family");
+        assert!(
+            families[0].get_metric().is_empty(),
+            "no labeled children -> the family carries zero metrics"
+        );
+        // And iterating it (as the reader does) simply runs the body zero times.
+        let mut seen = 0;
+        for family in prometheus::core::Collector::collect(&v) {
+            for _metric in family.get_metric() {
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 0, "an empty label vector contributes no samples");
     }
 }
