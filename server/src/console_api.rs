@@ -417,7 +417,7 @@ impl apis::instances::Instances for ServerImpl {
             Out::Resolved => Resp::Status204_TheIncidentWasResolved,
             Out::NotFound(d) => Resp::Status404_NotFound(d),
             Out::NotResolvable(d) => Resp::Status409_AlreadyExists(d),
-            Out::Internal(d) => Resp::Status500_InternalError(d),
+            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -447,7 +447,7 @@ impl apis::instances::Instances for ServerImpl {
         Ok(match self.cancel_instance_core(instance_key).await {
             Out::Canceled => Resp::Status204_TheInstanceWasCancelled,
             Out::NotFound(d) => Resp::Status404_NotFound(d),
-            Out::Internal(d) => Resp::Status500_InternalError(d),
+            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -476,9 +476,9 @@ impl apis::instances::Instances for ServerImpl {
         // core as `POST /v2/process-instances/{key}/suspension`.
         Ok(match self.suspend_instance_core(instance_key).await {
             Out::Ok => Resp::Status204_TheInstanceWasSuspended,
-            Out::BadRequest(d) => Resp::Status400_InvalidRequest(d),
+            Out::Conflict(d) => Resp::Status400_InvalidRequest(d),
             Out::NotFound(d) => Resp::Status404_NotFound(d),
-            Out::Internal(d) => Resp::Status500_InternalError(d),
+            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -507,9 +507,9 @@ impl apis::instances::Instances for ServerImpl {
         // core as `POST /v2/process-instances/{key}/resumption`.
         Ok(match self.resume_instance_core(instance_key).await {
             Out::Ok => Resp::Status204_TheInstanceWasResumed,
-            Out::BadRequest(d) => Resp::Status400_InvalidRequest(d),
+            Out::Conflict(d) => Resp::Status400_InvalidRequest(d),
             Out::NotFound(d) => Resp::Status404_NotFound(d),
-            Out::Internal(d) => Resp::Status500_InternalError(d),
+            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -548,7 +548,7 @@ impl apis::instances::Instances for ServerImpl {
             match self.set_variables_core(scope_key, variables, local).await {
                 Out::Updated => Resp::Status204_TheVariablesWereMerged,
                 Out::ScopeNotFound(d) => Resp::Status404_NotFound(d),
-                Out::Internal(d) => Resp::Status500_InternalError(d),
+                Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
             },
         )
     }

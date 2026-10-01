@@ -6124,6 +6124,13 @@ impl ServerImpl {
                     detail,
                 ))
             }
+            CancelInstanceOutcome::Unavailable(detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                ))
+            }
             CancelInstanceOutcome::Internal(detail) => {
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -6156,17 +6163,22 @@ impl ServerImpl {
 
         Ok(match self.suspend_instance_core(instance_key).await {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsSuspended,
-            TransitionInstanceOutcome::BadRequest(detail) => {
-                Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid transition",
-                    400,
-                    detail,
-                ))
+            TransitionInstanceOutcome::Conflict(detail) => {
+                Resp::Status409_TheProcessInstanceIsNotInTheACTIVEStateAndCannotBeSuspended(
+                    problem("Invalid transition", 409, detail),
+                )
             }
             TransitionInstanceOutcome::NotFound(detail) => {
                 Resp::Status404_TheProcessInstanceIsNotFound(problem(
                     "Process instance not found",
                     404,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::Unavailable(detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
                     detail,
                 ))
             }
@@ -6202,17 +6214,22 @@ impl ServerImpl {
 
         Ok(match self.resume_instance_core(instance_key).await {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsResumed,
-            TransitionInstanceOutcome::BadRequest(detail) => {
-                Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid transition",
-                    400,
-                    detail,
-                ))
+            TransitionInstanceOutcome::Conflict(detail) => {
+                Resp::Status409_TheProcessInstanceIsNotInTheSUSPENDEDStateAndCannotBeResumed(
+                    problem("Invalid transition", 409, detail),
+                )
             }
             TransitionInstanceOutcome::NotFound(detail) => {
                 Resp::Status404_TheProcessInstanceIsNotFound(problem(
                     "Process instance not found",
                     404,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::Unavailable(detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
                     detail,
                 ))
             }
@@ -6300,6 +6317,13 @@ impl ServerImpl {
                     Resp::Status409_TheProcessInstanceMigrationFailed(problem(
                         "Migration failed",
                         409,
+                        detail,
+                    ))
+                }
+                MigrateInstanceOutcome::Unavailable(detail) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
                         detail,
                     ))
                 }
@@ -7498,6 +7522,7 @@ impl ServerImpl {
                 Ok(link) => match link.cancel_instance(instance_key.to_string()).await {
                     Ok(r) if is_ok_status(r.status) => Out::Canceled,
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7511,6 +7536,7 @@ impl ServerImpl {
         {
             Ok(_) => Out::Canceled,
             Err((404, detail)) => Out::NotFound(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
             Err((_, detail)) => Out::Internal(detail),
         }
     }
@@ -7529,8 +7555,9 @@ impl ServerImpl {
             return match self.peer_link(node).await {
                 Ok(link) => match link.suspend_instance(instance_key.to_string()).await {
                     Ok(r) if is_ok_status(r.status) => Out::Ok,
-                    Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
+                    Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7553,8 +7580,9 @@ impl ServerImpl {
             return match self.peer_link(node).await {
                 Ok(link) => match link.resume_instance(instance_key.to_string()).await {
                     Ok(r) if is_ok_status(r.status) => Out::Ok,
-                    Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
+                    Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7567,9 +7595,10 @@ impl ServerImpl {
 
     /// Applies a suspend transition on this node's owning partition. Returns
     /// `Ok(())` on success (or an idempotent no-op), else `(status, detail)`:
-    /// 404 for an unknown instance, 400 for an illegal transition from a
-    /// terminal state, 500 otherwise. Shared by the v2 REST core and the
-    /// intra-cluster `SuspendInstance` frame handler so the two cannot drift.
+    /// 404 for an unknown instance, 409 for a transition conflicting with a
+    /// terminal state, 503 for a transient Raft condition, 500 otherwise.
+    /// Shared by the v2 REST core and the intra-cluster `SuspendInstance` frame
+    /// handler so the two cannot drift.
     pub(crate) async fn suspend_instance_local(
         &self,
         instance_key: u64,
@@ -7589,9 +7618,11 @@ impl ServerImpl {
     }
 
     /// Applies a suspend/resume transition on this node's owning partition,
-    /// mapping the engine result to `(status, detail)`: an unknown instance is
-    /// 404, an illegal transition from a terminal state is 400, any other engine
-    /// error is 500. A successful (or idempotent no-op) apply waits for commit.
+    /// mapping the engine result to `(status, detail)` via the shared
+    /// [`crate::raft::engine_error_status`]: an unknown instance is 404, a
+    /// transition conflicting with a terminal state is 409, a transient Raft
+    /// condition is 503, any other engine error is 500. A successful (or
+    /// idempotent no-op) apply waits for commit.
     pub(crate) async fn apply_transition_local(
         &self,
         instance_key: u64,
@@ -7629,6 +7660,7 @@ impl ServerImpl {
                     Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7648,6 +7680,7 @@ impl ServerImpl {
             Err((400, detail)) => Out::BadRequest(detail),
             Err((404, detail)) => Out::NotFound(detail),
             Err((409, detail)) => Out::Conflict(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
             Err((_, detail)) => Out::Internal(detail),
         }
     }
@@ -7693,6 +7726,7 @@ impl ServerImpl {
                     Ok(r) if is_ok_status(r.status) => Out::Resolved,
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 409 => Out::NotResolvable(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7713,6 +7747,7 @@ impl ServerImpl {
             }
             Err((404, detail)) => Out::NotFound(detail),
             Err((409, detail)) => Out::NotResolvable(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
             Err((_, detail)) => Out::Internal(detail),
         }
     }
@@ -7813,6 +7848,7 @@ impl ServerImpl {
                 {
                     Ok(r) if is_ok_status(r.status) => Out::Updated,
                     Ok(r) if r.status == 400 => Out::ScopeNotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7833,6 +7869,7 @@ impl ServerImpl {
         {
             Ok(_) => Out::Updated,
             Err((400, detail)) => Out::ScopeNotFound(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
             Err((_, detail)) => Out::Internal(detail),
         }
     }
@@ -7879,6 +7916,13 @@ impl ServerImpl {
                     Resp::Status409_TheIncidentCannotBeResolvedDueToAnInvalidState(problem(
                         "Incident not resolvable",
                         409,
+                        detail,
+                    ))
+                }
+                ResolveIncidentOutcome::Unavailable(detail) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
                         detail,
                     ))
                 }
@@ -7931,6 +7975,13 @@ impl ServerImpl {
                     Resp::Status400_TheProvidedDataIsNotValid(problem(
                         "Scope not found",
                         400,
+                        detail,
+                    ))
+                }
+                SetVariablesOutcome::Unavailable(detail) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
                         detail,
                     ))
                 }
@@ -9066,6 +9117,11 @@ impl ServerImpl {
                 400 => {
                     Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid data", 400, detail))
                 }
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -9089,6 +9145,11 @@ impl ServerImpl {
             Err((400, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Invalid data",
                 400,
+                detail,
+            ))),
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
                 detail,
             ))),
             Err((_, detail)) => Ok(
@@ -13011,6 +13072,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13039,6 +13105,11 @@ impl ServerImpl {
                     detail,
                 )),
             ),
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
             Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -13094,6 +13165,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13132,6 +13208,11 @@ impl ServerImpl {
                     detail,
                 )),
             ),
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
             Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -13415,6 +13496,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13439,6 +13525,11 @@ impl ServerImpl {
                     detail,
                 )),
             ),
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
             Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -13494,6 +13585,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13556,6 +13652,11 @@ impl ServerImpl {
                     detail,
                 )),
             ),
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
             Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -22272,6 +22373,9 @@ pub(crate) enum ResolveIncidentOutcome {
     NotFound(String),
     /// The incident exists but is not in a resolvable state (409).
     NotResolvable(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22286,6 +22390,9 @@ pub(crate) enum CancelInstanceOutcome {
     Canceled,
     /// No active process instance with the given key exists (404).
     NotFound(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22304,6 +22411,9 @@ pub(crate) enum MigrateInstanceOutcome {
     /// a mapped element changes type, or the instance uses a construct not yet
     /// supported by migration (409).
     Conflict(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22313,16 +22423,20 @@ pub(crate) enum MigrateInstanceOutcome {
 /// the `Command::suspend_instance` / `Command::resume_instance` and clustering
 /// (leader-forward) semantics have a single source of truth. `ACTIVE ⇄
 /// SUSPENDED` are the only valid live transitions; a request from a terminal
-/// state is [`Self::BadRequest`], and an unknown instance is [`Self::NotFound`].
+/// state is [`Self::Conflict`] (the suspend/resume contracts define wrong-state
+/// as 409), and an unknown instance is [`Self::NotFound`].
 pub(crate) enum TransitionInstanceOutcome {
     /// The instance reached the requested state (or was already in it — an
     /// idempotent no-op is reported as success).
     Ok,
-    /// The transition is illegal from the instance's current (terminal) state
-    /// (400).
-    BadRequest(String),
+    /// The transition conflicts with the instance's current (terminal) state
+    /// (409).
+    Conflict(String),
     /// No process instance with the given key exists (404).
     NotFound(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22334,8 +22448,9 @@ impl From<Result<(), (u16, String)>> for TransitionInstanceOutcome {
     fn from(result: Result<(), (u16, String)>) -> Self {
         match result {
             Ok(()) => TransitionInstanceOutcome::Ok,
-            Err((400, detail)) => TransitionInstanceOutcome::BadRequest(detail),
+            Err((409, detail)) => TransitionInstanceOutcome::Conflict(detail),
             Err((404, detail)) => TransitionInstanceOutcome::NotFound(detail),
+            Err((503, detail)) => TransitionInstanceOutcome::Unavailable(detail),
             Err((_, detail)) => TransitionInstanceOutcome::Internal(detail),
         }
     }
@@ -22348,6 +22463,9 @@ pub(crate) enum SetVariablesOutcome {
     /// No process/element instance with the given scope key exists (v2 maps
     /// this to 400 for Camunda parity; the console maps it to 404).
     ScopeNotFound(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
