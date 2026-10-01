@@ -22,6 +22,13 @@ export interface OpenApiDoc {
 
 const COMPONENT_REF = "#/components/";
 
+// An operation's `security` requirement names its schemes by key, not by
+// `$ref` (`security: [{ bearerAuth: [] }]`), so the `$ref` walk below never
+// reaches `components.securitySchemes`. Collect those names separately and
+// keep the schemes they name, or the generated SDK carries no operation
+// security metadata and cannot apply configured auth.
+const SECURITY_SCHEMES = "securitySchemes";
+
 function decodePointerSegment(segment: string): string {
   return segment.replace(/~1/g, "/").replace(/~0/g, "~");
 }
@@ -75,6 +82,15 @@ export function selectPaths(
             .map(decodePointerSegment);
           reached.add(`${section}/${name}`);
           walk(resolveLocal(doc, value));
+        }
+      } else if (key === "security" && Array.isArray(value)) {
+        // A security requirement is an array of `{ schemeName: [...] }` maps;
+        // each key names a scheme in `components.securitySchemes`.
+        for (const requirement of value) {
+          if (requirement === null || typeof requirement !== "object") continue;
+          for (const name of Object.keys(requirement)) {
+            reached.add(`${SECURITY_SCHEMES}/${name}`);
+          }
         }
       } else {
         walk(value);

@@ -24,6 +24,7 @@ export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends 
  * Search for agent instances based on given criteria.
  */
 export const searchAgentInstances = <ThrowOnError extends boolean = false>(options?: Options<SearchAgentInstancesData, ThrowOnError>): RequestResult<SearchAgentInstancesResponses, SearchAgentInstancesErrors, ThrowOnError> => (options?.client ?? client).post<SearchAgentInstancesResponses, SearchAgentInstancesErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }, { scheme: 'basic', type: 'http' }],
     url: '/agent-instances/search',
     ...options,
     headers: {
@@ -40,6 +41,7 @@ export const searchAgentInstances = <ThrowOnError extends boolean = false>(optio
  *
  */
 export const searchAgentInstanceHistory = <ThrowOnError extends boolean = false>(options: Options<SearchAgentInstanceHistoryData, ThrowOnError>): RequestResult<SearchAgentInstanceHistoryResponses, SearchAgentInstanceHistoryErrors, ThrowOnError> => (options.client ?? client).post<SearchAgentInstanceHistoryResponses, SearchAgentInstanceHistoryErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }, { scheme: 'basic', type: 'http' }],
     url: '/agent-instances/{agentInstanceKey}/history/search',
     ...options,
     headers: {

@@ -65,7 +65,7 @@ export default function AgentSessionPanel({
         </h2>
         {active ? (
           <Badge tone="accent">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+            <span className="h-1.5 w-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
             live · {instance.status.toLowerCase().replace("_", " ")}
           </Badge>
         ) : (
@@ -178,14 +178,16 @@ function Scrubber({
           aria-valuetext={`Step ${head.index + 1} of ${items.length}, iteration ${chapter?.loopIteration ?? "-"}`}
           onKeyDown={onKeyDown}
           onPointerDown={(e) => {
+            // Capture the element now: React clears `currentTarget` after the
+            // handler returns, so the async `pointermove` below cannot read it.
+            const el = e.currentTarget;
             const seekTo = (clientX: number) => {
-              const r = e.currentTarget.getBoundingClientRect();
+              const r = el.getBoundingClientRect();
               const f = (clientX - r.left) / r.width;
               setHead(seek(Math.floor(f * items.length), items.length));
             };
-            e.currentTarget.setPointerCapture(e.pointerId);
+            el.setPointerCapture(e.pointerId);
             seekTo(e.clientX);
-            const el = e.currentTarget;
             const move = (ev: PointerEvent) => seekTo(ev.clientX);
             const up = () => {
               el.removeEventListener("pointermove", move);
@@ -348,7 +350,7 @@ function Timeline({
                   className={`absolute h-[10px] min-w-[3px] rounded-sm ${
                     kind === "model" ? "bg-accent/70" : "bg-info/70"
                   } ${s.stepIndex === currentStep ? "ring-2 ring-fg/40" : ""} ${
-                    s.endMs === null ? "animate-pulse" : ""
+                    s.endMs === null ? "motion-safe:animate-pulse" : ""
                   }`}
                   style={{
                     left: `${left}%`,

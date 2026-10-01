@@ -72,7 +72,7 @@ const metrics = (durationMs: number, inputTokens = 0, outputTokens = 0) => ({
 });
 
 // A two-iteration session: user asks, model calls two tools, results come
-// back, model answers.
+// back (one TOOL_RESULT per call, each naming its `toolCallId`), model answers.
 const session = (): HistoryItem[] => [
   item("10", 1, "USER", 0),
   item("11", 1, "ASSISTANT", 3, {
@@ -80,7 +80,8 @@ const session = (): HistoryItem[] => [
     metrics: metrics(2000, 100, 20),
     toolCalls: [call("a", "bash"), call("b", "read_file")],
   }),
-  item("12", 2, "TOOL_RESULT", 5),
+  item("12", 2, "TOOL_RESULT", 5, { toolCalls: [call("a", "bash")] }),
+  item("12b", 2, "TOOL_RESULT", 6, { toolCalls: [call("b", "read_file")] }),
   item("13", 2, "ASSISTANT", 9, {
     model: "m1",
     metrics: metrics(4000, 300, 50),
@@ -118,12 +119,12 @@ test("one chapter per loop iteration, sized by step count", () => {
     c.map((x) => [x.loopIteration, x.startIndex, x.endIndex]),
     [
       [1, 0, 1],
-      [2, 2, 3],
+      [2, 2, 4],
     ],
   );
   assert.equal(c[0].leftPct, 0);
-  assert.equal(c[0].widthPct, 50);
-  assert.equal(c[1].leftPct, 50);
+  assert.equal(c[0].widthPct, 40);
+  assert.equal(c[1].leftPct, 40);
 });
 
 test("no chapters for an empty history", () => {
@@ -139,30 +140,30 @@ test("starts at the end, following", () => {
 
 test("stepping clamps and toggles follow at the end", () => {
   const c = chapters(session());
-  let h = initialPlayhead(4);
-  h = scrub(h, "stepForward", c, 4);
-  assert.deepEqual(h, { index: 3, follow: true });
-  h = scrub(h, "stepBack", c, 4);
-  assert.deepEqual(h, { index: 2, follow: false });
-  h = scrub(h, "start", c, 4);
-  h = scrub(h, "stepBack", c, 4);
+  let h = initialPlayhead(5);
+  h = scrub(h, "stepForward", c, 5);
+  assert.deepEqual(h, { index: 4, follow: true });
+  h = scrub(h, "stepBack", c, 5);
+  assert.deepEqual(h, { index: 3, follow: false });
+  h = scrub(h, "start", c, 5);
+  h = scrub(h, "stepBack", c, 5);
   assert.deepEqual(h, { index: 0, follow: false });
-  h = scrub(h, "end", c, 4);
-  assert.deepEqual(h, { index: 3, follow: true });
+  h = scrub(h, "end", c, 5);
+  assert.deepEqual(h, { index: 4, follow: true });
 });
 
 test("chapter moves land on chapter starts; back rewinds within a chapter first", () => {
   const c = chapters(session());
-  let h = seek(0, 4);
-  h = scrub(h, "nextChapter", c, 4);
+  let h = seek(0, 5);
+  h = scrub(h, "nextChapter", c, 5);
   assert.equal(h.index, 2);
-  h = scrub(h, "nextChapter", c, 4); // no later chapter -> end
-  assert.equal(h.index, 3);
-  h = scrub(h, "previousChapter", c, 4); // inside chapter 2 -> its start
+  h = scrub(h, "nextChapter", c, 5); // no later chapter -> end
+  assert.equal(h.index, 4);
+  h = scrub(h, "previousChapter", c, 5); // inside chapter 2 -> its start
   assert.equal(h.index, 2);
-  h = scrub(h, "previousChapter", c, 4); // at a start -> previous chapter
+  h = scrub(h, "previousChapter", c, 5); // at a start -> previous chapter
   assert.equal(h.index, 0);
-  h = scrub(h, "previousChapter", c, 4);
+  h = scrub(h, "previousChapter", c, 5);
   assert.equal(h.index, 0);
 });
 
@@ -198,20 +199,47 @@ test("model spans end at producedAt and last durationMs", () => {
     model.map((s) => [s.startMs - T0, s.endMs! - T0, s.stepIndex, s.label]),
     [
       [1000, 3000, 1, "m1"],
-      [5000, 9000, 3, "m1"],
+      [5000, 9000, 4, "m1"],
     ],
   );
 });
 
-test("tool spans run from the request to the next TOOL_RESULT, on separate lanes", () => {
+test("tool spans close at the TOOL_RESULT naming their toolCallId, on separate lanes", () => {
   const tools = spans(session()).filter((s) => s.kind === "tool");
   assert.deepEqual(
     tools.map((s) => [s.label, s.startMs - T0, s.endMs! - T0, s.lane]),
     [
       ["bash", 3000, 5000, 0],
-      ["read_file", 3000, 5000, 1],
+      ["read_file", 3000, 6000, 1],
     ],
   );
+});
+
+test("a result closes only its own call; concurrent calls stay open until answered", () => {
+  // One ASSISTANT dispatches two calls; the first result answers only `a`, so
+  // `b` is still running until its own result arrives a step later.
+  const s = spans(session()).filter((x) => x.kind === "tool");
+  const bash = s.find((x) => x.label === "bash")!;
+  const read = s.find((x) => x.label === "read_file")!;
+  assert.equal(bash.endMs! - T0, 5000);
+  assert.equal(read.endMs! - T0, 6000);
+
+  // Right after the first result, `b` is still open.
+  const mid = session().slice(0, 3);
+  const midTools = spans(mid).filter((x) => x.kind === "tool");
+  assert.equal(midTools.find((x) => x.label === "bash")!.endMs! - T0, 5000);
+  assert.equal(midTools.find((x) => x.label === "read_file")!.endMs, null);
+});
+
+test("a TOOL_RESULT with no correlation entry closes every open call", () => {
+  const legacy: HistoryItem[] = [
+    item("1", 1, "ASSISTANT", 3, {
+      toolCalls: [call("a", "bash"), call("b", "read_file")],
+    }),
+    item("2", 2, "TOOL_RESULT", 5),
+  ];
+  const tools = spans(legacy).filter((x) => x.kind === "tool");
+  assert.ok(tools.every((x) => x.endMs! - T0 === 5000));
 });
 
 test("a tool call with no result yet is open", () => {
@@ -237,7 +265,7 @@ test("totals accumulate up to the playhead", () => {
     modelCalls: 1,
     toolCalls: 2,
   });
-  assert.equal(totals(s, 3).inputTokens, 400);
+  assert.equal(totals(s, 4).inputTokens, 400);
   assert.equal(totals(s, -1).modelCalls, 0);
 });
 

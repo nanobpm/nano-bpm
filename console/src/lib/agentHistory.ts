@@ -192,18 +192,36 @@ export interface Span {
 /**
  * Model spans come from ASSISTANT items with a `durationMs` (the span ends at
  * `producedAt`). Tool spans run from the ASSISTANT item that requested the call
- * to the first later TOOL_RESULT item; one TOOL_RESULT answers every call its
- * requesting item made (the AgentHistory record does not carry per-call
- * results). A tool call with no result yet is open (`endMs: null`).
+ * to the TOOL_RESULT that answered it. The canonical contract correlates by ID:
+ * a TOOL_RESULT carries a single `toolCalls` entry whose `toolCallId` names the
+ * originating call (spec/agent-instances.yaml `AgentInstanceToolCall`), so only
+ * that pending span closes — concurrent calls from the same request stay open
+ * until their own result arrives. A result with no matching pending call (or a
+ * legacy one naming none) closes every call its requesting item still has open.
+ * A tool call with no result yet is open (`endMs: null`).
  */
 export function spans(items: readonly HistoryItem[]): Span[] {
   const out: Span[] = [];
-  let pending: { calls: Span[] } | null = null;
+  // Open tool spans by `toolCallId`, so a result closes only the call it
+  // answers. Order of insertion is request order, used for the fallback sweep.
+  const pending = new Map<string, Span>();
   items.forEach((item, i) => {
     const at = Date.parse(item.producedAt);
-    if (item.role === "TOOL_RESULT" && pending) {
-      for (const s of pending.calls) s.endMs = at;
-      pending = null;
+    if (item.role === "TOOL_RESULT") {
+      const ids = item.toolCalls.map((c) => c.toolCallId);
+      if (ids.length > 0) {
+        for (const id of ids) {
+          const s = pending.get(id);
+          if (s) {
+            s.endMs = at;
+            pending.delete(id);
+          }
+        }
+      } else {
+        // No correlation entry: answer every call still open.
+        for (const s of pending.values()) s.endMs = at;
+        pending.clear();
+      }
     }
     if (item.role !== "ASSISTANT") return;
     const duration = item.metrics?.durationMs;
@@ -231,7 +249,9 @@ export function spans(items: readonly HistoryItem[]): Span[] {
         lane: 0,
       }));
       out.push(...calls);
-      pending = { calls };
+      for (let c = 0; c < calls.length; c++) {
+        pending.set(item.toolCalls[c].toolCallId, calls[c]);
+      }
     }
   });
   assignLanes(out);

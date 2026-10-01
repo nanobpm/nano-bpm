@@ -26,6 +26,11 @@ const doc: OpenApiDoc = {
       Cycle: { properties: { self: { $ref: "#/components/schemas/Cycle" } } },
     },
     responses: { Bad: { description: "bad" }, Unused: { description: "x" } },
+    securitySchemes: {
+      bearerAuth: { type: "http", scheme: "bearer" },
+      basicAuth: { type: "http", scheme: "basic" },
+      unusedAuth: { type: "http", scheme: "digest" },
+    },
   },
 };
 
@@ -56,6 +61,28 @@ test("follows escaped pointers and terminates on cycles", () => {
   assert.deepEqual(Object.keys(out.components?.schemas ?? {}).sort(), [
     "Cycle",
     "Odd/Name",
+  ]);
+});
+
+test("keeps the security schemes an operation names in its security array", () => {
+  // A `security` requirement names schemes by key, not by `$ref`, so the
+  // reference walk alone would drop `components.securitySchemes` and the
+  // generated SDK would carry no auth metadata.
+  const secured: OpenApiDoc = {
+    paths: {
+      "/s": {
+        post: {
+          security: [{ bearerAuth: [] }, { basicAuth: [] }],
+          responses: { "200": { description: "ok" } },
+        },
+      },
+    },
+    components: doc.components,
+  };
+  const out = selectPaths(secured, ["/s"]);
+  assert.deepEqual(Object.keys(out.components?.securitySchemes ?? {}).sort(), [
+    "basicAuth",
+    "bearerAuth",
   ]);
 });
 

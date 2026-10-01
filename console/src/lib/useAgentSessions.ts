@@ -49,9 +49,11 @@ export function useAgentHistory(agentInstanceKey: string | undefined) {
   return useQuery({
     queryKey: [AGENT_HISTORY_KEY, agentInstanceKey],
     enabled: agentInstanceKey !== undefined,
-    // Keep showing the previous log while a live refetch is in flight, so the
-    // scrubber doesn't blank between turns.
-    placeholderData: (prev) => prev,
+    // No `placeholderData(prev => prev)`: it would also carry data across a
+    // query-key change, so picking another run would briefly render the previous
+    // run's transcript under the new run's header. A same-key refetch already
+    // retains its cached data, so a new run simply shows loading until its own
+    // history arrives (the Scrubber is keyed by agentInstanceKey and resets).
     queryFn: async (): Promise<AgentInstanceHistoryItemResult[]> => {
       const out: AgentInstanceHistoryItemResult[] = [];
       let after: string | undefined;
