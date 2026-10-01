@@ -7689,7 +7689,9 @@ impl ServerImpl {
     /// `Ok(())` on success, else `(status, detail)` where `status` is the
     /// HTTP code the migration [`EngineError`] maps to (400 invalid mapping,
     /// 404 unknown instance/target, 409 rejected migration, 500 otherwise) via
-    /// the shared [`crate::raft::engine_error_status`].
+    /// the shared [`crate::raft::engine_error_status`], or 503 when
+    /// [`Self::apply_partition_command`] rejects the write during a hand-off
+    /// completion-pause or leader transition (retryable).
     pub(crate) async fn migrate_instance_local(
         &self,
         instance_key: u64,
@@ -32002,11 +32004,18 @@ mod clustered_startup_tests {
             .expect("partition 0 has an elected leader");
         let leader = nodes[leader_idx];
 
-        // Deterministic short pause so the test is fast and non-flaky (shrink the
-        // catch-up ceiling too, or the clamp raises the pause to the 30s default).
-        let short = std::time::Duration::from_millis(500);
-        leader.set_handoff_catchup_ceiling_for_test(short);
-        leader.set_handoff_write_pause_for_test(short);
+        // Use a GENEROUS pause deadline, not a short wall-clock window: the two
+        // async adapter calls below must both observe the pause as engaged, and on
+        // a loaded CI runner a 500 ms window can expire between them (the second
+        // call then reaches the engine and returns 404, not the expected 503).
+        // The deadline is never actually waited on — the explicit
+        // `release_handoff_lease` at the end lifts the pause immediately, so the
+        // test stays fast while no longer depending on scheduler timing. Both knobs
+        // are set because `acquire_handoff_lease` clamps the pause up to the
+        // catch-up ceiling.
+        let generous = std::time::Duration::from_secs(60);
+        leader.set_handoff_catchup_ceiling_for_test(generous);
+        leader.set_handoff_write_pause_for_test(generous);
         assert!(
             leader.acquire_handoff_lease(partition),
             "the leader acquires the hand-off lease"
