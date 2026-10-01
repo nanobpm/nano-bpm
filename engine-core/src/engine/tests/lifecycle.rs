@@ -4510,17 +4510,40 @@ fn deploying_multiple_drg_versions_retains_every_version_and_evaluates_old_by_ke
     // Evaluate the OLD version by its key: it returns "hello" (v1), whereas the
     // latest (v2) would return "hi". This is impossible without retention.
     let inputs = vars(&[("lang", Value::Str("en".to_string()))]);
-    let old = engine
-        .evaluate_deployed_decision(None, Some(decision_k1), &inputs)
-        .expect("old decision resolves by key");
-    assert_eq!(old.version, 1);
-    assert_eq!(old.result.decision_output, Value::Str("hello".to_string()));
+    let mut evaluate = |decision: crate::command::DecisionReference| {
+        let events = engine
+            .apply_command(Command::EvaluateDecision {
+                decision,
+                variables: inputs.clone(),
+            })
+            .expect("deployed decision evaluates");
+        match events.as_slice() {
+            [Event::DecisionEvaluated {
+                decision_key,
+                decision_output,
+                decision_evaluation_key,
+                evaluated_decisions,
+                ..
+            }] => (
+                *decision_key,
+                decision_output.clone(),
+                *decision_evaluation_key,
+                evaluated_decisions[0].decision_version,
+            ),
+            other => panic!("expected one DecisionEvaluated, got {other:?}"),
+        }
+    };
+    let (old_key, old_output, old_eval, old_version) =
+        evaluate(crate::command::DecisionReference::Key(decision_k1));
+    assert_eq!((old_key, old_version), (decision_k1, 1));
+    assert_eq!(old_output, Value::Str("hello".to_string()));
 
-    let latest = engine
-        .evaluate_deployed_decision(Some("greeting"), None, &inputs)
-        .expect("latest decision resolves by id");
-    assert_eq!(latest.version, 2);
-    assert_eq!(latest.result.decision_output, Value::Str("hi".to_string()));
+    let (latest_key, latest_output, latest_eval, latest_version) = evaluate(
+        crate::command::DecisionReference::Id("greeting".to_string()),
+    );
+    assert_eq!((latest_key, latest_version), (decision_k2, 2));
+    assert_eq!(latest_output, Value::Str("hi".to_string()));
+    assert_ne!(old_eval, latest_eval, "each evaluation mints its own key");
 }
 
 #[test]

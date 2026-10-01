@@ -272,14 +272,16 @@ impl TestEngine {
     }
 
     /// Evaluate a deployed decision by id against the given variables — the
-    /// standalone counterpart to a business rule task's in-line evaluation. The
-    /// decision must already be deployed (via `deploy`/`deployDecision`). Read-only:
-    /// it evaluates and returns the result without mutating engine state or
-    /// recording a decision instance. `variables_json` is a JSON object string
-    /// (`"{}"` / `""` for none). Returns
-    /// `{ "decisionId": ..., "decisionKey": ..., "output": <value> }` on success,
-    /// or throws a JS error carrying an "unknown decision" or evaluation-failure
-    /// message.
+    /// standalone counterpart to a business rule task's in-line evaluation (the
+    /// engine's `EvaluateDecision` command, exactly as the gateway runs it). The
+    /// decision must already be deployed (via `deploy`/`deployDecision`). The
+    /// evaluation is recorded as a decision instance with its own minted
+    /// `decisionEvaluationKey` and no process instance — a failed one too
+    /// (Zeebe parity, #1292). `variables_json` is a JSON object string (`"{}"` /
+    /// `""` for none). Returns
+    /// `{ "decisionId": ..., "decisionKey": ..., "decisionEvaluationKey": ..., "output": <value> }`
+    /// on success, or throws a JS error carrying an "unknown decision" or
+    /// evaluation-failure message.
     #[wasm_bindgen(js_name = evaluateDecision)]
     pub fn evaluate_decision(
         &mut self,
@@ -288,28 +290,10 @@ impl TestEngine {
     ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
-        let deployed = self
-            .engine
-            .state()
-            .decisions
-            .get(decision_id)
-            .ok_or_else(|| {
-                js_err(&format!(
-                    "evaluate error: no deployed decision with id '{decision_id}'"
-                ))
-            })?;
-        let result = nanobpmn_engine_core::dmn::evaluate(&deployed.drg, decision_id, &variables);
-        if let Some(failure) = &result.failure {
-            return Err(js_err(&format!(
-                "evaluate error: failed to evaluate decision '{}': {}",
-                failure.failed_decision_id, failure.message
-            )));
-        }
-        to_json(&serde_json::json!({
-            "decisionId": decision_id,
-            "decisionKey": deployed.key.to_string(),
-            "output": value_to_json(&result.decision_output),
-        }))
+        let result = self
+            .evaluate_decision_json(decision_id, variables)
+            .map_err(|e| js_err(&e))?;
+        to_json(&result)
     }
 
     /// Deploy a single `form-js` `.form` resource (the verbatim form-js JSON
@@ -2353,6 +2337,50 @@ impl TestEngine {
         Ok(())
     }
 
+    /// [`evaluateDecision`](Self::evaluate_decision) without the JS boundary
+    /// (host-testable): applies `EvaluateDecision` and shapes the result, or
+    /// the error message the JS caller sees.
+    fn evaluate_decision_json(
+        &mut self,
+        decision_id: &str,
+        variables: HashMap<String, Value>,
+    ) -> Result<serde_json::Value, String> {
+        let events = self
+            .apply(Command::EvaluateDecision {
+                decision: nanobpmn_engine_core::DecisionReference::Id(decision_id.to_string()),
+                variables,
+            })
+            .map_err(|e| format!("evaluate error: {e}"))?;
+        let evaluated = events
+            .iter()
+            .find(|e| matches!(e, Event::DecisionEvaluated { .. }))
+            .ok_or("evaluate error: no evaluation was recorded")?;
+        let Event::DecisionEvaluated {
+            decision_key,
+            decision_output,
+            failure,
+            ..
+        } = evaluated
+        else {
+            unreachable!()
+        };
+        if let Some(failure) = failure {
+            return Err(format!(
+                "evaluate error: failed to evaluate decision '{}': {}",
+                failure.failed_decision_id, failure.message
+            ));
+        }
+        let evaluation_key = evaluated
+            .decision_evaluation_key()
+            .expect("DecisionEvaluated identifies its evaluation");
+        Ok(serde_json::json!({
+            "decisionId": decision_id,
+            "decisionKey": decision_key.to_string(),
+            "decisionEvaluationKey": evaluation_key.to_string(),
+            "output": value_to_json(decision_output),
+        }))
+    }
+
     /// Apply a command at the current virtual clock, recording the emitted
     /// events in the log.
     fn apply(&mut self, command: Command) -> Result<Vec<Event>, nanobpmn_engine_core::EngineError> {
@@ -2462,15 +2490,26 @@ impl TestEngine {
                 decision_id,
                 decision_output,
                 evaluated_at,
+                failure,
                 ..
             } => {
                 self.history.decisions.push(DecisionInstanceDto {
+                    decision_evaluation_key: ev
+                        .decision_evaluation_key()
+                        .expect("DecisionEvaluated identifies its evaluation")
+                        .to_string(),
                     instance_key: instance_key.to_string(),
                     element_id: element_id.clone(),
                     decision_key: decision_key.to_string(),
                     decision_id: decision_id.clone(),
                     output: value_to_json(decision_output),
                     evaluated_at: *evaluated_at,
+                    state: if failure.is_some() {
+                        "FAILED"
+                    } else {
+                        "EVALUATED"
+                    },
+                    evaluation_failure: failure.as_ref().map(|f| f.message.clone()),
                 });
             }
             _ => {}
@@ -2724,7 +2763,8 @@ impl TestEngine {
         // incrementally from the `DecisionEvaluated` audit events (Play's
         // `fetchDecisionInstances`). Not part of live engine state.
         let mut decision_instances: Vec<DecisionInstanceDto> = self.history.decisions.clone();
-        decision_instances.sort_by(|a, b| cmp_key(&a.decision_key, &b.decision_key));
+        decision_instances
+            .sort_by(|a, b| cmp_key(&a.decision_evaluation_key, &b.decision_evaluation_key));
 
         // Unions for one-shot diagram highlighting.
         let mut active_element_ids: Vec<String> = instances
@@ -2903,12 +2943,20 @@ struct SequenceFlowDto {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DecisionInstanceDto {
+    /// The evaluation's own key (#1292): distinct per evaluation, so repeat
+    /// evaluations of one decision are distinct decision instances.
+    decision_evaluation_key: String,
+    /// `"0"` for a standalone `evaluateDecision` (no process instance).
     instance_key: String,
     element_id: String,
     decision_key: String,
     decision_id: String,
     output: serde_json::Value,
     evaluated_at: u64,
+    /// `EVALUATED` or `FAILED` (a failed evaluation is recorded too).
+    state: &'static str,
+    /// Why the evaluation failed (`null` when it did not).
+    evaluation_failure: Option<String>,
 }
 
 /// A stable camelCase discriminant for an incident kind, exposed to the UI
@@ -5020,6 +5068,87 @@ mod tests {
         assert_eq!(out["decisionId"], "greeting");
         assert_eq!(out["output"], "hello");
         assert!(out["decisionKey"].as_str().is_some());
+    }
+
+    /// #1292: a standalone evaluation runs the engine's `EvaluateDecision`
+    /// command, so it is recorded as a decision instance with its own minted
+    /// key (no process instance) — and repeats are distinct instances.
+    #[test]
+    fn evaluate_decision_records_each_evaluation_as_a_decision_instance() {
+        let mut eng = TestEngine::new();
+        eng.deploy_decision(GREETING_DMN).unwrap();
+        let one = parse(
+            &eng.evaluate_decision("greeting", r#"{"lang":"en"}"#)
+                .unwrap(),
+        );
+        let two = parse(
+            &eng.evaluate_decision("greeting", r#"{"lang":"de"}"#)
+                .unwrap(),
+        );
+        let (k1, k2) = (
+            one["decisionEvaluationKey"].as_str().unwrap().to_string(),
+            two["decisionEvaluationKey"].as_str().unwrap().to_string(),
+        );
+        assert_ne!(k1, k2, "every evaluation mints its own key");
+        assert_ne!(k1, one["decisionKey"].as_str().unwrap());
+
+        let snap = parse(&eng.snapshot().unwrap());
+        let decisions = snap["decisionInstances"].as_array().unwrap();
+        let got: Vec<_> = decisions
+            .iter()
+            .map(|d| {
+                (
+                    d["decisionEvaluationKey"].as_str().unwrap(),
+                    d["instanceKey"].as_str().unwrap(),
+                    d["output"].as_str().unwrap(),
+                    d["state"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (k1.as_str(), "0", "hello", "EVALUATED"),
+                (k2.as_str(), "0", "hallo", "EVALUATED")
+            ]
+        );
+    }
+
+    /// A failed standalone evaluation still throws, but is recorded as a FAILED
+    /// decision instance (Zeebe `DecisionEvaluation:FAILED`); an unknown
+    /// decision throws and records nothing.
+    #[test]
+    fn evaluate_decision_failure_throws_and_is_recorded() {
+        let mut eng = TestEngine::new();
+        // UNIQUE with two matching rules for "xx" fails the hit policy.
+        eng.deploy_decision(
+            r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="drg" name="drg">
+              <decision id="pick" name="Pick">
+                <decisionTable hitPolicy="UNIQUE">
+                  <input id="i"><inputExpression id="e" typeRef="string"><text>lang</text></inputExpression></input>
+                  <output id="o" name="result" typeRef="string" />
+                  <rule id="r1"><inputEntry id="a"><text>"xx"</text></inputEntry><outputEntry id="b"><text>"a"</text></outputEntry></rule>
+                  <rule id="r2"><inputEntry id="c"><text>"xx"</text></inputEntry><outputEntry id="d"><text>"b"</text></outputEntry></rule>
+                </decisionTable>
+              </decision>
+            </definitions>"##,
+        )
+        .unwrap();
+        let vars = |v: &str| parse_vars(v).unwrap();
+        let err = eng
+            .evaluate_decision_json("pick", vars(r#"{"lang":"xx"}"#))
+            .unwrap_err();
+        assert!(
+            err.starts_with("evaluate error: failed to evaluate decision 'pick'"),
+            "{err}"
+        );
+        let err = eng.evaluate_decision_json("nope", vars("{}")).unwrap_err();
+        assert_eq!(err, "evaluate error: no deployed decision with id 'nope'");
+        let snap = parse(&eng.snapshot().unwrap());
+        let decisions = snap["decisionInstances"].as_array().unwrap();
+        assert_eq!(decisions.len(), 1, "{decisions:?}");
+        assert_eq!(decisions[0]["state"], "FAILED");
+        assert!(decisions[0]["evaluationFailure"].as_str().is_some());
     }
 
     #[test]

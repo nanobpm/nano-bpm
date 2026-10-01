@@ -382,6 +382,73 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
         );
     }
 
+    // Decision-evaluation witnesses (#1292): pin `DecisionEvaluated` (its
+    // `decision_evaluation_key`, `failure`, and each evaluated decision's
+    // `decision_key`/`decision_version`) across a successful businessRuleTask,
+    // a failed one (FAILED evaluation ahead of its incident) and a standalone
+    // `EvaluateDecision`, plus the deployed-decision snapshot state.
+    let drg = nanobpmn_engine_core::dmn::parse_dmn(
+        r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greet" name="greet">
+      <decision id="base" name="Base">
+        <literalExpression id="bl"><text>"b"</text></literalExpression>
+      </decision>
+      <decision id="root" name="Root">
+        <informationRequirement id="ir"><requiredDecision href="#base" /></informationRequirement>
+        <decisionTable hitPolicy="UNIQUE">
+          <input id="ri"><inputExpression id="re" typeRef="string"><text>lang</text></inputExpression></input>
+          <output id="ro" name="result" typeRef="string" />
+          <rule id="r1"><inputEntry id="rie1"><text>"xx"</text></inputEntry>
+            <outputEntry id="roe1"><text>"a"</text></outputEntry></rule>
+          <rule id="r2"><inputEntry id="rie2"><text>"xx"</text></inputEntry>
+            <outputEntry id="roe2"><text>"b"</text></outputEntry></rule>
+          <rule id="r3"><inputEntry id="rie3"><text>not("xx")</text></inputEntry>
+            <outputEntry id="roe3"><text>base</text></outputEntry></rule>
+        </decisionTable>
+      </decision>
+    </definitions>"##,
+    )
+    .expect("parse decision witness DRG");
+    let decide: ProcessDefinition = ProcessBuilder::new("decide")
+        .start_event("s")
+        .business_rule_task("brt", "root", Some("out".to_string()))
+        .end_event("e")
+        .connect("s", "brt")
+        .connect("brt", "e")
+        .build()
+        .expect("build decide process");
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployDecisionRequirements(vec![drg]), T0 + 11)
+            .expect("deploy decision witness DRG"),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(decide), T0 + 11)
+            .expect("deploy decide process"),
+    );
+    for (lang, at) in [("de", T0 + 12), ("xx", T0 + 13)] {
+        let mut vars = HashMap::new();
+        vars.insert("lang".to_string(), Value::Str(lang.to_string()));
+        journal.extend(
+            engine
+                .apply_command_at(Command::create_instance_with("decide", vars), at)
+                .expect("create decide instance"),
+        );
+    }
+    let mut vars = HashMap::new();
+    vars.insert("lang".to_string(), Value::Str("en".to_string()));
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::EvaluateDecision {
+                    decision: nanobpmn_engine_core::DecisionReference::Id("root".to_string()),
+                    variables: vars,
+                },
+                T0 + 14,
+            )
+            .expect("standalone evaluation"),
+    );
+
     let snapshot = engine.snapshot();
     (snapshot, journal)
 }

@@ -24,6 +24,16 @@ pub struct JobActivationOptions {
 }
 
 /// An instruction submitted to [`crate::Engine::apply_command`].
+/// Which deployed decision a [`Command::EvaluateDecision`] evaluates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DecisionReference {
+    /// The latest deployed version of the decision with this id.
+    Id(String),
+    /// Exactly the deployed decision (version) with this key.
+    Key(Key),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Command {
@@ -53,13 +63,26 @@ pub enum Command {
     /// served by `GetResourceByKey` / searched by `resourceId`.
     DeployGenericResources(Vec<GenericResource>),
     /// Mark a decision instance (all rows sharing a `decision_evaluation_key`) for
-    /// deletion in the read model. `instance_key` is the owning process instance,
-    /// carried so the emitted [`Event::DecisionInstanceDeleted`] is journaled and
+    /// deletion in the read model. `instance_key` is the owning process instance
+    /// (`0` for a standalone evaluation), carried so the emitted
+    /// [`Event::DecisionInstanceDeleted`] is journaled and
     /// projected on the same partition/shard as its originating
     /// [`Event::DecisionEvaluated`]. Audit-only: no core engine state changes.
     DeleteDecisionInstance {
         instance_key: Key,
         decision_evaluation_key: Key,
+    },
+    /// Evaluate a deployed decision on demand — the standalone EvaluateDecision
+    /// API (Zeebe `DecisionEvaluation:EVALUATE`). Resolves the decision, evaluates
+    /// it against `variables`, and records the evaluation as an
+    /// [`crate::Event::DecisionEvaluated`] with a freshly minted
+    /// `decision_evaluation_key` and no process instance, so it is a queryable
+    /// decision instance like a businessRuleTask's. A failed evaluation is
+    /// recorded (with its failure), not rejected; an unknown decision is
+    /// [`crate::EngineError::DecisionNotFound`].
+    EvaluateDecision {
+        decision: DecisionReference,
+        variables: HashMap<String, Value>,
     },
     /// Start a new instance of a previously deployed process, seeding it with the
     /// given variables (used by exclusive-gateway conditions), optional tags, and
@@ -695,6 +718,7 @@ impl Command {
             Command::DeployForms(_) => "deploy_forms",
             Command::DeployGenericResources(_) => "deploy_generic_resources",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
+            Command::EvaluateDecision { .. } => "evaluate_decision",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",
             Command::AssignUserTask { .. } => "assign_user_task",

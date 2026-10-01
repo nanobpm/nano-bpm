@@ -110,7 +110,23 @@ fn eval_decision(
             done.insert(decision_id.to_string());
             Ok(output)
         }
-        Err(failure) => Err(failure),
+        Err(failure) => {
+            // Audit the decision that failed as the last evaluated decision, as
+            // Zeebe's DMN audit log does (its `failedDecisionId` is the last
+            // evaluated decision, which the exporter marks FAILED). It has no
+            // output; its partial inputs/rules are not retained.
+            evaluated.push(EvaluatedDecision {
+                decision_id: decision.id.clone(),
+                decision_name: decision.name.clone(),
+                decision_type: decision.decision_type(),
+                decision_output: Value::Null,
+                evaluated_inputs: Vec::new(),
+                matched_rules: Vec::new(),
+                decision_key: 0,
+                decision_version: 0,
+            });
+            Err(failure)
+        }
     }
 }
 
@@ -137,6 +153,8 @@ fn eval_logic(
                 decision_output: output.clone(),
                 evaluated_inputs: Vec::new(),
                 matched_rules: Vec::new(),
+                decision_key: 0,
+                decision_version: 0,
             });
             Ok(output)
         }
@@ -253,6 +271,8 @@ fn eval_table(
                 }
             })
             .collect(),
+        decision_key: 0,
+        decision_version: 0,
     });
 
     Ok(output)

@@ -1577,6 +1577,225 @@ fn business_rule_task_evaluates_decision_and_binds_result_variable() {
     );
 }
 
+/// A two-decision DRG (#1292): `root` requires `base`; `root`'s UNIQUE table
+/// fails (two rules match) when `lang` is `"xx"`.
+fn requiring_drg(drg_id: &str) -> crate::dmn::DecisionRequirementsGraph {
+    let xml = format!(
+        r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="{drg_id}" name="{drg_id}">
+      <decision id="base" name="Base">
+        <literalExpression id="bl"><text>"b"</text></literalExpression>
+      </decision>
+      <decision id="root" name="Root">
+        <informationRequirement id="ir"><requiredDecision href="#base" /></informationRequirement>
+        <decisionTable hitPolicy="UNIQUE">
+          <input id="ri"><inputExpression id="re" typeRef="string"><text>lang</text></inputExpression></input>
+          <output id="ro" name="result" typeRef="string" />
+          <rule id="r1"><inputEntry id="rie1"><text>"xx"</text></inputEntry>
+            <outputEntry id="roe1"><text>"a"</text></outputEntry></rule>
+          <rule id="r2"><inputEntry id="rie2"><text>"xx"</text></inputEntry>
+            <outputEntry id="roe2"><text>"b"</text></outputEntry></rule>
+          <rule id="r3"><inputEntry id="rie3"><text>not("xx")</text></inputEntry>
+            <outputEntry id="roe3"><text>base</text></outputEntry></rule>
+        </decisionTable>
+      </decision>
+    </definitions>"##
+    );
+    crate::dmn::parse_dmn(&xml).unwrap()
+}
+
+/// The deployed decision key of `decision_id` from a deploy's events.
+fn deployed_decision_key(events: &[Event], decision_id: &str) -> crate::state::Key {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::DecisionDeployed {
+                decision_key,
+                decision_id: id,
+                ..
+            } if id == decision_id => Some(*decision_key),
+            _ => None,
+        })
+        .expect("decision deployed")
+}
+
+// zeebe-cells: element:BusinessRuleTask
+#[test]
+fn business_rule_task_failure_records_a_failed_evaluation_before_the_incident() {
+    // #1292 (Zeebe `DecisionEvaluation:FAILED`): a failed evaluation is still a
+    // decision evaluation — journaled with its own key and the failure, ahead of
+    // the incident — and its audit trail ends with the failed decision.
+    let mut engine = Engine::new();
+    let deployed = engine
+        .apply_command(Command::DeployDecisionRequirements(vec![requiring_drg(
+            "drg",
+        )]))
+        .unwrap();
+    let (base_key, root_key) = (
+        deployed_decision_key(&deployed, "base"),
+        deployed_decision_key(&deployed, "root"),
+    );
+    engine
+        .apply_command(Command::DeployProcess(brt_process(
+            "root",
+            Some("out".to_string()),
+        )))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("lang".to_string(), Value::Str("xx".into()));
+    let events = engine
+        .apply_command(Command::create_instance_with("brt", vars))
+        .unwrap();
+
+    let evaluated_at = events
+        .iter()
+        .position(|e| matches!(e, Event::DecisionEvaluated { .. }))
+        .expect("the failed evaluation is journaled");
+    let incident_at = events
+        .iter()
+        .position(|e| matches!(e, Event::IncidentRaised { .. }))
+        .expect("the failure raises an incident");
+    assert!(
+        evaluated_at < incident_at,
+        "evaluation precedes the incident"
+    );
+    let Event::DecisionEvaluated {
+        decision_key,
+        decision_evaluation_key,
+        failure,
+        evaluated_decisions,
+        ..
+    } = &events[evaluated_at]
+    else {
+        unreachable!()
+    };
+    assert_eq!(*decision_key, root_key);
+    assert_ne!(*decision_evaluation_key, 0, "a key is minted");
+    assert_eq!(
+        failure.as_ref().map(|f| f.failed_decision_id.as_str()),
+        Some("root")
+    );
+    let trail: Vec<_> = evaluated_decisions
+        .iter()
+        .map(|d| (d.decision_id.as_str(), d.decision_key, d.decision_version))
+        .collect();
+    assert_eq!(trail, [("base", base_key, 1), ("root", root_key, 1)]);
+
+    // Retrying (after fixing nothing) is a NEW evaluation with its own key.
+    let incident_key = events
+        .iter()
+        .find_map(|e| match e {
+            Event::IncidentRaised { incident_key, .. } => Some(*incident_key),
+            _ => None,
+        })
+        .unwrap();
+    let retried = engine
+        .apply_command(Command::ResolveIncident {
+            incident_key,
+            operation_reference: None,
+        })
+        .unwrap();
+    let retry_key = retried
+        .iter()
+        .find_map(Event::decision_evaluation_key)
+        .expect("the re-drive evaluates again");
+    assert_ne!(retry_key, *decision_evaluation_key);
+}
+
+#[test]
+fn evaluated_decisions_are_stamped_within_the_evaluated_drg() {
+    // #1292: each evaluated decision is identified within the DRG version that
+    // was evaluated, not by the latest deployment of its id — here a second DRG
+    // later takes over `base`, but `root`'s evaluation still used its own.
+    let mut engine = Engine::new();
+    let first = engine
+        .apply_command(Command::DeployDecisionRequirements(vec![requiring_drg(
+            "first",
+        )]))
+        .unwrap();
+    let own_base = deployed_decision_key(&first, "base");
+    let second = engine
+        .apply_command(Command::DeployDecisionRequirements(vec![requiring_drg(
+            "second",
+        )]))
+        .unwrap();
+    assert_ne!(deployed_decision_key(&second, "base"), own_base);
+    let first_root = deployed_decision_key(&first, "root");
+
+    let mut vars = HashMap::new();
+    vars.insert("lang".to_string(), Value::Str("de".into()));
+    let events = engine
+        .apply_command(Command::EvaluateDecision {
+            decision: crate::command::DecisionReference::Key(first_root),
+            variables: vars,
+        })
+        .unwrap();
+    let [Event::DecisionEvaluated {
+        evaluated_decisions,
+        failure: None,
+        instance_key: 0,
+        decision_requirements_id,
+        decision_requirements_key,
+        ..
+    }] = events.as_slice()
+    else {
+        panic!("expected one successful standalone evaluation, got {events:?}")
+    };
+    assert_eq!(decision_requirements_id, "first");
+    assert_eq!(
+        *decision_requirements_key,
+        engine
+            .state()
+            .decision_by_key(first_root)
+            .unwrap()
+            .decision_requirements_key
+    );
+    assert_eq!(evaluated_decisions[0].decision_id, "base");
+    assert_eq!(evaluated_decisions[0].decision_key, own_base);
+    assert_eq!(evaluated_decisions[1].decision_key, first_root);
+}
+
+#[test]
+fn standalone_evaluation_records_failures_and_rejects_unknown_decisions() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployDecisionRequirements(vec![requiring_drg(
+            "drg",
+        )]))
+        .unwrap();
+    let mut vars = HashMap::new();
+    vars.insert("lang".to_string(), Value::Str("xx".into()));
+    // A failed evaluation is recorded (with its failure), not rejected.
+    let events = engine
+        .apply_command(Command::EvaluateDecision {
+            decision: crate::command::DecisionReference::Id("root".to_string()),
+            variables: vars.clone(),
+        })
+        .unwrap();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [Event::DecisionEvaluated {
+                failure: Some(_),
+                ..
+            }]
+        ),
+        "{events:?}"
+    );
+    // An unknown decision is a typed rejection with nothing journaled.
+    let err = engine
+        .apply_command(Command::EvaluateDecision {
+            decision: crate::command::DecisionReference::Id("nope".to_string()),
+            variables: vars,
+        })
+        .unwrap_err();
+    assert_eq!(
+        err,
+        crate::EngineError::DecisionNotFound {
+            reference: "id 'nope'".to_string()
+        }
+    );
+}
+
 #[test]
 fn business_rule_task_resolves_decision_id_via_feel_expression() {
     let mut engine = Engine::new();

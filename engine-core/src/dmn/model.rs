@@ -55,6 +55,22 @@ impl Decision {
     pub fn result_name(&self) -> &str {
         self.variable_name.as_deref().unwrap_or(&self.id)
     }
+
+    /// The decision's type, derived from its logic (an unsupported logic
+    /// element reports the type its local name names).
+    pub fn decision_type(&self) -> DecisionType {
+        match &self.logic {
+            DecisionLogic::DecisionTable(_) => DecisionType::DecisionTable,
+            DecisionLogic::LiteralExpression(_) => DecisionType::LiteralExpression,
+            DecisionLogic::Unsupported(kind) => match kind.as_str() {
+                "context" => DecisionType::Context,
+                "invocation" => DecisionType::Invocation,
+                "list" => DecisionType::List,
+                "relation" => DecisionType::Relation,
+                _ => DecisionType::Unknown,
+            },
+        }
+    }
 }
 
 /// The decision logic of a [`Decision`].
@@ -232,6 +248,25 @@ pub struct EvaluatedDecision {
     pub evaluated_inputs: Vec<EvaluatedInput>,
     /// The matched rules (decision tables only; empty otherwise).
     pub matched_rules: Vec<MatchedRule>,
+    /// Key of the exact deployed definition evaluated (Zeebe's per-evaluated-
+    /// decision `decisionKey`), resolved by the engine within the evaluated DRG
+    /// version. `0` straight out of [`crate::dmn::evaluate`] (which knows no
+    /// deployments) and in journals written before it was recorded (#1292).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decision_key: crate::Key,
+    /// Version of that definition (Zeebe's `decisionVersion`); `0` when unknown,
+    /// as for [`EvaluatedDecision::decision_key`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decision_version: i32,
+}
+
+/// The id of the `n`-th (1-based, evaluation order) decision evaluated by the
+/// decision evaluation `decision_evaluation_key` — Zeebe's
+/// `decisionEvaluationInstanceKey` (`DecisionEvaluationInstanceKeyGenerator`:
+/// `"{decisionEvaluationKey}-{n}"`). The one canonical spelling of a
+/// decision-instance id, shared by the read model, the REST gateway and wasm.
+pub fn decision_evaluation_instance_key(decision_evaluation_key: crate::Key, n: usize) -> String {
+    format!("{decision_evaluation_key}-{n}")
 }
 
 /// An evaluated decision-table input.

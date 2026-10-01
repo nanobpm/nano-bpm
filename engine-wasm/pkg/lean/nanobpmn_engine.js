@@ -764,14 +764,16 @@ export class TestEngine {
     }
     /**
      * Evaluate a deployed decision by id against the given variables — the
-     * standalone counterpart to a business rule task's in-line evaluation. The
-     * decision must already be deployed (via `deploy`/`deployDecision`). Read-only:
-     * it evaluates and returns the result without mutating engine state or
-     * recording a decision instance. `variables_json` is a JSON object string
-     * (`"{}"` / `""` for none). Returns
-     * `{ "decisionId": ..., "decisionKey": ..., "output": <value> }` on success,
-     * or throws a JS error carrying an "unknown decision" or evaluation-failure
-     * message.
+     * standalone counterpart to a business rule task's in-line evaluation (the
+     * engine's `EvaluateDecision` command, exactly as the gateway runs it). The
+     * decision must already be deployed (via `deploy`/`deployDecision`). The
+     * evaluation is recorded as a decision instance with its own minted
+     * `decisionEvaluationKey` and no process instance — a failed one too
+     * (Zeebe parity, #1292). `variables_json` is a JSON object string (`"{}"` /
+     * `""` for none). Returns
+     * `{ "decisionId": ..., "decisionKey": ..., "decisionEvaluationKey": ..., "output": <value> }`
+     * on success, or throws a JS error carrying an "unknown decision" or
+     * evaluation-failure message.
      * @param {string} decision_id
      * @param {string} variables_json
      * @returns {string}

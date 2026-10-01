@@ -161,6 +161,9 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
+        Command::EvaluateDecision { .. } => Surface::Surfaced {
+            js_method: "evaluateDecision",
+        },
         Command::UpdateJobTimeout { .. } => Surface::Surfaced {
             js_method: "updateTimeout",
         },
