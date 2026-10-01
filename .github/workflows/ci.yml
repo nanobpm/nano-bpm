@@ -109,6 +109,10 @@ jobs:
               # App manifest types), so a spec-app change can alter the console
               # typecheck surface — re-run the console job to validate against it.
               - 'spec-app/**'
+              # src/gen-c8 is generated from the engine's Camunda REST spec
+              # (spec/rest-api.yaml and the files it $refs), so a spec change can
+              # make the committed subset client stale.
+              - 'spec/**'
               - '.github/workflows/ci.yml'
             # The Urban App manifest schema/types package (@nanobpm/nano-app-schema).
             # Owns its own job (`spec-app`) and is deliberately excluded from the
@@ -848,11 +852,15 @@ jobs:
         # then type-checks the browser app (tsconfig.json) and the node-runtime
         # unit tests (tsconfig.test.json) separately.
         run: npm run typecheck
-      - name: Fail if generated API client is stale
-        # `typecheck` regenerated src/gen in place; fail if the committed client
-        # drifted from spec-console/console-api.yaml (the maker forgot `npm run
-        # gen:api`). src/gen is committed and imported directly by the SPA.
-        run: git diff --exit-code -- src/gen
+      - name: Fail if generated API clients are stale
+        # `typecheck` regenerated src/gen (from spec-console/console-api.yaml) and
+        # src/gen-c8 (the Camunda REST subset of spec/rest-api.yaml) in place;
+        # fail if either committed client drifted (the maker forgot `npm run
+        # gen:api`), including newly generated files git diff alone would miss.
+        # Both are committed and imported directly by the SPA.
+        run: |
+          git diff --exit-code -- src/gen src/gen-c8
+          test -z "$(git status --porcelain -- src/gen src/gen-c8)"
       - name: Test (node:test unit tests)
         run: npm test
       - name: Build bundled docs (guard)
