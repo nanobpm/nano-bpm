@@ -27,11 +27,25 @@ export function drift(yaml, channel) {
   const bad = [];
   lines.forEach((line, i) => {
     const m = line.match(/dtolnay\/rust-toolchain@([^\s#]+)/);
-    if (!m || m[1] === channel) return;
-    if (m[1] === 'master') {
-      const window = lines.slice(i + 1, i + 4).join('\n');
-      if (/toolchain:\s*nightly-\d{4}-\d{2}-\d{2}\b/.test(window)) return;
+    if (!m) return;
+    // The step's explicit `toolchain:` input overrides the action ref, so it
+    // must be inspected too. The step spans the following lines that are
+    // indented deeper than its `- ` list marker.
+    const indent = line.search(/\S/);
+    const step = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j];
+      if (l.trim() === '') continue;
+      if (l.search(/\S/) <= indent) break;
+      step.push(l);
     }
+    const input = step.join('\n').match(/^\s*toolchain:\s*['"]?([^'"\s#]+)/m)?.[1];
+    if (m[1] === channel) {
+      if (input === undefined || input === channel) return;
+      bad.push(`line ${i + 1}: @${m[1]} overridden by toolchain: ${input}`);
+      return;
+    }
+    if (m[1] === 'master' && input && /^nightly-\d{4}-\d{2}-\d{2}$/.test(input)) return;
     bad.push(`line ${i + 1}: @${m[1]}`);
   });
   return bad;
@@ -56,4 +70,18 @@ test('drift detector rejects @stable and unpinned @master, allows a pinned night
   assert.deepEqual(drift('  - uses: dtolnay/rust-toolchain@master\n    with:\n      toolchain: stable', '1.98.1'), ['line 1: @master']);
   assert.deepEqual(drift('  - uses: dtolnay/rust-toolchain@master\n    with:\n      toolchain: nightly-2026-06-26', '1.98.1'), []);
   assert.deepEqual(drift('  - uses: dtolnay/rust-toolchain@1.98.1', '1.98.1'), []);
+  assert.deepEqual(
+    drift('  - uses: dtolnay/rust-toolchain@1.98.1\n    with:\n      targets: wasm32-unknown-unknown', '1.98.1'),
+    [],
+  );
+  // An explicit input overrides the pinned ref (#1318 review).
+  assert.deepEqual(
+    drift('  - uses: dtolnay/rust-toolchain@1.98.1\n    with:\n      toolchain: stable', '1.98.1'),
+    ['line 1: @1.98.1 overridden by toolchain: stable'],
+  );
+  // The next step's input is not attributed to this one.
+  assert.deepEqual(
+    drift('  - uses: dtolnay/rust-toolchain@1.98.1\n  - uses: other@v1\n    with:\n      toolchain: stable', '1.98.1'),
+    [],
+  );
 });
