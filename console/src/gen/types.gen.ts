@@ -1693,6 +1693,11 @@ export type ResolveIncidentErrors = {
      * Internal error
      */
     500: string;
+    /**
+     * The service is currently unavailable — a transient, retryable Raft condition (a leader handoff pause or an in-progress election). The operator action can be retried once the cluster settles.
+     *
+     */
+    503: string;
 };
 
 export type ResolveIncidentError = ResolveIncidentErrors[keyof ResolveIncidentErrors];
@@ -1724,6 +1729,11 @@ export type CancelInstanceErrors = {
      * Internal error
      */
     500: string;
+    /**
+     * The service is currently unavailable — a transient, retryable Raft condition (a leader handoff pause or an in-progress election). The operator action can be retried once the cluster settles.
+     *
+     */
+    503: string;
 };
 
 export type CancelInstanceError = CancelInstanceErrors[keyof CancelInstanceErrors];
@@ -1759,6 +1769,11 @@ export type SuspendInstanceErrors = {
      * Internal error
      */
     500: string;
+    /**
+     * The service is currently unavailable — a transient, retryable Raft condition (a leader handoff pause or an in-progress election). The operator action can be retried once the cluster settles.
+     *
+     */
+    503: string;
 };
 
 export type SuspendInstanceError = SuspendInstanceErrors[keyof SuspendInstanceErrors];
@@ -1794,6 +1809,11 @@ export type ResumeInstanceErrors = {
      * Internal error
      */
     500: string;
+    /**
+     * The service is currently unavailable — a transient, retryable Raft condition (a leader handoff pause or an in-progress election). The operator action can be retried once the cluster settles.
+     *
+     */
+    503: string;
 };
 
 export type ResumeInstanceError = ResumeInstanceErrors[keyof ResumeInstanceErrors];
@@ -1829,6 +1849,11 @@ export type SetInstanceVariablesErrors = {
      * Internal error
      */
     500: string;
+    /**
+     * The service is currently unavailable — a transient, retryable Raft condition (a leader handoff pause or an in-progress election). The operator action can be retried once the cluster settles.
+     *
+     */
+    503: string;
 };
 
 export type SetInstanceVariablesError = SetInstanceVariablesErrors[keyof SetInstanceVariablesErrors];

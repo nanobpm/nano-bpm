@@ -154,6 +154,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /instances/{key}/cancellation:
     post:
@@ -173,6 +174,7 @@ paths:
         '204': { description: The instance was cancelled }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /instances/{key}/suspension:
     post:
@@ -194,6 +196,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /instances/{key}/resumption:
     post:
@@ -214,6 +217,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /instances/{key}/variables:
     put:
@@ -236,6 +240,7 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         '500': { $ref: '#/components/responses/InternalError' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /traces:
     get:
@@ -1500,6 +1505,14 @@ components:
           schema: { type: string }
     InternalError:
       description: Internal error
+      content:
+        text/plain:
+          schema: { type: string }
+    ServiceUnavailable:
+      description: >
+        The service is currently unavailable — a transient, retryable Raft
+        condition (a leader handoff pause or an in-progress election). The
+        operator action can be retried once the cluster settles.
       content:
         text/plain:
           schema: { type: string }

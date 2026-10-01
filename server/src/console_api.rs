@@ -417,7 +417,10 @@ impl apis::instances::Instances for ServerImpl {
             Out::Resolved => Resp::Status204_TheIncidentWasResolved,
             Out::NotFound(d) => Resp::Status404_NotFound(d),
             Out::NotResolvable(d) => Resp::Status409_AlreadyExists(d),
-            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
+            // A transient Raft condition (handoff pause / leader election) is
+            // retryable — surface it as 503, not a 500 internal fault.
+            Out::Unavailable(d) => Resp::Status503_TheServiceIsCurrentlyUnavailable(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -447,7 +450,8 @@ impl apis::instances::Instances for ServerImpl {
         Ok(match self.cancel_instance_core(instance_key).await {
             Out::Canceled => Resp::Status204_TheInstanceWasCancelled,
             Out::NotFound(d) => Resp::Status404_NotFound(d),
-            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
+            Out::Unavailable(d) => Resp::Status503_TheServiceIsCurrentlyUnavailable(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -478,7 +482,8 @@ impl apis::instances::Instances for ServerImpl {
             Out::Ok => Resp::Status204_TheInstanceWasSuspended,
             Out::Conflict(d) => Resp::Status400_InvalidRequest(d),
             Out::NotFound(d) => Resp::Status404_NotFound(d),
-            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
+            Out::Unavailable(d) => Resp::Status503_TheServiceIsCurrentlyUnavailable(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -509,7 +514,8 @@ impl apis::instances::Instances for ServerImpl {
             Out::Ok => Resp::Status204_TheInstanceWasResumed,
             Out::Conflict(d) => Resp::Status400_InvalidRequest(d),
             Out::NotFound(d) => Resp::Status404_NotFound(d),
-            Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
+            Out::Unavailable(d) => Resp::Status503_TheServiceIsCurrentlyUnavailable(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
         })
     }
 
@@ -548,7 +554,8 @@ impl apis::instances::Instances for ServerImpl {
             match self.set_variables_core(scope_key, variables, local).await {
                 Out::Updated => Resp::Status204_TheVariablesWereMerged,
                 Out::ScopeNotFound(d) => Resp::Status404_NotFound(d),
-                Out::Unavailable(d) | Out::Internal(d) => Resp::Status500_InternalError(d),
+                Out::Unavailable(d) => Resp::Status503_TheServiceIsCurrentlyUnavailable(d),
+                Out::Internal(d) => Resp::Status500_InternalError(d),
             },
         )
     }

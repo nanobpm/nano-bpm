@@ -6478,6 +6478,11 @@ impl ServerImpl {
                         400,
                         detail,
                     )),
+                    // Preserve the retryable 503 (handoff pause / leadership race)
+                    // per spec/jobs.yaml; only genuinely untyped errors fall to 500.
+                    Err((503, detail)) => Resp::Status503_TheServiceIsCurrentlyUnavailable(
+                        problem("Service unavailable", 503, detail),
+                    ),
                     Err((_, detail)) => {
                         Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                             "Job completion failed",
@@ -6660,6 +6665,11 @@ impl ServerImpl {
                     ),
                     Err((409, detail)) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
                         problem("Job command rejected", 409, detail),
+                    ),
+                    // Preserve the retryable 503 (handoff pause / leadership race)
+                    // per spec/jobs.yaml; only genuinely untyped errors fall to 500.
+                    Err((503, detail)) => Resp::Status503_TheServiceIsCurrentlyUnavailable(
+                        problem("Service unavailable", 503, detail),
                     ),
                     Err((_, detail)) => {
                         Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
@@ -6847,6 +6857,11 @@ impl ServerImpl {
                             detail,
                         ))
                     }
+                    // Preserve the retryable 503 (handoff pause / leadership race)
+                    // per spec/jobs.yaml; only genuinely untyped errors fall to 500.
+                    Err((503, detail)) => Resp::Status503_TheServiceIsCurrentlyUnavailable(
+                        problem("Service unavailable", 503, detail),
+                    ),
                     Err((_, detail)) => {
                         Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                             "Job error failed",
@@ -7430,6 +7445,14 @@ impl ServerImpl {
             409 => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
                 "Job in wrong state",
                 409,
+                detail,
+            )),
+            // Preserve the retryable 503 (handoff pause / leadership race) that
+            // `update_job_core` propagates from the propose path, per
+            // spec/jobs.yaml:291-292 — a transient election is not a 500 fault.
+            503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
                 detail,
             )),
             // Any other status (e.g. 502 when a peer is unreachable) has no
@@ -18588,8 +18611,10 @@ impl ServerImpl {
                         Command::fail_job(job_key, retries, error_message),
                         lease_token,
                     ),
-                    // Stream fail path: record the stream-completion diagnostic.
-                    true,
+                    // `stream_complete_outcome_total` is a CompleteJob-only
+                    // diagnostic (metrics.rs); a FailJob outcome must not be
+                    // recorded as a CompleteJob outcome. #1306.
+                    false,
                 )
                 .await;
         }
@@ -18631,8 +18656,10 @@ impl ServerImpl {
                         ),
                         lease_token,
                     ),
-                    // Stream throw-error path: record the stream-completion diagnostic.
-                    true,
+                    // `stream_complete_outcome_total` is a CompleteJob-only
+                    // diagnostic (metrics.rs); a ThrowError outcome must not be
+                    // recorded as a CompleteJob outcome. #1306.
+                    false,
                 )
                 .await;
         }
@@ -42215,18 +42242,20 @@ mod no_direct_engine_apply_guard {
     //! #1306 regression guard: every durable by-key REST / operator mutation
     //! must flow through the canonical Raft-aware funnel
     //! [`ServerImpl::apply_partition_command`] (or `apply_create_command`),
-    //! never a direct `engine…apply_command_at` inside a handler. A direct local
-    //! apply while Raft is enabled never enters the partition's replicated log,
-    //! so a leader failover silently loses the acknowledged write — the exact
-    //! defect #1305 fixed for standalone decision evaluate / delete. This test
-    //! pins the complete set of production functions allowed to call
-    //! `apply_command_at` directly; a new durable mutation handler that applies
-    //! on the engine itself adds a name the allowlist does not contain and fails
-    //! here until it either routes through the helper or is consciously added
-    //! with a justification.
+    //! never a direct `engine…apply_command_at` / `engine…apply_command` inside
+    //! a handler. A direct local apply while Raft is enabled never enters the
+    //! partition's replicated log, so a leader failover silently loses the
+    //! acknowledged write — the exact defect #1305 fixed for standalone decision
+    //! evaluate / delete. This test pins the complete set of production functions
+    //! allowed to call either direct-apply API (`Journal::apply_command_at` and
+    //! the clock-implicit `Journal::apply_command`) directly; a new durable
+    //! mutation handler that applies on the engine itself adds a name the
+    //! allowlist does not contain and fails here until it either routes through
+    //! the helper or is consciously added with a justification.
 
-    /// Production functions permitted to call `apply_command_at` directly, each
-    /// paired with the reason it is NOT a #1306 violation.
+    /// Production functions permitted to call a direct-apply API
+    /// (`apply_command_at` / `apply_command`) directly, each paired with the
+    /// reason it is NOT a #1306 violation.
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
         "apply_partition_command",
@@ -42246,6 +42275,19 @@ mod no_direct_engine_apply_guard {
         // The periodic timer tick drives led partitions through Raft
         // (`tick_partition_via_raft`) and applies locally only when Raft is off.
         "main",
+        // Startup demo-process seed on a fresh deployment partition
+        // (`journals[0].apply_command(Command::DeployProcess)`): runs once at
+        // bootstrap before the node serves traffic, is re-derived from the
+        // durable log on every restart, and is replicated to peers via the stage-1
+        // deployment broadcast — never a client-acknowledged by-key mutation.
+        "new",
+        // The deployment partition-0 owner path (`deploy_resources_locally*`):
+        // deployment is topology-guarded (`topology().is_local(0)`) and the
+        // applied events are broadcast to every peer (`broadcast_deployment`), so
+        // the definitions replicate cluster-wide without a per-key Raft propose.
+        // Uses the clock-implicit `apply_command` for the batched resource/DRG/
+        // form/generic-resource commands.
+        "deploy_resources_locally_with_forms",
         // Documented engine-internal bypasses. The cross-partition routing pump
         // is a tracked follow-up (#1307): these apply on routing-computed
         // partitions rather than by an entity key, and `activate_on` is an
@@ -42310,7 +42352,13 @@ mod no_direct_engine_apply_guard {
 
         let mut offenders: Vec<(usize, String)> = Vec::new();
         for (idx, line) in lines.iter().enumerate() {
-            if in_test[idx] || !line.contains(".apply_command_at(") {
+            // Match both direct-apply APIs: the explicit-instant
+            // `apply_command_at` and the clock-implicit `apply_command`. The
+            // latter is a `apply_command_at` prefix-free call, so test it only
+            // when the line is not already an `apply_command_at` call.
+            let is_direct_apply = line.contains(".apply_command_at(")
+                || (line.contains(".apply_command(") && !line.contains(".apply_command_at("));
+            if in_test[idx] || !is_direct_apply {
                 continue;
             }
             let mut name = String::from("<unknown>");
@@ -42330,10 +42378,11 @@ mod no_direct_engine_apply_guard {
 
         assert!(
             offenders.is_empty(),
-            "direct `apply_command_at` in non-allowlisted production function(s): {offenders:?}. \
-             Route durable by-key mutations through `ServerImpl::apply_partition_command` so the \
-             write is replicated through Raft before it is acknowledged (#1306). If the call is a \
-             legitimate Raft-guarded or engine-internal exception, add it to ALLOWED with a reason."
+            "direct `apply_command_at`/`apply_command` in non-allowlisted production function(s): \
+             {offenders:?}. Route durable by-key mutations through \
+             `ServerImpl::apply_partition_command` so the write is replicated through Raft before \
+             it is acknowledged (#1306). If the call is a legitimate Raft-guarded or \
+             engine-internal exception, add it to ALLOWED with a reason."
         );
     }
 }
