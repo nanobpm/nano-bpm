@@ -90,7 +90,7 @@ jobs:
       # (engine-wasm -> console/src/wasm) so the distribution ships a freshly
       # release-built wasm rather than whatever artifact happens to be committed.
       - name: Install Rust toolchain (wasm32)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: wasm32-unknown-unknown
 
@@ -257,7 +257,7 @@ jobs:
           path: .
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
 
