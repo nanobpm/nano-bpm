@@ -141,6 +141,35 @@ if [ "$CONSOLE" = 1 ]; then
   touch "$PROJECT_ROOT/server/crates/nano-server-console/src/lib.rs"
 fi
 
+# Archive with zig's (llvm) ar/ranlib, not the host's. jemalloc-sys runs its own
+# autoconf build, which calls plain `ar crus` / `ranlib` (it reads `AR`/`RANLIB`,
+# not cc-rs's per-target `AR_<triple>`). On macOS that is Apple's ar, which
+# silently drops the ELF members and leaves a 96-byte `libjemalloc.a`, so the
+# final link fails with `undefined symbol: _rjem_malloc` etc. A warm target/
+# masks this (the archive was built before the host toolchain changed); a fresh
+# worktree or clean build hits it. llvm-ar handles host (Mach-O/ELF) objects
+# too, so build scripts compiled for the host are unaffected.
+if [ "$WINDOWS" = 0 ]; then
+  zig_tools="$PROJECT_ROOT/server/target/zig-tools"
+  mkdir -p "$zig_tools"
+  printf '#!/bin/sh\nexec zig ar "$@"\n' >"$zig_tools/ar"
+  printf '#!/bin/sh\nexec zig ranlib "$@"\n' >"$zig_tools/ranlib"
+  chmod +x "$zig_tools/ar" "$zig_tools/ranlib"
+  export AR="$zig_tools/ar" RANLIB="$zig_tools/ranlib"
+
+  # Self-heal a target dir poisoned before this fix: cargo won't re-run the
+  # jemalloc build script for an env change, so drop any empty archive's build
+  # dir and let it rebuild. A real libjemalloc.a is megabytes.
+  for archive in "$PROJECT_ROOT"/server/target/"$TARGET"/release/build/tikv-jemalloc-sys-*/out/lib/libjemalloc.a; do
+    [ -f "$archive" ] || continue
+    if [ "$(wc -c <"$archive")" -lt 1024 ]; then
+      stale="${archive%/out/lib/libjemalloc.a}"
+      echo "cross-build: removing empty jemalloc archive build ($stale)"
+      rm -rf "$stale"
+    fi
+  done
+fi
+
 if [ "$WINDOWS" = 1 ]; then
   echo "cross-build: $BIN_NAME -> $TARGET (backend: cargo-xwin/msvc, console: $CONSOLE)"
 else
