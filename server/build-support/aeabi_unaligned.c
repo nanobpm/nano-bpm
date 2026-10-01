@@ -1,3 +1,14 @@
+/*
+ * Weak ARM RTABI unaligned-access helpers (IHI0043, section 4.3.3), linked into
+ * armv6 zigbuild binaries via scripts/zig-arm-shim-env.sh (#1322). libgcc and
+ * Rust's compiler_builtins provide these, but cargo-zigbuild drops
+ * compiler_builtins on ARM and zig's compiler-rt lacks them.
+ *
+ * Verbatim from cargo-zigbuild v0.23.4 (src/zig/mod.rs, AEABI_UNALIGNED_C;
+ * MIT, https://github.com/rust-cross/cargo-zigbuild, commit 236ff1da).
+ * Compiled with zig's strict_align -mcpu, the memcpy lowers to byte loads and
+ * stores, so these never recurse into themselves.
+ */
 #ifdef __cplusplus
 extern "C" {
 #endif
