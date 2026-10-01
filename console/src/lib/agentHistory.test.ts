@@ -5,6 +5,7 @@ import type {
   AgentInstanceResult,
 } from "../gen-c8/types.gen";
 import {
+  agentBadge,
   agentsByElement,
   chapters,
   initialPlayhead,
@@ -12,8 +13,11 @@ import {
   onHistoryChanged,
   orderHistory,
   scrub,
+  scrubActionForKey,
   seek,
   spans,
+  timeWindow,
+  pctIn,
   totals,
   type HistoryItem,
 } from "./agentHistory.ts";
@@ -281,4 +285,55 @@ test("only COMPLETED and UNKNOWN are settled", () => {
   ] as const) {
     assert.equal(isAgentActive(s), true);
   }
+});
+
+test("badge: settled single run shows model calls; active shows status; runs counted", () => {
+  const withCalls = (a: AgentInstanceResult, n: number) =>
+    ({ ...a, metrics: { modelCalls: n } }) as AgentInstanceResult;
+  const done = agentsByElement([withCalls(agent("1", "e", "COMPLETED", 1), 3)]);
+  assert.deepEqual(agentBadge(done.get("e")!), {
+    label: "✦ 3 calls",
+    title: "Agent session on e: done, 3 model calls. Open the scrubber.",
+    tone: "settled",
+  });
+  const live = agentsByElement([
+    withCalls(agent("1", "e", "COMPLETED", 1), 1),
+    withCalls(agent("2", "e", "TOOL_CALLING", 2), 1),
+  ]);
+  const b = agentBadge(live.get("e")!);
+  assert.equal(b.label, "✦ calling tools · 2 runs");
+  assert.equal(b.tone, "active");
+  assert.match(b.title, /\(2 runs\).*2 model calls/);
+});
+
+test("hotkeys: arrows step, shift+arrows jump chapters, Home/End", () => {
+  const k = (key: string, shiftKey = false) =>
+    scrubActionForKey({ key, shiftKey });
+  assert.equal(k("ArrowLeft"), "stepBack");
+  assert.equal(k("ArrowRight"), "stepForward");
+  assert.equal(k("ArrowLeft", true), "previousChapter");
+  assert.equal(k("ArrowRight", true), "nextChapter");
+  assert.equal(k("Home"), "start");
+  assert.equal(k("End"), "end");
+  assert.equal(k("a"), null);
+});
+
+test("time window spans model starts to last item; open spans reach now only while active", () => {
+  const s = session();
+  const w = timeWindow(s, spans(s), false, T0 + 60_000)!;
+  assert.deepEqual([w.startMs - T0, w.endMs - T0], [0, 9000]);
+  assert.equal(pctIn(w, T0 + 4500), 50);
+  assert.equal(pctIn(w, T0 - 1), 0);
+
+  const live = s.slice(0, 2); // tool calls still open
+  const settled = timeWindow(live, spans(live), false, T0 + 60_000)!;
+  assert.equal(settled.endMs - T0, 3000);
+  const running = timeWindow(live, spans(live), true, T0 + 60_000)!;
+  assert.equal(running.endMs - T0, 60_000);
+  assert.equal(timeWindow([], [], true, 0), null);
+});
+
+test("a single instant still yields a non-zero window", () => {
+  const w = timeWindow([item("1", 1, "USER", 0)], [], false, 0)!;
+  assert.ok(w.endMs > w.startMs);
 });

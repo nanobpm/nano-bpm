@@ -18,6 +18,38 @@ interface Canvas {
   removeMarker(elementId: string, marker: string): void;
 }
 
+/// diagram-js's overlay service: HTML pinned to a diagram element, moving and
+/// scaling with it.
+interface Overlays {
+  add(
+    elementId: string,
+    type: string,
+    overlay: {
+      position: {
+        top?: number;
+        right?: number;
+        bottom?: number;
+        left?: number;
+      };
+      html: HTMLElement;
+    },
+  ): string;
+  remove(filter: { type: string }): void;
+}
+
+/// A small pill drawn on a flow element's top-right corner (e.g. an agent
+/// session: status and turn count). Clicking it calls `onBadgeClick`.
+export interface ElementBadge {
+  elementId: string;
+  label: string;
+  /// Accessible name and tooltip.
+  title: string;
+  /// `active` pulses (work still arriving); `settled` is static.
+  tone: "active" | "settled";
+}
+
+const BADGE_OVERLAY = "nano-badge";
+
 /// diagram-js's event bus. We only subscribe to `element.click` to surface a
 /// selection to the caller, so this is deliberately the minimal shape.
 interface EventBus {
@@ -74,6 +106,10 @@ interface BpmnViewerProps {
   /// ignored (never fired). Optional; omitting it leaves the viewer's existing
   /// read-only behaviour completely unchanged.
   onElementSelect?: (elementId: string) => void;
+  /// Pills overlaid on flow elements (agent sessions, #1314).
+  badges?: ElementBadge[];
+  /// Called with the element id when its badge is clicked.
+  onBadgeClick?: (elementId: string) => void;
 }
 
 /// Renders a deployed BPMN definition with diagram-js (read-only), overlaying
@@ -87,6 +123,8 @@ export default function BpmnViewer({
   onImportError,
   onImportSuccess,
   onElementSelect,
+  badges = [],
+  onBadgeClick,
 }: BpmnViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<NavigatedViewer | null>(null);
@@ -102,6 +140,8 @@ export default function BpmnViewer({
   // callback without re-subscribing on every render.
   const onElementSelectRef = useRef(onElementSelect);
   onElementSelectRef.current = onElementSelect;
+  const onBadgeClickRef = useRef(onBadgeClick);
+  onBadgeClickRef.current = onBadgeClick;
   // Set once the viewer has been destroyed, so async work already in flight (an
   // importXML, a marker pass) doesn't touch a dead instance.
   const disposedRef = useRef(false);
@@ -219,6 +259,10 @@ export default function BpmnViewer({
   // the backend reorders jobs/incidents between SSE ticks.
   const activeKey = [...activeElementIds].sort().join(",");
   const incidentKey = [...incidentElementIds].sort().join(",");
+  const badgeKey = badges
+    .map((b) => `${b.elementId}\u0000${b.label}\u0000${b.title}\u0000${b.tone}`)
+    .sort()
+    .join("\u0001");
 
   useEffect(() => {
     const viewer = viewerRef.current;
@@ -277,11 +321,37 @@ export default function BpmnViewer({
       }
       markedActiveRef.current = activeElementIds;
       markedIncidentRef.current = incidentElementIds;
+
+      const overlays = viewer.get<Overlays>("overlays");
+      overlays.remove({ type: BADGE_OVERLAY });
+      for (const badge of badges) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `nano-badge nano-badge-${badge.tone}`;
+        button.textContent = badge.label;
+        button.title = badge.title;
+        button.setAttribute("aria-label", badge.title);
+        button.dataset.elementId = badge.elementId;
+        // Stop the click reaching diagram-js, which would also fire
+        // `element.click` (the badge is a child of the element's overlay).
+        button.addEventListener("click", (e) => {
+          e.stopPropagation();
+          onBadgeClickRef.current?.(badge.elementId);
+        });
+        try {
+          overlays.add(badge.elementId, BADGE_OVERLAY, {
+            position: { top: -10, right: 12 },
+            html: button,
+          });
+        } catch {
+          /* element may not exist in this version's diagram */
+        }
+      }
     });
     // Keep the chain alive even when this op fails, so one bad import doesn't
     // wedge every later load.
     opChainRef.current = op.catch(() => {});
-  }, [xml, activeKey, incidentKey]);
+  }, [xml, activeKey, incidentKey, badgeKey]);
 
   // On mobile the diagram opens into a full-screen card and the phone can
   // rotate; re-fit to the viewport whenever the container resizes so the whole

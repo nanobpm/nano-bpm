@@ -336,3 +336,89 @@ export function agentsByElement(
   }
   return out;
 }
+
+export interface AgentBadge {
+  label: string;
+  title: string;
+  tone: "active" | "settled";
+}
+
+const STATUS_WORD: Record<AgentInstanceStatusEnum, string> = {
+  UNKNOWN: "unknown",
+  COMPLETED: "done",
+  IDLE: "idle",
+  INITIALIZING: "starting",
+  THINKING: "thinking",
+  TOOL_CALLING: "calling tools",
+  TOOL_DISCOVERY: "discovering tools",
+};
+
+/** The diagram pill for an element's agent sessions: what it's doing now (when
+ *  active) or how many model calls it took, and the run count when it ran more
+ *  than once. */
+export function agentBadge(entry: ElementAgents): AgentBadge {
+  const runs = entry.instances.length;
+  const calls = entry.instances.reduce(
+    (n, i) => n + (i.metrics?.modelCalls ?? 0),
+    0,
+  );
+  const what = entry.active
+    ? STATUS_WORD[entry.status]
+    : `${calls} ${calls === 1 ? "call" : "calls"}`;
+  const label = runs > 1 ? `✦ ${what} · ${runs} runs` : `✦ ${what}`;
+  const title =
+    `Agent session${runs > 1 ? `s (${runs} runs)` : ""} on ${entry.elementId}: ` +
+    `${STATUS_WORD[entry.status]}, ${calls} model ${calls === 1 ? "call" : "calls"}. ` +
+    "Open the scrubber.";
+  return { label, title, tone: entry.active ? "active" : "settled" };
+}
+
+/** Scrubber hotkeys (TAH `replayHotkeys` convention): arrows step one item,
+ *  Shift+arrows jump a chapter (loop iteration), Home/End go to the ends. */
+export function scrubActionForKey(e: {
+  key: string;
+  shiftKey: boolean;
+}): ScrubAction | null {
+  switch (e.key) {
+    case "ArrowLeft":
+      return e.shiftKey ? "previousChapter" : "stepBack";
+    case "ArrowRight":
+      return e.shiftKey ? "nextChapter" : "stepForward";
+    case "Home":
+      return "start";
+    case "End":
+      return "end";
+    default:
+      return null;
+  }
+}
+
+export interface TimeWindow {
+  startMs: number;
+  endMs: number;
+}
+
+/** The time window the timeline draws: earliest span start or item to the
+ *  latest end. Open spans run to `nowMs` while the agent is active, else to
+ *  the last item. Never zero-width, so percentages stay finite. */
+export function timeWindow(
+  items: readonly HistoryItem[],
+  list: readonly Span[],
+  active: boolean,
+  nowMs: number,
+): TimeWindow | null {
+  if (items.length === 0) return null;
+  const produced = items.map((i) => Date.parse(i.producedAt));
+  const startMs = Math.min(...produced, ...list.map((s) => s.startMs));
+  let endMs = Math.max(...produced, ...list.map((s) => s.endMs ?? -Infinity));
+  if (active && list.some((s) => s.endMs === null)) {
+    endMs = Math.max(endMs, nowMs);
+  }
+  return { startMs, endMs: Math.max(endMs, startMs + 1) };
+}
+
+/** `ms` as a percentage across `w`, clamped to the bar. */
+export function pctIn(w: TimeWindow, ms: number): number {
+  const p = ((ms - w.startMs) / (w.endMs - w.startMs)) * 100;
+  return Math.max(0, Math.min(100, p));
+}
