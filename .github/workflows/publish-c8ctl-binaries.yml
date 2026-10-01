@@ -90,7 +90,7 @@ jobs:
       # (engine-wasm -> console/src/wasm) so the distribution ships a freshly
       # release-built wasm rather than whatever artifact happens to be committed.
       - name: Install Rust toolchain (wasm32)
-        uses: dtolnay/rust-toolchain@1.98.1
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
 
@@ -257,7 +257,7 @@ jobs:
           path: .
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.98.1
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: ${{ matrix.target }}
 
@@ -283,7 +283,8 @@ jobs:
           #     linking the engine-core cdylib; cargo-zigbuild only allow-lists it
           #     from 0.23.0 onward, so <0.23.0 (e.g. 0.19.x/0.20.x) fails the
           #     aarch64 link with `unsupported linker arg: --fix-cortex-a53-843419`.
-          #   * 32-bit ARM (armv6/armv7) broke in 0.23.3: its jemalloc-sys C build
+          #   * 32-bit ARM (armv6/armv7) broke in 0.23.3 (still broken in 0.23.4,
+          #     re-verified with zig 0.13 and 0.16 for #1322): its jemalloc-sys C build
           #     fails with `aeabi_unaligned.c: FileNotFound` plus a zig-0.14+
           #     `-mcpu` string (`generic+v7a+vfp3-d32+thumb2-neon`) that zig 0.13.0
           #     rejects. The unpinned/latest install pulls 0.23.3 and hits this.
@@ -310,6 +311,10 @@ jobs:
             export CARGO_PROFILE_RELEASE_LTO=thin
             export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
           fi
+          # armv6: link the ARM-RTABI unaligned-access shim that Rust >= 1.99's
+          # strict-align libstd needs but zig's compiler-rt lacks (#1322). Shared
+          # with scripts/cross-build.sh; a no-op for every other target.
+          . ../scripts/zig-arm-shim-env.sh
           # The `.<glibc>` suffix pins the minimum glibc; zigbuild writes to the
           # unsuffixed target dir (server/target/<triple>/release/).
           cargo zigbuild --release --target "${{ matrix.target }}.${{ matrix.glibc }}" \

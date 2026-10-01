@@ -1,8 +1,9 @@
 # Single source of truth for the Rust toolchain (local dev + every CI/release
 # workflow). Bump deliberately, in its own PR, and only after every release leg
-# builds on the new version. On the day Rust 1.99.0 reached the unpinned
-# `@stable`, it broke clippy (double_must_use) and the zig armv6 link
-# (`__aeabi_uread4`). scripts/rust-toolchain-pin.test.mjs fails CI when a
-# workflow drifts from this file.
+# builds on the new version. When Rust 1.99.0 reached the then-unpinned
+# `@stable`, it broke clippy (double_must_use, fixed in #1313) and the zig armv6
+# link (`__aeabi_uread4`, fixed in #1322 via scripts/zig-arm-shim-env.sh).
+# scripts/rust-toolchain-pin.test.mjs fails CI when a workflow drifts from this
+# file.
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.0"
