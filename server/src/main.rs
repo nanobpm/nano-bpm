@@ -6449,60 +6449,58 @@ impl ServerImpl {
         );
         if !self.raft.is_empty() {
             let metadata = self.job_worker_metadata(job_key).await;
-            return Ok(match self.propose_job_for_stream(job_key, command).await {
-                Ok(commit) => {
-                    commit.wait().await;
-                    self.note_job_completion("rest");
-                    if let Some((job_type, worker)) = metadata {
-                        self.job_statistics
-                            .record_completed(job_type, worker, now_millis());
+            // REST complete is not the stream CompleteJob path: do not record the
+            // stream-completion diagnostic (`record_stream_outcome = false`). #1306.
+            return Ok(
+                match self.propose_job_for_stream(job_key, command, false).await {
+                    Ok(commit) => {
+                        commit.wait().await;
+                        self.note_job_completion("rest");
+                        if let Some((job_type, worker)) = metadata {
+                            self.job_statistics
+                                .record_completed(job_type, worker, now_millis());
+                        }
+                        self.signal_jobs_available();
+                        Resp::Status204_TheJobWasCompletedSuccessfully
                     }
-                    self.signal_jobs_available();
-                    Resp::Status204_TheJobWasCompletedSuccessfully
-                }
-                Err((404, detail)) => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
-                    "Job not found",
-                    404,
-                    detail,
-                )),
-                Err((409, detail)) => {
-                    Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                        "Job command rejected",
-                        409,
+                    Err((404, detail)) => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(
+                        problem("Job not found", 404, detail),
+                    ),
+                    Err((409, detail)) => {
+                        Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                            "Job command rejected",
+                            409,
+                            detail,
+                        ))
+                    }
+                    Err((400, detail)) => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job completion",
+                        400,
                         detail,
-                    ))
-                }
-                Err((400, detail)) => Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid job completion",
-                    400,
-                    detail,
-                )),
-                Err((_, detail)) => {
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Job completion failed",
-                        500,
-                        detail,
-                    ))
-                }
-            });
+                    )),
+                    Err((_, detail)) => {
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Job completion failed",
+                            500,
+                            detail,
+                        ))
+                    }
+                },
+            );
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
+        let (engine_meta, result) = self
+            .apply_job_command_direct_with(job_key, command, move |engine| {
                 // Capture the job's type/worker authoritatively from engine state
                 // *before* the completion drops the activation, so the
                 // job-statistics attribution is race-free (the read model is
                 // eventually consistent and may lag).
-                let meta = engine
+                engine
                     .state()
                     .jobs
                     .get(&job_key)
-                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
-                (meta, engine.apply_command_at(command, now_millis()))
+                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()))
             })
             .await;
-        let (engine_meta, result) = result;
         let completed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((events, commit)) => {
@@ -6644,55 +6642,52 @@ impl ServerImpl {
                 Command::fail_job(job_key, retries, error_message),
                 lease_token,
             );
-            return Ok(match self.propose_job_for_stream(job_key, command).await {
-                Ok(commit) => {
-                    commit.wait().await;
-                    self.note_job_completion("rest");
-                    if let Some((job_type, worker)) = metadata {
-                        self.job_statistics
-                            .record_failed(job_type, worker, now_millis());
+            // REST fail is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
+            return Ok(
+                match self.propose_job_for_stream(job_key, command, false).await {
+                    Ok(commit) => {
+                        commit.wait().await;
+                        self.note_job_completion("rest");
+                        if let Some((job_type, worker)) = metadata {
+                            self.job_statistics
+                                .record_failed(job_type, worker, now_millis());
+                        }
+                        self.signal_jobs_available();
+                        Resp::Status204_TheJobIsFailed
                     }
-                    self.signal_jobs_available();
-                    Resp::Status204_TheJobIsFailed
-                }
-                Err((404, detail)) => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(problem(
-                    "Job not found",
-                    404,
-                    detail,
-                )),
-                Err((409, detail)) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
-                    problem("Job command rejected", 409, detail),
-                ),
-                Err((_, detail)) => {
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Job failure failed",
-                        500,
-                        detail,
-                    ))
-                }
-            });
+                    Err((404, detail)) => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(
+                        problem("Job not found", 404, detail),
+                    ),
+                    Err((409, detail)) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
+                        problem("Job command rejected", 409, detail),
+                    ),
+                    Err((_, detail)) => {
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Job failure failed",
+                            500,
+                            detail,
+                        ))
+                    }
+                },
+            );
         }
 
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                let meta = engine
-                    .state()
-                    .jobs
-                    .get(&job_key)
-                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
-                let outcome = engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::fail_job(job_key, retries, error_message),
-                        lease_token,
-                    ),
-                    now_millis(),
-                );
-                (meta, outcome)
-            })
+        let (engine_meta, result) = self
+            .apply_job_command_direct_with(
+                job_key,
+                job_command_with_lease(
+                    Command::fail_job(job_key, retries, error_message),
+                    lease_token,
+                ),
+                move |engine| {
+                    engine
+                        .state()
+                        .jobs
+                        .get(&job_key)
+                        .map(|j| (Some(j.job_type.clone()), j.worker.clone()))
+                },
+            )
             .await;
-        let (engine_meta, result) = result;
         let failed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((_, commit)) => {
@@ -6820,70 +6815,69 @@ impl ServerImpl {
                 Command::throw_job_error_with(job_key, body_error_code, error_message, variables),
                 lease_token,
             );
-            return Ok(match self.propose_job_for_stream(job_key, command).await {
-                Ok(commit) => {
-                    commit.wait().await;
-                    self.note_job_completion("rest");
-                    if let Some((job_type, worker)) = metadata {
-                        self.job_statistics.record_error(
-                            job_type,
-                            worker,
-                            stat_error_code,
-                            stat_error_message,
-                            now_millis(),
-                        );
+            // REST throw-error is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
+            return Ok(
+                match self.propose_job_for_stream(job_key, command, false).await {
+                    Ok(commit) => {
+                        commit.wait().await;
+                        self.note_job_completion("rest");
+                        if let Some((job_type, worker)) = metadata {
+                            self.job_statistics.record_error(
+                                job_type,
+                                worker,
+                                stat_error_code,
+                                stat_error_message,
+                                now_millis(),
+                            );
+                        }
+                        self.signal_jobs_available();
+                        Resp::Status204_AnErrorIsThrownForTheJob
                     }
-                    self.signal_jobs_available();
-                    Resp::Status204_AnErrorIsThrownForTheJob
-                }
-                Err((404, detail)) => {
-                    Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
-                        "Job not found",
-                        404,
-                        detail,
-                    ))
-                }
-                Err((409, detail)) => {
-                    Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                        "Job command rejected",
-                        409,
-                        detail,
-                    ))
-                }
-                Err((_, detail)) => {
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Job error failed",
-                        500,
-                        detail,
-                    ))
-                }
-            });
+                    Err((404, detail)) => {
+                        Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
+                            "Job not found",
+                            404,
+                            detail,
+                        ))
+                    }
+                    Err((409, detail)) => {
+                        Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                            "Job command rejected",
+                            409,
+                            detail,
+                        ))
+                    }
+                    Err((_, detail)) => {
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Job error failed",
+                            500,
+                            detail,
+                        ))
+                    }
+                },
+            );
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                let meta = engine
-                    .state()
-                    .jobs
-                    .get(&job_key)
-                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
-                let outcome = engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::throw_job_error_with(
-                            job_key,
-                            body_error_code,
-                            error_message,
-                            variables,
-                        ),
-                        lease_token,
+        let (engine_meta, result) = self
+            .apply_job_command_direct_with(
+                job_key,
+                job_command_with_lease(
+                    Command::throw_job_error_with(
+                        job_key,
+                        body_error_code,
+                        error_message,
+                        variables,
                     ),
-                    now_millis(),
-                );
-                (meta, outcome)
-            })
+                    lease_token,
+                ),
+                move |engine| {
+                    engine
+                        .state()
+                        .jobs
+                        .get(&job_key)
+                        .map(|j| (Some(j.job_type.clone()), j.worker.clone()))
+                },
+            )
             .await;
-        let (engine_meta, result) = result;
         let error_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((_, commit)) => {
@@ -7494,14 +7488,11 @@ impl ServerImpl {
             lease_token,
         };
         let commit = if self.raft.is_empty() {
-            let result = self
-                .engine
-                .by_key(job_key)
-                .with(move |journal| journal.apply_command_at(command, now_millis()))
-                .await;
+            let result = self.apply_job_command_direct(job_key, command).await;
             Self::map_job_outcome(result)?
         } else {
-            self.propose_job_for_stream(job_key, command).await?
+            // REST job path, not stream CompleteJob: no stream diagnostic. #1306.
+            self.propose_job_for_stream(job_key, command, false).await?
         };
         commit.wait().await;
         self.signal_jobs_available();
@@ -8678,17 +8669,14 @@ impl ServerImpl {
             lease_token,
         );
         if !self.raft.is_empty() {
-            self.propose_job_for_stream(job_key, command)
+            // REST job-retries update, not stream CompleteJob: no stream diagnostic. #1306.
+            self.propose_job_for_stream(job_key, command, false)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
+        let result = self.apply_job_command_direct(job_key, command).await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -8733,17 +8721,14 @@ impl ServerImpl {
             lease_token,
         );
         if !self.raft.is_empty() {
-            self.propose_job_for_stream(job_key, command)
+            // REST job-timeout update, not stream CompleteJob: no stream diagnostic. #1306.
+            self.propose_job_for_stream(job_key, command, false)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
+        let result = self.apply_job_command_direct(job_key, command).await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -12730,7 +12715,14 @@ impl ServerImpl {
         let response = part
             .propose_result(command, now_millis())
             .await
-            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+            .map_err(|e| match e {
+                // A leadership race (ForwardToLeader while the batched write was
+                // queued) is retryable, not an internal fault. #1306.
+                crate::raft::ProposeError::Leader => {
+                    (503, format!("partition {p} leader unavailable; retry"))
+                }
+                other => (500, other.to_string()),
+            })?;
         if let Some((status, message)) = response.error {
             return Err((status, message));
         }
@@ -12782,6 +12774,57 @@ impl ServerImpl {
         self.observe_job_sojourn(&events, now_millis());
         self.record_adhoc_events(&events);
         Ok((events, Commit::ready()))
+    }
+
+    /// The non-Raft (single-node) fallback for the job/stream mutation handlers:
+    /// apply `command` directly on the owning engine actor and return the raw
+    /// [`Journal::apply_command_at`] outcome. This is the ONLY place those
+    /// handlers may apply on the engine — it exists so the
+    /// `no_direct_engine_apply_guard` can confine their direct apply to this one
+    /// small, allowlisted helper instead of trusting each whole handler body.
+    /// Under Raft the handlers take the replicated `propose_*` path and never
+    /// reach here, so this fallback runs only when Raft is disabled (where a
+    /// local apply is correct and durable). #1306.
+    ///
+    /// Returns the raw outcome (no routing / sojourn / ad-hoc side effects and
+    /// no durability wait): each caller keeps its own bespoke post-apply
+    /// handling, exactly as before.
+    async fn apply_job_command_direct(
+        &self,
+        job_key: Key,
+        command: Command,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        self.apply_job_command_direct_with(job_key, command, |_| ())
+            .await
+            .1
+    }
+
+    /// [`apply_job_command_direct`](Self::apply_job_command_direct) with a
+    /// pre-apply hook run on the engine thread just before the command applies
+    /// (the REST complete/fail/throw paths use it to capture the job's
+    /// type/worker for statistics *before* the apply drops the activation).
+    /// Keeping the apply itself inside this one helper is what lets the
+    /// `no_direct_engine_apply_guard` confine the job/stream handlers' direct
+    /// apply to the non-Raft fallback. #1306.
+    async fn apply_job_command_direct_with<M>(
+        &self,
+        job_key: Key,
+        command: Command,
+        pre_apply: impl FnOnce(&mut Journal) -> M + Send + 'static,
+    ) -> (
+        M,
+        Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError>,
+    )
+    where
+        M: Send + 'static,
+    {
+        self.engine
+            .by_key(job_key)
+            .with(move |journal| {
+                let meta = pre_apply(journal);
+                (meta, journal.apply_command_at(command, now_millis()))
+            })
+            .await
     }
 
     async fn forward_agent_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -18233,7 +18276,13 @@ impl ServerImpl {
                 now_millis(),
             )
             .await
-            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+            .map_err(|e| match e {
+                // Leadership race on the batched write is retryable, not 500. #1306.
+                crate::raft::ProposeError::Leader => {
+                    (503, format!("partition {p} leader unavailable; retry"))
+                }
+                other => (500, other.to_string()),
+            })?;
         if let Some((status, message)) = response.error {
             return Err((status, message));
         }
@@ -18347,14 +18396,18 @@ impl ServerImpl {
     /// owning partition's Raft leader, returning a ready [`Commit`] (durability is
     /// already awaited inside the state-machine apply). Surfaces engine rejections
     /// (404/409) via the replicated response, matching the direct path's statuses.
+    ///
+    /// `record_stream_outcome` gates the `stream_complete_outcome_total`
+    /// diagnostic and is `true` ONLY for the stream `CompleteJob` path — the REST
+    /// complete/fail/throw callers pass `false` so a failed REST mutation never
+    /// inflates the stream-completion counters (see [`propose_partition_command`]). #1306.
     async fn propose_job_for_stream(
         &self,
         job_key: u64,
         command: Command,
+        record_stream_outcome: bool,
     ) -> Result<Commit, (u16, String)> {
-        // The job-stream path owns the `stream_complete_outcome_total` diagnostic,
-        // so it is the only caller that records where the propose landed.
-        self.propose_partition_command(job_key, command, true)
+        self.propose_partition_command(job_key, command, record_stream_outcome)
             .await
             .map(|(_, commit)| commit)
     }
@@ -18400,7 +18453,16 @@ impl ServerImpl {
                 if record_stream_outcome {
                     crate::metrics::record_complete_outcome("propose_err");
                 }
-                (500, format!("raft propose failed: {e}"))
+                match e {
+                    // The leader pre-check above runs before the batched
+                    // `client_write`, so leadership can still turn over while the
+                    // command is queued. That `ForwardToLeader` race is retryable
+                    // (503), not an internal fault (500). #1306.
+                    crate::raft::ProposeError::Leader => {
+                        (503, format!("partition {p} leader unavailable; retry"))
+                    }
+                    other => (500, other.to_string()),
+                }
             })?;
         if let Some((status, message)) = response.error {
             if record_stream_outcome {
@@ -18485,13 +18547,11 @@ impl ServerImpl {
             business_id,
         );
         if !self.raft.is_empty() {
-            return self.propose_job_for_stream(job_key, command).await;
+            // The stream CompleteJob path owns the stream-completion diagnostic
+            // (`record_stream_outcome = true`). #1306.
+            return self.propose_job_for_stream(job_key, command, true).await;
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
+        let result = self.apply_job_command_direct(job_key, command).await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
             self.observe_job_sojourn(events, now_millis());
@@ -18528,21 +18588,19 @@ impl ServerImpl {
                         Command::fail_job(job_key, retries, error_message),
                         lease_token,
                     ),
+                    // Stream fail path: record the stream-completion diagnostic.
+                    true,
                 )
                 .await;
         }
         let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::fail_job(job_key, retries, error_message),
-                        lease_token,
-                    ),
-                    now_millis(),
-                )
-            })
+            .apply_job_command_direct(
+                job_key,
+                job_command_with_lease(
+                    Command::fail_job(job_key, retries, error_message),
+                    lease_token,
+                ),
+            )
             .await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
@@ -18573,26 +18631,19 @@ impl ServerImpl {
                         ),
                         lease_token,
                     ),
+                    // Stream throw-error path: record the stream-completion diagnostic.
+                    true,
                 )
                 .await;
         }
         let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::throw_job_error_with(
-                            job_key,
-                            error_code,
-                            error_message,
-                            variables,
-                        ),
-                        lease_token,
-                    ),
-                    now_millis(),
-                )
-            })
+            .apply_job_command_direct(
+                job_key,
+                job_command_with_lease(
+                    Command::throw_job_error_with(job_key, error_code, error_message, variables),
+                    lease_token,
+                ),
+            )
             .await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
@@ -42180,21 +42231,18 @@ mod no_direct_engine_apply_guard {
         // The canonical Raft-aware funnels themselves.
         "apply_partition_command",
         "apply_create_command",
-        // Raft-guarded instance/job stream paths: their `!raft.is_empty()` branch
+        // The single non-Raft fallback every job/stream mutation handler routes
+        // its direct apply through (confining the apply to this one small helper,
+        // not each whole handler body, is what secures the failure mode — a new
+        // unconditional `apply_command_at` added inside `complete_job_impl` et al.
+        // is NOT allowlisted and fails here). #1306.
+        "apply_job_command_direct_with",
+        // Raft-guarded instance-creation paths: their `!raft.is_empty()` branch
         // proposes through the partition's replicated log and the direct apply is
         // only the non-Raft (single-node) fallback.
         "create_process_instance_impl",
         "create_forwarded",
         "create_for_stream",
-        "complete_job_impl",
-        "fail_job_impl",
-        "throw_job_error_impl",
-        "update_job_core",
-        "update_job_retries_local_with_lease",
-        "update_job_timeout_local_with_lease",
-        "complete_job_for_stream_with_lease",
-        "fail_job_for_stream_with_lease",
-        "throw_error_for_stream_with_lease",
         // The periodic timer tick drives led partitions through Raft
         // (`tick_partition_via_raft`) and applies locally only when Raft is off.
         "main",

@@ -62,6 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use nanobpmn_engine_core::{Command, Event};
+use openraft::error::{ClientWriteError, RaftError};
 use openraft::storage::{
     LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine, Snapshot,
 };
@@ -264,6 +265,49 @@ pub struct ReplicatedItem {
     pub events: Vec<Event>,
     #[serde(default)]
     pub error: Option<(u16, String)>,
+}
+
+/// Why a [`RaftPartition::propose_result`] failed before the command could be
+/// replicated. The propose path runs an openraft `client_write`, whose typed
+/// error distinguishes a *leadership* failure (this node is not — or is no
+/// longer — the leader, so the write must be retried against the new leader)
+/// from a genuine internal fault. The batcher used to stringify that error,
+/// collapsing both into an opaque message the HTTP layer could only map to a
+/// 500; preserving the distinction lets a transient election surface as the
+/// retryable 503 the mutation funnels document. #1306.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProposeError {
+    /// The propose was rejected because this node is not the partition's
+    /// current leader (openraft `ForwardToLeader`), or leadership was lost
+    /// while the batched `client_write` was in flight. Retryable: the caller
+    /// should re-resolve the leader and retry.
+    Leader,
+    /// Any other propose failure (storage fault, batcher teardown, arity
+    /// mismatch, …). Not a leadership race; surfaced as an internal error.
+    Other(String),
+}
+
+impl std::fmt::Display for ProposeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProposeError::Leader => write!(f, "partition leader unavailable; retry"),
+            ProposeError::Other(msg) => write!(f, "raft propose failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ProposeError {}
+
+impl ProposeError {
+    /// Classifies an openraft `client_write` error, preserving the leadership
+    /// distinction the batcher would otherwise stringify away.
+    fn from_client_write(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Self {
+        if e.forward_to_leader().is_some() {
+            ProposeError::Leader
+        } else {
+            ProposeError::Other(e.to_string())
+        }
+    }
 }
 
 /// The result handed back to the `client_write` caller on the leader: one
@@ -1535,7 +1579,7 @@ fn max_entry_bytes() -> u64 {
 /// propose error) once the entry commits and applies.
 struct Submission {
     item: ReplicatedCommand,
-    resp: tokio::sync::oneshot::Sender<anyhow::Result<ReplicatedItem>>,
+    resp: tokio::sync::oneshot::Sender<Result<ReplicatedItem, ProposeError>>,
 }
 
 /// Command intake classification for the propose batcher's two-tier priority.
@@ -1656,17 +1700,21 @@ impl Batcher {
                             // apply returns exactly one item per command; an arity
                             // mismatch is a bug, surface it rather than mis-pair.
                             for s in subs {
-                                let _ = s.resp.send(Err(anyhow::anyhow!(
+                                let _ = s.resp.send(Err(ProposeError::Other(format!(
                                     "raft batch response arity mismatch ({} != {n})",
                                     out.len()
-                                )));
+                                ))));
                             }
                         }
                     }
                     Err(e) => {
-                        let msg = e.to_string();
+                        // Preserve the leadership distinction: a `ForwardToLeader`
+                        // (this node is not / no longer the leader) is a retryable
+                        // leadership race, not an internal fault — classify it so
+                        // the HTTP layer can answer 503 instead of 500. #1306.
+                        let err = ProposeError::from_client_write(e);
                         for s in subs {
-                            let _ = s.resp.send(Err(anyhow::anyhow!("{msg}")));
+                            let _ = s.resp.send(Err(err.clone()));
                         }
                     }
                 }
@@ -1675,7 +1723,7 @@ impl Batcher {
         Self { hi_tx, lo_tx }
     }
 
-    async fn submit(&self, command: Command, now: u64) -> anyhow::Result<ReplicatedItem> {
+    async fn submit(&self, command: Command, now: u64) -> Result<ReplicatedItem, ProposeError> {
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
         // (completes, fails, ticks, admin) takes the high lane so it
@@ -1689,9 +1737,10 @@ impl Batcher {
             item: ReplicatedCommand { command, now },
             resp,
         })
-        .map_err(|_| anyhow::anyhow!("raft propose batcher stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("raft propose batcher dropped the response"))?
+        .map_err(|_| ProposeError::Other("raft propose batcher stopped".to_string()))?;
+        rx.await.map_err(|_| {
+            ProposeError::Other("raft propose batcher dropped the response".to_string())
+        })?
     }
 }
 
@@ -2079,7 +2128,7 @@ impl RaftPartition {
         &self,
         command: Command,
         now: u64,
-    ) -> anyhow::Result<ReplicatedItem> {
+    ) -> Result<ReplicatedItem, ProposeError> {
         self.batcher.submit(command, now).await
     }
 
