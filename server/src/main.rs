@@ -5547,6 +5547,83 @@ fn resolve_create_selector(
     }
 }
 
+/// The post-apply fields the non-Raft instance-creation handlers project from a
+/// direct `CreateInstance` apply.
+struct CreatedInstanceDirect {
+    instance_key: nanobpmn_engine_core::Key,
+    /// The deployed key of the exact version the instance was pinned to (not the
+    /// latest), so by-id and by-key requests report the same identity.
+    definition_key: String,
+    /// The version number the instance was pinned to.
+    version: i32,
+    /// Whether the instance auto-completed synchronously within the create (no
+    /// wait states), vs. parking on a job/timer/etc.
+    sync_completed: bool,
+    /// Cross-partition subscription follow-ups to route once durable (empty on a
+    /// single partition).
+    routable: Vec<Event>,
+    commit: Commit,
+}
+
+/// The ONE place the non-Raft (single-node) instance-creation handlers may apply
+/// a `CreateInstance` command directly on the engine: apply `command` on the
+/// create actor's `journal` and project the common post-apply fields. Confining
+/// every create handler's direct apply to this single helper — exactly as the
+/// job/stream handlers already do via
+/// [`ServerImpl::apply_job_command_direct_with`] — lets the
+/// `no_direct_engine_apply_guard` allowlist just this helper rather than trust
+/// each whole handler body, so a *future* unconditional `apply_command_at` added
+/// inside `create_process_instance_impl`, `create_forwarded`, or
+/// `create_for_stream` is caught by the guard instead of silently bypassing the
+/// Raft funnel (#1305 class). The handlers reach here only when Raft is disabled;
+/// under Raft they take the replicated `create_via_raft` propose path and never
+/// apply directly. `fallback_process_id` names the version when the just-created
+/// instance's definition is no longer resolvable (pre-retention). #1308.
+fn apply_create_instance_direct(
+    journal: &mut Journal,
+    command: Command,
+    fallback_process_id: &str,
+) -> Result<CreatedInstanceDirect, EngineError> {
+    let (events, commit) = journal.apply_command_at(command, now_millis())?;
+    let instance_key = events
+        .iter()
+        .find_map(Event::instance_key)
+        .expect("created instance has a key");
+    let (definition_key, version) = journal
+        .state()
+        .instances
+        .get(&instance_key)
+        .and_then(|i| journal.state().definition_for(i))
+        .map(|d| (d.key.to_string(), d.version))
+        .unwrap_or_else(|| (fallback_process_id.to_string(), 1));
+    let sync_completed = journal.engine().is_completed(instance_key);
+    let routable: Vec<Event> = if journal.engine().num_partitions() > 1 {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::MessageSubscriptionOpening { .. }
+                        | Event::RemoteMessageCorrelation { .. }
+                        | Event::MessageSubscriptionClosing { .. }
+                        | Event::StartInstanceDispatched { .. }
+                )
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(CreatedInstanceDirect {
+        instance_key,
+        definition_key,
+        version,
+        sync_completed,
+        routable,
+        commit,
+    })
+}
+
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
@@ -5886,7 +5963,8 @@ impl ServerImpl {
                             }
                         };
 
-                    match engine.apply_command_at(
+                    match apply_create_instance_direct(
+                        engine,
                         Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
@@ -5895,56 +5973,17 @@ impl ServerImpl {
                             sel_key,
                             sel_ver,
                         ),
-                        now_millis(),
+                        &process_id,
                     ) {
-                        Ok((events, commit)) => {
-                            let instance_key = events
-                                .iter()
-                                .find_map(Event::instance_key)
-                                .expect("created instance has a key");
-                            // Project the real deployed key and version of the
-                            // version the instance was pinned to (not the latest),
-                            // so by-id and by-key requests report the same identity.
-                            let (definition_key, version) = engine
-                                .state()
-                                .instances
-                                .get(&instance_key)
-                                .and_then(|i| engine.state().definition_for(i))
-                                .map(|d| (d.key.to_string(), d.version))
-                                .unwrap_or_else(|| (process_id.clone(), 1));
-                            // An auto-completing process (no wait states) finishes
-                            // synchronously within this create command; a process that
-                            // parks on a job/timer/etc. is still running.
-                            let sync_completed = engine.engine().is_completed(instance_key);
-                            // Collect any cross-partition subscription follow-ups to
-                            // route once durable (none single-partition).
-                            let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
-                                events
-                                    .iter()
-                                    .filter(|e| {
-                                        matches!(
-                                            e,
-                                            Event::MessageSubscriptionOpening { .. }
-                                                | Event::RemoteMessageCorrelation { .. }
-                                                | Event::MessageSubscriptionClosing { .. }
-                                                | Event::StartInstanceDispatched { .. }
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            Ok((
-                                process_id,
-                                version,
-                                definition_key,
-                                instance_key,
-                                sync_completed,
-                                routable,
-                                commit,
-                            ))
-                        }
+                        Ok(created) => Ok((
+                            process_id,
+                            created.version,
+                            created.definition_key,
+                            created.instance_key,
+                            created.sync_completed,
+                            created.routable,
+                            created.commit,
+                        )),
                         Err(EngineError::ProcessNotFound { process_id }) => Err(Box::new(
                             Resp::Status400_TheProvidedDataIsNotValid(problem(
                                 "Process not found",
@@ -9686,7 +9725,8 @@ impl ServerImpl {
                             Ok(t) => t,
                             Err(e) => return Err(e),
                         };
-                    match engine.apply_command_at(
+                    match apply_create_instance_direct(
+                        engine,
                         Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
@@ -9695,48 +9735,17 @@ impl ServerImpl {
                             sel_key,
                             sel_ver,
                         ),
-                        now_millis(),
+                        &process_id,
                     ) {
-                        Ok((events, commit)) => {
-                            let instance_key = events
-                                .iter()
-                                .find_map(Event::instance_key)
-                                .expect("created instance has a key");
-                            let (definition_key, version) = engine
-                                .state()
-                                .instances
-                                .get(&instance_key)
-                                .and_then(|i| engine.state().definition_for(i))
-                                .map(|d| (d.key.to_string(), d.version))
-                                .unwrap_or_else(|| (process_id.clone(), 1));
-                            let sync_completed = engine.engine().is_completed(instance_key);
-                            let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
-                                events
-                                    .iter()
-                                    .filter(|e| {
-                                        matches!(
-                                            e,
-                                            Event::MessageSubscriptionOpening { .. }
-                                                | Event::RemoteMessageCorrelation { .. }
-                                                | Event::MessageSubscriptionClosing { .. }
-                                                | Event::StartInstanceDispatched { .. }
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            Ok((
-                                process_id,
-                                version,
-                                definition_key,
-                                instance_key,
-                                sync_completed,
-                                routable,
-                                commit,
-                            ))
-                        }
+                        Ok(created) => Ok((
+                            process_id,
+                            created.version,
+                            created.definition_key,
+                            created.instance_key,
+                            created.sync_completed,
+                            created.routable,
+                            created.commit,
+                        )),
                         Err(EngineError::ProcessNotFound { process_id }) => {
                             Err((400, format!("No deployed process with id '{process_id}'.")))
                         }
@@ -17741,7 +17750,8 @@ impl ServerImpl {
                             Ok(t) => t,
                             Err(e) => return Err(e),
                         };
-                    match engine.apply_command_at(
+                    match apply_create_instance_direct(
+                        engine,
                         Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
@@ -17750,35 +17760,16 @@ impl ServerImpl {
                             sel_key,
                             sel_ver,
                         ),
-                        now_millis(),
+                        &process_id,
                     ) {
-                        Ok((events, commit)) => {
-                            let instance_key = events
-                                .iter()
-                                .find_map(Event::instance_key)
-                                .expect("created instance has a key");
-                            let sync_completed = engine.engine().is_completed(instance_key);
-                            // Collect any cross-partition subscription follow-ups
-                            // to route once durable (none single-partition).
-                            let routable = if engine.engine().num_partitions() > 1 {
-                                events
-                                    .iter()
-                                    .filter(|e| {
-                                        matches!(
-                                            e,
-                                            Event::MessageSubscriptionOpening { .. }
-                                                | Event::RemoteMessageCorrelation { .. }
-                                                | Event::MessageSubscriptionClosing { .. }
-                                                | Event::StartInstanceDispatched { .. }
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            Ok((instance_key, sync_completed, routable, commit))
-                        }
+                        // The stream create reports only the key + completion; the
+                        // projected definition key/version are unused here.
+                        Ok(created) => Ok((
+                            created.instance_key,
+                            created.sync_completed,
+                            created.routable,
+                            created.commit,
+                        )),
                         Err(EngineError::ProcessNotFound { process_id }) => {
                             Err((400, format!("No deployed process with id '{process_id}'.")))
                         }
@@ -42306,12 +42297,14 @@ mod no_direct_engine_apply_guard {
         // unconditional `apply_command_at` added inside `complete_job_impl` et al.
         // is NOT allowlisted and fails here). #1306.
         "ServerImpl::apply_job_command_direct_with",
-        // Raft-guarded instance-creation paths: their `!raft.is_empty()` branch
-        // proposes through the partition's replicated log and the direct apply is
-        // only the non-Raft (single-node) fallback.
-        "ServerImpl::create_process_instance_impl",
-        "ServerImpl::create_forwarded",
-        "ServerImpl::create_for_stream",
+        // The single non-Raft fallback every instance-creation handler routes its
+        // direct apply through (the create analogue of the job helper above): it
+        // confines the create handlers' direct apply to this one helper, so a new
+        // unconditional `apply_command_at` added inside `create_process_instance_impl`,
+        // `create_forwarded`, or `create_for_stream` is NOT allowlisted and fails
+        // here. `apply_create_instance_direct` is a free function, keyed by its
+        // bare name. #1308.
+        "apply_create_instance_direct",
         // The periodic timer tick drives led partitions through Raft
         // (`tick_partition_via_raft`) and applies locally only when Raft is off.
         // `main` is a free function, so it is keyed by its bare name.
@@ -42553,12 +42546,14 @@ mod no_direct_engine_apply_guard {
 
     #[test]
     fn allowlist_keys_are_type_scoped() {
-        // Every allowlisted method is scoped to `ServerImpl`; only the free
-        // function `main` is keyed by its bare name. This is what stops the
-        // unrelated `ClusterVariableStore::new` from inheriting the
-        // `ServerImpl::new` exemption.
+        // Every allowlisted method is scoped to `ServerImpl`; only free functions
+        // are keyed by their bare name. This is what stops the unrelated
+        // `ClusterVariableStore::new` from inheriting the `ServerImpl::new`
+        // exemption. Keep this set of bare-name free functions explicit so a new
+        // *method* entry cannot silently slip in unscoped.
+        const BARE_FREE_FNS: &[&str] = &["main", "apply_create_instance_direct"];
         for entry in ALLOWED {
-            if *entry == "main" {
+            if BARE_FREE_FNS.contains(entry) {
                 continue;
             }
             assert!(
@@ -42568,5 +42563,12 @@ mod no_direct_engine_apply_guard {
         }
         assert!(ALLOWED.contains(&"ServerImpl::new"));
         assert!(!ALLOWED.contains(&"new"));
+        // The create fallback is allowlisted by its bare free-function name and
+        // the three create handlers that now route through it are NOT (so a new
+        // direct apply inside them is caught by the guard). #1308.
+        assert!(ALLOWED.contains(&"apply_create_instance_direct"));
+        assert!(!ALLOWED.contains(&"ServerImpl::create_process_instance_impl"));
+        assert!(!ALLOWED.contains(&"ServerImpl::create_forwarded"));
+        assert!(!ALLOWED.contains(&"ServerImpl::create_for_stream"));
     }
 }

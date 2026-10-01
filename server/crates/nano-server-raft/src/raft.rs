@@ -382,6 +382,41 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
     }
 }
 
+/// Maps an engine rejection to the `(http_status, message)` the client sees,
+/// applying any **command-specific** status contract on top of the shared
+/// [`engine_error_status`] mapping.
+///
+/// A handful of engine errors are status-polymorphic across endpoints, so a
+/// command-agnostic mapping cannot serve every caller. `AdHocUnknownElement` is
+/// the canonical case: for `ActivateAdHocActivities` an unknown container or
+/// element id is "not found" (404), but for `CompleteJob` (an agentic ad-hoc
+/// completion whose `JobResult` referenced an unknown activation target) it is
+/// invalid data (400). The non-Raft direct paths encode these per-endpoint (see
+/// `complete_job_impl`), so the replicated path must key on the command kind
+/// ([`Command::kind`]) too — otherwise the same rejection on a replicated
+/// `CompleteJob` is mis-reported as `Status404_TheJobWithTheGivenKeyWasNotFound`,
+/// falsely claiming the job is missing. #1308.
+pub fn engine_error_status_for(kind: &str, e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
+    use nanobpmn_engine_core::EngineError as E;
+    if kind == "complete_job" {
+        // The `CompleteJob` endpoint's direct (non-Raft) contract for its
+        // ad-hoc-completion and business-id rejections (`complete_job_impl`):
+        // an unknown/contradictory ad-hoc activation target and an invalid
+        // business id are 400 (invalid data), a business-id conflict is 409.
+        // The shared mapping would otherwise surface these as 404 / 500.
+        match e {
+            E::AdHocUnknownElement { .. }
+            | E::AdHocActivateWithCompletion { .. }
+            | E::BusinessIdInvalid { .. } => return (400, e.to_string()),
+            E::BusinessIdOnChildInstance { .. } | E::BusinessIdAlreadyAssigned { .. } => {
+                return (409, e.to_string());
+            }
+            _ => {}
+        }
+    }
+    engine_error_status(e)
+}
+
 /// In-memory Raft log store (v2 `RaftLogStorage`). Holds the log entries, the
 /// persisted vote, and the committed marker in memory.
 ///
@@ -1107,11 +1142,16 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                 EntryPayload::Normal(batch) => {
                     // Phase 1: apply every command in the batch in ONE actor hop,
                     // returning per-command (events, commit) or the engine rejection.
+                    // The command `kind` is captured alongside each outcome so the
+                    // error-mapping phase below can apply the command-specific HTTP
+                    // status contract (`engine_error_status_for`) — a rejection like
+                    // `AdHocUnknownElement` maps to a different status for
+                    // `CompleteJob` than for `ActivateAdHocActivities`. #1308.
                     type ApplyOutcome = Result<
                         (Arc<Vec<Event>>, crate::journal::Commit),
                         nanobpmn_engine_core::EngineError,
                     >;
-                    let outcomes: Vec<ApplyOutcome> = self
+                    let outcomes: Vec<(&'static str, ApplyOutcome)> = self
                         .engine
                         .with(move |journal| {
                             batch
@@ -1125,7 +1165,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                     let kind = command.kind();
                                     let outcome = journal.apply_command_at(command, now);
                                     crate::cmd_profile::finish(timer, kind);
-                                    outcome
+                                    (kind, outcome)
                                 })
                                 .collect()
                         })
@@ -1147,7 +1187,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     let mut terminal: Vec<nanobpmn_engine_core::Key> = Vec::new();
                     for outcome in outcomes {
                         match outcome {
-                            Ok((events, commit)) => {
+                            (_, Ok((events, commit))) => {
                                 commit.wait().await;
                                 if evict_terminal {
                                     terminal.extend(
@@ -1161,11 +1201,13 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             }
                             // A rejected command produced no events; the log entry is
                             // still consumed so every replica stays in lockstep. The
-                            // leader surfaces the mapped rejection to its client.
-                            Err(e) => {
+                            // leader surfaces the mapped rejection to its client,
+                            // keyed on the command kind so each endpoint keeps its
+                            // HTTP status contract across both deployment modes. #1308.
+                            (kind, Err(e)) => {
                                 items.push(ReplicatedItem {
                                     events: Vec::new(),
-                                    error: Some(engine_error_status(&e)),
+                                    error: Some(engine_error_status_for(kind, &e)),
                                 });
                             }
                         }
@@ -2408,6 +2450,60 @@ mod tests {
                 "{err:?} must map to {want}"
             );
         }
+    }
+
+    #[test]
+    fn engine_error_status_for_command_preserves_complete_job_adhoc_contract() {
+        // #1308: `AdHocUnknownElement` is status-polymorphic across endpoints —
+        // 404 for `ActivateAdHocActivities` (an unknown container/element is
+        // "not found"), but 400 for `CompleteJob` (the agentic completion
+        // referenced an unknown activation target — invalid data). The shared
+        // command-agnostic `engine_error_status` cannot serve both, so the
+        // replicated apply path keys the mapping on the command kind. Without
+        // this, a replicated `CompleteJob` hitting `AdHocUnknownElement` is
+        // mis-reported as 404 "job not found", falsely claiming the job is
+        // missing — the exact divergence from the non-Raft direct contract.
+        use nanobpmn_engine_core::EngineError as E;
+
+        let adhoc_unknown = E::AdHocUnknownElement {
+            instance_key: 1,
+            element_id: "x".into(),
+        };
+        // Default / ActivateAdHocActivities contract: 404.
+        assert_eq!(engine_error_status(&adhoc_unknown).0, 404);
+        assert_eq!(
+            engine_error_status_for("activate_ad_hoc_sub_process_activities", &adhoc_unknown).0,
+            404,
+        );
+        // CompleteJob contract: 400 (invalid data), matching `complete_job_impl`.
+        assert_eq!(
+            engine_error_status_for("complete_job", &adhoc_unknown).0,
+            400
+        );
+
+        // The rest of the `CompleteJob` ad-hoc / business-id direct contract the
+        // shared mapping would otherwise drop to 500 (unmapped) or mis-route.
+        let complete_job_cases: &[(E, u16)] = &[
+            (E::AdHocActivateWithCompletion { job_key: 1 }, 400),
+            (E::BusinessIdInvalid { chars: 0 }, 400),
+            (E::BusinessIdOnChildInstance { instance_key: 1 }, 409),
+            (E::BusinessIdAlreadyAssigned { instance_key: 1 }, 409),
+        ];
+        for (err, want) in complete_job_cases {
+            assert_eq!(
+                engine_error_status_for("complete_job", err).0,
+                *want,
+                "complete_job {err:?} must map to {want}"
+            );
+        }
+
+        // A command-kind-agnostic error (e.g. `JobNotFound`) is unaffected by the
+        // override and still maps identically through both functions.
+        let job_not_found = E::JobNotFound { job_key: 7 };
+        assert_eq!(
+            engine_error_status_for("complete_job", &job_not_found).0,
+            engine_error_status(&job_not_found).0,
+        );
     }
 
     #[test]
