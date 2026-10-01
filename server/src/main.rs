@@ -8974,6 +8974,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -8998,6 +8999,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -9015,6 +9017,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -9039,6 +9042,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -9213,6 +9217,7 @@ impl ServerImpl {
             Ok(R::Status204_TheAd) => (204, None),
             Ok(R::Status404_TheAd(p)) => (404, Some(p.detail)),
             Ok(R::Status400_TheProvidedDataIsNotValid(p)) => (400, Some(p.detail)),
+            Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
             Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                 (500, Some(p.detail))
             }
@@ -31970,6 +31975,92 @@ mod clustered_startup_tests {
             ),
             "re-assigning an assigned task without override must 409 (proves the forward took effect)"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forwarded_user_task_and_ad_hoc_mutations_preserve_a_retryable_503() {
+        // #1306 (Copilot round 5): the peer-side forwarding adapters
+        // (`apply_user_task_forwarded`, `apply_ad_hoc_activation_forwarded`) must
+        // preserve a typed 503 from the owning peer, not collapse it to a
+        // non-retryable 500. Force the leader of a partition into a bounded
+        // hand-off completion-pause so its local mutation returns 503, then drive
+        // the FORWARDED path from a non-leader node: the adapter must surface 503.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+        let nodes = [&node0, &node1, &node2];
+
+        // Pick partition 0 and find its current leader; the paused leader is the
+        // node whose local mutation path returns 503.
+        let partition = 0u64;
+        let leader_idx = nodes
+            .iter()
+            .position(|n| {
+                n.raft_registry()
+                    .get(partition)
+                    .and_then(|part| part.raft.metrics().borrow().current_leader)
+                    == Some(n.engine.topology().node_id as u64)
+            })
+            .expect("partition 0 has an elected leader");
+        let leader = nodes[leader_idx];
+
+        // Deterministic short pause so the test is fast and non-flaky (shrink the
+        // catch-up ceiling too, or the clamp raises the pause to the 30s default).
+        let short = std::time::Duration::from_millis(500);
+        leader.set_handoff_catchup_ceiling_for_test(short);
+        leader.set_handoff_write_pause_for_test(short);
+        assert!(
+            leader.acquire_handoff_lease(partition),
+            "the leader acquires the hand-off lease"
+        );
+        assert!(
+            leader.handoff_completion_paused(partition),
+            "the completion-pause is engaged on the leader"
+        );
+
+        // Any key on the paused partition routes to the (paused) leader. Compose a
+        // well-formed key on partition 0 (high bits = partition id).
+        let key_on_partition = nanobpmn_engine_core::compose_key(partition, 1);
+
+        // The adapter is the peer-side handler: it runs on the OWNING node (the
+        // leader), where `route_by_leader` returns `None` (self-leader) so the impl
+        // applies locally and hits the engaged pause -> 503. The adapter must map
+        // that typed 503 verbatim instead of collapsing it to (500, None).
+        let assign_body = serde_json::to_value(models::UserTaskAssignmentRequest {
+            assignee: Some("alice".into()),
+            allow_override: None,
+            action: None,
+        })
+        .ok();
+        let (status, _detail) = leader
+            .apply_user_task_forwarded(
+                crate::falcon::UserTaskOp::Assign,
+                &key_on_partition.to_string(),
+                assign_body,
+            )
+            .await;
+        assert_eq!(
+            status, 503,
+            "a forwarded user-task mutation preserves the leader's retryable 503"
+        );
+
+        // Ad-hoc forwarded adapter: same contract on the ad-hoc activation path.
+        let adhoc_body = serde_json::to_value(
+            models::AdHocSubProcessActivateActivitiesInstruction::new(vec![
+                models::AdHocSubProcessActivateActivityReference::new("toolA".into()),
+            ]),
+        )
+        .ok();
+        let (status, _detail) = leader
+            .apply_ad_hoc_activation_forwarded(&key_on_partition.to_string(), adhoc_body)
+            .await;
+        assert_eq!(
+            status, 503,
+            "a forwarded ad-hoc activation preserves the leader's retryable 503"
+        );
+
+        leader.release_handoff_lease(partition);
+        for h in handles.drain(..) {
+            h.abort();
+        }
     }
 
     #[tokio::test]
