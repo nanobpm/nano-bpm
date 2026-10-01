@@ -283,6 +283,7 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
             (400, format!("No deployed process with id '{process_id}'."))
         }
         E::JobNotFound { job_key } => (404, format!("No job with key {job_key}.")),
+        E::DecisionNotFound { .. } => (404, e.to_string()),
         E::JobNotActive { job_key } => (409, format!("Job {job_key} is not active.")),
         E::JobNotActivated { job_key } => (409, format!("Job {job_key} has not been activated.")),
         E::JobLeaseMismatch { .. } => (409, e.to_string()),

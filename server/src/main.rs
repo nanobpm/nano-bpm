@@ -10964,29 +10964,32 @@ impl ServerImpl {
             instance_key,
             decision_evaluation_key,
         );
+        // Raft-aware: replicated through the owning partition's leader before
+        // the 204 is acknowledged, so a failover cannot resurrect the rows.
         let result = self
-            .engine
-            .by_key(owner)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::DeleteDecisionInstance {
-                        instance_key,
-                        decision_evaluation_key,
-                    },
-                    now_millis(),
-                )
-            })
+            .apply_partition_command(
+                owner,
+                Command::DeleteDecisionInstance {
+                    instance_key,
+                    decision_evaluation_key,
+                },
+            )
             .await;
         match result {
             Ok((_events, commit)) => {
                 commit.wait().await;
                 Ok(Resp::Status204_TheDecisionInstanceIsMarkedForDeletion)
             }
-            Err(e) => Ok(
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -12472,7 +12475,7 @@ impl ServerImpl {
         };
 
         let outcome = self
-            .apply_agent_command(element_instance_key, command)
+            .apply_partition_command(element_instance_key, command)
             .await;
         match outcome {
             Ok((events, commit)) => {
@@ -12710,7 +12713,9 @@ impl ServerImpl {
                 return Ok(agent_update_http_error(status, detail));
             }
         };
-        let outcome = self.apply_agent_command(agent_instance_key, command).await;
+        let outcome = self
+            .apply_partition_command(agent_instance_key, command)
+            .await;
 
         match outcome {
             Ok((events, commit)) => {
@@ -12746,7 +12751,52 @@ impl ServerImpl {
         }
     }
 
-    async fn apply_agent_command(
+    /// Applies an instance-less command that mints its own key (a standalone
+    /// decision evaluation) on a partition chosen like a create. Raft mode
+    /// proposes it through a partition this node LEADS (never a static-local
+    /// follower), so an acknowledged write is replicated; a node leading nothing
+    /// sheds a retryable 503. Without Raft it applies on a local partition and
+    /// awaits durability.
+    async fn apply_create_command(
+        &self,
+        command: Command,
+    ) -> Result<Arc<Vec<Event>>, (u16, String)> {
+        if self.raft.is_empty() {
+            let Some(handle) = self.engine.try_for_create() else {
+                return Err((500, "this node hosts no engine partition".to_string()));
+            };
+            let (events, commit) = handle
+                .with(move |journal| journal.apply_command_at(command, now_millis()))
+                .await
+                .map_err(|error| crate::raft::engine_error_status(&error))?;
+            commit.wait().await;
+            return Ok(events);
+        }
+        let led: Vec<u64> = self
+            .led_partitions()
+            .into_iter()
+            .filter(|&p| !self.handoff_write_gated(p))
+            .collect();
+        let Some(p) = self.engine.for_create_among(&led) else {
+            return Err((503, "this node leads no partition; retry".to_string()));
+        };
+        let Some(part) = self.raft.get(p) else {
+            return Err((500, format!("partition {p} has no Raft group")));
+        };
+        let response = part
+            .propose_result(command, now_millis())
+            .await
+            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+        if let Some((status, message)) = response.error {
+            return Err((status, message));
+        }
+        Ok(Arc::new(response.events))
+    }
+
+    /// Applies `command` on the partition owning `key`: through that partition's
+    /// Raft leader when Raft is enabled (so the write is replicated before it is
+    /// acknowledged), else directly on the local engine actor.
+    async fn apply_partition_command(
         &self,
         key: Key,
         command: Command,
@@ -14102,63 +14152,63 @@ impl ServerImpl {
             (None, Some(key)) => nanobpmn_engine_core::DecisionReference::Key(key),
             (None, None) => unreachable!("the request names a decision by id or key"),
         };
-        type Evaluated = (Event, String, i32);
-        let Some(handle) = self.engine.try_for_create() else {
-            return Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "No engine partition",
-                    500,
-                    "This node hosts no engine partition to evaluate the decision.".to_string(),
-                )),
-            );
+        let command = Command::EvaluateDecision {
+            decision,
+            variables,
         };
-        let applied: Result<(Evaluated, Commit), EngineError> = handle
-            .with(move |engine| {
-                let (events, commit) = engine.apply_command_at(
-                    Command::EvaluateDecision {
-                        decision,
-                        variables,
-                    },
-                    now_millis(),
-                )?;
-                let event = events
-                    .iter()
-                    .find(|e| matches!(e, Event::DecisionEvaluated { .. }))
-                    .cloned()
-                    .expect("EvaluateDecision journals one DecisionEvaluated");
-                let Event::DecisionEvaluated { decision_key, .. } = &event else {
-                    unreachable!()
-                };
-                let root = engine
-                    .engine()
-                    .state()
-                    .decision_by_key(*decision_key)
-                    .expect("the evaluated decision is deployed");
-                let (name, version) = (root.decision_name.clone(), root.version);
-                Ok(((event, name, version), commit))
-            })
-            .await;
-        let (event, decision_name, decision_version) = match applied {
-            Ok((evaluated, commit)) => {
-                commit.wait().await;
-                evaluated
+        let failed = |status: u16, detail: String| match status {
+            404 => {
+                Resp::Status404_TheDecisionIsNotFound(problem("Decision not found", 404, detail))
             }
-            Err(EngineError::DecisionNotFound { reference }) => {
-                return Ok(Resp::Status404_TheDecisionIsNotFound(problem(
-                    "Decision not found",
-                    404,
-                    format!("No deployed decision with {reference}."),
-                )));
+            503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            )),
+            _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Internal error",
+                500,
+                detail,
+            )),
+        };
+        let event = match self.apply_create_command(command).await {
+            Ok(events) => events
+                .iter()
+                .find(|e| matches!(e, Event::DecisionEvaluated { .. }))
+                .cloned()
+                .expect("EvaluateDecision journals one DecisionEvaluated"),
+            Err((status, detail)) => return Ok(failed(status, detail)),
+        };
+        let Event::DecisionEvaluated { decision_key, .. } = &event else {
+            unreachable!()
+        };
+        let decision_key = *decision_key;
+        // The decision registry is replicated onto every partition, so the
+        // partition that minted the evaluation key resolves the root decision.
+        let owner = partition_of(
+            event
+                .decision_evaluation_key()
+                .expect("DecisionEvaluated identifies its evaluation"),
+        );
+        let meta = match self.engine_handle_for(owner) {
+            Some(handle) => {
+                handle
+                    .with(move |engine| {
+                        engine
+                            .engine()
+                            .state()
+                            .decision_by_key(decision_key)
+                            .map(|d| (d.decision_name.clone(), d.version))
+                    })
+                    .await
             }
-            Err(e) => {
-                return Ok(
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Internal error",
-                        500,
-                        e.to_string(),
-                    )),
-                );
-            }
+            None => None,
+        };
+        let Some((decision_name, decision_version)) = meta else {
+            return Ok(failed(
+                500,
+                format!("evaluated decision {decision_key} is not resolvable on partition {owner}"),
+            ));
         };
         let evaluation_key = event
             .decision_evaluation_key()
@@ -34103,6 +34153,107 @@ mod clustered_startup_tests {
                 }
             }
         }
+    }
+
+    /// Sum of the Raft applied indexes of every partition `node` hosts.
+    fn raft_applied_total(node: &ServerImpl) -> u64 {
+        (0..node.engine.topology().num_partitions)
+            .filter_map(|p| node.raft_registry().get(p))
+            .map(|part| {
+                part.raft
+                    .metrics()
+                    .borrow()
+                    .last_applied
+                    .map(|l| l.index)
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn standalone_decision_evaluate_and_delete_replicate_through_raft() {
+        // #1305 review: a standalone evaluation (and its deletion) is a durable
+        // write, so under Raft it must enter the replicated log — never a direct
+        // local-journal apply that a failover would lose.
+        use apis::decision_definition::EvaluateDecisionResponse as Resp;
+        use apis::decision_instance::DeleteDecisionInstanceResponse as DelResp;
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert("greet-drg".to_string(), "greet.dmn".to_string());
+        let (_r, events) = node0
+            .deploy_resources_locally(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![issue_1292_drg("hallo")],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("deploy the DRG on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+        node2.install_replicated_deployment(events.to_vec()).await;
+
+        let before = raft_applied_total(&node0);
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(
+            "lang".to_string(),
+            nanobpm_gateway_rest::types::Object(serde_json::json!("de")),
+        );
+        let mut by_id = models::DecisionEvaluationById::new("root".to_string());
+        by_id.variables = Some(variables);
+        let resp = node0
+            .evaluate_decision_impl(
+                &models::DecisionEvaluationInstruction::DecisionEvaluationById(by_id),
+            )
+            .await
+            .expect("evaluate returns a response");
+        let result = match resp {
+            Resp::Status200_TheDecisionWasEvaluated(r) => r,
+            other => panic!("evaluate through raft should be 200, got {other:?}"),
+        };
+        let after_eval = raft_applied_total(&node0);
+        assert!(
+            after_eval > before,
+            "the evaluation entered the Raft log ({before} -> {after_eval})"
+        );
+
+        // The leader's read model projects the rows; delete them through Raft.
+        let key: u64 = result
+            .decision_evaluation_key
+            .0
+            .parse()
+            .expect("numeric key");
+        let mut projected = false;
+        for _ in 0..250 {
+            if !node0
+                .store
+                .decision_instances_by_evaluation_key(key)
+                .is_empty()
+            {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(projected, "the evaluation projects decision-instance rows");
+        let deleted = node0
+            .delete_decision_instance_impl(&models::DeleteDecisionInstancePathParams {
+                decision_evaluation_key: result.decision_evaluation_key.0.clone(),
+            })
+            .await
+            .expect("delete returns a response");
+        assert!(
+            matches!(
+                deleted,
+                DelResp::Status204_TheDecisionInstanceIsMarkedForDeletion
+            ),
+            "{deleted:?}"
+        );
+        let after_delete = raft_applied_total(&node0);
+        assert!(
+            after_delete > after_eval,
+            "the deletion entered the Raft log ({after_eval} -> {after_delete})"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
