@@ -288,3 +288,50 @@ fn unknown_decision_is_a_failure() {
 fn non_dmn_document_is_rejected() {
     assert!(parse_dmn("<foo/>").is_err());
 }
+
+/// Defect class (#1305 review): every failed evaluation's audit trail must end
+/// with the decision named by `failed_decision_id`, since the projection marks
+/// the last evaluated decision FAILED.
+fn assert_trail_ends_with_failed(result: &crate::dmn::model::DecisionEvaluationResult) {
+    let failure = result.failure.as_ref().expect("evaluation must fail");
+    let last = result
+        .evaluated_decisions
+        .last()
+        .expect("a failed evaluation of an existing decision must audit it");
+    assert_eq!(last.decision_id, failure.failed_decision_id);
+    assert_eq!(last.decision_output, Value::Null);
+}
+
+fn literal(id: &str, requires: &[&str]) -> String {
+    let reqs: String = requires
+        .iter()
+        .map(|r| format!(r##"<informationRequirement><requiredDecision href="#{r}" /></informationRequirement>"##))
+        .collect();
+    format!(
+        r#"<decision id="{id}" name="{id}"><variable name="{id}" />{reqs}<literalExpression><text>1</text></literalExpression></decision>"#
+    )
+}
+
+fn drg_of(decisions: &[String]) -> String {
+    format!(
+        r#"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="d" name="d">{}</definitions>"#,
+        decisions.concat()
+    )
+}
+
+#[test]
+fn unresolved_requirement_after_successful_sibling_audits_the_requiring_decision() {
+    let xml = drg_of(&[literal("ok", &[]), literal("top", &["ok", "missing"])]);
+    let drg = parse_dmn(&xml).unwrap();
+    let result = evaluate(&drg, "top", &ctx(&[]));
+    assert_trail_ends_with_failed(&result);
+    assert_eq!(result.failure.unwrap().failed_decision_id, "top");
+}
+
+#[test]
+fn requirement_cycle_audits_the_failed_decision() {
+    let xml = drg_of(&[literal("a", &["b"]), literal("b", &["a"])]);
+    let drg = parse_dmn(&xml).unwrap();
+    let result = evaluate(&drg, "a", &ctx(&[]));
+    assert_trail_ends_with_failed(&result);
+}

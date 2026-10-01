@@ -1412,6 +1412,29 @@ impl Event {
         }
     }
 
+    /// For a decision-instance event (`DecisionEvaluated` /
+    /// `DecisionInstanceDeleted`), the key whose partition owns the decision
+    /// instance ([`crate::dmn::decision_instance_owner_key`]); `None` for every
+    /// other event.
+    pub fn decision_instance_owner_key(&self) -> Option<Key> {
+        match self {
+            Event::DecisionEvaluated { instance_key, .. } => {
+                Some(crate::dmn::decision_instance_owner_key(
+                    *instance_key,
+                    self.decision_evaluation_key()?,
+                ))
+            }
+            Event::DecisionInstanceDeleted {
+                instance_key,
+                decision_evaluation_key,
+            } => Some(crate::dmn::decision_instance_owner_key(
+                *instance_key,
+                *decision_evaluation_key,
+            )),
+            _ => None,
+        }
+    }
+
     /// The highest [`Key`] this event references in any field.
     ///
     /// Replay uses the maximum across the whole log to restore the engine's key

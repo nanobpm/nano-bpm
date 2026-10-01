@@ -269,6 +269,23 @@ pub fn decision_evaluation_instance_key(decision_evaluation_key: crate::Key, n: 
     format!("{decision_evaluation_key}-{n}")
 }
 
+/// The key whose partition owns a decision evaluation's journal records and
+/// read-model rows: the process instance it ran in, or — for a standalone
+/// evaluation (`instance_key == 0`, no process instance) — the evaluation's
+/// own key, minted on the partition that journaled it. The one routing rule
+/// shared by live deletion and read-model rebuild (#1292), so they cannot
+/// disagree about which shard holds a decision instance.
+pub const fn decision_instance_owner_key(
+    instance_key: crate::Key,
+    decision_evaluation_key: crate::Key,
+) -> crate::Key {
+    if instance_key != 0 {
+        instance_key
+    } else {
+        decision_evaluation_key
+    }
+}
+
 /// An evaluated decision-table input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

@@ -50,7 +50,7 @@ mod parser;
 mod tests;
 
 pub use eval::evaluate;
-pub use model::decision_evaluation_instance_key;
+pub use model::{decision_evaluation_instance_key, decision_instance_owner_key};
 pub use model::{
     Aggregation, Decision, DecisionEvaluationResult, DecisionLogic, DecisionRequirementsGraph,
     DecisionRule, DecisionTable, DecisionType, EvaluatedDecision, EvaluatedInput, EvaluatedOutput,

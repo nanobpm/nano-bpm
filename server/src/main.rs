@@ -3070,17 +3070,15 @@ fn rebuild_read_model_legacy(
         }
         let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
             .min(num_partitions.saturating_sub(1)) as u64;
-        let p = if let Event::DecisionEvaluated { instance_key, .. }
-        | Event::DecisionInstanceDeleted { instance_key, .. } = e
-        {
-            // Colocate the decision instance (and its later deletion) with its
-            // owning process instance (so the `process_definition_key` join
-            // resolves and the delete lands in the shard that holds the rows),
-            // not with the higher-numbered decision key its `max_key` might pick.
-            (nanobpmn_engine_core::partition_of(*instance_key) as usize)
-                .min(num_partitions.saturating_sub(1)) as u64
-        } else {
-            p
+        // Colocate a decision instance (and its later deletion) with its owner —
+        // the process instance it ran in (so the `process_definition_key` join
+        // resolves), or a standalone evaluation's own key — exactly where live
+        // deletion routes, not with the higher-numbered decision key its
+        // `max_key` might pick (nor shard 0 for an instance-less evaluation).
+        let p = match e.decision_instance_owner_key() {
+            Some(owner) => (nanobpmn_engine_core::partition_of(owner) as usize)
+                .min(num_partitions.saturating_sub(1)) as u64,
+            None => p,
         };
         if let Some(bucket) = per_shard.get_mut(&p) {
             bucket.push(e);
@@ -10962,11 +10960,10 @@ impl ServerImpl {
         // A standalone evaluation (no process instance) was journaled on the
         // partition its minted evaluation key encodes; an instance's evaluation
         // on the instance's partition.
-        let owner = if instance_key != 0 {
-            instance_key
-        } else {
-            decision_evaluation_key
-        };
+        let owner = nanobpmn_engine_core::dmn::decision_instance_owner_key(
+            instance_key,
+            decision_evaluation_key,
+        );
         let result = self
             .engine
             .by_key(owner)
@@ -27793,6 +27790,63 @@ mod clustered_startup_tests {
             ),
             "an unknown decision instance id is a 404"
         );
+    }
+
+    /// #1292 (Copilot): the legacy (non-segmented) read-model rebuild must
+    /// demux a standalone evaluation (no process instance) to the shard its
+    /// evaluation key encodes — where live deletion routes — not `partition_of(0)`.
+    #[test]
+    fn legacy_rebuild_routes_standalone_decision_instances_to_the_evaluation_key_shard() {
+        use nanobpmn_engine_core::{DecisionReference, Engine};
+        let mut engine = Engine::with_partition(1);
+        let mut events = engine
+            .apply_command(Command::DeployDecisionRequirements(vec![issue_1292_drg(
+                "hallo",
+            )]))
+            .expect("deploy the DRG");
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(
+            "lang".to_string(),
+            nanobpmn_engine_core::Value::Str("de".into()),
+        );
+        let evaluated = engine
+            .apply_command(Command::EvaluateDecision {
+                decision: DecisionReference::Id("root".into()),
+                variables,
+            })
+            .expect("evaluate");
+        let evaluation_key = evaluated
+            .iter()
+            .find_map(Event::decision_evaluation_key)
+            .expect("a journaled evaluation");
+        assert_eq!(nanobpmn_engine_core::partition_of(evaluation_key), 1);
+        events.extend(evaluated);
+
+        let read_model = readstore::ReadModel::in_memory_partitions(&[0, 1]);
+        let shards = read_model.shards();
+        rebuild_read_model_legacy(&shards, &events, 2);
+        let rows = |p: u64| {
+            shards
+                .iter()
+                .find(|(pid, _)| *pid == p)
+                .expect("shard")
+                .1
+                .decision_instances()
+                .len()
+        };
+        assert_eq!(
+            (rows(0), rows(1)),
+            (0, 2),
+            "rows live in the evaluation key's shard"
+        );
+
+        // ...so the deletion (routed the same way) retracts them on rebuild.
+        events.push(Event::DecisionInstanceDeleted {
+            instance_key: 0,
+            decision_evaluation_key: evaluation_key,
+        });
+        rebuild_read_model_legacy(&shards, &events, 2);
+        assert_eq!((rows(0), rows(1)), (0, 0));
     }
 
     /// Issue #1292 fixture: a two-decision DRG (`root` requires `base`). `base`
