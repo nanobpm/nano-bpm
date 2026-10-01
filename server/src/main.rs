@@ -14046,9 +14046,11 @@ impl ServerImpl {
     /// and maps the native DMN result onto the REST `EvaluateDecisionResult`
     /// (including the per-decision audit trail and any evaluation failure).
     ///
-    /// This is a pure read against the in-memory decision registry, which is
-    /// replicated onto every owned partition, so it runs on any local partition
-    /// without cross-node forwarding.
+    /// Durable and mutating (Zeebe parity, #1292): the evaluation is journaled as
+    /// a `DecisionEvaluated` event that mints a decision-evaluation key and
+    /// projects decision-instance rows. It runs on a local partition chosen like
+    /// a create (the decision registry is replicated onto every owned
+    /// partition), so no cross-node forwarding is needed.
     async fn evaluate_decision_impl(
         &self,
         body: &models::DecisionEvaluationInstruction,
@@ -14101,9 +14103,16 @@ impl ServerImpl {
             (None, None) => unreachable!("the request names a decision by id or key"),
         };
         type Evaluated = (Event, String, i32);
-        let applied: Result<(Evaluated, Commit), EngineError> = self
-            .engine
-            .for_create()
+        let Some(handle) = self.engine.try_for_create() else {
+            return Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "No engine partition",
+                    500,
+                    "This node hosts no engine partition to evaluate the decision.".to_string(),
+                )),
+            );
+        };
+        let applied: Result<(Evaluated, Commit), EngineError> = handle
             .with(move |engine| {
                 let (events, commit) = engine.apply_command_at(
                     Command::EvaluateDecision {

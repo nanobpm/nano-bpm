@@ -23,7 +23,6 @@ pub struct JobActivationOptions {
     pub with_lease: bool,
 }
 
-/// An instruction submitted to [`crate::Engine::apply_command`].
 /// Which deployed decision a [`Command::EvaluateDecision`] evaluates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -34,6 +33,7 @@ pub enum DecisionReference {
     Key(Key),
 }
 
+/// An instruction submitted to [`crate::Engine::apply_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Command {
