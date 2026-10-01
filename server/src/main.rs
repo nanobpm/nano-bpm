@@ -42291,46 +42291,53 @@ mod no_direct_engine_apply_guard {
 
     /// Production functions permitted to call a direct-apply API
     /// (`apply_command_at` / `apply_command`) directly, each paired with the
-    /// reason it is NOT a #1306 violation.
+    /// reason it is NOT a #1306 violation. Entries are `Type::method` (or the
+    /// bare name for a free function such as `main`) so two same-named methods
+    /// on different types cannot share one exemption: scoping the entry to its
+    /// enclosing type keeps the justification attached to exactly the function
+    /// it was written for.
     const ALLOWED: &[&str] = &[
         // The canonical Raft-aware funnels themselves.
-        "apply_partition_command",
-        "apply_create_command",
+        "ServerImpl::apply_partition_command",
+        "ServerImpl::apply_create_command",
         // The single non-Raft fallback every job/stream mutation handler routes
         // its direct apply through (confining the apply to this one small helper,
         // not each whole handler body, is what secures the failure mode — a new
         // unconditional `apply_command_at` added inside `complete_job_impl` et al.
         // is NOT allowlisted and fails here). #1306.
-        "apply_job_command_direct_with",
+        "ServerImpl::apply_job_command_direct_with",
         // Raft-guarded instance-creation paths: their `!raft.is_empty()` branch
         // proposes through the partition's replicated log and the direct apply is
         // only the non-Raft (single-node) fallback.
-        "create_process_instance_impl",
-        "create_forwarded",
-        "create_for_stream",
+        "ServerImpl::create_process_instance_impl",
+        "ServerImpl::create_forwarded",
+        "ServerImpl::create_for_stream",
         // The periodic timer tick drives led partitions through Raft
         // (`tick_partition_via_raft`) and applies locally only when Raft is off.
+        // `main` is a free function, so it is keyed by its bare name.
         "main",
         // Startup demo-process seed on a fresh deployment partition
         // (`journals[0].apply_command(Command::DeployProcess)`): runs once at
         // bootstrap before the node serves traffic, is re-derived from the
         // durable log on every restart, and is replicated to peers via the stage-1
         // deployment broadcast — never a client-acknowledged by-key mutation.
-        "new",
+        // Scoped to `ServerImpl::new` so the unrelated `ClusterVariables::new`
+        // constructor cannot inherit this exemption.
+        "ServerImpl::new",
         // The deployment partition-0 owner path (`deploy_resources_locally*`):
         // deployment is topology-guarded (`topology().is_local(0)`) and the
         // applied events are broadcast to every peer (`broadcast_deployment`), so
         // the definitions replicate cluster-wide without a per-key Raft propose.
         // Uses the clock-implicit `apply_command` for the batched resource/DRG/
         // form/generic-resource commands.
-        "deploy_resources_locally_with_forms",
+        "ServerImpl::deploy_resources_locally_with_forms",
         // Documented engine-internal bypasses. The cross-partition routing pump
         // is a tracked follow-up (#1307): these apply on routing-computed
         // partitions rather than by an entity key, and `activate_on` is an
         // intentional leader-local activation step.
-        "correlate_message_everywhere",
-        "drive_subscription_routing",
-        "activate_on",
+        "ServerImpl::correlate_message_everywhere",
+        "ServerImpl::drive_subscription_routing",
+        "ServerImpl::activate_on",
     ];
 
     fn enclosing_fn_name(line: &str) -> Option<String> {
@@ -42346,6 +42353,51 @@ mod no_direct_engine_apply_guard {
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// The `Type` of an `impl Type {` opener, so a method can be keyed as
+    /// `Type::method`. Returns `None` for a trait impl (`impl Trait for Type`)
+    /// or a non-impl line — the guard only needs the concrete inherent-impl
+    /// case the allowlist uses.
+    fn impl_type_name(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        if !t.starts_with("impl ") || !t.ends_with('{') {
+            return None;
+        }
+        let body = t.strip_prefix("impl ")?.strip_suffix('{')?.trim();
+        // A trait impl (`impl Trait for Type`) has no single enclosing type the
+        // allowlist keys on; treat it as untracked.
+        if body.contains(" for ") {
+            return None;
+        }
+        let name: String = body
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// True when `line` calls either direct-apply API, in either receiver form:
+    /// the method form `x.apply_command_at(..)` / `x.apply_command(..)` and the
+    /// leading-dot-free UFCS form `Journal::apply_command_at(journal, ..)` /
+    /// `Journal::apply_command(journal, ..)`. Matching the call token
+    /// independently of receiver syntax is what keeps a UFCS call from slipping
+    /// past the guard. `apply_command` is a strict prefix of
+    /// `apply_command_at`, so a token boundary check on `apply_command_at`
+    /// runs first and `apply_command` only matches when not already part of an
+    /// `apply_command_at` token.
+    fn is_direct_apply_call(line: &str) -> bool {
+        contains_call_token(line, "apply_command_at") || contains_call_token(line, "apply_command")
+    }
+
+    /// True when `line` contains a call to `token` used as either
+    /// `.token(` (method / enum-variant receiver) or `::token(` (UFCS /
+    /// associated-function). Requiring the `.`/`::` receiver prefix and the `(`
+    /// call paren keeps prose mentions and non-call uses from matching.
+    fn contains_call_token(line: &str, token: &str) -> bool {
+        let method = format!(".{token}(");
+        let ufcs = format!("::{token}(");
+        line.contains(&method) || line.contains(&ufcs)
     }
 
     #[test]
@@ -42388,27 +42440,58 @@ mod no_direct_engine_apply_guard {
 
         let mut offenders: Vec<(usize, String)> = Vec::new();
         for (idx, line) in lines.iter().enumerate() {
-            // Match both direct-apply APIs: the explicit-instant
-            // `apply_command_at` and the clock-implicit `apply_command`. The
-            // latter is a `apply_command_at` prefix-free call, so test it only
-            // when the line is not already an `apply_command_at` call.
-            let is_direct_apply = line.contains(".apply_command_at(")
-                || (line.contains(".apply_command(") && !line.contains(".apply_command_at("));
-            if in_test[idx] || !is_direct_apply {
+            // Match both direct-apply APIs (the explicit-instant
+            // `apply_command_at` and the clock-implicit `apply_command`) in
+            // either receiver form — method (`.apply_command_at(`) or UFCS
+            // (`Journal::apply_command_at(`) — so a durable handler cannot
+            // bypass the guard by spelling the call without a leading dot.
+            if in_test[idx] || !is_direct_apply_call(line) {
                 continue;
             }
-            let mut name = String::from("<unknown>");
+            // Walk back to the nearest enclosing fn and the nearest enclosing
+            // `impl Type {` so the allowlist key is `Type::method` (or the bare
+            // fn name for a free function). Scoping to the type keeps a
+            // same-named method on another type from inheriting this function's
+            // exemption.
+            let mut fn_name: Option<String> = None;
+            let mut ty_name: Option<String> = None;
             for b in (0..=idx).rev() {
                 if in_test[b] {
                     continue;
                 }
-                if let Some(n) = enclosing_fn_name(lines[b]) {
-                    name = n;
+                if fn_name.is_none()
+                    && let Some(n) = enclosing_fn_name(lines[b])
+                {
+                    fn_name = Some(n);
+                    continue;
+                }
+                // A column-0 `}` closes the innermost enclosing item. Once the
+                // fn is known, that item is the fn's body if the fn is free
+                // standing, or the `impl` block if the fn is a method — either
+                // way any `impl` opener further back belongs to an outer scope
+                // and must not be attributed to this fn. Resetting here keeps a
+                // free function (e.g. `main`) from being mis-scoped to a
+                // lingering `impl` opener above it.
+                if fn_name.is_some() && lines[b] == "}" {
+                    ty_name = None;
+                    break;
+                }
+                if ty_name.is_none()
+                    && let Some(t) = impl_type_name(lines[b])
+                {
+                    ty_name = Some(t);
+                }
+                if fn_name.is_some() && ty_name.is_some() {
                     break;
                 }
             }
-            if !ALLOWED.contains(&name.as_str()) {
-                offenders.push((idx + 1, name));
+            let key = match (ty_name, fn_name) {
+                (Some(t), Some(f)) => format!("{t}::{f}"),
+                (None, Some(f)) => f,
+                _ => String::from("<unknown>"),
+            };
+            if !ALLOWED.contains(&key.as_str()) {
+                offenders.push((idx + 1, key));
             }
         }
 
@@ -42420,5 +42503,70 @@ mod no_direct_engine_apply_guard {
              it is acknowledged (#1306). If the call is a legitimate Raft-guarded or \
              engine-internal exception, add it to ALLOWED with a reason."
         );
+    }
+
+    #[test]
+    fn direct_apply_call_matches_method_and_ufcs_forms() {
+        // Method receiver form.
+        assert!(is_direct_apply_call(
+            "match engine.apply_command_at(command, now_millis()) {"
+        ));
+        assert!(is_direct_apply_call(
+            "    journal.apply_command(command, now_millis())"
+        ));
+        // Leading-dot-free UFCS form — the bypass the guard must not miss.
+        assert!(is_direct_apply_call(
+            "Journal::apply_command_at(journal, command, now_millis())"
+        ));
+        assert!(is_direct_apply_call(
+            "Journal::apply_command(journal, command)"
+        ));
+        // `apply_command` is a prefix of `apply_command_at`; both still match.
+        assert!(is_direct_apply_call(
+            "engine.apply_command_at(*command, now)"
+        ));
+        // Non-calls and unrelated tokens must not match.
+        assert!(!is_direct_apply_call(
+            "// apply_command_at is the direct-apply API"
+        ));
+        assert!(!is_direct_apply_call("let apply_command_at = 1;"));
+        assert!(!is_direct_apply_call("engine.apply_command_batch(command)"));
+    }
+
+    #[test]
+    fn impl_type_name_scopes_method_to_its_type() {
+        assert_eq!(
+            impl_type_name("impl ServerImpl {"),
+            Some("ServerImpl".to_string())
+        );
+        assert_eq!(
+            impl_type_name("impl ClusterVariableStore {"),
+            Some("ClusterVariableStore".to_string())
+        );
+        // Trait impls and non-impl lines are untracked.
+        assert_eq!(
+            impl_type_name("impl AsRef<ServerImpl> for ServerImpl {"),
+            None
+        );
+        assert_eq!(impl_type_name("fn main() {"), None);
+    }
+
+    #[test]
+    fn allowlist_keys_are_type_scoped() {
+        // Every allowlisted method is scoped to `ServerImpl`; only the free
+        // function `main` is keyed by its bare name. This is what stops the
+        // unrelated `ClusterVariableStore::new` from inheriting the
+        // `ServerImpl::new` exemption.
+        for entry in ALLOWED {
+            if *entry == "main" {
+                continue;
+            }
+            assert!(
+                entry.starts_with("ServerImpl::"),
+                "allowlist entry `{entry}` must be type-scoped (`Type::method`)"
+            );
+        }
+        assert!(ALLOWED.contains(&"ServerImpl::new"));
+        assert!(!ALLOWED.contains(&"new"));
     }
 }
