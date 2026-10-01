@@ -1,6 +1,6 @@
 {
-  "next_local": 30,
-  "now": 1700000000010,
+  "next_local": 47,
+  "now": 1700000000014,
   "num_partitions": 1,
   "partition_id": 0,
   "start_dispatch_rr": 0,
@@ -22,18 +22,537 @@
     "activated_jobs": [],
     "conditional_subscriptions": {},
     "created_by_process": {
+      "decide": 2,
       "dup": 1,
       "order": 2,
       "sync": 1
     },
-    "decision_requirements": {},
-    "decision_requirements_versions": {},
-    "decision_versions": {},
-    "decisions": {},
+    "decision_requirements": {
+      "greet": {
+        "drg": {
+          "decisions": [
+            {
+              "id": "base",
+              "logic": {
+                "LiteralExpression": "\"b\""
+              },
+              "name": "Base",
+              "required_decisions": [],
+              "variable_name": null
+            },
+            {
+              "id": "root",
+              "logic": {
+                "DecisionTable": {
+                  "aggregation": null,
+                  "hit_policy": "Unique",
+                  "inputs": [
+                    {
+                      "expression": "lang",
+                      "id": "ri",
+                      "label": null,
+                      "type_ref": "string"
+                    }
+                  ],
+                  "outputs": [
+                    {
+                      "id": "ro",
+                      "label": null,
+                      "name": "result",
+                      "output_values": [],
+                      "type_ref": "string"
+                    }
+                  ],
+                  "rules": [
+                    {
+                      "id": "r1",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"a\""
+                      ]
+                    },
+                    {
+                      "id": "r2",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"b\""
+                      ]
+                    },
+                    {
+                      "id": "r3",
+                      "input_entries": [
+                        "not(\"xx\")"
+                      ],
+                      "output_entries": [
+                        "base"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "name": "Root",
+              "required_decisions": [
+                "base"
+              ],
+              "variable_name": null
+            }
+          ],
+          "id": "greet",
+          "name": "greet",
+          "namespace": "",
+          "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+        },
+        "key": 32,
+        "version": 1
+      }
+    },
+    "decision_requirements_versions": {
+      "32": {
+        "drg": {
+          "decisions": [
+            {
+              "id": "base",
+              "logic": {
+                "LiteralExpression": "\"b\""
+              },
+              "name": "Base",
+              "required_decisions": [],
+              "variable_name": null
+            },
+            {
+              "id": "root",
+              "logic": {
+                "DecisionTable": {
+                  "aggregation": null,
+                  "hit_policy": "Unique",
+                  "inputs": [
+                    {
+                      "expression": "lang",
+                      "id": "ri",
+                      "label": null,
+                      "type_ref": "string"
+                    }
+                  ],
+                  "outputs": [
+                    {
+                      "id": "ro",
+                      "label": null,
+                      "name": "result",
+                      "output_values": [],
+                      "type_ref": "string"
+                    }
+                  ],
+                  "rules": [
+                    {
+                      "id": "r1",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"a\""
+                      ]
+                    },
+                    {
+                      "id": "r2",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"b\""
+                      ]
+                    },
+                    {
+                      "id": "r3",
+                      "input_entries": [
+                        "not(\"xx\")"
+                      ],
+                      "output_entries": [
+                        "base"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "name": "Root",
+              "required_decisions": [
+                "base"
+              ],
+              "variable_name": null
+            }
+          ],
+          "id": "greet",
+          "name": "greet",
+          "namespace": "",
+          "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+        },
+        "key": 32,
+        "version": 1
+      }
+    },
+    "decision_versions": {
+      "33": {
+        "decision_id": "base",
+        "decision_name": "Base",
+        "decision_requirements_key": 32,
+        "drg": {
+          "decisions": [
+            {
+              "id": "base",
+              "logic": {
+                "LiteralExpression": "\"b\""
+              },
+              "name": "Base",
+              "required_decisions": [],
+              "variable_name": null
+            },
+            {
+              "id": "root",
+              "logic": {
+                "DecisionTable": {
+                  "aggregation": null,
+                  "hit_policy": "Unique",
+                  "inputs": [
+                    {
+                      "expression": "lang",
+                      "id": "ri",
+                      "label": null,
+                      "type_ref": "string"
+                    }
+                  ],
+                  "outputs": [
+                    {
+                      "id": "ro",
+                      "label": null,
+                      "name": "result",
+                      "output_values": [],
+                      "type_ref": "string"
+                    }
+                  ],
+                  "rules": [
+                    {
+                      "id": "r1",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"a\""
+                      ]
+                    },
+                    {
+                      "id": "r2",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"b\""
+                      ]
+                    },
+                    {
+                      "id": "r3",
+                      "input_entries": [
+                        "not(\"xx\")"
+                      ],
+                      "output_entries": [
+                        "base"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "name": "Root",
+              "required_decisions": [
+                "base"
+              ],
+              "variable_name": null
+            }
+          ],
+          "id": "greet",
+          "name": "greet",
+          "namespace": "",
+          "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+        },
+        "key": 33,
+        "version": 1
+      },
+      "34": {
+        "decision_id": "root",
+        "decision_name": "Root",
+        "decision_requirements_key": 32,
+        "drg": {
+          "decisions": [
+            {
+              "id": "base",
+              "logic": {
+                "LiteralExpression": "\"b\""
+              },
+              "name": "Base",
+              "required_decisions": [],
+              "variable_name": null
+            },
+            {
+              "id": "root",
+              "logic": {
+                "DecisionTable": {
+                  "aggregation": null,
+                  "hit_policy": "Unique",
+                  "inputs": [
+                    {
+                      "expression": "lang",
+                      "id": "ri",
+                      "label": null,
+                      "type_ref": "string"
+                    }
+                  ],
+                  "outputs": [
+                    {
+                      "id": "ro",
+                      "label": null,
+                      "name": "result",
+                      "output_values": [],
+                      "type_ref": "string"
+                    }
+                  ],
+                  "rules": [
+                    {
+                      "id": "r1",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"a\""
+                      ]
+                    },
+                    {
+                      "id": "r2",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"b\""
+                      ]
+                    },
+                    {
+                      "id": "r3",
+                      "input_entries": [
+                        "not(\"xx\")"
+                      ],
+                      "output_entries": [
+                        "base"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "name": "Root",
+              "required_decisions": [
+                "base"
+              ],
+              "variable_name": null
+            }
+          ],
+          "id": "greet",
+          "name": "greet",
+          "namespace": "",
+          "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+        },
+        "key": 34,
+        "version": 1
+      }
+    },
+    "decisions": {
+      "base": {
+        "decision_id": "base",
+        "decision_name": "Base",
+        "decision_requirements_key": 32,
+        "drg": {
+          "decisions": [
+            {
+              "id": "base",
+              "logic": {
+                "LiteralExpression": "\"b\""
+              },
+              "name": "Base",
+              "required_decisions": [],
+              "variable_name": null
+            },
+            {
+              "id": "root",
+              "logic": {
+                "DecisionTable": {
+                  "aggregation": null,
+                  "hit_policy": "Unique",
+                  "inputs": [
+                    {
+                      "expression": "lang",
+                      "id": "ri",
+                      "label": null,
+                      "type_ref": "string"
+                    }
+                  ],
+                  "outputs": [
+                    {
+                      "id": "ro",
+                      "label": null,
+                      "name": "result",
+                      "output_values": [],
+                      "type_ref": "string"
+                    }
+                  ],
+                  "rules": [
+                    {
+                      "id": "r1",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"a\""
+                      ]
+                    },
+                    {
+                      "id": "r2",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"b\""
+                      ]
+                    },
+                    {
+                      "id": "r3",
+                      "input_entries": [
+                        "not(\"xx\")"
+                      ],
+                      "output_entries": [
+                        "base"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "name": "Root",
+              "required_decisions": [
+                "base"
+              ],
+              "variable_name": null
+            }
+          ],
+          "id": "greet",
+          "name": "greet",
+          "namespace": "",
+          "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+        },
+        "key": 33,
+        "version": 1
+      },
+      "root": {
+        "decision_id": "root",
+        "decision_name": "Root",
+        "decision_requirements_key": 32,
+        "drg": {
+          "decisions": [
+            {
+              "id": "base",
+              "logic": {
+                "LiteralExpression": "\"b\""
+              },
+              "name": "Base",
+              "required_decisions": [],
+              "variable_name": null
+            },
+            {
+              "id": "root",
+              "logic": {
+                "DecisionTable": {
+                  "aggregation": null,
+                  "hit_policy": "Unique",
+                  "inputs": [
+                    {
+                      "expression": "lang",
+                      "id": "ri",
+                      "label": null,
+                      "type_ref": "string"
+                    }
+                  ],
+                  "outputs": [
+                    {
+                      "id": "ro",
+                      "label": null,
+                      "name": "result",
+                      "output_values": [],
+                      "type_ref": "string"
+                    }
+                  ],
+                  "rules": [
+                    {
+                      "id": "r1",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"a\""
+                      ]
+                    },
+                    {
+                      "id": "r2",
+                      "input_entries": [
+                        "\"xx\""
+                      ],
+                      "output_entries": [
+                        "\"b\""
+                      ]
+                    },
+                    {
+                      "id": "r3",
+                      "input_entries": [
+                        "not(\"xx\")"
+                      ],
+                      "output_entries": [
+                        "base"
+                      ]
+                    }
+                  ]
+                }
+              },
+              "name": "Root",
+              "required_decisions": [
+                "base"
+              ],
+              "variable_name": null
+            }
+          ],
+          "id": "greet",
+          "name": "greet",
+          "namespace": "",
+          "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+        },
+        "key": 34,
+        "version": 1
+      }
+    },
     "form_versions": {},
     "forms": {},
-    "incidents": {},
+    "incidents": {
+      "46": {
+        "created_at": 1700000000013,
+        "element_id": "brt",
+        "element_instance_key": 44,
+        "instance_key": 42,
+        "job_key": null,
+        "key": 46,
+        "kind": "DecisionEvaluation",
+        "operation_reference": null,
+        "reason": "failed to evaluate decision 'root' at business rule task 'brt': hit policy UNIQUE requires at most one matching rule, but 2 rules matched",
+        "redrive": null,
+        "resolved_at": null,
+        "state": "Active"
+      }
+    },
     "inflight_by_process": {
+      "decide": 1,
       "order": 1,
       "sync": 1
     },
@@ -141,6 +660,70 @@
         "suspended_at": null,
         "tags": [],
         "variables": {},
+        "variables_spilled": false
+      },
+      "37": {
+        "active": {},
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000012,
+        "incidents": [],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 37,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 36,
+        "process_id": "decide",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Completed",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
+      "42": {
+        "active": {
+          "44": "brt"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000013,
+        "incidents": [
+          46
+        ],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 42,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 36,
+        "process_id": "decide",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {
+          "lang": {
+            "Str": "xx"
+          }
+        },
         "variables_spilled": false
       },
       "7": {
@@ -567,6 +1150,88 @@
         "key": 2,
         "version": 1
       },
+      "36": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "brt": {
+              "end_listeners": [],
+              "id": "brt",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "BusinessRuleTask": {
+                  "decision_id": "root",
+                  "result_variable": "out"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "brt"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "decide",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 36,
+        "version": 1
+      },
       "4": {
         "definition": {
           "adhoc": [],
@@ -976,6 +1641,88 @@
       }
     },
     "processes": {
+      "decide": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "brt": {
+              "end_listeners": [],
+              "id": "brt",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "BusinessRuleTask": {
+                  "decision_id": "root",
+                  "result_variable": "out"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "brt"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "decide",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 36,
+        "version": 1
+      },
       "dup": {
         "definition": {
           "adhoc": [],

@@ -343,10 +343,24 @@ impl Partitions {
     /// budget it falls back to plain round-robin; the create-admission shed gate
     /// (see [`exporter_all_saturated`](Self::exporter_all_saturated)) rejects in
     /// that case, so the writer is never blocked.
+    ///
+    /// Panics if this node hosts no local partition (startup rejects that
+    /// topology); use [`try_for_create`](Self::try_for_create) where a
+    /// recoverable error is wanted instead.
     pub fn for_create(&self) -> &DeepthiHandle {
+        self.try_for_create()
+            .expect("for_create requires at least one local partition")
+    }
+
+    /// [`for_create`](Self::for_create), but `None` (never a panic) when this
+    /// node hosts no local partition.
+    pub fn try_for_create(&self) -> Option<&DeepthiHandle> {
         let locals = self.router.local_handles();
+        if locals.is_empty() {
+            return None;
+        }
         if locals.len() == 1 {
-            return &locals[0];
+            return Some(&locals[0]);
         }
         if let Some(bp) = self.exporter_bp.get() {
             // Steer to the first shard with headroom, scanning round-robin from a
@@ -357,14 +371,14 @@ impl Partitions {
             for off in 0..n {
                 let i = (start + off) % n;
                 if bp.gauges[i].load(Ordering::Relaxed) < bp.budget {
-                    return &locals[i];
+                    return Some(&locals[i]);
                 }
             }
             // Every shard saturated: fall through to plain round-robin (the
             // create is about to be shed by admission control anyway).
         }
         let i = self.next_create.fetch_add(1, Ordering::Relaxed) % locals.len();
-        &locals[i]
+        Some(&locals[i])
     }
 
     /// Wires read-model exporter-queue backpressure. Called once at startup after
@@ -651,6 +665,24 @@ mod tests {
             .map(|i| DeepthiHandle::spawn(Journal::in_memory_partition(i), i, None))
             .collect();
         Partitions::new(handles)
+    }
+
+    #[test]
+    fn try_for_create_is_none_without_local_partitions() {
+        // #1305 review: a node hosting no partition must yield a recoverable
+        // `None`, not the modulo-by-zero panic of round-robin selection.
+        // Node 1 of 2 with a single partition owns nothing locally.
+        let topology = Topology {
+            node_id: 1,
+            peers: vec!["http://n0".into(), "http://n1".into()],
+            num_partitions: 1,
+            replication_factor: 1,
+        };
+        assert!(topology.local_partitions().is_empty());
+        let parts = Partitions::with_topology(topology, Vec::new());
+        assert!(parts.try_for_create().is_none());
+        let parts = spawn_partitions(2);
+        assert!(parts.try_for_create().is_some());
     }
 
     #[test]

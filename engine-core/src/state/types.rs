@@ -1532,6 +1532,25 @@ impl State {
         self.decisions.values().find(|d| d.key == key)
     }
 
+    /// The decision `decision_id` exactly as deployed in the DRG version
+    /// `decision_requirements_key` — how each decision evaluated within one
+    /// DRG is identified (Zeebe resolves an evaluated decision's key and version
+    /// from the evaluated DRG, not from the latest version of its id). Falls
+    /// back to the latest-by-id index for pre-retention snapshots.
+    pub fn decision_in_drg(
+        &self,
+        decision_requirements_key: Key,
+        decision_id: &str,
+    ) -> Option<&DeployedDecision> {
+        let in_drg = |d: &&DeployedDecision| {
+            d.decision_requirements_key == decision_requirements_key && d.decision_id == decision_id
+        };
+        self.decision_versions
+            .values()
+            .find(in_drg)
+            .or_else(|| self.decisions.get(decision_id).filter(in_drg))
+    }
+
     /// The exact deployed version of decision `decision_id` with version number
     /// `version`, if retained. Falls back to the latest-by-id index for
     /// pre-retention snapshots.

@@ -1734,44 +1734,48 @@ impl Engine {
         Ok(())
     }
 
-    /// Evaluates a deployed decision on demand for the standalone
-    /// EvaluateDecision API. Resolves the decision by id (latest version) or, if
-    /// `by_id` is `None`, by decision key, evaluates it against `variables`
-    /// natively, and returns the deployment metadata together with the full
-    /// evaluation result (including any failure). This is a pure read: it does
-    /// not mint keys, emit events, or mutate state. Returns `None` when no such
-    /// decision is deployed.
-    pub fn evaluate_deployed_decision(
-        &self,
-        by_id: Option<&str>,
-        by_key: Option<Key>,
-        variables: &HashMap<String, Value>,
-    ) -> Option<DecisionEvaluation> {
-        let deployed = match (by_id, by_key) {
-            (Some(id), _) => self.state.decisions.get(id)?.clone(),
-            (None, Some(key)) => self.state.decision_by_key(key)?.clone(),
-            (None, None) => return None,
-        };
-        let result = crate::dmn::evaluate(&deployed.drg, &deployed.decision_id, variables);
-        Some(DecisionEvaluation {
+    /// Records one decision evaluation as an [`Event::DecisionEvaluated`]: the
+    /// one place every evaluation — a businessRuleTask's (successful or failed)
+    /// and the standalone EvaluateDecision command's — becomes an event, so they
+    /// cannot drift (issue #1292; Zeebe `DecisionBehavior.createDecisionEvaluationEvent`).
+    /// Mints the evaluation's own key from the partition key generator and
+    /// stamps every evaluated decision with the exact definition (key, version)
+    /// evaluated, resolved within `deployed`'s DRG version. `instance_key` /
+    /// `element_instance_key` are `0` and `element_id` empty for a standalone
+    /// evaluation.
+    fn decision_evaluated_event(
+        &mut self,
+        deployed: &state::DeployedDecision,
+        result: crate::dmn::DecisionEvaluationResult,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+    ) -> Event {
+        let decision_evaluation_key = self.mint_key();
+        let mut evaluated_decisions = result.evaluated_decisions;
+        for evaluated in &mut evaluated_decisions {
+            if let Some(definition) = self
+                .state
+                .decision_in_drg(deployed.decision_requirements_key, &evaluated.decision_id)
+            {
+                evaluated.decision_key = definition.key;
+                evaluated.decision_version = definition.version;
+            }
+        }
+        Event::DecisionEvaluated {
+            instance_key,
+            element_instance_key,
+            element_id,
             decision_key: deployed.key,
-            version: deployed.version,
             decision_id: deployed.decision_id.clone(),
-            decision_name: deployed.decision_name.clone(),
+            decision_output: result.decision_output,
+            evaluated_decisions,
+            evaluated_at: self.now,
+            decision_evaluation_key,
+            failure: result.failure,
             decision_requirements_key: deployed.decision_requirements_key,
             decision_requirements_id: deployed.drg.id.clone(),
-            result,
-        })
-    }
-
-    /// Deployment key and version of a deployed decision by id (latest version),
-    /// or `None` if not deployed. Used by the EvaluateDecision API to stamp each
-    /// evaluated decision in a graph with its own deployment identity.
-    pub fn deployed_decision_key_version(&self, decision_id: &str) -> Option<(Key, i32)> {
-        self.state
-            .decisions
-            .get(decision_id)
-            .map(|d| (d.key, d.version))
+        }
     }
 
     /// Applies a command using the engine's current clock reading (see
@@ -1885,6 +1889,30 @@ impl Engine {
                         decision_evaluation_key,
                     },
                 );
+            }
+
+            Command::EvaluateDecision {
+                decision,
+                variables,
+            } => {
+                // Zeebe `DecisionEvaluationEvaluateProcessor`: resolve, evaluate,
+                // and record the evaluation (successful or failed) under a freshly
+                // minted evaluation key, with no process instance.
+                let deployed = match &decision {
+                    crate::command::DecisionReference::Id(id) => self.state.decisions.get(id),
+                    crate::command::DecisionReference::Key(key) => self.state.decision_by_key(*key),
+                }
+                .cloned()
+                .ok_or_else(|| EngineError::DecisionNotFound {
+                    reference: match &decision {
+                        crate::command::DecisionReference::Id(id) => format!("id '{id}'"),
+                        crate::command::DecisionReference::Key(key) => format!("key {key}"),
+                    },
+                })?;
+                let result = crate::dmn::evaluate(&deployed.drg, &deployed.decision_id, &variables);
+                let event =
+                    self.decision_evaluated_event(&deployed, result, 0, 0, ElementId::default());
+                self.emit(&mut log, event);
             }
 
             Command::CreateInstance {
@@ -9313,24 +9341,38 @@ impl Engine {
                 );
             };
             let result = crate::dmn::evaluate(&deployed.drg, &resolved_id, &vars);
-            if let Some(failure) = &result.failure {
+            if let Some(failure) = result.failure.clone() {
+                // Zeebe parity (#1292): a failed evaluation is still recorded
+                // (`DecisionEvaluation:FAILED`, a FAILED decision instance) ahead
+                // of the incident; each re-drive after resolution is a new
+                // evaluation with its own key.
+                let failed = self.decision_evaluated_event(
+                    &deployed,
+                    result,
+                    instance_key,
+                    element_instance_key,
+                    element_id.clone(),
+                );
                 let incident_key = self.mint_key();
                 return (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        kind: state::IncidentKind::DecisionEvaluation,
-                        redrive: None,
-                        reason: format!(
-                            "failed to evaluate decision '{}' at business rule task '{element_id}': \
-                             {}",
-                            failure.failed_decision_id, failure.message
-                        ),
-                        job_key: None,
-                        created_at: self.now,
-                    }],
+                    vec![
+                        failed,
+                        Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id: element_id.clone(),
+                            kind: state::IncidentKind::DecisionEvaluation,
+                            redrive: None,
+                            reason: format!(
+                                "failed to evaluate decision '{}' at business rule task \
+                                 '{element_id}': {}",
+                                failure.failed_decision_id, failure.message
+                            ),
+                            job_key: None,
+                            created_at: self.now,
+                        },
+                    ],
                     Vec::new(),
                 );
             }
@@ -9354,16 +9396,13 @@ impl Engine {
             if !update.is_empty() {
                 script_update = Some(update);
             }
-            decision_event = Some(Event::DecisionEvaluated {
+            decision_event = Some(self.decision_evaluated_event(
+                &deployed,
+                result,
                 instance_key,
                 element_instance_key,
-                element_id: element_id.clone(),
-                decision_key: deployed.key,
-                decision_id: resolved_id,
-                decision_output: result.decision_output,
-                evaluated_decisions: result.evaluated_decisions,
-                evaluated_at: self.now,
-            });
+                element_id.clone(),
+            ));
         }
 
         // Output mappings (zeebe:output): evaluated BEFORE the element completes so
@@ -9405,16 +9444,18 @@ impl Engine {
                     // activation body. Both surface the one `IO_MAPPING_ERROR`
                     // taxonomy (Zeebe parity: input and output mapping failures
                     // share it, re-driven uniformly by lifecycle phase).
-                    return (
-                        vec![self.io_mapping_incident(
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            failure,
-                            state::IoMappingRedrive::Completion,
-                        )],
-                        Vec::new(),
-                    );
+                    // A businessRuleTask's decision WAS evaluated: record it ahead
+                    // of the incident rather than dropping it (#1292 — every
+                    // evaluation is a decision instance).
+                    let mut events: Vec<Event> = decision_event.into_iter().collect();
+                    events.push(self.io_mapping_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        state::IoMappingRedrive::Completion,
+                    ));
+                    return (events, Vec::new());
                 }
             }
         };
@@ -12471,6 +12512,9 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
 pub enum EngineError {
     /// `CreateInstance` referenced a process id that was never deployed.
     ProcessNotFound { process_id: String },
+    /// `EvaluateDecision` referenced a decision (by id or key) that was never
+    /// deployed. `reference` describes it (`id 'x'` / `key 123`).
+    DecisionNotFound { reference: String },
     /// `DeployProcess` was given a definition whose `start_event` is not among
     /// its elements.
     NoStartEvent { process_id: String },
@@ -12760,6 +12804,9 @@ impl std::fmt::Display for EngineError {
             EngineError::AgentHistoryInvalid { reason } => write!(f, "invalid agent history: {reason}"),
             EngineError::ProcessNotFound { process_id } => {
                 write!(f, "no deployed process with id {process_id}")
+            }
+            EngineError::DecisionNotFound { reference } => {
+                write!(f, "no deployed decision with {reference}")
             }
             EngineError::NoStartEvent { process_id } => {
                 write!(
@@ -13156,27 +13203,6 @@ pub struct ActivatedJob {
     /// (ADR 0037), surfaced so the worker/transport can report `jobKind` and
     /// `listenerEventType` (Camunda parity).
     pub kind: state::JobKind,
-}
-
-/// The outcome of a standalone [`Engine::evaluate_deployed_decision`] call: the
-/// deployment metadata of the resolved decision plus the full native DMN
-/// evaluation result. Surfaced to the EvaluateDecision REST API.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DecisionEvaluation {
-    /// Unique key of the evaluated decision definition (and version).
-    pub decision_key: Key,
-    /// Version of the evaluated decision definition.
-    pub version: i32,
-    /// The evaluated decision's id.
-    pub decision_id: String,
-    /// The evaluated decision's human-readable name.
-    pub decision_name: String,
-    /// Unique key of the decision requirements graph it belongs to.
-    pub decision_requirements_key: Key,
-    /// Id of the decision requirements graph it belongs to.
-    pub decision_requirements_id: String,
-    /// The native DMN evaluation result (output, per-decision audit, failure).
-    pub result: crate::dmn::DecisionEvaluationResult,
 }
 
 /// Whether a job can be activated at the logical instant `now`: it is created

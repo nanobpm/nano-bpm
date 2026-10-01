@@ -3070,17 +3070,15 @@ fn rebuild_read_model_legacy(
         }
         let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
             .min(num_partitions.saturating_sub(1)) as u64;
-        let p = if let Event::DecisionEvaluated { instance_key, .. }
-        | Event::DecisionInstanceDeleted { instance_key, .. } = e
-        {
-            // Colocate the decision instance (and its later deletion) with its
-            // owning process instance (so the `process_definition_key` join
-            // resolves and the delete lands in the shard that holds the rows),
-            // not with the higher-numbered decision key its `max_key` might pick.
-            (nanobpmn_engine_core::partition_of(*instance_key) as usize)
-                .min(num_partitions.saturating_sub(1)) as u64
-        } else {
-            p
+        // Colocate a decision instance (and its later deletion) with its owner —
+        // the process instance it ran in (so the `process_definition_key` join
+        // resolves), or a standalone evaluation's own key — exactly where live
+        // deletion routes, not with the higher-numbered decision key its
+        // `max_key` might pick (nor shard 0 for an instance-less evaluation).
+        let p = match e.decision_instance_owner_key() {
+            Some(owner) => (nanobpmn_engine_core::partition_of(owner) as usize)
+                .min(num_partitions.saturating_sub(1)) as u64,
+            None => p,
         };
         if let Some(bucket) = per_shard.get_mut(&p) {
             bucket.push(e);
@@ -10959,29 +10957,39 @@ impl ServerImpl {
             )));
         };
 
+        // A standalone evaluation (no process instance) was journaled on the
+        // partition its minted evaluation key encodes; an instance's evaluation
+        // on the instance's partition.
+        let owner = nanobpmn_engine_core::dmn::decision_instance_owner_key(
+            instance_key,
+            decision_evaluation_key,
+        );
+        // Raft-aware: replicated through the owning partition's leader before
+        // the 204 is acknowledged, so a failover cannot resurrect the rows.
         let result = self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::DeleteDecisionInstance {
-                        instance_key,
-                        decision_evaluation_key,
-                    },
-                    now_millis(),
-                )
-            })
+            .apply_partition_command(
+                owner,
+                Command::DeleteDecisionInstance {
+                    instance_key,
+                    decision_evaluation_key,
+                },
+            )
             .await;
         match result {
             Ok((_events, commit)) => {
                 commit.wait().await;
                 Ok(Resp::Status204_TheDecisionInstanceIsMarkedForDeletion)
             }
-            Err(e) => Ok(
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -11056,12 +11064,15 @@ impl ServerImpl {
             })
             .collect();
 
-        // A synthetic, unique numeric key for stable sort tiebreak + cursors: the
-        // evaluation key scaled past the small within-evaluation index.
-        let entity_key = |row: &readstore::DecisionInstanceRow| -> u64 {
-            row.decision_evaluation_key
-                .wrapping_mul(1000)
-                .wrapping_add(row.idx as u64)
+        // A unique cursor key for stable sort tiebreak + cursors. The decision
+        // count within one evaluation is unbounded, so a synthetic
+        // `decision_evaluation_key * 1000 + idx` collided (the 1,001st row of
+        // evaluation `k` shared a key with the first row of evaluation `k + 1`),
+        // breaking `paginate`'s unique-key requirement. The composite
+        // `(decision_evaluation_key, idx)` is unique per row however large an
+        // evaluation grows (#1305 review).
+        let entity_key = |row: &readstore::DecisionInstanceRow| -> (u64, u64) {
+            (row.decision_evaluation_key, row.idx as u64)
         };
 
         let sort = query::sort_keys(
@@ -11085,12 +11096,14 @@ impl ServerImpl {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
                 "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(entity_key(row) as i64),
+                // Default (key) sort: by evaluation key, then the within-
+                // evaluation index via the composite tiebreak below.
+                _ => query::SortVal::Num(row.decision_evaluation_key as i64),
             },
             |row| entity_key(row),
         );
 
-        let sorted: Vec<(u64, &readstore::DecisionInstanceRow)> = matched
+        let sorted: Vec<((u64, u64), &readstore::DecisionInstanceRow)> = matched
             .into_iter()
             .map(|row| (entity_key(row), row))
             .collect();
@@ -12467,7 +12480,7 @@ impl ServerImpl {
         };
 
         let outcome = self
-            .apply_agent_command(element_instance_key, command)
+            .apply_partition_command(element_instance_key, command)
             .await;
         match outcome {
             Ok((events, commit)) => {
@@ -12705,7 +12718,9 @@ impl ServerImpl {
                 return Ok(agent_update_http_error(status, detail));
             }
         };
-        let outcome = self.apply_agent_command(agent_instance_key, command).await;
+        let outcome = self
+            .apply_partition_command(agent_instance_key, command)
+            .await;
 
         match outcome {
             Ok((events, commit)) => {
@@ -12741,7 +12756,52 @@ impl ServerImpl {
         }
     }
 
-    async fn apply_agent_command(
+    /// Applies an instance-less command that mints its own key (a standalone
+    /// decision evaluation) on a partition chosen like a create. Raft mode
+    /// proposes it through a partition this node LEADS (never a static-local
+    /// follower), so an acknowledged write is replicated; a node leading nothing
+    /// sheds a retryable 503. Without Raft it applies on a local partition and
+    /// awaits durability.
+    async fn apply_create_command(
+        &self,
+        command: Command,
+    ) -> Result<Arc<Vec<Event>>, (u16, String)> {
+        if self.raft.is_empty() {
+            let Some(handle) = self.engine.try_for_create() else {
+                return Err((500, "this node hosts no engine partition".to_string()));
+            };
+            let (events, commit) = handle
+                .with(move |journal| journal.apply_command_at(command, now_millis()))
+                .await
+                .map_err(|error| crate::raft::engine_error_status(&error))?;
+            commit.wait().await;
+            return Ok(events);
+        }
+        let led: Vec<u64> = self
+            .led_partitions()
+            .into_iter()
+            .filter(|&p| !self.handoff_write_gated(p))
+            .collect();
+        let Some(p) = self.engine.for_create_among(&led) else {
+            return Err((503, "this node leads no partition; retry".to_string()));
+        };
+        let Some(part) = self.raft.get(p) else {
+            return Err((500, format!("partition {p} has no Raft group")));
+        };
+        let response = part
+            .propose_result(command, now_millis())
+            .await
+            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+        if let Some((status, message)) = response.error {
+            return Err((status, message));
+        }
+        Ok(Arc::new(response.events))
+    }
+
+    /// Applies `command` on the partition owning `key`: through that partition's
+    /// Raft leader when Raft is enabled (so the write is replicated before it is
+    /// acknowledged), else directly on the local engine actor.
+    async fn apply_partition_command(
         &self,
         key: Key,
         command: Command,
@@ -14041,9 +14101,11 @@ impl ServerImpl {
     /// and maps the native DMN result onto the REST `EvaluateDecisionResult`
     /// (including the per-decision audit trail and any evaluation failure).
     ///
-    /// This is a pure read against the in-memory decision registry, which is
-    /// replicated onto every owned partition, so it runs on any local partition
-    /// without cross-node forwarding.
+    /// Durable and mutating (Zeebe parity, #1292): the evaluation is journaled as
+    /// a `DecisionEvaluated` event that mints a decision-evaluation key and
+    /// projects decision-instance rows. It runs on a local partition chosen like
+    /// a create (the decision registry is replicated onto every owned
+    /// partition), so no cross-node forwarding is needed.
     async fn evaluate_decision_impl(
         &self,
         body: &models::DecisionEvaluationInstruction,
@@ -14084,68 +14146,97 @@ impl ServerImpl {
             None => None,
         };
 
-        // Evaluate on any owned partition (the decision registry is replicated
-        // to all of them), resolving each evaluated decision's deployment key
-        // and version inside the actor while the state is borrowed.
-        let by_id_owned = by_id.clone();
-        let handle = match self.engine.all().first() {
-            Some(h) => h,
-            None => {
-                return Ok(
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "No engine partition",
-                        500,
-                        "This node hosts no engine partition to evaluate the decision.".to_string(),
-                    )),
-                );
-            }
+        // Journal the evaluation (Zeebe `DecisionEvaluation:EVALUATE`, #1292) on
+        // a local partition, round-robin like a create: the decision registry is
+        // replicated to every partition, and the evaluation key minted there
+        // routes every later operation on this decision instance (get/delete)
+        // back to it. The response is built from the journaled event, so it is
+        // exactly what the decision-instance read model projects.
+        let decision = match (by_id.clone(), by_key) {
+            (Some(id), _) => nanobpmn_engine_core::DecisionReference::Id(id),
+            (None, Some(key)) => nanobpmn_engine_core::DecisionReference::Key(key),
+            (None, None) => unreachable!("the request names a decision by id or key"),
         };
-        type PerDecision = (nanobpmn_engine_core::Key, i32);
-        let evaluation: Option<(nanobpmn_engine_core::DecisionEvaluation, Vec<PerDecision>)> =
-            handle
-                .with(move |journal| {
-                    let engine = journal.engine();
-                    let eval = engine.evaluate_deployed_decision(
-                        by_id_owned.as_deref(),
-                        by_key,
-                        &variables,
-                    )?;
-                    let per_decision: Vec<PerDecision> = eval
-                        .result
-                        .evaluated_decisions
-                        .iter()
-                        .map(|ed| {
-                            engine
-                                .deployed_decision_key_version(&ed.decision_id)
-                                .unwrap_or((eval.decision_key, eval.version))
-                        })
-                        .collect();
-                    Some((eval, per_decision))
-                })
-                .await;
-
-        let (eval, per_decision) = match evaluation {
-            Some(t) => t,
-            None => {
-                let reference = by_id
-                    .map(|id| format!("id '{id}'"))
-                    .or_else(|| by_key_str.map(|k| format!("key '{k}'")))
-                    .unwrap_or_else(|| "the given reference".to_string());
-                return Ok(Resp::Status404_TheDecisionIsNotFound(problem(
-                    "Decision not found",
-                    404,
-                    format!("No deployed decision with {reference}."),
-                )));
+        let command = Command::EvaluateDecision {
+            decision,
+            variables,
+        };
+        let failed = |status: u16, detail: String| match status {
+            404 => {
+                Resp::Status404_TheDecisionIsNotFound(problem("Decision not found", 404, detail))
             }
+            503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            )),
+            _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Internal error",
+                500,
+                detail,
+            )),
+        };
+        let event = match self.apply_create_command(command).await {
+            Ok(events) => events
+                .iter()
+                .find(|e| matches!(e, Event::DecisionEvaluated { .. }))
+                .cloned()
+                .expect("EvaluateDecision journals one DecisionEvaluated"),
+            Err((status, detail)) => return Ok(failed(status, detail)),
+        };
+        let Event::DecisionEvaluated { decision_key, .. } = &event else {
+            unreachable!()
+        };
+        let decision_key = *decision_key;
+        // The decision registry is replicated onto every partition, so the
+        // partition that minted the evaluation key resolves the root decision.
+        let owner = partition_of(
+            event
+                .decision_evaluation_key()
+                .expect("DecisionEvaluated identifies its evaluation"),
+        );
+        let meta = match self.engine_handle_for(owner) {
+            Some(handle) => {
+                handle
+                    .with(move |engine| {
+                        engine
+                            .engine()
+                            .state()
+                            .decision_by_key(decision_key)
+                            .map(|d| (d.decision_name.clone(), d.version))
+                    })
+                    .await
+            }
+            None => None,
+        };
+        let Some((decision_name, decision_version)) = meta else {
+            return Ok(failed(
+                500,
+                format!("evaluated decision {decision_key} is not resolvable on partition {owner}"),
+            ));
+        };
+        let evaluation_key = event
+            .decision_evaluation_key()
+            .expect("DecisionEvaluated identifies its evaluation");
+        let Event::DecisionEvaluated {
+            decision_key: root_decision_key,
+            decision_id: root_decision_id,
+            decision_output,
+            evaluated_decisions: audit,
+            failure,
+            decision_requirements_key,
+            decision_requirements_id,
+            ..
+        } = event
+        else {
+            unreachable!()
         };
 
         // Map the native DMN audit trail onto the REST result.
-        let evaluated_decisions: Vec<models::EvaluatedDecisionResult> = eval
-            .result
-            .evaluated_decisions
+        let evaluated_decisions: Vec<models::EvaluatedDecisionResult> = audit
             .iter()
-            .zip(per_decision.iter())
-            .map(|(ed, (key, version))| {
+            .enumerate()
+            .map(|(i, ed)| {
                 let matched_rules = ed
                     .matched_rules
                     .iter()
@@ -14188,19 +14279,22 @@ impl ServerImpl {
                 models::EvaluatedDecisionResult::new(
                     ed.decision_id.clone(),
                     ed.decision_name.clone(),
-                    *version,
+                    ed.decision_version,
                     dmn_decision_type_name(&ed.decision_type).to_string(),
                     dmn_value_to_string(&ed.decision_output),
                     tenant_id.clone(),
                     matched_rules,
                     evaluated_inputs,
-                    models::DecisionDefinitionKey(key.to_string()),
-                    format!("{key}-1"),
+                    models::DecisionDefinitionKey(ed.decision_key.to_string()),
+                    nanobpmn_engine_core::dmn::decision_evaluation_instance_key(
+                        evaluation_key,
+                        i + 1,
+                    ),
                 )
             })
             .collect();
 
-        let (failed_id, failure_message) = match &eval.result.failure {
+        let (failed_id, failure_message) = match &failure {
             Some(f) => (
                 nanobpm_gateway_rest::types::Nullable::Present(f.failed_decision_id.clone()),
                 nanobpm_gateway_rest::types::Nullable::Present(f.message.clone()),
@@ -14211,19 +14305,21 @@ impl ServerImpl {
             ),
         };
 
+        // Zeebe reports the evaluation key as both `decisionEvaluationKey` and
+        // the deprecated `decisionInstanceKey`.
         let result = models::EvaluateDecisionResult::new(
-            eval.decision_id.clone(),
-            models::DecisionDefinitionKey(eval.decision_key.to_string()),
-            eval.decision_name.clone(),
-            eval.version,
-            models::DecisionEvaluationKey(eval.decision_key.to_string()),
-            models::DecisionInstanceKey(format!("{}-1", eval.decision_key)),
-            eval.decision_requirements_id.clone(),
-            models::DecisionRequirementsKey(eval.decision_requirements_key.to_string()),
+            root_decision_id,
+            models::DecisionDefinitionKey(root_decision_key.to_string()),
+            decision_name,
+            decision_version,
+            models::DecisionEvaluationKey(evaluation_key.to_string()),
+            models::DecisionInstanceKey(evaluation_key.to_string()),
+            decision_requirements_id,
+            models::DecisionRequirementsKey(decision_requirements_key.to_string()),
             evaluated_decisions,
             failed_id,
             failure_message,
-            dmn_value_to_string(&eval.result.decision_output),
+            dmn_value_to_string(&decision_output),
             tenant_id,
         );
         Ok(Resp::Status200_TheDecisionWasEvaluated(result))
@@ -20155,15 +20251,19 @@ fn decision_instance_result(
         decision_evaluation_key: models::DecisionEvaluationKey(
             row.decision_evaluation_key.to_string(),
         ),
-        element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
-            row.element_instance_key.to_string(),
-        )),
+        // A standalone evaluation has no process instance (Zeebe's `-1`): its
+        // process-side keys are null rather than a fabricated `0`.
+        element_instance_key: match row.element_instance_key {
+            0 => types::Nullable::Null,
+            k => types::Nullable::Present(models::ElementInstanceKey(k.to_string())),
+        },
         evaluation_date,
         evaluation_failure,
         process_definition_key,
-        process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
-            row.instance_key.to_string(),
-        )),
+        process_instance_key: match row.instance_key {
+            0 => types::Nullable::Null,
+            k => types::Nullable::Present(models::ProcessInstanceKey(k.to_string())),
+        },
         result: row.result_json.clone(),
         root_decision_definition_key: models::DecisionDefinitionKey(
             row.root_decision_key.to_string(),
@@ -27756,6 +27856,692 @@ mod clustered_startup_tests {
         );
     }
 
+    /// #1292 (Copilot): the legacy (non-segmented) read-model rebuild must
+    /// demux a standalone evaluation (no process instance) to the shard its
+    /// evaluation key encodes — where live deletion routes — not `partition_of(0)`.
+    #[test]
+    fn legacy_rebuild_routes_standalone_decision_instances_to_the_evaluation_key_shard() {
+        use nanobpmn_engine_core::{DecisionReference, Engine};
+        let mut engine = Engine::with_partition(1);
+        let mut events = engine
+            .apply_command(Command::DeployDecisionRequirements(vec![issue_1292_drg(
+                "hallo",
+            )]))
+            .expect("deploy the DRG");
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(
+            "lang".to_string(),
+            nanobpmn_engine_core::Value::Str("de".into()),
+        );
+        let evaluated = engine
+            .apply_command(Command::EvaluateDecision {
+                decision: DecisionReference::Id("root".into()),
+                variables,
+            })
+            .expect("evaluate");
+        let evaluation_key = evaluated
+            .iter()
+            .find_map(Event::decision_evaluation_key)
+            .expect("a journaled evaluation");
+        assert_eq!(nanobpmn_engine_core::partition_of(evaluation_key), 1);
+        events.extend(evaluated);
+
+        let read_model = readstore::ReadModel::in_memory_partitions(&[0, 1]);
+        let shards = read_model.shards();
+        rebuild_read_model_legacy(&shards, &events, 2);
+        let rows = |p: u64| {
+            shards
+                .iter()
+                .find(|(pid, _)| *pid == p)
+                .expect("shard")
+                .1
+                .decision_instances()
+                .len()
+        };
+        assert_eq!(
+            (rows(0), rows(1)),
+            (0, 2),
+            "rows live in the evaluation key's shard"
+        );
+
+        // ...so the deletion (routed the same way) retracts them on rebuild.
+        events.push(Event::DecisionInstanceDeleted {
+            instance_key: 0,
+            decision_evaluation_key: evaluation_key,
+        });
+        rebuild_read_model_legacy(&shards, &events, 2);
+        assert_eq!((rows(0), rows(1)), (0, 0));
+    }
+
+    /// Issue #1292 fixture: a two-decision DRG (`root` requires `base`). `base`
+    /// maps `lang = "de"` to `base_output`; `root` echoes it, unless
+    /// `lang = "xx"`, where two `root` rules match under a UNIQUE hit policy so
+    /// `root` fails after `base` succeeded (Zeebe's FAILED-evaluation shape).
+    fn issue_1292_drg(base_output: &str) -> nanobpmn_engine_core::dmn::DecisionRequirementsGraph {
+        let xml = format!(
+            r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greet-drg" name="Greet DRG">
+          <decision id="base" name="Base">
+            <decisionTable hitPolicy="FIRST">
+              <input id="bi"><inputExpression id="be" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="bo" name="base" typeRef="string" />
+              <rule id="b1"><inputEntry id="bie1"><text>"de"</text></inputEntry>
+                <outputEntry id="boe1"><text>"{base_output}"</text></outputEntry></rule>
+              <rule id="b2"><inputEntry id="bie2"><text>-</text></inputEntry>
+                <outputEntry id="boe2"><text>"other"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+          <decision id="root" name="Root">
+            <informationRequirement id="ir"><requiredDecision href="#base" /></informationRequirement>
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="ri"><inputExpression id="re" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="ro" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="rie1"><text>"xx"</text></inputEntry>
+                <outputEntry id="roe1"><text>"a"</text></outputEntry></rule>
+              <rule id="r2"><inputEntry id="rie2"><text>"xx"</text></inputEntry>
+                <outputEntry id="roe2"><text>"b"</text></outputEntry></rule>
+              <rule id="r3"><inputEntry id="rie3"><text>not("xx")</text></inputEntry>
+                <outputEntry id="roe3"><text>base</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##
+        );
+        nanobpmn_engine_core::dmn::parse_dmn(&xml).expect("valid issue-1292 DMN")
+    }
+
+    /// Deploys [`issue_1292_drg`] plus, when `with_process`, a `greeter`
+    /// process whose businessRuleTask evaluates `root`.
+    async fn deploy_issue_1292(server: &ServerImpl, base_output: &str, with_process: bool) {
+        let drg = issue_1292_drg(base_output);
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greet.dmn".to_string());
+        let mut procs = Vec::new();
+        let mut proc_names = std::collections::HashMap::new();
+        if with_process {
+            procs.push(
+                ProcessBuilder::new("greeter")
+                    .start_event("s")
+                    .business_rule_task("decide", "root", Some("greeting".to_string()))
+                    .end_event("e")
+                    .connect("s", "decide")
+                    .connect("decide", "e")
+                    .build()
+                    .expect("valid businessRuleTask process"),
+            );
+            proc_names.insert("greeter".to_string(), "greeter.bpmn".to_string());
+        }
+        server
+            .deploy_resources_locally(procs, &proc_names, vec![drg], &drg_names, "<default>")
+            .await
+            .expect("deploy succeeds");
+    }
+
+    /// Starts a `greeter` instance with `lang`, returning its key.
+    async fn start_greeter(server: &ServerImpl, lang: &str) -> u64 {
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("lang".to_string(), Value::Str(lang.into()));
+        server
+            .create_for_stream(Some("greeter".into()), None, variables)
+            .await
+            .expect("create the businessRuleTask instance")
+            .0
+    }
+
+    /// Polls the decision-instance search until `n` rows are projected (the read
+    /// model is fed by the async exporter thread), sorted by composite id.
+    async fn decision_rows(server: &ServerImpl, n: usize) -> Vec<models::DecisionInstanceResult> {
+        use apis::decision_instance::SearchDecisionInstancesResponse as SearchResp;
+        let mut items = Vec::new();
+        for _ in 0..300 {
+            let SearchResp::Status200_TheDecisionInstanceSearchResult(result) = server
+                .search_decision_instances_impl(&None)
+                .await
+                .expect("search returns a response")
+            else {
+                panic!("expected a 200 search result");
+            };
+            items = result.items;
+            // Exactly `n`: the projection is asynchronous, and rows may be
+            // arriving (evaluations) or leaving (deletions).
+            if items.len() == n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(items.len(), n, "decision-instance rows: {items:#?}");
+        items.sort_by(|a, b| {
+            a.decision_evaluation_instance_key
+                .cmp(&b.decision_evaluation_instance_key)
+        });
+        items
+    }
+
+    /// Issue #1292 (Zeebe parity): every evaluation of the same decision is its
+    /// own decision instance, keyed by a per-evaluation key minted from the
+    /// partition key generator (`BpmnDecisionBehavior` → `keyGenerator.nextKey()`)
+    /// — not by the decision definition key, which collided so every evaluation
+    /// after the first was silently dropped. Each evaluated decision is
+    /// `"{decisionEvaluationKey}-{n}"` (1-based, evaluation order) and deletion
+    /// retracts exactly one evaluation.
+    #[tokio::test]
+    async fn repeat_business_rule_task_evaluations_are_distinct_decision_instances() {
+        use apis::decision_instance::DeleteDecisionInstanceResponse as DelResp;
+        let server = ServerImpl::default();
+        deploy_issue_1292(&server, "hallo", true).await;
+        let first = start_greeter(&server, "de").await;
+        let second = start_greeter(&server, "de").await;
+
+        let rows = decision_rows(&server, 4).await;
+        let mut evaluations: std::collections::BTreeMap<
+            String,
+            Vec<&models::DecisionInstanceResult>,
+        > = Default::default();
+        for row in &rows {
+            evaluations
+                .entry(row.decision_evaluation_key.0.clone())
+                .or_default()
+                .push(row);
+        }
+        assert_eq!(
+            evaluations.len(),
+            2,
+            "two evaluations, two evaluation keys: {rows:#?}"
+        );
+        let mut owners = Vec::new();
+        for (eval_key, rows) in &evaluations {
+            let ids: Vec<&str> = rows
+                .iter()
+                .map(|r| r.decision_evaluation_instance_key.as_str())
+                .collect();
+            assert_eq!(ids, vec![format!("{eval_key}-1"), format!("{eval_key}-2")]);
+            assert_eq!(rows[0].decision_definition_id, "base");
+            assert_eq!(rows[1].decision_definition_id, "root");
+            assert_ne!(
+                eval_key, &rows[1].decision_definition_key.0,
+                "the evaluation key is minted per evaluation, not the definition key"
+            );
+            let nanobpm_gateway_rest::types::Nullable::Present(pi) = &rows[0].process_instance_key
+            else {
+                panic!("a businessRuleTask evaluation links to its process instance");
+            };
+            assert!(
+                rows.iter()
+                    .all(|r| r.process_instance_key == rows[0].process_instance_key)
+            );
+            owners.push(pi.0.parse::<u64>().expect("numeric instance key"));
+        }
+        owners.sort_unstable();
+        let mut expected = vec![first, second];
+        expected.sort_unstable();
+        assert_eq!(
+            owners, expected,
+            "each evaluation belongs to its own instance"
+        );
+
+        // Deleting one evaluation retracts exactly its rows.
+        let (gone, kept) = {
+            let mut keys = evaluations.keys();
+            (keys.next().unwrap().clone(), keys.next().unwrap().clone())
+        };
+        let resp = server
+            .delete_decision_instance_impl(&models::DeleteDecisionInstancePathParams {
+                decision_evaluation_key: gone.clone(),
+            })
+            .await
+            .expect("delete returns a response");
+        assert!(matches!(
+            resp,
+            DelResp::Status204_TheDecisionInstanceIsMarkedForDeletion
+        ));
+        let mut remaining = Vec::new();
+        for _ in 0..300 {
+            remaining = server.store.decision_instances();
+            if remaining.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(remaining.len(), 2, "only the deleted evaluation's rows go");
+        assert!(
+            remaining
+                .iter()
+                .all(|r| r.decision_evaluation_key.to_string() == kept)
+        );
+    }
+
+    /// Issue #1292 (Zeebe parity): each evaluated decision reports the exact
+    /// definition (key + version) that was evaluated, resolved within the
+    /// evaluated DRG (Zeebe stamps `decisionKey`/`decisionVersion` per evaluated
+    /// decision at evaluation time). A lookup by `decision_id` alone returned an
+    /// arbitrary version once a decision was redeployed.
+    #[tokio::test]
+    async fn decision_instance_reports_the_evaluated_version_after_redeploy() {
+        let server = ServerImpl::default();
+        deploy_issue_1292(&server, "hallo", true).await;
+        deploy_issue_1292(&server, "servus", false).await;
+        let mut defs = Vec::new();
+        for _ in 0..300 {
+            defs = server.store.decision_definitions();
+            if defs.len() == 4 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let key_of = |id: &str, version: i32| {
+            defs.iter()
+                .find(|d| d.decision_id == id && d.version == version)
+                .unwrap_or_else(|| panic!("{id} v{version} projected: {defs:#?}"))
+                .decision_key
+                .to_string()
+        };
+        start_greeter(&server, "de").await;
+
+        let rows = decision_rows(&server, 2).await;
+        let (base, root) = (&rows[0], &rows[1]);
+        assert_eq!(
+            root.result, "\"servus\"",
+            "the latest DRG version is evaluated"
+        );
+        assert_eq!(base.decision_definition_id, "base");
+        assert_eq!(base.decision_definition_version, 2);
+        assert_eq!(base.decision_definition_key.0, key_of("base", 2));
+        assert_eq!(root.decision_definition_version, 2);
+        assert_eq!(root.decision_definition_key.0, key_of("root", 2));
+        assert_eq!(base.root_decision_definition_key.0, key_of("root", 2));
+    }
+
+    /// Issue #1292 (Zeebe parity): a failed businessRuleTask evaluation still
+    /// records a decision instance next to its incident (Zeebe writes a
+    /// `DecisionEvaluation:FAILED` record). Like Camunda's exporter, the failed
+    /// decision — the last one evaluated — is FAILED and carries the failure
+    /// message; the required decisions that succeeded before it stay EVALUATED.
+    #[tokio::test]
+    async fn failed_business_rule_task_evaluation_records_a_failed_decision_instance() {
+        let server = ServerImpl::default();
+        deploy_issue_1292(&server, "hallo", true).await;
+        let instance = start_greeter(&server, "xx").await;
+
+        let rows = decision_rows(&server, 2).await;
+        let (base, root) = (&rows[0], &rows[1]);
+        assert_eq!(base.decision_evaluation_key, root.decision_evaluation_key);
+        assert_eq!(base.decision_definition_id, "base");
+        assert_eq!(base.state, models::DecisionInstanceStateEnum::Evaluated);
+        assert_eq!(
+            base.evaluation_failure,
+            nanobpm_gateway_rest::types::Nullable::Null
+        );
+        assert_eq!(root.decision_definition_id, "root");
+        assert_eq!(root.state, models::DecisionInstanceStateEnum::Failed);
+        let nanobpm_gateway_rest::types::Nullable::Present(message) = &root.evaluation_failure
+        else {
+            panic!("the failed decision carries its failure message: {root:#?}");
+        };
+        assert!(!message.is_empty());
+        assert_eq!(root.result, "null", "a failed decision has no output");
+        assert_eq!(
+            root.process_instance_key,
+            nanobpm_gateway_rest::types::Nullable::Present(models::ProcessInstanceKey(
+                instance.to_string()
+            ))
+        );
+    }
+
+    /// Issue #1292 (Zeebe parity): the standalone EvaluateDecision API is a
+    /// journaled command (`DecisionEvaluationEvaluateProcessor`): each call mints
+    /// a fresh evaluation key, returned as both `decisionEvaluationKey` and the
+    /// deprecated `decisionInstanceKey`, records a decision instance with no
+    /// process instance, and numbers each evaluated decision
+    /// `"{decisionEvaluationKey}-{n}"`, resolved within the evaluated DRG
+    /// version. A failed evaluation is still a 200 carrying the failure, and is
+    /// recorded as a FAILED decision instance.
+    #[tokio::test]
+    async fn standalone_decision_evaluation_is_journaled_with_a_minted_key() {
+        use apis::decision_instance::GetDecisionInstanceResponse as GetResp;
+        use nanobpm_gateway_rest::apis::decision_definition::EvaluateDecisionResponse as Resp;
+        use nanobpm_gateway_rest::types::Nullable;
+        let server = ServerImpl::default();
+        deploy_issue_1292(&server, "hallo", false).await;
+        let evaluate = |instruction: models::DecisionEvaluationInstruction| {
+            let server = &server;
+            async move {
+                match server
+                    .evaluate_decision_impl(&instruction)
+                    .await
+                    .expect("handler returns a response")
+                {
+                    Resp::Status200_TheDecisionWasEvaluated(r) => r,
+                    other => panic!("expected a 200 evaluation, got {other:?}"),
+                }
+            }
+        };
+        let by_id = |lang: &str| {
+            let mut variables = std::collections::HashMap::new();
+            variables.insert(
+                "lang".to_string(),
+                nanobpm_gateway_rest::types::Object(serde_json::json!(lang)),
+            );
+            let mut b = models::DecisionEvaluationById::new("root".to_string());
+            b.variables = Some(variables);
+            models::DecisionEvaluationInstruction::DecisionEvaluationById(b)
+        };
+
+        let one = evaluate(by_id("de")).await;
+        let two = evaluate(by_id("de")).await;
+        for r in [&one, &two] {
+            assert_eq!(r.output, "\"hallo\"");
+            assert_eq!(r.decision_evaluation_key.0, r.decision_instance_key.0);
+            assert_ne!(r.decision_evaluation_key.0, r.decision_definition_key.0);
+            let ids: Vec<&str> = r
+                .evaluated_decisions
+                .iter()
+                .map(|d| d.decision_evaluation_instance_key.as_str())
+                .collect();
+            let k = &r.decision_evaluation_key.0;
+            assert_eq!(ids, vec![format!("{k}-1"), format!("{k}-2")]);
+        }
+        assert_ne!(
+            one.decision_evaluation_key.0, two.decision_evaluation_key.0,
+            "every evaluation mints its own key"
+        );
+
+        // Both evaluations are journaled as instance-less decision instances.
+        let rows = decision_rows(&server, 4).await;
+        assert!(rows.iter().all(|r| r.process_instance_key == Nullable::Null
+            && r.element_instance_key == Nullable::Null
+            && r.process_definition_key == Nullable::Null));
+        let got = server
+            .get_decision_instance_impl(&models::GetDecisionInstancePathParams {
+                decision_evaluation_instance_key: one.evaluated_decisions[1]
+                    .decision_evaluation_instance_key
+                    .clone(),
+            })
+            .await
+            .expect("get returns a response");
+        let GetResp::Status200_TheDecisionInstanceIsSuccessfullyReturned(got) = got else {
+            panic!("the evaluation response's id resolves: {got:?}");
+        };
+        assert_eq!(got.decision_definition_id, "root");
+        assert_eq!(got.decision_evaluation_key, one.decision_evaluation_key);
+
+        // A failed evaluation is a 200 with the failure, recorded as FAILED.
+        let failed = evaluate(by_id("xx")).await;
+        assert_eq!(
+            failed.failed_decision_definition_id,
+            Nullable::Present("root".to_string())
+        );
+        assert!(matches!(&failed.failure_message, Nullable::Present(m) if !m.is_empty()));
+        assert_eq!(
+            failed.evaluated_decisions.len(),
+            2,
+            "the failed decision is audited"
+        );
+        let rows = decision_rows(&server, 6).await;
+        let failed_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.decision_evaluation_key == failed.decision_evaluation_key)
+            .collect();
+        assert_eq!(failed_rows.len(), 2);
+        assert_eq!(
+            failed_rows[0].state,
+            models::DecisionInstanceStateEnum::Evaluated
+        );
+        assert_eq!(
+            failed_rows[1].state,
+            models::DecisionInstanceStateEnum::Failed
+        );
+
+        // Pinned to the v1 key after a redeploy, every evaluated decision is
+        // resolved within the v1 DRG (not the latest version of its id).
+        let v1_root_key = one.decision_definition_key.clone();
+        let v1_base_key = one.evaluated_decisions[0].decision_definition_key.clone();
+        deploy_issue_1292(&server, "servus", false).await;
+        let mut b = models::DecisionEvaluationByKey::new(v1_root_key.clone());
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(
+            "lang".to_string(),
+            nanobpm_gateway_rest::types::Object(serde_json::json!("de")),
+        );
+        b.variables = Some(variables);
+        let pinned =
+            evaluate(models::DecisionEvaluationInstruction::DecisionEvaluationByKey(b)).await;
+        assert_eq!(pinned.output, "\"hallo\"");
+        assert_eq!(pinned.decision_definition_version, 1);
+        assert_eq!(
+            pinned.evaluated_decisions[0].decision_definition_key,
+            v1_base_key
+        );
+        assert_eq!(pinned.evaluated_decisions[0].decision_definition_version, 1);
+        assert_eq!(
+            pinned.evaluated_decisions[1].decision_definition_key,
+            v1_root_key
+        );
+        // ...and so do its projected rows (no `decision_id`-only lookup, which
+        // resolves to whichever version the read model returns first).
+        let rows = decision_rows(&server, 8).await;
+        let pinned_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.decision_evaluation_key == pinned.decision_evaluation_key)
+            .collect();
+        assert_eq!(pinned_rows.len(), 2);
+        assert_eq!(pinned_rows[0].decision_definition_key, v1_base_key);
+        assert_eq!(pinned_rows[0].decision_definition_version, 1);
+        assert_eq!(pinned_rows[1].decision_definition_key, v1_root_key);
+        assert_eq!(pinned_rows[1].decision_definition_version, 1);
+        assert_eq!(pinned_rows[0].root_decision_definition_key, v1_root_key);
+
+        // Deleting one standalone evaluation (no process instance — routed by
+        // its own key) retracts exactly its rows.
+        use apis::decision_instance::DeleteDecisionInstanceResponse as DelResp;
+        let deleted = server
+            .delete_decision_instance_impl(&models::DeleteDecisionInstancePathParams {
+                decision_evaluation_key: two.decision_evaluation_key.0.clone(),
+            })
+            .await
+            .expect("delete returns a response");
+        assert!(
+            matches!(
+                deleted,
+                DelResp::Status204_TheDecisionInstanceIsMarkedForDeletion
+            ),
+            "{deleted:?}"
+        );
+        let rows = decision_rows(&server, 6).await;
+        assert!(
+            rows.iter()
+                .all(|r| r.decision_evaluation_key != two.decision_evaluation_key)
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.decision_evaluation_key == one.decision_evaluation_key)
+                .count(),
+            2,
+            "another evaluation of the same decision is untouched"
+        );
+    }
+
+    /// PR #1305 review: an evaluation's decision count `n` is unbounded, so the
+    /// synthetic cursor key `decision_evaluation_key * 1000 + idx` collided —
+    /// the 1,001st row of evaluation `k` shared a key with the first row of the
+    /// next consecutively minted evaluation `k + 1`, and `paginate`'s
+    /// unique-key requirement broke (cursor paging skipped or repeated rows).
+    /// The cursor key is the composite `(decision_evaluation_key, idx)`, which
+    /// is unique per row however large an evaluation grows.
+    #[tokio::test]
+    async fn decision_instance_search_pages_past_a_thousand_decision_evaluation() {
+        use apis::decision_instance::SearchDecisionInstancesResponse as SearchResp;
+        use nanobpmn_engine_core::dmn::{DecisionType, EvaluatedDecision};
+
+        let server = ServerImpl::default();
+        // Two standalone evaluations minted consecutively: `EVAL_KEY` with 1,001
+        // evaluated decisions, then `EVAL_KEY + 1` with one. Under the scaled
+        // key, `EVAL_KEY * 1000 + 1001 == (EVAL_KEY + 1) * 1000 + 1`.
+        const EVAL_KEY: u64 = 225_179_981_368_524_800; // partition 5, sequence 0
+        let evaluated = |eval_key: u64, n: usize| {
+            let evaluated_decisions = (0..n)
+                .map(|i| EvaluatedDecision {
+                    decision_id: format!("d{i}"),
+                    decision_name: format!("Decision {i}"),
+                    decision_type: DecisionType::DecisionTable,
+                    decision_output: Value::Int(i as i64),
+                    evaluated_inputs: Vec::new(),
+                    matched_rules: Vec::new(),
+                    decision_key: 9_000 + i as u64,
+                    decision_version: 1,
+                })
+                .collect();
+            Event::DecisionEvaluated {
+                instance_key: 0,
+                element_instance_key: 0,
+                element_id: String::new(),
+                decision_key: 9_000,
+                decision_id: "d0".to_string(),
+                decision_output: Value::Int(0),
+                evaluated_decisions,
+                evaluated_at: 123,
+                decision_evaluation_key: eval_key,
+                failure: None,
+                decision_requirements_key: 77,
+                decision_requirements_id: "drg".to_string(),
+            }
+        };
+        let events = [evaluated(EVAL_KEY, 1_001), evaluated(EVAL_KEY + 1, 1)];
+        let shards = server.store.shards();
+        let (_, shard) = shards.first().expect("a default server has one shard");
+        shard
+            .export(&events.iter().collect::<Vec<_>>())
+            .expect("project the synthetic evaluations");
+        assert_eq!(server.store.decision_instances().len(), 1_002);
+
+        let search = |page: Option<models::SearchQueryPageRequest>| {
+            let server = &server;
+            async move {
+                let q = models::DecisionInstanceSearchQuery {
+                    filter: None,
+                    sort: None,
+                    page,
+                };
+                let SearchResp::Status200_TheDecisionInstanceSearchResult(r) = server
+                    .search_decision_instances_impl(&Some(q))
+                    .await
+                    .expect("search returns a response")
+                else {
+                    panic!("expected a 200 search result");
+                };
+                r
+            }
+        };
+        let ids = |r: &models::DecisionInstanceSearchQueryResult| -> Vec<String> {
+            r.items
+                .iter()
+                .map(|i| i.decision_evaluation_instance_key.clone())
+                .collect()
+        };
+
+        // Page FORWARD through every row; no row may repeat or be skipped.
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let r = search(Some(
+                models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: after.take(),
+                        limit: Some(100),
+                    },
+                ),
+            ))
+            .await;
+            let done = r.items.len() < 100;
+            let page_ids = ids(&r);
+            let end = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => None,
+            };
+            seen.extend(page_ids);
+            if done {
+                break;
+            }
+            after = end;
+        }
+        assert_eq!(seen.len(), 1_002, "every row paged exactly once");
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            1_002,
+            "no row repeated across cursor pages (colliding cursor keys)"
+        );
+        let last_of_big = format!("{EVAL_KEY}-1001");
+        let first_of_next = format!("{}-1", EVAL_KEY + 1);
+        assert!(
+            seen.contains(&last_of_big),
+            "the 1,001st decision of the first evaluation is reachable"
+        );
+        assert!(
+            seen.contains(&first_of_next),
+            "the next evaluation's first row is not shadowed"
+        );
+
+        // BACKWARD pagination anchoring on the colliding cursor. The default
+        // order is the composite key ascending, so the first row of the next
+        // evaluation (`{E+1}-1`) sorts immediately AFTER `{E}-1001` (their
+        // synthetic `*1000+idx` keys collided). Anchoring `before` on
+        // `{E+1}-1`'s cursor must resume just before THAT row — but the
+        // colliding key made `paginate` resolve the cursor to the FIRST row
+        // carrying it (`{E}-1001`), silently dropping `{E}-1001` from the page.
+        let first_page = search(Some(models::SearchQueryPageRequest::LimitPagination(
+            models::LimitPagination { limit: Some(100) },
+        )))
+        .await;
+        // Walk forward to the final page to learn `{E+1}-1`'s cursor.
+        let mut last_row = ids(&first_page).pop().unwrap();
+        let mut cursor = match first_page.page.end_cursor {
+            types::Nullable::Present(c) => c,
+            types::Nullable::Null => panic!("a non-empty page has an end cursor"),
+        };
+        loop {
+            let r = search(Some(
+                models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: Some(cursor.clone()),
+                        limit: Some(100),
+                    },
+                ),
+            ))
+            .await;
+            if r.items.is_empty() {
+                break;
+            }
+            let page_ids = ids(&r);
+            let under = page_ids.len() < 100;
+            last_row = page_ids.last().cloned().unwrap();
+            if let types::Nullable::Present(c) = r.page.end_cursor {
+                cursor = c;
+            }
+            if under {
+                break;
+            }
+        }
+        assert_eq!(last_row, first_of_next, "the last row overall is {{E+1}}-1");
+
+        // The page immediately BEFORE `{E+1}-1` must end at `{E}-1001`.
+        let back = search(Some(
+            models::SearchQueryPageRequest::CursorBackwardPagination(
+                models::CursorBackwardPagination {
+                    before: Some(cursor.clone()),
+                    limit: Some(100),
+                },
+            ),
+        ))
+        .await;
+        let back_ids = ids(&back);
+        assert_eq!(
+            back_ids.last().map(String::as_str),
+            Some(last_of_big.as_str()),
+            "backward page before {{E+1}}-1 ends at {{E}}-1001 (not dropped by the \
+             colliding cursor key): {back_ids:?}"
+        );
+    }
+
     /// `UserTaskFilter.$or` (upstream #1291 re-sync): top-level fields AND any
     /// one `$or` clause (each clause an AND of its own fields). Previously the
     /// clause list was silently ignored, so the search returned a superset.
@@ -33556,6 +34342,107 @@ mod clustered_startup_tests {
                 }
             }
         }
+    }
+
+    /// Sum of the Raft applied indexes of every partition `node` hosts.
+    fn raft_applied_total(node: &ServerImpl) -> u64 {
+        (0..node.engine.topology().num_partitions)
+            .filter_map(|p| node.raft_registry().get(p))
+            .map(|part| {
+                part.raft
+                    .metrics()
+                    .borrow()
+                    .last_applied
+                    .map(|l| l.index)
+                    .unwrap_or(0)
+            })
+            .sum()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn standalone_decision_evaluate_and_delete_replicate_through_raft() {
+        // #1305 review: a standalone evaluation (and its deletion) is a durable
+        // write, so under Raft it must enter the replicated log — never a direct
+        // local-journal apply that a failover would lose.
+        use apis::decision_definition::EvaluateDecisionResponse as Resp;
+        use apis::decision_instance::DeleteDecisionInstanceResponse as DelResp;
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert("greet-drg".to_string(), "greet.dmn".to_string());
+        let (_r, events) = node0
+            .deploy_resources_locally(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![issue_1292_drg("hallo")],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("deploy the DRG on the owner");
+        node1.install_replicated_deployment(events.to_vec()).await;
+        node2.install_replicated_deployment(events.to_vec()).await;
+
+        let before = raft_applied_total(&node0);
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(
+            "lang".to_string(),
+            nanobpm_gateway_rest::types::Object(serde_json::json!("de")),
+        );
+        let mut by_id = models::DecisionEvaluationById::new("root".to_string());
+        by_id.variables = Some(variables);
+        let resp = node0
+            .evaluate_decision_impl(
+                &models::DecisionEvaluationInstruction::DecisionEvaluationById(by_id),
+            )
+            .await
+            .expect("evaluate returns a response");
+        let result = match resp {
+            Resp::Status200_TheDecisionWasEvaluated(r) => r,
+            other => panic!("evaluate through raft should be 200, got {other:?}"),
+        };
+        let after_eval = raft_applied_total(&node0);
+        assert!(
+            after_eval > before,
+            "the evaluation entered the Raft log ({before} -> {after_eval})"
+        );
+
+        // The leader's read model projects the rows; delete them through Raft.
+        let key: u64 = result
+            .decision_evaluation_key
+            .0
+            .parse()
+            .expect("numeric key");
+        let mut projected = false;
+        for _ in 0..250 {
+            if !node0
+                .store
+                .decision_instances_by_evaluation_key(key)
+                .is_empty()
+            {
+                projected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(projected, "the evaluation projects decision-instance rows");
+        let deleted = node0
+            .delete_decision_instance_impl(&models::DeleteDecisionInstancePathParams {
+                decision_evaluation_key: result.decision_evaluation_key.0.clone(),
+            })
+            .await
+            .expect("delete returns a response");
+        assert!(
+            matches!(
+                deleted,
+                DelResp::Status204_TheDecisionInstanceIsMarkedForDeletion
+            ),
+            "{deleted:?}"
+        );
+        let after_delete = raft_applied_total(&node0);
+        assert!(
+            after_delete > after_eval,
+            "the deletion entered the Raft log ({after_eval} -> {after_delete})"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

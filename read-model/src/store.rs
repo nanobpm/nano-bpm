@@ -5306,8 +5306,18 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             decision_key: root_decision_key,
             evaluated_decisions,
             evaluated_at,
+            failure,
+            decision_requirements_key,
+            decision_requirements_id,
             ..
         } => {
+            // The evaluation's own key (#1292): minted per evaluation, so repeat
+            // and standalone evaluations never collide. Legacy records derive it
+            // canonically (see `Event::decision_evaluation_key`).
+            let evaluation_key = event
+                .decision_evaluation_key()
+                .expect("DecisionEvaluated always identifies its evaluation");
+            let last = evaluated_decisions.len();
             // The owning process definition key (join within this shard; the
             // businessRuleTask instance is projected here). Empty when absent.
             let process_definition_key: String = tx
@@ -5322,21 +5332,45 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 .unwrap_or_default();
             // One decision-instance row per evaluated decision (required
             // decisions first, root decision last), indexed 1-based within the
-            // evaluation, mirroring Zeebe's decision-instance records.
+            // evaluation, mirroring Zeebe's decision-instance records. A failed
+            // evaluation's trail ends with the decision that failed: that row is
+            // FAILED and carries the failure; the others stay EVALUATED (Zeebe
+            // exporter parity).
             for (i, ed) in evaluated_decisions.iter().enumerate() {
-                let idx = (i + 1) as i64;
-                let eval_instance_key = format!("{root_decision_key}-{idx}");
-                let (decision_key, version, drg_id, drg_key): (i64, i32, String, i64) = tx
-                    .cquery_row(
-                        "SELECT decision_key, version, decision_requirements_id, \
-                         decision_requirements_key FROM decision_definitions WHERE decision_id = ?1",
-                        params![ed.decision_id],
-                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                let idx = i + 1;
+                let eval_instance_key = nanobpmn_engine_core::dmn::decision_evaluation_instance_key(
+                    evaluation_key,
+                    idx,
+                );
+                let idx = idx as i64;
+                // The engine stamps the exact definition evaluated (within the
+                // evaluated DRG version) and the DRG itself; records from before
+                // #1292 (`0` / empty) fall back to the latest deployment by id —
+                // all such a record can say.
+                let (decision_key, version, drg_id, drg_key): (i64, i32, String, i64) = if ed
+                    .decision_key
+                    != 0
+                    && *decision_requirements_key != 0
+                {
+                    (
+                        ed.decision_key as i64,
+                        ed.decision_version,
+                        decision_requirements_id.clone(),
+                        *decision_requirements_key as i64,
                     )
-                    .optional()
-                    .ok()
-                    .flatten()
-                    .unwrap_or((*root_decision_key as i64, 1, String::new(), 0));
+                } else {
+                    tx.cquery_row(
+                            "SELECT decision_key, version, decision_requirements_id, \
+                             decision_requirements_key FROM decision_definitions WHERE decision_id = ?1",
+                            params![ed.decision_id],
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .unwrap_or((*root_decision_key as i64, 1, String::new(), 0))
+                };
+                let failed = failure.as_ref().filter(|_| i + 1 == last);
                 let result_json = serde_json::to_string(&crate::value_to_json(&ed.decision_output))
                     .unwrap_or_else(|_| "null".to_string());
                 let inputs_json = serde_json::to_string(
@@ -5390,7 +5424,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                      ON CONFLICT(eval_instance_key) DO NOTHING",
                     params![
                         eval_instance_key,
-                        *root_decision_key as i64,
+                        evaluation_key as i64,
                         idx,
                         ed.decision_id,
                         decision_key,
@@ -5403,8 +5437,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                         *instance_key as i64,
                         *element_instance_key as i64,
                         process_definition_key,
-                        "EVALUATED",
-                        Option::<String>::None,
+                        if failed.is_some() { "FAILED" } else { "EVALUATED" },
+                        failed.map(|f| f.message.clone()),
                         *evaluated_at as i64,
                         result_json,
                         inputs_json,
@@ -5417,16 +5451,25 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
 
         Event::DecisionInstanceDeleted {
             decision_evaluation_key,
-            ..
+            instance_key,
         } => {
             // Retract every decision-instance row of this evaluation (one per
             // evaluated decision). Idempotent: a replay or a broadcast to a shard
             // that never held the rows deletes nothing. Because this is journaled
             // on the owning instance's partition (same shard as the originating
             // DecisionEvaluated), the deletion survives replay/rebuild.
+            //
+            // Scoped to the owning instance (`0` for a standalone evaluation).
+            // Records written before #1292 carry the evaluation's root decision
+            // *definition* key rather than an evaluation key, so the second arm
+            // retracts that instance's rows of that decision — whether they were
+            // projected under the legacy definition-keyed scheme or re-projected
+            // under the per-evaluation scheme. Evaluation keys and definition
+            // keys come from one key space, so the arms never cross-match.
             tx.cexecute(
-                "DELETE FROM decision_instances WHERE decision_evaluation_key = ?1",
-                params![*decision_evaluation_key as i64],
+                "DELETE FROM decision_instances WHERE instance_key = ?2 \
+                 AND (decision_evaluation_key = ?1 OR root_decision_key = ?1)",
+                params![*decision_evaluation_key as i64, *instance_key as i64],
             )?;
         }
 
@@ -8446,9 +8489,13 @@ mod decision_deletion_tests {
 
     use super::ReadStore;
 
-    /// A DecisionEvaluated for process instance `instance_key`, whose root decision
-    /// (definition) key — the `decisionEvaluationKey` — is `eval_key`, carrying
-    /// `n` evaluated decisions (so it projects `n` decision-instance rows).
+    /// Root decision definition key every [`evaluated_event`] evaluates.
+    const ROOT_DECISION_KEY: u64 = 9_000;
+
+    /// A DecisionEvaluated for process instance `instance_key` (`0` =
+    /// standalone) with its own minted evaluation key `eval_key`, carrying `n`
+    /// evaluated decisions stamped with their definition key/version (so it
+    /// projects `n` decision-instance rows).
     fn evaluated_event(instance_key: u64, eval_key: u64, n: usize) -> Event {
         let evaluated_decisions = (0..n)
             .map(|i| EvaluatedDecision {
@@ -8458,18 +8505,217 @@ mod decision_deletion_tests {
                 decision_output: Value::Int(i as i64),
                 evaluated_inputs: Vec::new(),
                 matched_rules: Vec::new(),
+                decision_key: ROOT_DECISION_KEY + i as u64,
+                decision_version: 1,
             })
             .collect();
         Event::DecisionEvaluated {
             instance_key,
-            element_instance_key: instance_key + 1,
-            element_id: "brt".to_string(),
-            decision_key: eval_key,
+            element_instance_key: if instance_key == 0 {
+                0
+            } else {
+                instance_key + 1
+            },
+            element_id: if instance_key == 0 {
+                String::new()
+            } else {
+                "brt".to_string()
+            },
+            decision_key: ROOT_DECISION_KEY,
             decision_id: "d0".to_string(),
             decision_output: Value::Int(0),
             evaluated_decisions,
             evaluated_at: 123,
+            decision_evaluation_key: eval_key,
+            failure: None,
+            decision_requirements_key: 77,
+            decision_requirements_id: "drg".to_string(),
         }
+    }
+
+    /// The same evaluation as a journal written before #1292 records it: no
+    /// evaluation key, no DRG, unstamped decisions.
+    fn legacy_evaluated_event(instance_key: u64, n: usize) -> Event {
+        let Event::DecisionEvaluated {
+            instance_key,
+            element_instance_key,
+            element_id,
+            decision_key,
+            decision_id,
+            decision_output,
+            mut evaluated_decisions,
+            evaluated_at,
+            ..
+        } = evaluated_event(instance_key, 0, n)
+        else {
+            unreachable!()
+        };
+        for d in &mut evaluated_decisions {
+            d.decision_key = 0;
+            d.decision_version = 0;
+        }
+        Event::DecisionEvaluated {
+            instance_key,
+            element_instance_key,
+            element_id,
+            decision_key,
+            decision_id,
+            decision_output,
+            evaluated_decisions,
+            evaluated_at,
+            decision_evaluation_key: 0,
+            failure: None,
+            decision_requirements_key: 0,
+            decision_requirements_id: String::new(),
+        }
+    }
+
+    /// #1292: two evaluations of the same decision in the same instance are
+    /// two decision instances (they used to share the definition-keyed rows).
+    #[test]
+    fn repeat_evaluations_of_one_decision_are_distinct_decision_instances() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[&evaluated_event(5, 100, 2), &evaluated_event(5, 200, 2)])
+            .unwrap();
+        let first = store.decision_instances_by_evaluation_key(100);
+        let second = store.decision_instances_by_evaluation_key(200);
+        assert_eq!((first.len(), second.len()), (2, 2));
+        let keys: Vec<_> = first
+            .iter()
+            .chain(&second)
+            .map(|r| r.eval_instance_key.as_str())
+            .collect();
+        assert_eq!(keys, ["100-1", "100-2", "200-1", "200-2"]);
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .all(|r| r.root_decision_key == ROOT_DECISION_KEY && r.state == "EVALUATED")
+        );
+    }
+
+    /// Rows report the definition the engine stamped (the evaluated DRG
+    /// version), never the latest deployment of the id.
+    #[test]
+    fn rows_report_the_stamped_definition_and_drg() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&evaluated_event(5, 100, 2)]).unwrap();
+        let rows = store.decision_instances_by_evaluation_key(100);
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.decision_key,
+                    r.version,
+                    r.decision_requirements_key,
+                    r.decision_requirements_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (ROOT_DECISION_KEY, 1, 77, "drg"),
+                (ROOT_DECISION_KEY + 1, 1, 77, "drg")
+            ]
+        );
+    }
+
+    /// A failed evaluation's trail ends with the decision that failed: only
+    /// that row is FAILED and carries the failure (Zeebe exporter parity).
+    #[test]
+    fn failed_evaluation_marks_only_the_last_row_failed() {
+        let store = ReadStore::open(None).unwrap();
+        let Event::DecisionEvaluated {
+            instance_key,
+            element_instance_key,
+            element_id,
+            decision_key,
+            decision_id,
+            decision_output,
+            evaluated_decisions,
+            evaluated_at,
+            decision_evaluation_key,
+            decision_requirements_key,
+            decision_requirements_id,
+            ..
+        } = evaluated_event(5, 100, 2)
+        else {
+            unreachable!()
+        };
+        store
+            .export(&[&Event::DecisionEvaluated {
+                instance_key,
+                element_instance_key,
+                element_id,
+                decision_key,
+                decision_id,
+                decision_output,
+                evaluated_decisions,
+                evaluated_at,
+                decision_evaluation_key,
+                failure: Some(nanobpmn_engine_core::dmn::EvaluationFailure {
+                    message: "boom".to_string(),
+                    failed_decision_id: "d1".to_string(),
+                }),
+                decision_requirements_key,
+                decision_requirements_id,
+            }])
+            .unwrap();
+        let rows = store.decision_instances_by_evaluation_key(100);
+        let got: Vec<_> = rows
+            .iter()
+            .map(|r| (r.state.as_str(), r.evaluation_failure.as_deref()))
+            .collect();
+        assert_eq!(got, [("EVALUATED", None), ("FAILED", Some("boom"))]);
+    }
+
+    /// A standalone evaluation (no process instance) is a decision instance too.
+    #[test]
+    fn standalone_evaluation_projects_instance_less_rows() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&evaluated_event(0, 300, 1)]).unwrap();
+        let rows = store.decision_instances_by_evaluation_key(300);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].instance_key, rows[0].element_instance_key), (0, 0));
+        assert_eq!(rows[0].process_definition_key, "");
+        assert_eq!(rows[0].business_id, None);
+        // ...and it is deletable through its own evaluation key.
+        store
+            .export(&[&Event::DecisionInstanceDeleted {
+                instance_key: 0,
+                decision_evaluation_key: 300,
+            }])
+            .unwrap();
+        assert!(store.decision_instances_by_evaluation_key(300).is_empty());
+    }
+
+    /// Pre-#1292 journals: an evaluation is identified by its element instance
+    /// key, and a legacy deletion (which named the root decision *definition*
+    /// key) retracts only the owning instance's rows of that decision.
+    #[test]
+    fn legacy_records_key_by_element_instance_and_delete_per_instance() {
+        let store = ReadStore::open(None).unwrap();
+        store
+            .export(&[&legacy_evaluated_event(5, 2), &legacy_evaluated_event(9, 1)])
+            .unwrap();
+        // Element instance keys are instance_key + 1.
+        assert_eq!(store.decision_instances_by_evaluation_key(6).len(), 2);
+        assert!(store.decision_instance("6-1").is_some());
+        assert_eq!(store.decision_instances_by_evaluation_key(10).len(), 1);
+        store
+            .export(&[&Event::DecisionInstanceDeleted {
+                instance_key: 5,
+                decision_evaluation_key: ROOT_DECISION_KEY,
+            }])
+            .unwrap();
+        assert!(store.decision_instances_by_evaluation_key(6).is_empty());
+        assert_eq!(
+            store.decision_instances_by_evaluation_key(10).len(),
+            1,
+            "a legacy deletion stays within its instance"
+        );
     }
 
     /// Every artifact snapshots the owning instance's `businessId` when it is

@@ -134,8 +134,9 @@ pub enum Event {
 
     /// A decision was evaluated — by a `businessRuleTask` (with `instance_key` /
     /// `element_id` set) or by the standalone EvaluateDecision API (both `0` /
-    /// empty). Carries the root output and the per-decision audit trail for
-    /// exporter parity with Zeebe's decision-evaluation records.
+    /// empty — Zeebe's `-1`). Carries the root output and the per-decision audit
+    /// trail for exporter parity with Zeebe's decision-evaluation records; a
+    /// failed evaluation is recorded too (`failure` set).
     DecisionEvaluated {
         instance_key: Key,
         element_instance_key: Key,
@@ -149,15 +150,37 @@ pub enum Event {
         /// this field existed still replay.
         #[cfg_attr(feature = "serde", serde(default))]
         evaluated_at: u64,
+        /// The evaluation's own key, minted per evaluation from the partition
+        /// key generator (Zeebe's `decisionEvaluationKey`, issue #1292). `0` in
+        /// journals written before this field existed: read it through
+        /// [`Event::decision_evaluation_key`], which derives a stable
+        /// per-evaluation key for those legacy records.
+        #[cfg_attr(feature = "serde", serde(default))]
+        decision_evaluation_key: Key,
+        /// Why the evaluation failed, if it did (`None` = EVALUATED; Zeebe's
+        /// `DecisionEvaluation:FAILED`, whose audit trail ends with the failed
+        /// decision). Defaulted so older journals replay.
+        #[cfg_attr(feature = "serde", serde(default))]
+        failure: Option<crate::dmn::EvaluationFailure>,
+        /// Key and id of the decision requirements graph (DRG) version that was
+        /// evaluated — every evaluated decision belongs to it (Zeebe's
+        /// `decisionRequirementsKey`/`Id`). Carried on the event because the
+        /// read model retains only the latest version of a DRG. `0` / empty in
+        /// journals written before #1292.
+        #[cfg_attr(feature = "serde", serde(default))]
+        decision_requirements_key: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        decision_requirements_id: String,
     },
 
-    /// A decision instance (all rows sharing `decision_evaluation_key`, i.e. the
-    /// root decision key of one [`Event::DecisionEvaluated`]) was marked for
-    /// deletion via the DeleteDecisionInstance management API. `instance_key` is
-    /// the owning process instance, carried purely so this event is journaled and
-    /// projected on the same partition/shard as the `DecisionEvaluated` it retracts
-    /// (the read model deletes the matching rows). Audit/projection-only: no core
-    /// engine state to mutate.
+    /// A decision instance (all rows of one [`Event::DecisionEvaluated`], sharing
+    /// its [`Event::decision_evaluation_key`]) was marked for deletion via the
+    /// DeleteDecisionInstance management API. `instance_key` is the owning
+    /// process instance (`0` for a standalone evaluation), carried so this event
+    /// is journaled and projected on the same partition/shard as the evaluation
+    /// it retracts. Journals written before #1292 carry the evaluation's *root
+    /// decision definition key* here (the old row key) — the read model honours
+    /// that legacy meaning. Audit/projection-only: no core engine state to mutate.
     DecisionInstanceDeleted {
         instance_key: Key,
         decision_evaluation_key: Key,
@@ -1329,9 +1352,13 @@ impl Event {
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
-            | Event::DecisionEvaluated { instance_key, .. }
-            | Event::DecisionInstanceDeleted { instance_key, .. }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+            // A standalone decision evaluation (and its deletion) belongs to no
+            // process instance: `0` is the "none" sentinel (Zeebe's `-1`).
+            Event::DecisionEvaluated { instance_key, .. }
+            | Event::DecisionInstanceDeleted { instance_key, .. } => {
+                (*instance_key != 0).then_some(*instance_key)
+            }
             Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
             Event::ProcessInstanceSuspended { instance_key, .. } => Some(*instance_key),
             Event::ProcessInstanceResumed { instance_key } => Some(*instance_key),
@@ -1356,6 +1383,55 @@ impl Event {
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
             | Event::StartInstanceDispatched { .. } => None,
+        }
+    }
+
+    /// The decision evaluation an [`Event::DecisionEvaluated`] records — Zeebe's
+    /// `decisionEvaluationKey`, which every decision-instance row of the
+    /// evaluation shares — or `None` for any other event.
+    ///
+    /// This is the single canonical reading of the key (issue #1292): records
+    /// written before the key was minted carry `0`, and fall back to the
+    /// `businessRuleTask`'s `element_instance_key`. Those journals record only
+    /// successful evaluations — at most one per businessRuleTask activation —
+    /// so it is unique per evaluation, and it lives on the same partition, so
+    /// legacy rows get a stable, collision-free key that routes like a minted
+    /// one.
+    pub fn decision_evaluation_key(&self) -> Option<Key> {
+        match self {
+            Event::DecisionEvaluated {
+                decision_evaluation_key,
+                element_instance_key,
+                ..
+            } => Some(if *decision_evaluation_key != 0 {
+                *decision_evaluation_key
+            } else {
+                *element_instance_key
+            }),
+            _ => None,
+        }
+    }
+
+    /// For a decision-instance event (`DecisionEvaluated` /
+    /// `DecisionInstanceDeleted`), the key whose partition owns the decision
+    /// instance ([`crate::dmn::decision_instance_owner_key`]); `None` for every
+    /// other event.
+    pub fn decision_instance_owner_key(&self) -> Option<Key> {
+        match self {
+            Event::DecisionEvaluated { instance_key, .. } => {
+                Some(crate::dmn::decision_instance_owner_key(
+                    *instance_key,
+                    self.decision_evaluation_key()?,
+                ))
+            }
+            Event::DecisionInstanceDeleted {
+                instance_key,
+                decision_evaluation_key,
+            } => Some(crate::dmn::decision_instance_owner_key(
+                *instance_key,
+                *decision_evaluation_key,
+            )),
+            _ => None,
         }
     }
 
@@ -1404,8 +1480,14 @@ impl Event {
             Event::DecisionEvaluated {
                 element_instance_key,
                 decision_key,
+                decision_evaluation_key,
                 ..
-            } => m = m.max(*element_instance_key).max(*decision_key),
+            } => {
+                m = m
+                    .max(*element_instance_key)
+                    .max(*decision_key)
+                    .max(*decision_evaluation_key)
+            }
             Event::DecisionInstanceDeleted {
                 decision_evaluation_key,
                 ..
@@ -1920,6 +2002,37 @@ mod event_decode_tests {
             decode_event_json(torn),
             Err(EventDecodeError::Malformed { .. })
         ));
+    }
+
+    /// A pre-#1292 `DecisionEvaluated` record (no `decision_evaluation_key`,
+    /// no `failure`, evaluated decisions without `decision_key` /
+    /// `decision_version`) still decodes under this build — the additive-field
+    /// replay rule — and its evaluation is identified by the legacy key, its
+    /// element instance key, so an old journal replays to the same rows.
+    #[test]
+    fn legacy_decision_evaluated_record_decodes_with_the_element_instance_key() {
+        let line = r#"{"DecisionEvaluated":{"decision_id":"root","decision_key":34,"decision_output":{"Str":"b"},"element_id":"brt","element_instance_key":39,"evaluated_at":1700000000012,"evaluated_decisions":[{"decision_id":"base","decision_name":"Base","decision_output":{"Str":"b"},"decision_type":"LiteralExpression","evaluated_inputs":[],"matched_rules":[]}],"instance_key":37}}"#;
+        let event = decode_event_json(line).expect("legacy record decodes");
+        let Event::DecisionEvaluated {
+            decision_evaluation_key,
+            failure,
+            evaluated_decisions,
+            ..
+        } = &event
+        else {
+            panic!("expected DecisionEvaluated, got {event:?}")
+        };
+        assert_eq!(*decision_evaluation_key, 0);
+        assert!(failure.is_none());
+        assert_eq!(
+            (
+                evaluated_decisions[0].decision_key,
+                evaluated_decisions[0].decision_version
+            ),
+            (0, 0)
+        );
+        assert_eq!(event.decision_evaluation_key(), Some(39));
+        assert_eq!(event.instance_key(), Some(37));
     }
 
     /// A valid record round-trips through the typed decoder unchanged.

@@ -1382,5 +1382,592 @@
       "element_instance_key": 30,
       "instance_key": 25
     }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 31
+    }
+  },
+  {
+    "DecisionRequirementsDeployed": {
+      "decision_requirements_key": 32,
+      "deployment_key": 31,
+      "drg": {
+        "decisions": [
+          {
+            "id": "base",
+            "logic": {
+              "LiteralExpression": "\"b\""
+            },
+            "name": "Base",
+            "required_decisions": [],
+            "variable_name": null
+          },
+          {
+            "id": "root",
+            "logic": {
+              "DecisionTable": {
+                "aggregation": null,
+                "hit_policy": "Unique",
+                "inputs": [
+                  {
+                    "expression": "lang",
+                    "id": "ri",
+                    "label": null,
+                    "type_ref": "string"
+                  }
+                ],
+                "outputs": [
+                  {
+                    "id": "ro",
+                    "label": null,
+                    "name": "result",
+                    "output_values": [],
+                    "type_ref": "string"
+                  }
+                ],
+                "rules": [
+                  {
+                    "id": "r1",
+                    "input_entries": [
+                      "\"xx\""
+                    ],
+                    "output_entries": [
+                      "\"a\""
+                    ]
+                  },
+                  {
+                    "id": "r2",
+                    "input_entries": [
+                      "\"xx\""
+                    ],
+                    "output_entries": [
+                      "\"b\""
+                    ]
+                  },
+                  {
+                    "id": "r3",
+                    "input_entries": [
+                      "not(\"xx\")"
+                    ],
+                    "output_entries": [
+                      "base"
+                    ]
+                  }
+                ]
+              }
+            },
+            "name": "Root",
+            "required_decisions": [
+              "base"
+            ],
+            "variable_name": null
+          }
+        ],
+        "id": "greet",
+        "name": "greet",
+        "namespace": "",
+        "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+      },
+      "version": 1
+    }
+  },
+  {
+    "DecisionDeployed": {
+      "decision_id": "base",
+      "decision_key": 33,
+      "decision_name": "Base",
+      "decision_requirements_key": 32,
+      "deployment_key": 31,
+      "version": 1
+    }
+  },
+  {
+    "DecisionDeployed": {
+      "decision_id": "root",
+      "decision_key": 34,
+      "decision_name": "Root",
+      "decision_requirements_key": 32,
+      "deployment_key": 31,
+      "version": 1
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 35
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 35,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "brt": {
+            "end_listeners": [],
+            "id": "brt",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "BusinessRuleTask": {
+                "decision_id": "root",
+                "result_variable": "out"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "brt"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "decide",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 36,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000012,
+      "instance_key": 37,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 36,
+      "process_id": "decide",
+      "tags": [],
+      "variables": {
+        "lang": {
+          "Str": "de"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 38,
+      "instance_key": 37
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 38,
+      "instance_key": 37,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 38,
+      "instance_key": 37
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 38,
+      "instance_key": 37
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 37,
+      "to": "brt"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "brt",
+      "element_instance_key": 39,
+      "instance_key": 37
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "brt",
+      "element_instance_key": 39,
+      "instance_key": 37,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "brt",
+      "element_instance_key": 39,
+      "instance_key": 37
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "brt",
+      "element_instance_key": 39,
+      "instance_key": 37
+    }
+  },
+  {
+    "DecisionEvaluated": {
+      "decision_evaluation_key": 40,
+      "decision_id": "root",
+      "decision_key": 34,
+      "decision_output": {
+        "Str": "b"
+      },
+      "decision_requirements_id": "greet",
+      "decision_requirements_key": 32,
+      "element_id": "brt",
+      "element_instance_key": 39,
+      "evaluated_at": 1700000000012,
+      "evaluated_decisions": [
+        {
+          "decision_id": "base",
+          "decision_key": 33,
+          "decision_name": "Base",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "LiteralExpression",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        },
+        {
+          "decision_id": "root",
+          "decision_key": 34,
+          "decision_name": "Root",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "DecisionTable",
+          "decision_version": 1,
+          "evaluated_inputs": [
+            {
+              "input_id": "ri",
+              "input_name": null,
+              "input_value": {
+                "Str": "de"
+              }
+            }
+          ],
+          "matched_rules": [
+            {
+              "evaluated_outputs": [
+                {
+                  "output_id": "ro",
+                  "output_name": "result",
+                  "output_value": {
+                    "Str": "b"
+                  }
+                }
+              ],
+              "rule_id": "r3",
+              "rule_index": 3
+            }
+          ]
+        }
+      ],
+      "failure": null,
+      "instance_key": 37
+    }
+  },
+  {
+    "VariablesUpdated": {
+      "instance_key": 37,
+      "variables": {
+        "out": {
+          "Str": "b"
+        }
+      }
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "brt",
+      "instance_key": 37,
+      "to": "e"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "e",
+      "element_instance_key": 41,
+      "instance_key": 37
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "e",
+      "element_instance_key": 41,
+      "instance_key": 37,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "e",
+      "element_instance_key": 41,
+      "instance_key": 37
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "e",
+      "element_instance_key": 41,
+      "instance_key": 37
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 37
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000013,
+      "instance_key": 42,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 36,
+      "process_id": "decide",
+      "tags": [],
+      "variables": {
+        "lang": {
+          "Str": "xx"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 42,
+      "to": "brt"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "brt",
+      "element_instance_key": 44,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "brt",
+      "element_instance_key": 44,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "DecisionEvaluated": {
+      "decision_evaluation_key": 45,
+      "decision_id": "root",
+      "decision_key": 34,
+      "decision_output": "Null",
+      "decision_requirements_id": "greet",
+      "decision_requirements_key": 32,
+      "element_id": "brt",
+      "element_instance_key": 44,
+      "evaluated_at": 1700000000013,
+      "evaluated_decisions": [
+        {
+          "decision_id": "base",
+          "decision_key": 33,
+          "decision_name": "Base",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "LiteralExpression",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        },
+        {
+          "decision_id": "root",
+          "decision_key": 34,
+          "decision_name": "Root",
+          "decision_output": "Null",
+          "decision_type": "DecisionTable",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        }
+      ],
+      "failure": {
+        "failed_decision_id": "root",
+        "message": "hit policy UNIQUE requires at most one matching rule, but 2 rules matched"
+      },
+      "instance_key": 42
+    }
+  },
+  {
+    "IncidentRaised": {
+      "created_at": 1700000000013,
+      "element_id": "brt",
+      "element_instance_key": 44,
+      "incident_key": 46,
+      "instance_key": 42,
+      "job_key": null,
+      "kind": "DecisionEvaluation",
+      "reason": "failed to evaluate decision 'root' at business rule task 'brt': hit policy UNIQUE requires at most one matching rule, but 2 rules matched",
+      "redrive": null
+    }
+  },
+  {
+    "DecisionEvaluated": {
+      "decision_evaluation_key": 47,
+      "decision_id": "root",
+      "decision_key": 34,
+      "decision_output": {
+        "Str": "b"
+      },
+      "decision_requirements_id": "greet",
+      "decision_requirements_key": 32,
+      "element_id": "",
+      "element_instance_key": 0,
+      "evaluated_at": 1700000000014,
+      "evaluated_decisions": [
+        {
+          "decision_id": "base",
+          "decision_key": 33,
+          "decision_name": "Base",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "LiteralExpression",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        },
+        {
+          "decision_id": "root",
+          "decision_key": 34,
+          "decision_name": "Root",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "DecisionTable",
+          "decision_version": 1,
+          "evaluated_inputs": [
+            {
+              "input_id": "ri",
+              "input_name": null,
+              "input_value": {
+                "Str": "en"
+              }
+            }
+          ],
+          "matched_rules": [
+            {
+              "evaluated_outputs": [
+                {
+                  "output_id": "ro",
+                  "output_name": "result",
+                  "output_value": {
+                    "Str": "b"
+                  }
+                }
+              ],
+              "rule_id": "r3",
+              "rule_index": 3
+            }
+          ]
+        }
+      ],
+      "failure": null,
+      "instance_key": 0
+    }
   }
 ]

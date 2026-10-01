@@ -89,6 +89,9 @@ fn eval_decision(
             .unwrap_or(Value::Null));
     }
     if !on_stack.insert(decision_id.to_string()) {
+        // Audit the decision that closes the cycle so the trail ends with the
+        // failed decision (the invariant the FAILED-row projection relies on).
+        evaluated.push(failed_entry(decision));
         return Err(EvaluationFailure {
             message: format!(
                 "the decision requirements graph has a cycle involving decision '{decision_id}'"
@@ -98,6 +101,20 @@ fn eval_decision(
     }
 
     for required in &decision.required_decisions {
+        if drg.decision(required).is_none() {
+            // An unresolvable requirement fails the *requiring* decision, which
+            // is audited as the last evaluated decision.
+            on_stack.remove(decision_id);
+            evaluated.push(failed_entry(decision));
+            return Err(EvaluationFailure {
+                message: format!(
+                    "decision '{}' requires decision '{required}', which is not in the decision requirements graph",
+                    decision.id
+                ),
+                failed_decision_id: decision.id.clone(),
+            });
+        }
+        // A failing requirement has already audited itself as the last entry.
         eval_decision(drg, required, ctx, evaluated, done, on_stack)?;
     }
 
@@ -110,7 +127,29 @@ fn eval_decision(
             done.insert(decision_id.to_string());
             Ok(output)
         }
-        Err(failure) => Err(failure),
+        Err(failure) => {
+            // Audit the decision that failed as the last evaluated decision, as
+            // Zeebe's DMN audit log does (its `failedDecisionId` is the last
+            // evaluated decision, which the exporter marks FAILED). It has no
+            // output; its partial inputs/rules are not retained.
+            evaluated.push(failed_entry(decision));
+            Err(failure)
+        }
+    }
+}
+
+/// The audit entry for a decision that failed: no output, no partial
+/// inputs/rules.
+fn failed_entry(decision: &Decision) -> EvaluatedDecision {
+    EvaluatedDecision {
+        decision_id: decision.id.clone(),
+        decision_name: decision.name.clone(),
+        decision_type: decision.decision_type(),
+        decision_output: Value::Null,
+        evaluated_inputs: Vec::new(),
+        matched_rules: Vec::new(),
+        decision_key: 0,
+        decision_version: 0,
     }
 }
 
@@ -137,6 +176,8 @@ fn eval_logic(
                 decision_output: output.clone(),
                 evaluated_inputs: Vec::new(),
                 matched_rules: Vec::new(),
+                decision_key: 0,
+                decision_version: 0,
             });
             Ok(output)
         }
@@ -253,6 +294,8 @@ fn eval_table(
                 }
             })
             .collect(),
+        decision_key: 0,
+        decision_version: 0,
     });
 
     Ok(output)
