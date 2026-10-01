@@ -172,7 +172,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     # Defensive cap so a future build wedge (see issue #634) fails fast instead of
     # burning up to GitHub's 6h default and silently blocking the publish job.
-    timeout-minutes: 45
+    # Sized with headroom over the slowest leg: the x86_64-apple-darwin cross
+    # build on macos-14 with a cold cache took 44.7 min at v0.0.25 (vs ~25 min at
+    # v0.0.24), so a 45-min cap killed it and skipped the publish (#1309).
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
