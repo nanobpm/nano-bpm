@@ -2324,6 +2324,30 @@ mod tests {
                 },
                 409,
             ),
+            // Open-parallel/inclusive-join migration rejections (deadlock /
+            // early-fire): centralizing the mapping here must not drop the
+            // coverage the deleted `open_parallel_join_rejections_are_conflicts`
+            // test gave these two variants.
+            (
+                E::MigratedParallelJoinArityChanged {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
+                    target_element_id: "b".into(),
+                    source_incoming_count: 2,
+                    target_incoming_count: 3,
+                },
+                409,
+            ),
+            (
+                E::MigratedJoinFlowMissing {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
+                    target_element_id: "b".into(),
+                    flow_source_element_id: "c".into(),
+                    flow_ordinal: 0,
+                },
+                409,
+            ),
         ];
         for (err, want) in cases {
             assert_eq!(

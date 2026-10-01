@@ -12690,8 +12690,9 @@ impl ServerImpl {
         if !self.raft.is_empty() {
             // `propose_partition_command` already awaits the durable barrier and
             // drives routing / job-sojourn / ad-hoc side effects on the replicated
-            // events, so callers must NOT repeat them.
-            return self.propose_partition_command(key, command).await;
+            // events, so callers must NOT repeat them. `false`: this generic funnel
+            // must not record the stream-completion diagnostic (#1306).
+            return self.propose_partition_command(key, command, false).await;
         }
         let (events, commit) = self
             .engine
@@ -18243,15 +18244,25 @@ impl ServerImpl {
         job_key: u64,
         command: Command,
     ) -> Result<Commit, (u16, String)> {
-        self.propose_partition_command(job_key, command)
+        // The job-stream path owns the `stream_complete_outcome_total` diagnostic,
+        // so it is the only caller that records where the propose landed.
+        self.propose_partition_command(job_key, command, true)
             .await
             .map(|(_, commit)| commit)
     }
 
+    /// `record_stream_outcome` gates the `stream_complete_outcome_total`
+    /// diagnostic (`crate::metrics::record_complete_outcome`): it is documented
+    /// for stream `CompleteJob` outcomes, so only the job-stream caller
+    /// ([`propose_job_for_stream`]) sets it. The generic by-key mutation funnel
+    /// ([`apply_partition_command`]) passes `false` — otherwise a failed cancel,
+    /// incident, user-task, or migration would inflate the stream-completion
+    /// counters and corrupt that diagnostic. #1306.
     async fn propose_partition_command(
         &self,
         key: Key,
         command: Command,
+        record_stream_outcome: bool,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         let p = partition_of(key);
         // Bounded completion write-pause (ADR 0019): while this node is handing
@@ -18259,7 +18270,9 @@ impl ServerImpl {
         // log fully quiesces and the catch-up learner can reach zero lag. Retryable
         // (at-least-once) — the worker redelivers once the brief pause lifts.
         if self.handoff_completion_paused(p) {
-            crate::metrics::record_complete_outcome("handoff_pause");
+            if record_stream_outcome {
+                crate::metrics::record_complete_outcome("handoff_pause");
+            }
             return Err((503, format!("partition {p} handing off; retry")));
         }
         let Some(part) = self.raft.get(p) else {
@@ -18267,18 +18280,24 @@ impl ServerImpl {
         };
         let node_id = self.engine.topology().node_id as u64;
         if part.raft.metrics().borrow().current_leader != Some(node_id) {
-            crate::metrics::record_complete_outcome("leader_reject");
+            if record_stream_outcome {
+                crate::metrics::record_complete_outcome("leader_reject");
+            }
             return Err((503, format!("partition {p} leader unavailable; retry")));
         }
         let response = part
             .propose_result(command, now_millis())
             .await
             .map_err(|e| {
-                crate::metrics::record_complete_outcome("propose_err");
+                if record_stream_outcome {
+                    crate::metrics::record_complete_outcome("propose_err");
+                }
                 (500, format!("raft propose failed: {e}"))
             })?;
         if let Some((status, message)) = response.error {
-            crate::metrics::record_complete_outcome("apply_err");
+            if record_stream_outcome {
+                crate::metrics::record_complete_outcome("apply_err");
+            }
             return Err((status, message));
         }
         self.spawn_routing_if_needed(&response.events);
