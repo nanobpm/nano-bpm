@@ -2411,6 +2411,58 @@ mod tests {
     }
 
     #[test]
+    fn propose_error_classifies_forward_to_leader_as_retryable_leader() {
+        // #1306: a non-leader `client_write` surfaces openraft's `ForwardToLeader`,
+        // which `from_client_write` must classify as the retryable
+        // `ProposeError::Leader` (→ HTTP 503) — not collapse to `Other` (→ 500).
+        // This guards the classification the forwarded-503 contract relies on.
+        use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+
+        let fwd = RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
+            leader_id: Some(2),
+            leader_node: Some(BasicNode {
+                addr: "127.0.0.1:9002".into(),
+            }),
+        }));
+        assert!(
+            matches!(ProposeError::from_client_write(fwd), ProposeError::Leader),
+            "ForwardToLeader must classify as the retryable Leader variant"
+        );
+
+        // A leadership hint with no known leader is still a leadership race.
+        let fwd_no_leader = RaftError::APIError(
+            ClientWriteError::<NodeId, BasicNode>::ForwardToLeader(ForwardToLeader {
+                leader_id: None,
+                leader_node: None,
+            }),
+        );
+        assert!(
+            matches!(
+                ProposeError::from_client_write(fwd_no_leader),
+                ProposeError::Leader
+            ),
+            "ForwardToLeader with no leader hint must still classify as Leader"
+        );
+
+        // A non-leader fatal error (a change-membership conflict) is NOT a
+        // leadership race: it must fall to `Other`, not be mislabeled retryable.
+        use openraft::error::{ChangeMembershipError, InProgress};
+        let fatal = RaftError::APIError(ClientWriteError::<NodeId, BasicNode>::from(
+            ChangeMembershipError::InProgress(InProgress {
+                committed: None,
+                membership_log_id: None,
+            }),
+        ));
+        assert!(
+            matches!(
+                ProposeError::from_client_write(fatal),
+                ProposeError::Other(_)
+            ),
+            "a non-ForwardToLeader error must classify as Other, not Leader"
+        );
+    }
+
+    #[test]
     fn should_compact_only_with_unsnapshotted_tail() {
         let thresh = 128 * 1024 * 1024;
         // Fully snapshotted -> never compact, even if quiescent or over bytes.

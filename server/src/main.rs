@@ -7831,8 +7831,12 @@ impl ServerImpl {
             // The retry grant failed, so the incident stays unresolvable. Surface that as
             // `NotResolvable` (or `Internal` for a server-side failure) — never `NotFound`, which
             // is documented as "no incident with the given key" and would misreport an incident
-            // that plainly exists (we just resolved-then-refused it above).
-            return if status >= 500 {
+            // that plainly exists (we just resolved-then-refused it above). A retryable 503
+            // (leadership changed before the grant) is preserved as `Unavailable` so the console
+            // surfaces a retryable outcome instead of a terminal 500.
+            return if status == 503 {
+                Out::Unavailable(detail)
+            } else if status >= 500 {
                 Out::Internal(detail)
             } else {
                 Out::NotResolvable(detail)
@@ -9291,6 +9295,14 @@ impl ServerImpl {
                 400,
                 peer_detail(&r),
             )),
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) so a non-leader gateway forwards it intact per
+            // spec/jobs.yaml; only genuinely untyped errors fall to 500.
+            Ok(r) if r.status == 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -9334,6 +9346,13 @@ impl ServerImpl {
             Ok(r) if r.status == 409 => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
                 problem("Job in wrong state", 409, peer_detail(&r)),
             ),
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) per spec/jobs.yaml; only untyped errors fall to 500.
+            Ok(r) if r.status == 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -9393,6 +9412,13 @@ impl ServerImpl {
                     peer_detail(&r),
                 ))
             }
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) per spec/jobs.yaml; only untyped errors fall to 500.
+            Ok(r) if r.status == 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -9569,6 +9595,10 @@ impl ServerImpl {
             Ok(r) if is_ok_status(r.status) => Ok(()),
             Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
             Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) so callers can map it to Out::Unavailable instead of a
+            // non-retryable 500 during the incident-resolution retry phase.
+            Ok(r) if r.status == 503 => Err((503, peer_detail(&r))),
             Ok(r) => Err((500, peer_detail(&r))),
             Err(e) => Err((502, e.to_string())),
         }
@@ -21590,6 +21620,9 @@ fn agent_create_http_error(
             Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(problem)
         }
         409 => Resp::Status409_AnAgentInstanceAlreadyExistsForTheGivenElementInstance(problem),
+        // Preserve the retryable leadership-race 503 so agent writes stay
+        // retryable during leader turnover (spec/agent-instances.yaml).
+        503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem),
         _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem),
     }
 }
@@ -21604,6 +21637,9 @@ fn agent_update_http_error(
         400 => Resp::Status400_TheProvidedDataIsNotValid(problem),
         404 => Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(problem),
         409 => Resp::Status409_TheAgentInstanceHasAConflictingActiveWriter(problem),
+        // Preserve the retryable leadership-race 503 so agent writes stay
+        // retryable during leader turnover (spec/agent-instances.yaml).
+        503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem),
         _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem),
     }
 }
