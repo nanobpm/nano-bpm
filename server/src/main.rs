@@ -11064,12 +11064,15 @@ impl ServerImpl {
             })
             .collect();
 
-        // A synthetic, unique numeric key for stable sort tiebreak + cursors: the
-        // evaluation key scaled past the small within-evaluation index.
-        let entity_key = |row: &readstore::DecisionInstanceRow| -> u64 {
-            row.decision_evaluation_key
-                .wrapping_mul(1000)
-                .wrapping_add(row.idx as u64)
+        // A unique cursor key for stable sort tiebreak + cursors. The decision
+        // count within one evaluation is unbounded, so a synthetic
+        // `decision_evaluation_key * 1000 + idx` collided (the 1,001st row of
+        // evaluation `k` shared a key with the first row of evaluation `k + 1`),
+        // breaking `paginate`'s unique-key requirement. The composite
+        // `(decision_evaluation_key, idx)` is unique per row however large an
+        // evaluation grows (#1305 review).
+        let entity_key = |row: &readstore::DecisionInstanceRow| -> (u64, u64) {
+            (row.decision_evaluation_key, row.idx as u64)
         };
 
         let sort = query::sort_keys(
@@ -11093,12 +11096,14 @@ impl ServerImpl {
                     query::SortVal::Str(row.eval_instance_key.clone())
                 }
                 "businessId" => query::SortVal::Str(row.business_id.clone().unwrap_or_default()),
-                _ => query::SortVal::Num(entity_key(row) as i64),
+                // Default (key) sort: by evaluation key, then the within-
+                // evaluation index via the composite tiebreak below.
+                _ => query::SortVal::Num(row.decision_evaluation_key as i64),
             },
             |row| entity_key(row),
         );
 
-        let sorted: Vec<(u64, &readstore::DecisionInstanceRow)> = matched
+        let sorted: Vec<((u64, u64), &readstore::DecisionInstanceRow)> = matched
             .into_iter()
             .map(|row| (entity_key(row), row))
             .collect();
@@ -28350,6 +28355,190 @@ mod clustered_startup_tests {
                 .count(),
             2,
             "another evaluation of the same decision is untouched"
+        );
+    }
+
+    /// PR #1305 review: an evaluation's decision count `n` is unbounded, so the
+    /// synthetic cursor key `decision_evaluation_key * 1000 + idx` collided —
+    /// the 1,001st row of evaluation `k` shared a key with the first row of the
+    /// next consecutively minted evaluation `k + 1`, and `paginate`'s
+    /// unique-key requirement broke (cursor paging skipped or repeated rows).
+    /// The cursor key is the composite `(decision_evaluation_key, idx)`, which
+    /// is unique per row however large an evaluation grows.
+    #[tokio::test]
+    async fn decision_instance_search_pages_past_a_thousand_decision_evaluation() {
+        use apis::decision_instance::SearchDecisionInstancesResponse as SearchResp;
+        use nanobpmn_engine_core::dmn::{DecisionType, EvaluatedDecision};
+
+        let server = ServerImpl::default();
+        // Two standalone evaluations minted consecutively: `EVAL_KEY` with 1,001
+        // evaluated decisions, then `EVAL_KEY + 1` with one. Under the scaled
+        // key, `EVAL_KEY * 1000 + 1001 == (EVAL_KEY + 1) * 1000 + 1`.
+        const EVAL_KEY: u64 = 225_179_981_368_524_800; // partition 5, sequence 0
+        let evaluated = |eval_key: u64, n: usize| {
+            let evaluated_decisions = (0..n)
+                .map(|i| EvaluatedDecision {
+                    decision_id: format!("d{i}"),
+                    decision_name: format!("Decision {i}"),
+                    decision_type: DecisionType::DecisionTable,
+                    decision_output: Value::Int(i as i64),
+                    evaluated_inputs: Vec::new(),
+                    matched_rules: Vec::new(),
+                    decision_key: 9_000 + i as u64,
+                    decision_version: 1,
+                })
+                .collect();
+            Event::DecisionEvaluated {
+                instance_key: 0,
+                element_instance_key: 0,
+                element_id: String::new(),
+                decision_key: 9_000,
+                decision_id: "d0".to_string(),
+                decision_output: Value::Int(0),
+                evaluated_decisions,
+                evaluated_at: 123,
+                decision_evaluation_key: eval_key,
+                failure: None,
+                decision_requirements_key: 77,
+                decision_requirements_id: "drg".to_string(),
+            }
+        };
+        let events = [evaluated(EVAL_KEY, 1_001), evaluated(EVAL_KEY + 1, 1)];
+        let shards = server.store.shards();
+        let (_, shard) = shards.first().expect("a default server has one shard");
+        shard
+            .export(&events.iter().collect::<Vec<_>>())
+            .expect("project the synthetic evaluations");
+        assert_eq!(server.store.decision_instances().len(), 1_002);
+
+        let search = |page: Option<models::SearchQueryPageRequest>| {
+            let server = &server;
+            async move {
+                let q = models::DecisionInstanceSearchQuery {
+                    filter: None,
+                    sort: None,
+                    page,
+                };
+                let SearchResp::Status200_TheDecisionInstanceSearchResult(r) = server
+                    .search_decision_instances_impl(&Some(q))
+                    .await
+                    .expect("search returns a response")
+                else {
+                    panic!("expected a 200 search result");
+                };
+                r
+            }
+        };
+        let ids = |r: &models::DecisionInstanceSearchQueryResult| -> Vec<String> {
+            r.items
+                .iter()
+                .map(|i| i.decision_evaluation_instance_key.clone())
+                .collect()
+        };
+
+        // Page FORWARD through every row; no row may repeat or be skipped.
+        let mut seen = Vec::new();
+        let mut after: Option<String> = None;
+        loop {
+            let r = search(Some(
+                models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: after.take(),
+                        limit: Some(100),
+                    },
+                ),
+            ))
+            .await;
+            let done = r.items.len() < 100;
+            let page_ids = ids(&r);
+            let end = match r.page.end_cursor {
+                types::Nullable::Present(c) => Some(c),
+                types::Nullable::Null => None,
+            };
+            seen.extend(page_ids);
+            if done {
+                break;
+            }
+            after = end;
+        }
+        assert_eq!(seen.len(), 1_002, "every row paged exactly once");
+        let mut unique = seen.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            1_002,
+            "no row repeated across cursor pages (colliding cursor keys)"
+        );
+        let last_of_big = format!("{EVAL_KEY}-1001");
+        let first_of_next = format!("{}-1", EVAL_KEY + 1);
+        assert!(
+            seen.contains(&last_of_big),
+            "the 1,001st decision of the first evaluation is reachable"
+        );
+        assert!(
+            seen.contains(&first_of_next),
+            "the next evaluation's first row is not shadowed"
+        );
+
+        // BACKWARD pagination anchoring on the colliding cursor. The default
+        // order is the composite key ascending, so the first row of the next
+        // evaluation (`{E+1}-1`) sorts immediately AFTER `{E}-1001` (their
+        // synthetic `*1000+idx` keys collided). Anchoring `before` on
+        // `{E+1}-1`'s cursor must resume just before THAT row — but the
+        // colliding key made `paginate` resolve the cursor to the FIRST row
+        // carrying it (`{E}-1001`), silently dropping `{E}-1001` from the page.
+        let first_page = search(Some(models::SearchQueryPageRequest::LimitPagination(
+            models::LimitPagination { limit: Some(100) },
+        )))
+        .await;
+        // Walk forward to the final page to learn `{E+1}-1`'s cursor.
+        let mut last_row = ids(&first_page).pop().unwrap();
+        let mut cursor = match first_page.page.end_cursor {
+            types::Nullable::Present(c) => c,
+            types::Nullable::Null => panic!("a non-empty page has an end cursor"),
+        };
+        loop {
+            let r = search(Some(
+                models::SearchQueryPageRequest::CursorForwardPagination(
+                    models::CursorForwardPagination {
+                        after: Some(cursor.clone()),
+                        limit: Some(100),
+                    },
+                ),
+            ))
+            .await;
+            if r.items.is_empty() {
+                break;
+            }
+            let page_ids = ids(&r);
+            let under = page_ids.len() < 100;
+            last_row = page_ids.last().cloned().unwrap();
+            if let types::Nullable::Present(c) = r.page.end_cursor {
+                cursor = c;
+            }
+            if under {
+                break;
+            }
+        }
+        assert_eq!(last_row, first_of_next, "the last row overall is {{E+1}}-1");
+
+        // The page immediately BEFORE `{E+1}-1` must end at `{E}-1001`.
+        let back = search(Some(
+            models::SearchQueryPageRequest::CursorBackwardPagination(
+                models::CursorBackwardPagination {
+                    before: Some(cursor.clone()),
+                    limit: Some(100),
+                },
+            ),
+        ))
+        .await;
+        let back_ids = ids(&back);
+        assert_eq!(
+            back_ids.last().map(String::as_str),
+            Some(last_of_big.as_str()),
+            "backward page before {{E+1}}-1 ends at {{E}}-1001 (not dropped by the \
+             colliding cursor key): {back_ids:?}"
         );
     }
 
