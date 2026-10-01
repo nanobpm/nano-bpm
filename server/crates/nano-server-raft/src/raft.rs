@@ -304,6 +304,33 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         | E::AgentInstanceStatusNotSettable { .. }
         | E::AgentInstanceAlreadyCompleted { .. }
         | E::AgentInstanceLimitExceeded { .. } => (400, e.to_string()),
+        // Durable REST/operator mutations routed through
+        // `ServerImpl::apply_partition_command` surface their engine rejections
+        // here, so every by-key mutation command's error maps to its HTTP status
+        // in ONE place (the raft propose path and the direct local apply share
+        // this mapping — no per-handler drift). #1306.
+        E::InstanceNotFound { .. } => (404, e.to_string()),
+        E::InstanceTransitionInvalid { .. } => (400, e.to_string()),
+        E::IncidentNotFound { .. } => (404, e.to_string()),
+        E::IncidentNotResolvable { .. } => (409, e.to_string()),
+        E::ScopeNotFound { .. } => (400, e.to_string()),
+        E::UserTaskNotFound { .. } => (404, e.to_string()),
+        E::UserTaskNotActive { .. } => (409, e.to_string()),
+        E::UserTaskAlreadyAssigned { .. } => (409, e.to_string()),
+        E::AdHocSubProcessNotFound { .. } | E::AdHocUnknownElement { .. } => (404, e.to_string()),
+        E::AdHocNoActivationTargets { .. } => (400, e.to_string()),
+        // Instance migration: an unknown target definition is 404 (like an
+        // unknown instance above); an invalid mapping is 400; a migration the
+        // engine rejects for the instance's live state is 409.
+        E::TargetProcessDefinitionNotFound { .. } => (404, e.to_string()),
+        E::DuplicateMappingSourceElement { .. }
+        | E::MappingSourceElementNotFound { .. }
+        | E::MappingTargetElementNotFound { .. } => (400, e.to_string()),
+        E::UnmappedActiveElement { .. }
+        | E::MappedElementTypeChanged { .. }
+        | E::MigratedParallelJoinArityChanged { .. }
+        | E::MigratedJoinFlowMissing { .. }
+        | E::UnsupportedMigration { .. } => (409, e.to_string()),
         other => (500, other.to_string()),
     }
 }
@@ -2227,6 +2254,84 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    #[test]
+    fn engine_error_status_maps_by_key_mutation_rejections() {
+        // #1306: the single source of truth that lets every durable by-key
+        // mutation routed through `apply_partition_command` surface the SAME HTTP
+        // status whether it was applied directly or replicated through Raft.
+        use nanobpmn_engine_core::EngineError as E;
+        let cases: &[(E, u16)] = &[
+            (E::InstanceNotFound { instance_key: 1 }, 404),
+            (
+                E::InstanceTransitionInvalid {
+                    instance_key: 1,
+                    from: "Terminated",
+                    to: "Suspended",
+                },
+                400,
+            ),
+            (E::IncidentNotFound { incident_key: 1 }, 404),
+            (
+                E::IncidentNotResolvable {
+                    incident_key: 1,
+                    reason: "no retries".into(),
+                },
+                409,
+            ),
+            (E::ScopeNotFound { scope_key: 1 }, 400),
+            (E::UserTaskNotFound { user_task_key: 1 }, 404),
+            (E::UserTaskNotActive { user_task_key: 1 }, 409),
+            (E::UserTaskAlreadyAssigned { user_task_key: 1 }, 409),
+            (
+                E::AdHocSubProcessNotFound {
+                    ad_hoc_instance_key: 1,
+                },
+                404,
+            ),
+            (
+                E::AdHocUnknownElement {
+                    instance_key: 1,
+                    element_id: "x".into(),
+                },
+                404,
+            ),
+            (
+                E::AdHocNoActivationTargets {
+                    ad_hoc_instance_key: 1,
+                },
+                400,
+            ),
+            (
+                E::TargetProcessDefinitionNotFound {
+                    process_definition_key: 1,
+                },
+                404,
+            ),
+            (
+                E::MappingSourceElementNotFound {
+                    instance_key: 1,
+                    element_id: "a".into(),
+                },
+                400,
+            ),
+            (
+                E::UnsupportedMigration {
+                    instance_key: 1,
+                    element_id: "e".into(),
+                    reason: "x".into(),
+                },
+                409,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(
+                engine_error_status(err).0,
+                *want,
+                "{err:?} must map to {want}"
+            );
+        }
     }
 
     #[test]

@@ -7506,22 +7506,12 @@ impl ServerImpl {
         }
 
         match self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
-            })
+            .apply_partition_command(instance_key, Command::cancel_instance(instance_key))
             .await
         {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                Out::Canceled
-            }
-            Err(EngineError::InstanceNotFound { instance_key }) => Out::NotFound(format!(
-                "No active process instance with key {instance_key}."
-            )),
-            Err(e) => Out::Internal(e.to_string()),
+            Ok(_) => Out::Canceled,
+            Err((404, detail)) => Out::NotFound(detail),
+            Err((_, detail)) => Out::Internal(detail),
         }
     }
 
@@ -7607,30 +7597,9 @@ impl ServerImpl {
         instance_key: u64,
         command: Command,
     ) -> Result<(), (u16, String)> {
-        match self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
+        self.apply_partition_command(instance_key, command)
             .await
-        {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                Ok(())
-            }
-            Err(EngineError::InstanceNotFound { instance_key }) => {
-                Err((404, format!("No process instance with key {instance_key}.")))
-            }
-            Err(EngineError::InstanceTransitionInvalid {
-                instance_key,
-                from,
-                to,
-            }) => Err((
-                400,
-                format!("Process instance {instance_key} cannot transition from {from} to {to}."),
-            )),
-            Err(e) => Err((500, e.to_string())),
-        }
+            .map(|_| ())
     }
 
     /// Surface-independent core of "migrate a process instance": leader-forward
@@ -7686,7 +7655,8 @@ impl ServerImpl {
     /// Applies a migration on this node's owning partition. Returns
     /// `Ok(())` on success, else `(status, detail)` where `status` is the
     /// HTTP code the migration [`EngineError`] maps to (400 invalid mapping,
-    /// 404 unknown instance/target, 409 rejected migration, 500 otherwise).
+    /// 404 unknown instance/target, 409 rejected migration, 500 otherwise) via
+    /// the shared [`crate::raft::engine_error_status`].
     pub(crate) async fn migrate_instance_local(
         &self,
         instance_key: u64,
@@ -7698,20 +7668,9 @@ impl ServerImpl {
             target_process_definition_key,
             mapping_instructions,
         );
-        match self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await
-        {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                self.signal_jobs_available();
-                Ok(())
-            }
-            Err(e) => Err((migration_error_status(&e), e.to_string())),
-        }
+        let _ = self.apply_partition_command(instance_key, command).await?;
+        self.signal_jobs_available();
+        Ok(())
     }
     /// this node is not the leader, else apply [`Command::ResolveIncident`] and
     /// wait for commit. Returns a neutral outcome so every API surface (the v2
@@ -7745,24 +7704,16 @@ impl ServerImpl {
             incident_key,
             operation_reference,
         };
-        match self
-            .engine
-            .by_key(incident_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await
-        {
-            Ok((_, commit)) => {
-                commit.wait().await;
+        match self.apply_partition_command(incident_key, command).await {
+            Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
                 self.signal_jobs_available();
                 Out::Resolved
             }
-            Err(EngineError::IncidentNotFound { incident_key }) => {
-                Out::NotFound(format!("No incident with key {incident_key}."))
-            }
-            Err(EngineError::IncidentNotResolvable { reason, .. }) => Out::NotResolvable(reason),
-            Err(e) => Out::Internal(e.to_string()),
+            Err((404, detail)) => Out::NotFound(detail),
+            Err((409, detail)) => Out::NotResolvable(detail),
+            Err((_, detail)) => Out::Internal(detail),
         }
     }
 
@@ -7874,24 +7825,15 @@ impl ServerImpl {
             .map(|(name, v)| (name.clone(), json_to_value(v)))
             .collect();
         match self
-            .engine
-            .by_key(scope_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::set_variables_scoped(scope_key, engine_vars, local),
-                    now_millis(),
-                )
-            })
+            .apply_partition_command(
+                scope_key,
+                Command::set_variables_scoped(scope_key, engine_vars, local),
+            )
             .await
         {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Out::Updated
-            }
-            Err(EngineError::ScopeNotFound { scope_key }) => Out::ScopeNotFound(format!(
-                "No process or element instance with key {scope_key}."
-            )),
-            Err(e) => Out::Internal(e.to_string()),
+            Ok(_) => Out::Updated,
+            Err((400, detail)) => Out::ScopeNotFound(detail),
+            Err((_, detail)) => Out::Internal(detail),
         }
     }
 
@@ -8652,26 +8594,11 @@ impl ServerImpl {
         &self,
         instance_key: u64,
     ) -> Result<(), (u16, String)> {
-        let result = self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
-            })
-            .await;
-        match result {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                self.signal_jobs_available();
-                Ok(())
-            }
-            Err(EngineError::InstanceNotFound { instance_key }) => Err((
-                404,
-                format!("No active process instance with key {instance_key}."),
-            )),
-            Err(e) => Err((500, e.to_string())),
-        }
+        let _ = self
+            .apply_partition_command(instance_key, Command::cancel_instance(instance_key))
+            .await?;
+        self.signal_jobs_available();
+        Ok(())
     }
 
     /// Applies a job-retries update on this node's owning partition.
@@ -8792,23 +8719,9 @@ impl ServerImpl {
             incident_key,
             operation_reference,
         };
-        let result = self
-            .engine
-            .by_key(incident_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                self.signal_jobs_available();
-                Ok(())
-            }
-            Err(EngineError::IncidentNotFound { incident_key }) => {
-                Err((404, format!("No incident with key {incident_key}.")))
-            }
-            Err(EngineError::IncidentNotResolvable { reason, .. }) => Err((409, reason)),
-            Err(e) => Err((500, e.to_string())),
-        }
+        let _ = self.apply_partition_command(incident_key, command).await?;
+        self.signal_jobs_available();
+        Ok(())
     }
 
     /// Merges variables into a scope on this node's owning partition.
@@ -8818,27 +8731,12 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         local: bool,
     ) -> Result<(), (u16, String)> {
-        let result = self
-            .engine
-            .by_key(scope_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::set_variables_scoped(scope_key, variables, local),
-                    now_millis(),
-                )
-            })
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(())
-            }
-            Err(EngineError::ScopeNotFound { scope_key }) => Err((
-                400,
-                format!("No process or element instance with key {scope_key}."),
-            )),
-            Err(e) => Err((500, e.to_string())),
-        }
+        self.apply_partition_command(
+            scope_key,
+            Command::set_variables_scoped(scope_key, variables, local),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Returns the id of the peer owning `key`'s partition, or `None` when this
@@ -9181,48 +9079,23 @@ impl ServerImpl {
         }
 
         let command = adhoc_activation_command(container_key, body);
-        let result = self
-            .engine
-            .by_key(container_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                Ok(Resp::Status204_TheAd)
-            }
-            Err(EngineError::AdHocSubProcessNotFound {
-                ad_hoc_instance_key,
-            }) => Ok(Resp::Status404_TheAd(problem(
+        match self.apply_partition_command(container_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheAd),
+            Err((404, detail)) => Ok(Resp::Status404_TheAd(problem(
                 "Ad-hoc sub-process not found",
                 404,
-                format!(
-                    "No active ad-hoc sub-process container with instance key {ad_hoc_instance_key}."
-                ),
+                detail,
             ))),
-            Err(EngineError::AdHocUnknownElement {
-                instance_key: _,
-                element_id,
-            }) => Ok(Resp::Status404_TheAd(problem(
-                "Ad-hoc sub-process not found",
-                404,
-                format!("Ad-hoc sub-process has no activatable element with id '{element_id}'."),
-            ))),
-            Err(EngineError::AdHocNoActivationTargets {
-                ad_hoc_instance_key,
-            }) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+            Err((400, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Invalid data",
                 400,
-                format!(
-                    "Ad-hoc sub-process activation for instance key {ad_hoc_instance_key} named no elements and did not set cancelRemainingInstances."
-                ),
+                detail,
             ))),
-            Err(e) => Ok(
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -12485,7 +12358,6 @@ impl ServerImpl {
         match outcome {
             Ok((events, commit)) => {
                 commit.wait().await;
-                self.spawn_routing_if_needed(&events);
                 let agent_instance_key = events.iter().find_map(|e| match e {
                     Event::AgentInstanceCreated { agent_instance, .. } => {
                         Some(agent_instance.agent_instance_key)
@@ -12725,7 +12597,6 @@ impl ServerImpl {
         match outcome {
             Ok((events, commit)) => {
                 commit.wait().await;
-                self.spawn_routing_if_needed(&events);
                 // Correlate each emitted AgentHistoryCreated to its submitted item
                 // in request order; the processor emits them in submission order.
                 let created_history = match created_history_from_events(&events, submitted_ids) {
@@ -12798,22 +12669,46 @@ impl ServerImpl {
         Ok(Arc::new(response.events))
     }
 
-    /// Applies `command` on the partition owning `key`: through that partition's
-    /// Raft leader when Raft is enabled (so the write is replicated before it is
-    /// acknowledged), else directly on the local engine actor.
+    /// Applies `command` on the partition owning `key` and returns its events +
+    /// a durable-commit barrier: through that partition's Raft leader when Raft
+    /// is enabled (so the write is replicated before it is acknowledged), else
+    /// directly on the local engine actor.
+    ///
+    /// This is THE single funnel for durable by-key REST/operator mutations —
+    /// the `no_direct_engine_apply_in_handlers` guard test (#1306) forbids a
+    /// handler from calling `engine.apply_command_at` itself, because a direct
+    /// local apply under Raft never enters the replicated log and a failover
+    /// silently loses the write (the #1305 defect class). Both paths map an
+    /// engine rejection through [`crate::raft::engine_error_status`] and drive
+    /// the command's cross-partition subscription routing exactly ONCE, so a
+    /// caller cannot tell whether Raft was enabled.
     async fn apply_partition_command(
         &self,
         key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         if !self.raft.is_empty() {
+            // `propose_partition_command` already awaits the durable barrier and
+            // drives routing / job-sojourn / ad-hoc side effects on the replicated
+            // events, so callers must NOT repeat them.
             return self.propose_partition_command(key, command).await;
         }
-        self.engine
+        let (events, commit) = self
+            .engine
             .by_key(key)
             .with(move |journal| journal.apply_command_at(command, now_millis()))
             .await
-            .map_err(|error| crate::raft::engine_error_status(&error))
+            .map_err(|error| crate::raft::engine_error_status(&error))?;
+        // Mirror the Raft path: wait for durability, then route any
+        // cross-partition subscription follow-ups the command produced. Doing it
+        // here (not in each caller) keeps routing single-sourced and prevents the
+        // double-route a per-handler `spawn_routing_if_needed` would cause under
+        // Raft (where `propose_partition_command` already routed). The barrier is
+        // awaited here, so — like the Raft path — a ready barrier is handed back
+        // and a caller's own `commit.wait()` is a harmless no-op.
+        commit.wait().await;
+        self.spawn_routing_if_needed(&events);
+        Ok((events, Commit::ready()))
     }
 
     async fn forward_agent_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -13127,45 +13022,23 @@ impl ServerImpl {
             assignee,
             allow_override,
         };
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheUserTask)
-            }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheUserTask),
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be assigned."),
+                    detail,
                 )),
             ),
-            Err(EngineError::UserTaskAlreadyAssigned { user_task_key }) => Ok(
-                Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task already assigned",
-                    409,
-                    format!(
-                        "User task {user_task_key} is already assigned; unassign it before \
-                         assigning again."
-                    ),
-                )),
-            ),
-            Err(e) => Ok(
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -13237,38 +13110,28 @@ impl ServerImpl {
             .unwrap_or_default();
 
         let command = Command::complete_user_task_with(user_task_key, variables);
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => {
                 // Completing a user task advances the token, which may create a
                 // following job: wake any long-pollers.
                 self.signal_jobs_available();
                 Ok(Resp::Status204_TheUserTaskWasCompletedSuccessfully)
             }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be completed."),
+                    detail,
                 )),
             ),
-            Err(e) => Ok(
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -13528,7 +13391,6 @@ impl ServerImpl {
             }
         };
 
-        let command = Command::unassign_user_task(user_task_key);
         if let Some(node) = self.route_by_leader(user_task_key) {
             let (status, detail) = self
                 .forward_user_task(
@@ -13559,35 +13421,24 @@ impl ServerImpl {
                 )),
             });
         }
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheUserTaskWasUnassignedSuccessfully)
-            }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+        let command = Command::unassign_user_task(user_task_key);
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheUserTaskWasUnassignedSuccessfully),
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be unassigned."),
+                    detail,
                 )),
             ),
-            Err(e) => Ok(
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -13688,35 +13539,23 @@ impl ServerImpl {
         };
 
         let command = Command::update_user_task(user_task_key, engine_changeset);
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheUserTaskWasUpdatedSuccessfully)
-            }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheUserTaskWasUpdatedSuccessfully),
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be updated."),
+                    detail,
                 )),
             ),
-            Err(e) => Ok(
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -22418,6 +22257,7 @@ pub(crate) enum ResolveIncidentOutcome {
 /// to each API's own response type (v2 REST and console) so the
 /// `Command::cancel_instance` and clustering (leader-forward) semantics have a
 /// single source of truth.
+#[derive(Debug)]
 pub(crate) enum CancelInstanceOutcome {
     /// The instance was cancelled (every token discarded, state TERMINATED).
     Canceled,
@@ -22475,54 +22315,6 @@ impl From<Result<(), (u16, String)>> for TransitionInstanceOutcome {
             Err((404, detail)) => TransitionInstanceOutcome::NotFound(detail),
             Err((_, detail)) => TransitionInstanceOutcome::Internal(detail),
         }
-    }
-}
-
-/// Maps a migration [`EngineError`] to the HTTP status the v2 REST surface
-/// returns. Invalid mappings are 400; unknown instance/target are 404;
-/// engine-rejected migrations (unmapped element, type change, unsupported
-/// construct) are 409; anything else is a 500.
-fn migration_error_status(e: &EngineError) -> u16 {
-    match e {
-        EngineError::InstanceNotFound { .. }
-        | EngineError::TargetProcessDefinitionNotFound { .. } => 404,
-        EngineError::DuplicateMappingSourceElement { .. }
-        | EngineError::MappingSourceElementNotFound { .. }
-        | EngineError::MappingTargetElementNotFound { .. } => 400,
-        EngineError::UnmappedActiveElement { .. }
-        | EngineError::MappedElementTypeChanged { .. }
-        | EngineError::MigratedParallelJoinArityChanged { .. }
-        | EngineError::MigratedJoinFlowMissing { .. }
-        | EngineError::UnsupportedMigration { .. } => 409,
-        _ => 500,
-    }
-}
-
-#[cfg(test)]
-mod migration_error_status_tests {
-    use super::*;
-
-    #[test]
-    fn open_parallel_join_rejections_are_conflicts() {
-        // Both open-join guards reject a mapping the instance's current state
-        // cannot survive, not a malformed request: 409, like the other
-        // state-dependent migration rejections.
-        let arity = EngineError::MigratedParallelJoinArityChanged {
-            instance_key: 1,
-            source_element_id: "join".into(),
-            target_element_id: "join2".into(),
-            source_incoming_count: 2,
-            target_incoming_count: 3,
-        };
-        let flow = EngineError::MigratedJoinFlowMissing {
-            instance_key: 1,
-            source_element_id: "join".into(),
-            target_element_id: "join2".into(),
-            flow_source_element_id: "a".into(),
-            flow_ordinal: 0,
-        };
-        assert_eq!(migration_error_status(&arity), 409);
-        assert_eq!(migration_error_status(&flow), 409);
     }
 }
 
@@ -34446,6 +34238,65 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_instance_replicates_through_raft() {
+        // #1306: cancelling a running instance is a durable operator mutation, so
+        // under Raft it must enter the replicated log — never a direct local
+        // apply a failover would lose. Mirrors the #1305 decision test: assert the
+        // Raft applied index advances when the REST/console cancel path runs.
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+
+        let applied_total =
+            |nodes: [&ServerImpl; 3]| -> u64 { nodes.iter().map(|n| raft_applied_total(n)).sum() };
+
+        let body = models::ProcessInstanceCreationInstruction::from(
+            models::ProcessInstanceCreationInstructionById::new("intake".to_string()),
+        );
+        let resp = node0
+            .create_process_instance_impl(&body)
+            .await
+            .expect("rest create returns a response");
+        let instance_key: u64 = match resp {
+            Resp::Status200_TheProcessInstanceWasCreated(r) => r
+                .process_instance_key
+                .0
+                .parse()
+                .expect("numeric instance key"),
+            other => panic!("rest create through raft should be 200, got {other:?}"),
+        };
+
+        let before = applied_total([&node0, &node1, &node2]);
+        let outcome = node0.cancel_instance_core(instance_key).await;
+        assert!(
+            matches!(outcome, CancelInstanceOutcome::Canceled),
+            "cancel should succeed, got {outcome:?}"
+        );
+
+        // The commit replicates to every follower asynchronously; poll until the
+        // applied index visibly advances across the cluster.
+        let mut advanced = false;
+        for _ in 0..250 {
+            if applied_total([&node0, &node1, &node2]) > before {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            advanced,
+            "the cancellation entered the Raft log (applied index did not advance past {before})"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rest_creates_under_raft_spread_across_the_whole_cluster() {
         // Regression for the RF>=2 create-imbalance bug: a producer connected to
         // ONE gateway must spread createProcessInstance across EVERY partition in
@@ -42023,6 +41874,137 @@ mod provisioning_endpoint_tests {
         assert!(
             rec.get("job_type").is_none() && rec.get("suggest_worker_delta").is_none(),
             "snake_case leak in the recommendation payload"
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_direct_engine_apply_guard {
+    //! #1306 regression guard: every durable by-key REST / operator mutation
+    //! must flow through the canonical Raft-aware funnel
+    //! [`ServerImpl::apply_partition_command`] (or `apply_create_command`),
+    //! never a direct `engine…apply_command_at` inside a handler. A direct local
+    //! apply while Raft is enabled never enters the partition's replicated log,
+    //! so a leader failover silently loses the acknowledged write — the exact
+    //! defect #1305 fixed for standalone decision evaluate / delete. This test
+    //! pins the complete set of production functions allowed to call
+    //! `apply_command_at` directly; a new durable mutation handler that applies
+    //! on the engine itself adds a name the allowlist does not contain and fails
+    //! here until it either routes through the helper or is consciously added
+    //! with a justification.
+
+    /// Production functions permitted to call `apply_command_at` directly, each
+    /// paired with the reason it is NOT a #1306 violation.
+    const ALLOWED: &[&str] = &[
+        // The canonical Raft-aware funnels themselves.
+        "apply_partition_command",
+        "apply_create_command",
+        // Raft-guarded instance/job stream paths: their `!raft.is_empty()` branch
+        // proposes through the partition's replicated log and the direct apply is
+        // only the non-Raft (single-node) fallback.
+        "create_process_instance_impl",
+        "create_forwarded",
+        "create_for_stream",
+        "complete_job_impl",
+        "fail_job_impl",
+        "throw_job_error_impl",
+        "update_job_core",
+        "update_job_retries_local_with_lease",
+        "update_job_timeout_local_with_lease",
+        "complete_job_for_stream_with_lease",
+        "fail_job_for_stream_with_lease",
+        "throw_error_for_stream_with_lease",
+        // The periodic timer tick drives led partitions through Raft
+        // (`tick_partition_via_raft`) and applies locally only when Raft is off.
+        "main",
+        // Documented engine-internal bypasses. The cross-partition routing pump
+        // is a tracked follow-up (#1307): these apply on routing-computed
+        // partitions rather than by an entity key, and `activate_on` is an
+        // intentional leader-local activation step.
+        "correlate_message_everywhere",
+        "drive_subscription_routing",
+        "activate_on",
+    ];
+
+    fn enclosing_fn_name(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        let rest = t
+            .strip_prefix("pub(crate) ")
+            .or_else(|| t.strip_prefix("pub "))
+            .unwrap_or(t);
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("fn ")?;
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() { None } else { Some(name) }
+    }
+
+    #[test]
+    fn no_direct_engine_apply_in_durable_mutation_handlers() {
+        let src = include_str!("main.rs");
+        let lines: Vec<&str> = src.lines().collect();
+
+        // Mark every line that lives inside a top-level `#[cfg(test)]` module so
+        // the guard inspects production code only (and ignores its own text).
+        let mut in_test = vec![false; lines.len()];
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] == "#[cfg(test)]" {
+                let mut j = i + 1;
+                while j < lines.len()
+                    && j <= i + 3
+                    && !lines[j].starts_with("mod ")
+                    && !lines[j].starts_with("pub mod ")
+                {
+                    j += 1;
+                }
+                let is_mod = j < lines.len()
+                    && (lines[j].starts_with("mod ") || lines[j].starts_with("pub mod "));
+                if is_mod && lines[j].trim_end().ends_with('{') {
+                    // Inline module: everything up to its column-0 closing brace.
+                    let mut k = j;
+                    while k < lines.len() && lines[k] != "}" {
+                        in_test[k] = true;
+                        k += 1;
+                    }
+                    if k < lines.len() {
+                        in_test[k] = true;
+                    }
+                    i = k + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        let mut offenders: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if in_test[idx] || !line.contains(".apply_command_at(") {
+                continue;
+            }
+            let mut name = String::from("<unknown>");
+            for b in (0..=idx).rev() {
+                if in_test[b] {
+                    continue;
+                }
+                if let Some(n) = enclosing_fn_name(lines[b]) {
+                    name = n;
+                    break;
+                }
+            }
+            if !ALLOWED.contains(&name.as_str()) {
+                offenders.push((idx + 1, name));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "direct `apply_command_at` in non-allowlisted production function(s): {offenders:?}. \
+             Route durable by-key mutations through `ServerImpl::apply_partition_command` so the \
+             write is replicated through Raft before it is acknowledged (#1306). If the call is a \
+             legitimate Raft-guarded or engine-internal exception, add it to ALLOWED with a reason."
         );
     }
 }
