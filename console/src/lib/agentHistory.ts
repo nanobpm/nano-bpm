@@ -196,9 +196,10 @@ export interface Span {
  * a TOOL_RESULT carries a single `toolCalls` entry whose `toolCallId` names the
  * originating call (spec/agent-instances.yaml `AgentInstanceToolCall`), so only
  * that pending span closes — concurrent calls from the same request stay open
- * until their own result arrives. A result with no matching pending call (or a
- * legacy one naming none) closes every call its requesting item still has open.
- * A tool call with no result yet is open (`endMs: null`).
+ * until their own result arrives. A result that carries no correlation entry (an
+ * empty `toolCalls`, as a legacy producer emits) closes every call its requesting
+ * item still has open; a result naming an unknown id matches nothing, so those
+ * spans stay open. A tool call with no result yet is open (`endMs: null`).
  */
 export function spans(items: readonly HistoryItem[]): Span[] {
   const out: Span[] = [];

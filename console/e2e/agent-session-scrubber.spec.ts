@@ -16,6 +16,10 @@
 // state, never on elapsed time.
 
 import { expect, test, type Page } from "@playwright/test";
+import type {
+  AgentInstanceResult,
+  AgentInstanceStatusEnum,
+} from "../src/gen-c8";
 import {
   assertNoPageCrash,
   makeInstance,
@@ -87,17 +91,37 @@ const FIRST_TURNS = [
       },
     ],
   }),
-  historyItem("3", 2, "TOOL_RESULT", 3, "order 7: 3 items"),
+  historyItem("3", 2, "TOOL_RESULT", 3, "order 7: 3 items", {
+    // A TOOL_RESULT carries a single `toolCalls` entry naming the originating
+    // call (spec `AgentInstanceToolCall`), so the journey exercises the real
+    // `toolCallId` correlation path, not the legacy "close all pending" fallback.
+    toolCalls: [
+      {
+        toolCallId: "c1",
+        toolName: "lookup_order",
+        elementId: null,
+        arguments: { id: 7 },
+      },
+    ],
+  }),
 ];
 const NEXT_TURN = historyItem("4", 2, "ASSISTANT", 5, "Order 7 has 3 items.", {
   model: "nano-model",
   metrics: metrics(1800, 200),
 });
 
-function agentInstance(status: string) {
+function agentInstance(status: AgentInstanceStatusEnum): AgentInstanceResult {
   return {
     agentInstanceKey: AGENT_KEY,
     agentDefinitionKey: "2251799813910001",
+    status,
+    definition: {
+      model: "nano-model",
+      provider: "nano",
+      systemPrompt: [{ contentType: "TEXT", text: "You summarise orders." }],
+    },
+    limits: { maxModelCalls: -1, maxToolCalls: -1, maxTokens: -1 },
+    tools: [],
     elementId: ELEMENT_ID,
     elementInstanceKeys: ["2251799813850001"],
     processInstanceKey: INSTANCE_KEY,
@@ -107,7 +131,6 @@ function agentInstance(status: string) {
     processDefinitionVersion: 1,
     processDefinitionVersionTag: null,
     tenantId: "<default>",
-    status,
     creationDate: at(0),
     lastUpdatedDate: at(3),
     completionDate: null,
@@ -126,7 +149,10 @@ function agentInstance(status: string) {
 /** Stubs the engine's agent endpoints from mutable state, so a test can
  *  "commit a turn" by swapping the fixture. */
 async function stubAgents(page: Page) {
-  const state = { history: [...FIRST_TURNS], status: "TOOL_CALLING" };
+  const state: {
+    history: ReturnType<typeof historyItem>[];
+    status: AgentInstanceStatusEnum;
+  } = { history: [...FIRST_TURNS], status: "TOOL_CALLING" };
   const page1 = (items: unknown[]) => ({
     items,
     page: {
