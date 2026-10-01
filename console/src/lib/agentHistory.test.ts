@@ -266,6 +266,11 @@ test("totals accumulate up to the playhead", () => {
     toolCalls: 2,
   });
   assert.equal(totals(s, 4).inputTokens, 400);
+  // Tool calls are counted only at the ASSISTANT dispatch, not at the
+  // TOOL_RESULT correlation references (which would double each call).
+  assert.equal(totals(s, 2).toolCalls, 2);
+  assert.equal(totals(s, 3).toolCalls, 2);
+  assert.equal(totals(s, 4).toolCalls, 2);
   assert.equal(totals(s, -1).modelCalls, 0);
 });
 
@@ -299,6 +304,28 @@ test("groups runs per element, oldest first, newest status on the badge", () => 
   assert.equal(review.status, "THINKING");
   assert.equal(review.active, true);
   assert.equal(map.get("plan")!.active, false);
+});
+
+test("overlapping runs: badge status comes from the newest active run, not a newer settled one", () => {
+  // An older run still THINKING while a newer run already COMPLETED must not
+  // leave the badge pulsing "done": status follows the active run.
+  const overlap = agentsByElement([
+    agent("1", "review", "THINKING", 10),
+    agent("2", "review", "COMPLETED", 20),
+  ]);
+  const entry = overlap.get("review")!;
+  assert.equal(entry.active, true);
+  assert.equal(entry.status, "THINKING");
+  assert.match(agentBadge(entry).label, /thinking/);
+  assert.equal(agentBadge(entry).tone, "active");
+
+  // When no run is active, status is the newest run's (settled) status.
+  const settled = agentsByElement([
+    agent("1", "review", "COMPLETED", 10),
+    agent("2", "review", "UNKNOWN", 20),
+  ]);
+  assert.equal(settled.get("review")!.active, false);
+  assert.equal(settled.get("review")!.status, "UNKNOWN");
 });
 
 test("only COMPLETED and UNKNOWN are settled", () => {

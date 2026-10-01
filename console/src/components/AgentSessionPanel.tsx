@@ -420,52 +420,63 @@ function TranscriptItem({
     <li
       ref={ref}
       aria-current={current ? "step" : undefined}
-      onClick={onSelect}
-      className={`cursor-pointer rounded border-l-4 bg-surface px-3 py-2 text-sm ${ROLE_STYLE[item.role] ?? "border-edge"} ${
+      className={`rounded border-l-4 bg-surface text-sm ${ROLE_STYLE[item.role] ?? "border-edge"} ${
         current ? "ring-2 ring-accent/50" : "opacity-80 hover:opacity-100"
       }`}
     >
-      <div className="mb-1 flex items-center gap-2 text-[11px] text-fg-faint">
-        <span className="font-semibold uppercase">
-          {item.role.toLowerCase().replace("_", " ")}
-        </span>
-        <span>iteration {item.loopIteration}</span>
-        {item.model && <span>{item.model}</span>}
-        {item.metrics?.durationMs != null && (
-          <span>{fmtMs(item.metrics.durationMs)}</span>
-        )}
-        <time className="ml-auto tabular-nums" dateTime={item.producedAt}>
-          {new Date(item.producedAt).toLocaleTimeString()}
-        </time>
-      </div>
-      {item.role === "CONFIGURATION" && (
-        <details className="text-xs text-fg-muted">
-          <summary className="cursor-pointer">
-            {[item.provider, item.model].filter(Boolean).join(" / ") ||
-              "configuration"}{" "}
-            · {item.tools.length} {item.tools.length === 1 ? "tool" : "tools"}
-          </summary>
-          {item.systemPrompt.map((c, i) => (
-            <Content key={i} content={c} />
-          ))}
-          {item.tools.length > 0 && (
-            <p className="mt-1">{item.tools.map((t) => t.name).join(", ")}</p>
+      {/* Semantic select affordance: keyboard users get the same "jump to this
+          step" interaction pointer users have. The <details> blocks below stay
+          outside the button so no interactive controls are nested. */}
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-label={`Show step: ${item.role.toLowerCase().replace("_", " ")}, iteration ${item.loopIteration}`}
+        className="block w-full cursor-pointer rounded px-3 pt-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
+      >
+        <span className="mb-1 flex items-center gap-2 text-[11px] text-fg-faint">
+          <span className="font-semibold uppercase">
+            {item.role.toLowerCase().replace("_", " ")}
+          </span>
+          <span>iteration {item.loopIteration}</span>
+          {item.model && <span>{item.model}</span>}
+          {item.metrics?.durationMs != null && (
+            <span>{fmtMs(item.metrics.durationMs)}</span>
           )}
-        </details>
-      )}
-      {item.content.map((c, i) => (
-        <Content key={i} content={c} />
-      ))}
-      {item.toolCalls.map((call) => (
-        <details key={call.toolCallId} className="mt-1 text-xs">
-          <summary className="cursor-pointer text-info">
-            → {call.toolName}
-          </summary>
-          <pre className="mt-1 overflow-auto rounded bg-hover p-2 text-[11px]">
-            {JSON.stringify(call.arguments, null, 2)}
-          </pre>
-        </details>
-      ))}
+          <time className="ml-auto tabular-nums" dateTime={item.producedAt}>
+            {new Date(item.producedAt).toLocaleTimeString()}
+          </time>
+        </span>
+      </button>
+      <div className="px-3 pb-2">
+        {item.role === "CONFIGURATION" && (
+          <details className="text-xs text-fg-muted">
+            <summary className="cursor-pointer">
+              {[item.provider, item.model].filter(Boolean).join(" / ") ||
+                "configuration"}{" "}
+              · {item.tools.length} {item.tools.length === 1 ? "tool" : "tools"}
+            </summary>
+            {item.systemPrompt.map((c, i) => (
+              <Content key={i} content={c} />
+            ))}
+            {item.tools.length > 0 && (
+              <p className="mt-1">{item.tools.map((t) => t.name).join(", ")}</p>
+            )}
+          </details>
+        )}
+        {item.content.map((c, i) => (
+          <Content key={i} content={c} />
+        ))}
+        {item.toolCalls.map((call) => (
+          <details key={call.toolCallId} className="mt-1 text-xs">
+            <summary className="cursor-pointer text-info">
+              → {call.toolName}
+            </summary>
+            <pre className="mt-1 overflow-auto rounded bg-hover p-2 text-[11px]">
+              {JSON.stringify(call.arguments, null, 2)}
+            </pre>
+          </details>
+        ))}
+      </div>
     </li>
   );
 }
@@ -504,5 +515,8 @@ function Content({
 function fmtMs(ms: number): string {
   if (ms < 1000) return `${Math.round(ms)}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${Math.floor(ms / 60_000)}m${Math.round((ms % 60_000) / 1000)}s`;
+  // Round to whole seconds first so a sub-minute remainder can't render an
+  // impossible value like `1m60s` (e.g. 119.9s -> `2m0s`).
+  const totalSeconds = Math.round(ms / 1000);
+  return `${Math.floor(totalSeconds / 60)}m${totalSeconds % 60}s`;
 }

@@ -303,8 +303,14 @@ export function totals(items: readonly HistoryItem[], upTo: number): Totals {
     t.reasoningTokens += m?.reasoningTokenCount ?? 0;
     t.cacheReadTokens += m?.cacheReadTokenCount ?? 0;
     t.modelMs += m?.durationMs ?? 0;
-    if (item.role === "ASSISTANT") t.modelCalls += 1;
-    t.toolCalls += item.toolCalls.length;
+    if (item.role === "ASSISTANT") {
+      t.modelCalls += 1;
+      // Only ASSISTANT items dispatch tool calls; a TOOL_RESULT's `toolCalls`
+      // is a single-entry correlation reference back to the call it answers
+      // (engine-core `agent_behavior.rs`), so counting it here would double
+      // every completed call.
+      t.toolCalls += item.toolCalls.length;
+    }
   }
   return t;
 }
@@ -326,7 +332,8 @@ export interface ElementAgents {
   /** Oldest first, so a loop's runs read in order. */
   instances: AgentInstanceResult[];
   active: boolean;
-  /** Status of the newest instance, for the badge. */
+  /** Status for the badge: the newest *active* instance when one is running,
+   *  otherwise the newest instance. */
   status: AgentInstanceStatusEnum;
 }
 
@@ -350,8 +357,16 @@ export function agentsByElement(
       status: inst.status,
     };
     entry.instances.push(inst);
-    entry.active ||= isAgentActive(inst.status);
-    entry.status = inst.status;
+    // `status` tracks the newest active run while any run is live; once every
+    // run has settled it falls back to the newest run's (settled) status. This
+    // keeps the badge honest when runs overlap: an older still-active run must
+    // not leave the badge pulsing "done" because a newer run already completed.
+    if (isAgentActive(inst.status)) {
+      entry.active = true;
+      entry.status = inst.status;
+    } else if (!entry.active) {
+      entry.status = inst.status;
+    }
     out.set(inst.elementId, entry);
   }
   return out;
