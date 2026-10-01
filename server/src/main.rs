@@ -12700,14 +12700,18 @@ impl ServerImpl {
             .await
             .map_err(|error| crate::raft::engine_error_status(&error))?;
         // Mirror the Raft path: wait for durability, then route any
-        // cross-partition subscription follow-ups the command produced. Doing it
-        // here (not in each caller) keeps routing single-sourced and prevents the
-        // double-route a per-handler `spawn_routing_if_needed` would cause under
-        // Raft (where `propose_partition_command` already routed). The barrier is
-        // awaited here, so — like the Raft path — a ready barrier is handed back
-        // and a caller's own `commit.wait()` is a harmless no-op.
+        // cross-partition subscription follow-ups the command produced and record
+        // the same committed-event telemetry (`propose_partition_command` drives
+        // routing / job-sojourn / ad-hoc metrics on the replicated events). Doing
+        // it here (not in each caller) keeps the side effects single-sourced and
+        // prevents the double-count a per-handler repetition would cause under
+        // Raft. The barrier is awaited here, so — like the Raft path — a ready
+        // barrier is handed back and a caller's own `commit.wait()` is a harmless
+        // no-op.
         commit.wait().await;
         self.spawn_routing_if_needed(&events);
+        self.observe_job_sojourn(&events, now_millis());
+        self.record_adhoc_events(&events);
         Ok((events, Commit::ready()))
     }
 
@@ -34245,9 +34249,24 @@ mod clustered_startup_tests {
         // Raft applied index advances when the REST/console cancel path runs.
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
         let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+        let nodes = [&node0, &node1, &node2];
 
-        let applied_total =
-            |nodes: [&ServerImpl; 3]| -> u64 { nodes.iter().map(|n| raft_applied_total(n)).sum() };
+        // The applied index of partition `p`'s group on the node that currently
+        // leads it. A create response guarantees only that the LEADER applied the
+        // entry; followers apply asynchronously, so a cluster-wide sum cannot
+        // distinguish "the cancel replicated" from "a follower applied the
+        // earlier create after the baseline was sampled". The leader's own index
+        // for the owning partition can only advance past the create via a NEW
+        // committed entry — exactly what this regression guards.
+        let leader_applied = |p: u64| -> Option<u64> {
+            nodes.iter().find_map(|n| {
+                let part = n.raft_registry().get(p)?;
+                let metrics = part.raft.metrics();
+                let metrics = metrics.borrow();
+                (metrics.current_leader == Some(n.engine.topology().node_id as u64))
+                    .then(|| metrics.last_applied.map(|l| l.index).unwrap_or(0))
+            })
+        };
 
         let body = models::ProcessInstanceCreationInstruction::from(
             models::ProcessInstanceCreationInstructionById::new("intake".to_string()),
@@ -34264,19 +34283,23 @@ mod clustered_startup_tests {
                 .expect("numeric instance key"),
             other => panic!("rest create through raft should be 200, got {other:?}"),
         };
+        let partition = partition_of(instance_key);
 
-        let before = applied_total([&node0, &node1, &node2]);
+        // The create response guarantees the owning partition's leader applied
+        // the create, so its index is a stable baseline for the cancellation.
+        let before = leader_applied(partition)
+            .unwrap_or_else(|| panic!("partition {partition} has a leader"));
         let outcome = node0.cancel_instance_core(instance_key).await;
         assert!(
             matches!(outcome, CancelInstanceOutcome::Canceled),
             "cancel should succeed, got {outcome:?}"
         );
 
-        // The commit replicates to every follower asynchronously; poll until the
-        // applied index visibly advances across the cluster.
+        // The cancel commits on the same leader; poll until its applied index
+        // visibly advances past the create baseline.
         let mut advanced = false;
         for _ in 0..250 {
-            if applied_total([&node0, &node1, &node2]) > before {
+            if leader_applied(partition).is_some_and(|index| index > before) {
                 advanced = true;
                 break;
             }
@@ -34284,7 +34307,28 @@ mod clustered_startup_tests {
         }
         assert!(
             advanced,
-            "the cancellation entered the Raft log (applied index did not advance past {before})"
+            "the cancellation entered the Raft log (partition {partition} leader applied index did not advance past {before})"
+        );
+
+        // And the committed entry converges to the followers: every replica of
+        // the owning partition eventually applies at least the leader's index.
+        let mut converged = false;
+        for _ in 0..250 {
+            let replicas_caught_up = nodes.iter().all(|n| {
+                n.raft_registry()
+                    .get(partition)
+                    .and_then(|part| part.raft.metrics().borrow().last_applied)
+                    .is_some_and(|l| l.index > before)
+            });
+            if replicas_caught_up {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "the cancellation replicated to every replica of partition {partition}"
         );
 
         for node in [&node0, &node1, &node2] {
