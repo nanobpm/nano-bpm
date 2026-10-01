@@ -96,6 +96,8 @@ jobs:
               # still validate ProcessOS — without this it would skip the
               # processos job entirely (see #1294).
               - 'server/crates/nano-provisioning-advisor/**'
+              # The pinned Rust toolchain: a bump can change compile/clippy.
+              - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
             console:
               - 'console/**'
@@ -144,6 +146,8 @@ jobs:
               - 'engine-core/examples/**'
               - 'engine-core/Cargo.toml'
               - 'engine-core/Cargo.lock'
+              # The pinned Rust toolchain compiles the FEEL differential harness.
+              - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -223,7 +227,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -279,7 +283,11 @@ jobs:
         # trigger drifts from the train table. Lives in this REQUIRED job so a
         # regression in the release tooling blocks the merge.
         run: node --test scripts/release-tags.test.mjs
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain pin (every workflow uses rust-toolchain.toml)
+        # Fails if any workflow installs an unpinned/other Rust toolchain
+        # (`@stable` let Rust 1.99 break clippy + the armv6 release link).
+        run: node --test scripts/rust-toolchain-pin.test.mjs
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -349,7 +357,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
@@ -673,7 +681,7 @@ jobs:
             ~/.elan
             formal/lean/.lake
           key: lean-${{ hashFiles('formal/lean/lean-toolchain', 'formal/lean/lakefile.lean', 'formal/lean/lake-manifest.json') }}
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
       - name: Lean build + FEEL differential fuzz
         run: formal/lean/feel-diff.sh
 
@@ -707,7 +715,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: mozilla-actions/sccache-action@v0.0.10
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -765,7 +773,7 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: astral-sh/setup-uv@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
