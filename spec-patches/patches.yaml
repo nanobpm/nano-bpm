@@ -19,6 +19,12 @@
 # table omits that status. Keep the vendored specification unchanged, but let
 # the generated server represent the actual upstream error without converting
 # it into a misleading 400, 404, or 500.
+#
+# The 503 overlay (#1308) mirrors createAgentInstance: a leadership-race /
+# handoff-pause reply from the owner must surface as the typed, retryable 503
+# (ServiceUnavailable) instead of collapsing to the 500 wildcard. Upstream's
+# updateAgentInstance response table omits 503, so it lives here rather than as
+# a direct edit to the byte-identical vendored spec/.
 - file: agent-instances.yaml
   target: paths./agent-instances/{agentInstanceKey}.patch.responses
   merge:
@@ -28,6 +34,8 @@
         application/problem+json:
           schema:
             $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
+    "503":
+      $ref: 'common-responses.yaml#/components/responses/ServiceUnavailable'
 
 # --- createProcessInstance: processCompleted -------------------------------
 #
