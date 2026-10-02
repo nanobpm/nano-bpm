@@ -4,6 +4,7 @@ dist-observe
 
 # Generated API client — owned by `npm run gen:api` (openapi-ts), not authored.
 src/gen
+src/gen-c8
 
 # Generated in-browser engine (wasm-pack output).
 src/wasm
