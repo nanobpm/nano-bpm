@@ -31,6 +31,13 @@ import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import { usePaneResize } from "../lib/usePaneResize";
 import { ResizeHandle } from "../components/ResizeHandle";
 import BpmnViewer from "../components/BpmnViewer";
+import AgentSessionPanel from "../components/AgentSessionPanel";
+import { agentBadge, agentsByElement } from "../lib/agentHistory";
+import {
+  AGENT_HISTORY_KEY,
+  AGENT_INSTANCES_KEY,
+  useAgentInstances,
+} from "../lib/useAgentSessions";
 import { IncidentReason } from "../components/IncidentReason";
 import {
   TraceTimeline,
@@ -78,8 +85,15 @@ export default function InstanceDetail({
   onNavigateInstance?: (instanceKey: string) => void;
 }) {
   // Detail refetches on the same live signal as the list; the trace is folded
-  // from the same event stream, so refresh it on the same signal too.
-  useLiveInvalidation(["instance", "trace"]);
+  // from the same event stream, so refresh it on the same signal too. Agent
+  // sessions ride the same edge: a committed AgentHistory item advances the
+  // exported position, so the scrubber is live at turn granularity (#1314).
+  useLiveInvalidation([
+    "instance",
+    "trace",
+    AGENT_INSTANCES_KEY,
+    AGENT_HISTORY_KEY,
+  ]);
   const qc = useQueryClient();
   const narrow = useIsNarrow();
   // Which drill-down is open full-screen on mobile (Model / Variables / Trace).
@@ -100,6 +114,24 @@ export default function InstanceDetail({
   const [noCalledNotice, setNoCalledNotice] = useState<string | null>(null);
   const calledSectionRef = useRef<HTMLElement>(null);
 
+  // Agent sessions on the diagram (#1314): the engine's AgentInstances for this
+  // process instance, grouped by BPMN element, drawn as badges; `agentElement`
+  // is the element whose session scrubber is open.
+  const { data: agentInstances } = useAgentInstances(instanceKey);
+  const agentMap = useMemo(
+    () => agentsByElement(agentInstances ?? []),
+    [agentInstances],
+  );
+  const agentBadges = useMemo(
+    () =>
+      [...agentMap.values()].map((entry) => ({
+        elementId: entry.elementId,
+        ...agentBadge(entry),
+      })),
+    [agentMap],
+  );
+  const [agentElement, setAgentElement] = useState<string | null>(null);
+
   // Explorer keeps this component mounted (no `key` prop) and simply swaps the
   // `instanceKey`, so the parent->child navigation slice above would otherwise
   // carry over: a filter or "has not called" notice selected on one instance
@@ -108,6 +140,7 @@ export default function InstanceDetail({
   useEffect(() => {
     setCalledFilter(null);
     setNoCalledNotice(null);
+    setAgentElement(null);
   }, [instanceKey]);
 
   // Resizable, reload-persistent model space. Dragging the divider below the
@@ -306,6 +339,12 @@ export default function InstanceDetail({
   // reveals its rows; an un-spawned call activity shows a "no called instance"
   // affordance; a non-call-activity element is ignored (never navigates).
   const onDiagramElementSelect = (elementId: string) => {
+    // An element that ran an agent opens its session scrubber.
+    if (agentMap.has(elementId)) {
+      if (narrow) setPanel(null);
+      setAgentElement(elementId);
+      return;
+    }
     const sel = resolveCallActivitySelection(
       elementId,
       calledInstances,
@@ -462,6 +501,8 @@ export default function InstanceDetail({
         activeElementIds={activeEls}
         incidentElementIds={incidentEls}
         onElementSelect={onDiagramElementSelect}
+        badges={agentBadges}
+        onBadgeClick={onDiagramElementSelect}
         fitOnResize
       />
     </div>
@@ -587,6 +628,17 @@ export default function InstanceDetail({
       onNavigate={onNavigateInstance}
     />
   );
+  // The open agent session (null if none, or if its element no longer has one).
+  const agentSession = agentElement ? agentMap.get(agentElement) : undefined;
+  const agentSessionPanel = agentSession && (
+    <AgentSessionPanel
+      key={agentSession.elementId}
+      elementId={agentSession.elementId}
+      instances={agentSession.instances}
+      onClose={() => setAgentElement(null)}
+    />
+  );
+
   if (narrow) {
     const panels = {
       model: { title: `${instance.process_id} · Model`, body: modelBody },
@@ -638,44 +690,60 @@ export default function InstanceDetail({
             {openPanel.body}
           </FullScreenPanel>
         )}
+        {agentSession && (
+          <FullScreenPanel
+            title={`Agent session · ${agentSession.elementId}`}
+            onClose={() => setAgentElement(null)}
+            bodyClassName="min-h-0 flex-1 overflow-hidden"
+          >
+            {agentSessionPanel}
+          </FullScreenPanel>
+        )}
       </div>
     );
   }
 
   return (
-    <div className="flex h-full flex-col">
-      {header}
-      {breadcrumbBar}
+    <div className="flex h-full">
+      <div className="flex min-w-0 flex-1 flex-col">
+        {header}
+        {breadcrumbBar}
 
-      <div style={{ height: modelResize.size }} className="shrink-0 bg-white">
-        <BpmnViewer
-          xml={xml ?? null}
-          activeElementIds={activeEls}
-          incidentElementIds={incidentEls}
-          onElementSelect={onDiagramElementSelect}
+        <div style={{ height: modelResize.size }} className="shrink-0 bg-white">
+          <BpmnViewer
+            xml={xml ?? null}
+            activeElementIds={activeEls}
+            incidentElementIds={incidentEls}
+            onElementSelect={onDiagramElementSelect}
+            badges={agentBadges}
+            onBadgeClick={onDiagramElementSelect}
+          />
+        </div>
+
+        <ResizeHandle
+          axis="y"
+          label="Resize the model space"
+          onPointerDown={modelResize.onPointerDown}
+          onKeyDown={modelResize.onKeyDown}
+          dragging={modelResize.dragging}
+          size={modelResize.size}
+          min={modelResize.min}
+          max={modelResize.max}
         />
-      </div>
 
-      <ResizeHandle
-        axis="y"
-        label="Resize the model space"
-        onPointerDown={modelResize.onPointerDown}
-        onKeyDown={modelResize.onKeyDown}
-        dragging={modelResize.dragging}
-        size={modelResize.size}
-        min={modelResize.min}
-        max={modelResize.max}
-      />
-
-      <div className="min-h-0 flex-1 overflow-auto p-8">
-        {actionBanner}
-        {incidentsSection}
-        {calledNotice}
-        {calledInstancesSection}
-        <Section title="Variables">{variablesBody}</Section>
-        {jobsSection}
-        <Section title="Process Trace">{traceBody}</Section>
+        <div className="min-h-0 flex-1 overflow-auto p-8">
+          {actionBanner}
+          {incidentsSection}
+          {calledNotice}
+          {calledInstancesSection}
+          <Section title="Variables">{variablesBody}</Section>
+          {jobsSection}
+          <Section title="Process Trace">{traceBody}</Section>
+        </div>
       </div>
+      {agentSession && (
+        <div className="w-[min(480px,45vw)] shrink-0">{agentSessionPanel}</div>
+      )}
     </div>
   );
 }

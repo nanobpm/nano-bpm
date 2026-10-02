@@ -52,6 +52,49 @@ body {
   fill: #fee2e2 !important;
 }
 
+/* Agent-session badge (BpmnViewer `badges`, #1314): a pill on the element's
+ * top-right corner that opens the session scrubber. Fixed light colours for
+ * the same reason as the markers above. */
+.nano-badge {
+  white-space: nowrap;
+  border-radius: 9999px;
+  border: 1px solid #7c3aed;
+  background: #f5f3ff;
+  color: #5b21b6;
+  font:
+    600 11px/1.4 ui-sans-serif,
+    system-ui,
+    sans-serif;
+  padding: 0 6px;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
+}
+
+.nano-badge:hover,
+.nano-badge:focus-visible {
+  background: #ede9fe;
+  outline: 2px solid #7c3aed;
+  outline-offset: 1px;
+}
+
+.nano-badge-active {
+  background: #7c3aed;
+  color: #fff;
+  animation: nano-badge-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes nano-badge-pulse {
+  50% {
+    box-shadow: 0 0 0 4px rgb(124 58 237 / 0.25);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nano-badge-active {
+    animation: none;
+  }
+}
+
 /*
  * bpmn-js's popup menus (the "replace element" menu, context-pad popups),
  * search inputs, and the properties panel are light-themed widgets. When the
