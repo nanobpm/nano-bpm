@@ -17,12 +17,17 @@ const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const START = join(root, '.github', 'actions', 'sccache', 'start.sh');
 const COMPOSITE = join('.github', 'actions', 'sccache', 'action.yml');
 
-/** Lines that wire sccache directly instead of through the composite action. */
+/**
+ * Lines that wire sccache directly instead of through the composite action:
+ * YAML `env:` mappings (`NAME: v`) and shell assignments (`NAME=v`, as in
+ * `export NAME=v` or `echo "NAME=v" >> "$GITHUB_ENV"`), including
+ * `CARGO_BUILD_RUSTC_WRAPPER`.
+ */
 export function directSccacheWiring(text) {
   return text
     .split('\n')
     .map((line, i) => ({ code: line.replace(/^\s*#.*$/, ''), n: i + 1 }))
-    .filter(({ code }) => /RUSTC_WRAPPER\s*:|SCCACHE_[A-Z_]+\s*:|mozilla-actions\/sccache-action/.test(code))
+    .filter(({ code }) => /(RUSTC_WRAPPER|SCCACHE_[A-Z_]+)\s*[:=]|mozilla-actions\/sccache-action/.test(code))
     .map(({ n }) => `line ${n}`);
 }
 
@@ -40,6 +45,9 @@ test('detector flags direct wiring and ignores comments', () => {
   assert.deepEqual(directSccacheWiring("    env:\n      RUSTC_WRAPPER: 'sccache'"), ['line 2']);
   assert.deepEqual(directSccacheWiring('      - uses: mozilla-actions/sccache-action@v0.0.10'), ['line 1']);
   assert.deepEqual(directSccacheWiring("      SCCACHE_GHA_ENABLED: 'true'"), ['line 1']);
+  assert.deepEqual(directSccacheWiring('          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"'), ['line 1']);
+  assert.deepEqual(directSccacheWiring('          export SCCACHE_GHA_ENABLED=true'), ['line 1']);
+  assert.deepEqual(directSccacheWiring("      CARGO_BUILD_RUSTC_WRAPPER: sccache"), ['line 1']);
   assert.deepEqual(directSccacheWiring('    # RUSTC_WRAPPER: sccache\n      - uses: ./.github/actions/sccache'), []);
 });
 
