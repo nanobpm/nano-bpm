@@ -157,6 +157,10 @@ if [ "$WINDOWS" = 0 ]; then
   chmod +x "$zig_tools/ar" "$zig_tools/ranlib"
   export AR="$zig_tools/ar" RANLIB="$zig_tools/ranlib"
 
+  # armv6: link the ARM-RTABI unaligned-access shim (see the sourced script).
+  # shellcheck source=scripts/zig-arm-shim-env.sh
+  . "$SCRIPT_DIR/zig-arm-shim-env.sh"
+
   # Self-heal a target dir poisoned before this fix: cargo won't re-run the
   # jemalloc build script for an env change, so drop any empty archive's build
   # dir and let it rebuild. A real libjemalloc.a is megabytes.
