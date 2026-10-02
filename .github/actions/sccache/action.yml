@@ -1,0 +1,13 @@
+name: sccache (fail-open)
+description: >-
+  Install sccache and enable it as RUSTC_WRAPPER only if its server starts.
+  A cache-backend outage degrades to an uncached build with a warning instead
+  of failing the job (#1325). The single place CI wires sccache; guarded by
+  scripts/sccache-fail-open.test.mjs.
+runs:
+  using: composite
+  steps:
+    - uses: mozilla-actions/sccache-action@v0.0.10
+    - name: Start sccache (fall back to plain rustc if unavailable)
+      shell: bash
+      run: '"$GITHUB_ACTION_PATH/start.sh"'

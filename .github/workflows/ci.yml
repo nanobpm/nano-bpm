@@ -98,6 +98,8 @@ jobs:
               - 'server/crates/nano-provisioning-advisor/**'
               # The pinned Rust toolchain: a bump can change compile/clippy.
               - 'rust-toolchain.toml'
+              # The fail-open sccache wiring the processos job uses (#1325).
+              - '.github/actions/sccache/**'
               - '.github/workflows/ci.yml'
             console:
               - 'console/**'
@@ -222,15 +224,12 @@ jobs:
     # across the engine-core/server/processos jobs that all compile this crate as
     # a path dep). Unlike Swatinem's all-or-nothing target restore, sccache still
     # hits per-crate when a cache key is busted (e.g. the mold rustflag), so a
-    # flag change no longer forces a full cold rebuild. CARGO_INCREMENTAL=0 is
-    # required — incremental is incompatible with a compiler cache.
-    env:
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: 'sccache'
-      CARGO_INCREMENTAL: '0'
+    # flag change no longer forces a full cold rebuild. ./.github/actions/sccache
+    # wires it fail-open (a cache-backend outage degrades to an uncached build,
+    # #1325) and sets CARGO_INCREMENTAL=0, which a compiler cache requires.
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: ./.github/actions/sccache
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
@@ -269,13 +268,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: changes
     if: *code_gate
-    env:
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: 'sccache'
-      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: ./.github/actions/sccache
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
@@ -296,6 +291,10 @@ jobs:
         # which zig's compiler-rt lacks; every `cargo zigbuild` site must source
         # scripts/zig-arm-shim-env.sh or the armv6 release link fails.
         run: node --test scripts/zig-arm-shim.test.mjs
+      - name: sccache wired fail-open (#1325)
+        # A cache-backend outage must degrade to an uncached build, not fail the
+        # job: sccache may only be wired through .github/actions/sccache.
+        run: node --test scripts/sccache-fail-open.test.mjs
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -359,13 +358,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: changes
     if: *code_gate
-    env:
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: 'sccache'
-      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: ./.github/actions/sccache
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -709,9 +704,6 @@ jobs:
     # where the bulk of runs happen.
     if: ${{ github.event_name == 'merge_group' || needs.changes.outputs.processos == 'true' }}
     env:
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: 'sccache'
-      CARGO_INCREMENTAL: '0'
       # Link a PREBUILT DuckDB instead of compiling the bundled C++ amalgamation
       # from source (~20 min cold, ~590 translation units). libduckdb-sys downloads
       # the DuckDB release matching its crate version and uses pregenerated bindings
@@ -723,7 +715,7 @@ jobs:
       DUCKDB_DOWNLOAD_LIB: '1'
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: ./.github/actions/sccache
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy
@@ -759,13 +751,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: changes
     if: *code_gate
-    env:
-      SCCACHE_GHA_ENABLED: 'true'
-      RUSTC_WRAPPER: 'sccache'
-      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v5
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: ./.github/actions/sccache
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
