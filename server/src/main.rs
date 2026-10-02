@@ -5547,6 +5547,83 @@ fn resolve_create_selector(
     }
 }
 
+/// The post-apply fields the non-Raft instance-creation handlers project from a
+/// direct `CreateInstance` apply.
+struct CreatedInstanceDirect {
+    instance_key: nanobpmn_engine_core::Key,
+    /// The deployed key of the exact version the instance was pinned to (not the
+    /// latest), so by-id and by-key requests report the same identity.
+    definition_key: String,
+    /// The version number the instance was pinned to.
+    version: i32,
+    /// Whether the instance auto-completed synchronously within the create (no
+    /// wait states), vs. parking on a job/timer/etc.
+    sync_completed: bool,
+    /// Cross-partition subscription follow-ups to route once durable (empty on a
+    /// single partition).
+    routable: Vec<Event>,
+    commit: Commit,
+}
+
+/// The ONE place the non-Raft (single-node) instance-creation handlers may apply
+/// a `CreateInstance` command directly on the engine: apply `command` on the
+/// create actor's `journal` and project the common post-apply fields. Confining
+/// every create handler's direct apply to this single helper — exactly as the
+/// job/stream handlers already do via
+/// [`ServerImpl::apply_job_command_direct_with`] — lets the
+/// `no_direct_engine_apply_guard` allowlist just this helper rather than trust
+/// each whole handler body, so a *future* unconditional `apply_command_at` added
+/// inside `create_process_instance_impl`, `create_forwarded`, or
+/// `create_for_stream` is caught by the guard instead of silently bypassing the
+/// Raft funnel (#1305 class). The handlers reach here only when Raft is disabled;
+/// under Raft they take the replicated `create_via_raft` propose path and never
+/// apply directly. `fallback_process_id` names the version when the just-created
+/// instance's definition is no longer resolvable (pre-retention). #1308.
+fn apply_create_instance_direct(
+    journal: &mut Journal,
+    command: Command,
+    fallback_process_id: &str,
+) -> Result<CreatedInstanceDirect, EngineError> {
+    let (events, commit) = journal.apply_command_at(command, now_millis())?;
+    let instance_key = events
+        .iter()
+        .find_map(Event::instance_key)
+        .expect("created instance has a key");
+    let (definition_key, version) = journal
+        .state()
+        .instances
+        .get(&instance_key)
+        .and_then(|i| journal.state().definition_for(i))
+        .map(|d| (d.key.to_string(), d.version))
+        .unwrap_or_else(|| (fallback_process_id.to_string(), 1));
+    let sync_completed = journal.engine().is_completed(instance_key);
+    let routable: Vec<Event> = if journal.engine().num_partitions() > 1 {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::MessageSubscriptionOpening { .. }
+                        | Event::RemoteMessageCorrelation { .. }
+                        | Event::MessageSubscriptionClosing { .. }
+                        | Event::StartInstanceDispatched { .. }
+                )
+            })
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(CreatedInstanceDirect {
+        instance_key,
+        definition_key,
+        version,
+        sync_completed,
+        routable,
+        commit,
+    })
+}
+
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
@@ -5886,7 +5963,8 @@ impl ServerImpl {
                             }
                         };
 
-                    match engine.apply_command_at(
+                    match apply_create_instance_direct(
+                        engine,
                         Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
@@ -5895,56 +5973,17 @@ impl ServerImpl {
                             sel_key,
                             sel_ver,
                         ),
-                        now_millis(),
+                        &process_id,
                     ) {
-                        Ok((events, commit)) => {
-                            let instance_key = events
-                                .iter()
-                                .find_map(Event::instance_key)
-                                .expect("created instance has a key");
-                            // Project the real deployed key and version of the
-                            // version the instance was pinned to (not the latest),
-                            // so by-id and by-key requests report the same identity.
-                            let (definition_key, version) = engine
-                                .state()
-                                .instances
-                                .get(&instance_key)
-                                .and_then(|i| engine.state().definition_for(i))
-                                .map(|d| (d.key.to_string(), d.version))
-                                .unwrap_or_else(|| (process_id.clone(), 1));
-                            // An auto-completing process (no wait states) finishes
-                            // synchronously within this create command; a process that
-                            // parks on a job/timer/etc. is still running.
-                            let sync_completed = engine.engine().is_completed(instance_key);
-                            // Collect any cross-partition subscription follow-ups to
-                            // route once durable (none single-partition).
-                            let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
-                                events
-                                    .iter()
-                                    .filter(|e| {
-                                        matches!(
-                                            e,
-                                            Event::MessageSubscriptionOpening { .. }
-                                                | Event::RemoteMessageCorrelation { .. }
-                                                | Event::MessageSubscriptionClosing { .. }
-                                                | Event::StartInstanceDispatched { .. }
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            Ok((
-                                process_id,
-                                version,
-                                definition_key,
-                                instance_key,
-                                sync_completed,
-                                routable,
-                                commit,
-                            ))
-                        }
+                        Ok(created) => Ok((
+                            process_id,
+                            created.version,
+                            created.definition_key,
+                            created.instance_key,
+                            created.sync_completed,
+                            created.routable,
+                            created.commit,
+                        )),
                         Err(EngineError::ProcessNotFound { process_id }) => Err(Box::new(
                             Resp::Status400_TheProvidedDataIsNotValid(problem(
                                 "Process not found",
@@ -6124,6 +6163,13 @@ impl ServerImpl {
                     detail,
                 ))
             }
+            CancelInstanceOutcome::Unavailable(detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                ))
+            }
             CancelInstanceOutcome::Internal(detail) => {
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -6156,17 +6202,22 @@ impl ServerImpl {
 
         Ok(match self.suspend_instance_core(instance_key).await {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsSuspended,
-            TransitionInstanceOutcome::BadRequest(detail) => {
-                Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid transition",
-                    400,
-                    detail,
-                ))
+            TransitionInstanceOutcome::Conflict(detail) => {
+                Resp::Status409_TheProcessInstanceIsNotInTheACTIVEStateAndCannotBeSuspended(
+                    problem("Invalid transition", 409, detail),
+                )
             }
             TransitionInstanceOutcome::NotFound(detail) => {
                 Resp::Status404_TheProcessInstanceIsNotFound(problem(
                     "Process instance not found",
                     404,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::Unavailable(detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
                     detail,
                 ))
             }
@@ -6202,17 +6253,22 @@ impl ServerImpl {
 
         Ok(match self.resume_instance_core(instance_key).await {
             TransitionInstanceOutcome::Ok => Resp::Status204_TheProcessInstanceIsResumed,
-            TransitionInstanceOutcome::BadRequest(detail) => {
-                Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid transition",
-                    400,
-                    detail,
-                ))
+            TransitionInstanceOutcome::Conflict(detail) => {
+                Resp::Status409_TheProcessInstanceIsNotInTheSUSPENDEDStateAndCannotBeResumed(
+                    problem("Invalid transition", 409, detail),
+                )
             }
             TransitionInstanceOutcome::NotFound(detail) => {
                 Resp::Status404_TheProcessInstanceIsNotFound(problem(
                     "Process instance not found",
                     404,
+                    detail,
+                ))
+            }
+            TransitionInstanceOutcome::Unavailable(detail) => {
+                Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
                     detail,
                 ))
             }
@@ -6300,6 +6356,13 @@ impl ServerImpl {
                     Resp::Status409_TheProcessInstanceMigrationFailed(problem(
                         "Migration failed",
                         409,
+                        detail,
+                    ))
+                }
+                MigrateInstanceOutcome::Unavailable(detail) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
                         detail,
                     ))
                 }
@@ -6425,60 +6488,63 @@ impl ServerImpl {
         );
         if !self.raft.is_empty() {
             let metadata = self.job_worker_metadata(job_key).await;
-            return Ok(match self.propose_job_for_stream(job_key, command).await {
-                Ok(commit) => {
-                    commit.wait().await;
-                    self.note_job_completion("rest");
-                    if let Some((job_type, worker)) = metadata {
-                        self.job_statistics
-                            .record_completed(job_type, worker, now_millis());
+            // REST complete is not the stream CompleteJob path: do not record the
+            // stream-completion diagnostic (`record_stream_outcome = false`). #1306.
+            return Ok(
+                match self.propose_job_for_stream(job_key, command, false).await {
+                    Ok(commit) => {
+                        commit.wait().await;
+                        self.note_job_completion("rest");
+                        if let Some((job_type, worker)) = metadata {
+                            self.job_statistics
+                                .record_completed(job_type, worker, now_millis());
+                        }
+                        self.signal_jobs_available();
+                        Resp::Status204_TheJobWasCompletedSuccessfully
                     }
-                    self.signal_jobs_available();
-                    Resp::Status204_TheJobWasCompletedSuccessfully
-                }
-                Err((404, detail)) => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
-                    "Job not found",
-                    404,
-                    detail,
-                )),
-                Err((409, detail)) => {
-                    Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                        "Job command rejected",
-                        409,
+                    Err((404, detail)) => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(
+                        problem("Job not found", 404, detail),
+                    ),
+                    Err((409, detail)) => {
+                        Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                            "Job command rejected",
+                            409,
+                            detail,
+                        ))
+                    }
+                    Err((400, detail)) => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid job completion",
+                        400,
                         detail,
-                    ))
-                }
-                Err((400, detail)) => Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Invalid job completion",
-                    400,
-                    detail,
-                )),
-                Err((_, detail)) => {
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Job completion failed",
-                        500,
-                        detail,
-                    ))
-                }
-            });
+                    )),
+                    // Preserve the retryable 503 (handoff pause / leadership race)
+                    // per spec/jobs.yaml; only genuinely untyped errors fall to 500.
+                    Err((503, detail)) => Resp::Status503_TheServiceIsCurrentlyUnavailable(
+                        problem("Service unavailable", 503, detail),
+                    ),
+                    Err((_, detail)) => {
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Job completion failed",
+                            500,
+                            detail,
+                        ))
+                    }
+                },
+            );
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
+        let (engine_meta, result) = self
+            .apply_job_command_direct_with(job_key, command, move |engine| {
                 // Capture the job's type/worker authoritatively from engine state
                 // *before* the completion drops the activation, so the
                 // job-statistics attribution is race-free (the read model is
                 // eventually consistent and may lag).
-                let meta = engine
+                engine
                     .state()
                     .jobs
                     .get(&job_key)
-                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
-                (meta, engine.apply_command_at(command, now_millis()))
+                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()))
             })
             .await;
-        let (engine_meta, result) = result;
         let completed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((events, commit)) => {
@@ -6620,55 +6686,57 @@ impl ServerImpl {
                 Command::fail_job(job_key, retries, error_message),
                 lease_token,
             );
-            return Ok(match self.propose_job_for_stream(job_key, command).await {
-                Ok(commit) => {
-                    commit.wait().await;
-                    self.note_job_completion("rest");
-                    if let Some((job_type, worker)) = metadata {
-                        self.job_statistics
-                            .record_failed(job_type, worker, now_millis());
+            // REST fail is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
+            return Ok(
+                match self.propose_job_for_stream(job_key, command, false).await {
+                    Ok(commit) => {
+                        commit.wait().await;
+                        self.note_job_completion("rest");
+                        if let Some((job_type, worker)) = metadata {
+                            self.job_statistics
+                                .record_failed(job_type, worker, now_millis());
+                        }
+                        self.signal_jobs_available();
+                        Resp::Status204_TheJobIsFailed
                     }
-                    self.signal_jobs_available();
-                    Resp::Status204_TheJobIsFailed
-                }
-                Err((404, detail)) => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(problem(
-                    "Job not found",
-                    404,
-                    detail,
-                )),
-                Err((409, detail)) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
-                    problem("Job command rejected", 409, detail),
-                ),
-                Err((_, detail)) => {
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Job failure failed",
-                        500,
-                        detail,
-                    ))
-                }
-            });
+                    Err((404, detail)) => Resp::Status404_TheJobWithTheGivenJobKeyIsNotFound(
+                        problem("Job not found", 404, detail),
+                    ),
+                    Err((409, detail)) => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
+                        problem("Job command rejected", 409, detail),
+                    ),
+                    // Preserve the retryable 503 (handoff pause / leadership race)
+                    // per spec/jobs.yaml; only genuinely untyped errors fall to 500.
+                    Err((503, detail)) => Resp::Status503_TheServiceIsCurrentlyUnavailable(
+                        problem("Service unavailable", 503, detail),
+                    ),
+                    Err((_, detail)) => {
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Job failure failed",
+                            500,
+                            detail,
+                        ))
+                    }
+                },
+            );
         }
 
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                let meta = engine
-                    .state()
-                    .jobs
-                    .get(&job_key)
-                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
-                let outcome = engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::fail_job(job_key, retries, error_message),
-                        lease_token,
-                    ),
-                    now_millis(),
-                );
-                (meta, outcome)
-            })
+        let (engine_meta, result) = self
+            .apply_job_command_direct_with(
+                job_key,
+                job_command_with_lease(
+                    Command::fail_job(job_key, retries, error_message),
+                    lease_token,
+                ),
+                move |engine| {
+                    engine
+                        .state()
+                        .jobs
+                        .get(&job_key)
+                        .map(|j| (Some(j.job_type.clone()), j.worker.clone()))
+                },
+            )
             .await;
-        let (engine_meta, result) = result;
         let failed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((_, commit)) => {
@@ -6796,70 +6864,74 @@ impl ServerImpl {
                 Command::throw_job_error_with(job_key, body_error_code, error_message, variables),
                 lease_token,
             );
-            return Ok(match self.propose_job_for_stream(job_key, command).await {
-                Ok(commit) => {
-                    commit.wait().await;
-                    self.note_job_completion("rest");
-                    if let Some((job_type, worker)) = metadata {
-                        self.job_statistics.record_error(
-                            job_type,
-                            worker,
-                            stat_error_code,
-                            stat_error_message,
-                            now_millis(),
-                        );
+            // REST throw-error is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
+            return Ok(
+                match self.propose_job_for_stream(job_key, command, false).await {
+                    Ok(commit) => {
+                        commit.wait().await;
+                        self.note_job_completion("rest");
+                        if let Some((job_type, worker)) = metadata {
+                            self.job_statistics.record_error(
+                                job_type,
+                                worker,
+                                stat_error_code,
+                                stat_error_message,
+                                now_millis(),
+                            );
+                        }
+                        self.signal_jobs_available();
+                        Resp::Status204_AnErrorIsThrownForTheJob
                     }
-                    self.signal_jobs_available();
-                    Resp::Status204_AnErrorIsThrownForTheJob
-                }
-                Err((404, detail)) => {
-                    Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
-                        "Job not found",
-                        404,
-                        detail,
-                    ))
-                }
-                Err((409, detail)) => {
-                    Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                        "Job command rejected",
-                        409,
-                        detail,
-                    ))
-                }
-                Err((_, detail)) => {
-                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                        "Job error failed",
-                        500,
-                        detail,
-                    ))
-                }
-            });
-        }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                let meta = engine
-                    .state()
-                    .jobs
-                    .get(&job_key)
-                    .map(|j| (Some(j.job_type.clone()), j.worker.clone()));
-                let outcome = engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::throw_job_error_with(
-                            job_key,
-                            body_error_code,
-                            error_message,
-                            variables,
-                        ),
-                        lease_token,
+                    Err((404, detail)) => {
+                        Resp::Status404_TheJobWithTheGivenKeyWasNotFoundOrIsNotActivated(problem(
+                            "Job not found",
+                            404,
+                            detail,
+                        ))
+                    }
+                    Err((409, detail)) => {
+                        Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                            "Job command rejected",
+                            409,
+                            detail,
+                        ))
+                    }
+                    // Preserve the retryable 503 (handoff pause / leadership race)
+                    // per spec/jobs.yaml; only genuinely untyped errors fall to 500.
+                    Err((503, detail)) => Resp::Status503_TheServiceIsCurrentlyUnavailable(
+                        problem("Service unavailable", 503, detail),
                     ),
-                    now_millis(),
-                );
-                (meta, outcome)
-            })
+                    Err((_, detail)) => {
+                        Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                            "Job error failed",
+                            500,
+                            detail,
+                        ))
+                    }
+                },
+            );
+        }
+        let (engine_meta, result) = self
+            .apply_job_command_direct_with(
+                job_key,
+                job_command_with_lease(
+                    Command::throw_job_error_with(
+                        job_key,
+                        body_error_code,
+                        error_message,
+                        variables,
+                    ),
+                    lease_token,
+                ),
+                move |engine| {
+                    engine
+                        .state()
+                        .jobs
+                        .get(&job_key)
+                        .map(|j| (Some(j.job_type.clone()), j.worker.clone()))
+                },
+            )
             .await;
-        let (engine_meta, result) = result;
         let error_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((_, commit)) => {
@@ -7414,6 +7486,14 @@ impl ServerImpl {
                 409,
                 detail,
             )),
+            // Preserve the retryable 503 (handoff pause / leadership race) that
+            // `update_job_core` propagates from the propose path, per
+            // spec/jobs.yaml:291-292 — a transient election is not a 500 fault.
+            503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            )),
             // Any other status (e.g. 502 when a peer is unreachable) has no
             // dedicated response variant, so it maps onto the 500 transport
             // variant — but we preserve the real upstream status in the
@@ -7470,14 +7550,11 @@ impl ServerImpl {
             lease_token,
         };
         let commit = if self.raft.is_empty() {
-            let result = self
-                .engine
-                .by_key(job_key)
-                .with(move |journal| journal.apply_command_at(command, now_millis()))
-                .await;
+            let result = self.apply_job_command_direct(job_key, command).await;
             Self::map_job_outcome(result)?
         } else {
-            self.propose_job_for_stream(job_key, command).await?
+            // REST job path, not stream CompleteJob: no stream diagnostic. #1306.
+            self.propose_job_for_stream(job_key, command, false).await?
         };
         commit.wait().await;
         self.signal_jobs_available();
@@ -7498,6 +7575,7 @@ impl ServerImpl {
                 Ok(link) => match link.cancel_instance(instance_key.to_string()).await {
                     Ok(r) if is_ok_status(r.status) => Out::Canceled,
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7506,22 +7584,13 @@ impl ServerImpl {
         }
 
         match self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
-            })
+            .apply_partition_command(instance_key, Command::cancel_instance(instance_key))
             .await
         {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                Out::Canceled
-            }
-            Err(EngineError::InstanceNotFound { instance_key }) => Out::NotFound(format!(
-                "No active process instance with key {instance_key}."
-            )),
-            Err(e) => Out::Internal(e.to_string()),
+            Ok(_) => Out::Canceled,
+            Err((404, detail)) => Out::NotFound(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
+            Err((_, detail)) => Out::Internal(detail),
         }
     }
 
@@ -7539,8 +7608,9 @@ impl ServerImpl {
             return match self.peer_link(node).await {
                 Ok(link) => match link.suspend_instance(instance_key.to_string()).await {
                     Ok(r) if is_ok_status(r.status) => Out::Ok,
-                    Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
+                    Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7563,8 +7633,9 @@ impl ServerImpl {
             return match self.peer_link(node).await {
                 Ok(link) => match link.resume_instance(instance_key.to_string()).await {
                     Ok(r) if is_ok_status(r.status) => Out::Ok,
-                    Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
+                    Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7577,9 +7648,10 @@ impl ServerImpl {
 
     /// Applies a suspend transition on this node's owning partition. Returns
     /// `Ok(())` on success (or an idempotent no-op), else `(status, detail)`:
-    /// 404 for an unknown instance, 400 for an illegal transition from a
-    /// terminal state, 500 otherwise. Shared by the v2 REST core and the
-    /// intra-cluster `SuspendInstance` frame handler so the two cannot drift.
+    /// 404 for an unknown instance, 409 for a transition conflicting with a
+    /// terminal state, 503 for a transient Raft condition, 500 otherwise.
+    /// Shared by the v2 REST core and the intra-cluster `SuspendInstance` frame
+    /// handler so the two cannot drift.
     pub(crate) async fn suspend_instance_local(
         &self,
         instance_key: u64,
@@ -7599,38 +7671,19 @@ impl ServerImpl {
     }
 
     /// Applies a suspend/resume transition on this node's owning partition,
-    /// mapping the engine result to `(status, detail)`: an unknown instance is
-    /// 404, an illegal transition from a terminal state is 400, any other engine
-    /// error is 500. A successful (or idempotent no-op) apply waits for commit.
+    /// mapping the engine result to `(status, detail)` via the shared
+    /// [`crate::raft::engine_error_status`]: an unknown instance is 404, a
+    /// transition conflicting with a terminal state is 409, a transient Raft
+    /// condition is 503, any other engine error is 500. A successful (or
+    /// idempotent no-op) apply waits for commit.
     pub(crate) async fn apply_transition_local(
         &self,
         instance_key: u64,
         command: Command,
     ) -> Result<(), (u16, String)> {
-        match self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
+        self.apply_partition_command(instance_key, command)
             .await
-        {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                Ok(())
-            }
-            Err(EngineError::InstanceNotFound { instance_key }) => {
-                Err((404, format!("No process instance with key {instance_key}.")))
-            }
-            Err(EngineError::InstanceTransitionInvalid {
-                instance_key,
-                from,
-                to,
-            }) => Err((
-                400,
-                format!("Process instance {instance_key} cannot transition from {from} to {to}."),
-            )),
-            Err(e) => Err((500, e.to_string())),
-        }
+            .map(|_| ())
     }
 
     /// Surface-independent core of "migrate a process instance": leader-forward
@@ -7660,6 +7713,7 @@ impl ServerImpl {
                     Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7679,6 +7733,7 @@ impl ServerImpl {
             Err((400, detail)) => Out::BadRequest(detail),
             Err((404, detail)) => Out::NotFound(detail),
             Err((409, detail)) => Out::Conflict(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
             Err((_, detail)) => Out::Internal(detail),
         }
     }
@@ -7686,7 +7741,10 @@ impl ServerImpl {
     /// Applies a migration on this node's owning partition. Returns
     /// `Ok(())` on success, else `(status, detail)` where `status` is the
     /// HTTP code the migration [`EngineError`] maps to (400 invalid mapping,
-    /// 404 unknown instance/target, 409 rejected migration, 500 otherwise).
+    /// 404 unknown instance/target, 409 rejected migration, 500 otherwise) via
+    /// the shared [`crate::raft::engine_error_status`], or 503 when
+    /// [`Self::apply_partition_command`] rejects the write during a hand-off
+    /// completion-pause or leader transition (retryable).
     pub(crate) async fn migrate_instance_local(
         &self,
         instance_key: u64,
@@ -7698,20 +7756,9 @@ impl ServerImpl {
             target_process_definition_key,
             mapping_instructions,
         );
-        match self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await
-        {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                self.signal_jobs_available();
-                Ok(())
-            }
-            Err(e) => Err((migration_error_status(&e), e.to_string())),
-        }
+        let _ = self.apply_partition_command(instance_key, command).await?;
+        self.signal_jobs_available();
+        Ok(())
     }
     /// this node is not the leader, else apply [`Command::ResolveIncident`] and
     /// wait for commit. Returns a neutral outcome so every API surface (the v2
@@ -7734,6 +7781,7 @@ impl ServerImpl {
                     Ok(r) if is_ok_status(r.status) => Out::Resolved,
                     Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
                     Ok(r) if r.status == 409 => Out::NotResolvable(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7745,24 +7793,17 @@ impl ServerImpl {
             incident_key,
             operation_reference,
         };
-        match self
-            .engine
-            .by_key(incident_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await
-        {
-            Ok((_, commit)) => {
-                commit.wait().await;
+        match self.apply_partition_command(incident_key, command).await {
+            Ok(_) => {
                 // Resolving a job-incident returns the job to the activatable
                 // pool, so wake any long-pollers.
                 self.signal_jobs_available();
                 Out::Resolved
             }
-            Err(EngineError::IncidentNotFound { incident_key }) => {
-                Out::NotFound(format!("No incident with key {incident_key}."))
-            }
-            Err(EngineError::IncidentNotResolvable { reason, .. }) => Out::NotResolvable(reason),
-            Err(e) => Out::Internal(e.to_string()),
+            Err((404, detail)) => Out::NotFound(detail),
+            Err((409, detail)) => Out::NotResolvable(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
+            Err((_, detail)) => Out::Internal(detail),
         }
     }
 
@@ -7829,8 +7870,12 @@ impl ServerImpl {
             // The retry grant failed, so the incident stays unresolvable. Surface that as
             // `NotResolvable` (or `Internal` for a server-side failure) — never `NotFound`, which
             // is documented as "no incident with the given key" and would misreport an incident
-            // that plainly exists (we just resolved-then-refused it above).
-            return if status >= 500 {
+            // that plainly exists (we just resolved-then-refused it above). A retryable 503
+            // (leadership changed before the grant) is preserved as `Unavailable` so the console
+            // surfaces a retryable outcome instead of a terminal 500.
+            return if status == 503 {
+                Out::Unavailable(detail)
+            } else if status >= 500 {
                 Out::Internal(detail)
             } else {
                 Out::NotResolvable(detail)
@@ -7862,6 +7907,7 @@ impl ServerImpl {
                 {
                     Ok(r) if is_ok_status(r.status) => Out::Updated,
                     Ok(r) if r.status == 400 => Out::ScopeNotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 503 => Out::Unavailable(peer_detail(&r)),
                     Ok(r) => Out::Internal(peer_detail(&r)),
                     Err(e) => Out::Internal(e.to_string()),
                 },
@@ -7874,24 +7920,16 @@ impl ServerImpl {
             .map(|(name, v)| (name.clone(), json_to_value(v)))
             .collect();
         match self
-            .engine
-            .by_key(scope_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::set_variables_scoped(scope_key, engine_vars, local),
-                    now_millis(),
-                )
-            })
+            .apply_partition_command(
+                scope_key,
+                Command::set_variables_scoped(scope_key, engine_vars, local),
+            )
             .await
         {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Out::Updated
-            }
-            Err(EngineError::ScopeNotFound { scope_key }) => Out::ScopeNotFound(format!(
-                "No process or element instance with key {scope_key}."
-            )),
-            Err(e) => Out::Internal(e.to_string()),
+            Ok(_) => Out::Updated,
+            Err((400, detail)) => Out::ScopeNotFound(detail),
+            Err((503, detail)) => Out::Unavailable(detail),
+            Err((_, detail)) => Out::Internal(detail),
         }
     }
 
@@ -7937,6 +7975,13 @@ impl ServerImpl {
                     Resp::Status409_TheIncidentCannotBeResolvedDueToAnInvalidState(problem(
                         "Incident not resolvable",
                         409,
+                        detail,
+                    ))
+                }
+                ResolveIncidentOutcome::Unavailable(detail) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
                         detail,
                     ))
                 }
@@ -7989,6 +8034,13 @@ impl ServerImpl {
                     Resp::Status400_TheProvidedDataIsNotValid(problem(
                         "Scope not found",
                         400,
+                        detail,
+                    ))
+                }
+                SetVariablesOutcome::Unavailable(detail) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
                         detail,
                     ))
                 }
@@ -8652,26 +8704,11 @@ impl ServerImpl {
         &self,
         instance_key: u64,
     ) -> Result<(), (u16, String)> {
-        let result = self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
-            })
-            .await;
-        match result {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                self.signal_jobs_available();
-                Ok(())
-            }
-            Err(EngineError::InstanceNotFound { instance_key }) => Err((
-                404,
-                format!("No active process instance with key {instance_key}."),
-            )),
-            Err(e) => Err((500, e.to_string())),
-        }
+        let _ = self
+            .apply_partition_command(instance_key, Command::cancel_instance(instance_key))
+            .await?;
+        self.signal_jobs_available();
+        Ok(())
     }
 
     /// Applies a job-retries update on this node's owning partition.
@@ -8698,17 +8735,14 @@ impl ServerImpl {
             lease_token,
         );
         if !self.raft.is_empty() {
-            self.propose_job_for_stream(job_key, command)
+            // REST job-retries update, not stream CompleteJob: no stream diagnostic. #1306.
+            self.propose_job_for_stream(job_key, command, false)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
+        let result = self.apply_job_command_direct(job_key, command).await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -8753,17 +8787,14 @@ impl ServerImpl {
             lease_token,
         );
         if !self.raft.is_empty() {
-            self.propose_job_for_stream(job_key, command)
+            // REST job-timeout update, not stream CompleteJob: no stream diagnostic. #1306.
+            self.propose_job_for_stream(job_key, command, false)
                 .await?
                 .wait()
                 .await;
             return Ok(());
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
+        let result = self.apply_job_command_direct(job_key, command).await;
         match result {
             Ok((_, commit)) => {
                 commit.wait().await;
@@ -8792,23 +8823,9 @@ impl ServerImpl {
             incident_key,
             operation_reference,
         };
-        let result = self
-            .engine
-            .by_key(incident_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                self.signal_jobs_available();
-                Ok(())
-            }
-            Err(EngineError::IncidentNotFound { incident_key }) => {
-                Err((404, format!("No incident with key {incident_key}.")))
-            }
-            Err(EngineError::IncidentNotResolvable { reason, .. }) => Err((409, reason)),
-            Err(e) => Err((500, e.to_string())),
-        }
+        let _ = self.apply_partition_command(incident_key, command).await?;
+        self.signal_jobs_available();
+        Ok(())
     }
 
     /// Merges variables into a scope on this node's owning partition.
@@ -8818,27 +8835,12 @@ impl ServerImpl {
         variables: std::collections::HashMap<String, Value>,
         local: bool,
     ) -> Result<(), (u16, String)> {
-        let result = self
-            .engine
-            .by_key(scope_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::set_variables_scoped(scope_key, variables, local),
-                    now_millis(),
-                )
-            })
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(())
-            }
-            Err(EngineError::ScopeNotFound { scope_key }) => Err((
-                400,
-                format!("No process or element instance with key {scope_key}."),
-            )),
-            Err(e) => Err((500, e.to_string())),
-        }
+        self.apply_partition_command(
+            scope_key,
+            Command::set_variables_scoped(scope_key, variables, local),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Returns the id of the peer owning `key`'s partition, or `None` when this
@@ -9025,6 +9027,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -9049,6 +9052,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -9066,6 +9070,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -9090,6 +9095,7 @@ impl ServerImpl {
                     Ok(R::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(p)) => {
                         (409, Some(p.detail))
                     }
+                    Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
                     Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                         (500, Some(p.detail))
                     }
@@ -9168,6 +9174,11 @@ impl ServerImpl {
                 400 => {
                     Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid data", 400, detail))
                 }
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -9181,48 +9192,28 @@ impl ServerImpl {
         }
 
         let command = adhoc_activation_command(container_key, body);
-        let result = self
-            .engine
-            .by_key(container_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                Ok(Resp::Status204_TheAd)
-            }
-            Err(EngineError::AdHocSubProcessNotFound {
-                ad_hoc_instance_key,
-            }) => Ok(Resp::Status404_TheAd(problem(
+        match self.apply_partition_command(container_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheAd),
+            Err((404, detail)) => Ok(Resp::Status404_TheAd(problem(
                 "Ad-hoc sub-process not found",
                 404,
-                format!(
-                    "No active ad-hoc sub-process container with instance key {ad_hoc_instance_key}."
-                ),
+                detail,
             ))),
-            Err(EngineError::AdHocUnknownElement {
-                instance_key: _,
-                element_id,
-            }) => Ok(Resp::Status404_TheAd(problem(
-                "Ad-hoc sub-process not found",
-                404,
-                format!("Ad-hoc sub-process has no activatable element with id '{element_id}'."),
-            ))),
-            Err(EngineError::AdHocNoActivationTargets {
-                ad_hoc_instance_key,
-            }) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+            Err((400, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                 "Invalid data",
                 400,
-                format!(
-                    "Ad-hoc sub-process activation for instance key {ad_hoc_instance_key} named no elements and did not set cancelRemainingInstances."
-                ),
+                detail,
             ))),
-            Err(e) => Ok(
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -9279,6 +9270,7 @@ impl ServerImpl {
             Ok(R::Status204_TheAd) => (204, None),
             Ok(R::Status404_TheAd(p)) => (404, Some(p.detail)),
             Ok(R::Status400_TheProvidedDataIsNotValid(p)) => (400, Some(p.detail)),
+            Ok(R::Status503_TheServiceIsCurrentlyUnavailable(p)) => (503, Some(p.detail)),
             Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
                 (500, Some(p.detail))
             }
@@ -9342,6 +9334,14 @@ impl ServerImpl {
                 400,
                 peer_detail(&r),
             )),
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) so a non-leader gateway forwards it intact per
+            // spec/jobs.yaml; only genuinely untyped errors fall to 500.
+            Ok(r) if r.status == 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -9385,6 +9385,13 @@ impl ServerImpl {
             Ok(r) if r.status == 409 => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongState(
                 problem("Job in wrong state", 409, peer_detail(&r)),
             ),
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) per spec/jobs.yaml; only untyped errors fall to 500.
+            Ok(r) if r.status == 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -9444,6 +9451,13 @@ impl ServerImpl {
                     peer_detail(&r),
                 ))
             }
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) per spec/jobs.yaml; only untyped errors fall to 500.
+            Ok(r) if r.status == 503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                peer_detail(&r),
+            )),
             Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                 "Peer error",
                 500,
@@ -9620,6 +9634,10 @@ impl ServerImpl {
             Ok(r) if is_ok_status(r.status) => Ok(()),
             Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
             Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
+            // Preserve the owner's retryable 503 (handoff pause / leadership
+            // race) so callers can map it to Out::Unavailable instead of a
+            // non-retryable 500 during the incident-resolution retry phase.
+            Ok(r) if r.status == 503 => Err((503, peer_detail(&r))),
             Ok(r) => Err((500, peer_detail(&r))),
             Err(e) => Err((502, e.to_string())),
         }
@@ -9707,7 +9725,8 @@ impl ServerImpl {
                             Ok(t) => t,
                             Err(e) => return Err(e),
                         };
-                    match engine.apply_command_at(
+                    match apply_create_instance_direct(
+                        engine,
                         Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
@@ -9716,48 +9735,17 @@ impl ServerImpl {
                             sel_key,
                             sel_ver,
                         ),
-                        now_millis(),
+                        &process_id,
                     ) {
-                        Ok((events, commit)) => {
-                            let instance_key = events
-                                .iter()
-                                .find_map(Event::instance_key)
-                                .expect("created instance has a key");
-                            let (definition_key, version) = engine
-                                .state()
-                                .instances
-                                .get(&instance_key)
-                                .and_then(|i| engine.state().definition_for(i))
-                                .map(|d| (d.key.to_string(), d.version))
-                                .unwrap_or_else(|| (process_id.clone(), 1));
-                            let sync_completed = engine.engine().is_completed(instance_key);
-                            let routable: Vec<Event> = if engine.engine().num_partitions() > 1 {
-                                events
-                                    .iter()
-                                    .filter(|e| {
-                                        matches!(
-                                            e,
-                                            Event::MessageSubscriptionOpening { .. }
-                                                | Event::RemoteMessageCorrelation { .. }
-                                                | Event::MessageSubscriptionClosing { .. }
-                                                | Event::StartInstanceDispatched { .. }
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            Ok((
-                                process_id,
-                                version,
-                                definition_key,
-                                instance_key,
-                                sync_completed,
-                                routable,
-                                commit,
-                            ))
-                        }
+                        Ok(created) => Ok((
+                            process_id,
+                            created.version,
+                            created.definition_key,
+                            created.instance_key,
+                            created.sync_completed,
+                            created.routable,
+                            created.commit,
+                        )),
                         Err(EngineError::ProcessNotFound { process_id }) => {
                             Err((400, format!("No deployed process with id '{process_id}'.")))
                         }
@@ -12485,7 +12473,6 @@ impl ServerImpl {
         match outcome {
             Ok((events, commit)) => {
                 commit.wait().await;
-                self.spawn_routing_if_needed(&events);
                 let agent_instance_key = events.iter().find_map(|e| match e {
                     Event::AgentInstanceCreated { agent_instance, .. } => {
                         Some(agent_instance.agent_instance_key)
@@ -12725,7 +12712,6 @@ impl ServerImpl {
         match outcome {
             Ok((events, commit)) => {
                 commit.wait().await;
-                self.spawn_routing_if_needed(&events);
                 // Correlate each emitted AgentHistoryCreated to its submitted item
                 // in request order; the processor emits them in submission order.
                 let created_history = match created_history_from_events(&events, submitted_ids) {
@@ -12791,29 +12777,116 @@ impl ServerImpl {
         let response = part
             .propose_result(command, now_millis())
             .await
-            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+            .map_err(|e| match e {
+                // A leadership race (ForwardToLeader while the batched write was
+                // queued) is retryable, not an internal fault. #1306.
+                crate::raft::ProposeError::Leader => {
+                    (503, format!("partition {p} leader unavailable; retry"))
+                }
+                other => (500, other.to_string()),
+            })?;
         if let Some((status, message)) = response.error {
             return Err((status, message));
         }
         Ok(Arc::new(response.events))
     }
 
-    /// Applies `command` on the partition owning `key`: through that partition's
-    /// Raft leader when Raft is enabled (so the write is replicated before it is
-    /// acknowledged), else directly on the local engine actor.
+    /// Applies `command` on the partition owning `key` and returns its events +
+    /// a durable-commit barrier: through that partition's Raft leader when Raft
+    /// is enabled (so the write is replicated before it is acknowledged), else
+    /// directly on the local engine actor.
+    ///
+    /// This is THE single funnel for durable by-key REST/operator mutations —
+    /// the `no_direct_engine_apply_in_handlers` guard test (#1306) forbids a
+    /// handler from calling `engine.apply_command_at` itself, because a direct
+    /// local apply under Raft never enters the replicated log and a failover
+    /// silently loses the write (the #1305 defect class). Both paths map an
+    /// engine rejection through [`crate::raft::engine_error_status`] and drive
+    /// the command's cross-partition subscription routing exactly ONCE, so a
+    /// caller cannot tell whether Raft was enabled.
     async fn apply_partition_command(
         &self,
         key: Key,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         if !self.raft.is_empty() {
-            return self.propose_partition_command(key, command).await;
+            // `propose_partition_command` already awaits the durable barrier and
+            // drives routing / job-sojourn / ad-hoc side effects on the replicated
+            // events, so callers must NOT repeat them. `false`: this generic funnel
+            // must not record the stream-completion diagnostic (#1306).
+            return self.propose_partition_command(key, command, false).await;
         }
-        self.engine
+        let (events, commit) = self
+            .engine
             .by_key(key)
             .with(move |journal| journal.apply_command_at(command, now_millis()))
             .await
-            .map_err(|error| crate::raft::engine_error_status(&error))
+            .map_err(|error| crate::raft::engine_error_status(&error))?;
+        // Mirror the Raft path: wait for durability, then route any
+        // cross-partition subscription follow-ups the command produced and record
+        // the same committed-event telemetry (`propose_partition_command` drives
+        // routing / job-sojourn / ad-hoc metrics on the replicated events). Doing
+        // it here (not in each caller) keeps the side effects single-sourced and
+        // prevents the double-count a per-handler repetition would cause under
+        // Raft. The barrier is awaited here, so — like the Raft path — a ready
+        // barrier is handed back and a caller's own `commit.wait()` is a harmless
+        // no-op.
+        commit.wait().await;
+        self.spawn_routing_if_needed(&events);
+        self.observe_job_sojourn(&events, now_millis());
+        self.record_adhoc_events(&events);
+        Ok((events, Commit::ready()))
+    }
+
+    /// The non-Raft (single-node) fallback for the job/stream mutation handlers:
+    /// apply `command` directly on the owning engine actor and return the raw
+    /// [`Journal::apply_command_at`] outcome. This is the ONLY place those
+    /// handlers may apply on the engine — it exists so the
+    /// `no_direct_engine_apply_guard` can confine their direct apply to this one
+    /// small, allowlisted helper instead of trusting each whole handler body.
+    /// Under Raft the handlers take the replicated `propose_*` path and never
+    /// reach here, so this fallback runs only when Raft is disabled (where a
+    /// local apply is correct and durable). #1306.
+    ///
+    /// Returns the raw outcome (no routing / sojourn / ad-hoc side effects and
+    /// no durability wait): each caller keeps its own bespoke post-apply
+    /// handling, exactly as before.
+    async fn apply_job_command_direct(
+        &self,
+        job_key: Key,
+        command: Command,
+    ) -> Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError> {
+        self.apply_job_command_direct_with(job_key, command, |_| ())
+            .await
+            .1
+    }
+
+    /// [`apply_job_command_direct`](Self::apply_job_command_direct) with a
+    /// pre-apply hook run on the engine thread just before the command applies
+    /// (the REST complete/fail/throw paths use it to capture the job's
+    /// type/worker for statistics *before* the apply drops the activation).
+    /// Keeping the apply itself inside this one helper is what lets the
+    /// `no_direct_engine_apply_guard` confine the job/stream handlers' direct
+    /// apply to the non-Raft fallback. #1306.
+    async fn apply_job_command_direct_with<M>(
+        &self,
+        job_key: Key,
+        command: Command,
+        pre_apply: impl FnOnce(&mut Journal) -> M + Send + 'static,
+    ) -> (
+        M,
+        Result<(Arc<Vec<Event>>, Commit), nanobpmn_engine_core::EngineError>,
+    )
+    where
+        M: Send + 'static,
+    {
+        self.engine
+            .by_key(job_key)
+            .with(move |journal| {
+                let meta = pre_apply(journal);
+                (meta, journal.apply_command_at(command, now_millis()))
+            })
+            .await
     }
 
     async fn forward_agent_request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -13111,6 +13184,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13127,45 +13205,28 @@ impl ServerImpl {
             assignee,
             allow_override,
         };
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheUserTask)
-            }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheUserTask),
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be assigned."),
+                    detail,
                 )),
             ),
-            Err(EngineError::UserTaskAlreadyAssigned { user_task_key }) => Ok(
-                Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task already assigned",
-                    409,
-                    format!(
-                        "User task {user_task_key} is already assigned; unassign it before \
-                         assigning again."
-                    ),
-                )),
-            ),
-            Err(e) => Ok(
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -13216,6 +13277,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13237,38 +13303,33 @@ impl ServerImpl {
             .unwrap_or_default();
 
         let command = Command::complete_user_task_with(user_task_key, variables);
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => {
                 // Completing a user task advances the token, which may create a
                 // following job: wake any long-pollers.
                 self.signal_jobs_available();
                 Ok(Resp::Status204_TheUserTaskWasCompletedSuccessfully)
             }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be completed."),
+                    detail,
                 )),
             ),
-            Err(e) => Ok(
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -13528,7 +13589,6 @@ impl ServerImpl {
             }
         };
 
-        let command = Command::unassign_user_task(user_task_key);
         if let Some(node) = self.route_by_leader(user_task_key) {
             let (status, detail) = self
                 .forward_user_task(
@@ -13548,6 +13608,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13559,35 +13624,29 @@ impl ServerImpl {
                 )),
             });
         }
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheUserTaskWasUnassignedSuccessfully)
-            }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+        let command = Command::unassign_user_task(user_task_key);
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheUserTaskWasUnassignedSuccessfully),
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be unassigned."),
+                    detail,
                 )),
             ),
-            Err(e) => Ok(
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -13638,6 +13697,11 @@ impl ServerImpl {
                 409 => Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(
                     problem("User task in wrong state", 409, detail),
                 ),
+                503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                    "Service unavailable",
+                    503,
+                    detail,
+                )),
                 s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Peer error",
                     500,
@@ -13688,35 +13752,28 @@ impl ServerImpl {
         };
 
         let command = Command::update_user_task(user_task_key, engine_changeset);
-        let result = self
-            .engine
-            .by_key(user_task_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheUserTaskWasUpdatedSuccessfully)
-            }
-            Err(EngineError::UserTaskNotFound { user_task_key }) => Ok(
-                Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(problem(
-                    "User task not found",
-                    404,
-                    format!("No user task with key {user_task_key}."),
-                )),
-            ),
-            Err(EngineError::UserTaskNotActive { user_task_key }) => Ok(
+        match self.apply_partition_command(user_task_key, command).await {
+            Ok(_) => Ok(Resp::Status204_TheUserTaskWasUpdatedSuccessfully),
+            Err((404, detail)) => Ok(Resp::Status404_TheUserTaskWithTheGivenKeyWasNotFound(
+                problem("User task not found", 404, detail),
+            )),
+            Err((409, detail)) => Ok(
                 Resp::Status409_TheUserTaskWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "User task not active",
+                    "User task in wrong state",
                     409,
-                    format!("User task {user_task_key} is not active and cannot be updated."),
+                    detail,
                 )),
             ),
-            Err(e) => Ok(
+            Err((503, detail)) => Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "Service unavailable",
+                503,
+                detail,
+            ))),
+            Err((_, detail)) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
+                    detail,
                 )),
             ),
         }
@@ -17693,7 +17750,8 @@ impl ServerImpl {
                             Ok(t) => t,
                             Err(e) => return Err(e),
                         };
-                    match engine.apply_command_at(
+                    match apply_create_instance_direct(
+                        engine,
                         Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
@@ -17702,35 +17760,16 @@ impl ServerImpl {
                             sel_key,
                             sel_ver,
                         ),
-                        now_millis(),
+                        &process_id,
                     ) {
-                        Ok((events, commit)) => {
-                            let instance_key = events
-                                .iter()
-                                .find_map(Event::instance_key)
-                                .expect("created instance has a key");
-                            let sync_completed = engine.engine().is_completed(instance_key);
-                            // Collect any cross-partition subscription follow-ups
-                            // to route once durable (none single-partition).
-                            let routable = if engine.engine().num_partitions() > 1 {
-                                events
-                                    .iter()
-                                    .filter(|e| {
-                                        matches!(
-                                            e,
-                                            Event::MessageSubscriptionOpening { .. }
-                                                | Event::RemoteMessageCorrelation { .. }
-                                                | Event::MessageSubscriptionClosing { .. }
-                                                | Event::StartInstanceDispatched { .. }
-                                        )
-                                    })
-                                    .cloned()
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            Ok((instance_key, sync_completed, routable, commit))
-                        }
+                        // The stream create reports only the key + completion; the
+                        // projected definition key/version are unused here.
+                        Ok(created) => Ok((
+                            created.instance_key,
+                            created.sync_completed,
+                            created.routable,
+                            created.commit,
+                        )),
                         Err(EngineError::ProcessNotFound { process_id }) => {
                             Err((400, format!("No deployed process with id '{process_id}'.")))
                         }
@@ -18281,7 +18320,13 @@ impl ServerImpl {
                 now_millis(),
             )
             .await
-            .map_err(|e| (500, format!("raft propose failed: {e}")))?;
+            .map_err(|e| match e {
+                // Leadership race on the batched write is retryable, not 500. #1306.
+                crate::raft::ProposeError::Leader => {
+                    (503, format!("partition {p} leader unavailable; retry"))
+                }
+                other => (500, other.to_string()),
+            })?;
         if let Some((status, message)) = response.error {
             return Err((status, message));
         }
@@ -18395,20 +18440,34 @@ impl ServerImpl {
     /// owning partition's Raft leader, returning a ready [`Commit`] (durability is
     /// already awaited inside the state-machine apply). Surfaces engine rejections
     /// (404/409) via the replicated response, matching the direct path's statuses.
+    ///
+    /// `record_stream_outcome` gates the `stream_complete_outcome_total`
+    /// diagnostic and is `true` ONLY for the stream `CompleteJob` path — the REST
+    /// complete/fail/throw callers pass `false` so a failed REST mutation never
+    /// inflates the stream-completion counters (see [`propose_partition_command`]). #1306.
     async fn propose_job_for_stream(
         &self,
         job_key: u64,
         command: Command,
+        record_stream_outcome: bool,
     ) -> Result<Commit, (u16, String)> {
-        self.propose_partition_command(job_key, command)
+        self.propose_partition_command(job_key, command, record_stream_outcome)
             .await
             .map(|(_, commit)| commit)
     }
 
+    /// `record_stream_outcome` gates the `stream_complete_outcome_total`
+    /// diagnostic (`crate::metrics::record_complete_outcome`): it is documented
+    /// for stream `CompleteJob` outcomes, so only the job-stream caller
+    /// ([`propose_job_for_stream`]) sets it. The generic by-key mutation funnel
+    /// ([`apply_partition_command`]) passes `false` — otherwise a failed cancel,
+    /// incident, user-task, or migration would inflate the stream-completion
+    /// counters and corrupt that diagnostic. #1306.
     async fn propose_partition_command(
         &self,
         key: Key,
         command: Command,
+        record_stream_outcome: bool,
     ) -> Result<(Arc<Vec<Event>>, Commit), (u16, String)> {
         let p = partition_of(key);
         // Bounded completion write-pause (ADR 0019): while this node is handing
@@ -18416,7 +18475,9 @@ impl ServerImpl {
         // log fully quiesces and the catch-up learner can reach zero lag. Retryable
         // (at-least-once) — the worker redelivers once the brief pause lifts.
         if self.handoff_completion_paused(p) {
-            crate::metrics::record_complete_outcome("handoff_pause");
+            if record_stream_outcome {
+                crate::metrics::record_complete_outcome("handoff_pause");
+            }
             return Err((503, format!("partition {p} handing off; retry")));
         }
         let Some(part) = self.raft.get(p) else {
@@ -18424,18 +18485,33 @@ impl ServerImpl {
         };
         let node_id = self.engine.topology().node_id as u64;
         if part.raft.metrics().borrow().current_leader != Some(node_id) {
-            crate::metrics::record_complete_outcome("leader_reject");
+            if record_stream_outcome {
+                crate::metrics::record_complete_outcome("leader_reject");
+            }
             return Err((503, format!("partition {p} leader unavailable; retry")));
         }
         let response = part
             .propose_result(command, now_millis())
             .await
             .map_err(|e| {
-                crate::metrics::record_complete_outcome("propose_err");
-                (500, format!("raft propose failed: {e}"))
+                if record_stream_outcome {
+                    crate::metrics::record_complete_outcome("propose_err");
+                }
+                match e {
+                    // The leader pre-check above runs before the batched
+                    // `client_write`, so leadership can still turn over while the
+                    // command is queued. That `ForwardToLeader` race is retryable
+                    // (503), not an internal fault (500). #1306.
+                    crate::raft::ProposeError::Leader => {
+                        (503, format!("partition {p} leader unavailable; retry"))
+                    }
+                    other => (500, other.to_string()),
+                }
             })?;
         if let Some((status, message)) = response.error {
-            crate::metrics::record_complete_outcome("apply_err");
+            if record_stream_outcome {
+                crate::metrics::record_complete_outcome("apply_err");
+            }
             return Err((status, message));
         }
         self.spawn_routing_if_needed(&response.events);
@@ -18515,13 +18591,11 @@ impl ServerImpl {
             business_id,
         );
         if !self.raft.is_empty() {
-            return self.propose_job_for_stream(job_key, command).await;
+            // The stream CompleteJob path owns the stream-completion diagnostic
+            // (`record_stream_outcome = true`). #1306.
+            return self.propose_job_for_stream(job_key, command, true).await;
         }
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
+        let result = self.apply_job_command_direct(job_key, command).await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
             self.observe_job_sojourn(events, now_millis());
@@ -18558,21 +18632,21 @@ impl ServerImpl {
                         Command::fail_job(job_key, retries, error_message),
                         lease_token,
                     ),
+                    // `stream_complete_outcome_total` is a CompleteJob-only
+                    // diagnostic (metrics.rs); a FailJob outcome must not be
+                    // recorded as a CompleteJob outcome. #1306.
+                    false,
                 )
                 .await;
         }
         let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::fail_job(job_key, retries, error_message),
-                        lease_token,
-                    ),
-                    now_millis(),
-                )
-            })
+            .apply_job_command_direct(
+                job_key,
+                job_command_with_lease(
+                    Command::fail_job(job_key, retries, error_message),
+                    lease_token,
+                ),
+            )
             .await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
@@ -18603,26 +18677,21 @@ impl ServerImpl {
                         ),
                         lease_token,
                     ),
+                    // `stream_complete_outcome_total` is a CompleteJob-only
+                    // diagnostic (metrics.rs); a ThrowError outcome must not be
+                    // recorded as a CompleteJob outcome. #1306.
+                    false,
                 )
                 .await;
         }
         let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    job_command_with_lease(
-                        Command::throw_job_error_with(
-                            job_key,
-                            error_code,
-                            error_message,
-                            variables,
-                        ),
-                        lease_token,
-                    ),
-                    now_millis(),
-                )
-            })
+            .apply_job_command_direct(
+                job_key,
+                job_command_with_lease(
+                    Command::throw_job_error_with(job_key, error_code, error_message, variables),
+                    lease_token,
+                ),
+            )
             .await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
@@ -21542,6 +21611,9 @@ fn agent_create_http_error(
             Resp::Status404_TheElementInstanceKeyDoesNotCorrespondToAnActiveElementInstance(problem)
         }
         409 => Resp::Status409_AnAgentInstanceAlreadyExistsForTheGivenElementInstance(problem),
+        // Preserve the retryable leadership-race 503 so agent writes stay
+        // retryable during leader turnover (spec/agent-instances.yaml).
+        503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem),
         _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem),
     }
 }
@@ -21556,6 +21628,9 @@ fn agent_update_http_error(
         400 => Resp::Status400_TheProvidedDataIsNotValid(problem),
         404 => Resp::Status404_TheAgentInstanceWithTheGivenKeyWasNotFound(problem),
         409 => Resp::Status409_TheAgentInstanceHasAConflictingActiveWriter(problem),
+        // Preserve the retryable leadership-race 503 so agent writes stay
+        // retryable during leader turnover (spec/agent-instances.yaml).
+        503 => Resp::Status503_TheServiceIsCurrentlyUnavailable(problem),
         _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem),
     }
 }
@@ -22410,6 +22485,9 @@ pub(crate) enum ResolveIncidentOutcome {
     NotFound(String),
     /// The incident exists but is not in a resolvable state (409).
     NotResolvable(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22418,11 +22496,15 @@ pub(crate) enum ResolveIncidentOutcome {
 /// to each API's own response type (v2 REST and console) so the
 /// `Command::cancel_instance` and clustering (leader-forward) semantics have a
 /// single source of truth.
+#[derive(Debug)]
 pub(crate) enum CancelInstanceOutcome {
     /// The instance was cancelled (every token discarded, state TERMINATED).
     Canceled,
     /// No active process instance with the given key exists (404).
     NotFound(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22441,6 +22523,9 @@ pub(crate) enum MigrateInstanceOutcome {
     /// a mapped element changes type, or the instance uses a construct not yet
     /// supported by migration (409).
     Conflict(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22450,16 +22535,20 @@ pub(crate) enum MigrateInstanceOutcome {
 /// the `Command::suspend_instance` / `Command::resume_instance` and clustering
 /// (leader-forward) semantics have a single source of truth. `ACTIVE ⇄
 /// SUSPENDED` are the only valid live transitions; a request from a terminal
-/// state is [`Self::BadRequest`], and an unknown instance is [`Self::NotFound`].
+/// state is [`Self::Conflict`] (the suspend/resume contracts define wrong-state
+/// as 409), and an unknown instance is [`Self::NotFound`].
 pub(crate) enum TransitionInstanceOutcome {
     /// The instance reached the requested state (or was already in it — an
     /// idempotent no-op is reported as success).
     Ok,
-    /// The transition is illegal from the instance's current (terminal) state
-    /// (400).
-    BadRequest(String),
+    /// The transition conflicts with the instance's current (terminal) state
+    /// (409).
+    Conflict(String),
     /// No process instance with the given key exists (404).
     NotFound(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -22471,58 +22560,11 @@ impl From<Result<(), (u16, String)>> for TransitionInstanceOutcome {
     fn from(result: Result<(), (u16, String)>) -> Self {
         match result {
             Ok(()) => TransitionInstanceOutcome::Ok,
-            Err((400, detail)) => TransitionInstanceOutcome::BadRequest(detail),
+            Err((409, detail)) => TransitionInstanceOutcome::Conflict(detail),
             Err((404, detail)) => TransitionInstanceOutcome::NotFound(detail),
+            Err((503, detail)) => TransitionInstanceOutcome::Unavailable(detail),
             Err((_, detail)) => TransitionInstanceOutcome::Internal(detail),
         }
-    }
-}
-
-/// Maps a migration [`EngineError`] to the HTTP status the v2 REST surface
-/// returns. Invalid mappings are 400; unknown instance/target are 404;
-/// engine-rejected migrations (unmapped element, type change, unsupported
-/// construct) are 409; anything else is a 500.
-fn migration_error_status(e: &EngineError) -> u16 {
-    match e {
-        EngineError::InstanceNotFound { .. }
-        | EngineError::TargetProcessDefinitionNotFound { .. } => 404,
-        EngineError::DuplicateMappingSourceElement { .. }
-        | EngineError::MappingSourceElementNotFound { .. }
-        | EngineError::MappingTargetElementNotFound { .. } => 400,
-        EngineError::UnmappedActiveElement { .. }
-        | EngineError::MappedElementTypeChanged { .. }
-        | EngineError::MigratedParallelJoinArityChanged { .. }
-        | EngineError::MigratedJoinFlowMissing { .. }
-        | EngineError::UnsupportedMigration { .. } => 409,
-        _ => 500,
-    }
-}
-
-#[cfg(test)]
-mod migration_error_status_tests {
-    use super::*;
-
-    #[test]
-    fn open_parallel_join_rejections_are_conflicts() {
-        // Both open-join guards reject a mapping the instance's current state
-        // cannot survive, not a malformed request: 409, like the other
-        // state-dependent migration rejections.
-        let arity = EngineError::MigratedParallelJoinArityChanged {
-            instance_key: 1,
-            source_element_id: "join".into(),
-            target_element_id: "join2".into(),
-            source_incoming_count: 2,
-            target_incoming_count: 3,
-        };
-        let flow = EngineError::MigratedJoinFlowMissing {
-            instance_key: 1,
-            source_element_id: "join".into(),
-            target_element_id: "join2".into(),
-            flow_source_element_id: "a".into(),
-            flow_ordinal: 0,
-        };
-        assert_eq!(migration_error_status(&arity), 409);
-        assert_eq!(migration_error_status(&flow), 409);
     }
 }
 
@@ -22533,6 +22575,9 @@ pub(crate) enum SetVariablesOutcome {
     /// No process/element instance with the given scope key exists (v2 maps
     /// this to 400 for Camunda parity; the console maps it to 404).
     ScopeNotFound(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
     /// An unexpected engine/peer error occurred (500).
     Internal(String),
 }
@@ -32039,6 +32084,99 @@ mod clustered_startup_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn forwarded_user_task_and_ad_hoc_mutations_preserve_a_retryable_503() {
+        // #1306 (Copilot round 5): the peer-side forwarding adapters
+        // (`apply_user_task_forwarded`, `apply_ad_hoc_activation_forwarded`) must
+        // preserve a typed 503 from the owning peer, not collapse it to a
+        // non-retryable 500. Force the leader of a partition into a bounded
+        // hand-off completion-pause so its local mutation returns 503, then drive
+        // the FORWARDED path from a non-leader node: the adapter must surface 503.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+        let nodes = [&node0, &node1, &node2];
+
+        // Pick partition 0 and find its current leader; the paused leader is the
+        // node whose local mutation path returns 503.
+        let partition = 0u64;
+        let leader_idx = nodes
+            .iter()
+            .position(|n| {
+                n.raft_registry()
+                    .get(partition)
+                    .and_then(|part| part.raft.metrics().borrow().current_leader)
+                    == Some(n.engine.topology().node_id as u64)
+            })
+            .expect("partition 0 has an elected leader");
+        let leader = nodes[leader_idx];
+
+        // Use a GENEROUS pause deadline, not a short wall-clock window: the two
+        // async adapter calls below must both observe the pause as engaged, and on
+        // a loaded CI runner a 500 ms window can expire between them (the second
+        // call then reaches the engine and returns 404, not the expected 503).
+        // The deadline is never actually waited on — the explicit
+        // `release_handoff_lease` at the end lifts the pause immediately, so the
+        // test stays fast while no longer depending on scheduler timing. Both knobs
+        // are set because `acquire_handoff_lease` clamps the pause up to the
+        // catch-up ceiling.
+        let generous = std::time::Duration::from_secs(60);
+        leader.set_handoff_catchup_ceiling_for_test(generous);
+        leader.set_handoff_write_pause_for_test(generous);
+        assert!(
+            leader.acquire_handoff_lease(partition),
+            "the leader acquires the hand-off lease"
+        );
+        assert!(
+            leader.handoff_completion_paused(partition),
+            "the completion-pause is engaged on the leader"
+        );
+
+        // Any key on the paused partition routes to the (paused) leader. Compose a
+        // well-formed key on partition 0 (high bits = partition id).
+        let key_on_partition = nanobpmn_engine_core::compose_key(partition, 1);
+
+        // The adapter is the peer-side handler: it runs on the OWNING node (the
+        // leader), where `route_by_leader` returns `None` (self-leader) so the impl
+        // applies locally and hits the engaged pause -> 503. The adapter must map
+        // that typed 503 verbatim instead of collapsing it to (500, None).
+        let assign_body = serde_json::to_value(models::UserTaskAssignmentRequest {
+            assignee: Some("alice".into()),
+            allow_override: None,
+            action: None,
+        })
+        .ok();
+        let (status, _detail) = leader
+            .apply_user_task_forwarded(
+                crate::falcon::UserTaskOp::Assign,
+                &key_on_partition.to_string(),
+                assign_body,
+            )
+            .await;
+        assert_eq!(
+            status, 503,
+            "a forwarded user-task mutation preserves the leader's retryable 503"
+        );
+
+        // Ad-hoc forwarded adapter: same contract on the ad-hoc activation path.
+        let adhoc_body = serde_json::to_value(
+            models::AdHocSubProcessActivateActivitiesInstruction::new(vec![
+                models::AdHocSubProcessActivateActivityReference::new("toolA".into()),
+            ]),
+        )
+        .ok();
+        let (status, _detail) = leader
+            .apply_ad_hoc_activation_forwarded(&key_on_partition.to_string(), adhoc_body)
+            .await;
+        assert_eq!(
+            status, 503,
+            "a forwarded ad-hoc activation preserves the leader's retryable 503"
+        );
+
+        leader.release_handoff_lease(partition);
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
     #[tokio::test]
     async fn topology_reports_every_node_and_its_partitions() {
         // A 2-node, 4-partition cluster: ownership is p % num_nodes, so node 0
@@ -34443,6 +34581,105 @@ mod clustered_startup_tests {
             after_delete > after_eval,
             "the deletion entered the Raft log ({after_eval} -> {after_delete})"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancel_instance_replicates_through_raft() {
+        // #1306: cancelling a running instance is a durable operator mutation, so
+        // under Raft it must enter the replicated log — never a direct local
+        // apply a failover would lose. Mirrors the #1305 decision test: assert the
+        // Raft applied index advances when the REST/console cancel path runs.
+        use apis::process_instance::CreateProcessInstanceResponse as Resp;
+        let (node0, node1, node2) = boot_rf3_intake_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+
+        // The applied index of partition `p`'s group on the node that currently
+        // leads it. A create response guarantees only that the LEADER applied the
+        // entry; followers apply asynchronously, so a cluster-wide sum cannot
+        // distinguish "the cancel replicated" from "a follower applied the
+        // earlier create after the baseline was sampled". The leader's own index
+        // for the owning partition can only advance past the create via a NEW
+        // committed entry — exactly what this regression guards.
+        let leader_applied = |p: u64| -> Option<u64> {
+            nodes.iter().find_map(|n| {
+                let part = n.raft_registry().get(p)?;
+                let metrics = part.raft.metrics();
+                let metrics = metrics.borrow();
+                (metrics.current_leader == Some(n.engine.topology().node_id as u64))
+                    .then(|| metrics.last_applied.map(|l| l.index).unwrap_or(0))
+            })
+        };
+
+        let body = models::ProcessInstanceCreationInstruction::from(
+            models::ProcessInstanceCreationInstructionById::new("intake".to_string()),
+        );
+        let resp = node0
+            .create_process_instance_impl(&body)
+            .await
+            .expect("rest create returns a response");
+        let instance_key: u64 = match resp {
+            Resp::Status200_TheProcessInstanceWasCreated(r) => r
+                .process_instance_key
+                .0
+                .parse()
+                .expect("numeric instance key"),
+            other => panic!("rest create through raft should be 200, got {other:?}"),
+        };
+        let partition = partition_of(instance_key);
+
+        // The create response guarantees the owning partition's leader applied
+        // the create, so its index is a stable baseline for the cancellation.
+        let before = leader_applied(partition)
+            .unwrap_or_else(|| panic!("partition {partition} has a leader"));
+        let outcome = node0.cancel_instance_core(instance_key).await;
+        assert!(
+            matches!(outcome, CancelInstanceOutcome::Canceled),
+            "cancel should succeed, got {outcome:?}"
+        );
+
+        // The cancel commits on the same leader; poll until its applied index
+        // visibly advances past the create baseline.
+        let mut advanced = false;
+        for _ in 0..250 {
+            if leader_applied(partition).is_some_and(|index| index > before) {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            advanced,
+            "the cancellation entered the Raft log (partition {partition} leader applied index did not advance past {before})"
+        );
+
+        // And the committed entry converges to the followers: every replica of
+        // the owning partition eventually applies at least the leader's index.
+        let mut converged = false;
+        for _ in 0..250 {
+            let replicas_caught_up = nodes.iter().all(|n| {
+                n.raft_registry()
+                    .get(partition)
+                    .and_then(|part| part.raft.metrics().borrow().last_applied)
+                    .is_some_and(|l| l.index > before)
+            });
+            if replicas_caught_up {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "the cancellation replicated to every replica of partition {partition}"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -42024,5 +42261,314 @@ mod provisioning_endpoint_tests {
             rec.get("job_type").is_none() && rec.get("suggest_worker_delta").is_none(),
             "snake_case leak in the recommendation payload"
         );
+    }
+}
+
+#[cfg(test)]
+mod no_direct_engine_apply_guard {
+    //! #1306 regression guard: every durable by-key REST / operator mutation
+    //! must flow through the canonical Raft-aware funnel
+    //! [`ServerImpl::apply_partition_command`] (or `apply_create_command`),
+    //! never a direct `engine…apply_command_at` / `engine…apply_command` inside
+    //! a handler. A direct local apply while Raft is enabled never enters the
+    //! partition's replicated log, so a leader failover silently loses the
+    //! acknowledged write — the exact defect #1305 fixed for standalone decision
+    //! evaluate / delete. This test pins the complete set of production functions
+    //! allowed to call either direct-apply API (`Journal::apply_command_at` and
+    //! the clock-implicit `Journal::apply_command`) directly; a new durable
+    //! mutation handler that applies on the engine itself adds a name the
+    //! allowlist does not contain and fails here until it either routes through
+    //! the helper or is consciously added with a justification.
+
+    /// Production functions permitted to call a direct-apply API
+    /// (`apply_command_at` / `apply_command`) directly, each paired with the
+    /// reason it is NOT a #1306 violation. Entries are `Type::method` (or the
+    /// bare name for a free function such as `main`) so two same-named methods
+    /// on different types cannot share one exemption: scoping the entry to its
+    /// enclosing type keeps the justification attached to exactly the function
+    /// it was written for.
+    const ALLOWED: &[&str] = &[
+        // The canonical Raft-aware funnels themselves.
+        "ServerImpl::apply_partition_command",
+        "ServerImpl::apply_create_command",
+        // The single non-Raft fallback every job/stream mutation handler routes
+        // its direct apply through (confining the apply to this one small helper,
+        // not each whole handler body, is what secures the failure mode — a new
+        // unconditional `apply_command_at` added inside `complete_job_impl` et al.
+        // is NOT allowlisted and fails here). #1306.
+        "ServerImpl::apply_job_command_direct_with",
+        // The single non-Raft fallback every instance-creation handler routes its
+        // direct apply through (the create analogue of the job helper above): it
+        // confines the create handlers' direct apply to this one helper, so a new
+        // unconditional `apply_command_at` added inside `create_process_instance_impl`,
+        // `create_forwarded`, or `create_for_stream` is NOT allowlisted and fails
+        // here. `apply_create_instance_direct` is a free function, keyed by its
+        // bare name. #1308.
+        "apply_create_instance_direct",
+        // The periodic timer tick drives led partitions through Raft
+        // (`tick_partition_via_raft`) and applies locally only when Raft is off.
+        // `main` is a free function, so it is keyed by its bare name.
+        "main",
+        // Startup demo-process seed on a fresh deployment partition
+        // (`journals[0].apply_command(Command::DeployProcess)`): runs once at
+        // bootstrap before the node serves traffic, is re-derived from the
+        // durable log on every restart, and is replicated to peers via the stage-1
+        // deployment broadcast — never a client-acknowledged by-key mutation.
+        // Scoped to `ServerImpl::new` so the unrelated `ClusterVariables::new`
+        // constructor cannot inherit this exemption.
+        "ServerImpl::new",
+        // The deployment partition-0 owner path (`deploy_resources_locally*`):
+        // deployment is topology-guarded (`topology().is_local(0)`) and the
+        // applied events are broadcast to every peer (`broadcast_deployment`), so
+        // the definitions replicate cluster-wide without a per-key Raft propose.
+        // Uses the clock-implicit `apply_command` for the batched resource/DRG/
+        // form/generic-resource commands.
+        "ServerImpl::deploy_resources_locally_with_forms",
+        // Documented engine-internal bypasses. The cross-partition routing pump
+        // is a tracked follow-up (#1307): these apply on routing-computed
+        // partitions rather than by an entity key, and `activate_on` is an
+        // intentional leader-local activation step.
+        "ServerImpl::correlate_message_everywhere",
+        "ServerImpl::drive_subscription_routing",
+        "ServerImpl::activate_on",
+    ];
+
+    fn enclosing_fn_name(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        let rest = t
+            .strip_prefix("pub(crate) ")
+            .or_else(|| t.strip_prefix("pub "))
+            .unwrap_or(t);
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = rest.strip_prefix("fn ")?;
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// The `Type` of an `impl Type {` opener, so a method can be keyed as
+    /// `Type::method`. Returns `None` for a trait impl (`impl Trait for Type`)
+    /// or a non-impl line — the guard only needs the concrete inherent-impl
+    /// case the allowlist uses.
+    fn impl_type_name(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        if !t.starts_with("impl ") || !t.ends_with('{') {
+            return None;
+        }
+        let body = t.strip_prefix("impl ")?.strip_suffix('{')?.trim();
+        // A trait impl (`impl Trait for Type`) has no single enclosing type the
+        // allowlist keys on; treat it as untracked.
+        if body.contains(" for ") {
+            return None;
+        }
+        let name: String = body
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// True when `line` calls either direct-apply API, in either receiver form:
+    /// the method form `x.apply_command_at(..)` / `x.apply_command(..)` and the
+    /// leading-dot-free UFCS form `Journal::apply_command_at(journal, ..)` /
+    /// `Journal::apply_command(journal, ..)`. Matching the call token
+    /// independently of receiver syntax is what keeps a UFCS call from slipping
+    /// past the guard. `apply_command` is a strict prefix of
+    /// `apply_command_at`, so a token boundary check on `apply_command_at`
+    /// runs first and `apply_command` only matches when not already part of an
+    /// `apply_command_at` token.
+    fn is_direct_apply_call(line: &str) -> bool {
+        contains_call_token(line, "apply_command_at") || contains_call_token(line, "apply_command")
+    }
+
+    /// True when `line` contains a call to `token` used as either
+    /// `.token(` (method / enum-variant receiver) or `::token(` (UFCS /
+    /// associated-function). Requiring the `.`/`::` receiver prefix and the `(`
+    /// call paren keeps prose mentions and non-call uses from matching.
+    fn contains_call_token(line: &str, token: &str) -> bool {
+        let method = format!(".{token}(");
+        let ufcs = format!("::{token}(");
+        line.contains(&method) || line.contains(&ufcs)
+    }
+
+    #[test]
+    fn no_direct_engine_apply_in_durable_mutation_handlers() {
+        let src = include_str!("main.rs");
+        let lines: Vec<&str> = src.lines().collect();
+
+        // Mark every line that lives inside a top-level `#[cfg(test)]` module so
+        // the guard inspects production code only (and ignores its own text).
+        let mut in_test = vec![false; lines.len()];
+        let mut i = 0usize;
+        while i < lines.len() {
+            if lines[i] == "#[cfg(test)]" {
+                let mut j = i + 1;
+                while j < lines.len()
+                    && j <= i + 3
+                    && !lines[j].starts_with("mod ")
+                    && !lines[j].starts_with("pub mod ")
+                {
+                    j += 1;
+                }
+                let is_mod = j < lines.len()
+                    && (lines[j].starts_with("mod ") || lines[j].starts_with("pub mod "));
+                if is_mod && lines[j].trim_end().ends_with('{') {
+                    // Inline module: everything up to its column-0 closing brace.
+                    let mut k = j;
+                    while k < lines.len() && lines[k] != "}" {
+                        in_test[k] = true;
+                        k += 1;
+                    }
+                    if k < lines.len() {
+                        in_test[k] = true;
+                    }
+                    i = k + 1;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+
+        let mut offenders: Vec<(usize, String)> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            // Match both direct-apply APIs (the explicit-instant
+            // `apply_command_at` and the clock-implicit `apply_command`) in
+            // either receiver form — method (`.apply_command_at(`) or UFCS
+            // (`Journal::apply_command_at(`) — so a durable handler cannot
+            // bypass the guard by spelling the call without a leading dot.
+            if in_test[idx] || !is_direct_apply_call(line) {
+                continue;
+            }
+            // Walk back to the nearest enclosing fn and the nearest enclosing
+            // `impl Type {` so the allowlist key is `Type::method` (or the bare
+            // fn name for a free function). Scoping to the type keeps a
+            // same-named method on another type from inheriting this function's
+            // exemption.
+            let mut fn_name: Option<String> = None;
+            let mut ty_name: Option<String> = None;
+            for b in (0..=idx).rev() {
+                if in_test[b] {
+                    continue;
+                }
+                if fn_name.is_none()
+                    && let Some(n) = enclosing_fn_name(lines[b])
+                {
+                    fn_name = Some(n);
+                    continue;
+                }
+                // A column-0 `}` closes the innermost enclosing item. Once the
+                // fn is known, that item is the fn's body if the fn is free
+                // standing, or the `impl` block if the fn is a method — either
+                // way any `impl` opener further back belongs to an outer scope
+                // and must not be attributed to this fn. Resetting here keeps a
+                // free function (e.g. `main`) from being mis-scoped to a
+                // lingering `impl` opener above it.
+                if fn_name.is_some() && lines[b] == "}" {
+                    ty_name = None;
+                    break;
+                }
+                if ty_name.is_none()
+                    && let Some(t) = impl_type_name(lines[b])
+                {
+                    ty_name = Some(t);
+                }
+                if fn_name.is_some() && ty_name.is_some() {
+                    break;
+                }
+            }
+            let key = match (ty_name, fn_name) {
+                (Some(t), Some(f)) => format!("{t}::{f}"),
+                (None, Some(f)) => f,
+                _ => String::from("<unknown>"),
+            };
+            if !ALLOWED.contains(&key.as_str()) {
+                offenders.push((idx + 1, key));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "direct `apply_command_at`/`apply_command` in non-allowlisted production function(s): \
+             {offenders:?}. Route durable by-key mutations through \
+             `ServerImpl::apply_partition_command` so the write is replicated through Raft before \
+             it is acknowledged (#1306). If the call is a legitimate Raft-guarded or \
+             engine-internal exception, add it to ALLOWED with a reason."
+        );
+    }
+
+    #[test]
+    fn direct_apply_call_matches_method_and_ufcs_forms() {
+        // Method receiver form.
+        assert!(is_direct_apply_call(
+            "match engine.apply_command_at(command, now_millis()) {"
+        ));
+        assert!(is_direct_apply_call(
+            "    journal.apply_command(command, now_millis())"
+        ));
+        // Leading-dot-free UFCS form — the bypass the guard must not miss.
+        assert!(is_direct_apply_call(
+            "Journal::apply_command_at(journal, command, now_millis())"
+        ));
+        assert!(is_direct_apply_call(
+            "Journal::apply_command(journal, command)"
+        ));
+        // `apply_command` is a prefix of `apply_command_at`; both still match.
+        assert!(is_direct_apply_call(
+            "engine.apply_command_at(*command, now)"
+        ));
+        // Non-calls and unrelated tokens must not match.
+        assert!(!is_direct_apply_call(
+            "// apply_command_at is the direct-apply API"
+        ));
+        assert!(!is_direct_apply_call("let apply_command_at = 1;"));
+        assert!(!is_direct_apply_call("engine.apply_command_batch(command)"));
+    }
+
+    #[test]
+    fn impl_type_name_scopes_method_to_its_type() {
+        assert_eq!(
+            impl_type_name("impl ServerImpl {"),
+            Some("ServerImpl".to_string())
+        );
+        assert_eq!(
+            impl_type_name("impl ClusterVariableStore {"),
+            Some("ClusterVariableStore".to_string())
+        );
+        // Trait impls and non-impl lines are untracked.
+        assert_eq!(
+            impl_type_name("impl AsRef<ServerImpl> for ServerImpl {"),
+            None
+        );
+        assert_eq!(impl_type_name("fn main() {"), None);
+    }
+
+    #[test]
+    fn allowlist_keys_are_type_scoped() {
+        // Every allowlisted method is scoped to `ServerImpl`; only free functions
+        // are keyed by their bare name. This is what stops the unrelated
+        // `ClusterVariableStore::new` from inheriting the `ServerImpl::new`
+        // exemption. Keep this set of bare-name free functions explicit so a new
+        // *method* entry cannot silently slip in unscoped.
+        const BARE_FREE_FNS: &[&str] = &["main", "apply_create_instance_direct"];
+        for entry in ALLOWED {
+            if BARE_FREE_FNS.contains(entry) {
+                continue;
+            }
+            assert!(
+                entry.starts_with("ServerImpl::"),
+                "allowlist entry `{entry}` must be type-scoped (`Type::method`)"
+            );
+        }
+        assert!(ALLOWED.contains(&"ServerImpl::new"));
+        assert!(!ALLOWED.contains(&"new"));
+        // The create fallback is allowlisted by its bare free-function name and
+        // the three create handlers that now route through it are NOT (so a new
+        // direct apply inside them is caught by the guard). #1308.
+        assert!(ALLOWED.contains(&"apply_create_instance_direct"));
+        assert!(!ALLOWED.contains(&"ServerImpl::create_process_instance_impl"));
+        assert!(!ALLOWED.contains(&"ServerImpl::create_forwarded"));
+        assert!(!ALLOWED.contains(&"ServerImpl::create_for_stream"));
     }
 }

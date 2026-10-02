@@ -62,6 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use nanobpmn_engine_core::{Command, Event};
+use openraft::error::{ClientWriteError, RaftError};
 use openraft::storage::{
     LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine, Snapshot,
 };
@@ -266,6 +267,49 @@ pub struct ReplicatedItem {
     pub error: Option<(u16, String)>,
 }
 
+/// Why a [`RaftPartition::propose_result`] failed before the command could be
+/// replicated. The propose path runs an openraft `client_write`, whose typed
+/// error distinguishes a *leadership* failure (this node is not — or is no
+/// longer — the leader, so the write must be retried against the new leader)
+/// from a genuine internal fault. The batcher used to stringify that error,
+/// collapsing both into an opaque message the HTTP layer could only map to a
+/// 500; preserving the distinction lets a transient election surface as the
+/// retryable 503 the mutation funnels document. #1306.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProposeError {
+    /// The propose was rejected because this node is not the partition's
+    /// current leader (openraft `ForwardToLeader`), or leadership was lost
+    /// while the batched `client_write` was in flight. Retryable: the caller
+    /// should re-resolve the leader and retry.
+    Leader,
+    /// Any other propose failure (storage fault, batcher teardown, arity
+    /// mismatch, …). Not a leadership race; surfaced as an internal error.
+    Other(String),
+}
+
+impl std::fmt::Display for ProposeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProposeError::Leader => write!(f, "partition leader unavailable; retry"),
+            ProposeError::Other(msg) => write!(f, "raft propose failed: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ProposeError {}
+
+impl ProposeError {
+    /// Classifies an openraft `client_write` error, preserving the leadership
+    /// distinction the batcher would otherwise stringify away.
+    fn from_client_write(e: RaftError<NodeId, ClientWriteError<NodeId, BasicNode>>) -> Self {
+        if e.forward_to_leader().is_some() {
+            ProposeError::Leader
+        } else {
+            ProposeError::Other(e.to_string())
+        }
+    }
+}
+
 /// The result handed back to the `client_write` caller on the leader: one
 /// [`ReplicatedItem`] per command in the proposed batch, in submission order.
 /// Only meaningful on the applying leader; followers discard it.
@@ -304,8 +348,73 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         | E::AgentInstanceStatusNotSettable { .. }
         | E::AgentInstanceAlreadyCompleted { .. }
         | E::AgentInstanceLimitExceeded { .. } => (400, e.to_string()),
+        // Durable REST/operator mutations routed through
+        // `ServerImpl::apply_partition_command` surface their engine rejections
+        // here, so every by-key mutation command's error maps to its HTTP status
+        // in ONE place (the raft propose path and the direct local apply share
+        // this mapping — no per-handler drift). #1306.
+        E::InstanceNotFound { .. } => (404, e.to_string()),
+        // The suspend/resume contracts (spec/process-instances.yaml) define a
+        // wrong-state transition as 409 Conflict, not 400: the instance exists
+        // but its (terminal) state conflicts with the requested transition.
+        E::InstanceTransitionInvalid { .. } => (409, e.to_string()),
+        E::IncidentNotFound { .. } => (404, e.to_string()),
+        E::IncidentNotResolvable { .. } => (409, e.to_string()),
+        E::ScopeNotFound { .. } => (400, e.to_string()),
+        E::UserTaskNotFound { .. } => (404, e.to_string()),
+        E::UserTaskNotActive { .. } => (409, e.to_string()),
+        E::UserTaskAlreadyAssigned { .. } => (409, e.to_string()),
+        E::AdHocSubProcessNotFound { .. } | E::AdHocUnknownElement { .. } => (404, e.to_string()),
+        E::AdHocNoActivationTargets { .. } => (400, e.to_string()),
+        // Instance migration: an unknown target definition is 404 (like an
+        // unknown instance above); an invalid mapping is 400; a migration the
+        // engine rejects for the instance's live state is 409.
+        E::TargetProcessDefinitionNotFound { .. } => (404, e.to_string()),
+        E::DuplicateMappingSourceElement { .. }
+        | E::MappingSourceElementNotFound { .. }
+        | E::MappingTargetElementNotFound { .. } => (400, e.to_string()),
+        E::UnmappedActiveElement { .. }
+        | E::MappedElementTypeChanged { .. }
+        | E::MigratedParallelJoinArityChanged { .. }
+        | E::MigratedJoinFlowMissing { .. }
+        | E::UnsupportedMigration { .. } => (409, e.to_string()),
         other => (500, other.to_string()),
     }
+}
+
+/// Maps an engine rejection to the `(http_status, message)` the client sees,
+/// applying any **command-specific** status contract on top of the shared
+/// [`engine_error_status`] mapping.
+///
+/// A handful of engine errors are status-polymorphic across endpoints, so a
+/// command-agnostic mapping cannot serve every caller. `AdHocUnknownElement` is
+/// the canonical case: for `ActivateAdHocActivities` an unknown container or
+/// element id is "not found" (404), but for `CompleteJob` (an agentic ad-hoc
+/// completion whose `JobResult` referenced an unknown activation target) it is
+/// invalid data (400). The non-Raft direct paths encode these per-endpoint (see
+/// `complete_job_impl`), so the replicated path must key on the command kind
+/// ([`Command::kind`]) too — otherwise the same rejection on a replicated
+/// `CompleteJob` is mis-reported as `Status404_TheJobWithTheGivenKeyWasNotFound`,
+/// falsely claiming the job is missing. #1308.
+pub fn engine_error_status_for(kind: &str, e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
+    use nanobpmn_engine_core::EngineError as E;
+    if kind == "complete_job" {
+        // The `CompleteJob` endpoint's direct (non-Raft) contract for its
+        // ad-hoc-completion and business-id rejections (`complete_job_impl`):
+        // an unknown/contradictory ad-hoc activation target and an invalid
+        // business id are 400 (invalid data), a business-id conflict is 409.
+        // The shared mapping would otherwise surface these as 404 / 500.
+        match e {
+            E::AdHocUnknownElement { .. }
+            | E::AdHocActivateWithCompletion { .. }
+            | E::BusinessIdInvalid { .. } => return (400, e.to_string()),
+            E::BusinessIdOnChildInstance { .. } | E::BusinessIdAlreadyAssigned { .. } => {
+                return (409, e.to_string());
+            }
+            _ => {}
+        }
+    }
+    engine_error_status(e)
 }
 
 /// In-memory Raft log store (v2 `RaftLogStorage`). Holds the log entries, the
@@ -1033,11 +1142,16 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                 EntryPayload::Normal(batch) => {
                     // Phase 1: apply every command in the batch in ONE actor hop,
                     // returning per-command (events, commit) or the engine rejection.
+                    // The command `kind` is captured alongside each outcome so the
+                    // error-mapping phase below can apply the command-specific HTTP
+                    // status contract (`engine_error_status_for`) — a rejection like
+                    // `AdHocUnknownElement` maps to a different status for
+                    // `CompleteJob` than for `ActivateAdHocActivities`. #1308.
                     type ApplyOutcome = Result<
                         (Arc<Vec<Event>>, crate::journal::Commit),
                         nanobpmn_engine_core::EngineError,
                     >;
-                    let outcomes: Vec<ApplyOutcome> = self
+                    let outcomes: Vec<(&'static str, ApplyOutcome)> = self
                         .engine
                         .with(move |journal| {
                             batch
@@ -1051,7 +1165,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                     let kind = command.kind();
                                     let outcome = journal.apply_command_at(command, now);
                                     crate::cmd_profile::finish(timer, kind);
-                                    outcome
+                                    (kind, outcome)
                                 })
                                 .collect()
                         })
@@ -1073,7 +1187,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     let mut terminal: Vec<nanobpmn_engine_core::Key> = Vec::new();
                     for outcome in outcomes {
                         match outcome {
-                            Ok((events, commit)) => {
+                            (_, Ok((events, commit))) => {
                                 commit.wait().await;
                                 if evict_terminal {
                                     terminal.extend(
@@ -1087,11 +1201,13 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             }
                             // A rejected command produced no events; the log entry is
                             // still consumed so every replica stays in lockstep. The
-                            // leader surfaces the mapped rejection to its client.
-                            Err(e) => {
+                            // leader surfaces the mapped rejection to its client,
+                            // keyed on the command kind so each endpoint keeps its
+                            // HTTP status contract across both deployment modes. #1308.
+                            (kind, Err(e)) => {
                                 items.push(ReplicatedItem {
                                     events: Vec::new(),
-                                    error: Some(engine_error_status(&e)),
+                                    error: Some(engine_error_status_for(kind, &e)),
                                 });
                             }
                         }
@@ -1505,7 +1621,7 @@ fn max_entry_bytes() -> u64 {
 /// propose error) once the entry commits and applies.
 struct Submission {
     item: ReplicatedCommand,
-    resp: tokio::sync::oneshot::Sender<anyhow::Result<ReplicatedItem>>,
+    resp: tokio::sync::oneshot::Sender<Result<ReplicatedItem, ProposeError>>,
 }
 
 /// Command intake classification for the propose batcher's two-tier priority.
@@ -1626,17 +1742,21 @@ impl Batcher {
                             // apply returns exactly one item per command; an arity
                             // mismatch is a bug, surface it rather than mis-pair.
                             for s in subs {
-                                let _ = s.resp.send(Err(anyhow::anyhow!(
+                                let _ = s.resp.send(Err(ProposeError::Other(format!(
                                     "raft batch response arity mismatch ({} != {n})",
                                     out.len()
-                                )));
+                                ))));
                             }
                         }
                     }
                     Err(e) => {
-                        let msg = e.to_string();
+                        // Preserve the leadership distinction: a `ForwardToLeader`
+                        // (this node is not / no longer the leader) is a retryable
+                        // leadership race, not an internal fault — classify it so
+                        // the HTTP layer can answer 503 instead of 500. #1306.
+                        let err = ProposeError::from_client_write(e);
                         for s in subs {
-                            let _ = s.resp.send(Err(anyhow::anyhow!("{msg}")));
+                            let _ = s.resp.send(Err(err.clone()));
                         }
                     }
                 }
@@ -1645,7 +1765,7 @@ impl Batcher {
         Self { hi_tx, lo_tx }
     }
 
-    async fn submit(&self, command: Command, now: u64) -> anyhow::Result<ReplicatedItem> {
+    async fn submit(&self, command: Command, now: u64) -> Result<ReplicatedItem, ProposeError> {
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
         // (completes, fails, ticks, admin) takes the high lane so it
@@ -1659,9 +1779,10 @@ impl Batcher {
             item: ReplicatedCommand { command, now },
             resp,
         })
-        .map_err(|_| anyhow::anyhow!("raft propose batcher stopped"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("raft propose batcher dropped the response"))?
+        .map_err(|_| ProposeError::Other("raft propose batcher stopped".to_string()))?;
+        rx.await.map_err(|_| {
+            ProposeError::Other("raft propose batcher dropped the response".to_string())
+        })?
     }
 }
 
@@ -2049,7 +2170,7 @@ impl RaftPartition {
         &self,
         command: Command,
         now: u64,
-    ) -> anyhow::Result<ReplicatedItem> {
+    ) -> Result<ReplicatedItem, ProposeError> {
         self.batcher.submit(command, now).await
     }
 
@@ -2227,6 +2348,214 @@ mod tests {
             .build()
             .expect("valid process");
         Command::DeployProcess(proc)
+    }
+
+    #[test]
+    fn engine_error_status_maps_by_key_mutation_rejections() {
+        // #1306: the single source of truth that lets every durable by-key
+        // mutation routed through `apply_partition_command` surface the SAME HTTP
+        // status whether it was applied directly or replicated through Raft.
+        use nanobpmn_engine_core::EngineError as E;
+        let cases: &[(E, u16)] = &[
+            (E::InstanceNotFound { instance_key: 1 }, 404),
+            (
+                E::InstanceTransitionInvalid {
+                    instance_key: 1,
+                    from: "Terminated",
+                    to: "Suspended",
+                },
+                409,
+            ),
+            (E::IncidentNotFound { incident_key: 1 }, 404),
+            (
+                E::IncidentNotResolvable {
+                    incident_key: 1,
+                    reason: "no retries".into(),
+                },
+                409,
+            ),
+            (E::ScopeNotFound { scope_key: 1 }, 400),
+            (E::UserTaskNotFound { user_task_key: 1 }, 404),
+            (E::UserTaskNotActive { user_task_key: 1 }, 409),
+            (E::UserTaskAlreadyAssigned { user_task_key: 1 }, 409),
+            (
+                E::AdHocSubProcessNotFound {
+                    ad_hoc_instance_key: 1,
+                },
+                404,
+            ),
+            (
+                E::AdHocUnknownElement {
+                    instance_key: 1,
+                    element_id: "x".into(),
+                },
+                404,
+            ),
+            (
+                E::AdHocNoActivationTargets {
+                    ad_hoc_instance_key: 1,
+                },
+                400,
+            ),
+            (
+                E::TargetProcessDefinitionNotFound {
+                    process_definition_key: 1,
+                },
+                404,
+            ),
+            (
+                E::MappingSourceElementNotFound {
+                    instance_key: 1,
+                    element_id: "a".into(),
+                },
+                400,
+            ),
+            (
+                E::UnsupportedMigration {
+                    instance_key: 1,
+                    element_id: "e".into(),
+                    reason: "x".into(),
+                },
+                409,
+            ),
+            // Open-parallel/inclusive-join migration rejections (deadlock /
+            // early-fire): centralizing the mapping here must not drop the
+            // coverage the deleted `open_parallel_join_rejections_are_conflicts`
+            // test gave these two variants.
+            (
+                E::MigratedParallelJoinArityChanged {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
+                    target_element_id: "b".into(),
+                    source_incoming_count: 2,
+                    target_incoming_count: 3,
+                },
+                409,
+            ),
+            (
+                E::MigratedJoinFlowMissing {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
+                    target_element_id: "b".into(),
+                    flow_source_element_id: "c".into(),
+                    flow_ordinal: 0,
+                },
+                409,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(
+                engine_error_status(err).0,
+                *want,
+                "{err:?} must map to {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn engine_error_status_for_command_preserves_complete_job_adhoc_contract() {
+        // #1308: `AdHocUnknownElement` is status-polymorphic across endpoints —
+        // 404 for `ActivateAdHocActivities` (an unknown container/element is
+        // "not found"), but 400 for `CompleteJob` (the agentic completion
+        // referenced an unknown activation target — invalid data). The shared
+        // command-agnostic `engine_error_status` cannot serve both, so the
+        // replicated apply path keys the mapping on the command kind. Without
+        // this, a replicated `CompleteJob` hitting `AdHocUnknownElement` is
+        // mis-reported as 404 "job not found", falsely claiming the job is
+        // missing — the exact divergence from the non-Raft direct contract.
+        use nanobpmn_engine_core::EngineError as E;
+
+        let adhoc_unknown = E::AdHocUnknownElement {
+            instance_key: 1,
+            element_id: "x".into(),
+        };
+        // Default / ActivateAdHocActivities contract: 404.
+        assert_eq!(engine_error_status(&adhoc_unknown).0, 404);
+        assert_eq!(
+            engine_error_status_for("activate_ad_hoc_sub_process_activities", &adhoc_unknown).0,
+            404,
+        );
+        // CompleteJob contract: 400 (invalid data), matching `complete_job_impl`.
+        assert_eq!(
+            engine_error_status_for("complete_job", &adhoc_unknown).0,
+            400
+        );
+
+        // The rest of the `CompleteJob` ad-hoc / business-id direct contract the
+        // shared mapping would otherwise drop to 500 (unmapped) or mis-route.
+        let complete_job_cases: &[(E, u16)] = &[
+            (E::AdHocActivateWithCompletion { job_key: 1 }, 400),
+            (E::BusinessIdInvalid { chars: 0 }, 400),
+            (E::BusinessIdOnChildInstance { instance_key: 1 }, 409),
+            (E::BusinessIdAlreadyAssigned { instance_key: 1 }, 409),
+        ];
+        for (err, want) in complete_job_cases {
+            assert_eq!(
+                engine_error_status_for("complete_job", err).0,
+                *want,
+                "complete_job {err:?} must map to {want}"
+            );
+        }
+
+        // A command-kind-agnostic error (e.g. `JobNotFound`) is unaffected by the
+        // override and still maps identically through both functions.
+        let job_not_found = E::JobNotFound { job_key: 7 };
+        assert_eq!(
+            engine_error_status_for("complete_job", &job_not_found).0,
+            engine_error_status(&job_not_found).0,
+        );
+    }
+
+    #[test]
+    fn propose_error_classifies_forward_to_leader_as_retryable_leader() {
+        // #1306: a non-leader `client_write` surfaces openraft's `ForwardToLeader`,
+        // which `from_client_write` must classify as the retryable
+        // `ProposeError::Leader` (→ HTTP 503) — not collapse to `Other` (→ 500).
+        // This guards the classification the forwarded-503 contract relies on.
+        use openraft::error::{ClientWriteError, ForwardToLeader, RaftError};
+
+        let fwd = RaftError::APIError(ClientWriteError::ForwardToLeader(ForwardToLeader {
+            leader_id: Some(2),
+            leader_node: Some(BasicNode {
+                addr: "127.0.0.1:9002".into(),
+            }),
+        }));
+        assert!(
+            matches!(ProposeError::from_client_write(fwd), ProposeError::Leader),
+            "ForwardToLeader must classify as the retryable Leader variant"
+        );
+
+        // A leadership hint with no known leader is still a leadership race.
+        let fwd_no_leader = RaftError::APIError(
+            ClientWriteError::<NodeId, BasicNode>::ForwardToLeader(ForwardToLeader {
+                leader_id: None,
+                leader_node: None,
+            }),
+        );
+        assert!(
+            matches!(
+                ProposeError::from_client_write(fwd_no_leader),
+                ProposeError::Leader
+            ),
+            "ForwardToLeader with no leader hint must still classify as Leader"
+        );
+
+        // A non-leader fatal error (a change-membership conflict) is NOT a
+        // leadership race: it must fall to `Other`, not be mislabeled retryable.
+        use openraft::error::{ChangeMembershipError, InProgress};
+        let fatal = RaftError::APIError(ClientWriteError::<NodeId, BasicNode>::from(
+            ChangeMembershipError::InProgress(InProgress {
+                committed: None,
+                membership_log_id: None,
+            }),
+        ));
+        assert!(
+            matches!(
+                ProposeError::from_client_write(fatal),
+                ProposeError::Other(_)
+            ),
+            "a non-ForwardToLeader error must classify as Other, not Leader"
+        );
     }
 
     #[test]
