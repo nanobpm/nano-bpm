@@ -7,7 +7,16 @@ description: >-
 runs:
   using: composite
   steps:
+    # Fail-open install: a download/API failure here must not fail the job;
+    # start.sh then finds no sccache and falls back to plain rustc.
+    # disable_annotations skips the upstream post step, whose `sccache
+    # --show-stats` would hit an unavailable backend again and could fail the
+    # job after start.sh already fell back. start.sh is the sole fail-open
+    # boundary.
     - uses: mozilla-actions/sccache-action@v0.0.10
+      continue-on-error: true
+      with:
+        disable_annotations: 'true'
     - name: Start sccache (fall back to plain rustc if unavailable)
       shell: bash
       run: '"$GITHUB_ACTION_PATH/start.sh"'

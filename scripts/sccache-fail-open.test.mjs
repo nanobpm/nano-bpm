@@ -41,6 +41,25 @@ test('no workflow wires sccache except via .github/actions/sccache', () => {
   assert.match(readFileSync(join(root, COMPOSITE), 'utf8'), /mozilla-actions\/sccache-action@/);
 });
 
+test('the upstream action can neither fail install nor run a post-step stats call', () => {
+  const y = readFileSync(join(root, COMPOSITE), 'utf8');
+  const step = y.slice(y.indexOf('- uses: mozilla-actions/sccache-action@'));
+  const block = step.slice(0, step.indexOf('\n    - ', 1) === -1 ? undefined : step.indexOf('\n    - ', 1));
+  assert.match(block, /^\s+continue-on-error: true$/m, 'install must be continue-on-error');
+  assert.match(block, /^\s+disable_annotations: 'true'$/m, 'upstream post --show-stats must be disabled');
+});
+
+test('a missing sccache binary (failed install) falls back too', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sccache-'));
+  const envFile = join(dir, 'env');
+  writeFileSync(envFile, '');
+  const stdout = execFileSync('bash', [START], {
+    env: { PATH: process.env.PATH, GITHUB_ENV: envFile, SCCACHE: join(dir, 'absent') },
+  }).toString();
+  assert.doesNotMatch(readFileSync(envFile, 'utf8'), /RUSTC_WRAPPER/);
+  assert.match(stdout, /^::warning title=sccache unavailable::/m);
+});
+
 test('detector flags direct wiring and ignores comments', () => {
   assert.deepEqual(directSccacheWiring("    env:\n      RUSTC_WRAPPER: 'sccache'"), ['line 2']);
   assert.deepEqual(directSccacheWiring('      - uses: mozilla-actions/sccache-action@v0.0.10'), ['line 1']);
