@@ -189,12 +189,22 @@ function Scrubber({
             el.setPointerCapture(e.pointerId);
             seekTo(e.clientX);
             const move = (ev: PointerEvent) => seekTo(ev.clientX);
-            const up = () => {
+            // Detach on EVERY terminal pointer event, not just `pointerup`: a
+            // touch drag can end with `pointercancel`, and the browser can
+            // revoke the capture on its own (`lostpointercapture`). If we only
+            // cleaned up on `pointerup`, those paths would leave `pointermove`
+            // attached and later movement over the bar would keep seeking
+            // without a fresh press.
+            const end = () => {
               el.removeEventListener("pointermove", move);
-              el.removeEventListener("pointerup", up);
+              el.removeEventListener("pointerup", end);
+              el.removeEventListener("pointercancel", end);
+              el.removeEventListener("lostpointercapture", end);
             };
             el.addEventListener("pointermove", move);
-            el.addEventListener("pointerup", up);
+            el.addEventListener("pointerup", end);
+            el.addEventListener("pointercancel", end);
+            el.addEventListener("lostpointercapture", end);
           }}
           className="relative h-6 cursor-pointer rounded outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
         >

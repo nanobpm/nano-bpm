@@ -31,6 +31,8 @@ import {
 
 const INSTANCE_KEY = "2251799813800001";
 const AGENT_KEY = "2251799813900001";
+// A second run of the SAME element, for the run-picker journey.
+const AGENT_KEY_2 = "2251799813900002";
 // MINIMAL_BPMN's task: the element that ran the agent.
 const ELEMENT_ID = "Task_1";
 
@@ -110,9 +112,12 @@ const NEXT_TURN = historyItem("4", 2, "ASSISTANT", 5, "Order 7 has 3 items.", {
   metrics: metrics(1800, 200),
 });
 
-function agentInstance(status: AgentInstanceStatusEnum): AgentInstanceResult {
+function agentInstance(
+  status: AgentInstanceStatusEnum,
+  key: string = AGENT_KEY,
+): AgentInstanceResult {
   return {
-    agentInstanceKey: AGENT_KEY,
+    agentInstanceKey: key,
     agentDefinitionKey: "2251799813910001",
     status,
     definition: {
@@ -200,6 +205,82 @@ async function setup(page: Page) {
     page.getByText(new RegExp(`instance ${INSTANCE_KEY}\\b`)),
   ).toBeVisible();
   return state;
+}
+
+// A second run of the same element, with its own shorter transcript, so the
+// run-picker journey can assert that selecting each option loads only that
+// run's history (and resets the playhead).
+const RUN2_TURNS = [
+  historyItem("r2-1", 1, "USER", 0, "Draft the reply", {
+    agentInstanceKey: AGENT_KEY_2,
+  }),
+  historyItem("r2-2", 1, "ASSISTANT", 1, "Here is the draft.", {
+    agentInstanceKey: AGENT_KEY_2,
+    model: "nano-model",
+    metrics: metrics(900, 50),
+  }),
+];
+
+/** Stubs two settled runs of the same element: AGENT_KEY (FIRST_TURNS, 3 items)
+ *  and AGENT_KEY_2 (RUN2_TURNS, 2 items). */
+async function stubTwoRuns(page: Page) {
+  const page1 = (items: unknown[]) => ({
+    items,
+    page: {
+      totalItems: items.length,
+      hasMoreTotalItems: false,
+      startCursor: null,
+      endCursor: null,
+    },
+  });
+  await page.route("**/v2/agent-instances/search", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      // Oldest first (agentsByElement order): Run 1 then Run 2.
+      body: JSON.stringify(
+        page1([
+          agentInstance("COMPLETED", AGENT_KEY),
+          agentInstance("COMPLETED", AGENT_KEY_2),
+        ]),
+      ),
+    }),
+  );
+  await page.route(
+    `**/v2/agent-instances/${AGENT_KEY}/history/search`,
+    (route) =>
+      route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(page1([...FIRST_TURNS])),
+      }),
+  );
+  await page.route(
+    `**/v2/agent-instances/${AGENT_KEY_2}/history/search`,
+    (route) =>
+      route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify(page1([...RUN2_TURNS])),
+      }),
+  );
+  await page.route("**/console/api/stream", (route) =>
+    route.fulfill({
+      contentType: "text/event-stream",
+      body: 'retry: 200\nevent: instances\ndata: {"position":1,"active":0}\n\n',
+    }),
+  );
+}
+
+async function setupTwoRuns(page: Page) {
+  await stubConsoleApi(page);
+  await stubInstances(page, [
+    makeInstance({ key: INSTANCE_KEY, process_id: "demo" }),
+  ]);
+  await stubTwoRuns(page);
+  await resetTourState(page);
+  await suppressStartupPanel(page);
+  await page.goto(`explorer?instance=${INSTANCE_KEY}`);
+  await expect(
+    page.getByText(new RegExp(`instance ${INSTANCE_KEY}\\b`)),
+  ).toBeVisible();
 }
 
 const badge = (page: Page) =>
@@ -296,6 +377,40 @@ test.describe("agent session scrubber", () => {
     await expect(
       panel(page).getByRole("button", { name: "Jump to live" }),
     ).toHaveCount(0);
+    noCrash();
+  });
+
+  test("run picker loads only the selected run's transcript", async ({
+    page,
+  }) => {
+    const noCrash = assertNoPageCrash(page);
+    await setupTwoRuns(page);
+    await badge(page).click();
+    await expect(panel(page)).toBeVisible();
+
+    const runPicker = panel(page).getByRole("combobox", { name: "Agent run" });
+    await expect(runPicker).toBeVisible();
+
+    // Default is the newest run (Run 2): only its transcript shows.
+    await expect(runPicker).toHaveValue(AGENT_KEY_2);
+    await expect(panel(page).getByText("Here is the draft.")).toBeVisible();
+    await expect(slider(page)).toHaveAttribute("aria-valuemax", "2");
+    await expect(panel(page).getByText("Summarise the order")).toHaveCount(0);
+
+    // Selecting Run 1 swaps in only its transcript and resets the playhead to
+    // that run's length (the key-change path that previously showed stale
+    // history).
+    await runPicker.selectOption(AGENT_KEY);
+    await expect(panel(page).getByText("Summarise the order")).toBeVisible();
+    await expect(slider(page)).toHaveAttribute("aria-valuemax", "3");
+    await expect(slider(page)).toHaveAttribute("aria-valuenow", "3");
+    await expect(panel(page).getByText("Here is the draft.")).toHaveCount(0);
+
+    // And back to Run 2.
+    await runPicker.selectOption(AGENT_KEY_2);
+    await expect(panel(page).getByText("Here is the draft.")).toBeVisible();
+    await expect(slider(page)).toHaveAttribute("aria-valuemax", "2");
+    await expect(panel(page).getByText("Summarise the order")).toHaveCount(0);
     noCrash();
   });
 });
