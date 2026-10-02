@@ -40,9 +40,20 @@ export default function AgentSessionPanel({
   instances: AgentInstanceResult[];
   onClose: () => void;
 }) {
-  const [selectedKey, setSelectedKey] = useState(
-    () => instances[instances.length - 1].agentInstanceKey,
-  );
+  // Default to the newest ACTIVE run, mirroring the badge (agentsByElement):
+  // when runs overlap, the badge reports the newest active run even if a newer
+  // run already settled, so opening the newest run overall would open a
+  // completed transcript and not follow the live run. Fall back to the newest
+  // run only once every run has settled. (`instances` is oldest-first, so the
+  // newest active run is the last active entry; `findLast` is ES2023, but this
+  // package targets ES2022, so scan from the end.)
+  const [selectedKey, setSelectedKey] = useState(() => {
+    for (let n = instances.length - 1; n >= 0; n--) {
+      if (isAgentActive(instances[n].status))
+        return instances[n].agentInstanceKey;
+    }
+    return instances[instances.length - 1].agentInstanceKey;
+  });
   const instance =
     instances.find((i) => i.agentInstanceKey === selectedKey) ??
     instances[instances.length - 1];
@@ -288,6 +299,7 @@ function Scrubber({
           spans={spans}
           window={window}
           now={now}
+          active={active}
           playheadMs={Date.parse(current.producedAt)}
           currentStep={head.index}
           onSeek={(i) => setHead(seek(i, items.length))}
@@ -317,6 +329,7 @@ function Timeline({
   spans,
   window,
   now,
+  active,
   playheadMs,
   currentStep,
   onSeek,
@@ -324,6 +337,7 @@ function Timeline({
   spans: Span[];
   window: { startMs: number; endMs: number };
   now: number;
+  active: boolean;
   playheadMs: number;
   currentStep: number;
   onSeek: (step: number) => void;
@@ -347,20 +361,28 @@ function Timeline({
             {of.map((s) => {
               const left = pctIn(window, s.startMs);
               const right = pctIn(window, s.endMs ?? now);
+              // A span is "running" only while it is unresolved AND the agent
+              // is still active. Cancellation can settle the agent after
+              // discarding a pending result, leaving the last committed span
+              // unresolved forever; with no further result coming, that span
+              // must render incomplete/static, not pulse as live.
+              const running = s.endMs === null && active;
               return (
                 <button
                   key={s.id}
                   type="button"
                   title={`${s.label} · iteration ${s.loopIteration}${
-                    s.endMs === null
+                    running
                       ? " · running"
-                      : ` · ${fmtMs(s.endMs - s.startMs)}`
+                      : s.endMs === null
+                        ? " · incomplete"
+                        : ` · ${fmtMs(s.endMs - s.startMs)}`
                   }`}
                   onClick={() => onSeek(s.stepIndex)}
                   className={`absolute h-[10px] min-w-[3px] rounded-sm ${
                     kind === "model" ? "bg-accent/70" : "bg-info/70"
                   } ${s.stepIndex === currentStep ? "ring-2 ring-fg/40" : ""} ${
-                    s.endMs === null ? "motion-safe:animate-pulse" : ""
+                    running ? "motion-safe:animate-pulse" : ""
                   }`}
                   style={{
                     left: `${left}%`,
