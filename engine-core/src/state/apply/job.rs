@@ -35,6 +35,9 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     priority: *priority,
                     created_at: *created_at,
                     kind: JobKind::BpmnElement,
+                    error_message: None,
+                    error_code: None,
+                    has_failed_with_retries_left: false,
                 },
             );
             resync_job_index(state, *job_key);
@@ -81,6 +84,9 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                         index: *listener_index,
                         scope: *scope,
                     },
+                    error_message: None,
+                    error_code: None,
+                    has_failed_with_retries_left: false,
                 },
             );
             resync_job_index(state, *job_key);
@@ -127,6 +133,9 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                         index: *listener_index,
                         user_task_key: *user_task_key,
                     },
+                    error_message: None,
+                    error_code: None,
+                    has_failed_with_retries_left: false,
                 },
             );
             resync_job_index(state, *job_key);
@@ -190,6 +199,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             job_key,
             retries,
             worker,
+            error_message,
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
@@ -197,6 +207,15 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 job.deadline = None;
                 job.activated_at = None;
                 job.activation_timeout = None;
+                // Zeebe parity (#1327): retain the worker's message and whether
+                // retries remain so they survive a compaction-floor read-model
+                // rebuild (which re-seeds the row from engine state). Keep the
+                // last known message for events serialized before the field
+                // existed (mirrors the read model's `COALESCE`).
+                if error_message.is_some() {
+                    job.error_message = error_message.clone();
+                }
+                job.has_failed_with_retries_left = *retries > 0;
                 // With retries left the job returns to the activatable pool; with
                 // none it parks (an incident is raised alongside this event).
                 if *retries > 0 {
@@ -223,7 +242,11 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
         }
 
         Event::JobErrorThrown {
-            job_key, worker, ..
+            job_key,
+            worker,
+            error_code,
+            error_message,
+            ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Errored;
@@ -231,6 +254,16 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 job.activated_at = None;
                 job.activation_timeout = None;
                 job.lease_token = None;
+                // Zeebe parity (#1327): the thrown code/message land on the job
+                // and survive a compaction-floor rebuild. The exporter keys
+                // `jobFailedWithRetriesLeft` off the record's (unchanged) retries
+                // for ERROR_THROWN as well as FAILED. Keep the last known message
+                // for pre-field events (mirrors the read model's `COALESCE`).
+                job.error_code = Some(error_code.clone());
+                if error_message.is_some() {
+                    job.error_message = error_message.clone();
+                }
+                job.has_failed_with_retries_left = job.retries > 0;
                 // Terminal, incident-bearing transition: retain the activating
                 // `worker` for attribution (Zeebe parity — throwError retains the
                 // record incl. `worker`). Carried on the event so it survives a

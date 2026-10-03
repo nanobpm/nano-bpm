@@ -2873,3 +2873,202 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         .unwrap_err();
     assert_eq!(err, too_long);
 }
+
+fn activated_payment_job(engine: &mut Engine) -> Key {
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key
+}
+
+#[test]
+fn fail_job_with_retries_left_records_the_error_message_on_the_event() {
+    // #1327 — Zeebe's JobFailProcessor stores the worker's errorMessage on the job
+    // on EVERY fail, retries left or not; the engine used to drop it unless the
+    // fail raised an incident, so nothing durable ever carried it.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command(Command::fail_job(job_key, 2, "connection refused"))
+        .unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            e,
+            Event::JobFailed { retries: 2, error_message: Some(m), .. } if m == "connection refused"
+        )),
+        "JobFailed must carry the error message: {log:?}"
+    );
+}
+
+#[test]
+fn throw_job_error_records_the_error_message_on_the_event() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command(Command::throw_job_error(job_key, "E42", "card declined"))
+        .unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            e,
+            Event::JobErrorThrown { error_code, error_message: Some(m), .. }
+                if error_code == "E42" && m == "card declined"
+        )),
+        "JobErrorThrown must carry the error message: {log:?}"
+    );
+}
+
+#[test]
+fn job_error_messages_are_limited_like_zeebe() {
+    // Zeebe: StringUtil.limitString(msg, DEFAULT_MAX_ERROR_MESSAGE_SIZE = 10000)
+    // keeps the first 10000 characters and appends "...".
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let long = "é".repeat(MAX_ERROR_MESSAGE_LEN + 5);
+    let log = engine
+        .apply_command(Command::fail_job(job_key, 1, long))
+        .unwrap();
+    let msg = log
+        .iter()
+        .find_map(|e| match e {
+            Event::JobFailed { error_message, .. } => error_message.clone(),
+            _ => None,
+        })
+        .expect("JobFailed with a message");
+    assert_eq!(msg.chars().count(), MAX_ERROR_MESSAGE_LEN + 3);
+    assert!(msg.ends_with("é..."));
+    assert_eq!(limit_error_message("short".into()), "short");
+
+    // Java counts UTF-16 code units: an astral character (emoji) is two units,
+    // so 5001 of them (10002 units) exceed the limit. Zeebe's substring would
+    // split the 5001st pair; we never split a character, so it is dropped.
+    let astral = "😀".repeat(MAX_ERROR_MESSAGE_LEN / 2 + 1);
+    let limited = limit_error_message(astral);
+    assert_eq!(
+        limited,
+        format!("{}...", "😀".repeat(MAX_ERROR_MESSAGE_LEN / 2))
+    );
+    // Exactly at the bound is untouched.
+    let at_bound = "😀".repeat(MAX_ERROR_MESSAGE_LEN / 2);
+    assert_eq!(limit_error_message(at_bound.clone()), at_bound);
+}
+
+#[test]
+fn job_error_metadata_is_retained_on_engine_state_for_snapshot_recovery() {
+    // #1328 review — the read model's below-compaction-floor recovery re-seeds job
+    // rows from the engine snapshot, not the (compacted) events. So the engine's
+    // `Job` must retain the last error message/code and the retries-left flag;
+    // otherwise those Zeebe-parity fields come back NULL/false after a rebuild.
+    // A fail with retries left retains the message and sets the flag.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::fail_job(job_key, 2, "connection refused"))
+        .unwrap();
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(job.error_message.as_deref(), Some("connection refused"));
+    assert!(job.has_failed_with_retries_left);
+    assert!(job.error_code.is_none());
+
+    // A terminal fail overwrites the message and clears the flag.
+    engine
+        .apply_command(Command::fail_job(job_key, 0, "gave up"))
+        .unwrap();
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(job.error_message.as_deref(), Some("gave up"));
+    assert!(!job.has_failed_with_retries_left);
+
+    // A thrown error records its code and message; the flag follows the record's
+    // (unchanged) retries, matching the exporter's `jobFailedWithRetriesLeft`.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::throw_job_error(job_key, "E42", "card declined"))
+        .unwrap();
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(job.error_code.as_deref(), Some("E42"));
+    assert_eq!(job.error_message.as_deref(), Some("card declined"));
+    // The payment job was activated with its default retries (> 0) and a thrown
+    // error does not change them, so the flag is set.
+    assert!(job.has_failed_with_retries_left);
+}
+
+#[test]
+fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
+    // #1328 review — events serialized before `error_message` existed decode with
+    // `error_message: None` (serde default). The reducer must then KEEP the job's
+    // last known message rather than overwrite it with `None` (mirrors the read
+    // model's `COALESCE`). The command API always carries a message, so drive the
+    // `None` branch by replaying a full journal that ends in a legacy-shaped event.
+    //
+    // JobFailed: a message-bearing fail followed by a legacy (None) terminal fail
+    // retains the first message.
+    let mut seed = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        seed.apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    journal.extend(
+        seed.apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = seed.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let instance_key = seed.state().jobs[&job_key].instance_key;
+    journal.extend(
+        seed.apply_command(Command::fail_job(job_key, 2, "connection refused"))
+            .unwrap(),
+    );
+    // A legacy terminal fail: no message field, no worker field.
+    journal.push(Event::JobFailed {
+        job_key,
+        instance_key,
+        retries: 0,
+        worker: None,
+        error_message: None,
+    });
+    let engine = Engine::replay(journal);
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(
+        job.error_message.as_deref(),
+        Some("connection refused"),
+        "a legacy (None-message) JobFailed must not erase the last known message"
+    );
+    assert!(!job.has_failed_with_retries_left);
+
+    // JobErrorThrown: a message-bearing throw followed by a legacy (None) throw
+    // retains the first message (and still records the new code).
+    let mut seed = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        seed.apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    journal.extend(
+        seed.apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = seed.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let instance_key = seed.state().jobs[&job_key].instance_key;
+    journal.extend(
+        seed.apply_command(Command::throw_job_error(job_key, "E42", "card declined"))
+            .unwrap(),
+    );
+    journal.push(Event::JobErrorThrown {
+        job_key,
+        instance_key,
+        error_code: "E42".to_string(),
+        worker: None,
+        error_message: None,
+    });
+    let engine = Engine::replay(journal);
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(
+        job.error_message.as_deref(),
+        Some("card declined"),
+        "a legacy (None-message) JobErrorThrown must not erase the last known message"
+    );
+    assert_eq!(job.error_code.as_deref(), Some("E42"));
+}

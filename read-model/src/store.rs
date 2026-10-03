@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -52,7 +52,7 @@ const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 3791592609797233212;
+const SCHEMA_FINGERPRINT: i64 = -6985736873706243559;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -145,7 +145,14 @@ CREATE TABLE jobs (
     -- '[]' means no durable activation has declared a set (fetch-all / undeclared
     -- reads) or the job has not been activated with a declared set.
     read_set               TEXT NOT NULL DEFAULT '[]',
-    lease_token            TEXT
+    lease_token            TEXT,
+    -- Zeebe job `errorMessage` / `errorCode` / `hasFailedWithRetriesLeft`
+    -- (#1327): the last worker-reported failure/thrown-error message, the last
+    -- thrown error code, and whether the last FAILED / ERROR_THROWN left
+    -- retries > 0.
+    error_message          TEXT,
+    error_code             TEXT,
+    has_failed_with_retries_left INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE incidents (
     key                    INTEGER PRIMARY KEY,
@@ -1337,6 +1344,14 @@ pub struct JobRow {
     /// The owning process instance's `businessId` as it stood when this
     /// artifact was created (snapshot — a later assignment does not enrich it).
     pub business_id: Option<String>,
+    /// The last worker-reported message from [`crate::Event::JobFailed`] /
+    /// [`crate::Event::JobErrorThrown`] (Zeebe job `errorMessage`, #1327).
+    pub error_message: Option<String>,
+    /// The last thrown error code from [`crate::Event::JobErrorThrown`].
+    pub error_code: Option<String>,
+    /// Whether the last fail / thrown error left the job with retries > 0
+    /// (Zeebe exporter `jobFailedWithRetriesLeft`).
+    pub has_failed_with_retries_left: bool,
 }
 
 pub struct UserTaskRow {
@@ -2661,7 +2676,7 @@ impl ReadStore {
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
                  job_kind, listener_event_type, created_at_ms, read_set, CAST(lease_token AS TEXT), \
-                 business_id FROM jobs",
+                 business_id, error_message, error_code, has_failed_with_retries_left FROM jobs",
             )
             .expect("prepare jobs");
         let rows = stmt.query_map([], map_job).expect("query jobs");
@@ -3208,6 +3223,9 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         read_set: serde_json::from_str::<Vec<String>>(&r.get::<_, String>(14)?).unwrap_or_default(),
         lease_token: r.get(15)?,
         business_id: r.get(16)?,
+        error_message: r.get(17)?,
+        error_code: r.get(18)?,
+        has_failed_with_retries_left: r.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -3934,11 +3952,15 @@ fn project_engine_state(
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-             job_kind, listener_event_type, lease_token, business_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+             job_kind, listener_event_type, lease_token, error_message, error_code, \
+             has_failed_with_retries_left, business_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
              (SELECT business_id FROM process_instances WHERE key = ?2)) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-             worker = excluded.worker, deadline_ms = excluded.deadline_ms, lease_token = excluded.lease_token",
+             worker = excluded.worker, deadline_ms = excluded.deadline_ms, \
+             lease_token = excluded.lease_token, error_message = excluded.error_message, \
+             error_code = excluded.error_code, \
+             has_failed_with_retries_left = excluded.has_failed_with_retries_left",
             params![
                 job.key as i64,
                 job.instance_key as i64,
@@ -3961,6 +3983,12 @@ fn project_engine_state(
                 kind_code,
                 event_code,
                 job.lease_token,
+                // Zeebe job error metadata (#1327). Retained in engine state so a
+                // compaction-floor rebuild re-seeds them here instead of losing
+                // them to the compacted `JobFailed`/`JobErrorThrown` events.
+                job.error_message,
+                job.error_code,
+                i64::from(job.has_failed_with_retries_left),
             ],
         )?;
     }
@@ -4839,8 +4867,17 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             job_key,
             retries,
             worker,
+            error_message,
             ..
         } => {
+            // Zeebe parity (#1327): every fail records the worker's message and
+            // whether retries remain. `COALESCE` keeps the last known message for
+            // events serialized before the field existed.
+            tx.cexecute(
+                "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
+                 has_failed_with_retries_left = ?3 WHERE key = ?1",
+                params![*job_key as i64, error_message, i64::from(*retries > 0)],
+            )?;
             if *retries > 0 {
                 // Back to the activatable pool — drop the last activating worker.
                 tx.cexecute(
@@ -4874,8 +4911,20 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         }
 
         Event::JobErrorThrown {
-            job_key, worker, ..
+            job_key,
+            worker,
+            error_code,
+            error_message,
+            ..
         } => {
+            // Zeebe parity (#1327): the thrown code and message land on the job;
+            // the exporter keys `jobFailedWithRetriesLeft` off the record's
+            // (unchanged) retries for ERROR_THROWN as well as FAILED.
+            tx.cexecute(
+                "UPDATE jobs SET error_code = ?2, error_message = COALESCE(?3, error_message), \
+                 has_failed_with_retries_left = (retries > 0) WHERE key = ?1",
+                params![*job_key as i64, error_code, error_message],
+            )?;
             // Terminal, incident-bearing transition: set `worker` from the event
             // for attribution (see `JobFailed`); `COALESCE` keeps any existing
             // value for pre-field events, and `NULLIF(worker, '')` drops a legacy
@@ -9560,6 +9609,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     retries: 0,
                     worker: None,
+                    error_message: None,
                 },
                 // A terminal errored job on the same source element.
                 &Event::JobCreated {
@@ -9577,6 +9627,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     error_code: "BOOM".to_string(),
                     worker: None,
+                    error_message: None,
                 },
             ])
             .unwrap();
@@ -9645,6 +9696,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     retries: 0,
                     worker: Some("w1".to_string()),
+                    error_message: None,
                 },
                 // A job that throws a terminal (uncaught) error after activation by `w2`.
                 &Event::JobCreated {
@@ -9672,6 +9724,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     error_code: "BOOM".to_string(),
                     worker: Some("w2".to_string()),
+                    error_message: None,
                 },
                 // A job that fails with retries left, returning to the pool after `w3`.
                 &Event::JobCreated {
@@ -9699,6 +9752,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     retries: 1,
                     worker: Some("w3".to_string()),
+                    error_message: None,
                 },
             ])
             .unwrap();
@@ -9749,6 +9803,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     retries: 0,
                     worker: Some("host-a-senior".to_string()),
+                    error_message: None,
                 },
                 // Errored terminally — again no JobActivated projection.
                 &Event::JobCreated {
@@ -9766,6 +9821,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     error_code: "BOOM".to_string(),
                     worker: Some("host-b-senior".to_string()),
+                    error_message: None,
                 },
             ])
             .unwrap();
@@ -9892,6 +9948,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     retries: 0,
                     worker: Some(String::new()),
+                    error_message: None,
                 },
                 &Event::JobCreated {
                     job_key: 9203,
@@ -9908,6 +9965,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     error_code: "BOOM".to_string(),
                     worker: Some(String::new()),
+                    error_message: None,
                 },
             ])
             .unwrap();
@@ -10020,6 +10078,9 @@ mod element_instance_tests {
                 priority: 0,
                 created_at: 1,
                 kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
             },
         );
 
@@ -10050,6 +10111,85 @@ mod element_instance_tests {
         let completed = &jobs[&9401];
         assert_eq!(completed.state, JobState::Completed);
         assert_eq!(completed.worker, None);
+    }
+
+    #[test]
+    fn a_compaction_floor_rebuild_preserves_job_error_message_code_and_retries_left_flag() {
+        use nanobpmn_engine_core::{Job, JobKind, State};
+
+        // #1327 / #1328 review — below-compaction-floor recovery re-seeds job rows
+        // from the engine snapshot via `project_engine_state`, NOT from the (now
+        // compacted) `JobFailed`/`JobErrorThrown` events. The engine retains the
+        // last error message/code and the retries-left flag on `Job`, so the
+        // seeding binding must carry them through; otherwise a reset/corrupt read
+        // model comes back with NULL/false even for failures written by this
+        // version. Covers all three fields across a failed-with-retries job, a
+        // terminally-failed job, and a thrown-error job.
+        let base_job = |key, state| Job {
+            key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            state,
+            worker: None,
+            deadline: None,
+            activated_at: None,
+            activation_timeout: None,
+            lease_token: None,
+            durable_activation: false,
+            activated: true,
+            retries: 0,
+            priority: 0,
+            created_at: 1,
+            kind: JobKind::BpmnElement,
+            error_message: None,
+            error_code: None,
+            has_failed_with_retries_left: false,
+        };
+        let mut state = State::default();
+        // Failed with retries left.
+        state.jobs.insert(9601, {
+            let mut j = base_job(9601, JobState::Created);
+            j.retries = 2;
+            j.error_message = Some("upstream 503".to_string());
+            j.has_failed_with_retries_left = true;
+            j
+        });
+        // Terminally failed (retries exhausted).
+        state.jobs.insert(9602, {
+            let mut j = base_job(9602, JobState::Failed);
+            j.error_message = Some("gave up".to_string());
+            j
+        });
+        // Thrown error (code + message, retries left → flag set).
+        state.jobs.insert(9603, {
+            let mut j = base_job(9603, JobState::Errored);
+            j.retries = 1;
+            j.error_code = Some("E42".to_string());
+            j.error_message = Some("card declined".to_string());
+            j.has_failed_with_retries_left = true;
+            j
+        });
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        let seeded: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+
+        assert_eq!(seeded[&9601].error_message.as_deref(), Some("upstream 503"));
+        assert!(seeded[&9601].has_failed_with_retries_left);
+        assert!(seeded[&9601].error_code.is_none());
+
+        assert_eq!(seeded[&9602].error_message.as_deref(), Some("gave up"));
+        assert!(!seeded[&9602].has_failed_with_retries_left);
+
+        assert_eq!(seeded[&9603].error_code.as_deref(), Some("E42"));
+        assert_eq!(
+            seeded[&9603].error_message.as_deref(),
+            Some("card declined")
+        );
+        assert!(seeded[&9603].has_failed_with_retries_left);
     }
 
     #[test]
@@ -10084,6 +10224,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     retries: 0,
                     worker: None,
+                    error_message: None,
                 },
             ),
             (
@@ -10093,6 +10234,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     error_code: "BOOM".to_string(),
                     worker: None,
+                    error_message: None,
                 },
             ),
         ] {
@@ -10186,6 +10328,89 @@ mod element_instance_tests {
             .unwrap();
         }
         assert_eq!(store.jobs()[0].lease_token.as_deref(), Some("314"));
+    }
+
+    #[test]
+    fn projects_job_error_message_code_and_failed_with_retries_left() {
+        // #1327 — Zeebe stores the worker's errorMessage on the job on EVERY fail
+        // (retries left or not) and errorCode on a thrown error; the exporter
+        // sets `jobFailedWithRetriesLeft` on FAILED / ERROR_THROWN from the
+        // record's retries. The row must carry all three.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 1,
+            priority: 0,
+            retries: 3,
+        };
+        let row = |store: &ReadStore, key| store.jobs().into_iter().find(|j| j.key == key).unwrap();
+        store
+            .export(&[&deploy(), &created(), &job(7001), &job(7002)])
+            .unwrap();
+        assert!(row(&store, 7001).error_message.is_none());
+        assert!(!row(&store, 7001).has_failed_with_retries_left);
+
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7001,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("upstream 503".to_string()),
+            }])
+            .unwrap();
+        let r = row(&store, 7001);
+        assert_eq!(r.error_message.as_deref(), Some("upstream 503"));
+        assert!(r.has_failed_with_retries_left);
+        assert!(r.error_code.is_none());
+
+        // A legacy (pre-field) event keeps the last known message; the final
+        // fail overwrites it and clears the retries-left flag.
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7001,
+                instance_key: INST,
+                retries: 1,
+                worker: None,
+                error_message: None,
+            }])
+            .unwrap();
+        assert_eq!(
+            row(&store, 7001).error_message.as_deref(),
+            Some("upstream 503")
+        );
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7001,
+                instance_key: INST,
+                retries: 0,
+                worker: None,
+                error_message: Some("gave up".to_string()),
+            }])
+            .unwrap();
+        let r = row(&store, 7001);
+        assert_eq!(r.error_message.as_deref(), Some("gave up"));
+        assert!(!r.has_failed_with_retries_left);
+
+        store
+            .export(&[&Event::JobErrorThrown {
+                job_key: 7002,
+                instance_key: INST,
+                error_code: "E42".to_string(),
+                worker: None,
+                error_message: Some("card declined".to_string()),
+            }])
+            .unwrap();
+        let r = row(&store, 7002);
+        assert_eq!(r.error_code.as_deref(), Some("E42"));
+        assert_eq!(r.error_message.as_deref(), Some("card declined"));
+        // Exporter parity: ERROR_THROWN with retries > 0 counts as "failed with
+        // retries left" (JobHandler keys the flag off the record's retries).
+        assert!(r.has_failed_with_retries_left);
     }
 
     #[test]

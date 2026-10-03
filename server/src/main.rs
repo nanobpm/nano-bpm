@@ -12178,6 +12178,10 @@ impl ServerImpl {
                         && query::match_string(&f.r_type, &job.job_type)
                         && query::match_string(&f.element_id, &job.element_id)
                         && query::match_job_state(&f.state, &job_state_enum(job.state).to_string())
+                        && query::match_string_opt(&f.error_message, job.error_message.as_deref())
+                        && query::match_string_opt(&f.error_code, job.error_code.as_deref())
+                        && f.has_failed_with_retries_left
+                            .is_none_or(|want| want == job.has_failed_with_retries_left)
                 }
             })
             .collect();
@@ -21753,9 +21757,16 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         element_id: types::Nullable::Present(job.element_id.clone()),
         element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
         end_time: types::Nullable::Null,
-        error_code: types::Nullable::Null,
-        error_message: types::Nullable::Null,
-        has_failed_with_retries_left: false,
+        // Zeebe job errorMessage / errorCode / hasFailedWithRetriesLeft (#1327).
+        error_code: job
+            .error_code
+            .clone()
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        error_message: job
+            .error_message
+            .clone()
+            .map_or(types::Nullable::Null, types::Nullable::Present),
+        has_failed_with_retries_left: job.has_failed_with_retries_left,
         is_denied: types::Nullable::Null,
         job_key: models::JobKey(job.key.to_string()),
         kind: job_kind_enum,
@@ -37001,6 +37012,139 @@ mod clustered_startup_tests {
             panic!("expected 200 from global stats");
         };
         assert_eq!(g.failed.count, 1, "one failed job recorded");
+    }
+
+    /// #1327 — Zeebe parity: a fail with retries LEFT records the worker's
+    /// `errorMessage` on the job (not only the retries-exhausted incident), and
+    /// job search returns it, sets `hasFailedWithRetriesLeft`, and filters on
+    /// both. Previously the search result hard-coded `null` / `false`.
+    #[tokio::test]
+    async fn job_search_returns_and_filters_the_failure_error_message() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+
+        use apis::job::FailJobResponse as FResp;
+        let mut fail = models::JobFailRequest::new();
+        fail.retries = Some(2);
+        fail.error_message = Some("upstream 503".into());
+        let failed = server
+            .fail_job_impl(
+                &models::FailJobPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &Some(fail),
+            )
+            .await
+            .expect("failure runs");
+        assert!(matches!(failed, FResp::Status204_TheJobIsFailed));
+
+        use apis::job::SearchJobsResponse as SResp;
+        let search = |filter: models::JobFilter| {
+            let server = &server;
+            async move {
+                let mut q = models::JobSearchQuery::new();
+                q.filter = Some(filter);
+                let SResp::Status200_TheJobSearchResult(r) = server
+                    .search_jobs_impl(&Some(q))
+                    .await
+                    .expect("search runs")
+                else {
+                    panic!("expected 200 from job search");
+                };
+                r.items
+            }
+        };
+        let mut by_message = models::JobFilter::new();
+        by_message.error_message =
+            Some(models::StringFilterProperty::String("upstream 503".into()));
+        by_message.has_failed_with_retries_left = Some(true);
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            items = search(by_message.clone()).await;
+            if !items.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(items.len(), 1, "the failed job matches its errorMessage");
+        let job = &items[0];
+        assert_eq!(job.job_key.0, job_key.to_string());
+        assert_eq!(
+            job.error_message,
+            types::Nullable::Present("upstream 503".to_string())
+        );
+        assert!(job.has_failed_with_retries_left);
+        assert_eq!(job.retries, 2);
+
+        let mut other = models::JobFilter::new();
+        other.error_message = Some(models::StringFilterProperty::String("nope".into()));
+        assert!(
+            search(other).await.is_empty(),
+            "a different message matches nothing"
+        );
+        let mut not_failed = models::JobFilter::new();
+        not_failed.has_failed_with_retries_left = Some(false);
+        not_failed.job_key = by_message.job_key.clone();
+        assert!(
+            search(not_failed)
+                .await
+                .iter()
+                .all(|j| j.job_key.0 != job_key.to_string()),
+            "hasFailedWithRetriesLeft=false excludes the failed job"
+        );
+
+        // A thrown (uncaught) business error lands its errorCode + message on
+        // the job, and errorCode is filterable.
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+        let mut thrown = models::JobErrorRequest::new("E42".into());
+        thrown.error_message = Some(types::Nullable::Present("card declined".into()));
+        let threw = server
+            .throw_job_error_impl(
+                &models::ThrowJobErrorPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &thrown,
+            )
+            .await
+            .expect("throw runs");
+        assert!(matches!(
+            threw,
+            apis::job::ThrowJobErrorResponse::Status204_AnErrorIsThrownForTheJob
+        ));
+        let mut by_code = models::JobFilter::new();
+        by_code.error_code = Some(models::StringFilterProperty::String("E42".into()));
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            items = search(by_code.clone()).await;
+            if !items.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(items.len(), 1, "the errored job matches its errorCode");
+        assert_eq!(
+            items[0].error_code,
+            types::Nullable::Present("E42".to_string())
+        );
+        assert_eq!(
+            items[0].error_message,
+            types::Nullable::Present("card declined".to_string())
+        );
+        let mut other_code = models::JobFilter::new();
+        other_code.error_code = Some(models::StringFilterProperty::String("E43".into()));
+        assert!(
+            search(other_code).await.is_empty(),
+            "a different errorCode matches nothing"
+        );
     }
 
     #[tokio::test]

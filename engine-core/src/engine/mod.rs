@@ -2747,6 +2747,7 @@ impl Engine {
                         instance_key,
                         retries,
                         worker,
+                        error_message: Some(limit_error_message(error_message.clone())),
                     },
                 );
                 // No retries left: park the job and raise an incident so the
@@ -2808,6 +2809,7 @@ impl Engine {
                         instance_key,
                         error_code: error_code.clone(),
                         worker,
+                        error_message: Some(limit_error_message(error_message.clone())),
                     },
                 );
 
@@ -13225,6 +13227,30 @@ mod tests;
 /// The spec's `BusinessId` maximum length (`spec/identifiers.yaml`,
 /// `maxLength: 256`), counted in characters as JSON Schema does.
 pub const BUSINESS_ID_MAX_CHARS: usize = 256;
+
+/// Longest job error message (in characters) the engine records, matching
+/// Zeebe's `EngineConfiguration.DEFAULT_MAX_ERROR_MESSAGE_SIZE` (#1327).
+pub const MAX_ERROR_MESSAGE_LEN: usize = 10_000;
+
+/// Limits a worker-reported job error message like Zeebe's
+/// `StringUtil.limitString(msg, DEFAULT_MAX_ERROR_MESSAGE_SIZE)`: a message
+/// longer than [`MAX_ERROR_MESSAGE_LEN`] **UTF-16 code units** (Java
+/// `String.length()`) keeps its first that-many units followed by `"..."`. Unlike
+/// Java's `substring`, it never splits a surrogate pair: an astral character
+/// that would straddle the bound is dropped whole.
+pub fn limit_error_message(message: String) -> String {
+    let mut units = 0usize;
+    for (idx, ch) in message.char_indices() {
+        units += ch.len_utf16();
+        if units > MAX_ERROR_MESSAGE_LEN {
+            let mut limited = message;
+            limited.truncate(idx);
+            limited.push_str("...");
+            return limited;
+        }
+    }
+    message
+}
 
 /// The single business-id range check (1..=[`BUSINESS_ID_MAX_CHARS`]
 /// characters) applied to every command that carries one. `None` is valid.
