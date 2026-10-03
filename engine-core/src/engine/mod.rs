@@ -2747,6 +2747,7 @@ impl Engine {
                         instance_key,
                         retries,
                         worker,
+                        error_message: Some(limit_error_message(error_message.clone())),
                     },
                 );
                 // No retries left: park the job and raise an incident so the
@@ -2808,6 +2809,7 @@ impl Engine {
                         instance_key,
                         error_code: error_code.clone(),
                         worker,
+                        error_message: Some(limit_error_message(error_message.clone())),
                     },
                 );
 
@@ -13225,6 +13227,27 @@ mod tests;
 /// The spec's `BusinessId` maximum length (`spec/identifiers.yaml`,
 /// `maxLength: 256`), counted in characters as JSON Schema does.
 pub const BUSINESS_ID_MAX_CHARS: usize = 256;
+
+/// Longest job error message (in characters) the engine records, matching
+/// Zeebe's `EngineConfiguration.DEFAULT_MAX_ERROR_MESSAGE_SIZE` (#1327).
+pub const MAX_ERROR_MESSAGE_LEN: usize = 10_000;
+
+/// Limits a worker-reported job error message exactly like Zeebe's
+/// `StringUtil.limitString(msg, DEFAULT_MAX_ERROR_MESSAGE_SIZE)`: a message
+/// longer than [`MAX_ERROR_MESSAGE_LEN`] keeps its first that-many characters
+/// followed by `"..."`. Counts Unicode scalar values (Zeebe counts UTF-16 units;
+/// the two agree for BMP text) and never splits a character.
+pub fn limit_error_message(message: String) -> String {
+    match message.char_indices().nth(MAX_ERROR_MESSAGE_LEN) {
+        Some((cut, _)) => {
+            let mut limited = message;
+            limited.truncate(cut);
+            limited.push_str("...");
+            limited
+        }
+        None => message,
+    }
+}
 
 /// The single business-id range check (1..=[`BUSINESS_ID_MAX_CHARS`]
 /// characters) applied to every command that carries one. `None` is valid.

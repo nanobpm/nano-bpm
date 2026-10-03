@@ -2873,3 +2873,71 @@ fn business_ids_outside_the_spec_range_are_rejected_on_every_command() {
         .unwrap_err();
     assert_eq!(err, too_long);
 }
+
+fn activated_payment_job(engine: &mut Engine) -> Key {
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    engine.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key
+}
+
+#[test]
+fn fail_job_with_retries_left_records_the_error_message_on_the_event() {
+    // #1327 — Zeebe's JobFailProcessor stores the worker's errorMessage on the job
+    // on EVERY fail, retries left or not; the engine used to drop it unless the
+    // fail raised an incident, so nothing durable ever carried it.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command(Command::fail_job(job_key, 2, "connection refused"))
+        .unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            e,
+            Event::JobFailed { retries: 2, error_message: Some(m), .. } if m == "connection refused"
+        )),
+        "JobFailed must carry the error message: {log:?}"
+    );
+}
+
+#[test]
+fn throw_job_error_records_the_error_message_on_the_event() {
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let log = engine
+        .apply_command(Command::throw_job_error(job_key, "E42", "card declined"))
+        .unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            e,
+            Event::JobErrorThrown { error_code, error_message: Some(m), .. }
+                if error_code == "E42" && m == "card declined"
+        )),
+        "JobErrorThrown must carry the error message: {log:?}"
+    );
+}
+
+#[test]
+fn job_error_messages_are_limited_like_zeebe() {
+    // Zeebe: StringUtil.limitString(msg, DEFAULT_MAX_ERROR_MESSAGE_SIZE = 10000)
+    // keeps the first 10000 characters and appends "...".
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    let long = "é".repeat(MAX_ERROR_MESSAGE_LEN + 5);
+    let log = engine
+        .apply_command(Command::fail_job(job_key, 1, long))
+        .unwrap();
+    let msg = log
+        .iter()
+        .find_map(|e| match e {
+            Event::JobFailed { error_message, .. } => error_message.clone(),
+            _ => None,
+        })
+        .expect("JobFailed with a message");
+    assert_eq!(msg.chars().count(), MAX_ERROR_MESSAGE_LEN + 3);
+    assert!(msg.ends_with("é..."));
+    assert_eq!(limit_error_message("short".into()), "short");
+}

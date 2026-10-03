@@ -286,6 +286,32 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
         })
         .expect("instance A job was activated");
     journal.extend(activated_a);
+    // A transient failure with retries left, then a re-activation: pins the
+    // `JobFailed` frame (incl. its additive `worker` / `error_message` fields,
+    // #959 / #1327) — previously absent from the corpus, so a field added to it
+    // slipped past this guard.
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::fail_job(job_a, 2, "transient: upstream 503"),
+                T0 + 2,
+            )
+            .expect("fail job A"),
+    );
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::activate_jobs_by_key(
+                    engine.select_activatable_job_keys("payment", 1, T0 + 2, false),
+                    "worker-1",
+                    30_000,
+                    T0 + 2,
+                    Default::default(),
+                ),
+                T0 + 2,
+            )
+            .expect("re-activate job A"),
+    );
     let mut result_a = HashMap::new();
     result_a.insert("approved".to_string(), Value::Bool(true));
     // The completion assigns a Camunda 8.10 business id to root instance A,

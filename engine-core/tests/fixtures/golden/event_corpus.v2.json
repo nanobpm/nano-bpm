@@ -609,6 +609,25 @@
     }
   },
   {
+    "JobFailed": {
+      "error_message": "transient: upstream 503",
+      "instance_key": 7,
+      "job_key": 10,
+      "retries": 2,
+      "worker": "worker-1"
+    }
+  },
+  {
+    "JobActivated": {
+      "activated_at": 1700000000002,
+      "deadline": 1700000030002,
+      "durable": true,
+      "instance_key": 7,
+      "job_key": 10,
+      "worker": "worker-1"
+    }
+  },
+  {
     "ProcessInstanceBusinessIdAssigned": {
       "business_id": "order-A",
       "instance_key": 7

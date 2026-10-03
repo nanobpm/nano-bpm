@@ -771,7 +771,7 @@
         "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
-        "retries": 3,
+        "retries": 2,
         "state": "Completed",
         "worker": null
       },

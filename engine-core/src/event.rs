@@ -471,6 +471,13 @@ pub enum Event {
         /// before this field existed, and when the job had no activating worker.
         #[cfg_attr(feature = "serde", serde(default))]
         worker: Option<String>,
+        /// The worker-reported failure message, limited like Zeebe's
+        /// `JobFailProcessor` (see [`crate::limit_error_message`]).
+        /// Recorded on *every* fail, retries left or not, so the job's last
+        /// failure reason is queryable (Zeebe job `errorMessage`, #1327). `None`
+        /// for events serialized before this field existed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        error_message: Option<String>,
     },
     /// A worker threw a business error from a job. The job is consumed; either a
     /// matching error boundary event interrupts the activity, or an
@@ -487,6 +494,11 @@ pub enum Event {
         /// no activating worker.
         #[cfg_attr(feature = "serde", serde(default))]
         worker: Option<String>,
+        /// The worker-reported error message, limited like Zeebe's
+        /// `JobThrowErrorProcessor` (Zeebe job `errorMessage`, #1327). `None` for
+        /// events serialized before this field existed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        error_message: Option<String>,
     },
     /// A job was completed. `created_at` is the logical instant the job was
     /// created (carried through from job state) so the server can observe the
