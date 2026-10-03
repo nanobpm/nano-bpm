@@ -2972,8 +2972,7 @@ fn job_error_metadata_is_retained_on_engine_state_for_snapshot_recovery() {
     assert!(job.has_failed_with_retries_left);
     assert!(job.error_code.is_none());
 
-    // A legacy (pre-field) fail keeps the last known message; the terminal fail
-    // overwrites it and clears the flag.
+    // A terminal fail overwrites the message and clears the flag.
     engine
         .apply_command(Command::fail_job(job_key, 0, "gave up"))
         .unwrap();
@@ -2994,4 +2993,82 @@ fn job_error_metadata_is_retained_on_engine_state_for_snapshot_recovery() {
     // The payment job was activated with its default retries (> 0) and a thrown
     // error does not change them, so the flag is set.
     assert!(job.has_failed_with_retries_left);
+}
+
+#[test]
+fn legacy_pre_field_fail_and_throw_keep_the_last_known_error_message() {
+    // #1328 review — events serialized before `error_message` existed decode with
+    // `error_message: None` (serde default). The reducer must then KEEP the job's
+    // last known message rather than overwrite it with `None` (mirrors the read
+    // model's `COALESCE`). The command API always carries a message, so drive the
+    // `None` branch by replaying a full journal that ends in a legacy-shaped event.
+    //
+    // JobFailed: a message-bearing fail followed by a legacy (None) terminal fail
+    // retains the first message.
+    let mut seed = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        seed.apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    journal.extend(
+        seed.apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = seed.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let instance_key = seed.state().jobs[&job_key].instance_key;
+    journal.extend(
+        seed.apply_command(Command::fail_job(job_key, 2, "connection refused"))
+            .unwrap(),
+    );
+    // A legacy terminal fail: no message field, no worker field.
+    journal.push(Event::JobFailed {
+        job_key,
+        instance_key,
+        retries: 0,
+        worker: None,
+        error_message: None,
+    });
+    let engine = Engine::replay(journal);
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(
+        job.error_message.as_deref(),
+        Some("connection refused"),
+        "a legacy (None-message) JobFailed must not erase the last known message"
+    );
+    assert!(!job.has_failed_with_retries_left);
+
+    // JobErrorThrown: a message-bearing throw followed by a legacy (None) throw
+    // retains the first message (and still records the new code).
+    let mut seed = Engine::new();
+    let mut journal = Vec::new();
+    journal.extend(
+        seed.apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap(),
+    );
+    journal.extend(
+        seed.apply_command(Command::create_instance("order"))
+            .unwrap(),
+    );
+    let job_key = seed.activate_jobs("payment", "w1", 10, 60_000, 0)[0].key;
+    let instance_key = seed.state().jobs[&job_key].instance_key;
+    journal.extend(
+        seed.apply_command(Command::throw_job_error(job_key, "E42", "card declined"))
+            .unwrap(),
+    );
+    journal.push(Event::JobErrorThrown {
+        job_key,
+        instance_key,
+        error_code: "E42".to_string(),
+        worker: None,
+        error_message: None,
+    });
+    let engine = Engine::replay(journal);
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(
+        job.error_message.as_deref(),
+        Some("card declined"),
+        "a legacy (None-message) JobErrorThrown must not erase the last known message"
+    );
+    assert_eq!(job.error_code.as_deref(), Some("E42"));
 }
