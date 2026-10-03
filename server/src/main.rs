@@ -37099,6 +37099,52 @@ mod clustered_startup_tests {
                 .all(|j| j.job_key.0 != job_key.to_string()),
             "hasFailedWithRetriesLeft=false excludes the failed job"
         );
+
+        // A thrown (uncaught) business error lands its errorCode + message on
+        // the job, and errorCode is filterable.
+        server
+            .activate_for_stream("demo-work", "worker-f", 10, 60_000, None)
+            .await;
+        let mut thrown = models::JobErrorRequest::new("E42".into());
+        thrown.error_message = Some(types::Nullable::Present("card declined".into()));
+        let threw = server
+            .throw_job_error_impl(
+                &models::ThrowJobErrorPathParams {
+                    job_key: job_key.to_string(),
+                },
+                &thrown,
+            )
+            .await
+            .expect("throw runs");
+        assert!(matches!(
+            threw,
+            apis::job::ThrowJobErrorResponse::Status204_AnErrorIsThrownForTheJob
+        ));
+        let mut by_code = models::JobFilter::new();
+        by_code.error_code = Some(models::StringFilterProperty::String("E42".into()));
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            items = search(by_code.clone()).await;
+            if !items.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(items.len(), 1, "the errored job matches its errorCode");
+        assert_eq!(
+            items[0].error_code,
+            types::Nullable::Present("E42".to_string())
+        );
+        assert_eq!(
+            items[0].error_message,
+            types::Nullable::Present("card declined".to_string())
+        );
+        let mut other_code = models::JobFilter::new();
+        other_code.error_code = Some(models::StringFilterProperty::String("E43".into()));
+        assert!(
+            search(other_code).await.is_empty(),
+            "a different errorCode matches nothing"
+        );
     }
 
     #[tokio::test]

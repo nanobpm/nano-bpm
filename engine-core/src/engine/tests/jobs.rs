@@ -2940,4 +2940,17 @@ fn job_error_messages_are_limited_like_zeebe() {
     assert_eq!(msg.chars().count(), MAX_ERROR_MESSAGE_LEN + 3);
     assert!(msg.ends_with("é..."));
     assert_eq!(limit_error_message("short".into()), "short");
+
+    // Java counts UTF-16 code units: an astral character (emoji) is two units,
+    // so 5001 of them (10002 units) exceed the limit. Zeebe's substring would
+    // split the 5001st pair; we never split a character, so it is dropped.
+    let astral = "😀".repeat(MAX_ERROR_MESSAGE_LEN / 2 + 1);
+    let limited = limit_error_message(astral);
+    assert_eq!(
+        limited,
+        format!("{}...", "😀".repeat(MAX_ERROR_MESSAGE_LEN / 2))
+    );
+    // Exactly at the bound is untouched.
+    let at_bound = "😀".repeat(MAX_ERROR_MESSAGE_LEN / 2);
+    assert_eq!(limit_error_message(at_bound.clone()), at_bound);
 }

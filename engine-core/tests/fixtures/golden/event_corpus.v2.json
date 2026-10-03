@@ -1988,5 +1988,114 @@
       "failure": null,
       "instance_key": 0
     }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000015,
+      "instance_key": 48,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 49,
+      "instance_key": 48
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 49,
+      "instance_key": 48,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 49,
+      "instance_key": 48
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 49,
+      "instance_key": 48
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 48,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 50,
+      "instance_key": 48
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 50,
+      "instance_key": 48,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000015,
+      "element_id": "charge",
+      "element_instance_key": 50,
+      "instance_key": 48,
+      "job_key": 51,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "JobActivated": {
+      "activated_at": 1700000000016,
+      "deadline": 1700000030016,
+      "durable": true,
+      "instance_key": 48,
+      "job_key": 51,
+      "worker": "worker-3"
+    }
+  },
+  {
+    "JobErrorThrown": {
+      "error_code": "CARD_DECLINED",
+      "error_message": "card declined",
+      "instance_key": 48,
+      "job_key": 51,
+      "worker": "worker-3"
+    }
+  },
+  {
+    "IncidentRaised": {
+      "created_at": 1700000000017,
+      "element_id": "charge",
+      "element_instance_key": 50,
+      "incident_key": 52,
+      "instance_key": 48,
+      "job_key": null,
+      "kind": "UnhandledError",
+      "reason": "unhandled BPMN error 'CARD_DECLINED': card declined",
+      "redrive": null
+    }
   }
 ]

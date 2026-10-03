@@ -1,6 +1,6 @@
 {
-  "next_local": 47,
-  "now": 1700000000014,
+  "next_local": 52,
+  "now": 1700000000017,
   "num_partitions": 1,
   "partition_id": 0,
   "start_dispatch_rr": 0,
@@ -24,7 +24,7 @@
     "created_by_process": {
       "decide": 2,
       "dup": 1,
-      "order": 2,
+      "order": 3,
       "sync": 1
     },
     "decision_requirements": {
@@ -549,11 +549,25 @@
         "redrive": null,
         "resolved_at": null,
         "state": "Active"
+      },
+      "52": {
+        "created_at": 1700000000017,
+        "element_id": "charge",
+        "element_instance_key": 50,
+        "instance_key": 48,
+        "job_key": null,
+        "key": 52,
+        "kind": "UnhandledError",
+        "operation_reference": null,
+        "reason": "unhandled BPMN error 'CARD_DECLINED': card declined",
+        "redrive": null,
+        "resolved_at": null,
+        "state": "Active"
       }
     },
     "inflight_by_process": {
       "decide": 1,
-      "order": 1,
+      "order": 2,
       "sync": 1
     },
     "instances": {
@@ -726,6 +740,38 @@
         },
         "variables_spilled": false
       },
+      "48": {
+        "active": {
+          "50": "charge"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000015,
+        "incidents": [
+          52
+        ],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 48,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
       "7": {
         "active": {},
         "adhoc_instances": {},
@@ -810,6 +856,25 @@
         "retries": 3,
         "state": "Created",
         "worker": null
+      },
+      "51": {
+        "activated": true,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000015,
+        "deadline": null,
+        "durable_activation": true,
+        "element_id": "charge",
+        "element_instance_key": 50,
+        "instance_key": 48,
+        "job_type": "payment",
+        "key": 51,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Errored",
+        "worker": "worker-3"
       }
     },
     "jobs_by_instance": {
@@ -818,6 +883,9 @@
       ],
       "25": [
         29
+      ],
+      "48": [
+        51
       ],
       "7": [
         10
