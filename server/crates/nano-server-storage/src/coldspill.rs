@@ -318,6 +318,9 @@ mod tests {
             priority: nanobpmn_engine_core::DEFAULT_JOB_PRIORITY,
             created_at: 0,
             kind: nanobpmn_engine_core::JobKind::BpmnElement,
+            error_message: None,
+            error_code: None,
+            has_failed_with_retries_left: false,
         }
     }
 

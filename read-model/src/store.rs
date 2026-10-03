@@ -3952,11 +3952,15 @@ fn project_engine_state(
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-             job_kind, listener_event_type, lease_token, business_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
+             job_kind, listener_event_type, lease_token, error_message, error_code, \
+             has_failed_with_retries_left, business_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
              (SELECT business_id FROM process_instances WHERE key = ?2)) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-             worker = excluded.worker, deadline_ms = excluded.deadline_ms, lease_token = excluded.lease_token",
+             worker = excluded.worker, deadline_ms = excluded.deadline_ms, \
+             lease_token = excluded.lease_token, error_message = excluded.error_message, \
+             error_code = excluded.error_code, \
+             has_failed_with_retries_left = excluded.has_failed_with_retries_left",
             params![
                 job.key as i64,
                 job.instance_key as i64,
@@ -3979,6 +3983,12 @@ fn project_engine_state(
                 kind_code,
                 event_code,
                 job.lease_token,
+                // Zeebe job error metadata (#1327). Retained in engine state so a
+                // compaction-floor rebuild re-seeds them here instead of losing
+                // them to the compacted `JobFailed`/`JobErrorThrown` events.
+                job.error_message,
+                job.error_code,
+                i64::from(job.has_failed_with_retries_left),
             ],
         )?;
     }
@@ -10068,6 +10078,9 @@ mod element_instance_tests {
                 priority: 0,
                 created_at: 1,
                 kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
             },
         );
 
@@ -10098,6 +10111,85 @@ mod element_instance_tests {
         let completed = &jobs[&9401];
         assert_eq!(completed.state, JobState::Completed);
         assert_eq!(completed.worker, None);
+    }
+
+    #[test]
+    fn a_compaction_floor_rebuild_preserves_job_error_message_code_and_retries_left_flag() {
+        use nanobpmn_engine_core::{Job, JobKind, State};
+
+        // #1327 / #1328 review — below-compaction-floor recovery re-seeds job rows
+        // from the engine snapshot via `project_engine_state`, NOT from the (now
+        // compacted) `JobFailed`/`JobErrorThrown` events. The engine retains the
+        // last error message/code and the retries-left flag on `Job`, so the
+        // seeding binding must carry them through; otherwise a reset/corrupt read
+        // model comes back with NULL/false even for failures written by this
+        // version. Covers all three fields across a failed-with-retries job, a
+        // terminally-failed job, and a thrown-error job.
+        let base_job = |key, state| Job {
+            key,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            state,
+            worker: None,
+            deadline: None,
+            activated_at: None,
+            activation_timeout: None,
+            lease_token: None,
+            durable_activation: false,
+            activated: true,
+            retries: 0,
+            priority: 0,
+            created_at: 1,
+            kind: JobKind::BpmnElement,
+            error_message: None,
+            error_code: None,
+            has_failed_with_retries_left: false,
+        };
+        let mut state = State::default();
+        // Failed with retries left.
+        state.jobs.insert(9601, {
+            let mut j = base_job(9601, JobState::Created);
+            j.retries = 2;
+            j.error_message = Some("upstream 503".to_string());
+            j.has_failed_with_retries_left = true;
+            j
+        });
+        // Terminally failed (retries exhausted).
+        state.jobs.insert(9602, {
+            let mut j = base_job(9602, JobState::Failed);
+            j.error_message = Some("gave up".to_string());
+            j
+        });
+        // Thrown error (code + message, retries left → flag set).
+        state.jobs.insert(9603, {
+            let mut j = base_job(9603, JobState::Errored);
+            j.retries = 1;
+            j.error_code = Some("E42".to_string());
+            j.error_message = Some("card declined".to_string());
+            j.has_failed_with_retries_left = true;
+            j
+        });
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        let seeded: HashMap<Key, super::JobRow> =
+            store.jobs().into_iter().map(|j| (j.key, j)).collect();
+
+        assert_eq!(seeded[&9601].error_message.as_deref(), Some("upstream 503"));
+        assert!(seeded[&9601].has_failed_with_retries_left);
+        assert!(seeded[&9601].error_code.is_none());
+
+        assert_eq!(seeded[&9602].error_message.as_deref(), Some("gave up"));
+        assert!(!seeded[&9602].has_failed_with_retries_left);
+
+        assert_eq!(seeded[&9603].error_code.as_deref(), Some("E42"));
+        assert_eq!(
+            seeded[&9603].error_message.as_deref(),
+            Some("card declined")
+        );
+        assert!(seeded[&9603].has_failed_with_retries_left);
     }
 
     #[test]

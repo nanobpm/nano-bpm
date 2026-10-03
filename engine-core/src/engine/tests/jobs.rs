@@ -2954,3 +2954,44 @@ fn job_error_messages_are_limited_like_zeebe() {
     let at_bound = "😀".repeat(MAX_ERROR_MESSAGE_LEN / 2);
     assert_eq!(limit_error_message(at_bound.clone()), at_bound);
 }
+
+#[test]
+fn job_error_metadata_is_retained_on_engine_state_for_snapshot_recovery() {
+    // #1328 review — the read model's below-compaction-floor recovery re-seeds job
+    // rows from the engine snapshot, not the (compacted) events. So the engine's
+    // `Job` must retain the last error message/code and the retries-left flag;
+    // otherwise those Zeebe-parity fields come back NULL/false after a rebuild.
+    // A fail with retries left retains the message and sets the flag.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::fail_job(job_key, 2, "connection refused"))
+        .unwrap();
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(job.error_message.as_deref(), Some("connection refused"));
+    assert!(job.has_failed_with_retries_left);
+    assert!(job.error_code.is_none());
+
+    // A legacy (pre-field) fail keeps the last known message; the terminal fail
+    // overwrites it and clears the flag.
+    engine
+        .apply_command(Command::fail_job(job_key, 0, "gave up"))
+        .unwrap();
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(job.error_message.as_deref(), Some("gave up"));
+    assert!(!job.has_failed_with_retries_left);
+
+    // A thrown error records its code and message; the flag follows the record's
+    // (unchanged) retries, matching the exporter's `jobFailedWithRetriesLeft`.
+    let mut engine = Engine::new();
+    let job_key = activated_payment_job(&mut engine);
+    engine
+        .apply_command(Command::throw_job_error(job_key, "E42", "card declined"))
+        .unwrap();
+    let job = &engine.state().jobs[&job_key];
+    assert_eq!(job.error_code.as_deref(), Some("E42"));
+    assert_eq!(job.error_message.as_deref(), Some("card declined"));
+    // The payment job was activated with its default retries (> 0) and a thrown
+    // error does not change them, so the flag is set.
+    assert!(job.has_failed_with_retries_left);
+}

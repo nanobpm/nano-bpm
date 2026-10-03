@@ -335,6 +335,29 @@ pub struct Job {
     /// execution listeners existed, so ordinary jobs are unaffected.
     #[cfg_attr(feature = "serde", serde(default))]
     pub kind: JobKind,
+    /// The last worker-reported failure/thrown-error message (Zeebe job
+    /// `errorMessage`, #1327), limited by [`crate::limit_error_message`]. Retained
+    /// on the job so it survives a compaction-floor read-model rebuild, which
+    /// re-seeds the row from engine state rather than the (compacted) events.
+    /// `None` until the first `JobFailed`/`JobErrorThrown`, and for records
+    /// serialized before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub error_message: Option<String>,
+    /// The last thrown error code (Zeebe job `errorCode`, #1327), from
+    /// `JobErrorThrown`. Retained for the same compaction-floor-rebuild reason as
+    /// [`Job::error_message`]. `None` until the first thrown error, and for
+    /// pre-field records.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub error_code: Option<String>,
+    /// Whether the last `JobFailed`/`JobErrorThrown` left the job with retries > 0
+    /// (Zeebe exporter `jobFailedWithRetriesLeft`, #1327). Retained for the same
+    /// rebuild-durability reason. `false` until the first fail/thrown error, and
+    /// for pre-field records.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "std::ops::Not::not")
+    )]
+    pub has_failed_with_retries_left: bool,
 }
 
 impl Job {
@@ -1719,6 +1742,9 @@ mod job_attribution_worker_tests {
             priority: 0,
             created_at: 1,
             kind: JobKind::BpmnElement,
+            error_message: None,
+            error_code: None,
+            has_failed_with_retries_left: false,
         }
     }
 
