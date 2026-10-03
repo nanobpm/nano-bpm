@@ -196,6 +196,31 @@ returns, routed to fail-closed #1066 / the migrator #1071). Regression coverage:
 the `read_segment_events*` rejection tests in
 `server/crates/nano-server-storage/src/seglog.rs`.
 
+## Full-workspace builds with the `console` feature need `console/dist`
+
+`console/dist/` is a **CI-built, gitignored artifact** (the built frontend the
+gateway embeds via `rust_embed`), so it is **absent in a fresh clone/scratch
+env**. Any `cargo clippy`/`cargo test`/`cargo build` that pulls the **`console`**
+feature (e.g. a full-workspace `cargo clippy --workspace --features …/console`)
+then aborts in the `rust_embed` derive with the cryptic error:
+
+```
+no associated function `get` found for struct `Assets`
+```
+
+This is a missing-artifact failure, **not** a code error — don't chase it in
+`nano-server-console`. Before any such build, either build the frontend
+(`cd console && npm install && npm run build`, see
+[DEVELOPMENT.md](DEVELOPMENT.md#building-the-web-console)) or, when you only need
+clippy/tests to compile, drop a one-line stub:
+
+```bash
+mkdir -p console/dist && echo stub > console/dist/index.html
+```
+
+CI does this implicitly (its console jobs build the real bundle); the trap is
+local/scratch full-workspace runs. (Hit repeatedly across epic #1224.)
+
 ## Claim Your Task Before You Start
 
 Work here runs in **parallel worktrees across several agents** — an epic routinely
