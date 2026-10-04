@@ -37,6 +37,11 @@ use crate::seglog::{ActiveSegment, SegShared};
 use crate::varspill::VarSpillStore;
 use crate::varstore::VarStore;
 
+/// A variable-upsert delta: each changed instance's current variable map as a
+/// cheap `Arc` clone (the deep read happens off the engine thread when the host
+/// serializes it into the durable var store).
+type VarUpsertDelta = Vec<(Key, Arc<HashMap<String, Value>>)>;
+
 /// The result of a lean-snapshot checkpoint (see
 /// [`Journal::snapshot_and_rotate_lean`]): the control-only snapshot, the event
 /// count it covers, the changed instances' current variable maps to upsert into
@@ -45,7 +50,7 @@ use crate::varstore::VarStore;
 type LeanCheckpoint = (
     nanobpmn_engine_core::EngineSnapshot,
     u64,
-    Vec<(Key, Arc<HashMap<String, Value>>)>,
+    VarUpsertDelta,
     Vec<Key>,
 );
 
@@ -2293,20 +2298,11 @@ impl Journal {
     /// found is logged as an error and left as-is rather than silently
     /// serialized as an empty map.
     fn fold_offheap_into(&self, snap: &mut nanobpmn_engine_core::EngineSnapshot) {
-        if let Some(cold) = self.cold.as_ref() {
-            for key in cold.index.keys() {
-                match cold.store.get_cold(key) {
-                    Some(instance) => {
-                        nanobpmn_engine_core::restore_instance_snapshot(&mut snap.state, instance)
-                    }
-                    None => tracing::error!(
-                        instance_key = key,
-                        "snapshot: cold instance has no row in the spill store; \
-                         it cannot be included in the snapshot"
-                    ),
-                }
-            }
-        }
+        // Cold rows carry their variables inline (a variable-spilled instance is
+        // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
+        // fold keeps them as-is; the loop below only resolves *resident*
+        // variable-spilled instances.
+        let _ = self.fold_cold_into(&mut snap.state);
         for instance in snap.state.instances.values_mut() {
             if !instance.variables_spilled {
                 continue;
@@ -2323,6 +2319,44 @@ impl Journal {
                 ),
             }
         }
+    }
+
+    /// Folds every cold (wholly off-heap) instance's control state back into
+    /// `state` as a resident instance, returning each folded instance's
+    /// `(key, variables)`.
+    ///
+    /// Shared by the classic snapshot ([`fold_offheap_into`](Journal::fold_offheap_into))
+    /// and the lean checkpoint ([`snapshot_and_rotate_lean`](Journal::snapshot_and_rotate_lean)):
+    /// cold spill removes a *whole* instance from engine state and is configured
+    /// independently of lean mode, and nothing rebuilds the cold table at boot
+    /// (the in-RAM index is populated only by in-process shedding), so **every**
+    /// snapshot path must fold cold instances back in or they silently vanish on
+    /// the next restart — the #1331 cold-tier defect. A cold row that cannot be
+    /// read is logged and skipped rather than dropped silently. A cold row always
+    /// carries its variables inline (a variable-spilled instance is never
+    /// cold-shed — [`Engine::snapshot_instance`] refuses it), so the returned
+    /// payloads are authoritative.
+    fn fold_cold_into(&self, state: &mut nanobpmn_engine_core::State) -> VarUpsertDelta {
+        let mut folded = Vec::new();
+        let Some(cold) = self.cold.as_ref() else {
+            return folded;
+        };
+        for key in cold.index.keys() {
+            match cold.store.get_cold(key) {
+                Some(instance) => {
+                    nanobpmn_engine_core::restore_instance_snapshot(state, instance);
+                    if let Some(inst) = state.instances.get(&key) {
+                        folded.push((key, Arc::clone(&inst.variables)));
+                    }
+                }
+                None => tracing::error!(
+                    instance_key = key,
+                    "snapshot: cold instance has no row in the spill store; \
+                     it cannot be included in the snapshot"
+                ),
+            }
+        }
+        folded
     }
 
     /// Reads a spilled instance's variables without consuming them: from the
@@ -2399,12 +2433,21 @@ impl Journal {
     /// `(lean_snapshot, covered_events, upserts, forgets)`, or `None` if not
     /// segmented / the writer is gone. Only meaningful when a var store is wired
     /// ([`set_varstore`](Journal::set_varstore)); the drain is empty otherwise.
+    ///
+    /// Cold (wholly off-heap) instances are folded back in too: cold spill is
+    /// configured independently of lean mode, so a cold instance is absent from
+    /// both the control-only snapshot and the var store's working set, and would
+    /// silently vanish on restart (the #1331 cold-tier defect). Its control state
+    /// goes into the snapshot and its variables are routed through the upsert
+    /// delta — keeping the snapshot variable-free while the var store stays the
+    /// authoritative, consistent source for variables (no recovery rewind).
     pub fn snapshot_and_rotate_lean(&mut self) -> Option<LeanCheckpoint> {
         self.seg.as_ref()?;
         // Drain BEFORE the snapshot/seal so the delta reflects exactly the state
         // the control-only snapshot captures.
-        let (upserts, forgets) = self.engine.drain_dirty_vars();
-        let snap = self.engine.snapshot_control_only();
+        let (mut upserts, forgets) = self.engine.drain_dirty_vars();
+        let (snap, cold_upserts) = self.lean_snapshot_and_cold_upserts();
+        upserts.extend(cold_upserts);
         let writer = self.writer.as_ref()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
@@ -2417,6 +2460,28 @@ impl Journal {
             .copied()
             .unwrap_or(info.end);
         Some((snap, covered, upserts, forgets))
+    }
+
+    /// Builds the lean control-only snapshot together with the cold-instance
+    /// variable upserts that must accompany it (see
+    /// [`snapshot_and_rotate_lean`](Journal::snapshot_and_rotate_lean)). Folds
+    /// each cold instance's control state into the snapshot and empties its
+    /// variables there, returning those variables as upserts so the var store —
+    /// authoritative in lean mode — is written in lockstep with the snapshot that
+    /// omits them. Factored out so it is unit-testable without a segmented writer.
+    fn lean_snapshot_and_cold_upserts(
+        &self,
+    ) -> (nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta) {
+        let mut snap = self.engine.snapshot_control_only();
+        let cold_upserts = self.fold_cold_into(&mut snap.state);
+        for (key, _) in &cold_upserts {
+            if let Some(inst) = snap.state.instances.get_mut(key)
+                && !inst.variables.is_empty()
+            {
+                inst.variables = Arc::new(HashMap::new());
+            }
+        }
+        (snap, cold_upserts)
     }
 
     pub fn instance(&self, key: Key) -> Option<&ProcessInstance> {
@@ -3266,5 +3331,91 @@ mod tests {
         }
 
         assert_eq!(view(&spilled.engine_snapshot()), expected);
+    }
+
+    // #1331 (lean path): a cold-spilled (wholly off-heap) instance must survive a
+    // restart from a LEAN checkpoint too. Lean mode and cold spill are configured
+    // independently, so they co-occur; `snapshot_control_only` omits the cold
+    // instance and nothing rebuilds the cold table at boot, so without folding it
+    // into the lean checkpoint it silently vanishes. The fold routes its control
+    // state into the snapshot and its variables through the var-store delta.
+    #[test]
+    fn lean_checkpoint_includes_cold_spilled_instances() {
+        use nanobpmn_engine_core::Value;
+
+        let mut journal = Journal::in_memory();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).unwrap());
+        let cold_store = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+        journal.set_varstore(Arc::clone(&varstore));
+        journal.set_cold_spill(cold_store, 1, 0);
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("cold-payload".to_string()));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("demo", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Shed the whole instance to the cold tier.
+        assert!(
+            journal.force_cold_spill_all() >= 1,
+            "precondition: went cold"
+        );
+        assert!(journal.instance(key).is_none(), "precondition: off-heap");
+        assert_eq!(journal.cold_count(), 1);
+
+        // Cut a lean checkpoint: the cold instance's CONTROL state lands in the
+        // snapshot (variable-free), its variables in the upsert delta.
+        let (snap, cold_upserts) = journal.lean_snapshot_and_cold_upserts();
+        let inst = snap
+            .state
+            .instances
+            .get(&key)
+            .expect("cold instance folded into the lean snapshot");
+        assert!(
+            inst.variables.is_empty(),
+            "lean snapshot stays variable-free"
+        );
+        assert!(
+            snap.state.jobs.values().any(|j| j.instance_key == key),
+            "its jobs are folded in too"
+        );
+        let folded_vars = cold_upserts
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| Arc::clone(v))
+            .expect("cold instance variables routed through the upsert delta");
+        assert_eq!(
+            folded_vars.get("data"),
+            Some(&Value::Str("cold-payload".to_string()))
+        );
+
+        // Persist the delta to the authoritative store (as the checkpoint loop
+        // does), then recover: from_snapshot + install_variables(store).
+        let ups: Vec<(Key, &HashMap<String, Value>)> =
+            cold_upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+        varstore.checkpoint(0, 1, &ups, &[]).unwrap();
+
+        let mut rebooted = Journal::in_memory();
+        rebooted.set_varstore(Arc::clone(&varstore));
+        rebooted.restore_engine_from_snapshot(snap);
+        if let Some(stored) = varstore.get(key) {
+            rebooted.engine.install_variables(key, stored);
+        }
+
+        assert!(
+            rebooted.instance(key).is_some(),
+            "cold instance recovered after a lean restart"
+        );
+        let activated = rebooted.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(activated.len(), 1, "recovered job activates");
+        assert_eq!(
+            activated[0].variables.get("data"),
+            Some(&Value::Str("cold-payload".to_string())),
+            "job activates with its variables — #1331 lean path"
+        );
     }
 }
