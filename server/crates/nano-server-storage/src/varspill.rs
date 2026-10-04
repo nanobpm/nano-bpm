@@ -694,16 +694,12 @@ mod tests {
         assert!(store.take(999).is_none(), "absent key is None");
     }
 
-    #[test]
-    fn cold_snapshot_round_trips() {
-        use std::sync::Arc;
-
+    fn cold_snapshot(key: Key, payload: &str) -> InstanceSnapshot {
         use nanobpmn_engine_core::{ProcessInstance, ProcessInstanceState};
 
-        let store = VarSpillStore::open(None).unwrap();
-        let snapshot = InstanceSnapshot {
+        InstanceSnapshot {
             instance: ProcessInstance {
-                key: 42,
+                key,
                 process_id: "order".to_string(),
                 process_definition_key: 0,
                 state: ProcessInstanceState::Active,
@@ -715,7 +711,7 @@ mod tests {
                 suspended_at: None,
                 active: HashMap::new(),
                 scopes: HashMap::new(),
-                variables: Arc::new(vars("payload")),
+                variables: Arc::new(vars(payload)),
                 join_counts: HashMap::new(),
                 join_flow_arrivals: HashMap::new(),
                 join_instances: HashMap::new(),
@@ -737,12 +733,61 @@ mod tests {
             conditional_subscriptions: Vec::new(),
             user_tasks: Vec::new(),
             incidents: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn cold_snapshot_round_trips() {
+        let store = VarSpillStore::open(None).unwrap();
+        let snapshot = cold_snapshot(42, "payload");
         store.put_cold(42, &snapshot).unwrap();
         let got = store.take_cold(42).expect("snapshot present");
         assert_eq!(got, snapshot);
         assert!(store.take_cold(42).is_none(), "take_cold is destructive");
         assert!(store.take_cold(7).is_none(), "absent key is None");
+    }
+
+    // #1331: the new cold-read contract — a cold row must survive a process
+    // restart (re-open) and repeated non-destructive `get_cold` calls, exactly as
+    // the variable-spill reopen test above covers `get`. Without this guard the
+    // file-backed cold tier has no proof a still-cold instance is recoverable
+    // after a reboot.
+    #[test]
+    fn cold_snapshot_survives_reopen_and_repeated_get_cold() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-cold-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let snapshot = cold_snapshot(9, "cold-payload");
+        {
+            let store = VarSpillStore::open(Some(&path)).unwrap();
+            store.put_cold(9, &snapshot).unwrap();
+        }
+        let store = VarSpillStore::open(Some(&path)).unwrap();
+        assert_eq!(
+            store.get_cold(9),
+            Some(snapshot.clone()),
+            "cold row survives re-open"
+        );
+        assert_eq!(
+            store.get_cold(9),
+            Some(snapshot.clone()),
+            "get_cold does not consume the row"
+        );
+        assert_eq!(
+            store.take_cold(9),
+            Some(snapshot),
+            "take_cold still returns it"
+        );
+        assert!(store.get_cold(9).is_none(), "take_cold consumed it");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

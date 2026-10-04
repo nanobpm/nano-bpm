@@ -228,4 +228,33 @@ mod tests {
             "file collapses to ~live after draining (live={live}, after={file_after})"
         );
     }
+
+    // The `mode == 2` early-return is the entire guard against rewriting a
+    // populated database on every reopen (#1331): once a store is INCREMENTAL,
+    // `enable_incremental_auto_vacuum` must NOT run `VACUUM` again. Prove it by
+    // calling the helper a second time *inside an open transaction* — SQLite
+    // rejects `VACUUM` within a transaction, so the second call succeeds only
+    // because it skips the VACUUM.
+    #[test]
+    fn enable_incremental_auto_vacuum_skips_vacuum_when_already_incremental() {
+        let conn = open_incremental();
+        // Sanity: the helper left the db in INCREMENTAL mode.
+        let mode: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "precondition: already INCREMENTAL");
+
+        // A direct VACUUM inside a transaction fails — the control proving the
+        // transaction really does reject it.
+        conn.execute_batch("BEGIN").unwrap();
+        assert!(
+            conn.execute_batch("VACUUM").is_err(),
+            "control: VACUUM is rejected inside a transaction"
+        );
+        // The helper must succeed here, which is only possible because it skipped
+        // the VACUUM (mode is already 2).
+        enable_incremental_auto_vacuum(&conn)
+            .expect("re-enabling on an already-incremental db must not VACUUM");
+        conn.execute_batch("ROLLBACK").unwrap();
+    }
 }

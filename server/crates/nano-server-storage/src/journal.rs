@@ -2323,20 +2323,46 @@ impl Journal {
     /// separately in #1337.
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         let mut snap = self.engine.snapshot();
-        self.fold_offheap_into(&mut snap);
+        // Best-effort: an unreadable/absent off-heap payload is logged and left
+        // as-is (see `fold_offheap_into`). This total form is for consumers that
+        // need a value regardless — the Raft snapshot builder
+        // (`get_snapshot_builder`), whose snapshot is a catch-up optimisation
+        // openraft can regenerate, never a compaction gate. The compaction-gating
+        // rotation paths use the fail-closed [`try_engine_snapshot`] instead.
+        let _ = self.fold_offheap_into(&mut snap);
         snap
     }
 
+    /// The fail-closed counterpart of [`engine_snapshot`](Journal::engine_snapshot):
+    /// `Some(snapshot)` only when **every** indexed off-heap payload (each cold
+    /// instance, each spilled variable map) folded in successfully, `None` if any
+    /// read failed or was absent. Snapshot rotation + compaction
+    /// ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)) gates on this: an
+    /// incomplete snapshot must never be sealed and written, or compacting the
+    /// covered journal prefix would permanently discard the state the fold could
+    /// not read (a transient SQLite/read/deserialization failure turned into
+    /// durable data loss). Returning `None` aborts the rotation before the seal,
+    /// so no segment becomes eligible for compaction and the next tick retries.
+    pub fn try_engine_snapshot(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        let mut snap = self.engine.snapshot();
+        self.fold_offheap_into(&mut snap)?;
+        Some(snap)
+    }
+
     /// Folds cold instances and spilled variable payloads into `snap` (see
-    /// [`engine_snapshot`](Journal::engine_snapshot)). A payload that cannot be
-    /// found is logged as an error and left as-is rather than silently
-    /// serialized as an empty map.
-    fn fold_offheap_into(&self, snap: &mut nanobpmn_engine_core::EngineSnapshot) {
+    /// [`engine_snapshot`](Journal::engine_snapshot)). Fail-closed: returns `None`
+    /// the moment any indexed payload cannot be folded in (a cold row that will
+    /// not read, or a spilled variable map with no row in the spill store), so a
+    /// caller that will go on to seal + compact can abort instead of persisting an
+    /// incomplete snapshot. The `engine_snapshot` wrapper ignores the `None` (a
+    /// payload that cannot be found is logged as an error and left as-is rather
+    /// than silently serialized as an empty map); `try_engine_snapshot` honours it.
+    fn fold_offheap_into(&self, snap: &mut nanobpmn_engine_core::EngineSnapshot) -> Option<()> {
         // Cold rows carry their variables inline (a variable-spilled instance is
         // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
         // fold keeps them as-is; the loop below only resolves *resident*
         // variable-spilled instances.
-        let _ = self.fold_cold_into(&mut snap.state);
+        self.fold_cold_into(&mut snap.state)?;
         for instance in snap.state.instances.values_mut() {
             if !instance.variables_spilled {
                 continue;
@@ -2346,13 +2372,17 @@ impl Journal {
                     instance.variables = Arc::new(vars);
                     instance.variables_spilled = false;
                 }
-                None => tracing::error!(
-                    instance_key = instance.key,
-                    "snapshot: spilled instance has no variable row in the spill store; \
-                     its variables are lost"
-                ),
+                None => {
+                    tracing::error!(
+                        instance_key = instance.key,
+                        "snapshot: spilled instance has no variable row in the spill store; \
+                         its variables are lost"
+                    );
+                    return None;
+                }
             }
         }
+        Some(())
     }
 
     /// Folds every cold (wholly off-heap) instance's control state back into
@@ -2365,15 +2395,20 @@ impl Journal {
     /// independently of lean mode, and nothing rebuilds the cold table at boot
     /// (the in-RAM index is populated only by in-process shedding), so **every**
     /// snapshot path must fold cold instances back in or they silently vanish on
-    /// the next restart — the #1331 cold-tier defect. A cold row that cannot be
-    /// read is logged and skipped rather than dropped silently. A cold row always
-    /// carries its variables inline (a variable-spilled instance is never
-    /// cold-shed — [`Engine::snapshot_instance`] refuses it), so the returned
-    /// payloads are authoritative.
-    fn fold_cold_into(&self, state: &mut nanobpmn_engine_core::State) -> VarUpsertDelta {
+    /// the next restart — the #1331 cold-tier defect. Fail-closed: a cold row that
+    /// cannot be read is logged and the whole fold returns `None`, so a caller
+    /// that seals + compacts aborts rather than persisting a snapshot that omits a
+    /// live instance. A cold row always carries its variables inline (a
+    /// variable-spilled instance is never cold-shed —
+    /// [`Engine::snapshot_instance`] refuses it), so the returned payloads are
+    /// authoritative.
+    fn fold_cold_into(&self, state: &mut nanobpmn_engine_core::State) -> Option<VarUpsertDelta> {
         let mut folded = Vec::new();
+        // No cold tier configured is not a failure — nothing to fold, so succeed
+        // with an empty delta. Only an indexed cold row that will not read fails
+        // the fold (`None`).
         let Some(cold) = self.cold.as_ref() else {
-            return folded;
+            return Some(folded);
         };
         for key in cold.index.keys() {
             match cold.store.get_cold(key) {
@@ -2383,14 +2418,17 @@ impl Journal {
                         folded.push((key, Arc::clone(&inst.variables)));
                     }
                 }
-                None => tracing::error!(
-                    instance_key = key,
-                    "snapshot: cold instance has no row in the spill store; \
-                     it cannot be included in the snapshot"
-                ),
+                None => {
+                    tracing::error!(
+                        instance_key = key,
+                        "snapshot: cold instance has no row in the spill store; \
+                         it cannot be included in the snapshot"
+                    );
+                    return None;
+                }
             }
         }
-        folded
+        Some(folded)
     }
 
     /// Reads a spilled instance's variables without consuming them: from the
@@ -2437,7 +2475,11 @@ impl Journal {
     pub fn snapshot_and_rotate(&self) -> Option<(nanobpmn_engine_core::EngineSnapshot, u64)> {
         self.seg.as_ref()?;
         let writer = self.writer.as_ref()?;
-        let snap = self.engine_snapshot();
+        // Fail-closed: abort the rotation (returning `None` before the seal) if any
+        // off-heap payload could not be folded in, so an incomplete snapshot is
+        // never sealed/written and its covered prefix never becomes eligible for
+        // compaction — the caller skips this tick and retries.
+        let snap = self.try_engine_snapshot()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
             return None;
@@ -2475,12 +2517,21 @@ impl Journal {
     /// goes into the snapshot and its variables are routed through the upsert
     /// delta — keeping the snapshot variable-free while the var store stays the
     /// authoritative, consistent source for variables (no recovery rewind).
+    /// Fail-closed: returns `None` (aborting before the seal) if a cold instance
+    /// cannot be folded in, so an incomplete lean checkpoint never gates
+    /// compaction.
     pub fn snapshot_and_rotate_lean(&mut self) -> Option<LeanCheckpoint> {
         self.seg.as_ref()?;
-        // Drain BEFORE the snapshot/seal so the delta reflects exactly the state
-        // the control-only snapshot captures.
+        // Fold cold instances FIRST: it is a pure read of engine + cold store (no
+        // mutation), so doing it before the drain is equivalent on the success
+        // path, and on the fail-closed abort path it returns `None` WITHOUT having
+        // drained the dirty-var delta — leaving the accumulated upserts/forgets
+        // intact so the next checkpoint still captures them (draining first and
+        // then aborting would silently drop them).
+        let (snap, cold_upserts) = self.lean_snapshot_and_cold_upserts()?;
+        // Drain BEFORE the seal so the delta reflects exactly the state the
+        // control-only snapshot captures.
         let (mut upserts, forgets) = self.engine.drain_dirty_vars();
-        let (snap, cold_upserts) = self.lean_snapshot_and_cold_upserts();
         upserts.extend(cold_upserts);
         let writer = self.writer.as_ref()?;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2503,11 +2554,13 @@ impl Journal {
     /// variables there, returning those variables as upserts so the var store —
     /// authoritative in lean mode — is written in lockstep with the snapshot that
     /// omits them. Factored out so it is unit-testable without a segmented writer.
+    /// Fail-closed: `None` if a cold instance cannot be folded in (see
+    /// [`fold_cold_into`](Journal::fold_cold_into)).
     fn lean_snapshot_and_cold_upserts(
         &self,
-    ) -> (nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta) {
+    ) -> Option<(nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta)> {
         let mut snap = self.engine.snapshot_control_only();
-        let cold_upserts = self.fold_cold_into(&mut snap.state);
+        let cold_upserts = self.fold_cold_into(&mut snap.state)?;
         for (key, _) in &cold_upserts {
             if let Some(inst) = snap.state.instances.get_mut(key)
                 && !inst.variables.is_empty()
@@ -2515,7 +2568,7 @@ impl Journal {
                 inst.variables = Arc::new(HashMap::new());
             }
         }
-        (snap, cold_upserts)
+        Some((snap, cold_upserts))
     }
 
     pub fn instance(&self, key: Key) -> Option<&ProcessInstance> {
@@ -3511,7 +3564,9 @@ mod tests {
 
         // Cut a lean checkpoint: the cold instance's CONTROL state lands in the
         // snapshot (variable-free), its variables in the upsert delta.
-        let (snap, cold_upserts) = journal.lean_snapshot_and_cold_upserts();
+        let (snap, cold_upserts) = journal
+            .lean_snapshot_and_cold_upserts()
+            .expect("cold fold succeeds");
         let inst = snap
             .state
             .instances
@@ -3558,6 +3613,72 @@ mod tests {
             activated[0].variables.get("data"),
             Some(&Value::Str("cold-payload".to_string())),
             "job activates with its variables — #1331 lean path"
+        );
+    }
+
+    // Copilot review #1332 (fail-closed snapshot): a spilled instance whose
+    // variable row is missing from the spill store must NOT be baked into a
+    // compaction-gating snapshot as an empty placeholder — that would let
+    // compaction discard the journal prefix that still holds its variables,
+    // turning a transient read/lookup miss into permanent data loss.
+    // `try_engine_snapshot` must fail closed (return `None`) so the rotation
+    // aborts before the seal; the best-effort `engine_snapshot` still returns a
+    // value for the non-gating Raft catch-up path.
+    #[test]
+    fn try_engine_snapshot_fails_closed_on_missing_spill_row() {
+        let path = restart_store_path("fail-closed-spill");
+        let (journal, keys) = spilled_journal(&path, 2);
+
+        // Corrupt the off-heap tier: delete one spilled instance's variable row
+        // while the live engine still flags it spilled. The fold now cannot
+        // resolve that instance's variables.
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
+        store.forget(&[keys[0]]);
+
+        assert!(
+            journal.try_engine_snapshot().is_none(),
+            "snapshot rotation must abort when a spilled payload cannot be folded in"
+        );
+        // The non-gating form stays total (best-effort) for the Raft catch-up
+        // path: it returns a value even with the fold incomplete.
+        let _ = journal.engine_snapshot();
+
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review #1332 (fail-closed snapshot, cold tier): a cold instance
+    // whose row cannot be read from the spill store must abort the fold rather
+    // than be silently omitted from the snapshot (which would then gate
+    // compaction and permanently drop the live instance). Covers both the
+    // classic fold (`try_engine_snapshot`) and the lean checkpoint fold
+    // (`lean_snapshot_and_cold_upserts`).
+    #[test]
+    fn try_engine_snapshot_fails_closed_on_unreadable_cold_row() {
+        let mut journal = cold_journal();
+        let key = deploy_and_create(&mut journal);
+        assert!(
+            journal.force_cold_spill_all() >= 1,
+            "precondition: went cold"
+        );
+        assert!(journal.instance(key).is_none(), "precondition: off-heap");
+
+        // Corrupt the cold tier: drop the cold row from the store while the
+        // in-RAM cold index still routes to it.
+        journal
+            .cold
+            .as_ref()
+            .expect("cold spill configured")
+            .store
+            .forget(&[key]);
+
+        assert!(
+            journal.try_engine_snapshot().is_none(),
+            "classic snapshot must abort when a cold instance cannot be folded in"
+        );
+        assert!(
+            journal.lean_snapshot_and_cold_upserts().is_none(),
+            "lean checkpoint must abort when a cold instance cannot be folded in"
         );
     }
 }
