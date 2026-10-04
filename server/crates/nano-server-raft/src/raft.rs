@@ -1015,7 +1015,15 @@ pub fn sweep_orphaned_snapshot_dirs() {
 /// [`StorageError`] **before** publishing anything, so openraft treats the build
 /// as failed and — critically — does **not** purge the covered log. An incomplete
 /// snapshot is therefore never minted as the durable recovery point: the log that
-/// can still regenerate the omitted state survives for the next attempt.
+/// can still regenerate the omitted state is preserved intact on disk, so no data
+/// is lost. This is a hard fail-stop, not a graceful retry: openraft propagates
+/// the `StorageError` as a `Fatal`, which drives this partition's Raft core to
+/// [`ServerState::Shutdown`](openraft::ServerState::Shutdown) (see
+/// [`is_shutdown`](RaftPartition::is_shutdown)). There is no auto-restart in this
+/// crate, so the partition stops applying entries and every instance/job routed
+/// here is stranded until the process is restarted — at which point recovery
+/// replays the preserved log. The unreadable payload is thus traded for
+/// availability loss, never data loss.
 pub struct PartitionSnapshotBuilder {
     sm: Arc<PartitionStateMachine>,
     captured: Option<nanobpmn_engine_core::EngineSnapshot>,
@@ -1030,7 +1038,13 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // `build_snapshot` succeeds, so sealing an incomplete capture here would
         // permanently discard the only copy of the omitted cold/spilled state.
         // Returning an error aborts the build before the durable pointer is
-        // written and before the log is purged; the next trigger retries.
+        // written and before the log is purged, so the covered log is preserved
+        // and no data is lost. Note this is a hard fail-stop, not a retry:
+        // openraft propagates this `StorageError` as a `Fatal`, shutting down this
+        // partition's Raft core (`ServerState::Shutdown`, see `is_shutdown`). The
+        // partition then stops applying entries and strands its instances/jobs
+        // until the process restarts and replays the preserved log — availability
+        // is sacrificed to guarantee the omitted state is never lost.
         let captured = self.captured.take().ok_or_else(|| {
             StorageError::from_io_error(
                 ErrorSubject::Snapshot(None),
