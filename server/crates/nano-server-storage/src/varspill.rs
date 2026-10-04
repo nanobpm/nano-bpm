@@ -253,6 +253,18 @@ impl VarSpillStore {
         // dropped by `forget` at eviction, so the store stays bounded by the
         // live set.
         //
+        // That bound is **best-effort across crashes** (accepted, #1338): a crash
+        // between writing a cold/spill row and the instance reaching a terminal
+        // state (or a row written by an engine predating self-contained
+        // snapshots, whose routing index was never persisted) leaves an orphaned
+        // row that `forget` never reaches, because the in-RAM cold index is not
+        // rebuilt at boot. A post-recovery reconciliation/GC that deletes rows no
+        // longer referenced by live state — while preserving rows still
+        // referenced by legacy spilled flags — is deliberately **not** added in
+        // this PR: it carries durability/ordering implications (what is
+        // authoritative, when to run it, how to avoid deleting a row a concurrent
+        // recovery still needs) and is tracked separately in #1338.
+        //
         // Convert to INCREMENTAL auto-vacuum so freed pages can later be handed
         // back to the OS instead of plateauing at the high-water mark (a one-time
         // VACUUM on a store that predates the conversion).

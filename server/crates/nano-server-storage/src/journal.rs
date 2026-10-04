@@ -2309,6 +2309,18 @@ impl Journal {
     /// from the spill tiers here, by **non-destructive** reads, so the live
     /// instances stay off-heap while the snapshot restores every variable and
     /// every instance with no dependency on the spill store.
+    ///
+    /// **Memory tradeoff (accepted, #1337):** making the snapshot self-contained
+    /// requires materializing the full working set — every spilled variable map
+    /// and every cold instance — into one in-memory `EngineSnapshot` at capture
+    /// time. Because spill is what lets the live working set exceed available
+    /// RAM, a periodic or Raft snapshot can transiently recreate that entire
+    /// working set on the engine heap at once, risking a long actor stall or OOM
+    /// on the memory-constrained deployments spill targets. This
+    /// bounded-by-working-set materialisation is the accepted self-containment
+    /// tradeoff for now; a streaming/sidecar snapshot representation that never
+    /// holds the whole cold set in RAM is a larger Raft-snapshot redesign tracked
+    /// separately in #1337.
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         let mut snap = self.engine.snapshot();
         self.fold_offheap_into(&mut snap);
