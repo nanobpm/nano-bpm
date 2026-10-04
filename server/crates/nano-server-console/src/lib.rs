@@ -4019,9 +4019,10 @@ pub async fn config_ide() -> ApiResult {
 }
 
 /// `GET /console/api/extensions/marketplace` — packs on npm tagged `nano-ide-ext`,
-/// categorised by language/app/example, with installed status.
-pub async fn extensions_marketplace() -> ApiResult {
-    match tokio::task::spawn_blocking(extensions::marketplace).await {
+/// categorised by language/app/example, with installed status. `force` is the
+/// "check now" bypass that skips the cache TTL (still single-flight).
+pub async fn extensions_marketplace(force: bool) -> ApiResult {
+    match tokio::task::spawn_blocking(move || extensions::marketplace_refresh(force)).await {
         Ok(Ok(list)) => Ok(serde_json::json!({ "entries": list })),
         Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),

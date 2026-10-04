@@ -1858,13 +1858,157 @@ fn is_official(name: &str) -> bool {
     name.starts_with("@nanobpm/")
 }
 
-/// Browse npm for packs tagged `nano-ide-ext`. Shells out to `npm search`
-/// (npm is already required for install). Best-effort; empty on offline/error.
-pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
-    let npm = find_program("npm").ok_or("npm not found on PATH")?;
-    let out = std::process::Command::new(&npm)
-        .args(marketplace_search_args())
-        .output()
+/// How long a computed marketplace listing is served from cache before the next
+/// request recomputes it. Update discovery does not need second-level freshness,
+/// and every recompute shells out to `npm` once per installed pack; without a
+/// TTL every 30 s poll (several tabs, each with a `visibilitychange` kick) fans
+/// a fresh `npm search` + per-pack `npm view` burst out at the OS, which on a
+/// small host swap-thrashed the whole machine (issue #1330). Five minutes keeps
+/// the badge usefully current while collapsing that burst to at most one per
+/// window. An explicit "check now" bypasses this via [`marketplace_refresh`].
+const MARKETPLACE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Max concurrent `npm view` probes [`refresh_installed_latest`] runs. The old
+/// code spawned **one OS thread + one `npm view` Node process per installed
+/// pack, all at once** (issue #1330) — 6 packs meant 6 simultaneous ~40–80 MB
+/// Node processes per request, and nothing bounded overlapping requests. A small
+/// fixed pool caps the per-request process footprint regardless of how many
+/// packs are installed.
+const REFRESH_LATEST_CONCURRENCY: usize = 2;
+
+/// Runs an `npm` invocation and returns its captured output. Factored out behind
+/// a trait so the single-flight / concurrency guards can inject a counting
+/// spawner (issue #1330) and assert the process fan-out without shelling out to
+/// a real `npm`.
+pub trait NpmRunner: Send + Sync {
+    fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output>;
+}
+
+/// The production [`NpmRunner`]: shells out to the resolved `npm` binary.
+struct NpmCli {
+    npm: PathBuf,
+}
+
+impl NpmRunner for NpmCli {
+    fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        std::process::Command::new(&self.npm).args(args).output()
+    }
+}
+
+/// A single-flight, TTL'd cache for the marketplace listing. The expensive
+/// computation ([`marketplace_impl`]) shells out to `npm` once per installed
+/// pack, so it must never run concurrently with itself: concurrent callers
+/// (several studio tabs polling every few minutes, a `visibilitychange` kick, an
+/// explicit "check now") all share one in-flight computation, and a result is
+/// reused for [`MARKETPLACE_CACHE_TTL`] before the next recompute. This is the
+/// server-side half of the #1330 fix — without it N concurrent requests each
+/// started their own full `npm` fan-out.
+struct MarketplaceCache {
+    ttl: std::time::Duration,
+    state: std::sync::Mutex<MarketplaceCacheState>,
+    ready: std::sync::Condvar,
+}
+
+struct MarketplaceCacheState {
+    /// The last successfully computed listing and when it was stored.
+    value: Option<(std::time::Instant, std::sync::Arc<Vec<MarketEntry>>)>,
+    /// True while one caller (the "leader") is recomputing; others wait on
+    /// `ready` rather than starting a second computation.
+    in_flight: bool,
+}
+
+impl MarketplaceCache {
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            state: std::sync::Mutex::new(MarketplaceCacheState {
+                value: None,
+                in_flight: false,
+            }),
+            ready: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Return the cached listing when it is fresh (and `force` is false),
+    /// otherwise recompute it exactly once across all concurrent callers.
+    /// `force` bypasses the TTL but still joins the single in-flight
+    /// computation — a "check now" never fans out a second `npm` burst on top of
+    /// an in-progress one.
+    fn fetch<F>(&self, force: bool, compute: F) -> Result<std::sync::Arc<Vec<MarketEntry>>, String>
+    where
+        F: FnOnce() -> Result<Vec<MarketEntry>, String>,
+    {
+        let mut st = self.state.lock().unwrap();
+        let mut force = force;
+        loop {
+            if !force
+                && let Some((at, v)) = &st.value
+                && at.elapsed() < self.ttl
+            {
+                return Ok(std::sync::Arc::clone(v));
+            }
+            if st.in_flight {
+                // Someone else is already recomputing. Wait for their result and
+                // accept it — even a forced caller, because the in-flight run is
+                // itself producing a fresh listing.
+                st = self.ready.wait(st).unwrap();
+                force = false;
+                continue;
+            }
+            // Become the leader for this recompute.
+            st.in_flight = true;
+            break;
+        }
+        drop(st);
+
+        let result = compute();
+
+        let mut st = self.state.lock().unwrap();
+        st.in_flight = false;
+        let ret = match result {
+            Ok(entries) => {
+                let arc = std::sync::Arc::new(entries);
+                st.value = Some((std::time::Instant::now(), std::sync::Arc::clone(&arc)));
+                Ok(arc)
+            }
+            Err(e) => Err(e),
+        };
+        // Wake every waiter: on success they take the fresh value; on failure one
+        // of them becomes the next leader and retries (still single-flight).
+        self.ready.notify_all();
+        ret
+    }
+}
+
+/// Process-global marketplace cache backing [`marketplace`].
+fn marketplace_cache() -> &'static MarketplaceCache {
+    static CACHE: std::sync::OnceLock<MarketplaceCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| MarketplaceCache::new(MARKETPLACE_CACHE_TTL))
+}
+
+/// Browse npm for packs tagged `nano-ide-ext`. Served from a short-lived
+/// single-flight cache (see [`MarketplaceCache`]) so a burst of concurrent
+/// pollers collapses to one `npm` fan-out. `force` is the "check now" bypass
+/// that skips the cache TTL but still joins the single in-flight computation —
+/// it never starts a second `npm` burst on top of an in-progress one.
+/// Best-effort; empty on offline/error.
+pub fn marketplace_refresh(force: bool) -> Result<Vec<MarketEntry>, String> {
+    marketplace_cache()
+        .fetch(force, || {
+            let npm = find_program("npm").ok_or("npm not found on PATH")?;
+            marketplace_impl(&NpmCli { npm })
+        })
+        .map(|arc| (*arc).clone())
+}
+
+/// The uncached marketplace computation: one `npm search`, then a bounded
+/// per-installed-pack `npm view` refresh. Shells out via the injected
+/// [`NpmRunner`] so guards can count the process fan-out.
+fn marketplace_impl(runner: &dyn NpmRunner) -> Result<Vec<MarketEntry>, String> {
+    let search_args = marketplace_search_args();
+    let search_argv: Vec<&str> = search_args.iter().map(String::as_str).collect();
+    let out = runner
+        .run(&search_argv)
         .map_err(|e| format!("npm search: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -1926,8 +2070,9 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
     // the user has installed, hit `npm view <name> version --prefer-online`
     // to get the actual published latest — otherwise a freshly-published fix
     // won't surface an "Update" affordance in the console for a long time.
-    // Bounded by the installed-pack count so this stays cheap.
-    refresh_installed_latest(&npm, &mut entries);
+    // Bounded concurrency keeps the process fan-out small regardless of the
+    // installed-pack count (issue #1330).
+    refresh_installed_latest(runner, &mut entries, REFRESH_LATEST_CONCURRENCY);
     Ok(entries)
 }
 
@@ -1935,36 +2080,48 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
 /// recompute `update_available`. `npm view --prefer-online` bypasses the local
 /// metadata cache and hits registry.npmjs.org directly. Failures are ignored
 /// (the search result stands).
-fn refresh_installed_latest(npm: &std::path::Path, entries: &mut [MarketEntry]) {
+///
+/// Capped at `cap` concurrent probes (issue #1330): the probes are drained from
+/// a shared queue by a fixed pool of worker threads, so at most `cap` `npm view`
+/// Node processes are ever alive at once — not one per installed pack.
+fn refresh_installed_latest(runner: &dyn NpmRunner, entries: &mut [MarketEntry], cap: usize) {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use std::thread;
-    let updates: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let handles: Vec<_> = entries
+    let jobs: VecDeque<(usize, String)> = entries
         .iter()
         .enumerate()
         .filter(|(_, e)| e.installed)
-        .map(|(idx, e)| {
-            let name = e.name.clone();
-            let npm = npm.to_path_buf();
+        .map(|(idx, e)| (idx, e.name.clone()))
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    let workers = cap.max(1).min(jobs.len());
+    let queue: Arc<Mutex<VecDeque<(usize, String)>>> = Arc::new(Mutex::new(jobs));
+    let updates: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
             let updates = Arc::clone(&updates);
-            thread::spawn(move || {
-                let out = std::process::Command::new(&npm)
-                    .args(["view", &name, "version", "--prefer-online", "--silent"])
-                    .output();
-                if let Ok(o) = out
-                    && o.status.success()
-                {
-                    let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if !v.is_empty() {
-                        updates.lock().unwrap().push((idx, v));
+            scope.spawn(move || {
+                loop {
+                    let Some((idx, name)) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
+                    let out =
+                        runner.run(&["view", &name, "version", "--prefer-online", "--silent"]);
+                    if let Ok(o) = out
+                        && o.status.success()
+                    {
+                        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if !v.is_empty() {
+                            updates.lock().unwrap().push((idx, v));
+                        }
                     }
                 }
-            })
-        })
-        .collect();
-    for h in handles {
-        let _ = h.join();
-    }
+            });
+        }
+    });
     for (idx, latest) in updates.lock().unwrap().drain(..) {
         let e = &mut entries[idx];
         e.version = latest;
@@ -2293,7 +2450,7 @@ fn changelog_delta(md: &str, installed: &str) -> Option<String> {
 /// probe therefore matches nothing (or, worse, the non-runnable POSIX shell
 /// shim npm also drops next to `npm.cmd`), which is why the console showed an
 /// empty extension marketplace on Windows: `find_program("npm")` returned
-/// `None` and `marketplace()` failed with "npm not found on PATH". So on
+/// `None` and the marketplace listing failed with "npm not found on PATH". So on
 /// Windows we mirror cmd.exe's PATHEXT resolution — try `name` + each PATHEXT
 /// extension (`.CMD`, `.EXE`, …) before the bare name. `USERPROFILE` is also
 /// consulted as the home dir since Windows does not set `HOME`.
@@ -2563,6 +2720,173 @@ mod tests {
             "--searchlimit={limit} is too small; the marketplace truncates the catalogue as it grows"
         );
         assert_eq!(limit, MARKETPLACE_SEARCH_LIMIT);
+    }
+
+    /// Build a successful `std::process::Output` with the given stdout, so a
+    /// mock [`NpmRunner`] can stand in for a real `npm` without spawning one.
+    fn ok_output(stdout: &str) -> std::process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// A counting, non-spawning [`NpmRunner`]: it records how many `npm search`
+    /// calls happen and the peak number of concurrent `npm view` calls, so the
+    /// #1330 guard can assert the single-flight / bounded-fan-out contract
+    /// without starting real Node processes.
+    struct MockNpm {
+        search_calls: std::sync::atomic::AtomicUsize,
+        view_calls: std::sync::atomic::AtomicUsize,
+        view_concurrent: std::sync::atomic::AtomicUsize,
+        view_peak: std::sync::atomic::AtomicUsize,
+        search_json: String,
+    }
+
+    impl NpmRunner for MockNpm {
+        fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+            use std::sync::atomic::Ordering::SeqCst;
+            match args.first().copied() {
+                Some("search") => {
+                    self.search_calls.fetch_add(1, SeqCst);
+                    Ok(ok_output(&self.search_json))
+                }
+                Some("view") => {
+                    self.view_calls.fetch_add(1, SeqCst);
+                    let now = self.view_concurrent.fetch_add(1, SeqCst) + 1;
+                    self.view_peak.fetch_max(now, SeqCst);
+                    // Hold the "process" open long enough that an unbounded
+                    // fan-out would overlap and trip the cap assertion.
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    self.view_concurrent.fetch_sub(1, SeqCst);
+                    Ok(ok_output("9.9.9"))
+                }
+                _ => Ok(ok_output("")),
+            }
+        }
+    }
+
+    /// #1330 guard: N concurrent marketplace requests must collapse to **one**
+    /// `npm search` (single-flight cache) and run **at most
+    /// [`REFRESH_LATEST_CONCURRENCY`]** `npm view` probes at a time, no matter
+    /// how many packs are installed — the uncapped one-thread-per-pack fan-out
+    /// under a 30 s cross-tab poll is what swap-thrashed a small host.
+    #[test]
+    fn concurrent_marketplace_requests_single_flight_and_cap_view_fanout() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-mkt-sf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // SAFETY: test-local env set; serialized on ENV_LOCK.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+
+        // Six installed packs — more than the cap — so an uncapped fan-out would
+        // put six `npm view` processes live at once.
+        let packs = [
+            "@nanobpm/pack-a",
+            "@nanobpm/pack-b",
+            "@nanobpm/pack-c",
+            "@nanobpm/pack-d",
+            "@nanobpm/pack-e",
+            "@nanobpm/pack-f",
+        ];
+        for p in packs {
+            let dir = safe_pkg_dir(p).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), r#"{"version":"1.0.0"}"#).unwrap();
+        }
+        let search_json = serde_json::to_string(
+            &packs
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "name": n,
+                        "version": "1.0.0",
+                        "keywords": [MARKETPLACE_KEYWORD],
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let runner = MockNpm {
+            search_calls: AtomicUsize::new(0),
+            view_calls: AtomicUsize::new(0),
+            view_concurrent: AtomicUsize::new(0),
+            view_peak: AtomicUsize::new(0),
+            search_json,
+        };
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+
+        // Fire several concurrent callers — the burst a multi-tab 30 s poll
+        // produced. They must share one computation.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let _ = cache.fetch(false, || marketplace_impl(&runner));
+                });
+            }
+        });
+
+        assert_eq!(
+            runner.search_calls.load(SeqCst),
+            1,
+            "single-flight: concurrent pollers must share exactly one npm search"
+        );
+        assert_eq!(
+            runner.view_calls.load(SeqCst),
+            packs.len(),
+            "each installed pack is probed exactly once (no duplicate fan-out)"
+        );
+        let peak = runner.view_peak.load(SeqCst);
+        assert!(
+            peak <= REFRESH_LATEST_CONCURRENCY,
+            "npm view concurrency must be capped at {REFRESH_LATEST_CONCURRENCY}, saw {peak}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    /// The cache serves a fresh result without recomputing, and `force` bypasses
+    /// the TTL — the "check now" affordance still routes through the same
+    /// single-flight computation.
+    #[test]
+    fn marketplace_cache_serves_fresh_then_force_bypasses_ttl() {
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let compute = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, String>(Vec::<MarketEntry>::new())
+        };
+
+        // First call computes and caches.
+        cache.fetch(false, compute).unwrap();
+        // Second call within the TTL is served from cache — no recompute.
+        cache.fetch(false, compute).unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fresh cached result must not recompute"
+        );
+        // A forced "check now" bypasses the TTL and recomputes.
+        cache.fetch(true, compute).unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "force must bypass the cache TTL"
+        );
     }
 
     #[test]
