@@ -4886,7 +4886,20 @@ impl Engine {
                     continue;
                 }
                 let has_child = instance.scopes.values().any(|parent| parent == eik);
-                if !has_child && self.active_job_on(*eik).is_none() {
+                // A sub-process parked on an open incident (an input-mapping failure
+                // raised during activation, before its start event ran) has no inner
+                // token either, but it is NOT drained: it never entered its body.
+                // Completing it here would advance the token past the sub-process
+                // with its work silently skipped (and strand the incident on a
+                // completed element). Leave it parked; resolving the incident
+                // re-drives the activation (`RetryActivation`, #946).
+                let parked_on_incident = instance.incidents.iter().any(|k| {
+                    self.state
+                        .incidents
+                        .get(k)
+                        .is_some_and(|i| i.element_instance_key == *eik)
+                });
+                if !has_child && !parked_on_incident && self.active_job_on(*eik).is_none() {
                     // A sub-process resting in COMPLETING while its `end`
                     // execution-listener chain runs (ADR 0037) has also drained its
                     // children, but carries a parked listener job on its own
