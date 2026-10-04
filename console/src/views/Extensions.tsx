@@ -30,6 +30,11 @@ import {
 import { PostUpdateProjectsDialog } from "../components/PostUpdateProjectsDialog";
 import { registerFileTypesFromOverview } from "../lib/editorLang";
 import { MARKETPLACE_POLL_MS } from "../lib/marketplace";
+import {
+  createMarketFetchGate,
+  marketFetchBegin,
+  marketFetchEnd,
+} from "../lib/marketFetchGate";
 import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
 import { isThemeSpec } from "../theme/themes";
@@ -115,9 +120,12 @@ export default function Extensions() {
   const [ov, setOv] = useState<ExtensionsOverview | null>(null);
   const [market, setMarket] = useState<MarketEntry[] | null>(null);
   const [marketErr, setMarketErr] = useState<string | null>(null);
-  // Guards against overlapping marketplace fetches (#1330): a poll that outlasts
-  // the interval must not stack a second npm fan-out on top of the first.
-  const marketInFlight = useRef(false);
+  // Guards against overlapping marketplace fetches (#1330): a poll that
+  // outlasts the interval must not stack a second npm fan-out on top of the
+  // first. A forced "Check now" during an in-flight fetch is queued, not
+  // dropped — the user asked to bypass the cache, so silently serving the
+  // cached listing would be wrong.
+  const marketGate = useRef(createMarketFetchGate());
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -198,9 +206,9 @@ export default function Extensions() {
   const loadMarket = async (force = false) => {
     // Don't stack a new marketplace fetch on top of an unfinished one: the
     // server shells out to npm per installed pack, and overlapping fetches are
-    // the feedback loop that swap-thrashed a small host (#1330).
-    if (marketInFlight.current) return;
-    marketInFlight.current = true;
+    // the feedback loop that swap-thrashed a small host (#1330). A forced
+    // "Check now" during an in-flight fetch is queued and run when it settles.
+    if (marketFetchBegin(marketGate.current, force) !== "run") return;
     setMarketErr(null);
     try {
       // `force` is the explicit "check now": it bypasses the server's cache TTL
@@ -216,7 +224,11 @@ export default function Extensions() {
     } catch (e) {
       setMarketErr(String(e));
     } finally {
-      marketInFlight.current = false;
+      if (marketFetchEnd(marketGate.current).runQueuedForce) {
+        // A "Check now" click arrived while this fetch was in flight — run
+        // the forced refresh it asked for now that the gate is free.
+        void loadMarket(true);
+      }
     }
   };
   useEffect(() => {

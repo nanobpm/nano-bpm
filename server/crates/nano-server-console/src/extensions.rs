@@ -1898,23 +1898,49 @@ impl NpmRunner for NpmCli {
 /// A single-flight, TTL'd cache for the marketplace listing. The expensive
 /// computation ([`marketplace_impl`]) shells out to `npm` once per installed
 /// pack, so it must never run concurrently with itself: concurrent callers
-/// (several studio tabs polling every few minutes, a `visibilitychange` kick, an
-/// explicit "check now") all share one in-flight computation, and a result is
-/// reused for [`MARKETPLACE_CACHE_TTL`] before the next recompute. This is the
-/// server-side half of the #1330 fix — without it N concurrent requests each
-/// started their own full `npm` fan-out.
+/// (several studio tabs polling every few minutes, a `visibilitychange` kick,
+/// an explicit "check now") all share one in-flight computation, and a result
+/// is reused for [`MARKETPLACE_CACHE_TTL`] before the next recompute. This is
+/// the server-side half of the #1330 fix — without it N concurrent requests
+/// each started their own full `npm` fan-out.
+///
+/// The cache holds **registry metadata only**: the per-entry installation
+/// state (`installed`, `installed_version`, `update_available`,
+/// `changelog_available`) is re-derived from the live pack store on every
+/// response by [`overlay_install_state`], so an install / update / removal is
+/// reflected immediately instead of going stale for the rest of the TTL.
 struct MarketplaceCache {
     ttl: std::time::Duration,
     state: std::sync::Mutex<MarketplaceCacheState>,
     ready: std::sync::Condvar,
 }
 
+/// The outcome of one shared computation, cloned to every caller that joined
+/// it — success **and** failure. Sharing the failure matters: if only the
+/// leader saw the error, each of N waiters would wake, become the next leader,
+/// and serially repeat the same failing `npm search` (N sequential registry
+/// timeouts for one burst of requests).
+type ComputeResult = Result<std::sync::Arc<Vec<MarketEntry>>, String>;
+
 struct MarketplaceCacheState {
     /// The last successfully computed listing and when it was stored.
     value: Option<(std::time::Instant, std::sync::Arc<Vec<MarketEntry>>)>,
+    /// The outcome of the most recently completed computation — including its
+    /// failure — kept in a slot every waiter of that computation clones. It is
+    /// **not** consumed: a waiter that arrives after the outcome is published
+    /// but before `in_flight` clears would otherwise steal it and leave the
+    /// remaining waiters to each become the next leader and serially repeat
+    /// the same failing `npm search` (N registry timeouts for one burst).
+    /// Overwritten by the next leader when it starts a new computation.
+    last: Option<ComputeResult>,
     /// True while one caller (the "leader") is recomputing; others wait on
     /// `ready` rather than starting a second computation.
     in_flight: bool,
+    /// Bumped each time a computation completes. A waiter waits for the
+    /// generation to move past the one it observed when it joined, then reads
+    /// the outcome from `last` — generation-keyed, so a stale `last` from an
+    /// earlier computation is never mistaken for this one's.
+    generation: u64,
 }
 
 impl MarketplaceCache {
@@ -1923,7 +1949,9 @@ impl MarketplaceCache {
             ttl,
             state: std::sync::Mutex::new(MarketplaceCacheState {
                 value: None,
+                last: None,
                 in_flight: false,
+                generation: 0,
             }),
             ready: std::sync::Condvar::new(),
         }
@@ -1932,9 +1960,9 @@ impl MarketplaceCache {
     /// Return the cached listing when it is fresh (and `force` is false),
     /// otherwise recompute it exactly once across all concurrent callers.
     /// `force` bypasses the TTL but still joins the single in-flight
-    /// computation — a "check now" never fans out a second `npm` burst on top of
-    /// an in-progress one.
-    fn fetch<F>(&self, force: bool, compute: F) -> Result<std::sync::Arc<Vec<MarketEntry>>, String>
+    /// computation — a "check now" never fans out a second `npm` burst on top
+    /// of an in-progress one.
+    fn fetch<F>(&self, force: bool, compute: F) -> ComputeResult
     where
         F: FnOnce() -> Result<Vec<MarketEntry>, String>,
     {
@@ -1948,35 +1976,60 @@ impl MarketplaceCache {
                 return Ok(std::sync::Arc::clone(v));
             }
             if st.in_flight {
-                // Someone else is already recomputing. Wait for their result and
-                // accept it — even a forced caller, because the in-flight run is
-                // itself producing a fresh listing.
-                st = self.ready.wait(st).unwrap();
+                // Someone else is already recomputing. Wait for that run's
+                // generation to complete and clone its shared outcome — even a
+                // forced caller, because the in-flight run is itself producing
+                // a fresh listing. The outcome is shared with every waiter,
+                // failure included: a failed `npm search` is answered to the
+                // whole burst at once rather than re-attempted serially by
+                // each waiter in turn.
+                let joined_gen = st.generation;
+                while st.generation == joined_gen {
+                    st = self.ready.wait(st).unwrap();
+                }
+                if let Some(last) = &st.last {
+                    return last.clone();
+                }
+                // Unreachable in practice (a completed generation always
+                // publishes its outcome); fall through defensively and become
+                // the next leader.
                 force = false;
                 continue;
             }
-            // Become the leader for this recompute.
+            // Become the leader for this recompute. Clear the previous
+            // computation's outcome slot so no waiter can read a stale one.
             st.in_flight = true;
+            st.last = None;
             break;
         }
         drop(st);
 
-        let result = compute();
+        // Catch an unwind so a panicking computation can never strand
+        // `in_flight = true` (every later request would wait forever). The
+        // panic still aborts the leader's own call — as an error, not a hang.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compute))
+            .unwrap_or_else(|_| Err("marketplace computation panicked".to_string()));
 
+        // Publish the outcome, clear `in_flight`, and bump the generation in
+        // **one** lock acquisition, then wake every waiter: each clones the
+        // shared outcome (success or failure) rather than starting its own
+        // computation.
         let mut st = self.state.lock().unwrap();
-        st.in_flight = false;
-        let ret = match result {
+        let shared: ComputeResult = match result {
             Ok(entries) => {
                 let arc = std::sync::Arc::new(entries);
                 st.value = Some((std::time::Instant::now(), std::sync::Arc::clone(&arc)));
                 Ok(arc)
             }
+            // Keep any previously cached value: a failed refresh must not
+            // evict a still-usable listing.
             Err(e) => Err(e),
         };
-        // Wake every waiter: on success they take the fresh value; on failure one
-        // of them becomes the next leader and retries (still single-flight).
+        st.last = Some(shared.clone());
+        st.in_flight = false;
+        st.generation += 1;
         self.ready.notify_all();
-        ret
+        shared
     }
 }
 
@@ -1992,13 +2045,57 @@ fn marketplace_cache() -> &'static MarketplaceCache {
 /// that skips the cache TTL but still joins the single in-flight computation —
 /// it never starts a second `npm` burst on top of an in-progress one.
 /// Best-effort; empty on offline/error.
+///
+/// The cache holds registry metadata only; the installation state of every
+/// entry is re-derived from the live pack store on each response
+/// ([`overlay_install_state`]) so an install / update / removal is visible
+/// immediately rather than after the cache TTL expires.
 pub fn marketplace_refresh(force: bool) -> Result<Vec<MarketEntry>, String> {
     marketplace_cache()
         .fetch(force, || {
             let npm = find_program("npm").ok_or("npm not found on PATH")?;
             marketplace_impl(&NpmCli { npm })
         })
-        .map(|arc| (*arc).clone())
+        .map(|arc| overlay_install_state((*arc).clone()))
+}
+
+/// The one canonical derivation of a marketplace entry's installation state
+/// from the live pack store: `installed`, `installed_version`,
+/// `update_available` (against the entry's current `version`), and
+/// `changelog_available`. Used both when a listing is computed
+/// ([`marketplace_impl`]) and when a cached listing is projected onto the
+/// current disk state for a response ([`overlay_install_state`]) — a single
+/// source of truth so the two paths can never drift.
+fn derive_install_state(entry: &mut MarketEntry) {
+    let inst_ver = installed_version(&entry.name);
+    let installed = inst_ver.is_some()
+        || safe_pkg_dir(&entry.name)
+            .map(|d| d.is_dir())
+            .unwrap_or(false);
+    // Flag an update only when we can read the installed version and it
+    // differs from the latest published one.
+    let update_available = inst_ver
+        .as_deref()
+        .map(|iv| !iv.is_empty() && !entry.version.is_empty() && iv != entry.version)
+        .unwrap_or(false);
+    let changelog_available = installed && installed_changelog_path(&entry.name).is_some();
+    entry.installed = installed;
+    entry.installed_version = inst_ver;
+    entry.update_available = update_available;
+    entry.changelog_available = changelog_available;
+}
+
+/// Project a (possibly cached) listing onto the **current** local pack store:
+/// registry metadata (name, description, links, latest published version) may
+/// be served from the cache, but installation state must reflect installs,
+/// updates, and removals that happened since the listing was computed —
+/// otherwise a fresh install still offers "Install" and a removed pack still
+/// appears installed until the cache TTL expires.
+fn overlay_install_state(mut entries: Vec<MarketEntry>) -> Vec<MarketEntry> {
+    for entry in &mut entries {
+        derive_install_state(entry);
+    }
+    entries
 }
 
 /// The uncached marketplace computation: one `npm search`, then a bounded
@@ -2035,34 +2132,28 @@ fn marketplace_impl(runner: &dyn NpmRunner) -> Result<Vec<MarketEntry>, String> 
             // else carrying the marketplace keyword is a community extension.
             let official = is_official(&name);
             let latest = p["version"].as_str().unwrap_or_default().to_string();
-            let inst_ver = installed_version(&name);
-            let installed =
-                inst_ver.is_some() || safe_pkg_dir(&name).map(|d| d.is_dir()).unwrap_or(false);
-            // Flag an update only when we can read the installed version and it
-            // differs from the latest published one.
-            let update_available = inst_ver
-                .as_deref()
-                .map(|iv| !iv.is_empty() && !latest.is_empty() && iv != latest)
-                .unwrap_or(false);
             let links = &p["links"];
             let repository = links["repository"].as_str().and_then(normalize_repo_url);
             let homepage = links["homepage"].as_str().and_then(safe_http_url);
             let npm_url = links["npm"].as_str().and_then(safe_http_url);
-            let changelog_available = installed && installed_changelog_path(&name).is_some();
-            MarketEntry {
-                installed,
+            let mut entry = MarketEntry {
+                installed: false,
                 version: latest,
                 description: p["description"].as_str().unwrap_or_default().to_string(),
                 category: category.to_string(),
                 official,
-                installed_version: inst_ver,
-                update_available,
+                installed_version: None,
+                update_available: false,
                 repository,
                 homepage,
                 npm_url,
-                changelog_available,
+                changelog_available: false,
                 name,
-            }
+            };
+            // The same canonical projection [`overlay_install_state`] applies
+            // when a cached listing is served — one derivation, no drift.
+            derive_install_state(&mut entry);
+            entry
         })
         .collect();
     entries.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
@@ -2125,11 +2216,9 @@ fn refresh_installed_latest(runner: &dyn NpmRunner, entries: &mut [MarketEntry],
     for (idx, latest) in updates.lock().unwrap().drain(..) {
         let e = &mut entries[idx];
         e.version = latest;
-        e.update_available = e
-            .installed_version
-            .as_deref()
-            .map(|iv| !iv.is_empty() && !e.version.is_empty() && iv != e.version)
-            .unwrap_or(false);
+        // Re-derive the install state against the fresh `version` so
+        // `update_available` uses the one canonical comparison.
+        derive_install_state(e);
     }
 }
 
@@ -2887,6 +2976,155 @@ mod tests {
             2,
             "force must bypass the cache TTL"
         );
+    }
+
+    /// A panicking computation must not wedge the cache: `in_flight` is
+    /// cleared, waiters are woken, and a later fetch completes. Without the
+    /// `catch_unwind` guard, one panic stranded `in_flight = true` and every
+    /// subsequent request (cache misses and forced refreshes alike) waited on
+    /// the condvar until process restart.
+    #[test]
+    fn marketplace_cache_recovers_after_a_panicking_computation() {
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+
+        // The panicking leader surfaces as an ordinary error, not an unwind.
+        let err = match cache.fetch(false, || -> Result<Vec<MarketEntry>, String> {
+            panic!("boom");
+        }) {
+            Ok(_) => panic!("a panicking computation must not succeed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("panicked"),
+            "a panicking computation must surface as an error, got: {err}"
+        );
+
+        // The cache is not wedged: a later fetch computes and completes.
+        let ok = cache
+            .fetch(false, || Ok::<_, String>(Vec::<MarketEntry>::new()))
+            .unwrap();
+        assert!(ok.is_empty());
+    }
+
+    /// A failed computation is shared with **every** waiter of that
+    /// computation: N concurrent callers see the same single error and exactly
+    /// one `npm` attempt runs — not N serial retries, each waiting through its
+    /// own registry timeout. The retry belongs to the *next* request.
+    #[test]
+    fn marketplace_cache_shares_a_failed_computation_with_all_waiters() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+        let calls = AtomicUsize::new(0);
+        // Hold the computation until every caller has had the chance to join
+        // the in-flight run as a waiter — otherwise a thread that arrives
+        // after the leader finished becomes a sequential leader (a spawn
+        // race, not the behaviour under test). A gate, not a barrier: the
+        // leader proceeds after the delay whether or not every thread
+        // scheduled in time, so the test can never deadlock.
+        let go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let go = std::sync::Arc::clone(&go);
+                let cache = &cache;
+                let calls = &calls;
+                handles.push(scope.spawn(move || {
+                    cache
+                        .fetch(false, || {
+                            calls.fetch_add(1, SeqCst);
+                            while !go.load(SeqCst) {
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                            }
+                            Err::<Vec<MarketEntry>, _>("npm search: offline".to_string())
+                        })
+                        .map(|_| ())
+                }));
+            }
+            // Ample time for all 8 threads to enter `fetch` and park on the
+            // condvar, then release the leader.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            go.store(true, SeqCst);
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert_eq!(
+            calls.load(SeqCst),
+            1,
+            "a failed computation must run once for the whole burst, not once per waiter"
+        );
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "every waiter must see the shared failure"
+        );
+    }
+
+    /// The installation state of a cached listing is re-derived from the live
+    /// pack store on every response: an install, an update, and a removal that
+    /// happen **within the cache TTL** are reflected immediately — the cached
+    /// registry metadata is reused, but the Install/Update/Remove affordances
+    /// never go stale.
+    #[test]
+    fn overlay_install_state_reflects_mutations_within_the_cache_ttl() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-mkt-ovl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // SAFETY: test-local env set; serialized on ENV_LOCK.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+
+        let entry = |name: &str, version: &str| MarketEntry {
+            name: name.to_string(),
+            version: version.to_string(),
+            description: String::new(),
+            category: "lang".to_string(),
+            official: true,
+            installed: false,
+            installed_version: None,
+            update_available: false,
+            repository: None,
+            homepage: None,
+            npm_url: None,
+            changelog_available: false,
+        };
+        let write_pack = |name: &str, version: &str| {
+            let dir = safe_pkg_dir(name).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(r#"{{"version":"{version}"}}"#),
+            )
+            .unwrap();
+        };
+
+        // Install: a pack that was not installed when the listing was computed
+        // shows as installed, at the installed version, with no pending update.
+        write_pack("@nanobpm/pack-new", "2.0.0");
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.0.0")]);
+        assert!(out[0].installed, "a fresh install must show installed");
+        assert_eq!(out[0].installed_version.as_deref(), Some("2.0.0"));
+        assert!(!out[0].update_available);
+
+        // Update: the installed version lags the cached latest → Update offered.
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.1.0")]);
+        assert!(out[0].update_available, "a newer latest must offer Update");
+        // …and after the update is pulled, the same cached metadata no longer
+        // offers it.
+        write_pack("@nanobpm/pack-new", "2.1.0");
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.1.0")]);
+        assert!(
+            !out[0].update_available,
+            "a completed update must clear the Update affordance"
+        );
+
+        // Removal: the pack disappears from the store → Install offered again.
+        std::fs::remove_dir_all(safe_pkg_dir("@nanobpm/pack-new").unwrap()).unwrap();
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.1.0")]);
+        assert!(!out[0].installed, "a removed pack must offer Install");
+        assert_eq!(out[0].installed_version, None);
+        assert!(!out[0].update_available);
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 
     #[test]

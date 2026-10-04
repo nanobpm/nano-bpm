@@ -96,10 +96,13 @@ marketplace listing is **cached server-side for a few minutes** and computed
 **single-flight** (concurrent callers — several Studio tabs, the left-rail update
 badge — share one computation, and the per-installed-pack `npm view` probes run
 at a small bounded concurrency rather than one process per pack), so polling for
-updates can never fan an unbounded burst of `npm` processes out at the host. The
-Extensions tab's **Check now** button bypasses the cache TTL (still
-single-flight) for an on-demand refresh. Re-installing replaces the directory
-cleanly (no stale files).
+updates can never fan an unbounded burst of `npm` processes out at the host. Only
+the registry metadata is cached: each entry's installation state (installed,
+installed version, update/changelog availability) is re-derived from the live
+pack store on every response, so an install, update, or removal is reflected
+immediately rather than after the cache TTL. The Extensions tab's **Check now**
+button bypasses the cache TTL (still single-flight) for an on-demand refresh.
+Re-installing replaces the directory cleanly (no stale files).
 
 **Built-ins.** The `deno` language runtime and the `deno-gui` app template ship
 **built into the server binary**, so the console works offline with zero installs
