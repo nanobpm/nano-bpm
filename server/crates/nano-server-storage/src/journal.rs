@@ -2162,7 +2162,18 @@ impl Journal {
                 } else {
                     spill_store.as_ref().and_then(|s| s.take(job.instance_key))
                 };
-                if let Some(vars) = restored {
+                let Some(vars) = restored else {
+                    // #1331: never hand a worker the empty placeholder as if it
+                    // were the instance's variables without saying so.
+                    tracing::error!(
+                        instance_key = job.instance_key,
+                        job_key = job.key,
+                        "activation: spilled instance has no variable row in the spill \
+                         store; the job is activated WITHOUT its process variables"
+                    );
+                    continue;
+                };
+                {
                     let vars = Arc::new(vars);
                     self.engine
                         .rehydrate_variables(job.instance_key, Arc::clone(&vars));
@@ -2260,11 +2271,71 @@ impl Journal {
         self.engine.state()
     }
 
-    /// Captures a compact, serializable snapshot of the engine's live state (see
-    /// [`Engine::snapshot`]). Used to build a bounded Raft state-machine snapshot
-    /// whose size tracks the working set rather than the full event history.
+    /// Captures a compact, serializable, **self-contained** snapshot of the
+    /// engine's live state (see [`Engine::snapshot`]): the single canonical
+    /// capture behind both the Raft state-machine snapshot and the classic
+    /// periodic snapshot ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)).
+    ///
+    /// Spill is a live-memory artefact and must never leak into a snapshot
+    /// (#1331): a spilled instance holds only an empty placeholder in hot state,
+    /// and a cold instance is absent from it entirely. Both are folded back in
+    /// from the spill tiers here, by **non-destructive** reads, so the live
+    /// instances stay off-heap while the snapshot restores every variable and
+    /// every instance with no dependency on the spill store.
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
-        self.engine.snapshot()
+        let mut snap = self.engine.snapshot();
+        self.fold_offheap_into(&mut snap);
+        snap
+    }
+
+    /// Folds cold instances and spilled variable payloads into `snap` (see
+    /// [`engine_snapshot`](Journal::engine_snapshot)). A payload that cannot be
+    /// found is logged as an error and left as-is rather than silently
+    /// serialized as an empty map.
+    fn fold_offheap_into(&self, snap: &mut nanobpmn_engine_core::EngineSnapshot) {
+        if let Some(cold) = self.cold.as_ref() {
+            for key in cold.index.keys() {
+                match cold.store.get_cold(key) {
+                    Some(instance) => {
+                        nanobpmn_engine_core::restore_instance_snapshot(&mut snap.state, instance)
+                    }
+                    None => tracing::error!(
+                        instance_key = key,
+                        "snapshot: cold instance has no row in the spill store; \
+                         it cannot be included in the snapshot"
+                    ),
+                }
+            }
+        }
+        for instance in snap.state.instances.values_mut() {
+            if !instance.variables_spilled {
+                continue;
+            }
+            match self.peek_spilled_variables(instance.key) {
+                Some(vars) => {
+                    instance.variables = Arc::new(vars);
+                    instance.variables_spilled = false;
+                }
+                None => tracing::error!(
+                    instance_key = instance.key,
+                    "snapshot: spilled instance has no variable row in the spill store; \
+                     its variables are lost"
+                ),
+            }
+        }
+    }
+
+    /// Reads a spilled instance's variables without consuming them: from the
+    /// authoritative var store in lean mode, else from the spill cache.
+    fn peek_spilled_variables(&self, key: Key) -> Option<HashMap<String, Value>> {
+        if let Some(vstore) = self.varstore.as_ref() {
+            return vstore.get(key);
+        }
+        self.spill
+            .as_ref()
+            .map(|vs| &vs.store)
+            .or(self.cold.as_ref().map(|c| &c.store))
+            .and_then(|store| store.get(key))
     }
 
     /// Whether this journal is backed by a segmented (bounded-disk) log.
@@ -2298,7 +2369,7 @@ impl Journal {
     pub fn snapshot_and_rotate(&self) -> Option<(nanobpmn_engine_core::EngineSnapshot, u64)> {
         self.seg.as_ref()?;
         let writer = self.writer.as_ref()?;
-        let snap = self.engine.snapshot();
+        let snap = self.engine_snapshot();
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
             return None;
@@ -2944,5 +3015,256 @@ mod tests {
             batch.events.iter().any(|e| e.instance_key() == Some(key)),
             "the created instance's events must reach the preserved exporter"
         );
+    }
+
+    /// A unique on-disk spill-store path, so a test can close and **reopen** the
+    /// store exactly as a process restart does (an in-memory store cannot model
+    /// the boot path).
+    fn restart_store_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-spill-restart-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("var-spill.sqlite")
+    }
+
+    /// Spills `n` demo instances' variables (`data = "payload-<i>"`) to a
+    /// file-backed store at `path`, returning the journal and the instance keys.
+    fn spilled_journal(path: &std::path::Path, n: usize) -> (Journal, Vec<Key>) {
+        use nanobpmn_engine_core::Value;
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(path)).unwrap());
+        journal.set_spill(store, 0);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
+            let (events, _) = journal
+                .apply_command(Command::create_instance_with("demo", vars))
+                .unwrap();
+            keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+        }
+        journal.force_spill_scan();
+        for key in &keys {
+            assert!(
+                journal.engine.is_variables_spilled(*key),
+                "precondition: spilled"
+            );
+        }
+        (journal, keys)
+    }
+
+    /// Boots a fresh journal over a **reopened** store at `path` and restores
+    /// `snapshot` into it — the snapshot-recovery boot path (#1331).
+    fn reboot_from(
+        path: &std::path::Path,
+        snapshot: nanobpmn_engine_core::EngineSnapshot,
+    ) -> Journal {
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(path)).unwrap());
+        journal.set_spill(store, usize::MAX);
+        journal.restore_engine_from_snapshot(snapshot);
+        journal
+    }
+
+    fn assert_jobs_carry_payloads(journal: &mut Journal, n: usize) {
+        use nanobpmn_engine_core::Value;
+
+        let activated = journal.activate_jobs("demo-work", "w", n, 60_000, 0);
+        assert_eq!(activated.len(), n, "every recovered job activates");
+        let mut seen: Vec<String> = activated
+            .iter()
+            .map(|job| match job.variables.get("data") {
+                Some(Value::Str(s)) => s.clone(),
+                other => panic!(
+                    "job {} activated without its spilled variables (got {other:?}) — #1331",
+                    job.key
+                ),
+            })
+            .collect();
+        seen.sort();
+        let mut want: Vec<String> = (0..n).map(|i| format!("payload-{i}")).collect();
+        want.sort();
+        assert_eq!(seen, want);
+    }
+
+    // #1331: a classic (full-variable) snapshot cut while instances are spilled
+    // must be self-contained — it carries the real payloads, not the empty
+    // placeholders — so a restart recovers every variable.
+    #[test]
+    fn classic_snapshot_of_spilled_instances_survives_restart() {
+        let path = restart_store_path("snapshot");
+        let (journal, keys) = spilled_journal(&path, 3);
+
+        let snapshot = journal.engine_snapshot();
+        for key in &keys {
+            let inst = snapshot
+                .state
+                .instances
+                .get(key)
+                .expect("instance in snapshot");
+            assert!(
+                !inst.variables_spilled && inst.variables.contains_key("data"),
+                "snapshot must carry the spilled payload, not a placeholder"
+            );
+        }
+        // Spilled-ness is a live-memory artefact: capturing a snapshot must not
+        // rehydrate (or consume the row of) the live instance.
+        for key in &keys {
+            assert!(
+                journal.engine.is_variables_spilled(*key),
+                "live state untouched"
+            );
+        }
+        drop(journal);
+
+        let mut rebooted = reboot_from(&path, snapshot);
+        assert_jobs_carry_payloads(&mut rebooted, 3);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1331: a snapshot written by an older engine (placeholders + spilled flag)
+    // must still recover: booting must not destroy the spill rows that recovered
+    // state references.
+    #[test]
+    fn legacy_placeholder_snapshot_recovers_from_spill_rows_after_restart() {
+        let path = restart_store_path("legacy");
+        let (journal, _keys) = spilled_journal(&path, 2);
+        // The pre-fix capture: a raw state clone with placeholders.
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+
+        let mut rebooted = reboot_from(&path, legacy);
+        assert_jobs_carry_payloads(&mut rebooted, 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1331: a cold-spilled (wholly off-heap) instance must be in the snapshot,
+    // or it silently vanishes on restart.
+    #[test]
+    fn classic_snapshot_includes_cold_spilled_instances() {
+        let mut journal = cold_journal();
+        let key = deploy_and_create(&mut journal);
+        assert!(
+            journal.force_cold_spill_all() >= 1,
+            "precondition: went cold"
+        );
+        assert!(journal.instance(key).is_none(), "precondition: off-heap");
+
+        let snapshot = journal.engine_snapshot();
+        assert!(
+            snapshot.state.instances.contains_key(&key),
+            "cold instance must be folded into the snapshot"
+        );
+        assert!(
+            snapshot.state.jobs.values().any(|j| j.instance_key == key),
+            "its jobs too"
+        );
+        assert_eq!(journal.cold_count(), 1, "live cold state untouched");
+
+        let mut rebooted = Journal::in_memory();
+        rebooted.restore_engine_from_snapshot(snapshot);
+        assert!(rebooted.instance(key).is_some(), "recovered after restart");
+        assert_eq!(
+            rebooted.activate_jobs("demo-work", "w", 1, 60_000, 0).len(),
+            1
+        );
+    }
+
+    // #1331 defect-class guard: spill is a live-memory artefact and must be
+    // invisible to snapshots. Whatever mix of variable spill and cold spill is in
+    // effect, `engine_snapshot` must capture the same instances, jobs and
+    // variables as an identical journal that never spilled.
+    #[test]
+    fn snapshot_is_invariant_under_variable_and_cold_spill() {
+        use nanobpmn_engine_core::Value;
+
+        // Two batches of two instances; `between` runs after the first batch.
+        fn drive(journal: &mut Journal, between: fn(&mut Journal)) -> Vec<Key> {
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let mut keys = Vec::new();
+            for i in 0..4 {
+                if i == 2 {
+                    between(journal);
+                }
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("data".to_string(), Value::Str(format!("p{i}")));
+                vars.insert("n".to_string(), Value::Int(i));
+                let (events, _) = journal
+                    .apply_command(Command::create_instance_with("demo", vars))
+                    .unwrap();
+                keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+            }
+            keys
+        }
+        /// (instance key, sorted (name, value) variables, sorted job keys).
+        type InstanceView = (Key, Vec<(String, String)>, Vec<Key>);
+        fn view(snap: &nanobpmn_engine_core::EngineSnapshot) -> Vec<InstanceView> {
+            let mut out: Vec<_> = snap
+                .state
+                .instances
+                .values()
+                .map(|inst| {
+                    assert!(!inst.variables_spilled, "no placeholder in a snapshot");
+                    let mut vars: Vec<(String, String)> = inst
+                        .variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                        .collect();
+                    vars.sort();
+                    let mut jobs: Vec<Key> = snap
+                        .state
+                        .jobs
+                        .values()
+                        .filter(|j| j.instance_key == inst.key)
+                        .map(|j| j.key)
+                        .collect();
+                    jobs.sort();
+                    (inst.key, vars, jobs)
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        let mut resident = Journal::in_memory();
+        let keys = drive(&mut resident, |_| {});
+        let expected = view(&resident.engine_snapshot());
+
+        let mut spilled = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+        spilled.set_spill(Arc::clone(&store), usize::MAX);
+        spilled.set_cold_spill(Arc::clone(&store), u64::MAX, u64::MAX);
+        // First batch goes wholly cold; the second has its variables shed.
+        let spilled_keys = drive(&mut spilled, |j| {
+            assert_eq!(
+                j.force_cold_spill_all(),
+                2,
+                "precondition: first batch cold"
+            );
+        });
+        assert_eq!(spilled_keys, keys);
+        spilled.set_spill(store, 0);
+        spilled.force_spill_scan();
+        assert_eq!(spilled.cold_count(), 2);
+        for key in &keys[2..] {
+            assert!(
+                spilled.engine.is_variables_spilled(*key),
+                "second batch spilled"
+            );
+        }
+
+        assert_eq!(view(&spilled.engine_snapshot()), expected);
     }
 }

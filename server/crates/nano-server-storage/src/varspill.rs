@@ -240,13 +240,22 @@ impl VarSpillStore {
              PRAGMA synchronous=NORMAL;
              PRAGMA wal_autocheckpoint=0;
              CREATE TABLE IF NOT EXISTS spill (key INTEGER PRIMARY KEY, vars TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS cold (key INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);
-             DELETE FROM spill;
-             DELETE FROM cold;",
+             CREATE TABLE IF NOT EXISTS cold (key INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);",
         )?;
-        // Convert to INCREMENTAL auto-vacuum now that the tables are empty (the
-        // wipe above), so the VACUUM is near-free and freed pages can later be
-        // handed back to the OS instead of plateauing at the high-water mark.
+        // Rows are deliberately NOT wiped at boot (#1331). A snapshot written by
+        // an engine predating self-contained snapshots records spilled instances
+        // as empty placeholders, so these rows are the only surviving copy of
+        // their variables; wiping them destroyed that data on every restart. A
+        // leftover row is inert: a spill row is only read for an instance whose
+        // live `variables_spilled` flag is set, and a cold row only through the
+        // live routing index — both of which a fresh spill re-writes (`put` /
+        // `put_cold` replace). Rows for instances that reach a terminal state are
+        // dropped by `forget` at eviction, so the store stays bounded by the
+        // live set.
+        //
+        // Convert to INCREMENTAL auto-vacuum so freed pages can later be handed
+        // back to the OS instead of plateauing at the high-water mark (a one-time
+        // VACUUM on a store that predates the conversion).
         enable_incremental_auto_vacuum(&conn)?;
         let conn = Arc::new(Mutex::new(conn));
         let activity = Arc::new(AtomicU64::new(0));
@@ -454,24 +463,33 @@ impl VarSpillStore {
         Ok(())
     }
 
+    /// Returns the payload for `key` **without removing it**, or `None` if absent.
+    /// Used to fold spilled payloads into a self-contained snapshot (#1331): the
+    /// live instance stays spilled, so its row must survive the read.
+    pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
+        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
+        drop(conn);
+        serde_json::from_str(&json).ok()
+    }
+
     /// Removes and returns the payload for `key`, or `None` if absent. A spilled
     /// instance is rehydrated exactly once (on activation), so taking the row on
     /// read keeps the store bounded to the still-cold backlog.
     pub fn take(&self, key: Key) -> Option<HashMap<String, Value>> {
         let conn = self.conn.lock().expect("spill store poisoned");
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT vars FROM spill WHERE key = ?1",
-                params![key as i64],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()?;
-        let json = json?;
+        let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM spill WHERE key = ?1", params![key as i64]);
         drop(conn);
         self.note_activity();
         serde_json::from_str(&json).ok()
+    }
+
+    /// The single-column text row for `key` under `sql`, or `None` if absent.
+    fn select(conn: &Connection, sql: &str, key: Key) -> Option<String> {
+        conn.query_row(sql, params![key as i64], |r| r.get(0))
+            .optional()
+            .ok()?
     }
 
     /// Persists a whole-instance cold [`InstanceSnapshot`] under `key`, replacing
@@ -490,21 +508,23 @@ impl VarSpillStore {
         Ok(())
     }
 
+    /// Returns the cold snapshot for `key` **without removing it**, or `None` if
+    /// absent. Used to fold a still-cold instance into a self-contained snapshot
+    /// (#1331) while it stays off-heap.
+    pub fn get_cold(&self, key: Key) -> Option<InstanceSnapshot> {
+        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
+        drop(conn);
+        serde_json::from_str(&json).ok()
+    }
+
     /// Removes and returns the cold snapshot for `key`, or `None` if absent.
     /// Destructive on read (like [`take`](VarSpillStore::take)): rehydrating an
     /// instance takes its snapshot back out, so the cold table holds only the
     /// still-dormant backlog.
     pub fn take_cold(&self, key: Key) -> Option<InstanceSnapshot> {
         let conn = self.conn.lock().expect("spill store poisoned");
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT snapshot FROM cold WHERE key = ?1",
-                params![key as i64],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()?;
-        let json = json?;
+        let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
         drop(conn);
         self.note_activity();
@@ -621,6 +641,36 @@ mod tests {
         store.put(7, &vars("hello")).unwrap();
         let got = store.take(7).expect("payload present");
         assert_eq!(got.get("data"), Some(&Value::Str("hello".to_string())));
+    }
+
+    // #1331: the store's rows must survive a process restart (re-open), because
+    // a snapshot written before self-contained snapshots may still reference
+    // them; and `get`/`get_cold` must read without consuming.
+    #[test]
+    fn rows_survive_reopen_and_get_is_non_destructive() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let mut vars = HashMap::new();
+        vars.insert("k".to_string(), Value::Int(7));
+        {
+            let store = VarSpillStore::open(Some(&path)).unwrap();
+            store.put(1, &vars).unwrap();
+        }
+        let store = VarSpillStore::open(Some(&path)).unwrap();
+        assert_eq!(store.get(1), Some(vars.clone()), "row survives re-open");
+        assert_eq!(store.get(1), Some(vars.clone()), "get does not consume");
+        assert_eq!(store.take(1), Some(vars), "take still returns it");
+        assert!(store.get(1).is_none(), "take consumed it");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

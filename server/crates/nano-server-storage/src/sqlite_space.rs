@@ -50,12 +50,16 @@ pub fn freelist_bytes(conn: &Connection) -> u64 {
 /// Setting the pragma only *records* the request; the accompanying `VACUUM`
 /// rewrites the database to install the auto-vacuum pointer map and actually switch
 /// mode (a new database is fine before any table exists, but an existing one needs
-/// the VACUUM). On a fresh or just-wiped (empty) database this VACUUM is effectively
-/// free, so this is intended for wipe-on-open caches like [`crate::varspill`];
-/// callers holding large persistent data should instead set the pragma at creation
-/// time to avoid a full rewrite.
+/// the VACUUM). The VACUUM runs only when the database is not already
+/// `INCREMENTAL`, so it is paid once per store (free on a fresh, empty file) and
+/// re-opening a populated store — e.g. [`crate::varspill`], whose rows survive a
+/// restart (#1331) — never rewrites it.
 pub fn enable_incremental_auto_vacuum(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+    // auto_vacuum: 0 = NONE, 1 = FULL, 2 = INCREMENTAL.
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode != 2 {
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+    }
     Ok(())
 }
 

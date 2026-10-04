@@ -1679,6 +1679,55 @@ impl State {
     }
 }
 
+/// Re-inserts a lifted-out [`InstanceSnapshot`] into `state`: the instance and
+/// every owned entity, rebuilding the derived job indices. The single canonical
+/// implementation behind both live cold rehydration
+/// ([`Engine::rehydrate_instance`](crate::Engine::rehydrate_instance)) and the
+/// host's folding of cold instances into a self-contained snapshot, so the two
+/// can never drift. Re-inserting keys that already exist overwrites them.
+pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) {
+    let InstanceSnapshot {
+        instance,
+        jobs,
+        timers,
+        message_subscriptions,
+        signal_subscriptions,
+        conditional_subscriptions,
+        user_tasks,
+        incidents,
+    } = snapshot;
+    let key = instance.key;
+    state.instances.insert(key, instance);
+    for job in jobs {
+        let job_key = job.key;
+        state
+            .jobs_by_instance
+            .entry(key)
+            .or_default()
+            .insert(job_key);
+        state.jobs.insert(job_key, job);
+        resync_job_index(state, job_key);
+    }
+    for timer in timers {
+        state.timers.insert(timer.key, timer);
+    }
+    for sub in message_subscriptions {
+        state.message_subscriptions.insert(sub.key, sub);
+    }
+    for sub in signal_subscriptions {
+        state.signal_subscriptions.insert(sub.key, sub);
+    }
+    for sub in conditional_subscriptions {
+        state.conditional_subscriptions.insert(sub.key, sub);
+    }
+    for task in user_tasks {
+        state.user_tasks.insert(task.key, task);
+    }
+    for incident in incidents {
+        state.incidents.insert(incident.key, incident);
+    }
+}
+
 /// Re-syncs the index membership of one job to match its current state.
 /// Idempotent: a `Created` job is in the activatable index, an `Activated` job
 /// is in the activated index, and anything else (or a missing job) is removed

@@ -9,5 +9,4 @@ pub(crate) mod types;
 pub use apply::apply;
 #[cfg(test)]
 pub(crate) use types::activation_order;
-pub(crate) use types::resync_job_index;
 pub use types::*;
