@@ -2298,10 +2298,19 @@ impl Journal {
         self.engine.state()
     }
 
-    /// Captures a compact, serializable, **self-contained** snapshot of the
-    /// engine's live state (see [`Engine::snapshot`]): the single canonical
-    /// capture behind both the Raft state-machine snapshot and the classic
-    /// periodic snapshot ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)).
+    /// Captures a compact, serializable snapshot of the engine's live state (see
+    /// [`Engine::snapshot`]) with its off-heap payloads folded back in — the
+    /// **best-effort** form, for consumers that need a value regardless of fold
+    /// completeness (e.g. the non-durable Raft catch-up path). It is **not** the
+    /// capture behind any durable recovery point: both of those — the
+    /// compaction-gating classic rotation
+    /// ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)) and the Raft
+    /// snapshot builder (`get_snapshot_builder`, after which openraft may purge
+    /// the covered log) — use the fail-closed [`try_engine_snapshot`] instead, so
+    /// an incomplete snapshot is never sealed or published. This wrapper ignores a
+    /// failed fold (an unreadable/absent off-heap payload is logged and left
+    /// as-is, see `fold_offheap_into`), so it can return a spilled placeholder or
+    /// omit a later cold row; do not persist its result as a recovery point.
     ///
     /// Spill is a live-memory artefact and must never leak into a snapshot
     /// (#1331): a spilled instance holds only an empty placeholder in hot state,
@@ -2323,14 +2332,8 @@ impl Journal {
     /// separately in #1337.
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         let mut snap = self.engine.snapshot();
-        // Best-effort: an unreadable/absent off-heap payload is logged and left
-        // as-is (see `fold_offheap_into`). This total form is for consumers that
-        // need a value regardless of fold completeness. Every path whose snapshot
-        // can become a **durable recovery point** — the compaction-gating rotation
-        // ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)) and the Raft
-        // snapshot builder (`get_snapshot_builder`, which openraft may purge the
-        // covered log after) — uses the fail-closed [`try_engine_snapshot`]
-        // instead, so an incomplete snapshot is never sealed or published.
+        // Best-effort (see the doc above): a failed fold is logged and left
+        // as-is; durable recovery points use `try_engine_snapshot` instead.
         let _ = self.fold_offheap_into(&mut snap);
         snap
     }
