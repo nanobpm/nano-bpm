@@ -16,7 +16,7 @@
 //! only durable business facts keeps the log small and gives a clean recovery
 //! semantic — after a restart, workers simply re-activate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
@@ -1018,6 +1018,17 @@ impl Journal {
         }
         // Drop the snapshot's terminal shells: hot state keeps only in-flight work.
         self.engine.evict_completed();
+        // The received snapshot is self-contained: every cold (wholly off-heap)
+        // instance was folded back in as resident (`fold_cold_into`), so this
+        // receiver's own pre-existing cold routing index is now entirely stale.
+        // Clear it — otherwise a later command for a key this node happened to
+        // hold cold would route through `ensure_resident_for_command` →
+        // `rehydrate_cold` and clobber the freshly installed resident state with
+        // the superseded cold row (#1331). (Reclaiming the now-orphaned on-disk
+        // cold rows is the separate store-reconciliation concern.)
+        if let Some(cold) = self.cold.as_mut() {
+            cold.index = ColdIndex::default();
+        }
         self.fresh = false;
     }
 
@@ -2158,35 +2169,46 @@ impl Journal {
         if self.varstore.is_some() || self.spill.is_some() {
             let varstore = self.varstore.clone();
             let spill_store = self.spill.as_ref().map(|vs| Arc::clone(&vs.store));
+            // A single spilled instance can have *several* jobs activated in the
+            // same batch (parallel gateway / multi-instance). The first restore
+            // clears `variables_spilled`, so a later job for the same instance
+            // would skip the spilled-branch below. Rehydrate each unique instance
+            // exactly once, but refresh the variable projection for EVERY job of a
+            // rehydrated instance — otherwise the later jobs retain their empty
+            // placeholder projection and are handed to a worker without their
+            // process variables (#1331).
+            let mut rehydrated: HashSet<Key> = HashSet::new();
             for job in activated.iter_mut() {
-                if !self.engine.is_variables_spilled(job.instance_key) {
-                    continue;
-                }
-                let restored = if let Some(vstore) = varstore.as_ref() {
-                    vstore.get(job.instance_key)
-                } else {
-                    spill_store.as_ref().and_then(|s| s.take(job.instance_key))
-                };
-                let Some(vars) = restored else {
-                    // #1331: never hand a worker the empty placeholder as if it
-                    // were the instance's variables without saying so.
-                    tracing::error!(
-                        instance_key = job.instance_key,
-                        job_key = job.key,
-                        "activation: spilled instance has no variable row in the spill \
-                         store; the job is activated WITHOUT its process variables"
-                    );
-                    continue;
-                };
-                {
+                if self.engine.is_variables_spilled(job.instance_key) {
+                    let restored = if let Some(vstore) = varstore.as_ref() {
+                        vstore.get(job.instance_key)
+                    } else {
+                        spill_store.as_ref().and_then(|s| s.take(job.instance_key))
+                    };
+                    let Some(vars) = restored else {
+                        // #1331: never hand a worker the empty placeholder as if it
+                        // were the instance's variables without saying so.
+                        tracing::error!(
+                            instance_key = job.instance_key,
+                            job_key = job.key,
+                            "activation: spilled instance has no variable row in the spill \
+                             store; the job is activated WITHOUT its process variables"
+                        );
+                        continue;
+                    };
                     let vars = Arc::new(vars);
                     self.engine
                         .rehydrate_variables(job.instance_key, Arc::clone(&vars));
+                    rehydrated.insert(job.instance_key);
+                }
+                if rehydrated.contains(&job.instance_key) {
                     // Root is resident again; recompute the merged scoped view so a
                     // job on a nested scope (sub-process / MI-child) regains its
                     // scope-local bindings — those stayed resident through the spill,
                     // but the worker's snapshot must fold the freshly restored root
-                    // back in. A flat instance yields the same root `Arc` back.
+                    // back in. A flat instance yields the same root `Arc` back. This
+                    // runs for every activated job of the instance, not just the one
+                    // that triggered the (single) rehydrate.
                     job.variables = self
                         .engine
                         .element_variables(job.instance_key, job.element_instance_key);
@@ -2981,6 +3003,114 @@ mod tests {
             "sub-process scope-local variable folded back into the worker's view"
         );
         assert!(!journal.engine.is_variables_spilled(key), "rehydrated");
+    }
+
+    #[test]
+    fn parallel_jobs_of_a_spilled_instance_all_carry_restored_variables() {
+        use nanobpmn_engine_core::{ProcessBuilder, Value};
+
+        // #1331: when one spilled instance has several jobs activated in the SAME
+        // batch (a parallel gateway fan-out), the first restore clears
+        // `variables_spilled`; the later jobs for that instance must STILL receive
+        // the restored variables, not the empty placeholder projection they were
+        // skipped into when the spilled branch short-circuited on the cleared flag.
+        fn fork() -> nanobpmn_engine_core::ProcessDefinition {
+            ProcessBuilder::new("fork")
+                .start_event("start")
+                .parallel_gateway("split")
+                .service_task("a", "demo-work")
+                .service_task("b", "demo-work")
+                .parallel_gateway("join")
+                .end_event("end")
+                .connect("start", "split")
+                .connect("split", "a")
+                .connect("split", "b")
+                .connect("a", "join")
+                .connect("b", "join")
+                .connect("join", "end")
+                .build()
+                .expect("valid fork process")
+        }
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        // Budget 0: the job-parked instance sheds its root payload immediately.
+        journal.set_spill(Arc::clone(&store), 0);
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(fork()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Int(7));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("fork", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Both parallel tasks are parked on `demo-work`; shed the root payload.
+        journal.force_spill_scan();
+        assert!(
+            journal.engine.is_variables_spilled(key),
+            "the job-parked fork instance spilled its root payload"
+        );
+
+        // ONE activation batch returns BOTH jobs of the same spilled instance.
+        let activated = journal.activate_jobs("demo-work", "w", 2, 60_000, 0);
+        assert_eq!(
+            activated.len(),
+            2,
+            "both parallel jobs of the instance activate in one batch"
+        );
+        assert!(
+            activated.iter().all(|j| j.instance_key == key),
+            "both jobs belong to the spilled instance"
+        );
+        for job in &activated {
+            assert_eq!(
+                job.variables.get("data"),
+                Some(&Value::Int(7)),
+                "every parallel job must carry the restored root variable, not the \
+                 empty placeholder projection"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_install_clears_stale_cold_routing_index() {
+        // Raft-receiver regression (#1331): a self-contained snapshot folds every
+        // cold (wholly off-heap) instance back in as resident, so a receiver's own
+        // pre-existing cold routing index is entirely stale after the install. If
+        // it is not cleared, a later command for a key this node happened to hold
+        // cold routes through `rehydrate_cold` and clobbers the freshly installed
+        // resident state with the superseded cold row (or resurrects an instance
+        // the authoritative snapshot does not even contain).
+        let mut receiver = cold_journal();
+        let ghost = deploy_and_create(&mut receiver);
+        assert_eq!(receiver.force_cold_spill_all(), 1);
+        assert_eq!(receiver.cold_count(), 1);
+        assert!(
+            receiver.instance(ghost).is_none(),
+            "the instance is off-heap"
+        );
+
+        // A self-contained snapshot from a peer (its own resident instance).
+        let captured = {
+            let mut src = Journal::in_memory();
+            let _ = src.apply_command(Command::DeployProcess(demo())).unwrap();
+            let _ = src.apply_command(Command::create_instance("demo")).unwrap();
+            src.engine_snapshot()
+        };
+
+        receiver.restore_engine_from_snapshot(captured);
+
+        assert!(!receiver.is_fresh());
+        assert_eq!(
+            receiver.cold_count(),
+            0,
+            "a self-contained snapshot install must clear the receiver's stale cold \
+             routing index, so no later command can rehydrate_cold a superseded row \
+             over the freshly installed resident state"
+        );
     }
 
     #[test]
