@@ -11,9 +11,19 @@
 //! page cache underneath it) gives the tiering for free: a working set that fits
 //! the cache is served at memory speed, and only a genuinely large spill touches
 //! the disk — exactly the "memory/fs fusion" the spill is after, with no manual
-//! eviction logic. `synchronous=NORMAL` is safe here because the spill store is a
-//! *derived* cache: the variables are already durable in the journal (and the
-//! read model), so a lost spill page is reconstructable, never authoritative.
+//! eviction logic. `synchronous=NORMAL` is safe here because, in the steady
+//! state, the spill store is a *derived* cache: a self-contained snapshot
+//! (#1331) folds every spilled/cold payload back into the engine state it
+//! persists, so the variables are durable in the journal and a lost spill page
+//! is reconstructable from it.
+//!
+//! The one exception is **legacy recovery**: a snapshot written by an engine
+//! predating self-contained snapshots records a spilled instance as an empty
+//! placeholder, so after log compaction the spill row here is the *only*
+//! surviving copy of that instance's variables. Boot therefore never wipes these
+//! rows (see [`VarSpillStore::open`]), and a placeholder snapshot rehydrates
+//! from them on restart. Until every pre-#1331 snapshot has aged out, treat this
+//! store as authoritative for those rows — do not wipe or weaken it.
 //!
 //! ## Returning freed space to the OS
 //!
