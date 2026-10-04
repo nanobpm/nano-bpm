@@ -2325,10 +2325,12 @@ impl Journal {
         let mut snap = self.engine.snapshot();
         // Best-effort: an unreadable/absent off-heap payload is logged and left
         // as-is (see `fold_offheap_into`). This total form is for consumers that
-        // need a value regardless — the Raft snapshot builder
-        // (`get_snapshot_builder`), whose snapshot is a catch-up optimisation
-        // openraft can regenerate, never a compaction gate. The compaction-gating
-        // rotation paths use the fail-closed [`try_engine_snapshot`] instead.
+        // need a value regardless of fold completeness. Every path whose snapshot
+        // can become a **durable recovery point** — the compaction-gating rotation
+        // ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)) and the Raft
+        // snapshot builder (`get_snapshot_builder`, which openraft may purge the
+        // covered log after) — uses the fail-closed [`try_engine_snapshot`]
+        // instead, so an incomplete snapshot is never sealed or published.
         let _ = self.fold_offheap_into(&mut snap);
         snap
     }
