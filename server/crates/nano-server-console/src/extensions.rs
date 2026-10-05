@@ -1918,6 +1918,14 @@ struct MarketplaceCache {
     /// single flight, instead of sleeping and hoping the scheduler got there.
     #[cfg(test)]
     on_waiter_joined: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only instrumentation: invoked (holding no lock) by a waiter right
+    /// before it blocks on the flight's `ready` condvar — after it has cloned
+    /// the per-flight `Arc` but before it reads the outcome. Lets a test hold
+    /// one follower parked at the exact moment the per-flight isolation must
+    /// protect it, then start a *second* flight and prove the parked follower
+    /// still reads its own flight's outcome.
+    #[cfg(test)]
+    on_waiter_wait: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
 /// The outcome of one shared computation, cloned to every caller that joined
@@ -1962,6 +1970,8 @@ impl MarketplaceCache {
             }),
             #[cfg(test)]
             on_waiter_joined: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            on_waiter_wait: std::sync::Mutex::new(None),
         }
     }
 
@@ -1971,9 +1981,23 @@ impl MarketplaceCache {
         *self.on_waiter_joined.lock().unwrap() = Some(Box::new(f));
     }
 
+    /// Install the test-only "a waiter is about to block" gate (see
+    /// [`on_waiter_wait`]).
+    #[cfg(test)]
+    fn set_on_waiter_wait(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_waiter_wait.lock().unwrap() = Some(Box::new(f));
+    }
+
     #[cfg(test)]
     fn note_waiter_joined(&self) {
         if let Some(cb) = self.on_waiter_joined.lock().unwrap().as_ref() {
+            cb();
+        }
+    }
+
+    #[cfg(test)]
+    fn note_waiter_wait(&self) {
+        if let Some(cb) = self.on_waiter_wait.lock().unwrap().as_ref() {
             cb();
         }
     }
@@ -2011,6 +2035,11 @@ impl MarketplaceCache {
                 drop(st);
                 #[cfg(test)]
                 self.note_waiter_joined();
+                // Gate point for the isolation test: a follower can be parked
+                // here — holding its per-flight `Arc`, not yet reading the
+                // outcome — while a later leader completes a *second* flight.
+                #[cfg(test)]
+                self.note_waiter_wait();
                 let mut outcome = flight.outcome.lock().unwrap();
                 while outcome.is_none() {
                     outcome = flight.ready.wait(outcome).unwrap();
@@ -2117,6 +2146,26 @@ fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
             .collect::<Option<Vec<u64>>>()?;
         Some((nums, pre))
     }
+    /// A SemVer *numeric* pre-release identifier: a non-empty run of ASCII
+    /// digits (§11.4.1). This is the classification SemVer applies — it does
+    /// **not** impose an integer-width limit, so an identifier that overflows
+    /// `u64` (e.g. `99999999999999999999`) is still numeric and must order by
+    /// value, not lexically.
+    fn is_numeric_identifier(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    /// Order two numeric pre-release identifiers by value with no width limit:
+    /// more significant digits (after stripping leading zeros) wins, ties break
+    /// lexically. Avoids `u64` parsing so arbitrarily large identifiers compare
+    /// correctly — a lexical compare of `…99999` vs `…100000…` would invert
+    /// their numeric order and hide an available update.
+    fn cmp_numeric_identifiers(x: &str, y: &str) -> Ordering {
+        let nx = x.trim_start_matches('0');
+        let ny = y.trim_start_matches('0');
+        nx.len().cmp(&ny.len()).then_with(|| nx.cmp(ny))
+    }
+
     fn cmp_prerelease(a: &str, b: &str) -> Ordering {
         let mut ai = a.split('.');
         let mut bi = b.split('.');
@@ -2128,13 +2177,15 @@ fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
                 (None, Some(_)) => return Ordering::Less,
                 (Some(_), None) => return Ordering::Greater,
                 (Some(x), Some(y)) => {
-                    let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
-                        (Ok(nx), Ok(ny)) => nx.cmp(&ny),
+                    let ord = match (is_numeric_identifier(x), is_numeric_identifier(y)) {
+                        // Numeric identifiers order by value, no width limit.
+                        (true, true) => cmp_numeric_identifiers(x, y),
                         // Numeric identifiers always rank lower than
                         // alphanumeric ones.
-                        (Ok(_), Err(_)) => Ordering::Less,
-                        (Err(_), Ok(_)) => Ordering::Greater,
-                        (Err(_), Err(_)) => x.cmp(y),
+                        (true, false) => Ordering::Less,
+                        (false, true) => Ordering::Greater,
+                        // Alphanumeric identifiers order by ASCII lexical order.
+                        (false, false) => x.cmp(y),
                     };
                     if ord != Ordering::Equal {
                         return ord;
@@ -3215,26 +3266,19 @@ mod tests {
     /// resuming, dragging those waiters through a *second* `npm` timeout even
     /// though their own run had already produced a result. The per-flight
     /// handle isolates each run's waiters from every later leader.
+    ///
+    /// This test parks a flight-1 follower *after* it has cloned flight 1's
+    /// `Arc` but *before* it reads the outcome, completes flight 1, then runs a
+    /// forced flight 2 to a distinct result while the follower is still parked.
+    /// Releasing the follower must yield flight 1's result — a regression to a
+    /// shared outcome slot would instead surface flight 2's (or block on it).
     #[test]
     fn marketplace_cache_waiters_read_their_own_flight_not_a_later_leaders() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        use std::sync::{Arc, Condvar, Mutex};
-        const FOLLOWERS: usize = 4;
+        use std::sync::{Arc, Barrier, Condvar, Mutex};
 
         let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
         let leader_calls = AtomicUsize::new(0);
-
-        // Release the first leader only once all four followers have joined its
-        // flight — then it returns a tagged value they must all observe.
-        let joined = Arc::new((Mutex::new(0usize), Condvar::new()));
-        {
-            let joined = Arc::clone(&joined);
-            cache.set_on_waiter_joined(move || {
-                let (lock, cv) = &*joined;
-                *lock.lock().unwrap() += 1;
-                cv.notify_all();
-            });
-        }
 
         let entry = |name: &str| MarketEntry {
             name: name.to_string(),
@@ -3251,43 +3295,108 @@ mod tests {
             changelog_available: false,
         };
 
-        let outcomes: Vec<String> = std::thread::scope(|scope| {
-            let mut handles = Vec::new();
-            for _ in 0..(FOLLOWERS + 1) {
-                let cache = &cache;
-                let leader_calls = &leader_calls;
-                let joined = Arc::clone(&joined);
-                let entry = &entry;
-                handles.push(scope.spawn(move || {
-                    cache
-                        .fetch(false, move || {
+        // Release flight 1's leader only once its follower has joined the
+        // flight (bounded, so a regression fails rather than hangs).
+        let joined = Arc::new((Mutex::new(0usize), Condvar::new()));
+        {
+            let joined = Arc::clone(&joined);
+            cache.set_on_waiter_joined(move || {
+                let (lock, cv) = &*joined;
+                *lock.lock().unwrap() += 1;
+                cv.notify_all();
+            });
+        }
+
+        // Park the flight-1 follower at the wait gate until the main thread has
+        // completed flight 2. `parked` signals the follower reached the gate;
+        // `release` lets it through to read its outcome.
+        let parked = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        {
+            let parked = Arc::clone(&parked);
+            let release = Arc::clone(&release);
+            cache.set_on_waiter_wait(move || {
+                parked.wait();
+                release.wait();
+            });
+        }
+
+        let follower = std::thread::scope(|scope| {
+            // Flight 1 leader: waits for its follower, then returns flight-1.
+            let leader = scope.spawn(|| {
+                cache
+                    .fetch(false, {
+                        let joined = Arc::clone(&joined);
+                        let entry = &entry;
+                        let leader_calls = &leader_calls;
+                        move || {
                             leader_calls.fetch_add(1, SeqCst);
                             let (lock, cv) = &*joined;
                             let mut n = lock.lock().unwrap();
-                            while *n < FOLLOWERS {
-                                let (g, to) = cv
-                                    .wait_timeout(n, std::time::Duration::from_secs(10))
-                                    .unwrap();
+                            let start = std::time::Instant::now();
+                            while *n < 1 {
+                                let rem = std::time::Duration::from_secs(10)
+                                    .saturating_sub(start.elapsed());
+                                let (g, to) = cv.wait_timeout(n, rem).unwrap();
                                 n = g;
-                                assert!(!to.timed_out(), "followers never joined the flight");
+                                assert!(
+                                    !to.timed_out(),
+                                    "flight-1 follower never joined the flight"
+                                );
                             }
-                            Ok::<_, String>(vec![entry("flight-leader")])
-                        })
-                        .map(|arc| arc[0].name.clone())
-                        .unwrap()
-                }));
-            }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+                            Ok::<_, String>(vec![entry("flight-1")])
+                        }
+                    })
+                    .map(|arc| arc[0].name.clone())
+                    .unwrap()
+            });
+
+            // Flight 1 follower: joins, then is parked at the wait gate.
+            let follower = scope.spawn(|| {
+                cache
+                    .fetch(false, || {
+                        unreachable!("a follower never computes; it joins flight 1")
+                    })
+                    .map(|arc| arc[0].name.clone())
+                    .unwrap()
+            });
+
+            // Wait until the follower is parked at the gate (holding flight 1's
+            // Arc, not yet reading the outcome), then let flight 1 finish.
+            parked.wait();
+            let leader_outcome = leader.join().unwrap();
+            assert_eq!(leader_outcome, "flight-1");
+
+            // Flight 1 is complete and retired. Start a *forced* flight 2 with
+            // a distinct result while the follower is still parked. A shared
+            // outcome slot would now hold flight 2's value, ready to ambush the
+            // parked follower.
+            let second = cache
+                .fetch(true, {
+                    let entry = &entry;
+                    let leader_calls = &leader_calls;
+                    move || {
+                        leader_calls.fetch_add(1, SeqCst);
+                        Ok::<_, String>(vec![entry("flight-2")])
+                    }
+                })
+                .map(|arc| arc[0].name.clone())
+                .unwrap();
+            assert_eq!(second, "flight-2", "the forced refresh must recompute");
+
+            // Release the parked follower and read what it observed.
+            release.wait();
+            follower.join().unwrap()
         });
 
         assert_eq!(
-            leader_calls.load(SeqCst),
-            1,
-            "all five callers must share one flight, not spawn a second leader"
+            follower, "flight-1",
+            "a parked flight-1 waiter must read its own flight's outcome, not a later leader's"
         );
-        assert!(
-            outcomes.iter().all(|name| name == "flight-leader"),
-            "every waiter must read its own flight's outcome, got {outcomes:?}"
+        assert_eq!(
+            leader_calls.load(SeqCst),
+            2,
+            "exactly two computations ran: flight 1 and the forced flight 2"
         );
     }
 
@@ -3392,6 +3501,32 @@ mod tests {
         assert_eq!(version_cmp("1.0.0-beta", "1.0.0"), Some(Ordering::Less));
         assert_eq!(
             version_cmp("1.0.0-alpha.1", "1.0.0-alpha.2"),
+            Some(Ordering::Less)
+        );
+        // Numeric pre-release identifiers larger than `u64::MAX` still order by
+        // value, not lexically: `…100000…` (21 digits) > `…99999…` (20 digits)
+        // even though the lexical compare of the digit strings inverts that.
+        assert_eq!(
+            version_cmp("1.0.0-99999999999999999999", "1.0.0-100000000000000000000"),
+            Some(Ordering::Less)
+        );
+        // Leading zeros do not change a numeric identifier's value.
+        assert_eq!(version_cmp("1.0.0-007", "1.0.0-7"), Some(Ordering::Equal));
+        // A numeric identifier still ranks below an alphanumeric one, and two
+        // alphanumeric identifiers order lexically.
+        assert_eq!(
+            version_cmp("1.0.0-99999999999999999999", "1.0.0-alpha"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            version_cmp("1.0.0-alpha", "1.0.0-beta"),
+            Some(Ordering::Less)
+        );
+        // The numeric < alphanumeric rule holds even when the numeric
+        // identifier overflows `u64` and the alphanumeric one starts with a
+        // digit: `1a` is alphanumeric, so the huge numeric still ranks lower.
+        assert_eq!(
+            version_cmp("1.0.0-99999999999999999999", "1.0.0-1a"),
             Some(Ordering::Less)
         );
         // A non-numeric core (a dist-tag) is unorderable.
