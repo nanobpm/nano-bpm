@@ -666,6 +666,21 @@ pub fn projects_root() -> PathBuf {
     }
 }
 
+/// The crate-wide test guard serializing every test that mutates the
+/// process-global `NANOBPMN_PROJECTS_DIR` (read live by [`projects_root`]).
+/// Tests in `projects.rs`, `triggers.rs`, `connectors.rs`, and the `lib.rs`
+/// lifecycle suites all flip this variable; a mutex local to any one module
+/// would not serialize against the others under in-process `cargo test`,
+/// letting one test's root leak into another's `project_dir` resolution.
+/// Every such test must hold this lock for its full lifetime.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Ensures the projects root exists and returns it.
 pub fn ensure_projects_root() -> std::io::Result<PathBuf> {
     let dir = projects_root();
@@ -8000,8 +8015,8 @@ impl ProjectSupervisor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::MutexGuard;
     use std::sync::atomic::{AtomicU64, Ordering as AOrd};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::*;
 
@@ -8042,11 +8057,12 @@ mod tests {
         assert!(url.contains("a%20b"), "got {url:?}");
     }
 
+    /// Serializes tests that mutate the process-global `NANOBPMN_PROJECTS_DIR`.
+    /// This is the crate-wide guard ([`env_lock`]) — a module-local mutex would
+    /// not serialize against the lifecycle tests in `lib.rs` or the suites in
+    /// `triggers.rs` / `connectors.rs` mutating the same variable.
     fn lock() -> MutexGuard<'static, ()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        env_lock()
     }
 
     fn temp_root() -> PathBuf {

@@ -5335,8 +5335,17 @@ mod inbox_memo_invalidation_tests {
         p
     }
 
+    // Holds the std env-lock across `.await` (`project_rename` reads the
+    // process-global NANOBPMN_PROJECTS_DIR): benign — the await cannot re-enter
+    // this lock, and the lock exists precisely to serialize the shared env for
+    // in-process `cargo test` (nextest process-isolates these tests anyway).
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn rename_invalidates_the_old_names_inbox_memo() {
+        // Mutates the process-global `NANOBPMN_PROJECTS_DIR`: hold the
+        // crate-wide guard for the test's full lifetime so no other suite's
+        // root switch can redirect `project_dir` mid-test.
+        let _g = projects::env_lock();
         let _root = temp_root();
         projects::create_project("renameme", "", "starter").unwrap();
         // Simulate a previously-ensured inbox under the old name.
@@ -5353,6 +5362,10 @@ mod inbox_memo_invalidation_tests {
 
     #[test]
     fn saving_the_manifest_invalidates_the_inbox_memo() {
+        // Mutates the process-global `NANOBPMN_PROJECTS_DIR`: hold the
+        // crate-wide guard for the test's full lifetime so no other suite's
+        // root switch can redirect `project_dir` mid-test.
+        let _g = projects::env_lock();
         let _root = temp_root();
         projects::create_project("cfgsave", "", "starter").unwrap();
         triggers::ensure_inbox_memo_for_test("cfgsave");

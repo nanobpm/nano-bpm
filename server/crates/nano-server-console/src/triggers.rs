@@ -154,15 +154,40 @@ pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
     // Insert only if the generation we ensured under is still current — i.e.
     // no `forget_inbox` (delete / rename / datasource reconfig) landed while
     // the `CREATE` was in flight. A bumped generation means the table we just
-    // created may belong to a torn-down datasource, so we must not memo it. We
-    // also only memo a resolvable datasource; a `None` fingerprint fails closed.
+    // created may belong to a torn-down datasource, so we must not memo it.
     let mut memo = ensure_inbox_memo().lock().unwrap();
-    if memo.generation(project) == generation
-        && let Some(fp) = fingerprint
-    {
-        memo.ensured.insert(project.to_string(), fp);
-    }
+    memo.record_ensured(project, fingerprint, generation);
     Ok(())
+}
+
+/// Run one inbox datasource op (`body` is the `run_data_op` request), healing a
+/// stale memo on the way.
+///
+/// The memo's fingerprint covers the project directory and manifest bytes — it
+/// cannot observe the datasource's *contents*: deleting `app.db` through the
+/// console's file API, or dropping `trigger_inbox` through the data exec API,
+/// leaves the fingerprint unchanged, so a memo hit would skip the `CREATE` and
+/// every inbox op would fail on the missing table (pre-#1340 behaviour was to
+/// `CREATE` unconditionally, which self-healed). Rather than enumerate every
+/// mutation path, this wrapper treats the missing-table error itself as the
+/// invalidation signal: it drops the memo, re-`CREATE`s, and retries the op
+/// exactly once — restoring self-healing without re-introducing the per-op
+/// spawn #1340 removed. A genuine SQL error mentioning no table is unaffected
+/// (the retry reproduces the original error); an op that fails again after a
+/// successful re-`CREATE` propagates.
+async fn run_inbox_op(project: &str, body: Json) -> Result<Json, TriggerError> {
+    match projects::run_data_op(project, body.clone()).await {
+        Err(DataError::Op(msg))
+            if msg.contains("trigger_inbox") && msg.contains("no such table") =>
+        {
+            // The memo claimed the inbox existed, but the datasource says
+            // otherwise. Invalidate and re-create, then retry the op once.
+            forget_inbox(project);
+            ensure_inbox(project).await?;
+            Ok(projects::run_data_op(project, body).await?)
+        }
+        res => res.map_err(TriggerError::from),
+    }
 }
 
 /// Drop the memoised "inbox ensured" marker for `project`, so the next
@@ -199,6 +224,24 @@ impl InboxMemo {
     /// The current invalidation generation for `project` (0 if never torn down).
     fn generation(&self, project: &str) -> u64 {
         self.generations.get(project).copied().unwrap_or(0)
+    }
+
+    /// Record `project`'s inbox as ensured under `generation`, returning `true`
+    /// when the marker was inserted. The insert is refused (`false`) when the
+    /// memo's current generation has moved past `generation` — i.e. a
+    /// [`forget_inbox`] (delete / rename / datasource reconfig) landed while the
+    /// `CREATE` was in flight, so the table just created may belong to a
+    /// torn-down datasource and must not be memoised. A `None` fingerprint
+    /// (unresolvable datasource) also fails closed: nothing is memoised, so the
+    /// next call re-`CREATE`s.
+    fn record_ensured(&mut self, project: &str, fingerprint: Option<u64>, generation: u64) -> bool {
+        if self.generation(project) != generation {
+            return false;
+        }
+        if let Some(fp) = fingerprint {
+            self.ensured.insert(project.to_string(), fp);
+        }
+        true
     }
 
     /// Whether a memoised marker may be trusted for `project` under its current
@@ -272,7 +315,7 @@ pub(crate) async fn enqueue(
     };
     let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
     let now = now_ms() as i64;
-    let res = projects::run_data_op(
+    let res = run_inbox_op(
         project,
         json!({
             "op": "exec",
@@ -409,7 +452,7 @@ pub(crate) async fn claim_due(
     now: i64,
     limit: i64,
 ) -> Result<Vec<InboxRow>, TriggerError> {
-    let res = projects::run_data_op(
+    let res = run_inbox_op(
         project,
         json!({
             "op": "query",
@@ -443,7 +486,7 @@ pub(crate) async fn claim_due(
 
 /// Settle a row as applied (step 3, success path).
 pub(crate) async fn mark_done(project: &str, id: i64) -> Result<(), TriggerError> {
-    projects::run_data_op(
+    run_inbox_op(
         project,
         json!({
             "op": "exec",
@@ -483,7 +526,7 @@ pub(crate) async fn settle_failure(
     };
     // Keep dead-letter errors readable and the column bounded.
     let err = err.chars().take(500).collect::<String>();
-    projects::run_data_op(
+    run_inbox_op(
         project,
         json!({
             "op": "exec",
@@ -773,7 +816,7 @@ pub(crate) struct InboxStatusRow {
 /// Read the inbox counts + recent rows.
 pub(crate) async fn inbox_status(project: &str) -> Result<InboxStatus, TriggerError> {
     ensure_inbox(project).await?;
-    let counts = projects::run_data_op(
+    let counts = run_inbox_op(
         project,
         json!({
             "op": "query",
@@ -798,7 +841,7 @@ pub(crate) async fn inbox_status(project: &str) -> Result<InboxStatus, TriggerEr
             _ => {}
         }
     }
-    let recent = projects::run_data_op(
+    let recent = run_inbox_op(
         project,
         json!({
             "op": "query",
@@ -1199,8 +1242,8 @@ pub(crate) fn read_manifest(project: &str) -> Result<Json, TriggerError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::MutexGuard;
     use std::sync::atomic::AtomicU64;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::super::workers;
     use super::*;
@@ -1232,12 +1275,54 @@ mod tests {
         );
     }
 
+    /// The guarded memo insert itself: a `record_ensured` arriving with a
+    /// generation the memo has already moved past (a `forget_inbox` landed
+    /// while its `CREATE` was in flight) must be refused, so a stale
+    /// continuation cannot resurrect a marker for a torn-down datasource. This
+    /// is the unit the async `ensure_inbox_does_not_resurrect_a_marker_forgotten_mid_create`
+    /// test cannot reach deterministically (its await completes before the
+    /// forget), so it is exercised directly here. Pure — needs no
+    /// datasource/runtime.
+    #[test]
+    fn record_ensured_rejects_a_stale_generation() {
+        let mut memo = InboxMemo::default();
+
+        // Current generation, resolvable fingerprint: the marker is recorded.
+        assert!(memo.record_ensured("proj", Some(0xA11CE), 0));
+        assert!(memo.hits("proj", Some(0xA11CE)));
+
+        // A teardown bumps the generation and drops the marker…
+        memo.ensured.remove("proj");
+        *memo.generations.entry("proj".to_string()).or_insert(0) += 1;
+        // …so the in-flight ensure from generation 0 is refused: no marker.
+        assert!(
+            !memo.record_ensured("proj", Some(0xA11CE), 0),
+            "a stale-generation insert must be rejected"
+        );
+        assert!(
+            !memo.hits("proj", Some(0xA11CE)),
+            "no marker may be resurrected for the torn-down datasource"
+        );
+
+        // The next ensure runs under the new generation and records again.
+        assert!(memo.record_ensured("proj", Some(0xA11CE), 1));
+        assert!(memo.hits("proj", Some(0xA11CE)));
+
+        // An unresolvable fingerprint never memoises (fail closed), but is not
+        // treated as stale.
+        assert!(memo.record_ensured("other", None, 0));
+        assert!(
+            !memo.hits("other", None),
+            "a None fingerprint is never memoised"
+        );
+    }
+
     /// Serializes tests that mutate the process-global `NANOBPMN_PROJECTS_DIR`.
+    /// This is the crate-wide guard ([`projects::env_lock`]) — a module-local
+    /// mutex would not serialize against the lifecycle tests in `lib.rs` or the
+    /// suites in `projects.rs` / `connectors.rs` mutating the same variable.
     fn lock() -> MutexGuard<'static, ()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        projects::env_lock()
     }
 
     fn runtime_available() -> bool {
@@ -1673,6 +1758,9 @@ mod tests {
         // a missing `trigger_inbox` table. We can't intercept the await, so we
         // drive the exact interleaving: forget *between* the create and a
         // re-ensure, and assert the memo reflects only the current generation.
+        // The stale-generation rejection itself is exercised directly by
+        // `record_ensured_rejects_a_stale_generation` (the await here completes
+        // before the forget, so this test alone could not reach it).
         let name = setup_app("");
         forget_inbox(&name);
         let gen0 = inbox_generation(&name);
@@ -1698,6 +1786,115 @@ mod tests {
         ensure_inbox(&name).await.expect("re-ensure after forget");
         assert!(inbox_is_memoised(&name));
         assert_eq!(inbox_generation(&name), gen0 + 1);
+    }
+
+    /// The memo's fingerprint covers the project dir + manifest bytes, not the
+    /// datasource's *contents*: deleting the SQLite file (or dropping the table
+    /// through the data exec API) leaves the fingerprint unchanged, so a memo
+    /// hit would skip the `CREATE` and inbox ops would fail on a missing
+    /// `trigger_inbox` until something else invalidated the memo. `run_inbox_op`
+    /// must treat the missing-table error as the invalidation signal: drop the
+    /// memo, re-`CREATE`, and retry once — restoring the pre-#1340 self-healing
+    /// without the per-op spawn. Regression guard for the review finding on
+    /// #1341.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inbox_ops_self_heal_when_the_database_file_is_deleted() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        ensure_inbox(&name).await.expect("first ensure creates");
+        assert!(inbox_is_memoised(&name));
+
+        // Delete the datasource file out from under the memo (the console's
+        // file-delete API can do this); the manifest is untouched, so the
+        // fingerprint still matches and the memo reads as a hit.
+        std::fs::remove_file(
+            projects::project_dir(&name)
+                .expect("project dir")
+                .join("app.db"),
+        )
+        .expect("delete app.db");
+
+        // The next inbox op hits the missing table, self-heals, and succeeds —
+        // where a name/fingerprint-keyed memo alone would keep failing.
+        let out = enqueue(&name, "t", Some("after-db-delete"), &json!({}))
+            .await
+            .expect("enqueue self-heals after the database file is deleted");
+        assert!(out.enqueued);
+        let st = inbox_status(&name).await.expect("status after heal");
+        assert_eq!(st.pending, 1, "the healed inbox holds the enqueued row");
+    }
+
+    /// The DROP-TABLE twin of the file-deletion case: a `DROP TABLE
+    /// trigger_inbox` issued through the data exec API commits (each op is a
+    /// fresh gateway process), leaving the memo stale under an unchanged
+    /// manifest. The next op must self-heal the same way.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inbox_ops_self_heal_when_the_inbox_table_is_dropped() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        ensure_inbox(&name).await.expect("first ensure creates");
+        assert!(inbox_is_memoised(&name));
+
+        projects::run_data_op(
+            &name,
+            json!({ "op": "exec", "sql": "DROP TABLE trigger_inbox" }),
+        )
+        .await
+        .expect("drop the inbox table out from under the memo");
+
+        let out = enqueue(&name, "t", Some("after-drop"), &json!({}))
+            .await
+            .expect("enqueue self-heals after the inbox table is dropped");
+        assert!(out.enqueued);
+        let due = claim_due(&name, now_ms() as i64, 10)
+            .await
+            .expect("claim_due reads the healed inbox");
+        assert_eq!(due.len(), 1, "the healed inbox holds the enqueued row");
+    }
+
+    /// The self-heal must not mask a genuine SQL error: an op whose statement
+    /// is invalid for a reason *other* than the missing inbox table fails, and
+    /// the single retry reproduces the same error rather than looping or
+    /// swallowing it.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inbox_ops_do_not_heal_unrelated_sql_errors() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        ensure_inbox(&name).await.expect("first ensure creates");
+
+        // A bad column reference is an Op error that mentions neither
+        // "no such table" nor "trigger_inbox": no heal, error propagates.
+        let err = run_inbox_op(
+            &name,
+            json!({
+                "op": "query",
+                "sql": "SELECT no_such_column FROM trigger_inbox",
+            }),
+        )
+        .await
+        .expect_err("an unrelated SQL error must propagate unchanged");
+        assert!(
+            matches!(err, TriggerError::Data(DataError::Op(_))),
+            "expected a datasource op error, got {err:?}"
+        );
+        // And the memo is untouched — a genuine op error is not an
+        // invalidation signal.
+        assert!(inbox_is_memoised(&name));
     }
 
     // --- pack-source driver auto-launch (ADR 0025 phase 4) -----------------
