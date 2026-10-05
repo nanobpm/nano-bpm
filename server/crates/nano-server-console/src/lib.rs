@@ -4284,7 +4284,13 @@ pub async fn project_delete(name: &str) -> ApiResult {
         ));
     }
     match projects::delete_project(name) {
-        Ok(()) => Ok(serde_json::Value::Null),
+        Ok(()) => {
+            // Drop the memoised "inbox ensured" marker (#1340) so that a later
+            // project reusing this name re-creates its table on a fresh
+            // datasource rather than trusting a stale memo.
+            triggers::forget_inbox(name);
+            Ok(serde_json::Value::Null)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err((StatusCode::NOT_FOUND, "no such project".to_string()))
         }

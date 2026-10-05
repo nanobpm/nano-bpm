@@ -26,7 +26,7 @@
 //! Node-first (Deno optional). The dispatcher itself is pure in-process Rust; it
 //! carries no Deno dependency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -113,10 +113,48 @@ const CREATE_INBOX_SQL: &str = "CREATE TABLE IF NOT EXISTS trigger_inbox (\
     created_at INTEGER NOT NULL, \
     updated_at INTEGER NOT NULL)";
 
-/// Create the inbox table on the App's default datasource if absent. Idempotent.
+/// Create the inbox table on the App's default datasource if absent.
+///
+/// Idempotent **and memoised**: the `CREATE TABLE IF NOT EXISTS` is cheap on
+/// SQLite, but every call is a fresh `urban data` process spawn (ADR 0038), so
+/// re-running it on every drain round (#1340) burns a core on small hosts. Once
+/// the table has been created for a project we skip the spawn entirely; a
+/// failed attempt is *not* memoised, so a project whose datasource isn't ready
+/// yet retries on the next call.
 pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
+    if ensure_inbox_memo().lock().unwrap().contains(project) {
+        return Ok(());
+    }
     projects::run_data_op(project, json!({ "op": "exec", "sql": CREATE_INBOX_SQL })).await?;
+    ensure_inbox_memo()
+        .lock()
+        .unwrap()
+        .insert(project.to_string());
     Ok(())
+}
+
+/// Drop the memoised "inbox ensured" marker for `project`, so the next
+/// [`ensure_inbox`] re-creates the table. Called when a project's datasource is
+/// reset/torn down (project delete, test setup), so the memo can never mask a
+/// vanished table.
+pub(crate) fn forget_inbox(project: &str) {
+    ensure_inbox_memo().lock().unwrap().remove(project);
+}
+
+/// The process-wide "inbox ensured" memo, shared by [`ensure_inbox`] and
+/// [`forget_inbox`]. A project appears here once its `trigger_inbox` table has
+/// been created, so later calls skip the per-op `urban data` spawn (#1340). A
+/// plain `std::sync::Mutex` (never held across an `await`) keeps
+/// [`forget_inbox`] callable from synchronous teardown paths.
+fn ensure_inbox_memo() -> &'static std::sync::Mutex<HashSet<String>> {
+    static ENSURED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    ENSURED.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Test-only: whether `project`'s inbox is currently memoised as created.
+#[cfg(test)]
+pub(crate) fn inbox_is_memoised(project: &str) -> bool {
+    ensure_inbox_memo().lock().unwrap().contains(project)
 }
 
 /// The outcome of [`enqueue`]: `enqueued` is false when the idempotency key was
@@ -1010,6 +1048,16 @@ impl TriggerDispatcher {
         // the same `handle`, so `stop` tears them down alongside the sources.
         super::trigger_sources::spawn_workers(project, &manifest, handle.clone());
         let project = project.to_string();
+        // Only an App that declares inbound triggers[] needs the periodic inbox
+        // drain — its inbox is the only thing that can ever hold rows. A
+        // connector-only App (workers[], no triggers[]) still gets the
+        // supervised source/worker loops above, but spawning a drain here would
+        // poll (and, pre-#1340, re-`CREATE TABLE`) an inbox that can never
+        // receive anything — two `urban data` process spawns every
+        // POLL_INTERVAL_MS, pinning a core on a small host (#1340).
+        if !has_triggers {
+            return;
+        }
         tokio::spawn(async move {
             while handle.is_running() {
                 let wait = match drain_over_gateway(&project, &base_url).await {
@@ -1113,6 +1161,10 @@ mod tests {
         )
         .unwrap();
         projects::ensure_project_sdk(name).unwrap();
+        // Each setup creates a *fresh* datasource under the same project name,
+        // so clear the process-wide inbox memo (#1340) — otherwise a prior
+        // test's "inbox ensured" marker would skip creating the table here.
+        forget_inbox(name);
         name.to_string()
     }
 
@@ -1417,6 +1469,75 @@ mod tests {
         // stop() is a harmless no-op when nothing is registered.
         dispatcher().stop(&name).await;
         assert!(!dispatcher().is_running(&name).await);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatcher_supervises_workers_only_app_without_draining() {
+        let _g = lock();
+        // A connector-only App (workers[], no triggers[]) is still supervised so
+        // its workers stay alive, but it must NOT spawn the periodic inbox drain
+        // — that inbox can never receive anything, and each drain round is two
+        // `urban data` process spawns that pin a core on a small host (#1340).
+        let name = setup_app(r#", "workers": [ { "type": "test:job" } ]"#);
+        // Serial tests share the process-wide memo + dispatcher map under the
+        // same `name`; start from a clean slate so the assertion is isolated.
+        forget_inbox(&name);
+        dispatcher().stop(&name).await;
+
+        dispatcher()
+            .ensure_started(&name, "http://127.0.0.1:1".to_string())
+            .await;
+        assert!(
+            dispatcher().is_running(&name).await,
+            "a workers-only App stays supervised"
+        );
+
+        if runtime_available() {
+            // Give a (wrongly) spawned drain loop more than one poll interval to
+            // run its first pass, which would memoise the inbox via ensure_inbox.
+            tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS + 500)).await;
+            assert!(
+                !inbox_is_memoised(&name),
+                "a workers-only App must never drain (or create) its inbox"
+            );
+        }
+        dispatcher().stop(&name).await;
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_inbox_is_memoised_until_forgotten() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        // ensure_inbox is called on every drain round, enqueue and status path;
+        // it must only spawn `urban data` once per project (#1340). The memo is
+        // the observable proxy: once recorded, later calls short-circuit before
+        // the spawn.
+        let name = setup_app("");
+        forget_inbox(&name);
+        assert!(!inbox_is_memoised(&name));
+
+        ensure_inbox(&name)
+            .await
+            .expect("first ensure creates the table");
+        assert!(
+            inbox_is_memoised(&name),
+            "the first successful ensure records the memo"
+        );
+        // A repeat is a no-op — the memo short-circuits the spawn.
+        ensure_inbox(&name)
+            .await
+            .expect("second ensure is a cheap no-op");
+        assert!(inbox_is_memoised(&name));
+
+        // A datasource teardown (e.g. project delete) clears the memo, so the
+        // table is re-created on a fresh datasource rather than trusted stale.
+        forget_inbox(&name);
+        assert!(!inbox_is_memoised(&name), "forget_inbox clears the memo");
     }
 
     // --- pack-source driver auto-launch (ADR 0025 phase 4) -----------------
