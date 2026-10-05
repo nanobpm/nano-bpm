@@ -5262,7 +5262,13 @@ pub fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
             // the memoised "inbox ensured" marker (#1340). Drop it so the next
             // `ensure_inbox` re-creates `trigger_inbox` on the fresh datasource
             // instead of skipping the `CREATE` and failing on a missing table.
-            if rel == "nano.app.json" {
+            // Compare the RESOLVED path, not the raw `rel`: `safe_project_path`
+            // normalises `rel` (e.g. trims leading `/`), so `/nano.app.json`
+            // writes the manifest while a raw `rel == "nano.app.json"` check
+            // would not fire — leaving the stale memo in place.
+            let is_manifest =
+                projects::project_dir(name).is_some_and(|dir| path == dir.join("nano.app.json"));
+            if is_manifest {
                 triggers::forget_inbox(name);
             }
             Ok(serde_json::Value::Null)
@@ -5366,6 +5372,29 @@ mod inbox_memo_invalidation_tests {
         assert!(
             triggers::inbox_is_memoised("cfgsave"),
             "a non-manifest save leaves the inbox memo intact"
+        );
+
+        // The guard keys on the RESOLVED path, not the raw query param:
+        // `safe_project_path` trims leading `/`, so these all write the same
+        // manifest file and must each invalidate the memo. A raw
+        // `rel == "nano.app.json"` check would miss them (adversarial finding).
+        for rel in ["/nano.app.json", "//nano.app.json"] {
+            triggers::ensure_inbox_memo_for_test("cfgsave");
+            project_file_save("cfgsave", rel, "{ \"data\": {} }").unwrap();
+            assert!(
+                !triggers::inbox_is_memoised("cfgsave"),
+                "saving the manifest via {rel:?} (normalised to nano.app.json) \
+                 still drops the inbox memo"
+            );
+        }
+
+        // A DIFFERENT file that merely ends in the manifest name is not the
+        // project manifest and must NOT invalidate the memo.
+        triggers::ensure_inbox_memo_for_test("cfgsave");
+        project_file_save("cfgsave", "sub/nano.app.json", "{}").unwrap();
+        assert!(
+            triggers::inbox_is_memoised("cfgsave"),
+            "a nested nano.app.json is not the project manifest: memo stays"
         );
     }
 }
