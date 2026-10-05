@@ -26,7 +26,7 @@
 //! Node-first (Deno optional). The dispatcher itself is pure in-process Rust; it
 //! carries no Deno dependency.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -135,9 +135,17 @@ pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
     // the `await`. Two concurrent callers may both miss the memo and each spawn
     // a `CREATE` — `CREATE TABLE IF NOT EXISTS` makes that rare double-spawn
     // harmless, and both then insert under the same generation.
+    //
+    // The memo hit is validated against the datasource's current fingerprint,
+    // not just the name: a re-import or a manifest edit (even an out-of-band one
+    // that never calls `forget_inbox`) repoints the datasource, so a name-only
+    // marker would skip the required `CREATE` on the new datasource and make
+    // enqueue/drain/status fail on a missing `trigger_inbox` (#1340). The
+    // fingerprint is computed before the lock (it does filesystem IO).
+    let fingerprint = projects::datasource_fingerprint(project);
     let generation = {
         let memo = ensure_inbox_memo().lock().unwrap();
-        if memo.ensured.contains(project) {
+        if memo.hits(project, fingerprint) {
             return Ok(());
         }
         memo.generation(project)
@@ -146,10 +154,13 @@ pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
     // Insert only if the generation we ensured under is still current — i.e.
     // no `forget_inbox` (delete / rename / datasource reconfig) landed while
     // the `CREATE` was in flight. A bumped generation means the table we just
-    // created may belong to a torn-down datasource, so we must not memo it.
+    // created may belong to a torn-down datasource, so we must not memo it. We
+    // also only memo a resolvable datasource; a `None` fingerprint fails closed.
     let mut memo = ensure_inbox_memo().lock().unwrap();
-    if memo.generation(project) == generation {
-        memo.ensured.insert(project.to_string());
+    if memo.generation(project) == generation
+        && let Some(fp) = fingerprint
+    {
+        memo.ensured.insert(project.to_string(), fp);
     }
     Ok(())
 }
@@ -170,15 +181,17 @@ pub(crate) fn forget_inbox(project: &str) {
 }
 
 /// The process-wide "inbox ensured" memo state, shared by [`ensure_inbox`] and
-/// [`forget_inbox`]. A project appears in `ensured` once its `trigger_inbox`
-/// table has been created, so later calls skip the per-op `urban data` spawn
-/// (#1340). `generations` is the invalidation counter that lets an in-flight
-/// `ensure_inbox` detect a concurrent teardown. A plain `std::sync::Mutex`
-/// (never held across an `await`) keeps [`forget_inbox`] callable from
-/// synchronous teardown paths.
+/// [`forget_inbox`]. A project maps to the **datasource fingerprint** its
+/// `trigger_inbox` table was created on, so later calls skip the per-op
+/// `urban data` spawn (#1340) *only* while the datasource is unchanged — a
+/// re-import or (out-of-band) manifest edit yields a new fingerprint and forces
+/// a re-`CREATE`. `generations` is the invalidation counter that lets an
+/// in-flight `ensure_inbox` detect a concurrent teardown. A plain
+/// `std::sync::Mutex` (never held across an `await`) keeps [`forget_inbox`]
+/// callable from synchronous teardown paths.
 #[derive(Default)]
 struct InboxMemo {
-    ensured: HashSet<String>,
+    ensured: HashMap<String, u64>,
     generations: HashMap<String, u64>,
 }
 
@@ -186,6 +199,15 @@ impl InboxMemo {
     /// The current invalidation generation for `project` (0 if never torn down).
     fn generation(&self, project: &str) -> u64 {
         self.generations.get(project).copied().unwrap_or(0)
+    }
+
+    /// Whether a memoised marker may be trusted for `project` under its current
+    /// datasource `fingerprint`. A hit requires a recorded marker **and** a
+    /// fingerprint match: a `None` fingerprint (unresolved datasource) or a
+    /// changed one (re-import / manifest edit) is always a miss, so the caller
+    /// re-`CREATE`s the table rather than trusting a stale datasource.
+    fn hits(&self, project: &str, fingerprint: Option<u64>) -> bool {
+        matches!(fingerprint, Some(fp) if self.ensured.get(project) == Some(&fp))
     }
 }
 
@@ -201,7 +223,7 @@ pub(crate) fn inbox_is_memoised(project: &str) -> bool {
         .lock()
         .unwrap()
         .ensured
-        .contains(project)
+        .contains_key(project)
 }
 
 /// Test-only: the current invalidation generation for `project`.
@@ -215,11 +237,14 @@ pub(crate) fn inbox_generation(project: &str) -> u64 {
 /// memo without a JS runtime.
 #[cfg(test)]
 pub(crate) fn ensure_inbox_memo_for_test(project: &str) {
+    // Seed the fingerprint the project currently resolves to (0 when it does not
+    // resolve), so the seeded marker behaves like a genuine `ensure_inbox` hit.
+    let fingerprint = projects::datasource_fingerprint(project).unwrap_or(0);
     ensure_inbox_memo()
         .lock()
         .unwrap()
         .ensured
-        .insert(project.to_string());
+        .insert(project.to_string(), fingerprint);
 }
 
 /// The outcome of [`enqueue`]: `enqueued` is false when the idempotency key was
@@ -1179,6 +1204,33 @@ mod tests {
 
     use super::super::workers;
     use super::*;
+
+    /// The memo hit is gated on the datasource fingerprint, not just the name:
+    /// a changed fingerprint (re-import / manifest edit) or an unresolved one
+    /// must miss, so `ensure_inbox` re-`CREATE`s rather than trusting a stale
+    /// datasource (#1340). Pure — needs no datasource/runtime.
+    #[test]
+    fn memo_hit_requires_matching_datasource_fingerprint() {
+        let mut memo = InboxMemo::default();
+        memo.ensured.insert("proj".to_string(), 0xA11CE);
+
+        assert!(
+            memo.hits("proj", Some(0xA11CE)),
+            "same datasource fingerprint is a hit"
+        );
+        assert!(
+            !memo.hits("proj", Some(0xB0B)),
+            "a changed fingerprint (datasource repointed) must miss"
+        );
+        assert!(
+            !memo.hits("proj", None),
+            "an unresolved datasource must never hit (fail closed)"
+        );
+        assert!(
+            !memo.hits("other", Some(0xA11CE)),
+            "a different project never hits on another's fingerprint"
+        );
+    }
 
     /// Serializes tests that mutate the process-global `NANOBPMN_PROJECTS_DIR`.
     fn lock() -> MutexGuard<'static, ()> {
