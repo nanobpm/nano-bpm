@@ -321,12 +321,18 @@ pub(crate) fn validate_connector_seam(project: &str) -> Result<(), String> {
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use super::super::projects;
     use super::*;
 
     /// Tests here mutate the process-global `NANOBPMN_PROJECTS_DIR` and
-    /// `NANOBPMN_EXTENSIONS_DIR`; serialize on this mutex so cargo's parallel
-    /// runner can't let two of them read each other's temp dirs.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `NANOBPMN_EXTENSIONS_DIR`; serialize on the crate-wide guard
+    /// ([`projects::env_lock`]) so cargo's parallel runner can't let two of
+    /// them read each other's temp dirs. A mutex local to this module would
+    /// not serialize against the suites in `projects.rs` / `triggers.rs` /
+    /// `lib.rs` mutating the same variables.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        projects::env_lock()
+    }
 
     fn cfg(entries: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
         entries
@@ -414,7 +420,7 @@ mod tests {
 
     #[test]
     fn overview_lists_installable_registry_when_none_enabled() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         let name = setup(BARE_APP, true, true);
         let ov = connectors_overview(&name).unwrap();
         assert_eq!(ov["connectors"].as_array().unwrap().len(), 0);
@@ -428,7 +434,7 @@ mod tests {
 
     #[test]
     fn add_connector_appends_worker_and_connection() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         let name = setup(BARE_APP, true, true);
         add_connector(
             &name,
@@ -461,7 +467,7 @@ mod tests {
 
     #[test]
     fn add_connector_rejects_unknown_and_duplicate() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         let name = setup(BARE_APP, true, true);
         assert!(add_connector(&name, "no.such", None, &cfg(&[])).is_err());
         add_connector(&name, "test.slack", None, &cfg(&[])).unwrap();
@@ -471,7 +477,7 @@ mod tests {
 
     #[test]
     fn validate_seam_passes_for_backed_component_connector() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         let name = setup(BARE_APP, true, true);
         add_connector(&name, "test.slack", None, &cfg(&[])).unwrap();
         validate_connector_seam(&name).expect("seam is coherent");
@@ -479,7 +485,7 @@ mod tests {
 
     #[test]
     fn validate_seam_fails_when_worker_not_launchable() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         // Enable first (with a launchable pack so add_connector accepts it)...
         let name = setup(BARE_APP, true, true);
         add_connector(&name, "test.slack", None, &cfg(&[])).unwrap();
@@ -491,7 +497,7 @@ mod tests {
 
     #[test]
     fn validate_seam_fails_when_component_missing() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         // Pack ships a launchable worker but no seam component template.
         let name = setup(BARE_APP, true, false);
         // add_connector still accepts (registry match); the seam gate catches it.
@@ -534,7 +540,7 @@ mod tests {
     /// declaring a `type` config field could corrupt connection resolution.
     #[test]
     fn add_connector_config_cannot_clobber_reserved_type() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         let name = setup(BARE_APP, true, true);
         add_connector(
             &name,
@@ -603,7 +609,7 @@ mod tests {
     /// check — the wrong error, and `backed` would read `true`).
     #[test]
     fn validate_seam_is_pack_scoped_not_type_scoped() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = env_lock();
         let name = setup_pinned_pack_missing();
         let err = validate_connector_seam(&name).unwrap_err();
         assert!(err.contains("launchable"), "got: {err}");

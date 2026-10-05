@@ -666,6 +666,21 @@ pub fn projects_root() -> PathBuf {
     }
 }
 
+/// The crate-wide test guard serializing every test that mutates the
+/// process-global `NANOBPMN_PROJECTS_DIR` (read live by [`projects_root`]).
+/// Tests in `projects.rs`, `triggers.rs`, `connectors.rs`, and the `lib.rs`
+/// lifecycle suites all flip this variable; a mutex local to any one module
+/// would not serialize against the others under in-process `cargo test`,
+/// letting one test's root leak into another's `project_dir` resolution.
+/// Every such test must hold this lock for its full lifetime.
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static L: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    L.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// Ensures the projects root exists and returns it.
 pub fn ensure_projects_root() -> std::io::Result<PathBuf> {
     let dir = projects_root();
@@ -767,6 +782,37 @@ pub fn project_dir(name: &str) -> Option<PathBuf> {
     Some(workspace_dir)
 }
 
+/// A cheap fingerprint of the datasource `project` currently resolves to, used
+/// by [`crate::triggers::ensure_inbox`] to decide whether a memoised
+/// "inbox ensured" marker is still valid (#1340).
+///
+/// A project *name* does not identify a stable datasource: it is repointed by a
+/// re-import against a different directory ([`import_project_ref`]) and its
+/// datasource is repointed by any edit to the manifest — **including an
+/// out-of-band edit to an imported checkout's `nano.app.json` that never flows
+/// through the console's save path**. The fingerprint therefore folds in both
+/// the resolved (canonical) project directory *and* the manifest bytes, so any
+/// such change yields a different value and the memo treats it as a miss. The
+/// manifest is hashed whole (not just its `datasources`) so the check is
+/// parser-free and fails safe — an unrelated manifest edit merely re-`CREATE`s
+/// the (idempotent) table once. Returns `None` when the project does not
+/// resolve, which the memo treats as "never a hit" (fail closed).
+pub(crate) fn datasource_fingerprint(project: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let dir = project_dir(project)?;
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    dir.hash(&mut hasher);
+    // The manifest declares the datasource; hash its bytes so any repoint
+    // (direct/out-of-band edit, or a re-import onto a dir with a different
+    // manifest) changes the fingerprint. A legacy app (no manifest) hashes the
+    // directory alone, which still changes on rename/delete+recreate.
+    if let Ok(bytes) = std::fs::read(dir.join("nano.app.json")) {
+        bytes.hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
 /// Register a project reference (ADR 0041, `path` source): point `name` at an
 /// external directory, read live, without copying it. Fails closed when the name
 /// is unsafe, the path is not absolute, a real workspace project already owns the
@@ -820,6 +866,12 @@ pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> 
     let f = project_ref_file(name).ok_or_else(|| format!("invalid project name \"{name}\""))?;
     let body = serde_json::to_vec_pretty(&r).map_err(|e| format!("serialize reference: {e}"))?;
     std::fs::write(&f, body).map_err(|e| format!("write reference: {e}"))?;
+    // Re-importing an existing name repoints `project_dir` at a new external dir
+    // whose datasource may lack `trigger_inbox`. Drop any memoised "inbox
+    // ensured" marker so the next `ensure_inbox` re-creates the table on the new
+    // datasource rather than trusting a stale one (#1340); the generation bump
+    // also disarms an `ensure_inbox` that is mid-`CREATE` against the old dir.
+    crate::triggers::forget_inbox(name);
     Ok(r)
 }
 
@@ -7963,8 +8015,8 @@ impl ProjectSupervisor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::MutexGuard;
     use std::sync::atomic::{AtomicU64, Ordering as AOrd};
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use super::*;
 
@@ -8005,11 +8057,12 @@ mod tests {
         assert!(url.contains("a%20b"), "got {url:?}");
     }
 
+    /// Serializes tests that mutate the process-global `NANOBPMN_PROJECTS_DIR`.
+    /// This is the crate-wide guard ([`env_lock`]) — a module-local mutex would
+    /// not serialize against the lifecycle tests in `lib.rs` or the suites in
+    /// `triggers.rs` / `connectors.rs` mutating the same variable.
     fn lock() -> MutexGuard<'static, ()> {
-        static L: OnceLock<Mutex<()>> = OnceLock::new();
-        L.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        env_lock()
     }
 
     fn temp_root() -> PathBuf {
@@ -8215,6 +8268,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    /// The datasource fingerprint folds in both the resolved directory and the
+    /// manifest bytes, so the two cited mutations that repoint a project's
+    /// datasource — an (out-of-band) manifest edit and a re-import onto another
+    /// directory — each change it. `ensure_inbox` keys its memo on this, so a
+    /// stale "inbox ensured" marker cannot survive either change (#1340). Pure
+    /// filesystem — needs no datasource/runtime.
+    #[test]
+    fn datasource_fingerprint_changes_on_manifest_edit_and_reimport() {
+        let _g = lock();
+        let root = temp_root();
+
+        // A workspace project with a manifest declaring a datasource.
+        let proj = root.join("fp");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            proj.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"x","datasources":[{"name":"db","url":"file:a.db"}]}"#,
+        )
+        .unwrap();
+        let fp0 = datasource_fingerprint("fp").expect("resolves");
+
+        // A direct, out-of-band manifest edit that repoints the datasource — it
+        // never flows through the console save path, so only the fingerprint can
+        // catch it.
+        std::fs::write(
+            proj.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"x","datasources":[{"name":"db","url":"file:b.db"}]}"#,
+        )
+        .unwrap();
+        let fp1 = datasource_fingerprint("fp").expect("resolves");
+        assert_ne!(
+            fp0, fp1,
+            "an out-of-band manifest edit (datasource repoint) must change the fingerprint"
+        );
+
+        // Re-import the same name against a different external directory — the
+        // resolved dir changes, so the fingerprint must too.
+        std::fs::remove_dir_all(&proj).unwrap();
+        let ext = ext_app_dir("fp-reimport");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"x","datasources":[{"name":"db","url":"file:a.db"}]}"#,
+        )
+        .unwrap();
+        import_project_ref("fp", ext.to_str().unwrap()).expect("import ok");
+        let fp2 = datasource_fingerprint("fp").expect("resolves");
+        assert_ne!(
+            fp1, fp2,
+            "a re-import onto another directory must change the fingerprint"
+        );
+
+        // An unresolvable project has no fingerprint (fail closed → never a hit).
+        assert!(
+            datasource_fingerprint("no/such name").is_none(),
+            "an unsafe/unresolvable name yields no fingerprint"
+        );
     }
 
     #[test]
