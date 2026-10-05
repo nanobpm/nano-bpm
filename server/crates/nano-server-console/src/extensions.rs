@@ -3272,13 +3272,28 @@ mod tests {
     /// forced flight 2 to a distinct result while the follower is still parked.
     /// Releasing the follower must yield flight 1's result — a regression to a
     /// shared outcome slot would instead surface flight 2's (or block on it).
+    ///
+    /// The choreography is fully deterministic and every wait is bounded, so a
+    /// regression *fails* the test instead of hanging the test binary (a bare
+    /// `Barrier::wait()` has no timeout and could deadlock the whole suite).
+    /// The follower cannot begin its `fetch` until the leader has *provably*
+    /// installed flight 1 (`flight_installed`), so the leader always leads and
+    /// the follower always joins — the `unreachable!` compute is genuinely
+    /// unreachable, never a wrong-role panic.
     #[test]
     fn marketplace_cache_waiters_read_their_own_flight_not_a_later_leaders() {
-        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        use std::sync::{Arc, Barrier, Condvar, Mutex};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
 
-        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+        const BOUND: Duration = Duration::from_secs(10);
+
+        let cache = MarketplaceCache::new(Duration::from_secs(300));
         let leader_calls = AtomicUsize::new(0);
+        // Set when any bounded wait below times out; asserted at the end so a
+        // missed rendezvous fails the test rather than silently passing.
+        // `Arc` because the `'static` `on_waiter_wait` hook captures a clone.
+        let timed_out = Arc::new(AtomicBool::new(false));
 
         let entry = |name: &str| MarketEntry {
             name: name.to_string(),
@@ -3295,6 +3310,60 @@ mod tests {
             changelog_available: false,
         };
 
+        // A bounded two-party rendezvous (a `Barrier` with a timeout, which
+        // stable `std` does not provide). `arrive` blocks the caller until both
+        // parties have arrived or the deadline passes; it returns `false` on
+        // timeout instead of hanging the test binary, so a missed rendezvous
+        // *fails* the test rather than deadlocking the whole suite.
+        struct Gate {
+            state: Mutex<usize>,
+            cv: Condvar,
+        }
+        impl Gate {
+            fn new() -> Self {
+                Self {
+                    state: Mutex::new(0),
+                    cv: Condvar::new(),
+                }
+            }
+            /// Block until both parties arrive. Returns `false` on timeout.
+            fn arrive(&self, deadline: Instant) -> bool {
+                let mut n = self.state.lock().unwrap();
+                *n += 1;
+                if *n >= 2 {
+                    self.cv.notify_all();
+                    return true;
+                }
+                loop {
+                    let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                        return false;
+                    };
+                    let (g, to) = self.cv.wait_timeout(n, rem).unwrap();
+                    n = g;
+                    if *n >= 2 {
+                        return true;
+                    }
+                    if to.timed_out() {
+                        return false;
+                    }
+                }
+            }
+        }
+        let arrive = |gate: &Gate, deadline: Instant| -> bool {
+            if gate.arrive(deadline) {
+                true
+            } else {
+                timed_out.store(true, SeqCst);
+                false
+            }
+        };
+
+        // The leader opens this the instant it has installed flight 1 (its
+        // compute closure runs only on the leader, after `in_flight` is set),
+        // releasing the follower to join. This removes the startup race: the
+        // follower can never reach phase 1 first and become the leader.
+        let flight_installed = Arc::new(Gate::new());
+
         // Release flight 1's leader only once its follower has joined the
         // flight (bounded, so a regression fails rather than hangs).
         let joined = Arc::new((Mutex::new(0usize), Condvar::new()));
@@ -3310,39 +3379,55 @@ mod tests {
         // Park the flight-1 follower at the wait gate until the main thread has
         // completed flight 2. `parked` signals the follower reached the gate;
         // `release` lets it through to read its outcome.
-        let parked = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
+        let parked = Arc::new(Gate::new());
+        let release = Arc::new(Gate::new());
         {
             let parked = Arc::clone(&parked);
             let release = Arc::clone(&release);
+            let timed_out = Arc::clone(&timed_out);
             cache.set_on_waiter_wait(move || {
-                parked.wait();
-                release.wait();
+                // Unbounded here: the main thread guarantees it arrives at both
+                // gates (it releases the follower before joining it), and the
+                // follower's own arrival at `parked` is what the main thread's
+                // *bounded* wait observes — so a missed rendezvous fails there.
+                let far = Instant::now() + Duration::from_secs(3600);
+                if !parked.arrive(far) || !release.arrive(far) {
+                    timed_out.store(true, SeqCst);
+                }
             });
         }
 
         let follower = std::thread::scope(|scope| {
-            // Flight 1 leader: waits for its follower, then returns flight-1.
+            // Flight 1 leader: opens `flight_installed`, waits for its
+            // follower, then returns flight-1.
             let leader = scope.spawn(|| {
                 cache
                     .fetch(false, {
+                        let flight_installed = Arc::clone(&flight_installed);
                         let joined = Arc::clone(&joined);
                         let entry = &entry;
                         let leader_calls = &leader_calls;
+                        let timed_out = &timed_out;
                         move || {
                             leader_calls.fetch_add(1, SeqCst);
+                            // Flight 1 is installed (this closure runs only on
+                            // the leader): let the follower start its fetch.
+                            flight_installed.arrive(Instant::now() + BOUND);
                             let (lock, cv) = &*joined;
                             let mut n = lock.lock().unwrap();
-                            let start = std::time::Instant::now();
+                            let deadline = Instant::now() + BOUND;
                             while *n < 1 {
-                                let rem = std::time::Duration::from_secs(10)
-                                    .saturating_sub(start.elapsed());
+                                let Some(rem) = deadline.checked_duration_since(Instant::now())
+                                else {
+                                    timed_out.store(true, SeqCst);
+                                    break;
+                                };
                                 let (g, to) = cv.wait_timeout(n, rem).unwrap();
                                 n = g;
-                                assert!(
-                                    !to.timed_out(),
-                                    "flight-1 follower never joined the flight"
-                                );
+                                if to.timed_out() && *n < 1 {
+                                    timed_out.store(true, SeqCst);
+                                    break;
+                                }
                             }
                             Ok::<_, String>(vec![entry("flight-1")])
                         }
@@ -3351,8 +3436,11 @@ mod tests {
                     .unwrap()
             });
 
-            // Flight 1 follower: joins, then is parked at the wait gate.
+            // Flight 1 follower: cannot enter `fetch` until flight 1 exists, so
+            // it always joins as a waiter (never runs the `unreachable!`), then
+            // is parked at the wait gate.
             let follower = scope.spawn(|| {
+                flight_installed.arrive(Instant::now() + BOUND);
                 cache
                     .fetch(false, || {
                         unreachable!("a follower never computes; it joins flight 1")
@@ -3363,8 +3451,13 @@ mod tests {
 
             // Wait until the follower is parked at the gate (holding flight 1's
             // Arc, not yet reading the outcome), then let flight 1 finish.
-            parked.wait();
+            let deadline = Instant::now() + BOUND;
+            let follower_parked = arrive(&parked, deadline);
             let leader_outcome = leader.join().unwrap();
+            assert!(
+                follower_parked,
+                "the flight-1 follower never reached the wait gate"
+            );
             assert_eq!(leader_outcome, "flight-1");
 
             // Flight 1 is complete and retired. Start a *forced* flight 2 with
@@ -3385,10 +3478,14 @@ mod tests {
             assert_eq!(second, "flight-2", "the forced refresh must recompute");
 
             // Release the parked follower and read what it observed.
-            release.wait();
+            release.arrive(Instant::now() + BOUND);
             follower.join().unwrap()
         });
 
+        assert!(
+            !timed_out.load(SeqCst),
+            "a synchronisation wait timed out — a missed rendezvous must fail, not hang"
+        );
         assert_eq!(
             follower, "flight-1",
             "a parked flight-1 waiter must read its own flight's outcome, not a later leader's"
