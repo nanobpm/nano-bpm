@@ -34,6 +34,7 @@ import {
   createMarketFetchGate,
   marketFetchBegin,
   marketFetchEnd,
+  marketFetchQueueWaiter,
 } from "../lib/marketFetchGate";
 import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
@@ -213,7 +214,24 @@ export default function Extensions() {
       force,
       mustRun: opts?.mutation,
     });
-    if (begin !== "run") return;
+    if (begin !== "run") {
+      // A fetch is already in flight. A redundant background poll carries
+      // nothing new and resolves at once (begin === "drop", not must-run). A
+      // must-run request (a forced "Check now" or a post-mutation reload) was
+      // queued — or coalesced into the queue — so it must AWAIT the queued
+      // reload it depends on actually running. Otherwise an install/update
+      // handler that awaits its post-mutation reload would clear `busy` —
+      // re-enabling the Install/Update button against stale pre-mutation
+      // state — before the reload settles, permitting a duplicate install
+      // (#1330).
+      const mustRun = (opts?.mutation ?? false) || force;
+      if (mustRun) {
+        await new Promise<void>((resolve) =>
+          marketFetchQueueWaiter(marketGate.current, resolve),
+        );
+      }
+      return;
+    }
     setMarketErr(null);
     try {
       // `force` is the explicit "check now": it bypasses the server's cache TTL

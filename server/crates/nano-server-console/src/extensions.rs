@@ -3386,12 +3386,15 @@ mod tests {
             let release = Arc::clone(&release);
             let timed_out = Arc::clone(&timed_out);
             cache.set_on_waiter_wait(move || {
-                // Unbounded here: the main thread guarantees it arrives at both
-                // gates (it releases the follower before joining it), and the
-                // follower's own arrival at `parked` is what the main thread's
-                // *bounded* wait observes — so a missed rendezvous fails there.
-                let far = Instant::now() + Duration::from_secs(3600);
-                if !parked.arrive(far) || !release.arrive(far) {
+                // Bounded on BOTH gates. The happy-path rendezvous is fast, but
+                // on a FAILURE path the main thread can panic before it reaches
+                // `release.arrive` (e.g. the second-flight assertion fails), and
+                // `thread::scope` then joins this still-parked follower while it
+                // unwinds. An unbounded wait would stall that failure reporting
+                // for the full timeout; `BOUND` makes the regression fail
+                // promptly even when `release` is never signalled.
+                if !parked.arrive(Instant::now() + BOUND) || !release.arrive(Instant::now() + BOUND)
+                {
                     timed_out.store(true, SeqCst);
                 }
             });

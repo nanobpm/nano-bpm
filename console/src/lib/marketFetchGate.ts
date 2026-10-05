@@ -31,10 +31,33 @@ export interface MarketFetchGate {
    * never lost by coalescing.
    */
   queued: null | { force: boolean };
+  /**
+   * Resolvers for must-run callers (a forced "Check now" or a post-mutation
+   * reload) that were queued — or coalesced into the queue — behind the
+   * in-flight fetch. They must **not** resolve until the queued reload they
+   * depend on has actually run: otherwise an install/update handler that
+   * `await`s its post-mutation reload clears `busy` — re-enabling the
+   * Install/Update button against stale pre-mutation state — before the reload
+   * settles, permitting a duplicate installation (#1330). Accumulates for the
+   * currently pending `queued` slot.
+   */
+  queuedWaiters: Array<() => void>;
+  /**
+   * Resolvers captured for the run that is currently draining the queue — the
+   * waiters that accumulated while that request was queued. Resolved when that
+   * draining run settles (its `marketFetchEnd`), i.e. once the reload the
+   * callers depend on has actually completed.
+   */
+  drainingWaiters: Array<() => void>;
 }
 
 export function createMarketFetchGate(): MarketFetchGate {
-  return { inFlight: false, queued: null };
+  return {
+    inFlight: false,
+    queued: null,
+    queuedWaiters: [],
+    drainingWaiters: [],
+  };
 }
 
 /**
@@ -79,8 +102,30 @@ export function marketFetchBegin(
 }
 
 /**
+ * Register a resolver for a must-run request (a forced "Check now" or a
+ * post-mutation reload) that could not run immediately — it was queued, or
+ * coalesced into the queue, behind the in-flight fetch. The resolver fires once
+ * the queued reload it is waiting on has run to completion, so the caller can
+ * `await` the reload it depends on rather than resolving against pre-mutation
+ * state (#1330). Only a redundant background poll (dropped, never must-run)
+ * resolves immediately and registers no waiter.
+ */
+export function marketFetchQueueWaiter(
+  gate: MarketFetchGate,
+  resolve: () => void,
+): void {
+  gate.queuedWaiters.push(resolve);
+}
+
+/**
  * Settle the in-flight fetch and report the queued request (if any) that must
  * run next, consuming the queue marker. Call exactly once per `"run"`.
+ *
+ * Also resolves the waiters captured for the run that just settled (the
+ * draining run). If another request is queued, the waiters that accumulated
+ * while it was queued become the next draining set — resolved when *that* run
+ * settles — so a must-run caller never resolves before the reload it depends on
+ * has actually completed.
  */
 export function marketFetchEnd(gate: MarketFetchGate): {
   runQueued: null | { force: boolean };
@@ -88,5 +133,9 @@ export function marketFetchEnd(gate: MarketFetchGate): {
   gate.inFlight = false;
   const runQueued = gate.queued;
   gate.queued = null;
+  const settled = gate.drainingWaiters;
+  gate.drainingWaiters = runQueued ? gate.queuedWaiters : [];
+  gate.queuedWaiters = [];
+  for (const resolve of settled) resolve();
   return { runQueued };
 }

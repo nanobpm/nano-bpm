@@ -4,6 +4,7 @@ import {
   createMarketFetchGate,
   marketFetchBegin,
   marketFetchEnd,
+  marketFetchQueueWaiter,
 } from "./marketFetchGate.ts";
 
 test("a first request runs; a concurrent poll is dropped", () => {
@@ -60,4 +61,72 @@ test("a forced request on an idle gate runs immediately", () => {
   const gate = createMarketFetchGate();
   assert.equal(marketFetchBegin(gate, { force: true }), "run");
   assert.deepEqual(marketFetchEnd(gate), { runQueued: null });
+});
+
+test("a queued must-run request's waiter resolves only when the drained run settles", () => {
+  const gate = createMarketFetchGate();
+  // A background poll is in flight…
+  assert.equal(marketFetchBegin(gate, {}), "run");
+  // …when a post-mutation reload is queued behind it. Its caller registers a
+  // waiter so it can await the reload (the install handler must keep `busy`
+  // set until the reload reflecting its mutation has actually run).
+  assert.equal(marketFetchBegin(gate, { mustRun: true }), "queued");
+  let resolved = false;
+  marketFetchQueueWaiter(gate, () => {
+    resolved = true;
+  });
+  // The poll settles: the queued reload is reported but has NOT run yet, so the
+  // waiter MUST still be pending — resolving here would clear `busy` against
+  // pre-mutation state (#1330).
+  assert.deepEqual(marketFetchEnd(gate), { runQueued: { force: false } });
+  assert.equal(
+    resolved,
+    false,
+    "waiter must not resolve before the drain runs",
+  );
+  // The drain run starts and settles — now, and only now, the waiter resolves.
+  assert.equal(marketFetchBegin(gate, { mustRun: true }), "run");
+  assert.deepEqual(marketFetchEnd(gate), { runQueued: null });
+  assert.equal(
+    resolved,
+    true,
+    "waiter resolves once the drained reload settles",
+  );
+});
+
+test("must-run requests coalesced into the queue all await the same drain", () => {
+  const gate = createMarketFetchGate();
+  assert.equal(marketFetchBegin(gate, {}), "run");
+  // First mutation reload queues…
+  assert.equal(marketFetchBegin(gate, { mustRun: true }), "queued");
+  let first = false;
+  let second = false;
+  marketFetchQueueWaiter(gate, () => {
+    first = true;
+  });
+  // …a second mutation reload coalesces into the queue (returns "drop") but is
+  // still must-run, so it registers a waiter on the same drain.
+  assert.equal(marketFetchBegin(gate, { mustRun: true }), "drop");
+  marketFetchQueueWaiter(gate, () => {
+    second = true;
+  });
+  assert.deepEqual(marketFetchEnd(gate), { runQueued: { force: false } });
+  assert.equal(first, false);
+  assert.equal(second, false);
+  // The drain run settles — both coalesced waiters resolve together.
+  assert.equal(marketFetchBegin(gate, { mustRun: true }), "run");
+  assert.deepEqual(marketFetchEnd(gate), { runQueued: null });
+  assert.equal(first, true, "first coalesced waiter resolves");
+  assert.equal(second, true, "second coalesced waiter resolves");
+});
+
+test("a redundant background poll registers no waiter and leaves the queue empty", () => {
+  const gate = createMarketFetchGate();
+  assert.equal(marketFetchBegin(gate, {}), "run");
+  // A plain poll tick while a fetch is in flight is dropped — the view resolves
+  // it immediately and registers no waiter.
+  assert.equal(marketFetchBegin(gate, {}), "drop");
+  assert.deepEqual(marketFetchEnd(gate), { runQueued: null });
+  assert.deepEqual(gate.queuedWaiters, []);
+  assert.deepEqual(gate.drainingWaiters, []);
 });
