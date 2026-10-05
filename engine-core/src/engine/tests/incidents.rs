@@ -2317,3 +2317,60 @@ fn adhoc_call_activity_tool_preserves_chained_output_projection_across_type_inci
         "the redrive's intermediate must match the clean completion",
     );
 }
+
+#[test]
+fn subprocess_input_mapping_failure_reenters_the_body_on_resolve() {
+    // A sub-process whose INPUT `zeebe:ioMapping` fails parks ACTIVATED on an
+    // `IoMapping` incident with NO inner token yet. Fixing the variable and
+    // resolving must re-run the activation (#946 `RetryActivation`): re-apply the
+    // inputs and ENTER the body (start event → inner job). It must never be
+    // mistaken for a drained sub-process and completed straight past its body —
+    // that silently skips the sub-process's work (a guard incident an operator
+    // repaired would then advance the flow as if the node had run).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "sub-scope",
+            vars(&[("seed", Value::Str("oops".into()))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "expected one active incident: {active:?}");
+    assert_eq!(active[0].kind, state::IncidentKind::IoMapping);
+    assert_eq!(engine.state().jobs.len(), 0, "no inner job while parked");
+    // Parked, not skipped: the instance has not run past the sub-process.
+    assert!(
+        !engine.is_completed(key),
+        "a sub-process parked on an input-mapping incident must not complete"
+    );
+    let incident_key = engine.incidents()[0].key;
+
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            HashMap::from([("seed".to_string(), Value::Int(4))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(engine.instance(key).unwrap().incidents.is_empty());
+    assert!(
+        !engine.is_completed(key),
+        "the sub-process must not complete past its body on resolve"
+    );
+    let jobs = engine.activate_jobs("work", "w", 1, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "resolving re-entered the body: the inner job exists"
+    );
+    assert_eq!(jobs[0].variables.get("scoped"), Some(&Value::Int(5)));
+}
