@@ -121,40 +121,105 @@ const CREATE_INBOX_SQL: &str = "CREATE TABLE IF NOT EXISTS trigger_inbox (\
 /// the table has been created for a project we skip the spawn entirely; a
 /// failed attempt is *not* memoised, so a project whose datasource isn't ready
 /// yet retries on the next call.
+///
+/// The memo is keyed by name but **generation-checked** on insert: a project
+/// name does not identify a stable datasource (rename, datasource reconfig, and
+/// delete+recreate all swap the DB under a reused name), and the `CREATE` spawn
+/// is not atomic with the memo write. [`forget_inbox`] bumps the project's
+/// generation, so an in-flight `ensure_inbox` that was mid-`CREATE` when the
+/// datasource was torn down cannot re-insert a now-stale marker for the fresh
+/// datasource — its continuation observes the generation bump and skips the
+/// write, forcing a re-`CREATE` on the next call.
 pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
-    if ensure_inbox_memo().lock().unwrap().contains(project) {
-        return Ok(());
-    }
+    // Fast path: hold the lock only to read the memo + generation, never across
+    // the `await`. Two concurrent callers may both miss the memo and each spawn
+    // a `CREATE` — `CREATE TABLE IF NOT EXISTS` makes that rare double-spawn
+    // harmless, and both then insert under the same generation.
+    let generation = {
+        let memo = ensure_inbox_memo().lock().unwrap();
+        if memo.ensured.contains(project) {
+            return Ok(());
+        }
+        memo.generation(project)
+    };
     projects::run_data_op(project, json!({ "op": "exec", "sql": CREATE_INBOX_SQL })).await?;
-    ensure_inbox_memo()
-        .lock()
-        .unwrap()
-        .insert(project.to_string());
+    // Insert only if the generation we ensured under is still current — i.e.
+    // no `forget_inbox` (delete / rename / datasource reconfig) landed while
+    // the `CREATE` was in flight. A bumped generation means the table we just
+    // created may belong to a torn-down datasource, so we must not memo it.
+    let mut memo = ensure_inbox_memo().lock().unwrap();
+    if memo.generation(project) == generation {
+        memo.ensured.insert(project.to_string());
+    }
     Ok(())
 }
 
 /// Drop the memoised "inbox ensured" marker for `project`, so the next
-/// [`ensure_inbox`] re-creates the table. Called when a project's datasource is
-/// reset/torn down (project delete, test setup), so the memo can never mask a
-/// vanished table.
+/// [`ensure_inbox`] re-creates the table. Called whenever a project's
+/// datasource may have changed out from under the memo — project delete,
+/// rename, or a `nano.app.json` save that selects a fresh default database —
+/// and bumps the project's generation so any in-flight [`ensure_inbox`] for the
+/// old datasource cannot resurrect a stale marker.
 pub(crate) fn forget_inbox(project: &str) {
-    ensure_inbox_memo().lock().unwrap().remove(project);
+    let mut memo = ensure_inbox_memo().lock().unwrap();
+    memo.ensured.remove(project);
+    // Bump the generation so an `ensure_inbox` currently awaiting its `CREATE`
+    // for the pre-teardown datasource skips its memo insert.
+    let next = memo.generations.entry(project.to_string()).or_insert(0);
+    *next += 1;
 }
 
-/// The process-wide "inbox ensured" memo, shared by [`ensure_inbox`] and
-/// [`forget_inbox`]. A project appears here once its `trigger_inbox` table has
-/// been created, so later calls skip the per-op `urban data` spawn (#1340). A
-/// plain `std::sync::Mutex` (never held across an `await`) keeps
-/// [`forget_inbox`] callable from synchronous teardown paths.
-fn ensure_inbox_memo() -> &'static std::sync::Mutex<HashSet<String>> {
-    static ENSURED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
-    ENSURED.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+/// The process-wide "inbox ensured" memo state, shared by [`ensure_inbox`] and
+/// [`forget_inbox`]. A project appears in `ensured` once its `trigger_inbox`
+/// table has been created, so later calls skip the per-op `urban data` spawn
+/// (#1340). `generations` is the invalidation counter that lets an in-flight
+/// `ensure_inbox` detect a concurrent teardown. A plain `std::sync::Mutex`
+/// (never held across an `await`) keeps [`forget_inbox`] callable from
+/// synchronous teardown paths.
+#[derive(Default)]
+struct InboxMemo {
+    ensured: HashSet<String>,
+    generations: HashMap<String, u64>,
+}
+
+impl InboxMemo {
+    /// The current invalidation generation for `project` (0 if never torn down).
+    fn generation(&self, project: &str) -> u64 {
+        self.generations.get(project).copied().unwrap_or(0)
+    }
+}
+
+fn ensure_inbox_memo() -> &'static std::sync::Mutex<InboxMemo> {
+    static ENSURED: OnceLock<std::sync::Mutex<InboxMemo>> = OnceLock::new();
+    ENSURED.get_or_init(|| std::sync::Mutex::new(InboxMemo::default()))
 }
 
 /// Test-only: whether `project`'s inbox is currently memoised as created.
 #[cfg(test)]
 pub(crate) fn inbox_is_memoised(project: &str) -> bool {
-    ensure_inbox_memo().lock().unwrap().contains(project)
+    ensure_inbox_memo()
+        .lock()
+        .unwrap()
+        .ensured
+        .contains(project)
+}
+
+/// Test-only: the current invalidation generation for `project`.
+#[cfg(test)]
+pub(crate) fn inbox_generation(project: &str) -> u64 {
+    ensure_inbox_memo().lock().unwrap().generation(project)
+}
+
+/// Test-only: mark `project`'s inbox as ensured under the current generation,
+/// without spawning a `CREATE` — so lifecycle-invalidation tests can seed the
+/// memo without a JS runtime.
+#[cfg(test)]
+pub(crate) fn ensure_inbox_memo_for_test(project: &str) {
+    ensure_inbox_memo()
+        .lock()
+        .unwrap()
+        .ensured
+        .insert(project.to_string());
 }
 
 /// The outcome of [`enqueue`]: `enqueued` is false when the idempotency key was
@@ -1538,6 +1603,49 @@ mod tests {
         // table is re-created on a fresh datasource rather than trusted stale.
         forget_inbox(&name);
         assert!(!inbox_is_memoised(&name), "forget_inbox clears the memo");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_inbox_does_not_resurrect_a_marker_forgotten_mid_create() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        // The memo write is not atomic with the `CREATE` spawn: an in-flight
+        // `ensure_inbox` can still be awaiting its op when `forget_inbox`
+        // (project delete / rename / datasource reconfig) tears the datasource
+        // down. The continuation must NOT re-insert a marker for the now-stale
+        // generation, or a recreated project would skip the `CREATE` and fail on
+        // a missing `trigger_inbox` table. We can't intercept the await, so we
+        // drive the exact interleaving: forget *between* the create and a
+        // re-ensure, and assert the memo reflects only the current generation.
+        let name = setup_app("");
+        forget_inbox(&name);
+        let gen0 = inbox_generation(&name);
+
+        ensure_inbox(&name).await.expect("first ensure creates");
+        assert!(inbox_is_memoised(&name));
+        // The ensure did not bump the generation — only a teardown does.
+        assert_eq!(inbox_generation(&name), gen0);
+
+        // Teardown mid-lifecycle: the marker is dropped AND the generation
+        // bumps, so any in-flight ensure from the old generation would skip its
+        // insert.
+        forget_inbox(&name);
+        assert!(!inbox_is_memoised(&name));
+        assert_eq!(
+            inbox_generation(&name),
+            gen0 + 1,
+            "forget_inbox bumps the invalidation generation"
+        );
+
+        // The next ensure re-creates against the fresh datasource and re-memoises
+        // under the new generation.
+        ensure_inbox(&name).await.expect("re-ensure after forget");
+        assert!(inbox_is_memoised(&name));
+        assert_eq!(inbox_generation(&name), gen0 + 1);
     }
 
     // --- pack-source driver auto-launch (ADR 0025 phase 4) -----------------

@@ -4310,7 +4310,16 @@ pub async fn project_rename(name: &str, new_name: &str) -> ApiResult {
         ));
     }
     match projects::rename_project(name, new_name.trim()) {
-        Ok(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
+        Ok(cfg) => {
+            // A rename moves the project (and its datasource) to a new name and
+            // frees the old one. Drop the old name's memoised "inbox ensured"
+            // marker (#1340): a fresh project later created under the old name
+            // gets a brand-new datasource, and a stale marker would make
+            // `ensure_inbox` skip the `CREATE`, so enqueue/drain fail on the
+            // missing `trigger_inbox` table.
+            triggers::forget_inbox(name);
+            Ok(serde_json::to_value(cfg).unwrap())
+        }
         Err(e) if e.contains("already exists") => Err((StatusCode::CONFLICT, e)),
         Err(e) if e.contains("no such") => Err((StatusCode::NOT_FOUND, e)),
         Err(e) if e.contains("invalid") => Err((StatusCode::BAD_REQUEST, e)),
@@ -5247,7 +5256,17 @@ pub fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
         let _ = std::fs::create_dir_all(parent);
     }
     match std::fs::write(&path, body) {
-        Ok(()) => Ok(serde_json::Value::Null),
+        Ok(()) => {
+            // Saving the manifest can repoint the project's default datasource
+            // (`data.default` / `data.sources`), swapping the DB out from under
+            // the memoised "inbox ensured" marker (#1340). Drop it so the next
+            // `ensure_inbox` re-creates `trigger_inbox` on the fresh datasource
+            // instead of skipping the `CREATE` and failing on a missing table.
+            if rel == "nano.app.json" {
+                triggers::forget_inbox(name);
+            }
+            Ok(serde_json::Value::Null)
+        }
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save file: {e}"),
@@ -5281,6 +5300,73 @@ pub fn project_path_create(name: &str, rel: &str, dir: bool) -> ApiResult {
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not create: {e}"),
         )),
+    }
+}
+
+#[cfg(test)]
+mod inbox_memo_invalidation_tests {
+    //! Regression tests for the trigger-inbox memo (#1340): the memo is keyed by
+    //! project *name*, but a name does not identify a stable datasource — rename
+    //! and datasource-reconfig swap the DB under a reused name. Every lifecycle
+    //! transition that changes the datasource must invalidate the memo, or a
+    //! fresh datasource skips the `CREATE` and fails on a missing
+    //! `trigger_inbox` table.
+    use super::*;
+
+    fn temp_root() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as AOrd};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "nano-lib-inbox-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        unsafe {
+            std::env::set_var("NANOBPMN_PROJECTS_DIR", &p);
+        }
+        p
+    }
+
+    #[tokio::test]
+    async fn rename_invalidates_the_old_names_inbox_memo() {
+        let _root = temp_root();
+        projects::create_project("renameme", "", "starter").unwrap();
+        // Simulate a previously-ensured inbox under the old name.
+        triggers::ensure_inbox_memo_for_test("renameme");
+        assert!(triggers::inbox_is_memoised("renameme"));
+
+        project_rename("renameme", "renamed").await.unwrap();
+        assert!(
+            !triggers::inbox_is_memoised("renameme"),
+            "renaming a project drops the old name's inbox memo so a fresh \
+             project reusing the name re-creates its table"
+        );
+    }
+
+    #[test]
+    fn saving_the_manifest_invalidates_the_inbox_memo() {
+        let _root = temp_root();
+        projects::create_project("cfgsave", "", "starter").unwrap();
+        triggers::ensure_inbox_memo_for_test("cfgsave");
+        assert!(triggers::inbox_is_memoised("cfgsave"));
+
+        // A `nano.app.json` save can repoint the default datasource.
+        project_file_save("cfgsave", "nano.app.json", "{ \"data\": {} }").unwrap();
+        assert!(
+            !triggers::inbox_is_memoised("cfgsave"),
+            "saving nano.app.json drops the inbox memo so the next ensure \
+             re-creates the table on the fresh datasource"
+        );
+
+        // An unrelated file save must NOT invalidate the memo.
+        triggers::ensure_inbox_memo_for_test("cfgsave");
+        project_file_save("cfgsave", "README.md", "hi").unwrap();
+        assert!(
+            triggers::inbox_is_memoised("cfgsave"),
+            "a non-manifest save leaves the inbox memo intact"
+        );
     }
 }
 
