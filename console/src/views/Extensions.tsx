@@ -203,12 +203,17 @@ export default function Extensions() {
     registerFileTypesFromOverview(next);
     setIntellisenseFromOverview(next);
   };
-  const loadMarket = async (force = false) => {
+  const loadMarket = async (force = false, opts?: { mutation?: boolean }) => {
     // Don't stack a new marketplace fetch on top of an unfinished one: the
     // server shells out to npm per installed pack, and overlapping fetches are
     // the feedback loop that swap-thrashed a small host (#1330). A forced
-    // "Check now" during an in-flight fetch is queued and run when it settles.
-    if (marketFetchBegin(marketGate.current, force) !== "run") return;
+    // "Check now" OR a post-mutation reload during an in-flight fetch is queued
+    // and run when it settles; only a redundant background poll tick is dropped.
+    const begin = marketFetchBegin(marketGate.current, {
+      force,
+      mustRun: opts?.mutation,
+    });
+    if (begin !== "run") return;
     setMarketErr(null);
     try {
       // `force` is the explicit "check now": it bypasses the server's cache TTL
@@ -224,10 +229,13 @@ export default function Extensions() {
     } catch (e) {
       setMarketErr(String(e));
     } finally {
-      if (marketFetchEnd(marketGate.current).runQueuedForce) {
-        // A "Check now" click arrived while this fetch was in flight — run
-        // the forced refresh it asked for now that the gate is free.
-        void loadMarket(true);
+      const { runQueued } = marketFetchEnd(marketGate.current);
+      if (runQueued) {
+        // A "Check now" click or a post-mutation reload arrived while this
+        // fetch was in flight — run the queued request now that the gate is
+        // free. It is must-run (it was only queued because it mattered), so
+        // re-issue it as such.
+        void loadMarket(runQueued.force, { mutation: true });
       }
     }
   };
@@ -285,7 +293,9 @@ export default function Extensions() {
     try {
       await installExtension({ body: { pkg }, throwOnError: true });
       await load();
-      await loadMarket();
+      // Post-mutation reload: must reflect the just-installed/updated pack, so
+      // it must not be dropped if a background poll is in flight (#1330).
+      await loadMarket(false, { mutation: true });
       if (opts?.afterUpdate && before !== null) {
         // Take a *fresh* authoritative post-update snapshot rather than trusting
         // `loadProjects()`, which swallows a failed refresh and returns the stale
@@ -339,7 +349,9 @@ export default function Extensions() {
     try {
       await removeExtension({ body: { pkg: id }, throwOnError: true });
       await load();
-      await loadMarket();
+      // Post-mutation reload: must reflect the removal even if a background
+      // poll is in flight (#1330).
+      await loadMarket(false, { mutation: true });
       await loadProjects();
     } catch (e) {
       setErr(String(e));
