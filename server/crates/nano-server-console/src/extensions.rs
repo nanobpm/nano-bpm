@@ -1991,45 +1991,43 @@ impl MarketplaceCache {
         // and take ownership of a fresh `Flight`.
         let flight = {
             let mut st = self.state.lock().unwrap();
-            loop {
-                if !force
-                    && let Some((at, v)) = &st.value
-                    && at.elapsed() < self.ttl
-                {
-                    return Ok(std::sync::Arc::clone(v));
-                }
-                if let Some(flight) = &st.in_flight {
-                    // Someone else is already recomputing. Join *that exact*
-                    // flight and wait on its own condvar — even a forced caller,
-                    // because the in-flight run is itself producing a fresh
-                    // listing. The outcome is shared with every waiter, failure
-                    // included: a failed `npm search` is answered to the whole
-                    // burst at once rather than re-attempted serially by each
-                    // waiter. Capturing the flight handle (not a shared slot a
-                    // later leader could clear) means a waiter always reads the
-                    // result of the run it joined — never a newer leader's.
-                    let flight = std::sync::Arc::clone(flight);
-                    drop(st);
-                    #[cfg(test)]
-                    self.note_waiter_joined();
-                    let mut outcome = flight.outcome.lock().unwrap();
-                    while outcome.is_none() {
-                        outcome = flight.ready.wait(outcome).unwrap();
-                    }
-                    return outcome
-                        .as_ref()
-                        .expect("a settled flight always carries an outcome")
-                        .clone();
-                }
-                // Become the leader for this recompute: install a fresh flight
-                // that this call owns and every concurrent joiner will wait on.
-                let flight = std::sync::Arc::new(Flight {
-                    outcome: std::sync::Mutex::new(None),
-                    ready: std::sync::Condvar::new(),
-                });
-                st.in_flight = Some(std::sync::Arc::clone(&flight));
-                break flight;
+            if !force
+                && let Some((at, v)) = &st.value
+                && at.elapsed() < self.ttl
+            {
+                return Ok(std::sync::Arc::clone(v));
             }
+            if let Some(flight) = &st.in_flight {
+                // Someone else is already recomputing. Join *that exact*
+                // flight and wait on its own condvar — even a forced caller,
+                // because the in-flight run is itself producing a fresh
+                // listing. The outcome is shared with every waiter, failure
+                // included: a failed `npm search` is answered to the whole
+                // burst at once rather than re-attempted serially by each
+                // waiter. Capturing the flight handle (not a shared slot a
+                // later leader could clear) means a waiter always reads the
+                // result of the run it joined — never a newer leader's.
+                let flight = std::sync::Arc::clone(flight);
+                drop(st);
+                #[cfg(test)]
+                self.note_waiter_joined();
+                let mut outcome = flight.outcome.lock().unwrap();
+                while outcome.is_none() {
+                    outcome = flight.ready.wait(outcome).unwrap();
+                }
+                return outcome
+                    .as_ref()
+                    .expect("a settled flight always carries an outcome")
+                    .clone();
+            }
+            // Become the leader for this recompute: install a fresh flight
+            // that this call owns and every concurrent joiner will wait on.
+            let flight = std::sync::Arc::new(Flight {
+                outcome: std::sync::Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+            });
+            st.in_flight = Some(std::sync::Arc::clone(&flight));
+            flight
         };
 
         // Catch an unwind so a panicking computation can never strand the
