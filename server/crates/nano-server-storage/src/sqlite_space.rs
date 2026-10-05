@@ -50,12 +50,16 @@ pub fn freelist_bytes(conn: &Connection) -> u64 {
 /// Setting the pragma only *records* the request; the accompanying `VACUUM`
 /// rewrites the database to install the auto-vacuum pointer map and actually switch
 /// mode (a new database is fine before any table exists, but an existing one needs
-/// the VACUUM). On a fresh or just-wiped (empty) database this VACUUM is effectively
-/// free, so this is intended for wipe-on-open caches like [`crate::varspill`];
-/// callers holding large persistent data should instead set the pragma at creation
-/// time to avoid a full rewrite.
+/// the VACUUM). The VACUUM runs only when the database is not already
+/// `INCREMENTAL`, so it is paid once per store (free on a fresh, empty file) and
+/// re-opening a populated store — e.g. [`crate::varspill`], whose rows survive a
+/// restart (#1331) — never rewrites it.
 pub fn enable_incremental_auto_vacuum(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+    // auto_vacuum: 0 = NONE, 1 = FULL, 2 = INCREMENTAL.
+    let mode: i64 = conn.query_row("PRAGMA auto_vacuum", [], |r| r.get(0))?;
+    if mode != 2 {
+        conn.execute_batch("PRAGMA auto_vacuum=INCREMENTAL; VACUUM;")?;
+    }
     Ok(())
 }
 
@@ -223,5 +227,34 @@ mod tests {
             file_after <= live + 64 * 1024,
             "file collapses to ~live after draining (live={live}, after={file_after})"
         );
+    }
+
+    // The `mode == 2` early-return is the entire guard against rewriting a
+    // populated database on every reopen (#1331): once a store is INCREMENTAL,
+    // `enable_incremental_auto_vacuum` must NOT run `VACUUM` again. Prove it by
+    // calling the helper a second time *inside an open transaction* — SQLite
+    // rejects `VACUUM` within a transaction, so the second call succeeds only
+    // because it skips the VACUUM.
+    #[test]
+    fn enable_incremental_auto_vacuum_skips_vacuum_when_already_incremental() {
+        let conn = open_incremental();
+        // Sanity: the helper left the db in INCREMENTAL mode.
+        let mode: i64 = conn
+            .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, 2, "precondition: already INCREMENTAL");
+
+        // A direct VACUUM inside a transaction fails — the control proving the
+        // transaction really does reject it.
+        conn.execute_batch("BEGIN").unwrap();
+        assert!(
+            conn.execute_batch("VACUUM").is_err(),
+            "control: VACUUM is rejected inside a transaction"
+        );
+        // The helper must succeed here, which is only possible because it skipped
+        // the VACUUM (mode is already 2).
+        enable_incremental_auto_vacuum(&conn)
+            .expect("re-enabling on an already-incremental db must not VACUUM");
+        conn.execute_batch("ROLLBACK").unwrap();
     }
 }

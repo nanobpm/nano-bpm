@@ -11,9 +11,19 @@
 //! page cache underneath it) gives the tiering for free: a working set that fits
 //! the cache is served at memory speed, and only a genuinely large spill touches
 //! the disk — exactly the "memory/fs fusion" the spill is after, with no manual
-//! eviction logic. `synchronous=NORMAL` is safe here because the spill store is a
-//! *derived* cache: the variables are already durable in the journal (and the
-//! read model), so a lost spill page is reconstructable, never authoritative.
+//! eviction logic. `synchronous=NORMAL` is safe here because, in the steady
+//! state, the spill store is a *derived* cache: a self-contained snapshot
+//! (#1331) folds every spilled/cold payload back into the engine state it
+//! persists, so the variables are durable in the journal and a lost spill page
+//! is reconstructable from it.
+//!
+//! The one exception is **legacy recovery**: a snapshot written by an engine
+//! predating self-contained snapshots records a spilled instance as an empty
+//! placeholder, so after log compaction the spill row here is the *only*
+//! surviving copy of that instance's variables. Boot therefore never wipes these
+//! rows (see [`VarSpillStore::open`]), and a placeholder snapshot rehydrates
+//! from them on restart. Until every pre-#1331 snapshot has aged out, treat this
+//! store as authoritative for those rows — do not wipe or weaken it.
 //!
 //! ## Returning freed space to the OS
 //!
@@ -240,13 +250,34 @@ impl VarSpillStore {
              PRAGMA synchronous=NORMAL;
              PRAGMA wal_autocheckpoint=0;
              CREATE TABLE IF NOT EXISTS spill (key INTEGER PRIMARY KEY, vars TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS cold (key INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);
-             DELETE FROM spill;
-             DELETE FROM cold;",
+             CREATE TABLE IF NOT EXISTS cold (key INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);",
         )?;
-        // Convert to INCREMENTAL auto-vacuum now that the tables are empty (the
-        // wipe above), so the VACUUM is near-free and freed pages can later be
-        // handed back to the OS instead of plateauing at the high-water mark.
+        // Rows are deliberately NOT wiped at boot (#1331). A snapshot written by
+        // an engine predating self-contained snapshots records spilled instances
+        // as empty placeholders, so these rows are the only surviving copy of
+        // their variables; wiping them destroyed that data on every restart. A
+        // leftover row is inert: a spill row is only read for an instance whose
+        // live `variables_spilled` flag is set, and a cold row only through the
+        // live routing index — both of which a fresh spill re-writes (`put` /
+        // `put_cold` replace). Rows for instances that reach a terminal state are
+        // dropped by `forget` at eviction, so the store stays bounded by the
+        // live set.
+        //
+        // That bound is **best-effort across crashes** (accepted, #1338): a crash
+        // between writing a cold/spill row and the instance reaching a terminal
+        // state (or a row written by an engine predating self-contained
+        // snapshots, whose routing index was never persisted) leaves an orphaned
+        // row that `forget` never reaches, because the in-RAM cold index is not
+        // rebuilt at boot. A post-recovery reconciliation/GC that deletes rows no
+        // longer referenced by live state — while preserving rows still
+        // referenced by legacy spilled flags — is deliberately **not** added in
+        // this PR: it carries durability/ordering implications (what is
+        // authoritative, when to run it, how to avoid deleting a row a concurrent
+        // recovery still needs) and is tracked separately in #1338.
+        //
+        // Convert to INCREMENTAL auto-vacuum so freed pages can later be handed
+        // back to the OS instead of plateauing at the high-water mark (a one-time
+        // VACUUM on a store that predates the conversion).
         enable_incremental_auto_vacuum(&conn)?;
         let conn = Arc::new(Mutex::new(conn));
         let activity = Arc::new(AtomicU64::new(0));
@@ -454,24 +485,33 @@ impl VarSpillStore {
         Ok(())
     }
 
+    /// Returns the payload for `key` **without removing it**, or `None` if absent.
+    /// Used to fold spilled payloads into a self-contained snapshot (#1331): the
+    /// live instance stays spilled, so its row must survive the read.
+    pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
+        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
+        drop(conn);
+        serde_json::from_str(&json).ok()
+    }
+
     /// Removes and returns the payload for `key`, or `None` if absent. A spilled
     /// instance is rehydrated exactly once (on activation), so taking the row on
     /// read keeps the store bounded to the still-cold backlog.
     pub fn take(&self, key: Key) -> Option<HashMap<String, Value>> {
         let conn = self.conn.lock().expect("spill store poisoned");
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT vars FROM spill WHERE key = ?1",
-                params![key as i64],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()?;
-        let json = json?;
+        let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM spill WHERE key = ?1", params![key as i64]);
         drop(conn);
         self.note_activity();
         serde_json::from_str(&json).ok()
+    }
+
+    /// The single-column text row for `key` under `sql`, or `None` if absent.
+    fn select(conn: &Connection, sql: &str, key: Key) -> Option<String> {
+        conn.query_row(sql, params![key as i64], |r| r.get(0))
+            .optional()
+            .ok()?
     }
 
     /// Persists a whole-instance cold [`InstanceSnapshot`] under `key`, replacing
@@ -490,21 +530,23 @@ impl VarSpillStore {
         Ok(())
     }
 
+    /// Returns the cold snapshot for `key` **without removing it**, or `None` if
+    /// absent. Used to fold a still-cold instance into a self-contained snapshot
+    /// (#1331) while it stays off-heap.
+    pub fn get_cold(&self, key: Key) -> Option<InstanceSnapshot> {
+        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
+        drop(conn);
+        serde_json::from_str(&json).ok()
+    }
+
     /// Removes and returns the cold snapshot for `key`, or `None` if absent.
     /// Destructive on read (like [`take`](VarSpillStore::take)): rehydrating an
     /// instance takes its snapshot back out, so the cold table holds only the
     /// still-dormant backlog.
     pub fn take_cold(&self, key: Key) -> Option<InstanceSnapshot> {
         let conn = self.conn.lock().expect("spill store poisoned");
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT snapshot FROM cold WHERE key = ?1",
-                params![key as i64],
-                |r| r.get(0),
-            )
-            .optional()
-            .ok()?;
-        let json = json?;
+        let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
         drop(conn);
         self.note_activity();
@@ -623,6 +665,36 @@ mod tests {
         assert_eq!(got.get("data"), Some(&Value::Str("hello".to_string())));
     }
 
+    // #1331: the store's rows must survive a process restart (re-open), because
+    // a snapshot written before self-contained snapshots may still reference
+    // them; and `get`/`get_cold` must read without consuming.
+    #[test]
+    fn rows_survive_reopen_and_get_is_non_destructive() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let mut vars = HashMap::new();
+        vars.insert("k".to_string(), Value::Int(7));
+        {
+            let store = VarSpillStore::open(Some(&path)).unwrap();
+            store.put(1, &vars).unwrap();
+        }
+        let store = VarSpillStore::open(Some(&path)).unwrap();
+        assert_eq!(store.get(1), Some(vars.clone()), "row survives re-open");
+        assert_eq!(store.get(1), Some(vars.clone()), "get does not consume");
+        assert_eq!(store.take(1), Some(vars), "take still returns it");
+        assert!(store.get(1).is_none(), "take consumed it");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn take_is_destructive_and_absent_is_none() {
         let store = VarSpillStore::open(None).unwrap();
@@ -632,16 +704,12 @@ mod tests {
         assert!(store.take(999).is_none(), "absent key is None");
     }
 
-    #[test]
-    fn cold_snapshot_round_trips() {
-        use std::sync::Arc;
-
+    fn cold_snapshot(key: Key, payload: &str) -> InstanceSnapshot {
         use nanobpmn_engine_core::{ProcessInstance, ProcessInstanceState};
 
-        let store = VarSpillStore::open(None).unwrap();
-        let snapshot = InstanceSnapshot {
+        InstanceSnapshot {
             instance: ProcessInstance {
-                key: 42,
+                key,
                 process_id: "order".to_string(),
                 process_definition_key: 0,
                 state: ProcessInstanceState::Active,
@@ -653,7 +721,7 @@ mod tests {
                 suspended_at: None,
                 active: HashMap::new(),
                 scopes: HashMap::new(),
-                variables: Arc::new(vars("payload")),
+                variables: Arc::new(vars(payload)),
                 join_counts: HashMap::new(),
                 join_flow_arrivals: HashMap::new(),
                 join_instances: HashMap::new(),
@@ -675,12 +743,61 @@ mod tests {
             conditional_subscriptions: Vec::new(),
             user_tasks: Vec::new(),
             incidents: Vec::new(),
-        };
+        }
+    }
+
+    #[test]
+    fn cold_snapshot_round_trips() {
+        let store = VarSpillStore::open(None).unwrap();
+        let snapshot = cold_snapshot(42, "payload");
         store.put_cold(42, &snapshot).unwrap();
         let got = store.take_cold(42).expect("snapshot present");
         assert_eq!(got, snapshot);
         assert!(store.take_cold(42).is_none(), "take_cold is destructive");
         assert!(store.take_cold(7).is_none(), "absent key is None");
+    }
+
+    // #1331: the new cold-read contract — a cold row must survive a process
+    // restart (re-open) and repeated non-destructive `get_cold` calls, exactly as
+    // the variable-spill reopen test above covers `get`. Without this guard the
+    // file-backed cold tier has no proof a still-cold instance is recoverable
+    // after a reboot.
+    #[test]
+    fn cold_snapshot_survives_reopen_and_repeated_get_cold() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-cold-reopen-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let snapshot = cold_snapshot(9, "cold-payload");
+        {
+            let store = VarSpillStore::open(Some(&path)).unwrap();
+            store.put_cold(9, &snapshot).unwrap();
+        }
+        let store = VarSpillStore::open(Some(&path)).unwrap();
+        assert_eq!(
+            store.get_cold(9),
+            Some(snapshot.clone()),
+            "cold row survives re-open"
+        );
+        assert_eq!(
+            store.get_cold(9),
+            Some(snapshot.clone()),
+            "get_cold does not consume the row"
+        );
+        assert_eq!(
+            store.take_cold(9),
+            Some(snapshot),
+            "take_cold still returns it"
+        );
+        assert!(store.get_cold(9).is_none(), "take_cold consumed it");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

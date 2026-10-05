@@ -8,8 +8,9 @@
 //! carry just the control state (jobs, timers, scopes, tokens), so the snapshot
 //! file shrinks to the working-set skeleton and its fsync stops competing.
 //!
-//! Unlike [`crate::varspill::VarSpillStore`] — a *derived, destructive* cache that
-//! is wiped on open and whose rows are taken on rehydration — this store is
+//! Unlike [`crate::varspill::VarSpillStore`] — a *derived, destructive* cache
+//! whose rows are taken on rehydration (and only retained across a restart for
+//! legacy placeholder-snapshot recovery, #1331) — this store is
 //! **authoritative**: it survives a restart and is the source recovery reads to
 //! restore variables the lean snapshot omitted. It is written incrementally at
 //! each snapshot checkpoint from the engine's dirty-var set (the instances whose

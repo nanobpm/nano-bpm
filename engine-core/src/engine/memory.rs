@@ -789,45 +789,6 @@ impl Engine {
     /// job indices, so command processing sees exactly the state that was lifted
     /// out. Idempotent-ish: re-inserting keys that already exist overwrites them.
     pub fn rehydrate_instance(&mut self, snapshot: state::InstanceSnapshot) {
-        let state::InstanceSnapshot {
-            instance,
-            jobs,
-            timers,
-            message_subscriptions,
-            signal_subscriptions,
-            conditional_subscriptions,
-            user_tasks,
-            incidents,
-        } = snapshot;
-        let key = instance.key;
-        self.state.instances.insert(key, instance);
-        for job in jobs {
-            let job_key = job.key;
-            self.state
-                .jobs_by_instance
-                .entry(key)
-                .or_default()
-                .insert(job_key);
-            self.state.jobs.insert(job_key, job);
-            state::resync_job_index(&mut self.state, job_key);
-        }
-        for timer in timers {
-            self.state.timers.insert(timer.key, timer);
-        }
-        for sub in message_subscriptions {
-            self.state.message_subscriptions.insert(sub.key, sub);
-        }
-        for sub in signal_subscriptions {
-            self.state.signal_subscriptions.insert(sub.key, sub);
-        }
-        for sub in conditional_subscriptions {
-            self.state.conditional_subscriptions.insert(sub.key, sub);
-        }
-        for task in user_tasks {
-            self.state.user_tasks.insert(task.key, task);
-        }
-        for incident in incidents {
-            self.state.incidents.insert(incident.key, incident);
-        }
+        state::restore_instance_snapshot(&mut self.state, snapshot);
     }
 }

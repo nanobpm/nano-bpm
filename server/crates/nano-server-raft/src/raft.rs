@@ -67,8 +67,8 @@ use openraft::storage::{
     LogFlushed, LogState, RaftLogReader, RaftLogStorage, RaftStateMachine, Snapshot,
 };
 use openraft::{
-    BasicNode, Config, Entry, EntryPayload, LogId, OptionalSend, RaftSnapshotBuilder, SnapshotMeta,
-    StorageError, StorageIOError, StoredMembership, Vote,
+    BasicNode, Config, Entry, EntryPayload, ErrorSubject, ErrorVerb, LogId, OptionalSend,
+    RaftSnapshotBuilder, SnapshotMeta, StorageError, StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1008,15 +1008,56 @@ pub fn sweep_orphaned_snapshot_dirs() {
 /// it, so [`build_snapshot`](RaftSnapshotBuilder::build_snapshot) only has to
 /// serialize an already-consistent state — no engine round-trip, no race with a
 /// concurrent apply.
+///
+/// `captured` is the **fail-closed** capture ([`Journal::try_engine_snapshot`]):
+/// `None` when any indexed off-heap payload (a cold instance, a spilled variable
+/// map) could not be folded in. `build_snapshot` turns that `None` into a
+/// [`StorageError`] **before** publishing anything, so openraft treats the build
+/// as failed and — critically — does **not** purge the covered log. An incomplete
+/// snapshot is therefore never minted as the durable recovery point: the log that
+/// can still regenerate the omitted state is preserved intact on disk, so no data
+/// is lost. This is a hard fail-stop, not a graceful retry: openraft propagates
+/// the `StorageError` as a `Fatal`, which drives this partition's Raft core to
+/// [`ServerState::Shutdown`](openraft::ServerState::Shutdown) (see
+/// [`is_shutdown`](RaftPartition::is_shutdown)). There is no auto-restart in this
+/// crate, so the partition stops applying entries and every instance/job routed
+/// here is stranded until the process is restarted — at which point recovery
+/// replays the preserved log. The unreadable payload is thus traded for
+/// availability loss, never data loss.
 pub struct PartitionSnapshotBuilder {
     sm: Arc<PartitionStateMachine>,
-    captured: nanobpmn_engine_core::EngineSnapshot,
+    captured: Option<nanobpmn_engine_core::EngineSnapshot>,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
 }
 
 impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<RaftConfig>, StorageError<NodeId>> {
+        // Fail closed: refuse to publish a snapshot whose off-heap fold was
+        // incomplete. openraft purges the log this snapshot subsumes as soon as a
+        // `build_snapshot` succeeds, so sealing an incomplete capture here would
+        // permanently discard the only copy of the omitted cold/spilled state.
+        // Returning an error aborts the build before the durable pointer is
+        // written and before the log is purged, so the covered log is preserved
+        // and no data is lost. Note this is a hard fail-stop, not a retry:
+        // openraft propagates this `StorageError` as a `Fatal`, shutting down this
+        // partition's Raft core (`ServerState::Shutdown`, see `is_shutdown`). The
+        // partition then stops applying entries and strands its instances/jobs
+        // until the process restarts and replays the preserved log — availability
+        // is sacrificed to guarantee the omitted state is never lost.
+        let captured = self.captured.take().ok_or_else(|| {
+            StorageError::from_io_error(
+                ErrorSubject::Snapshot(None),
+                ErrorVerb::Write,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "refusing to build a Raft snapshot: an off-heap payload (cold \
+                     instance or spilled variable map) could not be folded in, so \
+                     the snapshot would be incomplete; aborting before the covered \
+                     log is purged",
+                ),
+            )
+        })?;
         let snapshot_idx = self.sm.snapshot_idx.fetch_add(1, Ordering::Relaxed) + 1;
         let snapshot_id = if let Some(last) = self.last_applied {
             format!("{}-{}-{}", last.leader_id, last.index, snapshot_idx)
@@ -1056,7 +1097,7 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         let mut writer = std::io::BufWriter::new(file);
         let serialize_start = std::time::Instant::now();
-        serde_json::to_writer(&mut writer, &self.captured)
+        serde_json::to_writer(&mut writer, &captured)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         let file = writer
             .into_inner()
@@ -1237,7 +1278,15 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // `apply` and snapshot building sequentially, so no command is applied
         // between the engine read and the `last_applied`/membership read — the
         // captured state corresponds exactly to `last_applied`.
-        let captured = self.engine.with(|journal| journal.engine_snapshot()).await;
+        //
+        // Capture **fail-closed** (`try_engine_snapshot`): when an off-heap
+        // payload cannot be folded in this yields `None`, which `build_snapshot`
+        // turns into a `StorageError` so the incomplete snapshot is never
+        // published and the covered log is never purged.
+        let captured = self
+            .engine
+            .with(|journal| journal.try_engine_snapshot())
+            .await;
         let (last_applied, last_membership) = {
             let inner = self.inner.lock().unwrap();
             (inner.last_applied, inner.last_membership.clone())
@@ -2884,6 +2933,67 @@ mod tests {
             dst_state.instances.len(),
             1,
             "only the in-flight instance is resident; the terminal shell was shed"
+        );
+    }
+
+    /// Fail-closed Raft snapshot build (the #1331 companion to the journal's
+    /// fail-closed rotation): when the off-heap fold fails, `get_snapshot_builder`
+    /// captures `None` and `build_snapshot` must return a `StorageError` and
+    /// publish NOTHING — no snapshot body, no durable current-snapshot pointer.
+    /// Otherwise openraft would purge the covered log on a successful build,
+    /// permanently discarding the only copy of the omitted cold/spilled state.
+    #[tokio::test]
+    async fn build_snapshot_fails_closed_when_the_off_heap_fold_failed() {
+        let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let src_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
+        let snap_dir = src_sm.snapshot_dir.clone();
+
+        // A builder whose capture is `None` — exactly what `get_snapshot_builder`
+        // produces when `try_engine_snapshot` cannot fold every off-heap payload.
+        let mut builder = PartitionSnapshotBuilder {
+            sm: src_sm.clone(),
+            captured: None,
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+        };
+        let err = match builder.build_snapshot().await {
+            Ok(_) => panic!("an incomplete capture must fail the snapshot build"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("off-heap payload"),
+            "the error names the incomplete fold, got: {err}"
+        );
+
+        // Nothing was published: no durable pointer, no snapshot body on disk.
+        assert!(
+            !snapshot_ptr_path(&snap_dir).is_file(),
+            "no current-snapshot pointer may be written for a failed build"
+        );
+        assert!(
+            std::fs::read_dir(&snap_dir)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true),
+            "no snapshot file may be left behind for a failed build"
+        );
+
+        // Control: a complete capture (`Some`) builds and publishes normally, so
+        // the fail-closed guard does not break the happy path.
+        let captured = src.with(|j| j.engine_snapshot()).await;
+        let mut ok_builder = PartitionSnapshotBuilder {
+            sm: src_sm.clone(),
+            captured: Some(captured),
+            last_applied: None,
+            last_membership: StoredMembership::default(),
+        };
+        ok_builder
+            .build_snapshot()
+            .await
+            .expect("a complete capture builds the snapshot");
+        assert!(
+            snapshot_ptr_path(&snap_dir).is_file(),
+            "a complete capture publishes the durable current-snapshot pointer"
         );
     }
 

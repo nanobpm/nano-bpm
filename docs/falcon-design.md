@@ -480,8 +480,10 @@ Disambiguation of the common confusion:
   optional varspill SQLite** (cold variables only); the export is a **separate** SQLite DB.
 - "RocksDB-in-memory + a JSONL file" describes the **engine state (RAM) + journal (WAL)** — the
   execution/durability side — **not** the export, which is a third store.
-- **varspill ≠ RocksDB:** it offloads one expensive field, is `synchronous=NORMAL`, and is wiped on
-  open (`DELETE FROM spill`) — a reconstructable cache, never authoritative.
+- **varspill ≠ RocksDB:** it offloads one expensive field and is `synchronous=NORMAL`. It is a
+  cache *relative to snapshots*: every classic snapshot folds spilled payloads and cold instances
+  back in (`Journal::engine_snapshot`), so a snapshot never depends on it. Its rows are not wiped
+  on open, because snapshots written before that fold (#1331) still reference them.
 
 ### 15.2 Command ordering: apply-then-commit (gap vs Zeebe's commit-then-apply)
 Current path (journal.rs:271-280, 235-265):
