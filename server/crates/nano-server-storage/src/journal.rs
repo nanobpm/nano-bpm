@@ -2301,13 +2301,16 @@ impl Journal {
     /// Captures a compact, serializable snapshot of the engine's live state (see
     /// [`Engine::snapshot`]) with its off-heap payloads folded back in — the
     /// **best-effort** form, for consumers that need a value regardless of fold
-    /// completeness (e.g. the non-durable Raft catch-up path). It is **not** the
+    /// completeness. It currently has only test callers; it is **not** the
     /// capture behind any durable recovery point: both of those — the
     /// compaction-gating classic rotation
     /// ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)) and the Raft
     /// snapshot builder (`get_snapshot_builder`, after which openraft may purge
     /// the covered log) — use the fail-closed [`try_engine_snapshot`] instead, so
-    /// an incomplete snapshot is never sealed or published. This wrapper ignores a
+    /// an incomplete snapshot is never sealed or published. (The Raft catch-up /
+    /// snapshot-serving path likewise never calls this: `get_current_snapshot`
+    /// serves the **stored** snapshot that `get_snapshot_builder` captured
+    /// fail-closed.) This wrapper ignores a
     /// failed fold (an unreadable/absent off-heap payload is logged and left
     /// as-is, see `fold_offheap_into`), so it can return a spilled placeholder or
     /// omit a later cold row; do not persist its result as a recovery point.
