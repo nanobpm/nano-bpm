@@ -29,6 +29,13 @@ import {
 } from "../lib/templateUpdate";
 import { PostUpdateProjectsDialog } from "../components/PostUpdateProjectsDialog";
 import { registerFileTypesFromOverview } from "../lib/editorLang";
+import { MARKETPLACE_POLL_MS } from "../lib/marketplace";
+import {
+  createMarketFetchGate,
+  marketFetchBegin,
+  marketFetchEnd,
+  marketFetchQueueWaiter,
+} from "../lib/marketFetchGate";
 import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
 import { isThemeSpec } from "../theme/themes";
@@ -114,6 +121,12 @@ export default function Extensions() {
   const [ov, setOv] = useState<ExtensionsOverview | null>(null);
   const [market, setMarket] = useState<MarketEntry[] | null>(null);
   const [marketErr, setMarketErr] = useState<string | null>(null);
+  // Guards against overlapping marketplace fetches (#1330): a poll that
+  // outlasts the interval must not stack a second npm fan-out on top of the
+  // first. A forced "Check now" during an in-flight fetch is queued, not
+  // dropped — the user asked to bypass the cache, so silently serving the
+  // cached listing would be wrong.
+  const marketGate = useRef(createMarketFetchGate());
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -191,12 +204,57 @@ export default function Extensions() {
     registerFileTypesFromOverview(next);
     setIntellisenseFromOverview(next);
   };
-  const loadMarket = async () => {
+  const loadMarket = async (force = false, opts?: { mutation?: boolean }) => {
+    // Don't stack a new marketplace fetch on top of an unfinished one: the
+    // server shells out to npm per installed pack, and overlapping fetches are
+    // the feedback loop that swap-thrashed a small host (#1330). A forced
+    // "Check now" OR a post-mutation reload during an in-flight fetch is queued
+    // and run when it settles; only a redundant background poll tick is dropped.
+    const begin = marketFetchBegin(marketGate.current, {
+      force,
+      mustRun: opts?.mutation,
+    });
+    if (begin !== "run") {
+      // A fetch is already in flight. A redundant background poll carries
+      // nothing new and resolves at once (begin === "drop", not must-run). A
+      // must-run request (a forced "Check now" or a post-mutation reload) was
+      // queued — or coalesced into the queue — so it must AWAIT the queued
+      // reload it depends on actually running. Otherwise an install/update
+      // handler that awaits its post-mutation reload would clear `busy` —
+      // re-enabling the Install/Update button against stale pre-mutation
+      // state — before the reload settles, permitting a duplicate install
+      // (#1330).
+      const mustRun = (opts?.mutation ?? false) || force;
+      if (mustRun) {
+        await new Promise<void>((resolve) =>
+          marketFetchQueueWaiter(marketGate.current, resolve),
+        );
+      }
+      return;
+    }
     setMarketErr(null);
     try {
-      setMarket((await getMarketplace({ throwOnError: true })).data.entries);
+      // `force` is the explicit "check now": it bypasses the server's cache TTL
+      // (still single-flight) so a freshly-published version surfaces at once.
+      setMarket(
+        (
+          await getMarketplace({
+            throwOnError: true,
+            query: force ? { refresh: true } : undefined,
+          })
+        ).data.entries,
+      );
     } catch (e) {
       setMarketErr(String(e));
+    } finally {
+      const { runQueued } = marketFetchEnd(marketGate.current);
+      if (runQueued) {
+        // A "Check now" click or a post-mutation reload arrived while this
+        // fetch was in flight — run the queued request now that the gate is
+        // free. It is must-run (it was only queued because it mattered), so
+        // re-issue it as such.
+        void loadMarket(runQueued.force, { mutation: true });
+      }
     }
   };
   useEffect(() => {
@@ -205,14 +263,16 @@ export default function Extensions() {
     void loadProjects();
   }, []);
 
-  // Poll the marketplace every 30s while this view is mounted so freshly
-  // published pack versions (and thus the "Update" affordance next to each
-  // installed pack) surface without the user having to leave and come back.
-  // The left-rail badge is refreshed on the same cadence from App.tsx.
+  // Poll the marketplace while this view is mounted so freshly published pack
+  // versions (and thus the "Update" affordance next to each installed pack)
+  // surface without the user having to leave and come back. On a several-minute
+  // cadence (not 30 s), never overlapping an unfinished poll — a tight cadence
+  // across several tabs swap-thrashed a small host (#1330). The left-rail badge
+  // is refreshed on the same cadence from App.tsx.
   useEffect(() => {
     const id = window.setInterval(() => {
       if (!document.hidden) void loadMarket();
-    }, 30_000);
+    }, MARKETPLACE_POLL_MS);
     const onVis = () => {
       if (!document.hidden) void loadMarket();
     };
@@ -251,7 +311,9 @@ export default function Extensions() {
     try {
       await installExtension({ body: { pkg }, throwOnError: true });
       await load();
-      await loadMarket();
+      // Post-mutation reload: must reflect the just-installed/updated pack, so
+      // it must not be dropped if a background poll is in flight (#1330).
+      await loadMarket(false, { mutation: true });
       if (opts?.afterUpdate && before !== null) {
         // Take a *fresh* authoritative post-update snapshot rather than trusting
         // `loadProjects()`, which swallows a failed refresh and returns the stale
@@ -305,7 +367,9 @@ export default function Extensions() {
     try {
       await removeExtension({ body: { pkg: id }, throwOnError: true });
       await load();
-      await loadMarket();
+      // Post-mutation reload: must reflect the removal even if a background
+      // poll is in flight (#1330).
+      await loadMarket(false, { mutation: true });
       await loadProjects();
     } catch (e) {
       setErr(String(e));
@@ -556,12 +620,21 @@ export default function Extensions() {
         }
       />
 
-      <Input
-        value={q}
-        onChange={(e) => setQ(e.target.value)}
-        placeholder="Search the marketplace…"
-        className="mb-3 w-full"
-      />
+      <div className="mb-3 flex items-center gap-2">
+        <Input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search the marketplace…"
+          className="w-full"
+        />
+        <Button
+          variant="secondary"
+          onClick={() => void loadMarket(true)}
+          title="Check npm now for freshly-published pack versions (bypasses the cache)"
+        >
+          Check now
+        </Button>
+      </div>
       {err && (
         <div className="mb-3">
           <ErrorText>{err}</ErrorText>

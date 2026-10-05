@@ -568,6 +568,9 @@ export const getExtensions = <ThrowOnError extends boolean = false>(options?: Op
 
 /**
  * Marketplace of installable extension packs
+ *
+ * Lists packs on npm tagged `nano-ide-ext`, with installed status and an update-available flag per installed pack. The result is cached server-side for several minutes (computing it shells out to npm once per installed pack), and concurrent callers share one in-flight computation. Pass `refresh=true` for an explicit "check now" that bypasses the cache TTL — it still joins the single in-flight computation, so it never fans a second npm burst out on top of an in-progress one.
+ *
  */
 export const getMarketplace = <ThrowOnError extends boolean = false>(options?: Options<GetMarketplaceData, ThrowOnError>): RequestResult<GetMarketplaceResponses, unknown, ThrowOnError> => (options?.client ?? client).get<GetMarketplaceResponses, unknown, ThrowOnError>({ url: '/extensions/marketplace', ...options });
 

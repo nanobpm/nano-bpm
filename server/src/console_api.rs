@@ -214,9 +214,13 @@ impl apis::extensions::Extensions for ServerImpl {
         _method: &Method,
         _host: &Host,
         _cookies: &CookieJar,
+        query_params: &models::GetMarketplaceQueryParams,
     ) -> Result<apis::extensions::GetMarketplaceResponse, ()> {
         // Only 200 is declared; on a registry error fall back to empty entries.
-        let v = nano_server_console::extensions_marketplace()
+        // `refresh=true` is the explicit "check now" that bypasses the cache TTL
+        // (still single-flight — see nano_server_console::extensions).
+        let force = query_params.refresh.unwrap_or(false);
+        let v = nano_server_console::extensions_marketplace(force)
             .await
             .unwrap_or_else(|_| serde_json::json!({ "entries": [] }));
         Ok(apis::extensions::GetMarketplaceResponse::Status200_MarketplaceListing(from_val(v)))

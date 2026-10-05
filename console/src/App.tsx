@@ -37,6 +37,7 @@ import { isAssetIcon } from "./lib/appRailIcon";
 import { AppIcon } from "./components/AppIcon";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO, CONSOLE_PROFILE } from "./lib/profile";
+import { MARKETPLACE_POLL_MS } from "./lib/marketplace";
 import { useProductTour } from "./lib/tour/useProductTour";
 import { TourContext } from "./lib/tour/tourContext";
 import { navAnchor, TOUR_ANCHOR } from "./lib/tour/tourAnchors";
@@ -548,20 +549,27 @@ export default function App() {
     }
   };
 
-  // Marketplace update poll (30s cadence) so the Extensions rail item can wear
-  // a badge with the current available-updates count on every page — the user
-  // doesn't have to open Extensions to notice a freshly-published fix. Skipped
-  // while the tab is hidden (background tabs shouldn't hammer npm). The
-  // server-side marketplace() also probes `npm view` per installed pack so
-  // this is not gated by npm's search-index lag.
+  // Marketplace update poll so the Extensions rail item can wear a badge with
+  // the current available-updates count on every page — the user doesn't have
+  // to open Extensions to notice a freshly-published fix. Skipped while the tab
+  // is hidden (background tabs shouldn't hammer npm). Polls on a several-minute
+  // cadence (not 30 s) and never starts a poll while the previous one is still
+  // running: the server-side marketplace() shells out to npm per installed pack,
+  // and a 30 s cadence across several tabs swap-thrashed a small host (#1330).
   const [updateCount, setUpdateCount] = useState(0);
   useEffect(() => {
     // Studio-only: the operator ("observe") build has no Extensions view, so
     // there's no badge to feed and no reason to poll npm.
     if (!IS_STUDIO) return;
     let cancelled = false;
+    let inFlight = false;
     const poll = () => {
       if (typeof document !== "undefined" && document.hidden) return;
+      // Don't stack a new poll on top of an unfinished one — under memory
+      // pressure a poll can outlast the interval, and overlapping fan-outs are
+      // exactly the feedback loop that collapsed merlin (#1330).
+      if (inFlight) return;
+      inFlight = true;
       getMarketplace({ throwOnError: true })
         .then(({ data }) => {
           if (cancelled) return;
@@ -569,10 +577,13 @@ export default function App() {
         })
         .catch(() => {
           /* offline or npm missing — leave the badge as-is */
+        })
+        .finally(() => {
+          inFlight = false;
         });
     };
     poll();
-    const id = window.setInterval(poll, 30_000);
+    const id = window.setInterval(poll, MARKETPLACE_POLL_MS);
     const onVis = () => {
       if (!document.hidden) poll();
     };

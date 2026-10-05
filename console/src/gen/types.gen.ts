@@ -3460,7 +3460,12 @@ export type GetExtensionsResponse = GetExtensionsResponses[keyof GetExtensionsRe
 export type GetMarketplaceData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * When `true`, bypass the server-side cache TTL and recompute the listing now (still single-flight). Omit or `false` to serve the cached result when it is still fresh.
+         */
+        refresh?: boolean;
+    };
     url: '/extensions/marketplace';
 };
 

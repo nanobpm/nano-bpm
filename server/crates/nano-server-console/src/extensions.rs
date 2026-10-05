@@ -1858,13 +1858,423 @@ fn is_official(name: &str) -> bool {
     name.starts_with("@nanobpm/")
 }
 
-/// Browse npm for packs tagged `nano-ide-ext`. Shells out to `npm search`
-/// (npm is already required for install). Best-effort; empty on offline/error.
-pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
-    let npm = find_program("npm").ok_or("npm not found on PATH")?;
-    let out = std::process::Command::new(&npm)
-        .args(marketplace_search_args())
-        .output()
+/// How long a computed marketplace listing is served from cache before the next
+/// request recomputes it. Update discovery does not need second-level freshness,
+/// and every recompute shells out to `npm` once per installed pack; without a
+/// TTL every 30 s poll (several tabs, each with a `visibilitychange` kick) fans
+/// a fresh `npm search` + per-pack `npm view` burst out at the OS, which on a
+/// small host swap-thrashed the whole machine (issue #1330). Five minutes keeps
+/// the badge usefully current while collapsing that burst to at most one per
+/// window. An explicit "check now" bypasses this via [`marketplace_refresh`].
+const MARKETPLACE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Max concurrent `npm view` probes [`refresh_installed_latest`] runs. The old
+/// code spawned **one OS thread + one `npm view` Node process per installed
+/// pack, all at once** (issue #1330) — 6 packs meant 6 simultaneous ~40–80 MB
+/// Node processes per request, and nothing bounded overlapping requests. A small
+/// fixed pool caps the per-request process footprint regardless of how many
+/// packs are installed.
+const REFRESH_LATEST_CONCURRENCY: usize = 2;
+
+/// Runs an `npm` invocation and returns its captured output. Factored out behind
+/// a trait so the single-flight / concurrency guards can inject a counting
+/// spawner (issue #1330) and assert the process fan-out without shelling out to
+/// a real `npm`.
+pub trait NpmRunner: Send + Sync {
+    fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output>;
+}
+
+/// The production [`NpmRunner`]: shells out to the resolved `npm` binary.
+struct NpmCli {
+    npm: PathBuf,
+}
+
+impl NpmRunner for NpmCli {
+    fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+        std::process::Command::new(&self.npm).args(args).output()
+    }
+}
+
+/// A single-flight, TTL'd cache for the marketplace listing. The expensive
+/// computation ([`marketplace_impl`]) shells out to `npm` once per installed
+/// pack, so it must never run concurrently with itself: concurrent callers
+/// (several studio tabs polling every few minutes, a `visibilitychange` kick,
+/// an explicit "check now") all share one in-flight computation, and a result
+/// is reused for [`MARKETPLACE_CACHE_TTL`] before the next recompute. This is
+/// the server-side half of the #1330 fix — without it N concurrent requests
+/// each started their own full `npm` fan-out.
+///
+/// The cache holds **registry metadata only**: the per-entry installation
+/// state (`installed`, `installed_version`, `update_available`,
+/// `changelog_available`) is re-derived from the live pack store on every
+/// response by [`overlay_install_state`], so an install / update / removal is
+/// reflected immediately instead of going stale for the rest of the TTL.
+struct MarketplaceCache {
+    ttl: std::time::Duration,
+    state: std::sync::Mutex<MarketplaceCacheState>,
+    /// Test-only instrumentation: invoked (holding no lock) each time a caller
+    /// commits to joining the in-flight computation as a waiter. Lets a test
+    /// release the leader only once every follower has *provably* joined the
+    /// single flight, instead of sleeping and hoping the scheduler got there.
+    #[cfg(test)]
+    on_waiter_joined: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test-only instrumentation: invoked (holding no lock) by a waiter right
+    /// before it blocks on the flight's `ready` condvar — after it has cloned
+    /// the per-flight `Arc` but before it reads the outcome. Lets a test hold
+    /// one follower parked at the exact moment the per-flight isolation must
+    /// protect it, then start a *second* flight and prove the parked follower
+    /// still reads its own flight's outcome.
+    #[cfg(test)]
+    on_waiter_wait: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// The outcome of one shared computation, cloned to every caller that joined
+/// it — success **and** failure. Sharing the failure matters: if only the
+/// leader saw the error, each of N waiters would wake, become the next leader,
+/// and serially repeat the same failing `npm search` (N sequential registry
+/// timeouts for one burst of requests).
+type ComputeResult = Result<std::sync::Arc<Vec<MarketEntry>>, String>;
+
+/// One in-flight computation. Each leader installs a **fresh** `Flight`; every
+/// caller that joins it clones this `Arc` and blocks on the flight's own
+/// `ready` condvar, reading the result from this exact flight's `outcome`
+/// slot. Because the handle is per-flight rather than a single shared "last
+/// outcome" slot, a *later* leader starting a new computation can never clobber
+/// the slot an earlier flight's waiters are about to read — so a waiter whose
+/// own run already completed is never dragged through an unrelated run's `npm`
+/// timeout (#1330).
+struct Flight {
+    /// `None` until the leader publishes; then the shared success/failure that
+    /// every waiter of this flight clones.
+    outcome: std::sync::Mutex<Option<ComputeResult>>,
+    ready: std::sync::Condvar,
+}
+
+struct MarketplaceCacheState {
+    /// The last successfully computed listing and when it was stored.
+    value: Option<(std::time::Instant, std::sync::Arc<Vec<MarketEntry>>)>,
+    /// The computation currently running, if any. A caller that finds this
+    /// `Some` joins that exact flight (cloning the `Arc`) instead of starting a
+    /// second `npm` fan-out; the leader clears it back to `None` when it
+    /// finishes, so the next request starts a fresh flight.
+    in_flight: Option<std::sync::Arc<Flight>>,
+}
+
+impl MarketplaceCache {
+    fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            ttl,
+            state: std::sync::Mutex::new(MarketplaceCacheState {
+                value: None,
+                in_flight: None,
+            }),
+            #[cfg(test)]
+            on_waiter_joined: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            on_waiter_wait: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Install the test-only "a waiter joined" hook (see [`on_waiter_joined`]).
+    #[cfg(test)]
+    fn set_on_waiter_joined(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_waiter_joined.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Install the test-only "a waiter is about to block" gate (see
+    /// [`on_waiter_wait`]).
+    #[cfg(test)]
+    fn set_on_waiter_wait(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_waiter_wait.lock().unwrap() = Some(Box::new(f));
+    }
+
+    #[cfg(test)]
+    fn note_waiter_joined(&self) {
+        if let Some(cb) = self.on_waiter_joined.lock().unwrap().as_ref() {
+            cb();
+        }
+    }
+
+    #[cfg(test)]
+    fn note_waiter_wait(&self) {
+        if let Some(cb) = self.on_waiter_wait.lock().unwrap().as_ref() {
+            cb();
+        }
+    }
+
+    /// Return the cached listing when it is fresh (and `force` is false),
+    /// otherwise recompute it exactly once across all concurrent callers.
+    /// `force` bypasses the TTL but still joins the single in-flight
+    /// computation — a "check now" never fans out a second `npm` burst on top
+    /// of an in-progress one.
+    fn fetch<F>(&self, force: bool, compute: F) -> ComputeResult
+    where
+        F: FnOnce() -> Result<Vec<MarketEntry>, String>,
+    {
+        // Phase 1: either return a fresh/shared result, or become the leader
+        // and take ownership of a fresh `Flight`.
+        let flight = {
+            let mut st = self.state.lock().unwrap();
+            if !force
+                && let Some((at, v)) = &st.value
+                && at.elapsed() < self.ttl
+            {
+                return Ok(std::sync::Arc::clone(v));
+            }
+            if let Some(flight) = &st.in_flight {
+                // Someone else is already recomputing. Join *that exact*
+                // flight and wait on its own condvar — even a forced caller,
+                // because the in-flight run is itself producing a fresh
+                // listing. The outcome is shared with every waiter, failure
+                // included: a failed `npm search` is answered to the whole
+                // burst at once rather than re-attempted serially by each
+                // waiter. Capturing the flight handle (not a shared slot a
+                // later leader could clear) means a waiter always reads the
+                // result of the run it joined — never a newer leader's.
+                let flight = std::sync::Arc::clone(flight);
+                drop(st);
+                #[cfg(test)]
+                self.note_waiter_joined();
+                // Gate point for the isolation test: a follower can be parked
+                // here — holding its per-flight `Arc`, not yet reading the
+                // outcome — while a later leader completes a *second* flight.
+                #[cfg(test)]
+                self.note_waiter_wait();
+                let mut outcome = flight.outcome.lock().unwrap();
+                while outcome.is_none() {
+                    outcome = flight.ready.wait(outcome).unwrap();
+                }
+                return outcome
+                    .as_ref()
+                    .expect("a settled flight always carries an outcome")
+                    .clone();
+            }
+            // Become the leader for this recompute: install a fresh flight
+            // that this call owns and every concurrent joiner will wait on.
+            let flight = std::sync::Arc::new(Flight {
+                outcome: std::sync::Mutex::new(None),
+                ready: std::sync::Condvar::new(),
+            });
+            st.in_flight = Some(std::sync::Arc::clone(&flight));
+            flight
+        };
+
+        // Catch an unwind so a panicking computation can never strand the
+        // flight (`in_flight` set, no outcome → every later request waits
+        // forever). The panic still aborts the leader's own call — as an error,
+        // not a hang.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(compute))
+            .unwrap_or_else(|_| Err("marketplace computation panicked".to_string()));
+
+        // Record the fresh value (success only — a failed refresh must not
+        // evict a still-usable listing) and retire this flight from `in_flight`
+        // so the next request starts a new one.
+        let shared: ComputeResult = {
+            let mut st = self.state.lock().unwrap();
+            let shared = match result {
+                Ok(entries) => {
+                    let arc = std::sync::Arc::new(entries);
+                    st.value = Some((std::time::Instant::now(), std::sync::Arc::clone(&arc)));
+                    Ok(arc)
+                }
+                Err(e) => Err(e),
+            };
+            st.in_flight = None;
+            shared
+        };
+
+        // Publish to *this* flight's waiters (success and failure alike): each
+        // clones the shared outcome rather than starting its own `npm` fan-out.
+        let mut outcome = flight.outcome.lock().unwrap();
+        *outcome = Some(shared.clone());
+        flight.ready.notify_all();
+        shared
+    }
+}
+
+/// Process-global marketplace cache backing [`marketplace`].
+fn marketplace_cache() -> &'static MarketplaceCache {
+    static CACHE: std::sync::OnceLock<MarketplaceCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| MarketplaceCache::new(MARKETPLACE_CACHE_TTL))
+}
+
+/// Browse npm for packs tagged `nano-ide-ext`. Served from a short-lived
+/// single-flight cache (see [`MarketplaceCache`]) so a burst of concurrent
+/// pollers collapses to one `npm` fan-out. `force` is the "check now" bypass
+/// that skips the cache TTL but still joins the single in-flight computation —
+/// it never starts a second `npm` burst on top of an in-progress one.
+/// Best-effort; empty on offline/error.
+///
+/// The cache holds registry metadata only; the installation state of every
+/// entry is re-derived from the live pack store on each response
+/// ([`overlay_install_state`]) so an install / update / removal is visible
+/// immediately rather than after the cache TTL expires.
+pub fn marketplace_refresh(force: bool) -> Result<Vec<MarketEntry>, String> {
+    marketplace_cache()
+        .fetch(force, || {
+            let npm = find_program("npm").ok_or("npm not found on PATH")?;
+            marketplace_impl(&NpmCli { npm })
+        })
+        .map(|arc| overlay_install_state((*arc).clone()))
+}
+
+/// Compare two version strings by semantic-version **precedence**
+/// (semver.org §11): the numeric core is compared field-by-field numerically
+/// (missing trailing fields treated as `0`), a pre-release version ranks below
+/// its associated normal version, and build metadata (`+…`) is ignored. A
+/// leading `v` on either side is tolerated.
+///
+/// Returns `None` when either side carries a non-numeric core field we cannot
+/// order (e.g. a dist-tag like `latest`): callers then conservatively decline
+/// rather than guess an up/downgrade.
+fn version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    fn split(v: &str) -> Option<(Vec<u64>, Option<String>)> {
+        let v = v.trim().trim_start_matches('v');
+        // Build metadata does not affect precedence.
+        let v = v.split('+').next().unwrap_or("");
+        let (core, pre) = match v.split_once('-') {
+            Some((c, p)) => (c, (!p.is_empty()).then(|| p.to_string())),
+            None => (v, None),
+        };
+        if core.is_empty() {
+            return None;
+        }
+        let nums = core
+            .split('.')
+            .map(|p| p.parse::<u64>().ok())
+            .collect::<Option<Vec<u64>>>()?;
+        Some((nums, pre))
+    }
+    /// A SemVer *numeric* pre-release identifier: a non-empty run of ASCII
+    /// digits (§11.4.1). This is the classification SemVer applies — it does
+    /// **not** impose an integer-width limit, so an identifier that overflows
+    /// `u64` (e.g. `99999999999999999999`) is still numeric and must order by
+    /// value, not lexically.
+    fn is_numeric_identifier(s: &str) -> bool {
+        !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+    }
+
+    /// Order two numeric pre-release identifiers by value with no width limit:
+    /// more significant digits (after stripping leading zeros) wins, ties break
+    /// lexically. Avoids `u64` parsing so arbitrarily large identifiers compare
+    /// correctly — a lexical compare of `…99999` vs `…100000…` would invert
+    /// their numeric order and hide an available update.
+    fn cmp_numeric_identifiers(x: &str, y: &str) -> Ordering {
+        let nx = x.trim_start_matches('0');
+        let ny = y.trim_start_matches('0');
+        nx.len().cmp(&ny.len()).then_with(|| nx.cmp(ny))
+    }
+
+    fn cmp_prerelease(a: &str, b: &str) -> Ordering {
+        let mut ai = a.split('.');
+        let mut bi = b.split('.');
+        loop {
+            match (ai.next(), bi.next()) {
+                (None, None) => return Ordering::Equal,
+                // A larger set of pre-release fields (when all preceding are
+                // equal) has higher precedence.
+                (None, Some(_)) => return Ordering::Less,
+                (Some(_), None) => return Ordering::Greater,
+                (Some(x), Some(y)) => {
+                    let ord = match (is_numeric_identifier(x), is_numeric_identifier(y)) {
+                        // Numeric identifiers order by value, no width limit.
+                        (true, true) => cmp_numeric_identifiers(x, y),
+                        // Numeric identifiers always rank lower than
+                        // alphanumeric ones.
+                        (true, false) => Ordering::Less,
+                        (false, true) => Ordering::Greater,
+                        // Alphanumeric identifiers order by ASCII lexical order.
+                        (false, false) => x.cmp(y),
+                    };
+                    if ord != Ordering::Equal {
+                        return ord;
+                    }
+                }
+            }
+        }
+    }
+    let (ca, pa) = split(a)?;
+    let (cb, pb) = split(b)?;
+    let n = ca.len().max(cb.len());
+    for i in 0..n {
+        let x = ca.get(i).copied().unwrap_or(0);
+        let y = cb.get(i).copied().unwrap_or(0);
+        match x.cmp(&y) {
+            Ordering::Equal => {}
+            ord => return Some(ord),
+        }
+    }
+    Some(match (&pa, &pb) {
+        (None, None) => Ordering::Equal,
+        // A pre-release ranks below the normal release of the same core.
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(x), Some(y)) => cmp_prerelease(x, y),
+    })
+}
+
+/// `true` iff `a` is strictly older than `b` by semver precedence. Unorderable
+/// inputs yield `false` — we decline to advertise an update rather than risk a
+/// bogus up/downgrade off stale metadata.
+fn version_lt(a: &str, b: &str) -> bool {
+    matches!(version_cmp(a, b), Some(std::cmp::Ordering::Less))
+}
+
+/// The one canonical derivation of a marketplace entry's installation state
+/// from the live pack store: `installed`, `installed_version`,
+/// `update_available` (against the entry's current `version`), and
+/// `changelog_available`. Used both when a listing is computed
+/// ([`marketplace_impl`]) and when a cached listing is projected onto the
+/// current disk state for a response ([`overlay_install_state`]) — a single
+/// source of truth so the two paths can never drift.
+fn derive_install_state(entry: &mut MarketEntry) {
+    let inst_ver = installed_version(&entry.name);
+    let installed = inst_ver.is_some()
+        || safe_pkg_dir(&entry.name)
+            .map(|d| d.is_dir())
+            .unwrap_or(false);
+    // Flag an update only when we can read the installed version AND the
+    // latest published version is **strictly newer** by semantic-version
+    // ordering. A plain `iv != latest` inequality falsely advertises an
+    // "update" to an *older* version whenever the cached registry metadata
+    // lags the pack actually on disk — e.g. a pack cached as uninstalled at
+    // 2.0.0, then installed after npm published 2.1.0: the unpinned install
+    // lands 2.1.0, but the stale cached `version` (2.0.0) would otherwise
+    // offer a downgrade "update". Comparing by precedence keeps Update honest
+    // regardless of how stale the cached `version` is (#1330).
+    let update_available = inst_ver
+        .as_deref()
+        .map(|iv| version_lt(iv, &entry.version))
+        .unwrap_or(false);
+    let changelog_available = installed && installed_changelog_path(&entry.name).is_some();
+    entry.installed = installed;
+    entry.installed_version = inst_ver;
+    entry.update_available = update_available;
+    entry.changelog_available = changelog_available;
+}
+
+/// Project a (possibly cached) listing onto the **current** local pack store:
+/// registry metadata (name, description, links, latest published version) may
+/// be served from the cache, but installation state must reflect installs,
+/// updates, and removals that happened since the listing was computed —
+/// otherwise a fresh install still offers "Install" and a removed pack still
+/// appears installed until the cache TTL expires.
+fn overlay_install_state(mut entries: Vec<MarketEntry>) -> Vec<MarketEntry> {
+    for entry in &mut entries {
+        derive_install_state(entry);
+    }
+    entries
+}
+
+/// The uncached marketplace computation: one `npm search`, then a bounded
+/// per-installed-pack `npm view` refresh. Shells out via the injected
+/// [`NpmRunner`] so guards can count the process fan-out.
+fn marketplace_impl(runner: &dyn NpmRunner) -> Result<Vec<MarketEntry>, String> {
+    let search_args = marketplace_search_args();
+    let search_argv: Vec<&str> = search_args.iter().map(String::as_str).collect();
+    let out = runner
+        .run(&search_argv)
         .map_err(|e| format!("npm search: {e}"))?;
     if !out.status.success() {
         return Err(format!(
@@ -1891,34 +2301,28 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
             // else carrying the marketplace keyword is a community extension.
             let official = is_official(&name);
             let latest = p["version"].as_str().unwrap_or_default().to_string();
-            let inst_ver = installed_version(&name);
-            let installed =
-                inst_ver.is_some() || safe_pkg_dir(&name).map(|d| d.is_dir()).unwrap_or(false);
-            // Flag an update only when we can read the installed version and it
-            // differs from the latest published one.
-            let update_available = inst_ver
-                .as_deref()
-                .map(|iv| !iv.is_empty() && !latest.is_empty() && iv != latest)
-                .unwrap_or(false);
             let links = &p["links"];
             let repository = links["repository"].as_str().and_then(normalize_repo_url);
             let homepage = links["homepage"].as_str().and_then(safe_http_url);
             let npm_url = links["npm"].as_str().and_then(safe_http_url);
-            let changelog_available = installed && installed_changelog_path(&name).is_some();
-            MarketEntry {
-                installed,
+            let mut entry = MarketEntry {
+                installed: false,
                 version: latest,
                 description: p["description"].as_str().unwrap_or_default().to_string(),
                 category: category.to_string(),
                 official,
-                installed_version: inst_ver,
-                update_available,
+                installed_version: None,
+                update_available: false,
                 repository,
                 homepage,
                 npm_url,
-                changelog_available,
+                changelog_available: false,
                 name,
-            }
+            };
+            // The same canonical projection [`overlay_install_state`] applies
+            // when a cached listing is served — one derivation, no drift.
+            derive_install_state(&mut entry);
+            entry
         })
         .collect();
     entries.sort_by(|a, b| a.category.cmp(&b.category).then(a.name.cmp(&b.name)));
@@ -1926,8 +2330,9 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
     // the user has installed, hit `npm view <name> version --prefer-online`
     // to get the actual published latest — otherwise a freshly-published fix
     // won't surface an "Update" affordance in the console for a long time.
-    // Bounded by the installed-pack count so this stays cheap.
-    refresh_installed_latest(&npm, &mut entries);
+    // Bounded concurrency keeps the process fan-out small regardless of the
+    // installed-pack count (issue #1330).
+    refresh_installed_latest(runner, &mut entries, REFRESH_LATEST_CONCURRENCY);
     Ok(entries)
 }
 
@@ -1935,44 +2340,54 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
 /// recompute `update_available`. `npm view --prefer-online` bypasses the local
 /// metadata cache and hits registry.npmjs.org directly. Failures are ignored
 /// (the search result stands).
-fn refresh_installed_latest(npm: &std::path::Path, entries: &mut [MarketEntry]) {
+///
+/// Capped at `cap` concurrent probes (issue #1330): the probes are drained from
+/// a shared queue by a fixed pool of worker threads, so at most `cap` `npm view`
+/// Node processes are ever alive at once — not one per installed pack.
+fn refresh_installed_latest(runner: &dyn NpmRunner, entries: &mut [MarketEntry], cap: usize) {
+    use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
-    use std::thread;
-    let updates: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
-    let handles: Vec<_> = entries
+    let jobs: VecDeque<(usize, String)> = entries
         .iter()
         .enumerate()
         .filter(|(_, e)| e.installed)
-        .map(|(idx, e)| {
-            let name = e.name.clone();
-            let npm = npm.to_path_buf();
+        .map(|(idx, e)| (idx, e.name.clone()))
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
+    let workers = cap.max(1).min(jobs.len());
+    let queue: Arc<Mutex<VecDeque<(usize, String)>>> = Arc::new(Mutex::new(jobs));
+    let updates: Arc<Mutex<Vec<(usize, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let queue = Arc::clone(&queue);
             let updates = Arc::clone(&updates);
-            thread::spawn(move || {
-                let out = std::process::Command::new(&npm)
-                    .args(["view", &name, "version", "--prefer-online", "--silent"])
-                    .output();
-                if let Ok(o) = out
-                    && o.status.success()
-                {
-                    let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                    if !v.is_empty() {
-                        updates.lock().unwrap().push((idx, v));
+            scope.spawn(move || {
+                loop {
+                    let Some((idx, name)) = queue.lock().unwrap().pop_front() else {
+                        break;
+                    };
+                    let out =
+                        runner.run(&["view", &name, "version", "--prefer-online", "--silent"]);
+                    if let Ok(o) = out
+                        && o.status.success()
+                    {
+                        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                        if !v.is_empty() {
+                            updates.lock().unwrap().push((idx, v));
+                        }
                     }
                 }
-            })
-        })
-        .collect();
-    for h in handles {
-        let _ = h.join();
-    }
+            });
+        }
+    });
     for (idx, latest) in updates.lock().unwrap().drain(..) {
         let e = &mut entries[idx];
         e.version = latest;
-        e.update_available = e
-            .installed_version
-            .as_deref()
-            .map(|iv| !iv.is_empty() && !e.version.is_empty() && iv != e.version)
-            .unwrap_or(false);
+        // Re-derive the install state against the fresh `version` so
+        // `update_available` uses the one canonical comparison.
+        derive_install_state(e);
     }
 }
 
@@ -2293,7 +2708,7 @@ fn changelog_delta(md: &str, installed: &str) -> Option<String> {
 /// probe therefore matches nothing (or, worse, the non-runnable POSIX shell
 /// shim npm also drops next to `npm.cmd`), which is why the console showed an
 /// empty extension marketplace on Windows: `find_program("npm")` returned
-/// `None` and `marketplace()` failed with "npm not found on PATH". So on
+/// `None` and the marketplace listing failed with "npm not found on PATH". So on
 /// Windows we mirror cmd.exe's PATHEXT resolution — try `name` + each PATHEXT
 /// extension (`.CMD`, `.EXE`, …) before the bare name. `USERPROFILE` is also
 /// consulted as the home dir since Windows does not set `HOME`.
@@ -2563,6 +2978,666 @@ mod tests {
             "--searchlimit={limit} is too small; the marketplace truncates the catalogue as it grows"
         );
         assert_eq!(limit, MARKETPLACE_SEARCH_LIMIT);
+    }
+
+    /// Build a successful `std::process::Output` with the given stdout, so a
+    /// mock [`NpmRunner`] can stand in for a real `npm` without spawning one.
+    fn ok_output(stdout: &str) -> std::process::Output {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        };
+        #[cfg(windows)]
+        let status = {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(0)
+        };
+        std::process::Output {
+            status,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// A counting, non-spawning [`NpmRunner`]: it records how many `npm search`
+    /// calls happen and the peak number of concurrent `npm view` calls, so the
+    /// #1330 guard can assert the single-flight / bounded-fan-out contract
+    /// without starting real Node processes.
+    struct MockNpm {
+        search_calls: std::sync::atomic::AtomicUsize,
+        view_calls: std::sync::atomic::AtomicUsize,
+        view_concurrent: std::sync::atomic::AtomicUsize,
+        view_peak: std::sync::atomic::AtomicUsize,
+        search_json: String,
+    }
+
+    impl NpmRunner for MockNpm {
+        fn run(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
+            use std::sync::atomic::Ordering::SeqCst;
+            match args.first().copied() {
+                Some("search") => {
+                    self.search_calls.fetch_add(1, SeqCst);
+                    Ok(ok_output(&self.search_json))
+                }
+                Some("view") => {
+                    self.view_calls.fetch_add(1, SeqCst);
+                    let now = self.view_concurrent.fetch_add(1, SeqCst) + 1;
+                    self.view_peak.fetch_max(now, SeqCst);
+                    // Hold the "process" open long enough that an unbounded
+                    // fan-out would overlap and trip the cap assertion.
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                    self.view_concurrent.fetch_sub(1, SeqCst);
+                    Ok(ok_output("9.9.9"))
+                }
+                _ => Ok(ok_output("")),
+            }
+        }
+    }
+
+    /// #1330 guard: N concurrent marketplace requests must collapse to **one**
+    /// `npm search` (single-flight cache) and run **at most
+    /// [`REFRESH_LATEST_CONCURRENCY`]** `npm view` probes at a time, no matter
+    /// how many packs are installed — the uncapped one-thread-per-pack fan-out
+    /// under a 30 s cross-tab poll is what swap-thrashed a small host.
+    #[test]
+    fn concurrent_marketplace_requests_single_flight_and_cap_view_fanout() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-mkt-sf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // SAFETY: test-local env set; serialized on ENV_LOCK.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+
+        // Six installed packs — more than the cap — so an uncapped fan-out would
+        // put six `npm view` processes live at once.
+        let packs = [
+            "@nanobpm/pack-a",
+            "@nanobpm/pack-b",
+            "@nanobpm/pack-c",
+            "@nanobpm/pack-d",
+            "@nanobpm/pack-e",
+            "@nanobpm/pack-f",
+        ];
+        for p in packs {
+            let dir = safe_pkg_dir(p).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), r#"{"version":"1.0.0"}"#).unwrap();
+        }
+        let search_json = serde_json::to_string(
+            &packs
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "name": n,
+                        "version": "1.0.0",
+                        "keywords": [MARKETPLACE_KEYWORD],
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let runner = MockNpm {
+            search_calls: AtomicUsize::new(0),
+            view_calls: AtomicUsize::new(0),
+            view_concurrent: AtomicUsize::new(0),
+            view_peak: AtomicUsize::new(0),
+            search_json,
+        };
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+
+        // Fire several concurrent callers — the burst a multi-tab 30 s poll
+        // produced. They must share one computation.
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let _ = cache.fetch(false, || marketplace_impl(&runner));
+                });
+            }
+        });
+
+        assert_eq!(
+            runner.search_calls.load(SeqCst),
+            1,
+            "single-flight: concurrent pollers must share exactly one npm search"
+        );
+        assert_eq!(
+            runner.view_calls.load(SeqCst),
+            packs.len(),
+            "each installed pack is probed exactly once (no duplicate fan-out)"
+        );
+        let peak = runner.view_peak.load(SeqCst);
+        assert!(
+            peak <= REFRESH_LATEST_CONCURRENCY,
+            "npm view concurrency must be capped at {REFRESH_LATEST_CONCURRENCY}, saw {peak}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    /// The cache serves a fresh result without recomputing, and `force` bypasses
+    /// the TTL — the "check now" affordance still routes through the same
+    /// single-flight computation.
+    #[test]
+    fn marketplace_cache_serves_fresh_then_force_bypasses_ttl() {
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let compute = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, String>(Vec::<MarketEntry>::new())
+        };
+
+        // First call computes and caches.
+        cache.fetch(false, compute).unwrap();
+        // Second call within the TTL is served from cache — no recompute.
+        cache.fetch(false, compute).unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a fresh cached result must not recompute"
+        );
+        // A forced "check now" bypasses the TTL and recomputes.
+        cache.fetch(true, compute).unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "force must bypass the cache TTL"
+        );
+    }
+
+    /// A panicking computation must not wedge the cache: `in_flight` is
+    /// cleared, waiters are woken, and a later fetch completes. Without the
+    /// `catch_unwind` guard, one panic stranded `in_flight = true` and every
+    /// subsequent request (cache misses and forced refreshes alike) waited on
+    /// the condvar until process restart.
+    #[test]
+    fn marketplace_cache_recovers_after_a_panicking_computation() {
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+
+        // The panicking leader surfaces as an ordinary error, not an unwind.
+        let err = match cache.fetch(false, || -> Result<Vec<MarketEntry>, String> {
+            panic!("boom");
+        }) {
+            Ok(_) => panic!("a panicking computation must not succeed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("panicked"),
+            "a panicking computation must surface as an error, got: {err}"
+        );
+
+        // The cache is not wedged: a later fetch computes and completes.
+        let ok = cache
+            .fetch(false, || Ok::<_, String>(Vec::<MarketEntry>::new()))
+            .unwrap();
+        assert!(ok.is_empty());
+    }
+
+    /// A failed computation is shared with **every** waiter of that
+    /// computation: N concurrent callers see the same single error and exactly
+    /// one `npm` attempt runs — not N serial retries, each waiting through its
+    /// own registry timeout. The retry belongs to the *next* request.
+    #[test]
+    fn marketplace_cache_shares_a_failed_computation_with_all_waiters() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::sync::{Arc, Condvar, Mutex};
+        const WAITERS: usize = 7; // one leader + seven followers = eight callers
+
+        let cache = MarketplaceCache::new(std::time::Duration::from_secs(300));
+        let calls = AtomicUsize::new(0);
+
+        // Deterministic synchronisation (no sleeps): every follower that joins
+        // the in-flight run bumps `joined` through the cache's test hook, and
+        // the leader is released only once all seven have *provably* joined —
+        // so a follower the scheduler is slow to start can never race past the
+        // finished leader and begin a second computation (the failure mode a
+        // fixed sleep could not rule out). A bounded wait reports a failed
+        // sync instead of hanging.
+        let joined = Arc::new((Mutex::new(0usize), Condvar::new()));
+        {
+            let joined = Arc::clone(&joined);
+            cache.set_on_waiter_joined(move || {
+                let (lock, cv) = &*joined;
+                *lock.lock().unwrap() += 1;
+                cv.notify_all();
+            });
+        }
+        let timed_out = Arc::new(AtomicBool::new(false));
+
+        let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..(WAITERS + 1) {
+                let cache = &cache;
+                let calls = &calls;
+                let joined = Arc::clone(&joined);
+                let timed_out = Arc::clone(&timed_out);
+                handles.push(scope.spawn(move || {
+                    cache
+                        .fetch(false, move || {
+                            // Only the leader runs this. Block until every
+                            // follower has joined this exact flight, then fail —
+                            // proving all seven are waiters of one run, never
+                            // sequential leaders.
+                            calls.fetch_add(1, SeqCst);
+                            let (lock, cv) = &*joined;
+                            let mut n = lock.lock().unwrap();
+                            let start = std::time::Instant::now();
+                            let deadline = std::time::Duration::from_secs(10);
+                            while *n < WAITERS {
+                                let Some(rem) = deadline.checked_sub(start.elapsed()) else {
+                                    timed_out.store(true, SeqCst);
+                                    break;
+                                };
+                                let (g, to) = cv.wait_timeout(n, rem).unwrap();
+                                n = g;
+                                if to.timed_out() && *n < WAITERS {
+                                    timed_out.store(true, SeqCst);
+                                    break;
+                                }
+                            }
+                            Err::<Vec<MarketEntry>, _>("npm search: offline".to_string())
+                        })
+                        .map(|_| ())
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        assert!(
+            !timed_out.load(SeqCst),
+            "every follower must join the single flight before the leader completes"
+        );
+        assert_eq!(
+            calls.load(SeqCst),
+            1,
+            "a failed computation must run once for the whole burst, not once per waiter"
+        );
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "every waiter must see the shared failure"
+        );
+    }
+
+    /// A later leader must never steal the outcome an earlier flight's waiters
+    /// are about to read. A single shared "last outcome" slot let a new leader
+    /// clear it between the previous run's `notify_all` and its waiters
+    /// resuming, dragging those waiters through a *second* `npm` timeout even
+    /// though their own run had already produced a result. The per-flight
+    /// handle isolates each run's waiters from every later leader.
+    ///
+    /// This test parks a flight-1 follower *after* it has cloned flight 1's
+    /// `Arc` but *before* it reads the outcome, completes flight 1, then runs a
+    /// forced flight 2 to a distinct result while the follower is still parked.
+    /// Releasing the follower must yield flight 1's result — a regression to a
+    /// shared outcome slot would instead surface flight 2's (or block on it).
+    ///
+    /// The choreography is fully deterministic and every wait is bounded, so a
+    /// regression *fails* the test instead of hanging the test binary (a bare
+    /// `Barrier::wait()` has no timeout and could deadlock the whole suite).
+    /// The follower cannot begin its `fetch` until the leader has *provably*
+    /// installed flight 1 (`flight_installed`), so the leader always leads and
+    /// the follower always joins — the `unreachable!` compute is genuinely
+    /// unreachable, never a wrong-role panic.
+    #[test]
+    fn marketplace_cache_waiters_read_their_own_flight_not_a_later_leaders() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::{Duration, Instant};
+
+        const BOUND: Duration = Duration::from_secs(10);
+
+        let cache = MarketplaceCache::new(Duration::from_secs(300));
+        let leader_calls = AtomicUsize::new(0);
+        // Set when any bounded wait below times out; asserted at the end so a
+        // missed rendezvous fails the test rather than silently passing.
+        // `Arc` because the `'static` `on_waiter_wait` hook captures a clone.
+        let timed_out = Arc::new(AtomicBool::new(false));
+
+        let entry = |name: &str| MarketEntry {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: String::new(),
+            category: "lang".to_string(),
+            official: true,
+            installed: false,
+            installed_version: None,
+            update_available: false,
+            repository: None,
+            homepage: None,
+            npm_url: None,
+            changelog_available: false,
+        };
+
+        // A bounded two-party rendezvous (a `Barrier` with a timeout, which
+        // stable `std` does not provide). `arrive` blocks the caller until both
+        // parties have arrived or the deadline passes; it returns `false` on
+        // timeout instead of hanging the test binary, so a missed rendezvous
+        // *fails* the test rather than deadlocking the whole suite.
+        struct Gate {
+            state: Mutex<usize>,
+            cv: Condvar,
+        }
+        impl Gate {
+            fn new() -> Self {
+                Self {
+                    state: Mutex::new(0),
+                    cv: Condvar::new(),
+                }
+            }
+            /// Block until both parties arrive. Returns `false` on timeout.
+            fn arrive(&self, deadline: Instant) -> bool {
+                let mut n = self.state.lock().unwrap();
+                *n += 1;
+                if *n >= 2 {
+                    self.cv.notify_all();
+                    return true;
+                }
+                loop {
+                    let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
+                        return false;
+                    };
+                    let (g, to) = self.cv.wait_timeout(n, rem).unwrap();
+                    n = g;
+                    if *n >= 2 {
+                        return true;
+                    }
+                    if to.timed_out() {
+                        return false;
+                    }
+                }
+            }
+        }
+        let arrive = |gate: &Gate, deadline: Instant| -> bool {
+            if gate.arrive(deadline) {
+                true
+            } else {
+                timed_out.store(true, SeqCst);
+                false
+            }
+        };
+
+        // The leader opens this the instant it has installed flight 1 (its
+        // compute closure runs only on the leader, after `in_flight` is set),
+        // releasing the follower to join. This removes the startup race: the
+        // follower can never reach phase 1 first and become the leader.
+        let flight_installed = Arc::new(Gate::new());
+
+        // Release flight 1's leader only once its follower has joined the
+        // flight (bounded, so a regression fails rather than hangs).
+        let joined = Arc::new((Mutex::new(0usize), Condvar::new()));
+        {
+            let joined = Arc::clone(&joined);
+            cache.set_on_waiter_joined(move || {
+                let (lock, cv) = &*joined;
+                *lock.lock().unwrap() += 1;
+                cv.notify_all();
+            });
+        }
+
+        // Park the flight-1 follower at the wait gate until the main thread has
+        // completed flight 2. `parked` signals the follower reached the gate;
+        // `release` lets it through to read its outcome.
+        let parked = Arc::new(Gate::new());
+        let release = Arc::new(Gate::new());
+        {
+            let parked = Arc::clone(&parked);
+            let release = Arc::clone(&release);
+            let timed_out = Arc::clone(&timed_out);
+            cache.set_on_waiter_wait(move || {
+                // Bounded on BOTH gates. The happy-path rendezvous is fast, but
+                // on a FAILURE path the main thread can panic before it reaches
+                // `release.arrive` (e.g. the second-flight assertion fails), and
+                // `thread::scope` then joins this still-parked follower while it
+                // unwinds. An unbounded wait would stall that failure reporting
+                // for the full timeout; `BOUND` makes the regression fail
+                // promptly even when `release` is never signalled.
+                if !parked.arrive(Instant::now() + BOUND) || !release.arrive(Instant::now() + BOUND)
+                {
+                    timed_out.store(true, SeqCst);
+                }
+            });
+        }
+
+        let follower = std::thread::scope(|scope| {
+            // Flight 1 leader: opens `flight_installed`, waits for its
+            // follower, then returns flight-1.
+            let leader = scope.spawn(|| {
+                cache
+                    .fetch(false, {
+                        let flight_installed = Arc::clone(&flight_installed);
+                        let joined = Arc::clone(&joined);
+                        let entry = &entry;
+                        let leader_calls = &leader_calls;
+                        let timed_out = &timed_out;
+                        move || {
+                            leader_calls.fetch_add(1, SeqCst);
+                            // Flight 1 is installed (this closure runs only on
+                            // the leader): let the follower start its fetch.
+                            flight_installed.arrive(Instant::now() + BOUND);
+                            let (lock, cv) = &*joined;
+                            let mut n = lock.lock().unwrap();
+                            let deadline = Instant::now() + BOUND;
+                            while *n < 1 {
+                                let Some(rem) = deadline.checked_duration_since(Instant::now())
+                                else {
+                                    timed_out.store(true, SeqCst);
+                                    break;
+                                };
+                                let (g, to) = cv.wait_timeout(n, rem).unwrap();
+                                n = g;
+                                if to.timed_out() && *n < 1 {
+                                    timed_out.store(true, SeqCst);
+                                    break;
+                                }
+                            }
+                            Ok::<_, String>(vec![entry("flight-1")])
+                        }
+                    })
+                    .map(|arc| arc[0].name.clone())
+                    .unwrap()
+            });
+
+            // Flight 1 follower: cannot enter `fetch` until flight 1 exists, so
+            // it always joins as a waiter (never runs the `unreachable!`), then
+            // is parked at the wait gate.
+            let follower = scope.spawn(|| {
+                flight_installed.arrive(Instant::now() + BOUND);
+                cache
+                    .fetch(false, || {
+                        unreachable!("a follower never computes; it joins flight 1")
+                    })
+                    .map(|arc| arc[0].name.clone())
+                    .unwrap()
+            });
+
+            // Wait until the follower is parked at the gate (holding flight 1's
+            // Arc, not yet reading the outcome), then let flight 1 finish.
+            let deadline = Instant::now() + BOUND;
+            let follower_parked = arrive(&parked, deadline);
+            let leader_outcome = leader.join().unwrap();
+            assert!(
+                follower_parked,
+                "the flight-1 follower never reached the wait gate"
+            );
+            assert_eq!(leader_outcome, "flight-1");
+
+            // Flight 1 is complete and retired. Start a *forced* flight 2 with
+            // a distinct result while the follower is still parked. A shared
+            // outcome slot would now hold flight 2's value, ready to ambush the
+            // parked follower.
+            let second = cache
+                .fetch(true, {
+                    let entry = &entry;
+                    let leader_calls = &leader_calls;
+                    move || {
+                        leader_calls.fetch_add(1, SeqCst);
+                        Ok::<_, String>(vec![entry("flight-2")])
+                    }
+                })
+                .map(|arc| arc[0].name.clone())
+                .unwrap();
+            assert_eq!(second, "flight-2", "the forced refresh must recompute");
+
+            // Release the parked follower and read what it observed.
+            release.arrive(Instant::now() + BOUND);
+            follower.join().unwrap()
+        });
+
+        assert!(
+            !timed_out.load(SeqCst),
+            "a synchronisation wait timed out — a missed rendezvous must fail, not hang"
+        );
+        assert_eq!(
+            follower, "flight-1",
+            "a parked flight-1 waiter must read its own flight's outcome, not a later leader's"
+        );
+        assert_eq!(
+            leader_calls.load(SeqCst),
+            2,
+            "exactly two computations ran: flight 1 and the forced flight 2"
+        );
+    }
+
+    /// The installation state of a cached listing is re-derived from the live
+    /// pack store on every response: an install, an update, and a removal that
+    /// happen **within the cache TTL** are reflected immediately — the cached
+    /// registry metadata is reused, but the Install/Update/Remove affordances
+    /// never go stale.
+    #[test]
+    fn overlay_install_state_reflects_mutations_within_the_cache_ttl() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-mkt-ovl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // SAFETY: test-local env set; serialized on ENV_LOCK.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+
+        let entry = |name: &str, version: &str| MarketEntry {
+            name: name.to_string(),
+            version: version.to_string(),
+            description: String::new(),
+            category: "lang".to_string(),
+            official: true,
+            installed: false,
+            installed_version: None,
+            update_available: false,
+            repository: None,
+            homepage: None,
+            npm_url: None,
+            changelog_available: false,
+        };
+        let write_pack = |name: &str, version: &str| {
+            let dir = safe_pkg_dir(name).unwrap();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("package.json"),
+                format!(r#"{{"version":"{version}"}}"#),
+            )
+            .unwrap();
+        };
+
+        // Install: a pack that was not installed when the listing was computed
+        // shows as installed, at the installed version, with no pending update.
+        write_pack("@nanobpm/pack-new", "2.0.0");
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.0.0")]);
+        assert!(out[0].installed, "a fresh install must show installed");
+        assert_eq!(out[0].installed_version.as_deref(), Some("2.0.0"));
+        assert!(!out[0].update_available);
+
+        // Update: the installed version (2.0.0, on disk) lags the cached latest
+        // 2.1.0 → Update offered.
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.1.0")]);
+        assert!(out[0].update_available, "a newer latest must offer Update");
+        // …and after the update is pulled, the same cached metadata no longer
+        // offers it.
+        write_pack("@nanobpm/pack-new", "2.1.0");
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.1.0")]);
+        assert!(
+            !out[0].update_available,
+            "a completed update must clear the Update affordance"
+        );
+
+        // Stale cached metadata must never advertise a *downgrade*: the pack is
+        // installed at 2.1.0 (an unpinned install pulled npm's latest) while the
+        // cached registry `version` still lags at 2.0.0. A string-inequality
+        // check (`iv != version`) would falsely offer an "update" to the older
+        // 2.0.0; semver ordering keeps it honest — installed ≥ latest ⇒ no
+        // update (#1330).
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.0.0")]);
+        assert!(
+            !out[0].update_available,
+            "stale cached metadata must not advertise a downgrade as an update"
+        );
+        assert_eq!(out[0].installed_version.as_deref(), Some("2.1.0"));
+
+        // Removal: the pack disappears from the store → Install offered again.
+        std::fs::remove_dir_all(safe_pkg_dir("@nanobpm/pack-new").unwrap()).unwrap();
+        let out = overlay_install_state(vec![entry("@nanobpm/pack-new", "2.1.0")]);
+        assert!(!out[0].installed, "a removed pack must offer Install");
+        assert_eq!(out[0].installed_version, None);
+        assert!(!out[0].update_available);
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    fn version_cmp_orders_by_semver_precedence() {
+        use std::cmp::Ordering;
+        // Numeric core, field by field (not lexicographic: 2.10.0 > 2.9.0).
+        assert_eq!(version_cmp("2.9.0", "2.10.0"), Some(Ordering::Less));
+        assert_eq!(version_cmp("1.0.0", "1.0.0"), Some(Ordering::Equal));
+        assert_eq!(version_cmp("2.1.0", "2.0.0"), Some(Ordering::Greater));
+        // A leading `v` and build metadata are ignored.
+        assert_eq!(
+            version_cmp("v1.2.3", "1.2.3+build.9"),
+            Some(Ordering::Equal)
+        );
+        // Missing trailing fields are zero: 1.2 == 1.2.0.
+        assert_eq!(version_cmp("1.2", "1.2.0"), Some(Ordering::Equal));
+        // A pre-release ranks below its normal release, and numeric pre-release
+        // identifiers order numerically.
+        assert_eq!(version_cmp("1.0.0-beta", "1.0.0"), Some(Ordering::Less));
+        assert_eq!(
+            version_cmp("1.0.0-alpha.1", "1.0.0-alpha.2"),
+            Some(Ordering::Less)
+        );
+        // Numeric pre-release identifiers larger than `u64::MAX` still order by
+        // value, not lexically: `…100000…` (21 digits) > `…99999…` (20 digits)
+        // even though the lexical compare of the digit strings inverts that.
+        assert_eq!(
+            version_cmp("1.0.0-99999999999999999999", "1.0.0-100000000000000000000"),
+            Some(Ordering::Less)
+        );
+        // Leading zeros do not change a numeric identifier's value.
+        assert_eq!(version_cmp("1.0.0-007", "1.0.0-7"), Some(Ordering::Equal));
+        // A numeric identifier still ranks below an alphanumeric one, and two
+        // alphanumeric identifiers order lexically.
+        assert_eq!(
+            version_cmp("1.0.0-99999999999999999999", "1.0.0-alpha"),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            version_cmp("1.0.0-alpha", "1.0.0-beta"),
+            Some(Ordering::Less)
+        );
+        // The numeric < alphanumeric rule holds even when the numeric
+        // identifier overflows `u64` and the alphanumeric one starts with a
+        // digit: `1a` is alphanumeric, so the huge numeric still ranks lower.
+        assert_eq!(
+            version_cmp("1.0.0-99999999999999999999", "1.0.0-1a"),
+            Some(Ordering::Less)
+        );
+        // A non-numeric core (a dist-tag) is unorderable.
+        assert_eq!(version_cmp("latest", "1.0.0"), None);
+
+        // `version_lt` is strict and conservative: unorderable ⇒ not-less, so no
+        // spurious update is advertised.
+        assert!(version_lt("2.0.0", "2.1.0"));
+        assert!(!version_lt("2.1.0", "2.0.0"));
+        assert!(!version_lt("1.0.0", "1.0.0"));
+        assert!(!version_lt("latest", "1.0.0"));
     }
 
     #[test]

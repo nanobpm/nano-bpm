@@ -1180,6 +1180,23 @@ paths:
       operationId: getMarketplace
       tags: [extensions]
       summary: Marketplace of installable extension packs
+      description: >
+        Lists packs on npm tagged `nano-ide-ext`, with installed status and an
+        update-available flag per installed pack. The result is cached
+        server-side for several minutes (computing it shells out to npm once per
+        installed pack), and concurrent callers share one in-flight computation.
+        Pass `refresh=true` for an explicit "check now" that bypasses the cache
+        TTL — it still joins the single in-flight computation, so it never fans a
+        second npm burst out on top of an in-progress one.
+      parameters:
+        - name: refresh
+          in: query
+          required: false
+          description: >-
+            When `true`, bypass the server-side cache TTL and recompute the
+            listing now (still single-flight). Omit or `false` to serve the
+            cached result when it is still fresh.
+          schema: { type: boolean }
       responses:
         '200':
           description: Marketplace listing
