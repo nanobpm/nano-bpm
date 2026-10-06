@@ -183,9 +183,10 @@ impl TraceSink {
         let written_w = written.clone();
         let errors_w = errors.clone();
         let queued_w = queued_bytes.clone();
+        let dropped_w = dropped.clone();
         let handle = std::thread::Builder::new()
             .name("trace-ndjson".to_string())
-            .spawn(move || writer_loop(cfg, rx, queued_w, written_w, errors_w))
+            .spawn(move || writer_loop(cfg, rx, queued_w, written_w, errors_w, dropped_w))
             .expect("spawn trace-ndjson writer thread");
         Self {
             tx,
@@ -445,6 +446,32 @@ fn drain_and_account(rx: &Receiver<Msg>, queued_bytes: &AtomicU64, errors: &Atom
     }
 }
 
+/// How often the writer thread emits a durability report (dropped/error
+/// counters) to stderr so silent trace loss is observable in a running node,
+/// not only through the console API that nothing polls.
+const REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Whether a periodic durability report is warranted: emit only when the
+/// `(dropped, errors)` loss counters have GROWN since the last report, so a
+/// steady state is logged once rather than every window. Both counters are
+/// monotonic, so "grew" also implies the current value is non-zero. Pure, so
+/// the cadence/threshold decision is unit-tested without the writer thread.
+fn loss_grew(prev: (u64, u64), cur: (u64, u64)) -> bool {
+    cur.0 > prev.0 || cur.1 > prev.1
+}
+
+/// Abandons a `BufWriter` whose buffered bytes have already been accounted as
+/// lost, WITHOUT the implicit flush retry that `drop` would run. A
+/// `BufWriter`'s `Drop` re-attempts the failed flush; if that retry were to
+/// succeed it would persist lines we have already counted in `errors` and can
+/// never move to `written`, so the exposed stats would contradict the file.
+/// `into_parts` disassembles the writer and discards the buffer instead, so
+/// "counted as lost" stays truthful. The returned file handle is dropped
+/// (closed) without a flush.
+fn abandon_without_flush(writer: BufWriter<File>) {
+    let _ = writer.into_parts();
+}
+
 /// The writer thread body: drains the channel, appends lines, flushes on an
 /// **absolute** periodic deadline, and rotates on size. Terminates on `Shutdown`
 /// or when the sender is dropped, flushing first. Write/flush failures are
@@ -464,6 +491,7 @@ fn writer_loop(
     queued_bytes: Arc<AtomicU64>,
     written: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
 ) {
     let file = match open_append(&cfg.path) {
         Ok(f) => f,
@@ -529,14 +557,57 @@ fn writer_loop(
     };
 
     // Accounts lines still buffered when a writer is about to be abandoned
-    // (dropped for rotation, or on thread exit). Dropping a `BufWriter` cannot
-    // reliably persist bytes a prior flush already failed to write, so those
-    // lines are genuinely lost now and counted as `errors` exactly once.
+    // (dropped for rotation, or on thread exit). The writer is then abandoned
+    // via `abandon_without_flush` (not a plain `drop`), which discards the
+    // buffer WITHOUT the implicit flush retry a `BufWriter`'s `Drop` performs —
+    // so a prior failed flush's bytes are genuinely gone, and counting these
+    // lines as `errors` exactly once here cannot be contradicted by a late
+    // retry silently persisting them.
     let account_lost = |pending: &mut u64| {
         *pending = account_lost_pending(*pending, &errors);
     };
 
+    // A fatal writer failure inside line handling: the current line has already
+    // been removed from `rx`, so its byte reservation (released at the bottom of
+    // the arm on the normal path) and its loss would otherwise leak when we
+    // return early. Release the reservation and — unless the line was already
+    // counted as a write failure (`already_counted`) — count it lost, then drain
+    // and account every still-queued line before the thread exits.
+    let fatal_settle = |line_bytes: u64, already_counted: bool| {
+        if !already_counted {
+            errors.fetch_add(1, Ordering::Relaxed);
+        }
+        queued_bytes.fetch_sub(line_bytes, Ordering::AcqRel);
+        drain_and_account(&rx, &queued_bytes, &errors);
+    };
+
+    // Periodic durability report: dropped/error counters are otherwise only
+    // reachable via the console API (which nothing polls), leaving queue-full
+    // drops and disk/rotation errors invisible in a running node. Report deltas
+    // to stderr so operators can see when to raise the budget or check the disk.
+    let mut report_deadline = Instant::now() + REPORT_INTERVAL;
+    let mut last_report: (u64, u64) = (0, 0);
+
     loop {
+        // Surface accumulated drops/errors on the report cadence. The loop wakes
+        // at least every flush interval (the Timeout arm fires even when idle),
+        // so this is evaluated regularly without its own timer.
+        if Instant::now() >= report_deadline {
+            report_deadline = Instant::now() + REPORT_INTERVAL;
+            let cur = (
+                dropped.load(Ordering::Relaxed),
+                errors.load(Ordering::Relaxed),
+            );
+            if loss_grew(last_report, cur) {
+                eprintln!(
+                    "nano-trace-store: durability report for {}: {} trace(s) dropped (budget full), {} write/rotation error(s); raise NANOBPMN_TRACE_FILE_QUEUE_BYTES or check the disk",
+                    cfg.path.display(),
+                    cur.0,
+                    cur.1
+                );
+                last_report = cur;
+            }
+        }
         // Wait only until the absolute deadline; if it has already passed,
         // flush immediately rather than blocking on another arrival.
         let wait = next_flush.saturating_duration_since(Instant::now());
@@ -555,9 +626,11 @@ fn writer_loop(
                     // they are accounted and durable before rotation.
                     let flush_ok = do_flush(&mut writer, &mut pending, &mut next_flush, true);
                     // Any lines still pending survived a failed flush; the writer
-                    // we are about to drop cannot persist them, so they are lost.
+                    // we are about to abandon cannot persist them, so they are
+                    // lost. Abandon it without an implicit flush retry (see
+                    // `abandon_without_flush`) so that loss stays truthful.
                     account_lost(&mut pending);
-                    drop(writer);
+                    abandon_without_flush(writer);
                     // A failed flush may have persisted a PREFIX of the final
                     // record before erroring, leaving a torn tail on disk.
                     // Repair the active file before renaming it — otherwise the
@@ -586,7 +659,11 @@ fn writer_loop(
                                     "nano-trace-store: cannot reopen trace file {} after failed repair: {e}",
                                     cfg.path.display()
                                 );
-                                drain_and_account(&rx, &queued_bytes, &errors);
+                                // The triggering line was never written: count it
+                                // lost and release its reservation, then drain the
+                                // rest — otherwise its bytes leak in `queued_bytes`
+                                // and the trace vanishes unaccounted.
+                                fatal_settle(line_bytes, false);
                                 return;
                             }
                         }
@@ -612,12 +689,14 @@ fn writer_loop(
                                             "nano-trace-store: cannot reopen trace file {} after rotation: {e}",
                                             cfg.path.display()
                                         );
-                                        // The writer can no longer persist. Drain and
-                                        // account every already-queued line (release
-                                        // its byte reservation, count it lost) rather
-                                        // than returning with the channel silently
-                                        // dropping them and the reservations leaking.
-                                        drain_and_account(&rx, &queued_bytes, &errors);
+                                        // The writer can no longer persist. The
+                                        // triggering line was never written: count
+                                        // it lost and release its reservation, then
+                                        // drain and account every already-queued
+                                        // line — rather than returning with the
+                                        // channel silently dropping them and the
+                                        // reservations leaking.
+                                        fatal_settle(line_bytes, false);
                                         return;
                                     }
                                 }
@@ -638,15 +717,17 @@ fn writer_loop(
                                         size = file_size(&cfg.path);
                                     }
                                     Err(e) => {
-                                        // Cannot continue appending either. Drain and
-                                        // account the queued lines (release their byte
-                                        // reservations, count them lost) before exit.
+                                        // Cannot continue appending either. The
+                                        // triggering line was never written: count
+                                        // it lost and release its reservation, then
+                                        // drain and account the queued lines before
+                                        // exit.
                                         errors.fetch_add(1, Ordering::Relaxed);
                                         eprintln!(
                                             "nano-trace-store: cannot reopen trace file {} after failed rotation: {e}",
                                             cfg.path.display()
                                         );
-                                        drain_and_account(&rx, &queued_bytes, &errors);
+                                        fatal_settle(line_bytes, false);
                                         return;
                                     }
                                 }
@@ -679,22 +760,24 @@ fn writer_loop(
                             cfg.path.display()
                         );
                         account_lost(&mut pending);
-                        drop(writer);
+                        abandon_without_flush(writer);
                         match open_append(&cfg.path) {
                             Ok(f) => {
                                 size = file_size(&cfg.path);
                                 writer = BufWriter::new(f);
                             }
                             Err(e) => {
-                                // Cannot re-establish a clean writer. Drain and
-                                // account the queued lines (release their byte
-                                // reservations, count them lost) before exit.
+                                // Cannot re-establish a clean writer. The current
+                                // line was already counted as a write failure above,
+                                // so only release its still-held reservation (it is
+                                // not counted a second time), then drain and account
+                                // the queued lines before exit.
                                 errors.fetch_add(1, Ordering::Relaxed);
                                 eprintln!(
                                     "nano-trace-store: cannot reopen trace file {} after write failure: {e}",
                                     cfg.path.display()
                                 );
-                                drain_and_account(&rx, &queued_bytes, &errors);
+                                fatal_settle(line_bytes, true);
                                 return;
                             }
                         }
@@ -717,19 +800,38 @@ fn writer_loop(
         }
     }
     // The thread is exiting: the final flush above may have failed, leaving lines
-    // buffered in the writer we are about to drop. They cannot be persisted now,
-    // so classify them as lost (counted once).
+    // buffered in the writer we are about to abandon. They cannot be persisted
+    // now, so classify them as lost (counted once) and abandon the writer without
+    // the implicit flush retry `drop` would run — a late retry persisting them
+    // would contradict the loss we just counted.
     account_lost(&mut pending);
+    abandon_without_flush(writer);
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{account_lost_pending, settle_flush};
+    use super::{account_lost_pending, loss_grew, settle_flush};
 
     fn load(a: &AtomicU64) -> u64 {
         a.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn loss_grew_only_fires_when_a_counter_increases() {
+        // Steady state (no new loss) must not re-log every report window.
+        assert!(!loss_grew((0, 0), (0, 0)));
+        assert!(!loss_grew((3, 5), (3, 5)));
+        // A growth in either the dropped or the errors counter warrants a report.
+        assert!(loss_grew((0, 0), (1, 0)), "new drop should report");
+        assert!(loss_grew((0, 0), (0, 1)), "new error should report");
+        assert!(loss_grew((3, 5), (4, 5)), "dropped grew");
+        assert!(loss_grew((3, 5), (3, 6)), "errors grew");
+        assert!(loss_grew((3, 5), (4, 6)), "both grew");
+        // Counters are monotonic, so a non-increase (the baseline already past
+        // the current read, which should not happen) never reports.
+        assert!(!loss_grew((4, 6), (3, 5)));
     }
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
