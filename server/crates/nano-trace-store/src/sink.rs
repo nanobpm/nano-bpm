@@ -567,7 +567,8 @@ fn writer_loop(
                     // verified, skip the rotation rather than archive a file we
                     // cannot vouch for; the error is counted and the reopen
                     // below re-establishes a clean writer on the still-present
-                    // (unrepaired) file.
+                    // file, then falls through to write the triggering line so
+                    // it is not silently dropped.
                     if !flush_ok && let Err(e) = truncate_incomplete_tail(&cfg.path) {
                         errors.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
@@ -589,60 +590,65 @@ fn writer_loop(
                                 return;
                             }
                         }
-                        queued_bytes.fetch_sub(line_bytes, Ordering::AcqRel);
-                        continue;
-                    }
-                    match rotate(&cfg.path, cfg.keep) {
-                        Ok(()) => {
-                            // The active file is gone (renamed); reopen a fresh
-                            // empty segment and reset the tracked size to zero.
-                            match open_append(&cfg.path) {
-                                Ok(f) => {
-                                    size = 0;
-                                    writer = BufWriter::new(f);
-                                }
-                                Err(e) => {
-                                    errors.fetch_add(1, Ordering::Relaxed);
-                                    eprintln!(
-                                        "nano-trace-store: cannot reopen trace file {} after rotation: {e}",
-                                        cfg.path.display()
-                                    );
-                                    // The writer can no longer persist. Drain and
-                                    // account every already-queued line (release
-                                    // its byte reservation, count it lost) rather
-                                    // than returning with the channel silently
-                                    // dropping them and the reservations leaking.
-                                    drain_and_account(&rx, &queued_bytes, &errors);
-                                    return;
+                        // Rotation was skipped, but `open_append` re-ran the tail
+                        // repair itself, so the reopened handle is verifiably
+                        // clean. Fall through to write the current line onto it
+                        // rather than dropping it: a `continue` here would discard
+                        // the triggering trace without counting it in `errors`,
+                        // the exact silent loss this sink exists to prevent.
+                    } else {
+                        match rotate(&cfg.path, cfg.keep) {
+                            Ok(()) => {
+                                // The active file is gone (renamed); reopen a fresh
+                                // empty segment and reset the tracked size to zero.
+                                match open_append(&cfg.path) {
+                                    Ok(f) => {
+                                        size = 0;
+                                        writer = BufWriter::new(f);
+                                    }
+                                    Err(e) => {
+                                        errors.fetch_add(1, Ordering::Relaxed);
+                                        eprintln!(
+                                            "nano-trace-store: cannot reopen trace file {} after rotation: {e}",
+                                            cfg.path.display()
+                                        );
+                                        // The writer can no longer persist. Drain and
+                                        // account every already-queued line (release
+                                        // its byte reservation, count it lost) rather
+                                        // than returning with the channel silently
+                                        // dropping them and the reservations leaking.
+                                        drain_and_account(&rx, &queued_bytes, &errors);
+                                        return;
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            // Rotation failed (e.g. permission): keep the real
-                            // over-limit size, count the error, and continue
-                            // appending to a reopened handle on the still-present
-                            // file so the size bound is not silently defeated.
-                            errors.fetch_add(1, Ordering::Relaxed);
-                            eprintln!(
-                                "nano-trace-store: rotation of trace file {} failed, continuing to append: {e}",
-                                cfg.path.display()
-                            );
-                            match open_append(&cfg.path) {
-                                Ok(f) => {
-                                    writer = BufWriter::new(f);
-                                    size = file_size(&cfg.path);
-                                }
-                                Err(e) => {
-                                    // Cannot continue appending either. Drain and
-                                    // account the queued lines (release their byte
-                                    // reservations, count them lost) before exit.
-                                    errors.fetch_add(1, Ordering::Relaxed);
-                                    eprintln!(
-                                        "nano-trace-store: cannot reopen trace file {} after failed rotation: {e}",
-                                        cfg.path.display()
-                                    );
-                                    drain_and_account(&rx, &queued_bytes, &errors);
-                                    return;
+                            Err(e) => {
+                                // Rotation failed (e.g. permission): keep the real
+                                // over-limit size, count the error, and continue
+                                // appending to a reopened handle on the still-present
+                                // file so the size bound is not silently defeated.
+                                errors.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "nano-trace-store: rotation of trace file {} failed, continuing to append: {e}",
+                                    cfg.path.display()
+                                );
+                                match open_append(&cfg.path) {
+                                    Ok(f) => {
+                                        writer = BufWriter::new(f);
+                                        size = file_size(&cfg.path);
+                                    }
+                                    Err(e) => {
+                                        // Cannot continue appending either. Drain and
+                                        // account the queued lines (release their byte
+                                        // reservations, count them lost) before exit.
+                                        errors.fetch_add(1, Ordering::Relaxed);
+                                        eprintln!(
+                                            "nano-trace-store: cannot reopen trace file {} after failed rotation: {e}",
+                                            cfg.path.display()
+                                        );
+                                        drain_and_account(&rx, &queued_bytes, &errors);
+                                        return;
+                                    }
                                 }
                             }
                         }
