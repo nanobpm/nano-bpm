@@ -429,6 +429,17 @@ fn account_lost_pending(pending: u64, errors: &AtomicU64) -> u64 {
     0
 }
 
+/// Whether appending a `line_bytes`-long record to a `BufWriter` that already
+/// holds `buffered` bytes would overflow its `cap`-byte buffer, triggering the
+/// writer's *implicit* mid-write flush. The writer loop uses this to flush
+/// EXPLICITLY first: otherwise `write_all` would persist the buffered records
+/// and could then fail on the direct write of the oversized line, leaving those
+/// already-durable records miscounted as lost. A line that exactly fills the
+/// buffer (`buffered + line_bytes == cap`) does not overflow.
+fn write_would_overflow(buffered: u64, line_bytes: u64, cap: usize) -> bool {
+    buffered + line_bytes > cap as u64
+}
+
 /// Drains every message still queued in `rx`, releasing each line's byte
 /// reservation and counting it as an error, until a `Shutdown` (or the sender
 /// disconnecting) ends the stream. Used when the writer can no longer persist —
@@ -450,6 +461,14 @@ fn drain_and_account(rx: &Receiver<Msg>, queued_bytes: &AtomicU64, errors: &Atom
 /// counters) to stderr so silent trace loss is observable in a running node,
 /// not only through the console API that nothing polls.
 const REPORT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Capacity of the trace-file `BufWriter`. Fixed (rather than relying on the
+/// std default) so the writer thread can track how full the buffer is and flush
+/// EXPLICITLY before an incoming line would overflow it — pre-empting the
+/// BufWriter's implicit mid-write flush, which would otherwise persist buffered
+/// records and then let a direct write of the oversized line fail, leaving those
+/// already-durable records miscounted as lost.
+const WRITER_CAP: usize = 8 * 1024;
 
 /// Whether a periodic durability report is warranted: emit only when the
 /// `(dropped, errors)` loss counters have GROWN since the last report, so a
@@ -507,9 +526,14 @@ fn writer_loop(
         }
     };
     let mut size = file_size(&cfg.path);
-    let mut writer = BufWriter::new(file);
+    let mut writer = BufWriter::with_capacity(WRITER_CAP, file);
     // Lines accepted into the BufWriter but not yet flushed to the OS.
     let mut pending: u64 = 0;
+    // Bytes currently held in the BufWriter's buffer (a conservative upper
+    // bound). Tracked so we can flush EXPLICITLY before a write that would
+    // overflow the buffer, pre-empting the BufWriter's *implicit* mid-write
+    // flush — see the write arm below for why that matters to loss accounting.
+    let mut buffered_bytes: u64 = 0;
     // Absolute flush deadline: set once and advanced only when a flush actually
     // happens, so a steady stream of arrivals (each restarting a relative
     // timeout) can never starve the flush. This is what makes the documented
@@ -608,6 +632,20 @@ fn writer_loop(
                 last_report = cur;
             }
         }
+        // If the flush deadline has already passed, flush NOW rather than
+        // relying on the `Timeout` arm. Under a sustained backlog `wait` is
+        // zero, but `recv_timeout(Duration::ZERO)` returns an already-queued
+        // `Line` (not `Timeout`), so the Timeout arm that flushes would never
+        // fire: pending records would ride only the BufWriter's implicit
+        // capacity flushes and the documented "at most one flush interval of
+        // data at risk" guarantee would be violated. Flushing here settles
+        // pending and advances `next_flush`, so at least one flush happens per
+        // interval even if the channel never drains.
+        if Instant::now() >= next_flush
+            && do_flush(&mut writer, &mut pending, &mut next_flush, true)
+        {
+            buffered_bytes = 0;
+        }
         // Wait only until the absolute deadline; if it has already passed,
         // flush immediately rather than blocking on another arrival.
         let wait = next_flush.saturating_duration_since(Instant::now());
@@ -650,7 +688,8 @@ fn writer_loop(
                         );
                         match open_append(&cfg.path) {
                             Ok(f) => {
-                                writer = BufWriter::new(f);
+                                writer = BufWriter::with_capacity(WRITER_CAP, f);
+                                buffered_bytes = 0;
                                 size = file_size(&cfg.path);
                             }
                             Err(e) => {
@@ -681,7 +720,8 @@ fn writer_loop(
                                 match open_append(&cfg.path) {
                                     Ok(f) => {
                                         size = 0;
-                                        writer = BufWriter::new(f);
+                                        writer = BufWriter::with_capacity(WRITER_CAP, f);
+                                        buffered_bytes = 0;
                                     }
                                     Err(e) => {
                                         errors.fetch_add(1, Ordering::Relaxed);
@@ -713,7 +753,8 @@ fn writer_loop(
                                 );
                                 match open_append(&cfg.path) {
                                     Ok(f) => {
-                                        writer = BufWriter::new(f);
+                                        writer = BufWriter::with_capacity(WRITER_CAP, f);
+                                        buffered_bytes = 0;
                                         size = file_size(&cfg.path);
                                     }
                                     Err(e) => {
@@ -735,6 +776,25 @@ fn writer_loop(
                         }
                     }
                 }
+                // Pre-empt the BufWriter's *implicit* mid-write flush. When the
+                // incoming line would not fit alongside the currently buffered
+                // bytes, `write_all` first flushes the buffered (newline-
+                // terminated, durable-once-flushed) records and can then fail on
+                // the direct write of this line — which would make
+                // `account_lost` classify those already-persisted records as
+                // lost, contradicting the file contents. By flushing explicitly
+                // here (settling pending as `written`) we guarantee a subsequent
+                // write failure can only lose THIS single line. A FAILED
+                // pre-flush leaves the same writer we are about to write through
+                // (and keeps `buffered_bytes`): the write below detects the error
+                // and runs the terminal abandon/repair/reopen path, so nothing
+                // extra is needed here.
+                if pending > 0
+                    && write_would_overflow(buffered_bytes, line_bytes, WRITER_CAP)
+                    && do_flush(&mut writer, &mut pending, &mut next_flush, true)
+                {
+                    buffered_bytes = 0;
+                }
                 match writer
                     .write_all(line.as_bytes())
                     .and_then(|()| writer.write_all(b"\n"))
@@ -742,6 +802,7 @@ fn writer_loop(
                     Ok(()) => {
                         size += line_bytes;
                         pending += 1;
+                        buffered_bytes += line_bytes;
                     }
                     Err(e) => {
                         // The line is lost (e.g. disk full): count and log it so
@@ -764,7 +825,8 @@ fn writer_loop(
                         match open_append(&cfg.path) {
                             Ok(f) => {
                                 size = file_size(&cfg.path);
-                                writer = BufWriter::new(f);
+                                writer = BufWriter::with_capacity(WRITER_CAP, f);
+                                buffered_bytes = 0;
                             }
                             Err(e) => {
                                 // Cannot re-establish a clean writer. The current
@@ -791,7 +853,9 @@ fn writer_loop(
             }
             Err(RecvTimeoutError::Timeout) => {
                 // Absolute deadline reached.
-                do_flush(&mut writer, &mut pending, &mut next_flush, true);
+                if do_flush(&mut writer, &mut pending, &mut next_flush, true) {
+                    buffered_bytes = 0;
+                }
             }
             Err(RecvTimeoutError::Disconnected) => {
                 do_flush(&mut writer, &mut pending, &mut next_flush, false);
@@ -812,7 +876,7 @@ fn writer_loop(
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{account_lost_pending, loss_grew, settle_flush};
+    use super::{account_lost_pending, loss_grew, settle_flush, write_would_overflow};
 
     fn load(a: &AtomicU64) -> u64 {
         a.load(Ordering::Relaxed)
@@ -832,6 +896,23 @@ mod tests {
         // Counters are monotonic, so a non-increase (the baseline already past
         // the current read, which should not happen) never reports.
         assert!(!loss_grew((4, 6), (3, 5)));
+    }
+
+    #[test]
+    fn write_would_overflow_guards_the_implicit_mid_write_flush() {
+        // Room to spare: the line fits with bytes left over -> no explicit flush.
+        assert!(!write_would_overflow(0, 100, 8 * 1024));
+        assert!(!write_would_overflow(4000, 1000, 8 * 1024));
+        // Exact fill is NOT an overflow (the buffer can still hold it without an
+        // implicit flush), so the boundary must not trip the guard.
+        assert!(!write_would_overflow(8000, 192, 8 * 1024));
+        // One byte past capacity overflows -> the loop must flush first so a
+        // failed direct write can only lose this one line, never the buffered
+        // (already-flushed, durable) records.
+        assert!(write_would_overflow(8000, 193, 8 * 1024));
+        // An oversized line on top of any buffered content overflows, too.
+        assert!(write_would_overflow(1, 9000, 8 * 1024));
+        assert!(write_would_overflow(8192, 1, 8 * 1024));
     }
 
     fn tmp_path(tag: &str) -> std::path::PathBuf {
@@ -1057,11 +1138,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn rotation_repairs_a_torn_tail_before_archiving_the_segment() {
-        // End-to-end regression for the torn-rotation finding: simulate a failed
-        // pre-rotation flush that persisted only a prefix of the final record
-        // (a torn tail on disk). Rotation must repair the active file back to
-        // its last complete newline BEFORE renaming it, so the archived `.1`
-        // segment is valid NDJSON.
+        // End-to-end regression for the torn-rotation finding: an active file
+        // that carries a torn tail (a prefix of a record with no terminating
+        // newline) must be repaired back to its last complete newline BEFORE it
+        // is renamed, so the archived `.1` segment is always valid NDJSON.
+        //
+        // NOTE: here the torn tail is repaired by `open_append` at spawn (not by
+        // the writer loop's post-failed-flush `!flush_ok` repair branch, which a
+        // real `File` writer cannot be made to reach deterministically without a
+        // fault-injectable writer). This test therefore guards the end-to-end
+        // invariant "a torn active file never becomes a corrupt archive"; the
+        // repair-then-archive ordering the `!flush_ok` branch relies on is
+        // covered deterministically by `repair_before_rotate_keeps_archive_valid`.
         let path = tmp_path("rottorn");
         std::fs::write(&path, b"{\"a\":1}\n{\"b\":2").unwrap(); // torn tail
         {
@@ -1093,6 +1181,41 @@ mod tests {
         {
             let _: serde_json::Value = serde_json::from_slice(l).expect("valid JSON line");
         }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.1", path.display()));
+    }
+
+    #[test]
+    fn repair_before_rotate_keeps_archive_valid() {
+        // Deterministic coverage of the exact sequence the writer loop's
+        // post-failed-flush `!flush_ok` branch performs: repair the torn active
+        // tail, THEN rotate. Driving it through the real helpers (rather than a
+        // spawned sink, whose `File` writer cannot be forced to fail a flush)
+        // proves the ordering the branch depends on: the archived `.1` segment
+        // is the file repaired back to its last complete newline, never the torn
+        // bytes sealed in.
+        let path = tmp_path("repairrot");
+        // A torn tail: a complete record, then a prefix with no newline.
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2").unwrap();
+
+        // 1. Repair (the `!flush_ok` branch's `truncate_incomplete_tail` step).
+        super::truncate_incomplete_tail(&path).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"a\":1}\n",
+            "repair drops the torn prefix before the file is archived"
+        );
+
+        // 2. Rotate (the branch's archive step), then assert the archived
+        //    segment is valid NDJSON — the invariant the branch guarantees.
+        super::rotate(&path, 5).unwrap();
+        let archived = std::fs::read(format!("{}.1", path.display())).unwrap();
+        assert_eq!(archived, b"{\"a\":1}\n");
+        for l in archived.split(|&b| b == b'\n').filter(|s| !s.is_empty()) {
+            let _: serde_json::Value =
+                serde_json::from_slice(l).expect("archived segment is valid JSON");
+        }
+
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}.1", path.display()));
     }
