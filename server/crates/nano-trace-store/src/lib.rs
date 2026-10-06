@@ -918,11 +918,31 @@ impl Inner {
     }
 
     /// Inserts a new instance trace, evicting the oldest if over capacity.
+    ///
+    /// When the durability sink is configured, an **active** instance is never
+    /// evicted: evicting one would lose its in-flight trace, so its terminal
+    /// event would later find no DTO and emit no NDJSON line — silently
+    /// defeating the sink's every-finished-trace durability contract. Instead
+    /// the oldest **finished-tail** entry is retired first (the tail is only a
+    /// console convenience; those traces are already durable). Only when no
+    /// finished-tail entry remains is the oldest active instance evicted, the
+    /// pre-sink behaviour retained as a last-resort bound on memory. With the
+    /// sink off there is no finished tail, so this degenerates to the original
+    /// oldest-first eviction.
     fn insert(&mut self, key: u64, trace: InstanceTrace) {
         if self.instances.insert(key, trace).is_none() {
             self.order.push_back(key);
         }
         while self.order.len() > self.capacity {
+            // Prefer retiring an already-durable finished-tail entry (front =
+            // oldest) over evicting a live trace. `remove_instance` guarantees
+            // the entry leaves `order`, so this branch always makes progress.
+            if self.sink.is_some()
+                && let Some(old) = self.finished_tail.pop_front()
+            {
+                self.remove_instance(old);
+                continue;
+            }
             if let Some(old) = self.order.pop_front() {
                 self.instances.remove(&old);
             }
@@ -933,14 +953,22 @@ impl Inner {
     /// and drops it from the in-memory ring, keeping at most `sink.tail()`
     /// recently-finished instances for the console. A no-op when no sink is
     /// configured, so the default path is unchanged.
+    ///
+    /// A terminal event for an instance the ring no longer holds (evicted,
+    /// restarted away, or a duplicate terminal) is ignored entirely: it has no
+    /// DTO to sink, and appending its key to `finished_tail` would let a phantom
+    /// entry evict a genuinely retained recent trace.
     fn finish_instance(&mut self, key: u64) {
         let tail = match self.sink.as_ref() {
             None => return,
             Some(sink) => {
-                if let Some(t) = self.instances.get(&key)
-                    && let Ok(line) = serde_json::to_string(&t.dto())
-                {
-                    sink.append(line);
+                if let Some(t) = self.instances.get(&key) {
+                    if let Ok(line) = serde_json::to_string(&t.dto()) {
+                        sink.append(line);
+                    }
+                } else {
+                    // Untracked terminal: nothing to sink, nothing to retain.
+                    return;
                 }
                 sink.tail()
             }
@@ -955,6 +983,17 @@ impl Inner {
                 {
                     self.remove_instance(old);
                 }
+            }
+            // The tail counts against ring capacity. If retaining it overfills
+            // the ring, retire the oldest finished-tail entries (already
+            // durable) before any active instance is at risk of eviction. This
+            // may retire `key` itself when the ring is already full of active
+            // instances — correct: a finished trace is durable, so it yields to
+            // live ones.
+            while self.order.len() > self.capacity
+                && let Some(old) = self.finished_tail.pop_front()
+            {
+                self.remove_instance(old);
             }
         }
     }
@@ -2208,5 +2247,179 @@ mod tests {
             let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capacity_eviction_retires_finished_tail_before_active() {
+        // Regression for the active-eviction finding: with the sink on, an
+        // *active* instance must never be evicted to make room — its terminal
+        // event would then find no DTO and emit no NDJSON line. Retention
+        // pressure must fall on the already-durable finished tail first.
+        let path = temp_trace_path("evict-tail-first");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 4; // keep finished instances in the ring
+        {
+            // Capacity 2: one finished (tailed) + one active fill the ring.
+            let store = TraceStore::with_sink(2, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // finished, tailed (durable)
+            store.ingest(&[&created(2, &[])], 1020); // active
+            assert!(store.get(1).is_some() && store.get(2).is_some());
+            // A third insert exceeds capacity: the durable finished tail (1) is
+            // retired, NOT the active instance (2).
+            store.ingest(&[&created(3, &[])], 1030);
+            assert!(store.get(1).is_none(), "oldest finished-tail entry retired");
+            assert!(store.get(2).is_some(), "active instance is never evicted");
+            assert!(store.get(3).is_some());
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_instance_survives_capacity_and_still_sinks() {
+        // Companion to the above: an active instance that would previously have
+        // been evicted over capacity must survive to its terminal event and be
+        // written to the file exactly once.
+        let path = temp_trace_path("active-survives");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 4;
+        {
+            let store = TraceStore::with_sink(2, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // durable tail
+            store.ingest(&[&created(2, &[])], 1020); // active
+            store.ingest(&[&created(3, &[])], 1030); // over capacity → retires 1
+            // The still-active instance 2 finishes and must sink.
+            store.ingest(&[&completed(2)], 1040);
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "both finished instances are sunk");
+        let keys: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["instanceKey"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(keys.iter().any(|k| k == "1"), "keys={keys:?}");
+        assert!(keys.iter().any(|k| k == "2"), "active instance 2 was sunk");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminal_event_for_untracked_instance_does_not_advance_tail() {
+        // Regression for the phantom-tail finding: a terminal event for an
+        // instance the ring no longer holds (duplicate terminal, or one evicted
+        // after a restart) must not push a phantom key onto `finished_tail` —
+        // the phantom would evict a genuinely retained recent trace.
+        let path = temp_trace_path("phantom-tail");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 1;
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // finished, tail = [1]
+            assert!(store.get(1).is_some());
+            // A terminal event for an instance never seen (or already gone).
+            store.ingest(&[&completed(999)], 1020);
+            // The phantom key must not have evicted the real retained trace.
+            assert!(
+                store.get(1).is_some(),
+                "phantom terminal must not evict the retained finished trace"
+            );
+        }
+        // Only the genuinely finished instance was written.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().filter(|l| !l.is_empty()).count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_terminal_sinks_exactly_once() {
+        // A duplicate terminal event for an already-sunk (tail = 0) instance is
+        // untracked: it must not produce a second NDJSON line.
+        let path = temp_trace_path("dup-terminal");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone())); // tail = 0
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010);
+            store.ingest(&[&completed(1)], 1020); // duplicate terminal
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "a duplicate terminal sinks the instance exactly once"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rotate_aborts_before_touching_active_when_shift_fails() {
+        // Regression for the rotation finding: if shifting an intermediate
+        // segment fails, the active file must NOT be renamed onto `.1` — on
+        // platforms where `rename` replaces the destination that would
+        // overwrite the newest rotated segment. Force every shift to fail by
+        // making the containing directory read-only (no write permission →
+        // `rename` returns EACCES), then assert the active file is untouched.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-trace-rotate-abort-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("trace.ndjson");
+        std::fs::write(&active, b"active\n").unwrap();
+        std::fs::write(dir.join("trace.ndjson.1"), b"one\n").unwrap();
+        std::fs::write(dir.join("trace.ndjson.2"), b"two\n").unwrap();
+        // Read-only directory: no segment can be renamed within it.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let res = sink::rotate(&active, 5);
+
+        // Restore writability first so cleanup (and a failing assert) cannot
+        // leave a read-only temp dir behind.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        // A read-only directory only blocks `rename` for a non-root user; root
+        // bypasses the permission check. Detect that by probing whether a write
+        // is still possible despite the read-only mode, and skip if so.
+        let probe = dir.join(".probe");
+        let still_writable = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+        if still_writable {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            res.is_err(),
+            "a failed intermediate shift aborts rotation (got {res:?})"
+        );
+        assert!(
+            active.exists(),
+            "the active file is left in place when a shift fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("trace.ndjson.1")).unwrap(),
+            "one\n",
+            "the newest rotated segment is not overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

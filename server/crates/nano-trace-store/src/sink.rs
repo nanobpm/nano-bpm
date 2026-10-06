@@ -280,11 +280,16 @@ fn file_size(path: &Path) -> u64 {
 ///
 /// Returns `Ok(())` only when the active file was successfully renamed to
 /// `<path>.1` — the caller resets its tracked size to zero only then. A failure
-/// to remove an aged-out segment or shift an intermediate one is logged but
-/// non-fatal (retention is best-effort); a failure to rename the *active* file
-/// is returned as an `Err` so the caller keeps the real (over-limit) size and
-/// counts the error rather than silently defeating the configured bound.
-fn rotate(path: &Path, keep: usize) -> std::io::Result<()> {
+/// to remove an aged-out segment is logged but non-fatal (retention is
+/// best-effort). A failure to *shift* an intermediate segment is **fatal to the
+/// rotation**: on platforms where `rename` replaces an existing destination,
+/// renaming the active file onto a still-present `.1` would overwrite the newest
+/// rotated segment, losing it in addition to the intended aged-out file. So any
+/// shift failure aborts before the active file is touched, and a failure to
+/// rename the *active* file is likewise returned as an `Err` — the caller keeps
+/// the real (over-limit) size and counts the error rather than silently
+/// defeating the configured bound.
+pub(crate) fn rotate(path: &Path, keep: usize) -> std::io::Result<()> {
     let s = path.to_string_lossy();
     // Drop the oldest beyond the retention window (best-effort).
     if let Err(e) = fs::remove_file(format!("{s}.{keep}"))
@@ -297,15 +302,35 @@ fn rotate(path: &Path, keep: usize) -> std::io::Result<()> {
         if from.exists()
             && let Err(e) = fs::rename(&from, PathBuf::from(format!("{s}.{}", i + 1)))
         {
-            eprintln!(
-                "nano-trace-store: cannot shift trace file {s}.{i} to .{}: {e}",
-                i + 1
-            );
+            // Do not rename the active file onto a segment we failed to move:
+            // that would overwrite the newest rotated segment. Surface the
+            // failure so the caller keeps the real size and counts the error.
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!("cannot shift trace file {s}.{i} to .{}: {e}", i + 1),
+            ));
         }
     }
     // The load-bearing step: rename the active file. Propagate a failure so the
     // caller keeps the real size and counts the error.
     fs::rename(path, PathBuf::from(format!("{s}.1")))
+}
+
+/// Drains every message still queued in `rx`, releasing each line's byte
+/// reservation and counting it as an error, until a `Shutdown` (or the sender
+/// disconnecting) ends the stream. Used when the writer can no longer persist —
+/// the file failed to open or reopen — so senders see the channel as
+/// alive-but-dropping rather than blocking forever, and no queued trace is lost
+/// from the `queued_bytes`/`errors` accounting.
+fn drain_and_account(rx: &Receiver<Msg>, queued_bytes: &AtomicU64, errors: &AtomicU64) {
+    while let Ok(msg) = rx.recv() {
+        if let Msg::Line(line) = msg {
+            queued_bytes.fetch_sub(line.len() as u64 + 1, Ordering::AcqRel);
+            errors.fetch_add(1, Ordering::Relaxed);
+        } else {
+            break; // Shutdown
+        }
+    }
 }
 
 /// The writer thread body: drains the channel, appends lines, flushes on an
@@ -334,15 +359,8 @@ fn writer_loop(
                 cfg.path.display()
             );
             // Drain so senders see the channel as alive-but-dropping rather than
-            // blocking forever; traces are simply discarded.
-            while let Ok(msg) = rx.recv() {
-                if let Msg::Line(line) = msg {
-                    queued_bytes.fetch_sub(line.len() as u64 + 1, Ordering::AcqRel);
-                    errors.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    break; // Shutdown
-                }
-            }
+            // blocking forever; traces are simply discarded (and accounted).
+            drain_and_account(&rx, &queued_bytes, &errors);
             return;
         }
     };
@@ -418,6 +436,12 @@ fn writer_loop(
                                         "nano-trace-store: cannot reopen trace file {} after rotation: {e}",
                                         cfg.path.display()
                                     );
+                                    // The writer can no longer persist. Drain and
+                                    // account every already-queued line (release
+                                    // its byte reservation, count it lost) rather
+                                    // than returning with the channel silently
+                                    // dropping them and the reservations leaking.
+                                    drain_and_account(&rx, &queued_bytes, &errors);
                                     return;
                                 }
                             }
@@ -437,7 +461,18 @@ fn writer_loop(
                                     writer = BufWriter::new(f);
                                     size = file_size(&cfg.path);
                                 }
-                                Err(_) => return,
+                                Err(e) => {
+                                    // Cannot continue appending either. Drain and
+                                    // account the queued lines (release their byte
+                                    // reservations, count them lost) before exit.
+                                    errors.fetch_add(1, Ordering::Relaxed);
+                                    eprintln!(
+                                        "nano-trace-store: cannot reopen trace file {} after failed rotation: {e}",
+                                        cfg.path.display()
+                                    );
+                                    drain_and_account(&rx, &queued_bytes, &errors);
+                                    return;
+                                }
                             }
                         }
                     }
