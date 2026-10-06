@@ -460,9 +460,9 @@ impl TraceStore {
     /// finished traces discarded because the bounded writer budget was full
     /// (back-pressure is never applied to the engine); `errors` counts traces
     /// lost to a write/flush failure (e.g. a full disk) after reaching the
-    /// writer, **plus** each failed rotation/reopen — an operation failure that
-    /// loses no trace — so the counter stays monotonic for alerting. Useful
-    /// for a metric/log.
+    /// writer, **plus** each failed rotation/reopen or pre-rotation repair —
+    /// an operation failure that loses no trace — so the counter stays
+    /// monotonic for alerting. Useful for a metric/log.
     pub fn sink_stats(&self) -> Option<(u64, u64, u64)> {
         let inner = self.inner.lock().unwrap();
         inner

@@ -39,7 +39,11 @@
 //!   writer is then abandoned and the file is repaired back to its last
 //!   complete newline before a fresh writer reopens it — the next trace never
 //!   concatenates onto a partial record. The same repair runs on open, so a
-//!   crash that left an incomplete final line is recovered on restart.
+//!   crash that left an incomplete final line is recovered on restart, and
+//!   before a rotation renames the file, so a failed pre-rotation flush cannot
+//!   seal a torn record into an archived segment. Repair is fail-closed: if
+//!   the tail cannot be verified the sink refuses to append (or skips the
+//!   rotation) rather than risk corrupting the stream.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -244,8 +248,9 @@ impl TraceSink {
     /// on thread exit) after its flush failed. A flush that fails but leaves the
     /// bytes buffered for a later retry is *not* counted here until the writer
     /// is actually abandoned. On top of that, `errors` also counts each failed
-    /// rotation or reopen — an *operation* failure that loses no trace — so the
-    /// counter stays monotonic for alerting even when nothing was lost. Read it
+    /// rotation, reopen, or pre-rotation repair — an *operation* failure that
+    /// loses no trace — so the counter stays monotonic for alerting even when
+    /// nothing was lost. Read it
     /// as "traces lost + unrecovered sink operations", not a pure trace count.
     /// Distinct from [`Self::dropped`], which counts traces that never reached
     /// the writer.
@@ -275,6 +280,13 @@ impl Drop for TraceSink {
 /// if necessary. When the file already exists it is first repaired to the last
 /// complete newline (see [`truncate_incomplete_tail`]), so a crash that left a
 /// torn final record never has the next trace concatenated onto it.
+///
+/// The repair is **fail-closed**: if it errors (e.g. the file is write-only and
+/// rejects the read/write repair open while still accepting append), the error
+/// is propagated and no append handle is returned. Appending anyway would
+/// concatenate the next record onto an unexamined — possibly torn — tail and
+/// silently corrupt the NDJSON stream, so the caller's open-failure path (drain
+/// and account) takes the sink down instead.
 fn open_append(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -282,7 +294,7 @@ fn open_append(path: &Path) -> std::io::Result<File> {
         fs::create_dir_all(parent)?;
     }
     if path.exists() {
-        truncate_incomplete_tail(path);
+        truncate_incomplete_tail(path)?;
     }
     OpenOptions::new().create(true).append(true).open(path)
 }
@@ -290,45 +302,53 @@ fn open_append(path: &Path) -> std::io::Result<File> {
 /// Truncates `path` back to just past its last `\n`, removing a torn final
 /// record left by a crash or a failed write. NDJSON is one record per line, so
 /// any bytes after the last newline are a partial record that would corrupt the
-/// next append; dropping them keeps every remaining line valid. Best-effort: a
-/// read/seek/write failure is logged and ignored (appending proceeds), because
-/// failing to repair must not take the durability sink down.
-fn truncate_incomplete_tail(path: &Path) {
-    let repair = || -> std::io::Result<()> {
-        let size = file_size(path);
-        if size == 0 {
+/// next append; dropping them keeps every remaining line valid. Fail-closed: a
+/// read/seek/write failure is returned to the caller, because appending to an
+/// unexamined tail risks concatenating onto a torn record — a caller that
+/// cannot repair must not append.
+fn truncate_incomplete_tail(path: &Path) -> std::io::Result<()> {
+    let size = file_size(path);
+    if size == 0 {
+        return Ok(());
+    }
+    // A file whose last byte is a newline is already well-formed: return before
+    // opening anything, so a write-only (unreadable) but clean file is not
+    // failed by a repair that has nothing to do. Read the final byte with a
+    // read-only handle — the read/write repair open below stays fail-closed
+    // for a file that genuinely needs truncating.
+    {
+        let f = OpenOptions::new().read(true).open(path)?;
+        let mut r = std::io::BufReader::new(f);
+        std::io::Seek::seek(&mut r, std::io::SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        std::io::Read::read_exact(&mut r, &mut last)?;
+        if last[0] == b'\n' {
             return Ok(());
         }
-        let f = OpenOptions::new().read(true).write(true).open(path)?;
-        let mut r = std::io::BufReader::new(f);
-        // Find the last newline by scanning backward in 8 KiB blocks. Only the
-        // tail matters, so a huge file costs at most a few trailing reads.
-        let mut pos = size;
-        let mut cut = None;
-        let mut block = vec![0u8; 8192];
-        while pos > 0 {
-            let n = (pos.min(block.len() as u64)) as usize;
-            pos -= n as u64;
-            std::io::Seek::seek(&mut r, std::io::SeekFrom::Start(pos))?;
-            let buf = &mut block[..n];
-            std::io::Read::read_exact(&mut r, buf)?;
-            if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
-                cut = Some(pos + i as u64 + 1);
-                break;
-            }
-        }
-        let keep = cut.unwrap_or(0);
-        if keep < size {
-            r.into_inner().set_len(keep)?;
-        }
-        Ok(())
-    };
-    if let Err(e) = repair() {
-        eprintln!(
-            "nano-trace-store: cannot repair incomplete tail of trace file {}: {e}",
-            path.display()
-        );
     }
+    let f = OpenOptions::new().read(true).write(true).open(path)?;
+    let mut r = std::io::BufReader::new(f);
+    // Find the last newline by scanning backward in 8 KiB blocks. Only the
+    // tail matters, so a huge file costs at most a few trailing reads.
+    let mut pos = size;
+    let mut cut = None;
+    let mut block = vec![0u8; 8192];
+    while pos > 0 {
+        let n = (pos.min(block.len() as u64)) as usize;
+        pos -= n as u64;
+        std::io::Seek::seek(&mut r, std::io::SeekFrom::Start(pos))?;
+        let buf = &mut block[..n];
+        std::io::Read::read_exact(&mut r, buf)?;
+        if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+            cut = Some(pos + i as u64 + 1);
+            break;
+        }
+    }
+    let keep = cut.unwrap_or(0);
+    if keep < size {
+        r.into_inner().set_len(keep)?;
+    }
+    Ok(())
 }
 
 /// Current size of `path` in bytes, or `0` if it does not yet exist.
@@ -468,25 +488,30 @@ fn writer_loop(
     // "a crash loses at most one flush interval" guarantee hold.
     let mut next_flush = Instant::now() + cfg.flush_interval;
 
-    // Flushes the buffer and settles the pending accounting. On a successful
-    // flush the pending lines have reached the OS and become `written`. On a
-    // FAILED flush the lines stay buffered: `BufWriter` retains the bytes it
-    // could not write (it does not drop the whole buffer), so a later flush may
-    // still persist them. We therefore keep `pending` intact and do NOT count
-    // the batch as `errors` here — doing so would both double-count the lines (a
-    // later successful flush writes and `written`-counts the same bytes) and
-    // under-report `written`. Buffered lines are classified as lost only when the
-    // writer is abandoned (see `account_lost_pending`). When `reset_deadline` is
-    // true the absolute deadline advances so a persistently-failing disk is not
-    // retried in a tight loop; the terminal Shutdown/Disconnected flushes pass
-    // false because the deadline is never read again.
+    // Flushes the buffer and settles the pending accounting, returning whether
+    // the flush succeeded (the rotation path needs the outcome: a failed flush
+    // can leave a torn tail on disk that must be repaired before the file is
+    // renamed). On a successful flush the pending lines have reached the OS and
+    // become `written`. On a FAILED flush the lines stay buffered: `BufWriter`
+    // retains the bytes it could not write (it does not drop the whole buffer),
+    // so a later flush may still persist them. We therefore keep `pending`
+    // intact and do NOT count the batch as `errors` here — doing so would both
+    // double-count the lines (a later successful flush writes and
+    // `written`-counts the same bytes) and under-report `written`. Buffered
+    // lines are classified as lost only when the writer is abandoned (see
+    // `account_lost_pending`). When `reset_deadline` is true the absolute
+    // deadline advances so a persistently-failing disk is not retried in a
+    // tight loop; the terminal Shutdown/Disconnected flushes pass false because
+    // the deadline is never read again.
     let do_flush = |writer: &mut BufWriter<File>,
                     pending: &mut u64,
                     next_flush: &mut Instant,
-                    reset_deadline: bool| {
-        match writer.flush() {
+                    reset_deadline: bool|
+     -> bool {
+        let ok = match writer.flush() {
             Ok(()) => {
                 *pending = settle_flush(true, *pending, &written);
+                true
             }
             Err(e) => {
                 *pending = settle_flush(false, *pending, &written);
@@ -494,11 +519,13 @@ fn writer_loop(
                     "nano-trace-store: flush of trace file {} failed: {e}",
                     cfg.path.display()
                 );
+                false
             }
-        }
+        };
         if reset_deadline {
             *next_flush = Instant::now() + cfg.flush_interval;
         }
+        ok
     };
 
     // Accounts lines still buffered when a writer is about to be abandoned
@@ -526,11 +553,45 @@ fn writer_loop(
                 {
                     // Flush pending bytes into the about-to-be-renamed segment so
                     // they are accounted and durable before rotation.
-                    do_flush(&mut writer, &mut pending, &mut next_flush, true);
+                    let flush_ok = do_flush(&mut writer, &mut pending, &mut next_flush, true);
                     // Any lines still pending survived a failed flush; the writer
                     // we are about to drop cannot persist them, so they are lost.
                     account_lost(&mut pending);
                     drop(writer);
+                    // A failed flush may have persisted a PREFIX of the final
+                    // record before erroring, leaving a torn tail on disk.
+                    // Repair the active file before renaming it — otherwise the
+                    // torn record is sealed into the rotated `.1` segment
+                    // (repair only ever runs on the active path), permanently
+                    // corrupting it. Fail closed: if the tail cannot be
+                    // verified, skip the rotation rather than archive a file we
+                    // cannot vouch for; the error is counted and the reopen
+                    // below re-establishes a clean writer on the still-present
+                    // (unrepaired) file.
+                    if !flush_ok && let Err(e) = truncate_incomplete_tail(&cfg.path) {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "nano-trace-store: cannot repair trace file {} after a failed flush; skipping rotation: {e}",
+                            cfg.path.display()
+                        );
+                        match open_append(&cfg.path) {
+                            Ok(f) => {
+                                writer = BufWriter::new(f);
+                                size = file_size(&cfg.path);
+                            }
+                            Err(e) => {
+                                errors.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "nano-trace-store: cannot reopen trace file {} after failed repair: {e}",
+                                    cfg.path.display()
+                                );
+                                drain_and_account(&rx, &queued_bytes, &errors);
+                                return;
+                            }
+                        }
+                        queued_bytes.fetch_sub(line_bytes, Ordering::AcqRel);
+                        continue;
+                    }
                     match rotate(&cfg.path, cfg.keep) {
                         Ok(()) => {
                             // The active file is gone (renamed); reopen a fresh
@@ -837,5 +898,93 @@ mod tests {
         let pending = account_lost_pending(0, &errors);
         assert_eq!(pending, 0);
         assert_eq!(load(&errors), 0, "no pending means no loss to account");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_append_fails_closed_when_the_tail_cannot_be_repaired() {
+        // Regression for the ignored-repair finding: a write-only trace file
+        // rejects the read/write repair open but would accept an append.
+        // Appending anyway could concatenate onto an unexamined torn tail, so
+        // the open must fail (the writer's drain-and-account path handles it)
+        // rather than proceed.
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("writeonly");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2").unwrap(); // torn tail
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let result = super::open_append(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            result.is_err(),
+            "an unrepairable tail must fail the open, not append blindly"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_repairs_a_torn_tail_before_archiving_the_segment() {
+        // End-to-end regression for the torn-rotation finding: simulate a failed
+        // pre-rotation flush that persisted only a prefix of the final record
+        // (a torn tail on disk). Rotation must repair the active file back to
+        // its last complete newline BEFORE renaming it, so the archived `.1`
+        // segment is valid NDJSON.
+        let path = tmp_path("rottorn");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2").unwrap(); // torn tail
+        {
+            let sink = super::TraceSink::spawn(super::SinkConfig {
+                path: path.clone(),
+                max_bytes: Some(1), // the first append triggers prospective rotation
+                keep: 5,
+                queue_bytes: 1024 * 1024,
+                flush_interval: std::time::Duration::from_millis(10),
+                tail: 0,
+            });
+            sink.append("{\"c\":3}".to_string());
+            // Drop flushes and joins the writer before we inspect the files.
+        }
+        let archived = std::fs::read(format!("{}.1", path.display())).unwrap();
+        assert_eq!(
+            archived, b"{\"a\":1}\n",
+            "the torn tail is repaired before the segment is archived"
+        );
+        let active = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            active, "{\"c\":3}\n",
+            "the new trace lands in a fresh segment"
+        );
+        for l in archived
+            .split(|&b| b == b'\n')
+            .filter(|s| !s.is_empty())
+            .chain(active.lines().map(str::as_bytes))
+        {
+            let _: serde_json::Value = serde_json::from_slice(l).expect("valid JSON line");
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}.1", path.display()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotation_is_skipped_fail_closed_when_the_torn_tail_cannot_be_repaired() {
+        // The fail-closed sibling: a failed pre-rotation flush leaves a torn
+        // tail, but the file is write-only so the repair cannot run. Rotation
+        // must be SKIPPED (never archive a file whose tail could not be
+        // verified). We test this at the unit level: `truncate_incomplete_tail`
+        // fails on a write-only file, and `open_append` propagates that failure
+        // rather than appending blindly.
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("rotskip");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2").unwrap(); // torn tail
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let repair = super::truncate_incomplete_tail(&path);
+        let open = super::open_append(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(repair.is_err(), "repair fails on a write-only file");
+        assert!(
+            open.is_err(),
+            "open_append fails closed when the tail cannot be repaired"
+        );
     }
 }
