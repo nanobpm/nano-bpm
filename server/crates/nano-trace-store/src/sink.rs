@@ -35,7 +35,11 @@
 //!   file while the new active path stays empty.
 //! - Write/flush failures (e.g. a full disk) are counted as *errors* and
 //!   logged; the affected line is discarded, never propagated back onto the
-//!   engine's path.
+//!   engine's path. A write that fails mid-record leaves a torn tail, so the
+//!   writer is then abandoned and the file is repaired back to its last
+//!   complete newline before a fresh writer reopens it — the next trace never
+//!   concatenates onto a partial record. The same repair runs on open, so a
+//!   crash that left an incomplete final line is recovered on restart.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -232,13 +236,19 @@ impl TraceSink {
         self.written.load(Ordering::Relaxed)
     }
 
-    /// Number of finished traces lost to a write/flush error (e.g. a full disk)
-    /// after they reached the writer thread: a line the `BufWriter` rejected, or
-    /// a line still buffered when the writer was abandoned (dropped for rotation
-    /// or on thread exit) after its flush failed. A flush that fails but leaves
-    /// the bytes buffered for a later retry is *not* counted here until the
-    /// writer is actually abandoned. Distinct from [`Self::dropped`], which
-    /// counts traces that never reached the writer.
+    /// Number of finished traces lost to a write/flush failure (e.g. a full
+    /// disk) after they reached the writer thread, **plus** a small number of
+    /// writer-operation failures that lose no trace. The trace-loss component is
+    /// a line the `BufWriter` rejected, or a line still buffered when the writer
+    /// was abandoned (dropped for rotation, reopened after a write failure, or
+    /// on thread exit) after its flush failed. A flush that fails but leaves the
+    /// bytes buffered for a later retry is *not* counted here until the writer
+    /// is actually abandoned. On top of that, `errors` also counts each failed
+    /// rotation or reopen — an *operation* failure that loses no trace — so the
+    /// counter stays monotonic for alerting even when nothing was lost. Read it
+    /// as "traces lost + unrecovered sink operations", not a pure trace count.
+    /// Distinct from [`Self::dropped`], which counts traces that never reached
+    /// the writer.
     pub(crate) fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
     }
@@ -262,14 +272,63 @@ impl Drop for TraceSink {
 }
 
 /// Opens `path` for appending, creating it (and any missing parent directory)
-/// if necessary.
+/// if necessary. When the file already exists it is first repaired to the last
+/// complete newline (see [`truncate_incomplete_tail`]), so a crash that left a
+/// torn final record never has the next trace concatenated onto it.
 fn open_append(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         fs::create_dir_all(parent)?;
     }
+    if path.exists() {
+        truncate_incomplete_tail(path);
+    }
     OpenOptions::new().create(true).append(true).open(path)
+}
+
+/// Truncates `path` back to just past its last `\n`, removing a torn final
+/// record left by a crash or a failed write. NDJSON is one record per line, so
+/// any bytes after the last newline are a partial record that would corrupt the
+/// next append; dropping them keeps every remaining line valid. Best-effort: a
+/// read/seek/write failure is logged and ignored (appending proceeds), because
+/// failing to repair must not take the durability sink down.
+fn truncate_incomplete_tail(path: &Path) {
+    let repair = || -> std::io::Result<()> {
+        let size = file_size(path);
+        if size == 0 {
+            return Ok(());
+        }
+        let f = OpenOptions::new().read(true).write(true).open(path)?;
+        let mut r = std::io::BufReader::new(f);
+        // Find the last newline by scanning backward in 8 KiB blocks. Only the
+        // tail matters, so a huge file costs at most a few trailing reads.
+        let mut pos = size;
+        let mut cut = None;
+        let mut block = vec![0u8; 8192];
+        while pos > 0 {
+            let n = (pos.min(block.len() as u64)) as usize;
+            pos -= n as u64;
+            std::io::Seek::seek(&mut r, std::io::SeekFrom::Start(pos))?;
+            let buf = &mut block[..n];
+            std::io::Read::read_exact(&mut r, buf)?;
+            if let Some(i) = buf.iter().rposition(|&b| b == b'\n') {
+                cut = Some(pos + i as u64 + 1);
+                break;
+            }
+        }
+        let keep = cut.unwrap_or(0);
+        if keep < size {
+            r.into_inner().set_len(keep)?;
+        }
+        Ok(())
+    };
+    if let Err(e) = repair() {
+        eprintln!(
+            "nano-trace-store: cannot repair incomplete tail of trace file {}: {e}",
+            path.display()
+        );
+    }
 }
 
 /// Current size of `path` in bytes, or `0` if it does not yet exist.
@@ -538,14 +597,40 @@ fn writer_loop(
                     }
                     Err(e) => {
                         // The line is lost (e.g. disk full): count and log it so
-                        // silent trace loss is observable, but keep serving —
-                        // the next write may succeed and the engine must never
-                        // see this error.
+                        // silent trace loss is observable — the engine must never
+                        // see this error. But `write_all` may have persisted only
+                        // part of the record (or the JSON but not its newline),
+                        // so the writer now holds a torn tail. Continuing to
+                        // append would concatenate the next trace onto that
+                        // partial record and corrupt the NDJSON stream, so treat
+                        // the writer as terminal: account any still-buffered
+                        // lines, drop it, and reopen onto a file repaired back to
+                        // its last complete newline.
                         errors.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "nano-trace-store: write to trace file {} failed, trace discarded: {e}",
                             cfg.path.display()
                         );
+                        account_lost(&mut pending);
+                        drop(writer);
+                        match open_append(&cfg.path) {
+                            Ok(f) => {
+                                size = file_size(&cfg.path);
+                                writer = BufWriter::new(f);
+                            }
+                            Err(e) => {
+                                // Cannot re-establish a clean writer. Drain and
+                                // account the queued lines (release their byte
+                                // reservations, count them lost) before exit.
+                                errors.fetch_add(1, Ordering::Relaxed);
+                                eprintln!(
+                                    "nano-trace-store: cannot reopen trace file {} after write failure: {e}",
+                                    cfg.path.display()
+                                );
+                                drain_and_account(&rx, &queued_bytes, &errors);
+                                return;
+                            }
+                        }
                     }
                 }
                 queued_bytes.fetch_sub(line_bytes, Ordering::AcqRel);
@@ -578,6 +663,106 @@ mod tests {
 
     fn load(a: &AtomicU64) -> u64 {
         a.load(Ordering::Relaxed)
+    }
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "nano-trace-sink-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn open_append_truncates_a_torn_final_record() {
+        // Regression for the partial-tail finding: a crash that leaves bytes
+        // after the last newline must not have the next trace concatenated onto
+        // them. Opening for append repairs the file to its last complete
+        // newline first.
+        let path = tmp_path("torn");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2}\n{\"c\":3") // torn final record
+            .unwrap();
+        {
+            let _f = super::open_append(&path).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"a\":1}\n{\"b\":2}\n",
+            "the incomplete final record is dropped, keeping complete lines"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_append_keeps_a_newline_terminated_file_untouched() {
+        let path = tmp_path("clean");
+        std::fs::write(&path, b"{\"a\":1}\n{\"b\":2}\n").unwrap();
+        {
+            let _f = super::open_append(&path).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"a\":1}\n{\"b\":2}\n",
+            "a well-formed file is left byte-for-byte intact"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_append_empties_a_file_with_no_newline_at_all() {
+        // A single record that never got its newline is entirely torn; there is
+        // no complete line to keep.
+        let path = tmp_path("nonl");
+        std::fs::write(&path, b"{\"a\":1").unwrap();
+        {
+            let _f = super::open_append(&path).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"",
+            "a file with no complete line is truncated to empty"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reopen_after_a_partial_write_recovers_valid_ndjson() {
+        // End-to-end: seed a torn tail (as a failed mid-record write leaves),
+        // then run a real sink over it. The appended trace must land on its own
+        // line, not concatenated onto the partial record.
+        let path = tmp_path("recover");
+        std::fs::write(&path, b"{\"old\":true}\n{\"partial\":") // torn tail
+            .unwrap();
+        {
+            let sink = super::TraceSink::spawn(super::SinkConfig {
+                path: path.clone(),
+                max_bytes: None,
+                keep: 5,
+                queue_bytes: 1024 * 1024,
+                flush_interval: std::time::Duration::from_millis(10),
+                tail: 0,
+            });
+            sink.append("{\"new\":true}".to_string());
+            // Drop flushes and joins the writer before we read the file.
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["{\"old\":true}", "{\"new\":true}"],
+            "the torn record is dropped and the new trace is a clean line"
+        );
+        // Every surviving line is valid JSON (no concatenated corruption).
+        for l in lines {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(l).is_ok(),
+                "line is valid JSON: {l}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

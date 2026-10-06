@@ -460,7 +460,8 @@ impl TraceStore {
     /// finished traces discarded because the bounded writer budget was full
     /// (back-pressure is never applied to the engine); `errors` counts traces
     /// lost to a write/flush failure (e.g. a full disk) after reaching the
-    /// writer, plus one for a flush that failed with an empty buffer. Useful
+    /// writer, **plus** each failed rotation/reopen — an operation failure that
+    /// loses no trace — so the counter stays monotonic for alerting. Useful
     /// for a metric/log.
     pub fn sink_stats(&self) -> Option<(u64, u64, u64)> {
         let inner = self.inner.lock().unwrap();
@@ -2435,18 +2436,21 @@ mod tests {
 
         let res = sink::rotate(&active, 5);
 
-        // Restore writability first so cleanup (and a failing assert) cannot
-        // leave a read-only temp dir behind.
+        // A read-only directory only blocks `rename` for a non-root user; root
+        // bypasses the permission check. Detect that by probing whether a write
+        // is still possible — while the mode is still 0o555, before restoring —
+        // and skip if so. (Probing after the restore would always succeed and
+        // skip the assertions for every user.)
+        let probe = dir.join(".probe");
+        let still_writable = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+
+        // Restore writability before any assertion (and before the early return)
+        // so cleanup cannot leave a read-only temp dir behind.
         let mut perms = std::fs::metadata(&dir).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&dir, perms).unwrap();
 
-        // A read-only directory only blocks `rename` for a non-root user; root
-        // bypasses the permission check. Detect that by probing whether a write
-        // is still possible despite the read-only mode, and skip if so.
-        let probe = dir.join(".probe");
-        let still_writable = std::fs::write(&probe, b"x").is_ok();
-        let _ = std::fs::remove_file(&probe);
         if still_writable {
             let _ = std::fs::remove_dir_all(&dir);
             return;
