@@ -845,6 +845,28 @@ mod tests {
         ))
     }
 
+    /// Probes whether the current process is actually subject to filesystem
+    /// permission bits. Root (or any `CAP_DAC_OVERRIDE` holder, common in CI
+    /// containers) bypasses them: it can read and repair a `0o200` write-only
+    /// file, so a fail-closed assertion that depends on a read being *rejected*
+    /// does not hold. Tests that force failure via `0o200` must skip themselves
+    /// when this returns `false`, keeping the workspace suite portable to
+    /// root-run environments.
+    #[cfg(unix)]
+    fn permission_bits_enforced() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let probe = tmp_path("permprobe");
+        if std::fs::write(&probe, b"x").is_err() {
+            return true; // cannot probe; assume enforced (best effort)
+        }
+        let enforced = std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o200))
+            .is_ok()
+            && std::fs::File::open(&probe).is_err();
+        let _ = std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::remove_file(&probe);
+        enforced
+    }
+
     #[test]
     fn open_append_truncates_a_torn_final_record() {
         // Regression for the partial-tail finding: a crash that leaves bytes
@@ -1017,6 +1039,9 @@ mod tests {
         // the open must fail (the writer's drain-and-account path handles it)
         // rather than proceed.
         use std::os::unix::fs::PermissionsExt;
+        if !permission_bits_enforced() {
+            return; // root bypasses 0o200; the read this test must reject would succeed.
+        }
         let path = tmp_path("writeonly");
         std::fs::write(&path, b"{\"a\":1}\n{\"b\":2").unwrap(); // torn tail
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
@@ -1082,6 +1107,9 @@ mod tests {
         // fails on a write-only file, and `open_append` propagates that failure
         // rather than appending blindly.
         use std::os::unix::fs::PermissionsExt;
+        if !permission_bits_enforced() {
+            return; // root bypasses 0o200; repair/open would succeed, not fail closed.
+        }
         let path = tmp_path("rotskip");
         std::fs::write(&path, b"{\"a\":1}\n{\"b\":2").unwrap(); // torn tail
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();

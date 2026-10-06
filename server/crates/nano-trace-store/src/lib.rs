@@ -827,20 +827,10 @@ impl Inner {
                 }
             }
             Event::ProcessInstanceCompleted { instance_key } => {
-                if let Some(t) = self.instances.get_mut(instance_key) {
-                    t.last_at = now;
-                    t.ended_at = Some(now);
-                    t.outcome = Outcome::Completed;
-                }
-                self.finish_instance(*instance_key);
+                self.finalize_instance(*instance_key, Outcome::Completed, now);
             }
             Event::ProcessInstanceTerminated { instance_key } => {
-                if let Some(t) = self.instances.get_mut(instance_key) {
-                    t.last_at = now;
-                    t.ended_at = Some(now);
-                    t.outcome = Outcome::Terminated;
-                }
-                self.finish_instance(*instance_key);
+                self.finalize_instance(*instance_key, Outcome::Terminated, now);
             }
             // --- Tier 2 recorded-input stimuli (only when enabled) -------------
             Event::UserTaskCompleted { instance_key, .. } => {
@@ -948,6 +938,30 @@ impl Inner {
                 self.instances.remove(&old);
             }
         }
+    }
+
+    /// Applies a terminal transition (`Completed`/`Terminated`) exactly once.
+    ///
+    /// Both terminal arms funnel through here so the duplicate-terminal guard
+    /// has a single source of truth. A duplicate terminal for a trace still
+    /// retained in the console tail (its key already in `finished_tail`) is
+    /// skipped **entirely**: its durable NDJSON record was written on the first
+    /// terminal and is immutable, so mutating the retained console copy's
+    /// `ended_at`/`last_at`/`outcome` here would silently diverge the console
+    /// view's end time/duration from the frozen durable record. `finish_instance`
+    /// already refuses to re-sink such a key; this guard additionally refuses to
+    /// re-finalize it. With no sink (or `tail == 0`) `finished_tail` is empty, so
+    /// the default path is unchanged.
+    fn finalize_instance(&mut self, key: u64, outcome: Outcome, now: u64) {
+        if self.finished_tail.contains(&key) {
+            return;
+        }
+        if let Some(t) = self.instances.get_mut(&key) {
+            t.last_at = now;
+            t.ended_at = Some(now);
+            t.outcome = outcome;
+        }
+        self.finish_instance(key);
     }
 
     /// Flushes a just-finished instance to the durability sink (one NDJSON line)
@@ -2402,6 +2416,44 @@ mod tests {
             body.lines().filter(|l| !l.is_empty()).count(),
             1,
             "a duplicate terminal with a nonzero tail still sinks exactly once"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_terminal_does_not_mutate_retained_console_trace() {
+        // Regression for the console/durable divergence finding: with a nonzero
+        // console tail the first terminal sinks the DTO durably but leaves the
+        // trace in `instances` for the console. A later duplicate terminal must
+        // NOT re-stamp its `ended_at`/`outcome`, or the console view would drift
+        // away from the immutable durable NDJSON record.
+        let path = temp_trace_path("dup-terminal-no-mutate");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 2;
+        let store = TraceStore::with_sink(8, cfg);
+        store.ingest(&[&created(1, &[])], 1000);
+        store.ingest(&[&completed(1)], 1010); // first terminal: sunk at 1010
+        let first = store.get(1).expect("retained in the console tail");
+        assert_eq!(first.ended_at, Some(1010));
+        assert_eq!(first.outcome, "completed");
+
+        // A duplicate completion AND a differently-typed terminal, both later.
+        store.ingest(&[&completed(1)], 1020);
+        store.ingest(&[&terminated(1)], 1030);
+        let after = store.get(1).expect("still retained");
+        assert_eq!(
+            after.ended_at,
+            Some(1010),
+            "duplicate terminal must not re-stamp the retained console end time"
+        );
+        assert_eq!(
+            after.duration_ms, first.duration_ms,
+            "duplicate terminal must not change the retained duration"
+        );
+        assert_eq!(
+            after.outcome, "completed",
+            "a later Terminated must not flip the already-finalized outcome"
         );
         let _ = std::fs::remove_file(&path);
     }
