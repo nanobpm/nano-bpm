@@ -14,15 +14,20 @@
 //! live set and capture can stay on.
 //!
 //! Durability is deliberately cheap, never on the engine's path:
-//! - Appends go through a **bounded** channel to a dedicated writer thread, so a
-//!   slow disk never blocks the exporter. If the channel is full the trace is
-//!   counted as *dropped* (a metric) rather than applying backpressure.
-//! - The writer buffers and flushes on a periodic interval. There is no fsync per
-//!   trace — losing the last flush interval on a crash is acceptable for analysis
-//!   data.
+//! - Appends go through a **bounded** channel (`NANOBPMN_TRACE_FILE_QUEUE`,
+//!   default 4096) to a dedicated writer thread, so a slow disk never blocks
+//!   the exporter. If the channel is full the trace is counted as *dropped*
+//!   (a metric) rather than applying backpressure.
+//! - The writer buffers and flushes on a periodic interval
+//!   (`NANOBPMN_TRACE_FILE_FLUSH_MS`, default 1000 ms). There is no fsync per
+//!   trace — losing the last flush interval on a crash is acceptable for
+//!   analysis data.
 //! - Optional size-based rotation (`NANOBPMN_TRACE_FILE_MAX_BYTES`, keeping
 //!   `NANOBPMN_TRACE_FILE_KEEP` files). With rotation unset, the file is a plain
 //!   append log you can hand to `logrotate`.
+//! - Write/flush failures (e.g. a full disk) are counted as *errors* and
+//!   logged; the affected line is discarded, never propagated back onto the
+//!   engine's path.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -114,6 +119,7 @@ pub(crate) struct TraceSink {
     tx: SyncSender<Msg>,
     dropped: Arc<AtomicU64>,
     written: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
     handle: Option<JoinHandle<()>>,
     tail: usize,
 }
@@ -130,16 +136,19 @@ impl TraceSink {
         let (tx, rx) = sync_channel::<Msg>(cfg.queue);
         let dropped = Arc::new(AtomicU64::new(0));
         let written = Arc::new(AtomicU64::new(0));
+        let errors = Arc::new(AtomicU64::new(0));
         let tail = cfg.tail;
         let written_w = written.clone();
+        let errors_w = errors.clone();
         let handle = std::thread::Builder::new()
             .name("trace-ndjson".to_string())
-            .spawn(move || writer_loop(cfg, rx, written_w))
+            .spawn(move || writer_loop(cfg, rx, written_w, errors_w))
             .expect("spawn trace-ndjson writer thread");
         Self {
             tx,
             dropped,
             written,
+            errors,
             handle: Some(handle),
             tail,
         }
@@ -165,6 +174,13 @@ impl TraceSink {
     /// Number of finished traces written to the file.
     pub(crate) fn written(&self) -> u64 {
         self.written.load(Ordering::Relaxed)
+    }
+
+    /// Number of finished traces lost to a write/flush error (e.g. a full disk)
+    /// after they reached the writer thread. Distinct from [`Self::dropped`],
+    /// which counts traces that never reached the writer.
+    pub(crate) fn errors(&self) -> u64 {
+        self.errors.load(Ordering::Relaxed)
     }
 
     /// How many recently-finished instances to retain in the ring for the
@@ -218,8 +234,15 @@ fn rotate(path: &Path, keep: usize) {
 
 /// The writer thread body: drains the channel, appends lines, flushes on a
 /// periodic interval, and rotates on size. Terminates on `Shutdown` or when the
-/// sender is dropped, flushing first.
-fn writer_loop(cfg: SinkConfig, rx: std::sync::mpsc::Receiver<Msg>, written: Arc<AtomicU64>) {
+/// sender is dropped, flushing first. Write/flush failures are counted in
+/// `errors` and logged once per line — the line is then discarded (a durability
+/// sink must never propagate an error back onto the engine's path).
+fn writer_loop(
+    cfg: SinkConfig,
+    rx: std::sync::mpsc::Receiver<Msg>,
+    written: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+) {
     let file = match open_append(&cfg.path) {
         Ok(f) => f,
         Err(e) => {
@@ -233,6 +256,7 @@ fn writer_loop(cfg: SinkConfig, rx: std::sync::mpsc::Receiver<Msg>, written: Arc
                 if matches!(msg, Msg::Shutdown) {
                     break;
                 }
+                errors.fetch_add(1, Ordering::Relaxed);
             }
             return;
         }
@@ -248,7 +272,13 @@ fn writer_loop(cfg: SinkConfig, rx: std::sync::mpsc::Receiver<Msg>, written: Arc
                 if let Some(max) = cfg.max_bytes
                     && size >= max
                 {
-                    let _ = writer.flush();
+                    if let Err(e) = writer.flush() {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "nano-trace-store: flush of trace file {} failed before rotation: {e}",
+                            cfg.path.display()
+                        );
+                    }
                     drop(writer);
                     rotate(&cfg.path, cfg.keep);
                     match open_append(&cfg.path) {
@@ -265,20 +295,54 @@ fn writer_loop(cfg: SinkConfig, rx: std::sync::mpsc::Receiver<Msg>, written: Arc
                         }
                     }
                 }
-                if writer.write_all(line.as_bytes()).is_ok() && writer.write_all(b"\n").is_ok() {
-                    size += line.len() as u64 + 1;
-                    written.fetch_add(1, Ordering::Relaxed);
+                match writer
+                    .write_all(line.as_bytes())
+                    .and_then(|()| writer.write_all(b"\n"))
+                {
+                    Ok(()) => {
+                        size += line.len() as u64 + 1;
+                        written.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        // The line is lost (e.g. disk full): count and log it so
+                        // silent trace loss is observable, but keep serving —
+                        // the next write may succeed and the engine must never
+                        // see this error.
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!(
+                            "nano-trace-store: write to trace file {} failed, trace discarded: {e}",
+                            cfg.path.display()
+                        );
+                    }
                 }
             }
             Ok(Msg::Shutdown) => {
-                let _ = writer.flush();
+                if let Err(e) = writer.flush() {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "nano-trace-store: final flush of trace file {} failed: {e}",
+                        cfg.path.display()
+                    );
+                }
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {
-                let _ = writer.flush();
+                if let Err(e) = writer.flush() {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "nano-trace-store: periodic flush of trace file {} failed: {e}",
+                        cfg.path.display()
+                    );
+                }
             }
             Err(RecvTimeoutError::Disconnected) => {
-                let _ = writer.flush();
+                if let Err(e) = writer.flush() {
+                    errors.fetch_add(1, Ordering::Relaxed);
+                    eprintln!(
+                        "nano-trace-store: final flush of trace file {} failed: {e}",
+                        cfg.path.display()
+                    );
+                }
                 break;
             }
         }

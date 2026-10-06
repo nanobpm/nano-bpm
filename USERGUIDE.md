@@ -563,6 +563,8 @@ adjustable:
 | `NANOBPMN_TRACE_FILE_MAX_BYTES` | *(unset)* | Rotate the trace file at this size (`<path>.1` … `<path>.<keep>`). Unset leaves rotation to `logrotate`. |
 | `NANOBPMN_TRACE_FILE_KEEP` | 5 | Rotated trace files to keep. |
 | `NANOBPMN_TRACE_FILE_TAIL` | 0 | Recently-finished traces to keep in memory for the console after writing them to the file. |
+| `NANOBPMN_TRACE_FILE_QUEUE` | 4096 | Bounded depth of the writer channel between the engine and the sink thread. A full queue **drops** finished traces (counted in `sink_stats().dropped`) rather than back-pressuring the engine — raise it if drops appear under load. |
+| `NANOBPMN_TRACE_FILE_FLUSH_MS` | 1000 | How often the writer thread flushes its buffer to the file. A crash can lose at most one flush interval of traces. |
 
 ## Run a cluster
 

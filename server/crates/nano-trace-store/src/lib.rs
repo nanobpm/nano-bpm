@@ -454,13 +454,18 @@ impl TraceStore {
         inner.instances.get(&instance_key).map(InstanceTrace::dto)
     }
 
-    /// Durability-sink counters `(written, dropped)` when `NANOBPMN_TRACE_FILE`
-    /// is configured, else `None`. `dropped` counts finished traces discarded
-    /// because the bounded writer channel was full (back-pressure is never
-    /// applied to the engine). Useful for a metric/log.
-    pub fn sink_stats(&self) -> Option<(u64, u64)> {
+    /// Durability-sink counters `(written, dropped, errors)` when
+    /// `NANOBPMN_TRACE_FILE` is configured, else `None`. `dropped` counts
+    /// finished traces discarded because the bounded writer channel was full
+    /// (back-pressure is never applied to the engine); `errors` counts traces
+    /// lost to a write/flush failure (e.g. a full disk) after reaching the
+    /// writer. Useful for a metric/log.
+    pub fn sink_stats(&self) -> Option<(u64, u64, u64)> {
         let inner = self.inner.lock().unwrap();
-        inner.sink.as_ref().map(|s| (s.written(), s.dropped()))
+        inner
+            .sink
+            .as_ref()
+            .map(|s| (s.written(), s.dropped(), s.errors()))
     }
 
     /// The instance trace as an OTLP/JSON trace document (resource → scope →
@@ -1815,6 +1820,10 @@ mod tests {
         Event::ProcessInstanceTerminated { instance_key: key }
     }
 
+    fn terminating(key: u64) -> Event {
+        Event::ProcessInstanceTerminating { instance_key: key }
+    }
+
     #[test]
     fn no_sink_by_default_keeps_finished_in_ring() {
         let store = TraceStore::with_capture(8, 16 * 1024, 16);
@@ -1866,6 +1875,35 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["outcome"], "terminated");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminating_then_terminated_sinks_exactly_once() {
+        // The deferred-cancellation path (cancel with listeners) emits
+        // `ProcessInstanceTerminating` first, then `ProcessInstanceTerminated`
+        // once termination completes. The intermediate event must not sink the
+        // instance early, and the final one must sink it exactly once.
+        let path = temp_trace_path("terminating-terminated");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            store.ingest(&[&created(9, &[])], 1000);
+            store.ingest(&[&terminating(9)], 1100);
+            // Intermediate state: still active, still in the ring, not yet sunk.
+            assert!(store.get(9).is_some(), "terminating keeps the instance");
+            store.ingest(&[&terminated(9)], 1200);
+            assert!(store.get(9).is_none(), "terminated drops the instance");
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "Terminating then Terminated must produce exactly one NDJSON line"
+        );
         let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(parsed["outcome"], "terminated");
         let _ = std::fs::remove_file(&path);
