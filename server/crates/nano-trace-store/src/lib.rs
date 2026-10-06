@@ -958,10 +958,23 @@ impl Inner {
     /// restarted away, or a duplicate terminal) is ignored entirely: it has no
     /// DTO to sink, and appending its key to `finished_tail` would let a phantom
     /// entry evict a genuinely retained recent trace.
+    ///
+    /// A duplicate terminal for an instance that is *still* retained in the ring
+    /// because it sits in the console tail (`tail > 0`) is likewise ignored: its
+    /// key already appears in `finished_tail`, so re-sinking its DTO would append
+    /// the same trace twice and re-pushing its key would double-count it against
+    /// the tail bound. The `finished_tail` membership check closes that
+    /// exactly-once gap for every nonzero tail (the `tail == 0` case is covered by
+    /// the untracked-terminal early return, since the first terminal removes it).
     fn finish_instance(&mut self, key: u64) {
         let tail = match self.sink.as_ref() {
             None => return,
             Some(sink) => {
+                if self.finished_tail.contains(&key) {
+                    // Already finished and sunk on an earlier terminal; retained
+                    // only for the console. A second terminal is a duplicate.
+                    return;
+                }
                 if let Some(t) = self.instances.get(&key) {
                     if let Ok(line) = serde_json::to_string(&t.dto()) {
                         sink.append(line);
@@ -2357,6 +2370,37 @@ mod tests {
             body.lines().filter(|l| !l.is_empty()).count(),
             1,
             "a duplicate terminal sinks the instance exactly once"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_terminal_with_console_tail_sinks_exactly_once() {
+        // Regression for the exactly-once gap with console retention enabled:
+        // with `tail > 0` the first terminal leaves the instance in `instances`
+        // (retained for the console), so a duplicate terminal must NOT re-sink
+        // its DTO nor push its key onto `finished_tail` a second time.
+        let path = temp_trace_path("dup-terminal-tail");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut cfg = sink_cfg(path.clone());
+            cfg.tail = 2;
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // finished, tail = [1]
+            assert!(store.get(1).is_some(), "retained in the console tail");
+            store.ingest(&[&completed(1)], 1020); // duplicate terminal
+            store.ingest(&[&terminated(1)], 1030); // and a differently-typed one
+            assert!(
+                store.get(1).is_some(),
+                "duplicate terminals must not evict the retained trace"
+            );
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "a duplicate terminal with a nonzero tail still sinks exactly once"
         );
         let _ = std::fs::remove_file(&path);
     }

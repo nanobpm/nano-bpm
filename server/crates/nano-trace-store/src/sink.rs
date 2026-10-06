@@ -233,10 +233,12 @@ impl TraceSink {
     }
 
     /// Number of finished traces lost to a write/flush error (e.g. a full disk)
-    /// after they reached the writer thread, plus one for a flush operation that
-    /// failed with an empty buffer (no trace lost, but the disk fault is still
-    /// worth a metric). Distinct from [`Self::dropped`], which counts traces
-    /// that never reached the writer.
+    /// after they reached the writer thread: a line the `BufWriter` rejected, or
+    /// a line still buffered when the writer was abandoned (dropped for rotation
+    /// or on thread exit) after its flush failed. A flush that fails but leaves
+    /// the bytes buffered for a later retry is *not* counted here until the
+    /// writer is actually abandoned. Distinct from [`Self::dropped`], which
+    /// counts traces that never reached the writer.
     pub(crate) fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
     }
@@ -316,6 +318,37 @@ pub(crate) fn rotate(path: &Path, keep: usize) -> std::io::Result<()> {
     fs::rename(path, PathBuf::from(format!("{s}.1")))
 }
 
+/// Settles pending-line accounting for a single flush outcome and returns the
+/// new pending count. The **single source of truth** for how a flush transitions
+/// `pending`/`written`:
+///
+/// - On success the pending lines have reached the OS, so they are counted in
+///   `written` once and pending resets to `0`.
+/// - On failure the lines stay buffered — a `BufWriter` retains (does not drop)
+///   the bytes it could not write — so pending is preserved for a later retry
+///   and **nothing is counted lost here**. Counting them as `errors` now would
+///   both double-count them (a later successful flush writes and `written`-counts
+///   the same bytes) and under-report `written`.
+fn settle_flush(flush_ok: bool, pending: u64, written: &AtomicU64) -> u64 {
+    if flush_ok {
+        written.fetch_add(pending, Ordering::Relaxed);
+        0
+    } else {
+        pending
+    }
+}
+
+/// Accounts lines still buffered when a writer is abandoned (dropped for
+/// rotation, or on thread exit) and returns the new pending count (`0`). A prior
+/// flush already failed to persist these bytes and dropping the `BufWriter`
+/// cannot, so they are genuinely lost now and counted in `errors` exactly once.
+fn account_lost_pending(pending: u64, errors: &AtomicU64) -> u64 {
+    if pending > 0 {
+        errors.fetch_add(pending, Ordering::Relaxed);
+    }
+    0
+}
+
 /// Drains every message still queued in `rx`, releasing each line's byte
 /// reservation and counting it as an error, until a `Shutdown` (or the sender
 /// disconnecting) ends the stream. Used when the writer can no longer persist —
@@ -341,9 +374,11 @@ fn drain_and_account(rx: &Receiver<Msg>, queued_bytes: &AtomicU64, errors: &Atom
 ///
 /// Accounting: `written` counts a trace only once its bytes have survived a
 /// successful `flush` (i.e. reached the OS). Lines accepted into the `BufWriter`
-/// but not yet flushed are `pending`; a failed flush moves the whole pending
-/// batch into `errors`, because `BufWriter` drops its buffer on a failed flush
-/// and those lines are genuinely lost.
+/// but not yet flushed are `pending`; a failed flush leaves them buffered (a
+/// `BufWriter` retains, not drops, the bytes it could not write), so they stay
+/// `pending` and are retried on the next flush. They are counted in `errors`
+/// only when the writer is abandoned (dropped for rotation or on thread exit)
+/// without having flushed them, which is the point at which they are truly lost.
 fn writer_loop(
     cfg: SinkConfig,
     rx: Receiver<Msg>,
@@ -374,32 +409,45 @@ fn writer_loop(
     // "a crash loses at most one flush interval" guarantee hold.
     let mut next_flush = Instant::now() + cfg.flush_interval;
 
-    // Flushes the buffer and settles the pending accounting. On success the
-    // pending lines become `written`; on failure they become `errors` (the
-    // BufWriter has dropped them). When `reset_deadline` is true the absolute
-    // deadline advances so a persistently-failing disk is not retried in a tight
-    // loop; the terminal Shutdown/Disconnected flushes pass false because the
-    // deadline is never read again.
+    // Flushes the buffer and settles the pending accounting. On a successful
+    // flush the pending lines have reached the OS and become `written`. On a
+    // FAILED flush the lines stay buffered: `BufWriter` retains the bytes it
+    // could not write (it does not drop the whole buffer), so a later flush may
+    // still persist them. We therefore keep `pending` intact and do NOT count
+    // the batch as `errors` here — doing so would both double-count the lines (a
+    // later successful flush writes and `written`-counts the same bytes) and
+    // under-report `written`. Buffered lines are classified as lost only when the
+    // writer is abandoned (see `account_lost_pending`). When `reset_deadline` is
+    // true the absolute deadline advances so a persistently-failing disk is not
+    // retried in a tight loop; the terminal Shutdown/Disconnected flushes pass
+    // false because the deadline is never read again.
     let do_flush = |writer: &mut BufWriter<File>,
                     pending: &mut u64,
                     next_flush: &mut Instant,
                     reset_deadline: bool| {
         match writer.flush() {
             Ok(()) => {
-                written.fetch_add(*pending, Ordering::Relaxed);
+                *pending = settle_flush(true, *pending, &written);
             }
             Err(e) => {
-                errors.fetch_add((*pending).max(1), Ordering::Relaxed);
+                *pending = settle_flush(false, *pending, &written);
                 eprintln!(
                     "nano-trace-store: flush of trace file {} failed: {e}",
                     cfg.path.display()
                 );
             }
         }
-        *pending = 0;
         if reset_deadline {
             *next_flush = Instant::now() + cfg.flush_interval;
         }
+    };
+
+    // Accounts lines still buffered when a writer is about to be abandoned
+    // (dropped for rotation, or on thread exit). Dropping a `BufWriter` cannot
+    // reliably persist bytes a prior flush already failed to write, so those
+    // lines are genuinely lost now and counted as `errors` exactly once.
+    let account_lost = |pending: &mut u64| {
+        *pending = account_lost_pending(*pending, &errors);
     };
 
     loop {
@@ -420,6 +468,9 @@ fn writer_loop(
                     // Flush pending bytes into the about-to-be-renamed segment so
                     // they are accounted and durable before rotation.
                     do_flush(&mut writer, &mut pending, &mut next_flush, true);
+                    // Any lines still pending survived a failed flush; the writer
+                    // we are about to drop cannot persist them, so they are lost.
+                    account_lost(&mut pending);
                     drop(writer);
                     match rotate(&cfg.path, cfg.keep) {
                         Ok(()) => {
@@ -512,5 +563,94 @@ fn writer_loop(
                 break;
             }
         }
+    }
+    // The thread is exiting: the final flush above may have failed, leaving lines
+    // buffered in the writer we are about to drop. They cannot be persisted now,
+    // so classify them as lost (counted once).
+    account_lost(&mut pending);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{account_lost_pending, settle_flush};
+
+    fn load(a: &AtomicU64) -> u64 {
+        a.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn successful_flush_counts_pending_as_written_once() {
+        let written = AtomicU64::new(0);
+        let pending = settle_flush(true, 3, &written);
+        assert_eq!(pending, 0, "a successful flush clears pending");
+        assert_eq!(
+            load(&written),
+            3,
+            "all pending lines are written exactly once"
+        );
+    }
+
+    #[test]
+    fn failed_flush_keeps_pending_and_counts_nothing() {
+        // Regression for the lost-accounting finding: a BufWriter retains the
+        // bytes it could not flush, so a failed flush must NOT count the batch as
+        // written and must NOT drop/zero pending — the lines are retried.
+        let written = AtomicU64::new(0);
+        let pending = settle_flush(false, 3, &written);
+        assert_eq!(pending, 3, "a failed flush preserves pending for retry");
+        assert_eq!(load(&written), 0, "nothing is written on a failed flush");
+    }
+
+    #[test]
+    fn failed_then_successful_flush_writes_each_line_exactly_once() {
+        // The exact double-accounting the finding warned about: after a failed
+        // flush retains the bytes, the next successful flush persists them — they
+        // must be counted in `written` once and never in `errors`.
+        let written = AtomicU64::new(0);
+        let errors = AtomicU64::new(0);
+        let pending = settle_flush(false, 2, &written); // flush fails, bytes buffered
+        assert_eq!(pending, 2);
+        let pending = settle_flush(true, pending, &written); // retry succeeds
+        assert_eq!(pending, 0);
+        assert_eq!(
+            load(&written),
+            2,
+            "the retried lines are written exactly once"
+        );
+        assert_eq!(
+            load(&errors),
+            0,
+            "nothing is counted lost when the retry persists them"
+        );
+    }
+
+    #[test]
+    fn abandoning_buffered_lines_counts_them_lost_once() {
+        // When the writer is abandoned (dropped for rotation or on thread exit)
+        // with lines still buffered after a failed flush, they are truly lost and
+        // counted in `errors` exactly once.
+        let written = AtomicU64::new(0);
+        let errors = AtomicU64::new(0);
+        let pending = settle_flush(false, 4, &written); // flush fails, 4 buffered
+        let pending = account_lost_pending(pending, &errors); // writer abandoned
+        assert_eq!(pending, 0);
+        assert_eq!(load(&written), 0);
+        assert_eq!(
+            load(&errors),
+            4,
+            "abandoned buffered lines are lost exactly once"
+        );
+    }
+
+    #[test]
+    fn abandoning_with_no_pending_counts_nothing() {
+        // A clean abandon (everything already flushed) must not fabricate an
+        // error — the old `.max(1)` behaviour over-counted an empty buffer.
+        let errors = AtomicU64::new(0);
+        let pending = account_lost_pending(0, &errors);
+        assert_eq!(pending, 0);
+        assert_eq!(load(&errors), 0, "no pending means no loss to account");
     }
 }
