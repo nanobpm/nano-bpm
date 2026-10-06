@@ -558,7 +558,13 @@ adjustable:
 | `NANOBPMN_TRACE_STIMULI=1` | off | Enable recorded-input replay capture. |
 | `NANOBPMN_TRACE_VARIABLES_MAX_BYTES` | 16384 | Max captured variable payload bytes. |
 | `NANOBPMN_TRACE_STIMULI_MAX` | 1024 | Max recorded inputs per instance. |
-| `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained. |
+| `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained in memory. |
+| `NANOBPMN_TRACE_FILE` | *(unset)* | Append each **finished** trace to this file as one NDJSON line, then drop it from memory. Durable across restart; memory stays bounded by the active set, so capture can stay on. Unset keeps the in-memory-only behaviour. |
+| `NANOBPMN_TRACE_FILE_MAX_BYTES` | *(unset)* | Rotate the trace file at this size (`<path>.1` … `<path>.<keep>`). Unset leaves rotation to `logrotate` — which **must** use `copytruncate`, because the writer opens the file once and never reopens it (rename/create rotation would leave it writing to the renamed file). |
+| `NANOBPMN_TRACE_FILE_KEEP` | 5 | Rotated trace files to keep. |
+| `NANOBPMN_TRACE_FILE_TAIL` | 0 | Recently-finished traces to keep in memory for the console after writing them to the file. |
+| `NANOBPMN_TRACE_FILE_QUEUE_BYTES` | 16777216 | Byte budget of the writer channel between the engine and the sink thread. A full budget **drops** finished traces (the `dropped` counter returned by `sink_stats()`) rather than back-pressuring the engine — raise it if drops appear under load. Bounded in bytes (not trace count) so a stalled disk can never retain more than this much serialized trace. The budget bounds *backlog*, not one trace's size: a single trace larger than the whole budget is still admitted to an **empty** queue (a healthy writer drains it immediately), so it is a backlog ceiling, not an absolute memory ceiling. |
+| `NANOBPMN_TRACE_FILE_FLUSH_MS` | 1000 | How often the writer thread flushes its buffer to the file, on an absolute deadline that does not move when new traces arrive. A crash can lose at most one flush interval of traces. |
 
 ## Run a cluster
 

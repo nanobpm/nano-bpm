@@ -38,6 +38,9 @@ use std::sync::Mutex;
 use nanobpmn_engine_core::{Event, Value};
 use serde::Serialize;
 
+mod sink;
+use sink::TraceSink;
+
 const DEFAULT_CAPACITY: usize = 2000;
 
 /// Default per-instance/per-incident cap on a captured variable snapshot,
@@ -150,6 +153,15 @@ struct Inner {
     /// exporter is async, a fast worker can activate before the create batch
     /// projects. Buffered here (keyed by job key) and drained on fold.
     pending_acts: HashMap<u64, PendingAct>,
+    /// Optional durability sink (`NANOBPMN_TRACE_FILE`). When present, a finished
+    /// instance is appended to the file as one NDJSON line and dropped from the
+    /// ring (keeping at most `sink.tail()` recently-finished ones), so memory is
+    /// bounded by the active set even with recorded-input capture on.
+    sink: Option<TraceSink>,
+    /// Keys of recently-finished instances kept in the ring for the console after
+    /// being written to the sink (bounded by `sink.tail()`). Empty when no sink is
+    /// configured or its tail is zero.
+    finished_tail: VecDeque<u64>,
 }
 
 /// A job activation seen before its `JobCreated` reached the projection.
@@ -300,12 +312,43 @@ impl TraceStore {
         )
     }
 
+    /// Test-only: a store with capture on and an explicit NDJSON durability sink.
+    #[cfg(test)]
+    fn with_sink(capacity: usize, cfg: sink::SinkConfig) -> Self {
+        Self::build_with_sink(
+            capacity,
+            true,
+            true,
+            DEFAULT_VARS_MAX_BYTES,
+            DEFAULT_STIMULI_MAX,
+            Some(TraceSink::spawn(cfg)),
+        )
+    }
+
     fn build(
         capacity: usize,
         capture_vars: bool,
         capture_stimuli: bool,
         vars_max_bytes: usize,
         stimuli_max: usize,
+    ) -> Self {
+        Self::build_with_sink(
+            capacity,
+            capture_vars,
+            capture_stimuli,
+            vars_max_bytes,
+            stimuli_max,
+            None,
+        )
+    }
+
+    fn build_with_sink(
+        capacity: usize,
+        capture_vars: bool,
+        capture_stimuli: bool,
+        vars_max_bytes: usize,
+        stimuli_max: usize,
+        sink: Option<TraceSink>,
     ) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -318,6 +361,8 @@ impl TraceStore {
                 order: VecDeque::new(),
                 versions: HashMap::new(),
                 pending_acts: HashMap::new(),
+                sink,
+                finished_tail: VecDeque::new(),
             }),
         }
     }
@@ -329,6 +374,12 @@ impl TraceStore {
     /// `NANOBPMN_TRACE_STIMULI` (truthy), capped per instance by
     /// `NANOBPMN_TRACE_STIMULI_MAX` (default 1024); enabling it implies variable
     /// capture so the replay has both its creation inputs and its deltas.
+    ///
+    /// Durability is opt-in via `NANOBPMN_TRACE_FILE=<path>`: when set, each
+    /// finished instance is appended to the file as one NDJSON line and dropped
+    /// from the ring, so history survives restart and memory stays bounded by the
+    /// active set even with capture on (issue #1343). See [`sink`] for the full
+    /// `NANOBPMN_TRACE_FILE_*` set.
     pub fn from_env() -> Self {
         let cap = std::env::var("NANOBPMN_TRACE_CAPACITY")
             .ok()
@@ -349,12 +400,13 @@ impl TraceStore {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_STIMULI_MAX);
-        Self::build(
+        Self::build_with_sink(
             cap,
             capture_vars,
             capture_stimuli,
             vars_max_bytes,
             stimuli_max,
+            TraceSink::from_env(),
         )
     }
 
@@ -400,6 +452,23 @@ impl TraceStore {
     pub fn get(&self, instance_key: u64) -> Option<InstanceTraceDto> {
         let inner = self.inner.lock().unwrap();
         inner.instances.get(&instance_key).map(InstanceTrace::dto)
+    }
+
+    /// Durability-sink counters `(written, dropped, errors)` when
+    /// `NANOBPMN_TRACE_FILE` is configured, else `None`. `written` counts traces
+    /// whose bytes survived a successful flush to the OS; `dropped` counts
+    /// finished traces discarded because the bounded writer budget was full
+    /// (back-pressure is never applied to the engine); `errors` counts traces
+    /// lost to a write/flush failure (e.g. a full disk) after reaching the
+    /// writer, **plus** each failed rotation/reopen or pre-rotation repair —
+    /// an operation failure that loses no trace — so the counter stays
+    /// monotonic for alerting. Useful for a metric/log.
+    pub fn sink_stats(&self) -> Option<(u64, u64, u64)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .sink
+            .as_ref()
+            .map(|s| (s.written(), s.dropped(), s.errors()))
     }
 
     /// The instance trace as an OTLP/JSON trace document (resource → scope →
@@ -758,18 +827,10 @@ impl Inner {
                 }
             }
             Event::ProcessInstanceCompleted { instance_key } => {
-                if let Some(t) = self.instances.get_mut(instance_key) {
-                    t.last_at = now;
-                    t.ended_at = Some(now);
-                    t.outcome = Outcome::Completed;
-                }
+                self.finalize_instance(*instance_key, Outcome::Completed, now);
             }
             Event::ProcessInstanceTerminated { instance_key } => {
-                if let Some(t) = self.instances.get_mut(instance_key) {
-                    t.last_at = now;
-                    t.ended_at = Some(now);
-                    t.outcome = Outcome::Terminated;
-                }
+                self.finalize_instance(*instance_key, Outcome::Terminated, now);
             }
             // --- Tier 2 recorded-input stimuli (only when enabled) -------------
             Event::UserTaskCompleted { instance_key, .. } => {
@@ -848,14 +909,128 @@ impl Inner {
     }
 
     /// Inserts a new instance trace, evicting the oldest if over capacity.
+    ///
+    /// When the durability sink is configured, an **active** instance is never
+    /// evicted: evicting one would lose its in-flight trace, so its terminal
+    /// event would later find no DTO and emit no NDJSON line — silently
+    /// defeating the sink's every-finished-trace durability contract. Instead
+    /// the oldest **finished-tail** entry is retired first (the tail is only a
+    /// console convenience; those traces are already durable). Only when no
+    /// finished-tail entry remains is the oldest active instance evicted, the
+    /// pre-sink behaviour retained as a last-resort bound on memory. With the
+    /// sink off there is no finished tail, so this degenerates to the original
+    /// oldest-first eviction.
     fn insert(&mut self, key: u64, trace: InstanceTrace) {
         if self.instances.insert(key, trace).is_none() {
             self.order.push_back(key);
         }
         while self.order.len() > self.capacity {
+            // Prefer retiring an already-durable finished-tail entry (front =
+            // oldest) over evicting a live trace. `remove_instance` guarantees
+            // the entry leaves `order`, so this branch always makes progress.
+            if self.sink.is_some()
+                && let Some(old) = self.finished_tail.pop_front()
+            {
+                self.remove_instance(old);
+                continue;
+            }
             if let Some(old) = self.order.pop_front() {
                 self.instances.remove(&old);
             }
+        }
+    }
+
+    /// Applies a terminal transition (`Completed`/`Terminated`) exactly once.
+    ///
+    /// Both terminal arms funnel through here so the duplicate-terminal guard
+    /// has a single source of truth. A duplicate terminal for a trace still
+    /// retained in the console tail (its key already in `finished_tail`) is
+    /// skipped **entirely**: its durable NDJSON record was written on the first
+    /// terminal and is immutable, so mutating the retained console copy's
+    /// `ended_at`/`last_at`/`outcome` here would silently diverge the console
+    /// view's end time/duration from the frozen durable record. `finish_instance`
+    /// already refuses to re-sink such a key; this guard additionally refuses to
+    /// re-finalize it. With no sink (or `tail == 0`) `finished_tail` is empty, so
+    /// the default path is unchanged.
+    fn finalize_instance(&mut self, key: u64, outcome: Outcome, now: u64) {
+        if self.finished_tail.contains(&key) {
+            return;
+        }
+        if let Some(t) = self.instances.get_mut(&key) {
+            t.last_at = now;
+            t.ended_at = Some(now);
+            t.outcome = outcome;
+        }
+        self.finish_instance(key);
+    }
+
+    /// Flushes a just-finished instance to the durability sink (one NDJSON line)
+    /// and drops it from the in-memory ring, keeping at most `sink.tail()`
+    /// recently-finished instances for the console. A no-op when no sink is
+    /// configured, so the default path is unchanged.
+    ///
+    /// A terminal event for an instance the ring no longer holds (evicted,
+    /// restarted away, or a duplicate terminal) is ignored entirely: it has no
+    /// DTO to sink, and appending its key to `finished_tail` would let a phantom
+    /// entry evict a genuinely retained recent trace.
+    ///
+    /// A duplicate terminal for an instance that is *still* retained in the ring
+    /// because it sits in the console tail (`tail > 0`) is likewise ignored: its
+    /// key already appears in `finished_tail`, so re-sinking its DTO would append
+    /// the same trace twice and re-pushing its key would double-count it against
+    /// the tail bound. The `finished_tail` membership check closes that
+    /// exactly-once gap for every nonzero tail (the `tail == 0` case is covered by
+    /// the untracked-terminal early return, since the first terminal removes it).
+    fn finish_instance(&mut self, key: u64) {
+        let tail = match self.sink.as_ref() {
+            None => return,
+            Some(sink) => {
+                if self.finished_tail.contains(&key) {
+                    // Already finished and sunk on an earlier terminal; retained
+                    // only for the console. A second terminal is a duplicate.
+                    return;
+                }
+                if let Some(t) = self.instances.get(&key) {
+                    if let Ok(line) = serde_json::to_string(&t.dto()) {
+                        sink.append(line);
+                    }
+                } else {
+                    // Untracked terminal: nothing to sink, nothing to retain.
+                    return;
+                }
+                sink.tail()
+            }
+        };
+        if tail == 0 {
+            self.remove_instance(key);
+        } else {
+            self.finished_tail.push_back(key);
+            while self.finished_tail.len() > tail {
+                if let Some(old) = self.finished_tail.pop_front()
+                    && old != key
+                {
+                    self.remove_instance(old);
+                }
+            }
+            // The tail counts against ring capacity. If retaining it overfills
+            // the ring, retire the oldest finished-tail entries (already
+            // durable) before any active instance is at risk of eviction. This
+            // may retire `key` itself when the ring is already full of active
+            // instances — correct: a finished trace is durable, so it yields to
+            // live ones.
+            while self.order.len() > self.capacity
+                && let Some(old) = self.finished_tail.pop_front()
+            {
+                self.remove_instance(old);
+            }
+        }
+    }
+
+    /// Removes an instance from the ring (both the map and the insertion order),
+    /// used when the durability sink has taken ownership of a finished trace.
+    fn remove_instance(&mut self, key: u64) {
+        if self.instances.remove(&key).is_some() {
+            self.order.retain(|&k| k != key);
         }
     }
 
@@ -1682,5 +1857,669 @@ mod tests {
         let dto = store.get(1).unwrap();
         assert_eq!(dto.stimuli.unwrap().len(), 2);
         assert!(dto.stimuli_truncated);
+    }
+
+    fn temp_trace_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nano-trace-{tag}-{}-{nanos}.ndjson",
+            std::process::id()
+        ))
+    }
+
+    fn sink_cfg(path: std::path::PathBuf) -> sink::SinkConfig {
+        sink::SinkConfig {
+            path,
+            max_bytes: None,
+            keep: 5,
+            queue_bytes: 16 * 1024 * 1024,
+            flush_interval: std::time::Duration::from_millis(20),
+            tail: 0,
+        }
+    }
+
+    fn completed(key: u64) -> Event {
+        Event::ProcessInstanceCompleted { instance_key: key }
+    }
+
+    fn terminated(key: u64) -> Event {
+        Event::ProcessInstanceTerminated { instance_key: key }
+    }
+
+    fn terminating(key: u64) -> Event {
+        Event::ProcessInstanceTerminating { instance_key: key }
+    }
+
+    #[test]
+    fn no_sink_by_default_keeps_finished_in_ring() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 16);
+        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
+        store.ingest(&[&completed(1)], 1100);
+        // Default behaviour: the finished instance stays in the ring and no sink
+        // stats exist.
+        assert!(store.get(1).is_some());
+        assert_eq!(store.list(10).len(), 1);
+        assert!(store.sink_stats().is_none());
+    }
+
+    #[test]
+    fn finished_instance_is_written_once_and_dropped_from_ring() {
+        let path = temp_trace_path("one-line");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            store.ingest(&[&created(1, &[("amount", Value::Int(5))])], 1000);
+            // Still active → still in the ring, not yet written.
+            assert!(store.get(1).is_some());
+            store.ingest(&[&completed(1)], 1100);
+            // Finished → gone from the ring (tail = 0).
+            assert!(store.get(1).is_none());
+            assert_eq!(store.list(10).len(), 0);
+            // Dropping the store flushes and joins the writer.
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one NDJSON line for the instance");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["instanceKey"], "1");
+        assert_eq!(parsed["outcome"], "completed");
+        // Same shape as GET /console/api/traces/{key}: capture fields present.
+        assert_eq!(parsed["creationVariables"]["values"]["amount"], 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminated_instance_is_also_sunk() {
+        let path = temp_trace_path("terminated");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            store.ingest(&[&created(7, &[])], 1000);
+            store.ingest(&[&terminated(7)], 1200);
+            assert!(store.get(7).is_none());
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["outcome"], "terminated");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminating_then_terminated_sinks_exactly_once() {
+        // The deferred-cancellation path (cancel with listeners) emits
+        // `ProcessInstanceTerminating` first, then `ProcessInstanceTerminated`
+        // once termination completes. The intermediate event must not sink the
+        // instance early, and the final one must sink it exactly once.
+        let path = temp_trace_path("terminating-terminated");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            store.ingest(&[&created(9, &[])], 1000);
+            store.ingest(&[&terminating(9)], 1100);
+            // Intermediate state: still active, still in the ring, not yet sunk.
+            assert!(store.get(9).is_some(), "terminating keeps the instance");
+            store.ingest(&[&terminated(9)], 1200);
+            assert!(store.get(9).is_none(), "terminated drops the instance");
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "Terminating then Terminated must produce exactly one NDJSON line"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["outcome"], "terminated");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tail_keeps_recent_finished_in_ring() {
+        let path = temp_trace_path("tail");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 1;
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1100);
+            // Tail = 1 keeps the most-recent finished instance visible.
+            assert!(store.get(1).is_some());
+            store.ingest(&[&created(2, &[])], 1200);
+            store.ingest(&[&completed(2)], 1300);
+            // The newer finished instance evicts the older from the tail.
+            assert!(store.get(2).is_some());
+            assert!(store.get(1).is_none());
+        }
+        // Both were still written to the file exactly once.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_instances_stay_in_memory_with_sink_on() {
+        let path = temp_trace_path("active");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            // Two active instances, one finished: only the finished one is sunk.
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&created(2, &[])], 1010);
+            store.ingest(&[&completed(1)], 1100);
+            assert!(store.get(1).is_none(), "finished instance dropped");
+            assert!(store.get(2).is_some(), "active instance retained");
+            assert_eq!(store.list(10).len(), 1);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotation_keeps_bounded_files() {
+        let path = temp_trace_path("rotate");
+        for i in 0..6 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut cfg = sink_cfg(path.clone());
+            cfg.max_bytes = Some(1); // rotate on every subsequent write
+            cfg.keep = 2;
+            let store = TraceStore::with_sink(8, cfg);
+            for k in 1..=4u64 {
+                store.ingest(&[&created(k, &[])], 1000 + k);
+                store.ingest(&[&completed(k)], 1050 + k);
+            }
+        }
+        // Keep window is honoured: at most `keep` rotated files survive.
+        assert!(std::fs::metadata(format!("{}.1", path.display())).is_ok());
+        assert!(std::fs::metadata(format!("{}.2", path.display())).is_ok());
+        assert!(
+            std::fs::metadata(format!("{}.3", path.display())).is_err(),
+            "rotated files beyond keep are removed"
+        );
+        for i in 0..6 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn queue_is_bounded_by_bytes_not_trace_count() {
+        // Regression for the memory-bound finding: a count-only queue lets a
+        // stalled disk retain ~queue × per-trace-payload bytes (≈64 GiB at the
+        // documented defaults). The budget is in *bytes*, so a tiny budget drops
+        // traces once their queued serialized size exceeds it — regardless of
+        // how few traces that is. Pin a reservation directly on the sink's
+        // counter (simulating a stalled writer holding one line), then append:
+        // the line must be dropped even though it is the only *message* — the
+        // bound is the queued bytes, not the count.
+        let path = temp_trace_path("byte-bound");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        // A budget smaller than a single serialized trace.
+        cfg.queue_bytes = 1;
+        cfg.flush_interval = std::time::Duration::from_secs(3600); // never flush mid-test
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            // Clone the shared byte counter and release the store lock *before*
+            // ingesting — `ingest` re-locks `inner`, so holding it here would
+            // deadlock the non-reentrant mutex.
+            let queued = {
+                let inner = store.inner.lock().unwrap();
+                inner.sink.as_ref().unwrap().queued_bytes.clone()
+            };
+            // Occupy the (1-byte) budget as a stalled writer's pending line
+            // would, and hold it until after the append below.
+            queued.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            store.ingest(
+                &[&created(1, &[("payload", Value::Str("x".repeat(256)))])],
+                1000,
+            );
+            store.ingest(&[&completed(1)], 1100);
+            let (_written, dropped, _errors) = store.sink_stats().unwrap();
+            assert_eq!(dropped, 1, "trace over an occupied byte budget is dropped");
+            queued.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oversized_single_line_admitted_to_empty_queue() {
+        // Regression for the lone-oversized-trace finding: the byte budget
+        // bounds *backlog*, not one trace's size. A single trace larger than
+        // the whole budget must still reach the file when the queue is empty
+        // (a healthy writer drains it immediately) — otherwise the largest,
+        // most replay-valuable traces (e.g. 1024 stimuli × up-to-16 KiB
+        // snapshots ≈ the 16 MiB default budget) would be dropped even with an
+        // idle writer. This mirrors the rotation path's `size > 0` exception.
+        let path = temp_trace_path("oversized-admit");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.queue_bytes = 1; // far smaller than any real trace line
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(
+                &[&created(1, &[("payload", Value::Str("x".repeat(256)))])],
+                1000,
+            );
+            store.ingest(&[&completed(1)], 1100);
+            // Drop flushes + joins the writer: the oversized line must have
+            // been admitted and written, not dropped.
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "the lone oversized trace is written exactly once"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn written_counts_only_after_a_successful_flush() {
+        // Regression for the durability-counter finding: `written` must not
+        // count a trace merely accepted into the BufWriter. With a long flush
+        // interval, a trace sits buffered and `written` stays 0 until the flush
+        // (here, the shutdown flush on drop) publishes it.
+        let path = temp_trace_path("written-after-flush");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.flush_interval = std::time::Duration::from_secs(3600); // no periodic flush
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1100);
+            // Let the writer receive (but not flush) the line.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let (written, _dropped, _errors) = store.sink_stats().unwrap();
+            assert_eq!(
+                written, 0,
+                "buffered-but-unflushed trace is not yet counted as written"
+            );
+            // Dropping the store flushes + joins: now it is written.
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().filter(|l| !l.is_empty()).count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn flush_fires_on_absolute_deadline_despite_continuous_arrivals() {
+        // Regression for the flush-starvation finding: a relative recv_timeout
+        // restarts on every arrival, so a queue receiving at least one trace per
+        // interval never flushes. The absolute deadline must flush even when
+        // arrivals are more frequent than the interval.
+        let path = temp_trace_path("absolute-deadline");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.flush_interval = std::time::Duration::from_millis(80);
+        {
+            let store = TraceStore::with_sink(64, cfg);
+            // Send traces faster than the flush interval for several intervals.
+            for k in 1..=40u64 {
+                store.ingest(&[&created(k, &[])], 1000 + k);
+                store.ingest(&[&completed(k)], 1050 + k);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Continuous arrivals at 10 ms ≪ 80 ms interval. With a relative
+            // timeout nothing would have flushed yet; with the absolute deadline
+            // at least one flush has fired, so `written` is already non-zero
+            // before shutdown.
+            let (written, _dropped, _errors) = store.sink_stats().unwrap();
+            assert!(
+                written > 0,
+                "absolute deadline flushes even under continuous arrivals (written={written})"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotation_is_prospective_not_just_at_cap() {
+        // Regression for the rotation off-by-one: a file just below the cap must
+        // rotate *before* accepting a trace that would push it over, so a
+        // segment never exceeds max_bytes by a whole trace. Use a cap larger
+        // than one line but smaller than two.
+        let path = temp_trace_path("prospective");
+        for i in 0..4 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+        // First, measure one line's size with no rotation.
+        let line_len = {
+            let p = temp_trace_path("prospective-measure");
+            let _ = std::fs::remove_file(&p);
+            {
+                let store = TraceStore::with_sink(8, sink_cfg(p.clone()));
+                store.ingest(&[&created(1, &[])], 1000);
+                store.ingest(&[&completed(1)], 1100);
+            }
+            let n = std::fs::metadata(&p).unwrap().len();
+            let _ = std::fs::remove_file(&p);
+            n
+        };
+        {
+            let mut cfg = sink_cfg(path.clone());
+            // Cap fits ~1.5 lines: the second line must trigger rotation *before*
+            // being appended, so segment 1 holds exactly one line.
+            cfg.max_bytes = Some(line_len + line_len / 2);
+            cfg.keep = 3;
+            let store = TraceStore::with_sink(8, cfg);
+            for k in 1..=3u64 {
+                store.ingest(&[&created(k, &[])], 1000 + k);
+                store.ingest(&[&completed(k)], 1050 + k);
+            }
+        }
+        // Rotation happened (a .1 segment exists) ...
+        assert!(
+            std::fs::metadata(format!("{}.1", path.display())).is_ok(),
+            "prospective rotation produced a rotated segment"
+        );
+        // ... and no single segment exceeds the cap by a whole extra line: the
+        // rotated segment holds one line, not two.
+        let seg1 = std::fs::metadata(format!("{}.1", path.display()))
+            .unwrap()
+            .len();
+        assert!(
+            seg1 <= line_len + 1,
+            "rotated segment holds one line ({seg1} <= {}), not an over-cap append",
+            line_len + 1
+        );
+        for i in 0..4 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oversized_single_line_goes_to_fresh_segment() {
+        // The prospective check must allow a single line larger than the cap
+        // into an empty segment (size == 0), otherwise it would spin on
+        // rotation forever and never write.
+        let path = temp_trace_path("oversized-line");
+        for i in 0..4 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut cfg = sink_cfg(path.clone());
+            cfg.max_bytes = Some(8); // far smaller than any real trace line
+            cfg.keep = 2;
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1100);
+        }
+        // The oversized line was still written exactly once (to a fresh segment).
+        let mut total = 0;
+        for cand in [
+            path.clone(),
+            std::path::PathBuf::from(format!("{}.1", path.display())),
+            std::path::PathBuf::from(format!("{}.2", path.display())),
+        ] {
+            if let Ok(body) = std::fs::read_to_string(&cand) {
+                total += body.lines().filter(|l| !l.is_empty()).count();
+            }
+        }
+        assert_eq!(
+            total, 1,
+            "the single oversized line is written exactly once"
+        );
+        for i in 0..4 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capacity_eviction_retires_finished_tail_before_active() {
+        // Regression for the active-eviction finding: with the sink on, an
+        // *active* instance must never be evicted to make room — its terminal
+        // event would then find no DTO and emit no NDJSON line. Retention
+        // pressure must fall on the already-durable finished tail first.
+        let path = temp_trace_path("evict-tail-first");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 4; // keep finished instances in the ring
+        {
+            // Capacity 2: one finished (tailed) + one active fill the ring.
+            let store = TraceStore::with_sink(2, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // finished, tailed (durable)
+            store.ingest(&[&created(2, &[])], 1020); // active
+            assert!(store.get(1).is_some() && store.get(2).is_some());
+            // A third insert exceeds capacity: the durable finished tail (1) is
+            // retired, NOT the active instance (2).
+            store.ingest(&[&created(3, &[])], 1030);
+            assert!(store.get(1).is_none(), "oldest finished-tail entry retired");
+            assert!(store.get(2).is_some(), "active instance is never evicted");
+            assert!(store.get(3).is_some());
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_instance_survives_capacity_and_still_sinks() {
+        // Companion to the above: an active instance that would previously have
+        // been evicted over capacity must survive to its terminal event and be
+        // written to the file exactly once.
+        let path = temp_trace_path("active-survives");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 4;
+        {
+            let store = TraceStore::with_sink(2, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // durable tail
+            store.ingest(&[&created(2, &[])], 1020); // active
+            store.ingest(&[&created(3, &[])], 1030); // over capacity → retires 1
+            // The still-active instance 2 finishes and must sink.
+            store.ingest(&[&completed(2)], 1040);
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2, "both finished instances are sunk");
+        let keys: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["instanceKey"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(keys.iter().any(|k| k == "1"), "keys={keys:?}");
+        assert!(keys.iter().any(|k| k == "2"), "active instance 2 was sunk");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminal_event_for_untracked_instance_does_not_advance_tail() {
+        // Regression for the phantom-tail finding: a terminal event for an
+        // instance the ring no longer holds (duplicate terminal, or one evicted
+        // after a restart) must not push a phantom key onto `finished_tail` —
+        // the phantom would evict a genuinely retained recent trace.
+        let path = temp_trace_path("phantom-tail");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 1;
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // finished, tail = [1]
+            assert!(store.get(1).is_some());
+            // A terminal event for an instance never seen (or already gone).
+            store.ingest(&[&completed(999)], 1020);
+            // The phantom key must not have evicted the real retained trace.
+            assert!(
+                store.get(1).is_some(),
+                "phantom terminal must not evict the retained finished trace"
+            );
+        }
+        // Only the genuinely finished instance was written.
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().filter(|l| !l.is_empty()).count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_terminal_sinks_exactly_once() {
+        // A duplicate terminal event for an already-sunk (tail = 0) instance is
+        // untracked: it must not produce a second NDJSON line.
+        let path = temp_trace_path("dup-terminal");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone())); // tail = 0
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010);
+            store.ingest(&[&completed(1)], 1020); // duplicate terminal
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "a duplicate terminal sinks the instance exactly once"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_terminal_with_console_tail_sinks_exactly_once() {
+        // Regression for the exactly-once gap with console retention enabled:
+        // with `tail > 0` the first terminal leaves the instance in `instances`
+        // (retained for the console), so a duplicate terminal must NOT re-sink
+        // its DTO nor push its key onto `finished_tail` a second time.
+        let path = temp_trace_path("dup-terminal-tail");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut cfg = sink_cfg(path.clone());
+            cfg.tail = 2;
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1010); // finished, tail = [1]
+            assert!(store.get(1).is_some(), "retained in the console tail");
+            store.ingest(&[&completed(1)], 1020); // duplicate terminal
+            store.ingest(&[&terminated(1)], 1030); // and a differently-typed one
+            assert!(
+                store.get(1).is_some(),
+                "duplicate terminals must not evict the retained trace"
+            );
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "a duplicate terminal with a nonzero tail still sinks exactly once"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn duplicate_terminal_does_not_mutate_retained_console_trace() {
+        // Regression for the console/durable divergence finding: with a nonzero
+        // console tail the first terminal sinks the DTO durably but leaves the
+        // trace in `instances` for the console. A later duplicate terminal must
+        // NOT re-stamp its `ended_at`/`outcome`, or the console view would drift
+        // away from the immutable durable NDJSON record.
+        let path = temp_trace_path("dup-terminal-no-mutate");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 2;
+        let store = TraceStore::with_sink(8, cfg);
+        store.ingest(&[&created(1, &[])], 1000);
+        store.ingest(&[&completed(1)], 1010); // first terminal: sunk at 1010
+        let first = store.get(1).expect("retained in the console tail");
+        assert_eq!(first.ended_at, Some(1010));
+        assert_eq!(first.outcome, "completed");
+
+        // A duplicate completion AND a differently-typed terminal, both later.
+        store.ingest(&[&completed(1)], 1020);
+        store.ingest(&[&terminated(1)], 1030);
+        let after = store.get(1).expect("still retained");
+        assert_eq!(
+            after.ended_at,
+            Some(1010),
+            "duplicate terminal must not re-stamp the retained console end time"
+        );
+        assert_eq!(
+            after.duration_ms, first.duration_ms,
+            "duplicate terminal must not change the retained duration"
+        );
+        assert_eq!(
+            after.outcome, "completed",
+            "a later Terminated must not flip the already-finalized outcome"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rotate_aborts_before_touching_active_when_shift_fails() {
+        // Regression for the rotation finding: if shifting an intermediate
+        // segment fails, the active file must NOT be renamed onto `.1` — on
+        // platforms where `rename` replaces the destination that would
+        // overwrite the newest rotated segment. Force every shift to fail by
+        // making the containing directory read-only (no write permission →
+        // `rename` returns EACCES), then assert the active file is untouched.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "nano-trace-rotate-abort-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let active = dir.join("trace.ndjson");
+        std::fs::write(&active, b"active\n").unwrap();
+        std::fs::write(dir.join("trace.ndjson.1"), b"one\n").unwrap();
+        std::fs::write(dir.join("trace.ndjson.2"), b"two\n").unwrap();
+        // Read-only directory: no segment can be renamed within it.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        let res = sink::rotate(&active, 5);
+
+        // A read-only directory only blocks `rename` for a non-root user; root
+        // bypasses the permission check. Detect that by probing whether a write
+        // is still possible — while the mode is still 0o555, before restoring —
+        // and skip if so. (Probing after the restore would always succeed and
+        // skip the assertions for every user.)
+        let probe = dir.join(".probe");
+        let still_writable = std::fs::write(&probe, b"x").is_ok();
+        let _ = std::fs::remove_file(&probe);
+
+        // Restore writability before any assertion (and before the early return)
+        // so cleanup cannot leave a read-only temp dir behind.
+        let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&dir, perms).unwrap();
+
+        if still_writable {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert!(
+            res.is_err(),
+            "a failed intermediate shift aborts rotation (got {res:?})"
+        );
+        assert!(
+            active.exists(),
+            "the active file is left in place when a shift fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("trace.ndjson.1")).unwrap(),
+            "one\n",
+            "the newest rotated segment is not overwritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
