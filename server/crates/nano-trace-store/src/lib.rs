@@ -38,6 +38,9 @@ use std::sync::Mutex;
 use nanobpmn_engine_core::{Event, Value};
 use serde::Serialize;
 
+mod sink;
+use sink::TraceSink;
+
 const DEFAULT_CAPACITY: usize = 2000;
 
 /// Default per-instance/per-incident cap on a captured variable snapshot,
@@ -150,6 +153,15 @@ struct Inner {
     /// exporter is async, a fast worker can activate before the create batch
     /// projects. Buffered here (keyed by job key) and drained on fold.
     pending_acts: HashMap<u64, PendingAct>,
+    /// Optional durability sink (`NANOBPMN_TRACE_FILE`). When present, a finished
+    /// instance is appended to the file as one NDJSON line and dropped from the
+    /// ring (keeping at most `sink.tail()` recently-finished ones), so memory is
+    /// bounded by the active set even with recorded-input capture on.
+    sink: Option<TraceSink>,
+    /// Keys of recently-finished instances kept in the ring for the console after
+    /// being written to the sink (bounded by `sink.tail()`). Empty when no sink is
+    /// configured or its tail is zero.
+    finished_tail: VecDeque<u64>,
 }
 
 /// A job activation seen before its `JobCreated` reached the projection.
@@ -300,12 +312,43 @@ impl TraceStore {
         )
     }
 
+    /// Test-only: a store with capture on and an explicit NDJSON durability sink.
+    #[cfg(test)]
+    fn with_sink(capacity: usize, cfg: sink::SinkConfig) -> Self {
+        Self::build_with_sink(
+            capacity,
+            true,
+            true,
+            DEFAULT_VARS_MAX_BYTES,
+            DEFAULT_STIMULI_MAX,
+            Some(TraceSink::spawn(cfg)),
+        )
+    }
+
     fn build(
         capacity: usize,
         capture_vars: bool,
         capture_stimuli: bool,
         vars_max_bytes: usize,
         stimuli_max: usize,
+    ) -> Self {
+        Self::build_with_sink(
+            capacity,
+            capture_vars,
+            capture_stimuli,
+            vars_max_bytes,
+            stimuli_max,
+            None,
+        )
+    }
+
+    fn build_with_sink(
+        capacity: usize,
+        capture_vars: bool,
+        capture_stimuli: bool,
+        vars_max_bytes: usize,
+        stimuli_max: usize,
+        sink: Option<TraceSink>,
     ) -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -318,6 +361,8 @@ impl TraceStore {
                 order: VecDeque::new(),
                 versions: HashMap::new(),
                 pending_acts: HashMap::new(),
+                sink,
+                finished_tail: VecDeque::new(),
             }),
         }
     }
@@ -329,6 +374,12 @@ impl TraceStore {
     /// `NANOBPMN_TRACE_STIMULI` (truthy), capped per instance by
     /// `NANOBPMN_TRACE_STIMULI_MAX` (default 1024); enabling it implies variable
     /// capture so the replay has both its creation inputs and its deltas.
+    ///
+    /// Durability is opt-in via `NANOBPMN_TRACE_FILE=<path>`: when set, each
+    /// finished instance is appended to the file as one NDJSON line and dropped
+    /// from the ring, so history survives restart and memory stays bounded by the
+    /// active set even with capture on (issue #1343). See [`sink`] for the full
+    /// `NANOBPMN_TRACE_FILE_*` set.
     pub fn from_env() -> Self {
         let cap = std::env::var("NANOBPMN_TRACE_CAPACITY")
             .ok()
@@ -349,12 +400,13 @@ impl TraceStore {
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_STIMULI_MAX);
-        Self::build(
+        Self::build_with_sink(
             cap,
             capture_vars,
             capture_stimuli,
             vars_max_bytes,
             stimuli_max,
+            TraceSink::from_env(),
         )
     }
 
@@ -400,6 +452,15 @@ impl TraceStore {
     pub fn get(&self, instance_key: u64) -> Option<InstanceTraceDto> {
         let inner = self.inner.lock().unwrap();
         inner.instances.get(&instance_key).map(InstanceTrace::dto)
+    }
+
+    /// Durability-sink counters `(written, dropped)` when `NANOBPMN_TRACE_FILE`
+    /// is configured, else `None`. `dropped` counts finished traces discarded
+    /// because the bounded writer channel was full (back-pressure is never
+    /// applied to the engine). Useful for a metric/log.
+    pub fn sink_stats(&self) -> Option<(u64, u64)> {
+        let inner = self.inner.lock().unwrap();
+        inner.sink.as_ref().map(|s| (s.written(), s.dropped()))
     }
 
     /// The instance trace as an OTLP/JSON trace document (resource → scope →
@@ -763,6 +824,7 @@ impl Inner {
                     t.ended_at = Some(now);
                     t.outcome = Outcome::Completed;
                 }
+                self.finish_instance(*instance_key);
             }
             Event::ProcessInstanceTerminated { instance_key } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
@@ -770,6 +832,7 @@ impl Inner {
                     t.ended_at = Some(now);
                     t.outcome = Outcome::Terminated;
                 }
+                self.finish_instance(*instance_key);
             }
             // --- Tier 2 recorded-input stimuli (only when enabled) -------------
             Event::UserTaskCompleted { instance_key, .. } => {
@@ -856,6 +919,44 @@ impl Inner {
             if let Some(old) = self.order.pop_front() {
                 self.instances.remove(&old);
             }
+        }
+    }
+
+    /// Flushes a just-finished instance to the durability sink (one NDJSON line)
+    /// and drops it from the in-memory ring, keeping at most `sink.tail()`
+    /// recently-finished instances for the console. A no-op when no sink is
+    /// configured, so the default path is unchanged.
+    fn finish_instance(&mut self, key: u64) {
+        let tail = match self.sink.as_ref() {
+            None => return,
+            Some(sink) => {
+                if let Some(t) = self.instances.get(&key)
+                    && let Ok(line) = serde_json::to_string(&t.dto())
+                {
+                    sink.append(line);
+                }
+                sink.tail()
+            }
+        };
+        if tail == 0 {
+            self.remove_instance(key);
+        } else {
+            self.finished_tail.push_back(key);
+            while self.finished_tail.len() > tail {
+                if let Some(old) = self.finished_tail.pop_front()
+                    && old != key
+                {
+                    self.remove_instance(old);
+                }
+            }
+        }
+    }
+
+    /// Removes an instance from the ring (both the map and the insertion order),
+    /// used when the durability sink has taken ownership of a finished trace.
+    fn remove_instance(&mut self, key: u64) {
+        if self.instances.remove(&key).is_some() {
+            self.order.retain(|&k| k != key);
         }
     }
 
@@ -1682,5 +1783,163 @@ mod tests {
         let dto = store.get(1).unwrap();
         assert_eq!(dto.stimuli.unwrap().len(), 2);
         assert!(dto.stimuli_truncated);
+    }
+
+    fn temp_trace_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "nano-trace-{tag}-{}-{nanos}.ndjson",
+            std::process::id()
+        ))
+    }
+
+    fn sink_cfg(path: std::path::PathBuf) -> sink::SinkConfig {
+        sink::SinkConfig {
+            path,
+            max_bytes: None,
+            keep: 5,
+            queue: 1024,
+            flush_interval: std::time::Duration::from_millis(20),
+            tail: 0,
+        }
+    }
+
+    fn completed(key: u64) -> Event {
+        Event::ProcessInstanceCompleted { instance_key: key }
+    }
+
+    fn terminated(key: u64) -> Event {
+        Event::ProcessInstanceTerminated { instance_key: key }
+    }
+
+    #[test]
+    fn no_sink_by_default_keeps_finished_in_ring() {
+        let store = TraceStore::with_capture(8, 16 * 1024, 16);
+        store.ingest(&[&created(1, &[("a", Value::Int(1))])], 1000);
+        store.ingest(&[&completed(1)], 1100);
+        // Default behaviour: the finished instance stays in the ring and no sink
+        // stats exist.
+        assert!(store.get(1).is_some());
+        assert_eq!(store.list(10).len(), 1);
+        assert!(store.sink_stats().is_none());
+    }
+
+    #[test]
+    fn finished_instance_is_written_once_and_dropped_from_ring() {
+        let path = temp_trace_path("one-line");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            store.ingest(&[&created(1, &[("amount", Value::Int(5))])], 1000);
+            // Still active → still in the ring, not yet written.
+            assert!(store.get(1).is_some());
+            store.ingest(&[&completed(1)], 1100);
+            // Finished → gone from the ring (tail = 0).
+            assert!(store.get(1).is_none());
+            assert_eq!(store.list(10).len(), 0);
+            // Dropping the store flushes and joins the writer.
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "exactly one NDJSON line for the instance");
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["instanceKey"], "1");
+        assert_eq!(parsed["outcome"], "completed");
+        // Same shape as GET /console/api/traces/{key}: capture fields present.
+        assert_eq!(parsed["creationVariables"]["values"]["amount"], 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn terminated_instance_is_also_sunk() {
+        let path = temp_trace_path("terminated");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            store.ingest(&[&created(7, &[])], 1000);
+            store.ingest(&[&terminated(7)], 1200);
+            assert!(store.get(7).is_none());
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        let parsed: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(parsed["outcome"], "terminated");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tail_keeps_recent_finished_in_ring() {
+        let path = temp_trace_path("tail");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.tail = 1;
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1100);
+            // Tail = 1 keeps the most-recent finished instance visible.
+            assert!(store.get(1).is_some());
+            store.ingest(&[&created(2, &[])], 1200);
+            store.ingest(&[&completed(2)], 1300);
+            // The newer finished instance evicts the older from the tail.
+            assert!(store.get(2).is_some());
+            assert!(store.get(1).is_none());
+        }
+        // Both were still written to the file exactly once.
+        let body = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(lines.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn active_instances_stay_in_memory_with_sink_on() {
+        let path = temp_trace_path("active");
+        let _ = std::fs::remove_file(&path);
+        {
+            let store = TraceStore::with_sink(8, sink_cfg(path.clone()));
+            // Two active instances, one finished: only the finished one is sunk.
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&created(2, &[])], 1010);
+            store.ingest(&[&completed(1)], 1100);
+            assert!(store.get(1).is_none(), "finished instance dropped");
+            assert!(store.get(2).is_some(), "active instance retained");
+            assert_eq!(store.list(10).len(), 1);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotation_keeps_bounded_files() {
+        let path = temp_trace_path("rotate");
+        for i in 0..6 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut cfg = sink_cfg(path.clone());
+            cfg.max_bytes = Some(1); // rotate on every subsequent write
+            cfg.keep = 2;
+            let store = TraceStore::with_sink(8, cfg);
+            for k in 1..=4u64 {
+                store.ingest(&[&created(k, &[])], 1000 + k);
+                store.ingest(&[&completed(k)], 1050 + k);
+            }
+        }
+        // Keep window is honoured: at most `keep` rotated files survive.
+        assert!(std::fs::metadata(format!("{}.1", path.display())).is_ok());
+        assert!(std::fs::metadata(format!("{}.2", path.display())).is_ok());
+        assert!(
+            std::fs::metadata(format!("{}.3", path.display())).is_err(),
+            "rotated files beyond keep are removed"
+        );
+        for i in 0..6 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

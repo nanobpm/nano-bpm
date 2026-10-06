@@ -558,7 +558,11 @@ adjustable:
 | `NANOBPMN_TRACE_STIMULI=1` | off | Enable recorded-input replay capture. |
 | `NANOBPMN_TRACE_VARIABLES_MAX_BYTES` | 16384 | Max captured variable payload bytes. |
 | `NANOBPMN_TRACE_STIMULI_MAX` | 1024 | Max recorded inputs per instance. |
-| `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained. |
+| `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained in memory. |
+| `NANOBPMN_TRACE_FILE` | *(unset)* | Append each **finished** trace to this file as one NDJSON line, then drop it from memory. Durable across restart; memory stays bounded by the active set, so capture can stay on. Unset keeps the in-memory-only behaviour. |
+| `NANOBPMN_TRACE_FILE_MAX_BYTES` | *(unset)* | Rotate the trace file at this size (`<path>.1` … `<path>.<keep>`). Unset leaves rotation to `logrotate`. |
+| `NANOBPMN_TRACE_FILE_KEEP` | 5 | Rotated trace files to keep. |
+| `NANOBPMN_TRACE_FILE_TAIL` | 0 | Recently-finished traces to keep in memory for the console after writing them to the file. |
 
 ## Run a cluster
 

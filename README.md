@@ -1083,7 +1083,11 @@ GET /console/api/traces/{instanceKey}
 | `NANOBPMN_TRACE_STIMULI=1` | off | Enable Tier 2 recorded-input replay (also enables Tier 1). |
 | `NANOBPMN_TRACE_VARIABLES_MAX_BYTES` | 16384 | Max captured variable payload bytes. |
 | `NANOBPMN_TRACE_STIMULI_MAX` | 1024 | Max recorded stimuli per instance. |
-| `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained. |
+| `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained in memory. |
+| `NANOBPMN_TRACE_FILE` | *(unset)* | Append each **finished** trace to this file as one NDJSON line, then drop it from memory. Durable across restart and bounds memory to the active set, so recorded-input capture can stay on in production. Unset keeps the in-memory-only behaviour. Each line is the same JSON as `GET /console/api/traces/{key}`. |
+| `NANOBPMN_TRACE_FILE_MAX_BYTES` | *(unset)* | Rotate the trace file at this size (`<path>.1` … `<path>.<keep>`). Unset leaves rotation to `logrotate`. |
+| `NANOBPMN_TRACE_FILE_KEEP` | 5 | Rotated trace files to keep. |
+| `NANOBPMN_TRACE_FILE_TAIL` | 0 | Recently-finished traces to keep in memory for the console after writing them to the file. |
 
 > **Roadmap:** beyond the Camunda-compatible engine, see
 > [`docs/process-optimization-design.md`](docs/process-optimization-design.md) for
