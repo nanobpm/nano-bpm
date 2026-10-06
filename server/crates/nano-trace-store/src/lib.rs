@@ -1988,14 +1988,54 @@ mod tests {
         // Regression for the memory-bound finding: a count-only queue lets a
         // stalled disk retain ~queue × per-trace-payload bytes (≈64 GiB at the
         // documented defaults). The budget is in *bytes*, so a tiny budget drops
-        // traces once their serialized size exceeds it — regardless of how few
-        // traces that is.
+        // traces once their queued serialized size exceeds it — regardless of
+        // how few traces that is. Pin a reservation directly on the sink's
+        // counter (simulating a stalled writer holding one line), then append:
+        // the line must be dropped even though it is the only *message* — the
+        // bound is the queued bytes, not the count.
         let path = temp_trace_path("byte-bound");
         let _ = std::fs::remove_file(&path);
         let mut cfg = sink_cfg(path.clone());
-        // A budget smaller than a single serialized trace: every append drops.
+        // A budget smaller than a single serialized trace.
         cfg.queue_bytes = 1;
         cfg.flush_interval = std::time::Duration::from_secs(3600); // never flush mid-test
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            // Clone the shared byte counter and release the store lock *before*
+            // ingesting — `ingest` re-locks `inner`, so holding it here would
+            // deadlock the non-reentrant mutex.
+            let queued = {
+                let inner = store.inner.lock().unwrap();
+                inner.sink.as_ref().unwrap().queued_bytes.clone()
+            };
+            // Occupy the (1-byte) budget as a stalled writer's pending line
+            // would, and hold it until after the append below.
+            queued.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            store.ingest(
+                &[&created(1, &[("payload", Value::Str("x".repeat(256)))])],
+                1000,
+            );
+            store.ingest(&[&completed(1)], 1100);
+            let (_written, dropped, _errors) = store.sink_stats().unwrap();
+            assert_eq!(dropped, 1, "trace over an occupied byte budget is dropped");
+            queued.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oversized_single_line_admitted_to_empty_queue() {
+        // Regression for the lone-oversized-trace finding: the byte budget
+        // bounds *backlog*, not one trace's size. A single trace larger than
+        // the whole budget must still reach the file when the queue is empty
+        // (a healthy writer drains it immediately) — otherwise the largest,
+        // most replay-valuable traces (e.g. 1024 stimuli × up-to-16 KiB
+        // snapshots ≈ the 16 MiB default budget) would be dropped even with an
+        // idle writer. This mirrors the rotation path's `size > 0` exception.
+        let path = temp_trace_path("oversized-admit");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.queue_bytes = 1; // far smaller than any real trace line
         {
             let store = TraceStore::with_sink(8, cfg);
             store.ingest(
@@ -2003,12 +2043,15 @@ mod tests {
                 1000,
             );
             store.ingest(&[&completed(1)], 1100);
-            // Give the writer a beat to (not) consume; the line far exceeds the
-            // 1-byte budget so it must be dropped, never written.
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            let (_written, dropped, _errors) = store.sink_stats().unwrap();
-            assert_eq!(dropped, 1, "oversized-vs-budget trace is dropped");
+            // Drop flushes + joins the writer: the oversized line must have
+            // been admitted and written, not dropped.
         }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            body.lines().filter(|l| !l.is_empty()).count(),
+            1,
+            "the lone oversized trace is written exactly once"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

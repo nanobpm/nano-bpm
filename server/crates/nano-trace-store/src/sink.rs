@@ -20,7 +20,9 @@
 //!   never retain more than the configured byte budget of serialized traces —
 //!   the memory guarantee this sink exists to provide. If the budget is full
 //!   the trace is counted as *dropped* (a metric) rather than applying
-//!   backpressure.
+//!   backpressure — except that a single trace larger than the whole budget is
+//!   still admitted to an *empty* queue (the budget bounds backlog, not one
+//!   trace's size; a healthy writer drains it immediately).
 //! - The writer buffers and flushes on an **absolute** periodic deadline
 //!   (`NANOBPMN_TRACE_FILE_FLUSH_MS`, default 1000 ms) that does not move when
 //!   new traces arrive. There is no fsync per trace — losing the last flush
@@ -141,8 +143,9 @@ pub(crate) struct TraceSink {
     /// Bytes of serialized trace currently sitting in the channel, shared with
     /// the writer (which subtracts on receipt). This is the *real* memory bound:
     /// the channel is count-capped too, but the byte budget is what guarantees a
-    /// stalled disk cannot balloon memory.
-    queued_bytes: Arc<AtomicU64>,
+    /// stalled disk cannot balloon memory. Visible to the crate so tests can
+    /// pin a reservation (simulating a stalled writer) deterministically.
+    pub(crate) queued_bytes: Arc<AtomicU64>,
     queue_budget: u64,
     dropped: Arc<AtomicU64>,
     written: Arc<AtomicU64>,
@@ -190,14 +193,18 @@ impl TraceSink {
 
     /// Enqueues one finished-trace NDJSON line. Never blocks: if the byte budget
     /// (or the defensive channel cap) is full, or the writer is gone, the trace
-    /// is counted as dropped rather than back-pressuring the caller.
+    /// is counted as dropped rather than back-pressuring the caller. A single
+    /// line larger than the whole budget is admitted when the queue is empty —
+    /// the same lone-oversized exception the writer's rotation path makes —
+    /// because the budget bounds *backlog*, not one trace's size: a healthy
+    /// writer drains the line immediately, so it never becomes backlog.
     pub(crate) fn append(&self, line: String) {
         let bytes = line.len() as u64 + 1; // + the newline the writer adds
         // Reserve budget before sending so a stalled disk cannot accumulate more
         // than `queue_budget` bytes of pending traces. `fetch_add` then check:
-        // if we overflowed the budget, undo the reservation and drop.
+        // if we overflowed a *non-empty* queue, undo the reservation and drop.
         let prev = self.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
-        if prev + bytes > self.queue_budget {
+        if prev != 0 && prev + bytes > self.queue_budget {
             self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
             self.dropped.fetch_add(1, Ordering::Relaxed);
             return;
