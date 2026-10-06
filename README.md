@@ -1085,11 +1085,11 @@ GET /console/api/traces/{instanceKey}
 | `NANOBPMN_TRACE_STIMULI_MAX` | 1024 | Max recorded stimuli per instance. |
 | `NANOBPMN_TRACE_CAPACITY` | 2000 | Max traced instances retained in memory. |
 | `NANOBPMN_TRACE_FILE` | *(unset)* | Append each **finished** trace to this file as one NDJSON line, then drop it from memory. Durable across restart and bounds memory to the active set, so recorded-input capture can stay on in production. Unset keeps the in-memory-only behaviour. Each line is the same JSON as `GET /console/api/traces/{key}`. |
-| `NANOBPMN_TRACE_FILE_MAX_BYTES` | *(unset)* | Rotate the trace file at this size (`<path>.1` … `<path>.<keep>`). Unset leaves rotation to `logrotate`. |
+| `NANOBPMN_TRACE_FILE_MAX_BYTES` | *(unset)* | Rotate the trace file at this size (`<path>.1` … `<path>.<keep>`). Unset leaves rotation to `logrotate` — which **must** use `copytruncate`, because the writer opens the file once and never reopens it (rename/create rotation would leave it writing to the renamed file). |
 | `NANOBPMN_TRACE_FILE_KEEP` | 5 | Rotated trace files to keep. |
 | `NANOBPMN_TRACE_FILE_TAIL` | 0 | Recently-finished traces to keep in memory for the console after writing them to the file. |
-| `NANOBPMN_TRACE_FILE_QUEUE` | 4096 | Bounded depth of the writer channel between the engine and the sink thread. A full queue **drops** finished traces (counted in `sink_stats().dropped`) rather than back-pressuring the engine — raise it if drops appear under load. |
-| `NANOBPMN_TRACE_FILE_FLUSH_MS` | 1000 | How often the writer thread flushes its buffer to the file. A crash can lose at most one flush interval of traces. |
+| `NANOBPMN_TRACE_FILE_QUEUE_BYTES` | 16777216 | Byte budget of the writer channel between the engine and the sink thread. A full budget **drops** finished traces (counted in `sink_stats().dropped`) rather than back-pressuring the engine — raise it if drops appear under load. Bounded in bytes (not trace count) so a stalled disk can never retain more than this much serialized trace. |
+| `NANOBPMN_TRACE_FILE_FLUSH_MS` | 1000 | How often the writer thread flushes its buffer to the file, on an absolute deadline that does not move when new traces arrive. A crash can lose at most one flush interval of traces. |
 
 > **Roadmap:** beyond the Camunda-compatible engine, see
 > [`docs/process-optimization-design.md`](docs/process-optimization-design.md) for

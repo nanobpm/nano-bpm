@@ -455,11 +455,13 @@ impl TraceStore {
     }
 
     /// Durability-sink counters `(written, dropped, errors)` when
-    /// `NANOBPMN_TRACE_FILE` is configured, else `None`. `dropped` counts
-    /// finished traces discarded because the bounded writer channel was full
+    /// `NANOBPMN_TRACE_FILE` is configured, else `None`. `written` counts traces
+    /// whose bytes survived a successful flush to the OS; `dropped` counts
+    /// finished traces discarded because the bounded writer budget was full
     /// (back-pressure is never applied to the engine); `errors` counts traces
     /// lost to a write/flush failure (e.g. a full disk) after reaching the
-    /// writer. Useful for a metric/log.
+    /// writer, plus one for a flush that failed with an empty buffer. Useful
+    /// for a metric/log.
     pub fn sink_stats(&self) -> Option<(u64, u64, u64)> {
         let inner = self.inner.lock().unwrap();
         inner
@@ -1806,7 +1808,7 @@ mod tests {
             path,
             max_bytes: None,
             keep: 5,
-            queue: 1024,
+            queue_bytes: 16 * 1024 * 1024,
             flush_interval: std::time::Duration::from_millis(20),
             tail: 0,
         }
@@ -1976,6 +1978,190 @@ mod tests {
             "rotated files beyond keep are removed"
         );
         for i in 0..6 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn queue_is_bounded_by_bytes_not_trace_count() {
+        // Regression for the memory-bound finding: a count-only queue lets a
+        // stalled disk retain ~queue × per-trace-payload bytes (≈64 GiB at the
+        // documented defaults). The budget is in *bytes*, so a tiny budget drops
+        // traces once their serialized size exceeds it — regardless of how few
+        // traces that is.
+        let path = temp_trace_path("byte-bound");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        // A budget smaller than a single serialized trace: every append drops.
+        cfg.queue_bytes = 1;
+        cfg.flush_interval = std::time::Duration::from_secs(3600); // never flush mid-test
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(
+                &[&created(1, &[("payload", Value::Str("x".repeat(256)))])],
+                1000,
+            );
+            store.ingest(&[&completed(1)], 1100);
+            // Give the writer a beat to (not) consume; the line far exceeds the
+            // 1-byte budget so it must be dropped, never written.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let (_written, dropped, _errors) = store.sink_stats().unwrap();
+            assert_eq!(dropped, 1, "oversized-vs-budget trace is dropped");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn written_counts_only_after_a_successful_flush() {
+        // Regression for the durability-counter finding: `written` must not
+        // count a trace merely accepted into the BufWriter. With a long flush
+        // interval, a trace sits buffered and `written` stays 0 until the flush
+        // (here, the shutdown flush on drop) publishes it.
+        let path = temp_trace_path("written-after-flush");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.flush_interval = std::time::Duration::from_secs(3600); // no periodic flush
+        {
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1100);
+            // Let the writer receive (but not flush) the line.
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let (written, _dropped, _errors) = store.sink_stats().unwrap();
+            assert_eq!(
+                written, 0,
+                "buffered-but-unflushed trace is not yet counted as written"
+            );
+            // Dropping the store flushes + joins: now it is written.
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().filter(|l| !l.is_empty()).count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn flush_fires_on_absolute_deadline_despite_continuous_arrivals() {
+        // Regression for the flush-starvation finding: a relative recv_timeout
+        // restarts on every arrival, so a queue receiving at least one trace per
+        // interval never flushes. The absolute deadline must flush even when
+        // arrivals are more frequent than the interval.
+        let path = temp_trace_path("absolute-deadline");
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = sink_cfg(path.clone());
+        cfg.flush_interval = std::time::Duration::from_millis(80);
+        {
+            let store = TraceStore::with_sink(64, cfg);
+            // Send traces faster than the flush interval for several intervals.
+            for k in 1..=40u64 {
+                store.ingest(&[&created(k, &[])], 1000 + k);
+                store.ingest(&[&completed(k)], 1050 + k);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Continuous arrivals at 10 ms ≪ 80 ms interval. With a relative
+            // timeout nothing would have flushed yet; with the absolute deadline
+            // at least one flush has fired, so `written` is already non-zero
+            // before shutdown.
+            let (written, _dropped, _errors) = store.sink_stats().unwrap();
+            assert!(
+                written > 0,
+                "absolute deadline flushes even under continuous arrivals (written={written})"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rotation_is_prospective_not_just_at_cap() {
+        // Regression for the rotation off-by-one: a file just below the cap must
+        // rotate *before* accepting a trace that would push it over, so a
+        // segment never exceeds max_bytes by a whole trace. Use a cap larger
+        // than one line but smaller than two.
+        let path = temp_trace_path("prospective");
+        for i in 0..4 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+        // First, measure one line's size with no rotation.
+        let line_len = {
+            let p = temp_trace_path("prospective-measure");
+            let _ = std::fs::remove_file(&p);
+            {
+                let store = TraceStore::with_sink(8, sink_cfg(p.clone()));
+                store.ingest(&[&created(1, &[])], 1000);
+                store.ingest(&[&completed(1)], 1100);
+            }
+            let n = std::fs::metadata(&p).unwrap().len();
+            let _ = std::fs::remove_file(&p);
+            n
+        };
+        {
+            let mut cfg = sink_cfg(path.clone());
+            // Cap fits ~1.5 lines: the second line must trigger rotation *before*
+            // being appended, so segment 1 holds exactly one line.
+            cfg.max_bytes = Some(line_len + line_len / 2);
+            cfg.keep = 3;
+            let store = TraceStore::with_sink(8, cfg);
+            for k in 1..=3u64 {
+                store.ingest(&[&created(k, &[])], 1000 + k);
+                store.ingest(&[&completed(k)], 1050 + k);
+            }
+        }
+        // Rotation happened (a .1 segment exists) ...
+        assert!(
+            std::fs::metadata(format!("{}.1", path.display())).is_ok(),
+            "prospective rotation produced a rotated segment"
+        );
+        // ... and no single segment exceeds the cap by a whole extra line: the
+        // rotated segment holds one line, not two.
+        let seg1 = std::fs::metadata(format!("{}.1", path.display()))
+            .unwrap()
+            .len();
+        assert!(
+            seg1 <= line_len + 1,
+            "rotated segment holds one line ({seg1} <= {}), not an over-cap append",
+            line_len + 1
+        );
+        for i in 0..4 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn oversized_single_line_goes_to_fresh_segment() {
+        // The prospective check must allow a single line larger than the cap
+        // into an empty segment (size == 0), otherwise it would spin on
+        // rotation forever and never write.
+        let path = temp_trace_path("oversized-line");
+        for i in 0..4 {
+            let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
+        }
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut cfg = sink_cfg(path.clone());
+            cfg.max_bytes = Some(8); // far smaller than any real trace line
+            cfg.keep = 2;
+            let store = TraceStore::with_sink(8, cfg);
+            store.ingest(&[&created(1, &[])], 1000);
+            store.ingest(&[&completed(1)], 1100);
+        }
+        // The oversized line was still written exactly once (to a fresh segment).
+        let mut total = 0;
+        for cand in [
+            path.clone(),
+            std::path::PathBuf::from(format!("{}.1", path.display())),
+            std::path::PathBuf::from(format!("{}.2", path.display())),
+        ] {
+            if let Ok(body) = std::fs::read_to_string(&cand) {
+                total += body.lines().filter(|l| !l.is_empty()).count();
+            }
+        }
+        assert_eq!(
+            total, 1,
+            "the single oversized line is written exactly once"
+        );
+        for i in 0..4 {
             let _ = std::fs::remove_file(format!("{}.{i}", path.display()));
         }
         let _ = std::fs::remove_file(&path);
