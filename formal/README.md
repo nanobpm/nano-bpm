@@ -353,6 +353,28 @@ hand-edit fails the corpus drift guard in `check.sh`). To add a model:
 If the model finds a violation, confirm it against the real engine with a red
 Rust test before recording it. The model may simply be wrong.
 
+## TLA+ authoring gotchas
+
+Reusable pitfalls hit while adding the JobLease, RaftHandoff, SnapshotReplay and
+ZeebeTokenFlow families (epic #1224). A future spec author will hit these again:
+
+- **Never let one operator return a mix of `Int` and a string sentinel.** TLC
+  (v1.7.4) aborts with `Attempted to check equality of integer N with
+  non-integer 'x'` if a value can be *either* a number *or* a string tag (e.g. a
+  recovery outcome that is a length **or** `"fail"`). Model the sum type as a
+  **record** so every branch has one type, e.g. `[reject |-> BOOLEAN, len |->
+  Nat]`, and read the tag field instead of comparing the bare value.
+- **Compare against a reference spec with an INSTANCE + a state-predicate
+  invariant, not a second temporal property.** The harness allows **at most one**
+  `PROPERTIES` entry (TLC cannot name temporal violations). To assert Nano
+  matches a reference (e.g. `RefinesZeebe`) over the *whole* corpus without new
+  model files: expose the reference guard as **pure predicates** (params only),
+  `INSTANCE` the reference module in the Nano base module (`WITH` state-var
+  mapping; same-named `CONSTANTS` auto-map), and add a **state-predicate
+  `INVARIANT`** comparing the two decisions. Register it in the existing spec
+  descriptor's `SPEC_INVARIANTS` — it then runs over every model, no per-graph
+  twins. See `RefinesZeebe` in `TokenFlow.tla` / `TokenFlow.spec`.
+
 ## Keeping the spec honest
 
 The spec is hand-written, so it can drift from the Rust code. Trace validation
