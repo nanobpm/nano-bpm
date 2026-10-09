@@ -215,7 +215,16 @@ fn apply_patch(doc: &mut Value, patch: &Value) {
             .get("append")
             .and_then(Value::as_sequence)
             .unwrap_or_else(|| panic!("'append' for target '{target}' must be a list"));
-        if !parent.contains_key(last.as_str()) {
+        // Mirror `preprocess-spec.py::_apply_patch`'s `node = parent.get(last)` +
+        // `if node is None`: an EXPLICITLY NULL target (`required: null`) is
+        // treated exactly like an absent one and becomes a fresh list — Python's
+        // `dict.get` returns None for both. Treating null as "present" here would
+        // panic on the null→sequence conversion and reject a patch the real
+        // preprocessor accepts (the same parity rule the `merge` branch above
+        // already follows).
+        if !parent.contains_key(last.as_str())
+            || parent.get(last.as_str()).is_some_and(Value::is_null)
+        {
             parent.insert(Value::String(last.clone()), Value::Sequence(Vec::new()));
         }
         let node = parent
@@ -673,6 +682,35 @@ fn apply_patch_append_appends_new_items() {
         items,
         ["keep", "added"],
         "append adds new items, dedupes existing"
+    );
+}
+
+/// Defect-class guard (#1346 review, "previously missed": handle null patch
+/// targets like absent targets): `preprocess-spec.py::_apply_patch`'s append
+/// branch resolves the target with `node = parent.get(last)` and creates a
+/// fresh list when `node is None` — which covers BOTH an absent key AND an
+/// explicitly null one (`required: null`). The guard must mirror that: treating
+/// a null target as "present" and then panicking on the null→sequence
+/// conversion would reject a patch the real preprocessor accepts (a drift
+/// surface between the guarded spec and the served one). The `merge` branch
+/// already treats null like absent; `append` must too.
+#[test]
+fn apply_patch_append_treats_a_null_target_as_absent() {
+    let mut doc = serde_yaml::from_str::<Value>("required: null\n").unwrap();
+    let patch = serde_yaml::from_str::<Value>("target: required\nappend:\n  - added\n").unwrap();
+    apply_patch(&mut doc, &patch);
+    let items: Vec<&str> = doc
+        .get("required")
+        .and_then(Value::as_sequence)
+        .unwrap()
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        items,
+        ["added"],
+        "an explicitly null append target becomes a fresh list, mirroring Python"
     );
 }
 
