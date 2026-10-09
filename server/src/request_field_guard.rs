@@ -178,6 +178,7 @@ fn apply_patch(doc: &mut Value, patch: &Value) {
     let target = patch
         .get("target")
         .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
         .unwrap_or_else(|| panic!("patch missing a string 'target': {patch:?}"));
     let (parent, last) = resolve_parent(doc, target);
     let parent = parent
@@ -711,6 +712,28 @@ fn apply_patch_append_treats_a_null_target_as_absent() {
         items,
         ["added"],
         "an explicitly null append target becomes a fresh list, mirroring Python"
+    );
+}
+
+/// Defect-class guard (#1346 review, "previously missed"): the patch target must
+/// be rejected when EMPTY, mirroring `preprocess-spec.py::_apply_patch`
+/// (`not isinstance(target, str) or not target`). Without the emptiness check,
+/// `"".split('.')` yields one empty component, so `resolve_parent` returns the
+/// document root and the guard would patch an empty YAML key — passing a patch
+/// the production preprocessor rejects (a drift surface between the guarded
+/// spec and the served one).
+#[test]
+fn apply_patch_fails_loud_on_an_empty_target() {
+    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
+    let patch = serde_yaml::from_str::<Value>("target: \"\"\nappend:\n  - added\n").unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_patch(&mut doc, &patch);
+    }));
+    let payload = outcome.expect_err("an empty patch target must panic");
+    let message = panic_message(payload);
+    assert!(
+        message.contains("patch missing a string 'target'"),
+        "the panic must reject the empty target, got: {message}"
     );
 }
 

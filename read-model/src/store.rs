@@ -43,6 +43,12 @@ const SCHEMA_VERSION: i64 = 12;
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
 const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
+/// The schema version that introduced the job replay-identity floor
+/// (`jobs.last_event_identity_ms`, #1344). A database migrated across it
+/// receives the column as `0`, so its rows need the floor backfilled from the
+/// best instant the migrated row already carries (see
+/// [`ReadStore::ensure_schema_on`]).
+const JOB_REPLAY_FLOOR_SCHEMA_VERSION: i64 = 12;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -1993,6 +1999,30 @@ impl ReadStore {
             conn.execute(
                 "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
                 params![EVENT_WAITS_BACKFILL_KEY],
+            )?;
+        }
+        // The job replay-identity floor (`last_event_identity_ms`, v12) is added
+        // by the reconcile above as `0` on every existing row, and a normal
+        // restart resumes from `exported_position` WITHOUT reseeding from engine
+        // state — so a migrated row would keep the disabled (`0`) floor while the
+        // journal tail replays. A replayed `JobCreated` (`created_at > 0`) would
+        // then pass the strict-newer gate over a job that had genuinely advanced
+        // before the upgrade and RETURNED to `Created` (lock expiry / retryable
+        // failure), regressing its retries and `lastUpdateTime`. Backfill the
+        // floor from the best instant the migrated row already carries: a
+        // pre-#1344 database has no `last_update_ms`, so `created_at_ms` (the
+        // job's genuine creation instant) is the only available lower bound. It
+        // is exact for a never-activated job (floor == creation identity, so the
+        // replayed genuine CREATED re-stamps the SAME value — a no-op) and the
+        // tightest available bound for a previously-activated one (the genuine
+        // activation instant is not recoverable from the migrated row). A legacy
+        // (`created_at_ms == 0`) row keeps floor `0`, preserving the pre-field
+        // last-writer-wins behaviour the `0` floor documents.
+        if stored_version.is_none_or(|v| v < JOB_REPLAY_FLOOR_SCHEMA_VERSION) {
+            conn.execute(
+                "UPDATE jobs SET last_event_identity_ms = \
+                 MAX(COALESCE(last_event_identity_ms, 0), COALESCE(created_at_ms, 0))",
+                [],
             )?;
         }
         let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
@@ -4029,16 +4059,23 @@ fn project_engine_state(
         // fallback as `last_update_ms` when the snapshot predates `created_at`
         // (legacy `0`), so a recovered legacy job surfaces a non-null
         // `creationTime` (== `lastUpdateTime`) rather than a null creation time.
-        // Seed the replay-identity floor with the same `created_at` (the only
-        // engine-carried instant the snapshot has): a subsequent replayed
-        // `JobCreated` then re-stamps the SAME identity (a no-op), and a genuine
-        // later activation raises it. On CONFLICT the floor is never lowered.
+        // Seed the replay-identity floor with the NEWEST engine-carried instant
+        // the snapshot has for this job — `max(created_at, activated_at)`, not
+        // creation alone: a job snapshotted while ACTIVATED carries its current
+        // activation instant in `activated_at`, and seeding only from creation
+        // would leave the floor below it. The journal tail then replays that
+        // same activation (`activated_at == floor`): the activation gate's
+        // `at == prior_floor` arm applies only on a row that never left
+        // `Created` (`fresh`), and the seeded row IS Activated (not fresh), so
+        // the replayed activation is correctly held instead of re-stamping
+        // worker/deadline. On CONFLICT the floor is never lowered.
         let last_update = if job.created_at != 0 {
             job.created_at
         } else {
             now_ms
         };
         let creation_ms = last_update;
+        let replay_floor = job.created_at.max(job.activated_at.unwrap_or(0));
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
@@ -4083,7 +4120,7 @@ fn project_engine_state(
                 i64::from(job.has_failed_with_retries_left),
                 creation_ms as i64,
                 last_update as i64,
-                job.created_at as i64,
+                replay_floor as i64,
             ],
         )?;
     }
@@ -7065,7 +7102,10 @@ impl ReadStore {
 mod writability_tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use nanobpmn_engine_core::Event;
+
     use super::ReadStore;
+    use super::read_surface_tests::{apply_at, job_row};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -7351,6 +7391,96 @@ mod writability_tests {
     }
 
     #[test]
+    fn migration_backfills_the_job_replay_identity_floor() {
+        // Defect-class guard (#1346 review): the additive migration adds
+        // `jobs.last_event_identity_ms` as `0` on every existing row, and a
+        // normal restart resumes from `exported_position` WITHOUT reseeding from
+        // engine state — so a migrated row would keep the disabled (`0`) floor
+        // while the journal tail replays. A replayed `JobCreated`
+        // (`created_at > 0`) would then pass the strict-newer gate over a job
+        // that had genuinely advanced before the upgrade and RETURNED to
+        // `Created` (lock expiry / retryable failure), regressing its retries
+        // and re-stamping `lastUpdateTime`. The migration must backfill the
+        // floor from the best instant the migrated row carries
+        // (`created_at_ms`), so the replayed CREATED re-stamps an identity at
+        // or below the floor and is held.
+        let path = scratch_db();
+        {
+            let store = ReadStore::open(Some(&path)).expect("fresh open");
+            let conn = store.conn.lock().unwrap();
+            // A job created at t=100, activated at t=200, then returned to
+            // `Created` by a retryable failure at t=3_000 (state Created,
+            // retries 2, last_update_ms 3_000, floor 200).
+            conn.execute(
+                "INSERT INTO jobs \
+                 (key, instance_key, element_instance_key, element_id, job_type, \
+                  state, retries, process_definition_id, process_definition_key, \
+                  created_at_ms, last_update_ms, last_event_identity_ms) \
+                 VALUES (12, 1, 1, 'e', 't', 0, 2, 'p', '1', 100, 3000, 200)",
+                [],
+            )
+            .unwrap();
+        }
+        // Regress the database to a pre-#1344 schema: drop the replay-identity
+        // floor (and the sibling timing columns a pre-#1344 database lacks) and
+        // stamp the version to just before the floor was introduced, so the
+        // next open runs the migration path across the v12 boundary.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE jobs DROP COLUMN last_event_identity_ms;
+                 ALTER TABLE jobs DROP COLUMN last_update_ms;
+                 UPDATE meta SET v = 11 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let store = ReadStore::open(Some(&path)).expect("migration on open");
+        // The backfill raised the floor from the migration default `0` to the
+        // row's creation instant (the pre-#1344 row carried no later instant).
+        let floor: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT last_event_identity_ms FROM jobs WHERE key = 12",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            floor, 100,
+            "migration must backfill the replay floor from created_at_ms"
+        );
+
+        // The regression the finding cites: replaying the genuine CREATED
+        // (identity 100) over the migrated row must now be a no-op — with the
+        // migration-default `0` floor it would have passed the strict-newer
+        // gate and reset retries to the event's 3.
+        let created = Event::JobCreated {
+            job_key: 12,
+            instance_key: 1,
+            element_instance_key: 1,
+            element_id: "e".to_string(),
+            job_type: "t".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        apply_at(&store, &created, 9_000);
+        let row = job_row(&store, 12);
+        assert_eq!(
+            row.retries, 2,
+            "replayed CREATED must not reset retries on a migrated row"
+        );
+        assert_eq!(
+            row.last_event_identity_ms, 100,
+            "the replayed identity must not raise the backfilled floor"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn schema_fingerprint_is_stable_within_a_build() {
         // Derived purely from SCHEMA, so it is constant across calls and never
         // hand-maintained.
@@ -7449,6 +7579,7 @@ mod writability_tests {
 mod definition_xml_tests {
     use nanobpmn_engine_core::{Event, ProcessBuilder, ProcessDefinition};
 
+    use super::read_surface_tests::{apply_at, job_row};
     use super::{ReadStore, RootResolver};
 
     fn deployed_event(key: u64, xml: &str) -> Event {
@@ -7627,6 +7758,112 @@ mod definition_xml_tests {
             store.process_definition_xml(42).as_deref(),
             Some("<xml>latest</xml>")
         );
+    }
+
+    /// Defect-class guard (#1346 review): `seed_from_engine_state` must seed the
+    /// replay-identity floor from the NEWEST engine-carried instant the snapshot
+    /// has for the job — `max(created_at, activated_at)` — not creation alone.
+    /// A job snapshotted while ACTIVATED carries its current activation instant
+    /// in `Job::activated_at`; seeding only from creation leaves the floor below
+    /// it, so the journal tail's replayed `JobActivated` (`activated_at` ABOVE
+    /// the creation-seeded floor) would re-apply the transition over the
+    /// already-seeded Activated row — and over a row that has since returned to
+    /// `Created` it would restore stale worker/deadline data. With the floor at
+    /// the activation instant, the replayed activation lands at
+    /// `at == prior_floor` on a NON-fresh (Activated) row and is held.
+    #[test]
+    fn seed_from_engine_state_seeds_the_replay_floor_from_the_max_job_instant() {
+        use nanobpmn_engine_core::{Job, JobKind, ProcessInstance, State};
+
+        let mut state = State::default();
+        let mut inst = ProcessInstance {
+            key: 7_700,
+            process_id: "p".to_string(),
+            process_definition_key: 0,
+            state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            suspended_at: None,
+            created_at: 50,
+            tags: Vec::new(),
+            business_id: None,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+            active: Default::default(),
+            scopes: Default::default(),
+            variables: Default::default(),
+            join_counts: Default::default(),
+            join_flow_arrivals: Default::default(),
+            join_instances: Default::default(),
+            incidents: Vec::new(),
+            variables_spilled: false,
+            multi_instances: Default::default(),
+            adhoc_instances: Default::default(),
+            scope_parents: Default::default(),
+            scope_variables: Default::default(),
+            compensable: Vec::new(),
+            compensation_waits: Default::default(),
+            agent_instances: Default::default(),
+            agent_history: Default::default(),
+        };
+        inst.active.insert(7_701, "t".to_string());
+        state.instances.insert(7_700, inst);
+        state.jobs.insert(
+            8_700,
+            Job {
+                key: 8_700,
+                instance_key: 7_700,
+                element_instance_key: 7_701,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: nanobpmn_engine_core::JobState::Activated,
+                worker: Some("w1".to_string()),
+                deadline: Some(60_000),
+                activated_at: Some(200),
+                activation_timeout: Some(60_000),
+                lease_token: None,
+                durable_activation: false,
+                activated: true,
+                retries: 3,
+                priority: 0,
+                created_at: 100,
+                kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+            },
+        );
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
+        let seeded = job_row(&store, 8_700);
+        assert_eq!(
+            seeded.state,
+            nanobpmn_engine_core::JobState::Activated,
+            "the seed projects the snapshotted Activated state"
+        );
+        assert_eq!(
+            seeded.last_event_identity_ms, 200,
+            "the floor seeds from max(created_at, activated_at), not creation alone"
+        );
+
+        // The journal tail then replays the SAME activation (identity 200). With
+        // a creation-only floor (100) the gate would pass (`200 > 100`); with the
+        // max-instant floor the replay lands at `at == prior_floor` on a
+        // non-fresh Activated row and must be held — no worker/deadline re-stamp.
+        let replayed_activation = Event::JobActivated {
+            job_key: 8_700,
+            instance_key: 7_700,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        apply_at(&store, &replayed_activation, 9_000);
+        let after = job_row(&store, 8_700);
+        assert_eq!(after.state, nanobpmn_engine_core::JobState::Activated);
+        assert_eq!(after.last_event_identity_ms, 200);
     }
 
     #[test]
@@ -11833,14 +12070,16 @@ mod read_surface_tests {
 
     /// Apply one event at an explicit `now_ms` (bypassing wall clock) so a
     /// re-delivery/replay in a *later* batch can be modelled deterministically.
-    fn apply_at(store: &ReadStore, event: &Event, now_ms: u64) {
+    /// `pub(super)` so the sibling migration/seed test modules can drive the
+    /// same deterministic-replay scenarios.
+    pub(super) fn apply_at(store: &ReadStore, event: &Event, now_ms: u64) {
         let mut conn = store.conn.lock().unwrap();
         let tx = conn.transaction().unwrap();
         super::project(&tx, event, now_ms).unwrap();
         tx.commit().unwrap();
     }
 
-    fn job_row(store: &ReadStore, key: Key) -> super::JobRow {
+    pub(super) fn job_row(store: &ReadStore, key: Key) -> super::JobRow {
         store
             .jobs()
             .into_iter()
