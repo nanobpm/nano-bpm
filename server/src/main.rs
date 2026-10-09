@@ -12220,7 +12220,12 @@ impl ServerImpl {
                 "retries" => query::SortVal::Num(job.retries as i64),
                 "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
                 "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
-                "processDefinitionKey" => query::SortVal::Str(job.process_definition_key.clone()),
+                // `processDefinitionKey` is a numeric key stored as its decimal
+                // string; parse it so sorting is numeric (`"2"` < `"10"`), not
+                // lexicographic — matching the sibling search handlers (#1344).
+                "processDefinitionKey" => {
+                    query::SortVal::Num(job.process_definition_key.parse().unwrap_or(0))
+                }
                 "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
                 "errorMessage" => {
                     query::SortVal::Str(job.error_message.clone().unwrap_or_default())
@@ -37196,6 +37201,127 @@ mod clustered_startup_tests {
         assert!(
             search(other_code).await.is_empty(),
             "a different errorCode matches nothing"
+        );
+    }
+
+    /// #1344 — the Camunda-parity timing filters (`creationTime`,
+    /// `lastUpdateTime`, `endTime`) must actually select on the projected
+    /// timestamps, including the nullable `endTime` ($exists semantics): an
+    /// active job has a creation/last-update time but a NULL `endTime`, and only
+    /// a completed/cancelled job matches `endTime: {$exists: true}`. The existing
+    /// e2e only searches with `{}`, so this guards the filter wiring directly.
+    #[tokio::test]
+    async fn job_search_filters_timing_fields() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        let job_key = job_key.to_string();
+
+        use apis::job::SearchJobsResponse as SResp;
+        let search = |filter: models::JobFilter| {
+            let server = &server;
+            async move {
+                let mut q = models::JobSearchQuery::new();
+                q.filter = Some(filter);
+                let SResp::Status200_TheJobSearchResult(r) = server
+                    .search_jobs_impl(&Some(q))
+                    .await
+                    .expect("search runs")
+                else {
+                    panic!("expected 200 from job search");
+                };
+                r.items
+            }
+        };
+        let exists = |want: bool| {
+            Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                models::AdvancedDateTimeFilter {
+                    dollar_exists: Some(want),
+                    ..models::AdvancedDateTimeFilter::new()
+                },
+            ))
+        };
+
+        // Active job: creationTime + lastUpdateTime exist, endTime is NULL.
+        let mut creation_present = models::JobFilter::new();
+        creation_present.creation_time = exists(true);
+        assert!(
+            search(creation_present)
+                .await
+                .iter()
+                .any(|j| j.job_key.0 == job_key),
+            "an active job matches creationTime: {{$exists: true}}"
+        );
+        let mut last_update_present = models::JobFilter::new();
+        last_update_present.last_update_time = exists(true);
+        assert!(
+            search(last_update_present)
+                .await
+                .iter()
+                .any(|j| j.job_key.0 == job_key),
+            "an active job matches lastUpdateTime: {{$exists: true}}"
+        );
+        let mut end_absent = models::JobFilter::new();
+        end_absent.end_time = exists(false);
+        assert!(
+            search(end_absent)
+                .await
+                .iter()
+                .any(|j| j.job_key.0 == job_key),
+            "an active job matches endTime: {{$exists: false}}"
+        );
+        let mut end_present = models::JobFilter::new();
+        end_present.end_time = exists(true);
+        assert!(
+            search(end_present.clone())
+                .await
+                .iter()
+                .all(|j| j.job_key.0 != job_key),
+            "an active job must NOT match endTime: {{$exists: true}}"
+        );
+
+        // Complete the job; now endTime exists.
+        server
+            .activate_for_stream("demo-work", "worker-t", 10, 60_000, None)
+            .await;
+        use apis::job::CompleteJobResponse as CResp;
+        let done = server
+            .complete_job_impl(
+                &models::CompleteJobPathParams {
+                    job_key: job_key.clone(),
+                },
+                &None,
+            )
+            .await
+            .expect("completion runs");
+        assert!(matches!(
+            done,
+            CResp::Status204_TheJobWasCompletedSuccessfully
+        ));
+
+        let mut matched = Vec::new();
+        for _ in 0..200 {
+            matched = search(end_present.clone()).await;
+            if matched.iter().any(|j| j.job_key.0 == job_key) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            matched.iter().any(|j| j.job_key.0 == job_key),
+            "a completed job matches endTime: {{$exists: true}}"
+        );
+        let mut end_absent_after = models::JobFilter::new();
+        end_absent_after.end_time = exists(false);
+        assert!(
+            search(end_absent_after)
+                .await
+                .iter()
+                .all(|j| j.job_key.0 != job_key),
+            "a completed job must NOT match endTime: {{$exists: false}}"
         );
     }
 
