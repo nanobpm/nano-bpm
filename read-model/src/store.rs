@@ -925,7 +925,7 @@ impl InstanceFilter {
     }
 }
 
-fn job_state_code(s: JobState) -> i64 {
+const fn job_state_code(s: JobState) -> i64 {
     match s {
         JobState::Created => 0,
         JobState::Activated => 1,
@@ -934,6 +934,27 @@ fn job_state_code(s: JobState) -> i64 {
         JobState::Completed => 4,
         JobState::Canceled => 5,
     }
+}
+
+/// The terminal job-state codes that carry **no** `endTime` (`Failed`,
+/// `Errored`), **derived** from the canonical [`job_state_code`] mapping rather
+/// than hard-coded. These are the states the `lastUpdateTime`-freeze arm must
+/// hold at (a terminal `endTime`-less job must not have `lastUpdateTime` pushed
+/// past its first terminal transition — #1344). Mirrors
+/// [`TERMINAL_INSTANCE_STATE_CODES`] so the SQL can never drift from the
+/// enum-to-int codes should [`job_state_code`] ever be renumbered.
+const ENDTIMELESS_TERMINAL_JOB_STATE_CODES: [i64; 2] = [
+    job_state_code(JobState::Failed),
+    job_state_code(JobState::Errored),
+];
+
+/// Builds a `<column> IN (<endTime-less terminal job codes>)` SQL predicate from
+/// [`ENDTIMELESS_TERMINAL_JOB_STATE_CODES`]. Use this instead of writing a
+/// literal `state IN (2, 3)`, so the freeze arm has one source of truth (mirrors
+/// [`terminal_state_predicate`]).
+fn endtimeless_terminal_job_predicate(column: &str) -> String {
+    let [failed, errored] = ENDTIMELESS_TERMINAL_JOB_STATE_CODES;
+    format!("{column} IN ({failed}, {errored})")
 }
 fn job_state_from(code: i64) -> JobState {
     match code {
@@ -4928,12 +4949,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // subsequent-event projections; the `state IN (2, 3)` arm is likewise
             // class-uniform (a Failed/Errored job is never Activated either).
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL, \
+                &format!(
+                    "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL, \
                  last_update_ms = CASE \
                      WHEN end_ms IS NOT NULL THEN end_ms \
-                     WHEN state IN (2, 3) THEN last_update_ms \
+                     WHEN {freeze} THEN last_update_ms \
                      ELSE ?4 END \
                  WHERE key = ?1 AND state = ?3",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Created),
@@ -4962,13 +4986,16 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // NO `endTime` (Failed/Errored) — a re-delivered FAILED must not move
             // `lastUpdateTime` off the first terminal transition.
             tx.cexecute(
-                "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
+                &format!(
+                    "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
                  has_failed_with_retries_left = ?3, \
                  last_update_ms = CASE \
                      WHEN end_ms IS NOT NULL THEN end_ms \
-                     WHEN state IN (2, 3) THEN last_update_ms \
+                     WHEN {freeze} THEN last_update_ms \
                      ELSE ?4 END \
                  WHERE key = ?1",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
                 params![
                     *job_key as i64,
                     error_message,
@@ -5027,13 +5054,16 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // a terminal `endTime`-less state (Failed/Errored) — the first
             // transition still stamps `now_ms`, a re-delivery is then a no-op.
             tx.cexecute(
-                "UPDATE jobs SET error_code = ?2, error_message = COALESCE(?3, error_message), \
+                &format!(
+                    "UPDATE jobs SET error_code = ?2, error_message = COALESCE(?3, error_message), \
                  has_failed_with_retries_left = (retries > 0), \
                  last_update_ms = CASE \
                      WHEN end_ms IS NOT NULL THEN end_ms \
-                     WHEN state IN (2, 3) THEN last_update_ms \
+                     WHEN {freeze} THEN last_update_ms \
                      ELSE ?4 END \
                  WHERE key = ?1",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
                 params![*job_key as i64, error_code, error_message, now_ms as i64],
             )?;
             // Terminal, incident-bearing transition: set `worker` from the event
@@ -5113,12 +5143,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // `state IN (2, 3)` arm holds it for a terminal job with NO `endTime`
             // (Failed/Errored) — a replayed RETRIES_UPDATED must not move it.
             tx.cexecute(
-                "UPDATE jobs SET retries = ?2, \
+                &format!(
+                    "UPDATE jobs SET retries = ?2, \
                  last_update_ms = CASE \
                      WHEN end_ms IS NOT NULL THEN end_ms \
-                     WHEN state IN (2, 3) THEN last_update_ms \
+                     WHEN {freeze} THEN last_update_ms \
                      ELSE ?3 END \
                  WHERE key = ?1",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
                 params![*job_key as i64, retries, now_ms as i64],
             )?;
         }
@@ -5133,12 +5166,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // (Failed/Errored), so a re-delivery/replay cannot push it past the
             // terminal transition.
             tx.cexecute(
-                "UPDATE jobs SET deadline_ms = ?2, \
+                &format!(
+                    "UPDATE jobs SET deadline_ms = ?2, \
                  last_update_ms = CASE \
                      WHEN end_ms IS NOT NULL THEN end_ms \
-                     WHEN state IN (2, 3) THEN last_update_ms \
+                     WHEN {freeze} THEN last_update_ms \
                      ELSE ?3 END \
                  WHERE key = ?1",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
                 params![*job_key as i64, *deadline as i64, now_ms as i64],
             )?;
         }
@@ -8366,6 +8402,44 @@ mod definition_xml_tests {
         assert_eq!(
             terminal_state_predicate("state"),
             format!("state IN ({completed}, {terminated})")
+        );
+    }
+
+    #[test]
+    fn endtimeless_terminal_job_predicate_is_derived_from_the_canonical_job_codes() {
+        use nanobpmn_engine_core::JobState;
+
+        use super::{
+            ENDTIMELESS_TERMINAL_JOB_STATE_CODES, endtimeless_terminal_job_predicate,
+            job_state_code, job_state_from,
+        };
+
+        // Drift guard: the `lastUpdateTime`-freeze arm (#1344) in every
+        // subsequent-event job projection (JobLockExpired, JobFailed,
+        // JobErrorThrown, JobRetriesUpdated, JobTimeoutUpdated) builds its
+        // `state IN (...)` predicate from `ENDTIMELESS_TERMINAL_JOB_STATE_CODES`,
+        // itself derived from `job_state_code`. If the enum-to-int codes are ever
+        // renumbered the SQL follows automatically instead of a magic
+        // `state IN (2, 3)` literal silently freezing the wrong states.
+        assert_eq!(
+            ENDTIMELESS_TERMINAL_JOB_STATE_CODES,
+            [
+                job_state_code(JobState::Failed),
+                job_state_code(JobState::Errored),
+            ]
+        );
+        // The two codes must map back to the genuinely terminal, `endTime`-less
+        // states, never to a live or completed/canceled (`endTime`-bearing) one.
+        for code in ENDTIMELESS_TERMINAL_JOB_STATE_CODES {
+            assert!(matches!(
+                job_state_from(code),
+                JobState::Failed | JobState::Errored
+            ));
+        }
+        let [failed, errored] = ENDTIMELESS_TERMINAL_JOB_STATE_CODES;
+        assert_eq!(
+            endtimeless_terminal_job_predicate("state"),
+            format!("state IN ({failed}, {errored})")
         );
     }
 
