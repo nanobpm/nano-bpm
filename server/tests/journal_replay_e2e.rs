@@ -1763,6 +1763,95 @@ fn create_instance_variables_flow_through_to_activated_jobs() {
     server.shutdown();
 }
 
+/// Reads the full `/jobs/search` item the read model surfaces for `job_key`,
+/// polling until the job has been projected (the read model is eventually
+/// consistent).
+fn searched_job_item(server: &ServerProcess, job_key: &str) -> serde_json::Value {
+    let (_status, body) =
+        server.request_until("POST", &path("/jobs/search"), Some("{}"), |_, b| {
+            serde_json::from_str::<serde_json::Value>(b)
+                .ok()
+                .and_then(|j| j["items"].as_array().cloned())
+                .map(|items| items.iter().any(|i| i["jobKey"].as_str() == Some(job_key)))
+                .unwrap_or(false)
+        });
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
+    json["items"]
+        .as_array()
+        .expect("items array")
+        .iter()
+        .find(|i| i["jobKey"].as_str() == Some(job_key))
+        .cloned()
+        .unwrap_or_else(|| panic!("job {job_key} not found in search: {body}"))
+}
+
+/// #1344: `/jobs/search` must project `creationTime`, `lastUpdateTime` and
+/// `endTime` instead of always returning them `null`. On activation a job has a
+/// `creationTime`/`lastUpdateTime` but no `endTime`; once completed, all three are
+/// present and `endTime` is set — end-to-end over the real REST surface.
+#[test]
+fn job_search_surfaces_creation_last_update_and_end_times() {
+    let scratch = ScratchDir::new();
+    let server = boot_replicated_activation(&scratch.journal_path());
+    create_demo_instance_with_vars_replicated(&server);
+
+    let job_key = activate_demo_job_key(&server, None);
+
+    // Before completion: creationTime + lastUpdateTime present, endTime null.
+    let active = searched_job_item(&server, &job_key);
+    assert!(
+        active["creationTime"].as_str().is_some(),
+        "an active job must surface a creationTime: {active}"
+    );
+    assert!(
+        active["lastUpdateTime"].as_str().is_some(),
+        "an active job must surface a lastUpdateTime: {active}"
+    );
+    assert!(
+        active["endTime"].is_null(),
+        "an active (not-yet-ended) job must have a null endTime: {active}"
+    );
+
+    complete_job(&server, &job_key);
+
+    // After completion: all three timestamps are present and endTime is set.
+    let (_status, completed) =
+        server.request_until("POST", &path("/jobs/search"), Some("{}"), |_, b| {
+            serde_json::from_str::<serde_json::Value>(b)
+                .ok()
+                .and_then(|j| j["items"].as_array().cloned())
+                .map(|items| {
+                    items
+                        .iter()
+                        .any(|i| i["jobKey"].as_str() == Some(&job_key) && !i["endTime"].is_null())
+                })
+                .unwrap_or(false)
+        });
+    let item: serde_json::Value = serde_json::from_str::<serde_json::Value>(&completed)
+        .ok()
+        .and_then(|j| j["items"].as_array().cloned())
+        .and_then(|items| {
+            items
+                .into_iter()
+                .find(|i| i["jobKey"].as_str() == Some(&job_key))
+        })
+        .expect("completed job present in search");
+    assert!(
+        item["creationTime"].as_str().is_some(),
+        "a completed job must surface a creationTime: {item}"
+    );
+    assert!(
+        item["lastUpdateTime"].as_str().is_some(),
+        "a completed job must surface a lastUpdateTime: {item}"
+    );
+    assert!(
+        item["endTime"].as_str().is_some(),
+        "a completed job must surface an endTime: {item}"
+    );
+
+    server.shutdown();
+}
+
 #[test]
 fn await_completion_returns_variables_when_the_process_completes() {
     let scratch = ScratchDir::new();

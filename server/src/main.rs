@@ -12182,10 +12182,28 @@ impl ServerImpl {
                         && query::match_string_opt(&f.error_code, job.error_code.as_deref())
                         && f.has_failed_with_retries_left
                             .is_none_or(|want| want == job.has_failed_with_retries_left)
+                        // Camunda-parity timing filters (#1344).
+                        && query::match_date_time_ms(
+                            &f.creation_time,
+                            (job.created_at_ms != 0).then_some(job.created_at_ms as i64),
+                        )
+                        && query::match_date_time_ms(
+                            &f.last_update_time,
+                            job.last_update_ms.map(|v| v as i64),
+                        )
+                        && query::match_date_time_ms(&f.end_time, job.end_ms.map(|v| v as i64))
+                        && match &f.deadline {
+                            None | Some(types::Nullable::Null) => true,
+                            Some(types::Nullable::Present(d)) => query::match_date_time_ms(
+                                &Some(d.clone()),
+                                job.deadline_ms.map(|v| v as i64),
+                            ),
+                        }
                 }
             })
             .collect();
 
+        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
         let sort = query::sort_keys(
             body.as_ref().and_then(|q| q.sort.as_ref()),
             |r: &models::JobSearchQuerySortRequest| (r.field.clone(), r.order),
@@ -12196,9 +12214,23 @@ impl ServerImpl {
             |job, field| match field {
                 "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
                 "elementId" => query::SortVal::Str(job.element_id.clone()),
+                "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i64),
                 "type" => query::SortVal::Str(job.job_type.clone()),
                 "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
                 "retries" => query::SortVal::Num(job.retries as i64),
+                "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
+                "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
+                "processDefinitionKey" => query::SortVal::Str(job.process_definition_key.clone()),
+                "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
+                "errorMessage" => {
+                    query::SortVal::Str(job.error_message.clone().unwrap_or_default())
+                }
+                // Camunda-parity timing sort fields (#1344). Missing values sort
+                // as 0 (epoch), so jobs lacking a timestamp group first ascending.
+                "creationTime" => query::SortVal::Num(job.created_at_ms as i64),
+                "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
+                "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
+                "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
                 _ => query::SortVal::Num(job.key as i64),
             },
             |job| job.key,
@@ -12207,8 +12239,11 @@ impl ServerImpl {
         let sorted: Vec<(u64, &readstore::JobRow)> =
             matched.into_iter().map(|job| (job.key, job)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::JobSearchResult> =
-            page.items.into_iter().map(job_search_result).collect();
+        let items: Vec<models::JobSearchResult> = page
+            .items
+            .into_iter()
+            .map(|job| job_search_result(job, &roots))
+            .collect();
 
         Ok(Resp::Status200_TheJobSearchResult(
             models::JobSearchQueryResult::new(page.response, items),
@@ -21735,7 +21770,10 @@ fn job_kind_enums(
 
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
 /// process-definition identity is denormalized onto the row at projection time.
-fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
+fn job_search_result(
+    job: &readstore::JobRow,
+    roots: &readstore::RootResolver,
+) -> models::JobSearchResult {
     // The business id snapshotted when the job was created.
     let business_id = nullable_business_id(job.business_id.clone());
     let process_definition_id = job.process_definition_id.clone();
@@ -21748,6 +21786,20 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         None => types::Nullable::Null,
     };
 
+    // Camunda-parity job timing (#1344). `creationTime` is present once the
+    // engine recorded the creation instant (`created_at_ms > 0`); older jobs read
+    // as null. `lastUpdateTime` / `endTime` map from the projected columns.
+    let creation_time = batch_ms_to_datetime((job.created_at_ms != 0).then_some(job.created_at_ms));
+    let last_update_time = batch_ms_to_datetime(job.last_update_ms);
+    let end_time = batch_ms_to_datetime(job.end_ms);
+    // `rootProcessInstanceKey` walks the call-activity parent chain (Camunda sets
+    // it whenever > 0; a top-level instance is its own root).
+    let root_process_instance_key = types::Nullable::Present(models::ProcessInstanceKey(
+        roots
+            .root_process_instance_key(job.instance_key)
+            .to_string(),
+    ));
+
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
     let mut result = models::JobSearchResult {
@@ -21756,7 +21808,7 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         denied_reason: types::Nullable::Null,
         element_id: types::Nullable::Present(job.element_id.clone()),
         element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
-        end_time: types::Nullable::Null,
+        end_time,
         // Zeebe job errorMessage / errorCode / hasFailedWithRetriesLeft (#1327).
         error_code: job
             .error_code
@@ -21774,15 +21826,15 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         process_definition_id,
         process_definition_key: models::ProcessDefinitionKey(process_definition_key),
         process_instance_key: models::ProcessInstanceKey(job.instance_key.to_string()),
-        root_process_instance_key: types::Nullable::Null,
+        root_process_instance_key,
         business_id,
         retries: job.retries,
         state: job_state_enum(job.state),
         tenant_id: "<default>".to_string(),
         r_type: job.job_type.clone(),
         worker: job.worker.clone().unwrap_or_default(),
-        creation_time: types::Nullable::Null,
-        last_update_time: types::Nullable::Null,
+        creation_time,
+        last_update_time,
         priority: 0,
         fetched_variables: None,
     };

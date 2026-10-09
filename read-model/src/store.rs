@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -52,7 +52,7 @@ const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -6985736873706243559;
+const SCHEMA_FINGERPRINT: i64 = 9054396959573802666;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -137,6 +137,15 @@ CREATE TABLE jobs (
     job_kind               INTEGER NOT NULL DEFAULT 0,
     listener_event_type    INTEGER NOT NULL DEFAULT 0,
     created_at_ms          INTEGER NOT NULL DEFAULT 0,
+    -- Job timing for the Camunda-parity read model (#1344). `last_update_ms` is
+    -- the record-timestamp of the most recent projected job event (CREATED and
+    -- every subsequent FAILED / TIMED_OUT / RETRIES_UPDATED / TIMEOUT_UPDATED /
+    -- ERROR_THROWN / COMPLETED / CANCELED — activation is NOT projected, matching
+    -- Camunda). `end_ms` is the record-timestamp of the active→terminal
+    -- COMPLETED / CANCELED transition only (failures, timeouts and errors leave it
+    -- NULL). Both are NULL for rows migrated from a pre-#1344 database.
+    last_update_ms         INTEGER,
+    end_ms                 INTEGER,
     -- Declared read-set (`fetchVariables`) recorded on the durable
     -- `JobActivated` event: the variable names the worker asked for on the most
     -- recent activation that declared a non-empty set. Preserved across a later
@@ -1331,6 +1340,18 @@ pub struct JobRow {
     /// [`crate::Event::JobCreated`]. `0` for jobs created before the engine
     /// recorded the field. Feeds the `/v2/jobs/statistics/*` `created` counters.
     pub created_at_ms: u64,
+    /// Record-timestamp (epoch ms) of the most recent projected job event — the
+    /// Camunda `lastUpdateTime` (#1344). Set on `JobCreated` and every subsequent
+    /// projected job event (fail, timeout, retries update, timeout update, error,
+    /// completion, cancellation). `None` for rows migrated from a pre-#1344
+    /// database that never saw a fresh job event.
+    pub last_update_ms: Option<u64>,
+    /// Record-timestamp (epoch ms) of the active→terminal `JobCompleted` /
+    /// `JobCanceled` transition — the Camunda `endTime` (#1344). `None` while the
+    /// job is live, and for a job that reached a non-completing terminal state
+    /// (failed / errored). Stamped once; a re-delivery of the terminal event is a
+    /// no-op.
+    pub end_ms: Option<u64>,
     /// The declared read-set (`fetchVariables`) recorded on the most recent
     /// durable [`crate::Event::JobActivated`] for this job that declared a
     /// non-empty set — the variable names the worker was handed. Preserved across
@@ -2676,7 +2697,8 @@ impl ReadStore {
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
                  job_kind, listener_event_type, created_at_ms, read_set, CAST(lease_token AS TEXT), \
-                 business_id, error_message, error_code, has_failed_with_retries_left FROM jobs",
+                 business_id, error_message, error_code, has_failed_with_retries_left, \
+                 last_update_ms, end_ms FROM jobs",
             )
             .expect("prepare jobs");
         let rows = stmt.query_map([], map_job).expect("query jobs");
@@ -3226,6 +3248,8 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         error_message: r.get(17)?,
         error_code: r.get(18)?,
         has_failed_with_retries_left: r.get::<_, i64>(19)? != 0,
+        last_update_ms: r.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u64),
+        end_ms: r.get::<_, Option<i64>>(21)?.map(|v| v.max(0) as u64),
     })
 }
 
@@ -3949,13 +3973,26 @@ fn project_engine_state(
     for job in state.jobs.values() {
         let (def_id, def_key) = instance_def(tx, job.instance_key);
         let (kind_code, event_code) = job_kind_codes(&job.kind);
+        // Timing (#1344): a snapshotted job is still live (terminal jobs are
+        // evicted from engine state), so `end_ms` stays NULL and `last_update_ms`
+        // seeds from the creation instant — the best lower bound available without
+        // the per-event history, matching `creationTime <= lastUpdateTime`. On a
+        // CONFLICT we deliberately do NOT overwrite `created_at_ms` /
+        // `last_update_ms` / `end_ms`: an existing read-model row already carries
+        // the authoritative event-derived values, which a compaction-floor reseed
+        // must not clobber.
+        let last_update = if job.created_at != 0 {
+            job.created_at
+        } else {
+            now_ms
+        };
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
              job_kind, listener_event_type, lease_token, error_message, error_code, \
-             has_failed_with_retries_left, business_id) \
+             has_failed_with_retries_left, created_at_ms, last_update_ms, business_id) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             (SELECT business_id FROM process_instances WHERE key = ?2)) \
+             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2)) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
              worker = excluded.worker, deadline_ms = excluded.deadline_ms, \
              lease_token = excluded.lease_token, error_message = excluded.error_message, \
@@ -3989,6 +4026,8 @@ fn project_engine_state(
                 job.error_message,
                 job.error_code,
                 i64::from(job.has_failed_with_retries_left),
+                job.created_at as i64,
+                last_update as i64,
             ],
         )?;
     }
@@ -4736,14 +4775,24 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
+            // Camunda sets `lastUpdateTime` from the CREATED record timestamp.
+            // Prefer the engine-carried `created_at`; fall back to the batch
+            // observation time for older events that never recorded it (#1344).
+            let last_update = if *created_at != 0 {
+                *created_at
+            } else {
+                now_ms
+            };
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 created_at_ms, business_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, \
+                 created_at_ms, last_update_ms, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, \
                  (SELECT business_id FROM process_instances WHERE key = ?2)) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
+                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms, \
+                 last_update_ms = CASE WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                 ELSE excluded.last_update_ms END",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4755,6 +4804,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     def_id,
                     def_key,
                     *created_at as i64,
+                    last_update as i64,
                 ],
             )?;
         }
@@ -4776,14 +4826,21 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 index: 0,
                 scope: 0,
             });
+            let last_update = if *created_at != 0 {
+                *created_at
+            } else {
+                now_ms
+            };
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms, business_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, \
+                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, \
                  (SELECT business_id FROM process_instances WHERE key = ?2)) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
+                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms, \
+                 last_update_ms = CASE WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                 ELSE excluded.last_update_ms END",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4797,6 +4854,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     kind_code,
                     event_code,
                     *created_at as i64,
+                    last_update as i64,
                 ],
             )?;
         }
@@ -4852,13 +4910,17 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         }
 
         Event::JobLockExpired { job_key, .. } => {
+            // Camunda projects the TIMED_OUT record timestamp onto `lastUpdateTime`
+            // (not `endTime`). Stamped only on the genuine Activated→Created
+            // transition, so a re-delivery is a no-op (#1344).
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL \
+                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL, last_update_ms = ?4 \
                  WHERE key = ?1 AND state = ?3",
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Created),
                     job_state_code(JobState::Activated),
+                    now_ms as i64,
                 ],
             )?;
         }
@@ -4875,8 +4937,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // events serialized before the field existed.
             tx.cexecute(
                 "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
-                 has_failed_with_retries_left = ?3 WHERE key = ?1",
-                params![*job_key as i64, error_message, i64::from(*retries > 0)],
+                 has_failed_with_retries_left = ?3, last_update_ms = ?4 WHERE key = ?1",
+                params![
+                    *job_key as i64,
+                    error_message,
+                    i64::from(*retries > 0),
+                    now_ms as i64
+                ],
             )?;
             if *retries > 0 {
                 // Back to the activatable pool — drop the last activating worker.
@@ -4922,8 +4989,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // (unchanged) retries for ERROR_THROWN as well as FAILED.
             tx.cexecute(
                 "UPDATE jobs SET error_code = ?2, error_message = COALESCE(?3, error_message), \
-                 has_failed_with_retries_left = (retries > 0) WHERE key = ?1",
-                params![*job_key as i64, error_code, error_message],
+                 has_failed_with_retries_left = (retries > 0), last_update_ms = ?4 WHERE key = ?1",
+                params![*job_key as i64, error_code, error_message, now_ms as i64],
             )?;
             // Terminal, incident-bearing transition: set `worker` from the event
             // for attribution (see `JobFailed`); `COALESCE` keeps any existing
@@ -4954,39 +5021,63 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // makes a husked agent round (a COMPLETED job that minted no
             // AgentInstance) attributable via the
             // `AgentInstance.jobKey → completed Job.worker` join.
+            //
+            // Timing (#1344): stamp `lastUpdateTime` and `endTime` from the batch
+            // observation time, but only on the first active→terminal transition
+            // (`end_ms IS NULL`), so a re-delivery is a no-op — mirroring
+            // `ElementCompleted`. The deadline is NOT cleared: Camunda keeps the
+            // last projected deadline on a completed job.
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), deadline_ms = NULL \
+                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
+                 last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
+                 end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
                  WHERE key = ?1",
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Completed),
-                    worker_attribution(worker.as_deref())
+                    worker_attribution(worker.as_deref()),
+                    now_ms as i64,
                 ],
             )?;
         }
 
         Event::JobCanceled { job_key, .. } => {
+            // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
+            // Guard on the first terminal transition so a re-delivery is a no-op;
+            // a job that was already FAILED/ERRORED (no `end_ms`) still gets its
+            // cancellation `endTime` here (#1344).
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
-                params![*job_key as i64, job_state_code(JobState::Canceled)],
+                "UPDATE jobs SET state = ?2, worker = NULL, \
+                 last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
+                 end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
+                 WHERE key = ?1",
+                params![
+                    *job_key as i64,
+                    job_state_code(JobState::Canceled),
+                    now_ms as i64,
+                ],
             )?;
         }
 
         Event::JobRetriesUpdated {
             job_key, retries, ..
         } => {
+            // RETRIES_UPDATED is a projected job event: refresh `lastUpdateTime`
+            // (#1344). It never ends the job, so `end_ms` is untouched.
             tx.cexecute(
-                "UPDATE jobs SET retries = ?2 WHERE key = ?1",
-                params![*job_key as i64, retries],
+                "UPDATE jobs SET retries = ?2, last_update_ms = ?3 WHERE key = ?1",
+                params![*job_key as i64, retries, now_ms as i64],
             )?;
         }
 
         Event::JobTimeoutUpdated {
             job_key, deadline, ..
         } => {
+            // TIMEOUT_UPDATED is a projected job event: refresh `lastUpdateTime`
+            // alongside the extended deadline (#1344).
             tx.cexecute(
-                "UPDATE jobs SET deadline_ms = ?2 WHERE key = ?1",
-                params![*job_key as i64, *deadline as i64],
+                "UPDATE jobs SET deadline_ms = ?2, last_update_ms = ?3 WHERE key = ?1",
+                params![*job_key as i64, *deadline as i64, now_ms as i64],
             )?;
         }
 
@@ -10278,6 +10369,121 @@ mod element_instance_tests {
                 "terminal event carrying no attribution must clear the legacy '' worker to NULL"
             );
         }
+    }
+
+    #[test]
+    fn projects_job_timing_creation_last_update_and_end() {
+        // #1344 — Camunda-parity job timing. A created→completed job satisfies
+        // `creationTime <= lastUpdateTime == endTime`; a re-delivery is a no-op; a
+        // cancelled job carries an `endTime` while a failed or timed-out one does
+        // not; and the deadline is NOT cleared on completion.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key, eik, element_id: &str| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+            job_type: "worker".to_string(),
+            created_at: 123,
+            priority: 0,
+            retries: 3,
+        };
+        let activate = |key, deadline| Event::JobActivated {
+            job_key: key,
+            instance_key: INST,
+            worker: "W".into(),
+            deadline,
+            activated_at: Some(1),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+            durable: false,
+        };
+        let complete = |key| Event::JobCompleted {
+            job_key: key,
+            instance_key: INST,
+            created_at: 0,
+            job_type: String::new(),
+            worker: None,
+        };
+        let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
+
+        store
+            .export(&[&deploy(), &created(), &job(7001, TASK_EI, "t")])
+            .unwrap();
+        let created_row = get(7001);
+        assert_eq!(created_row.created_at_ms, 123);
+        // `lastUpdateTime` seeds from the (deterministic) creation instant; the
+        // job has not ended yet.
+        assert_eq!(created_row.last_update_ms, Some(123));
+        assert_eq!(created_row.end_ms, None);
+
+        // Activate (not projected onto the timing row — Camunda parity) then
+        // complete.
+        store.export(&[&activate(7001, 9999)]).unwrap();
+        assert_eq!(
+            get(7001).last_update_ms,
+            Some(123),
+            "activation must NOT move lastUpdateTime"
+        );
+        store.export(&[&complete(7001)]).unwrap();
+        let completed = get(7001);
+        assert!(completed.end_ms.is_some(), "a completed job has an endTime");
+        assert_eq!(
+            completed.last_update_ms, completed.end_ms,
+            "lastUpdateTime == endTime on completion"
+        );
+        assert!(
+            completed.created_at_ms <= completed.last_update_ms.unwrap(),
+            "creationTime <= lastUpdateTime"
+        );
+        assert_eq!(
+            completed.deadline_ms,
+            Some(9999),
+            "the deadline is kept on completion (Camunda parity)"
+        );
+
+        // Re-delivering the terminal event is a no-op for both timestamps.
+        store.export(&[&complete(7001)]).unwrap();
+        let redelivered = get(7001);
+        assert_eq!(redelivered.end_ms, completed.end_ms);
+        assert_eq!(redelivered.last_update_ms, completed.last_update_ms);
+
+        // A cancelled job gets an endTime.
+        store.export(&[&job(7002, 1002, "t")]).unwrap();
+        store
+            .export(&[&Event::JobCanceled {
+                job_key: 7002,
+                instance_key: INST,
+            }])
+            .unwrap();
+        assert!(get(7002).end_ms.is_some(), "a cancelled job has an endTime");
+
+        // A terminally failed job (retries exhausted) has NO endTime, but its
+        // lastUpdateTime moved off the creation instant.
+        store.export(&[&job(7003, 1003, "t")]).unwrap();
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7003,
+                instance_key: INST,
+                retries: 0,
+                worker: None,
+                error_message: None,
+            }])
+            .unwrap();
+        let failed = get(7003);
+        assert_eq!(failed.end_ms, None, "a failed job has no endTime");
+        assert!(failed.last_update_ms.is_some());
+
+        // A timed-out (lock-expired) job likewise has no endTime.
+        store.export(&[&job(7004, 1004, "t")]).unwrap();
+        store.export(&[&activate(7004, 50)]).unwrap();
+        store
+            .export(&[&Event::JobLockExpired {
+                job_key: 7004,
+                instance_key: INST,
+            }])
+            .unwrap();
+        assert_eq!(get(7004).end_ms, None, "a timed-out job has no endTime");
     }
 
     #[test]
