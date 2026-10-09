@@ -4865,10 +4865,14 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // would then admit the replayed CREATED (equal passes) and re-stamp
             // `lastUpdateTime` off a later lock-expiry/failure update.
             // - `created_at_ms`: keep the stored value unless THIS event carries a
-            //   real (nonzero) `created_at`. A legacy (`created_at == 0`)
+            //   real (nonzero) `created_at` that is STRICTLY NEWER than the floor
+            //   (`?12 > last_event_identity_ms`). A legacy (`created_at == 0`)
             //   re-delivery must NOT re-stamp a fresh batch-time fallback (that
             //   would move `creationTime` every replay); a later real timestamp
-            //   still repairs a stale fallback.
+            //   still repairs a stale fallback. The strict-newer gate also stops an
+            //   OLDER-identity replayed CREATED from regressing a creationTime a
+            //   newer-created repair already advanced (#1346): the repair raises
+            //   the floor, so the replay's identity is at/below it and held.
             // - state/retries/worker/deadline: refreshed only when this CREATED
             //   is strictly newer than the floor (`?12 > last_event_identity_ms`)
             //   AND the row is still live-and-unactivated (`jobs.state = ?6`). The
@@ -4896,7 +4900,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                  retries = CASE WHEN jobs.state = ?6 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
                  worker = CASE WHEN jobs.state = ?6 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
                  deadline_ms = CASE WHEN jobs.state = ?6 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
-                 created_at_ms = CASE WHEN ?12 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 created_at_ms = CASE WHEN ?12 <> 0 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
                  last_update_ms = CASE \
                      WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
                      WHEN {freeze_jobs} THEN jobs.last_update_ms \
@@ -4964,7 +4968,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                  retries = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
                  worker = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
                  deadline_ms = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
-                 created_at_ms = CASE WHEN ?14 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 created_at_ms = CASE WHEN ?14 <> 0 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
                  last_update_ms = CASE \
                      WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
                      WHEN {freeze_jobs} THEN jobs.last_update_ms \
@@ -5034,7 +5038,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                  retries = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
                  worker = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
                  deadline_ms = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
-                 created_at_ms = CASE WHEN ?14 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 created_at_ms = CASE WHEN ?14 <> 0 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
                  last_update_ms = CASE \
                      WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
                      WHEN {freeze_jobs} THEN jobs.last_update_ms \
@@ -5106,6 +5110,23 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // than re-stamping `lastUpdateTime` with the replay batch's fresh
             // `now_ms`. The floor-raise below is unconditional so the floor
             // always reflects the newest activation seen.
+            //
+            // KNOWN LIMITATION (#1346 review): the discriminator is a
+            // millisecond logical instant, not a unique event identity, and the
+            // host clock is not monotonic across commands
+            // (`Engine::apply_command_at` takes `now` as a host reading). A
+            // genuine re-activation that lands in the SAME millisecond as the
+            // failure/lock-expiry that returned the job to `Created` would have
+            // `activated_at == prior_floor` on a non-fresh row and be held (its
+            // worker/deadline/lease left stale). That requires a retryable
+            // failure and its re-activation to be processed within one
+            // wall-clock millisecond — a positive lock timeout makes a same-ms
+            // lock-expiry→re-activation unreachable, and the two are distinct
+            // commands. The correct discriminator is a unique persisted
+            // event/position identity, which `project` is not currently threaded
+            // with; that is a deliberate follow-up, not patched here with a
+            // heuristic that would weaken the replay no-op this gate exists to
+            // guarantee.
             let (prior_floor, fresh): (i64, bool) = tx.query_row(
                 "SELECT COALESCE(last_event_identity_ms, 0), \
                  COALESCE(last_update_ms, created_at_ms) <= created_at_ms \
@@ -12167,6 +12188,71 @@ mod read_surface_tests {
         );
     }
 
+    /// Defect-class guard (#1346 review, "older JobCreated replay regresses
+    /// repaired creationTime"): after a newer-created repair raises both the
+    /// stored `created_at_ms` and the `last_event_identity_ms` floor to 250,
+    /// replaying the ORIGINAL `JobCreated` (identity 100, below the floor) must
+    /// be a no-op for `created_at_ms` — not regress it back to 100. The
+    /// `created_at_ms` arm previously gated only on `? <> 0` (nonzero), so any
+    /// real-timestamped replay overwrote a newer repaired value. The fix gates
+    /// the write on the same strict-newer comparison (`> floor`) that
+    /// `last_update_ms` already uses: a replay's identity is always `<=` the
+    /// floor, only a genuinely newer `created_at` (a repair) re-applies.
+    #[test]
+    fn older_created_replay_does_not_regress_repaired_creation_time() {
+        let store = ReadStore::open(None).unwrap();
+        let created = |at: u64| Event::JobCreated {
+            job_key: 8620,
+            instance_key: 7620,
+            element_instance_key: 7621,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: at,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8620,
+            instance_key: 7620,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8620,
+            instance_key: 7620,
+        };
+
+        // Genuine history: create (t=100) -> activate (t=200) -> lock expiry
+        // returns the job to Created. Then a newer-created repair (250) refreshes
+        // the row and raises the floor to 250.
+        apply_at(&store, &created(100), 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        apply_at(&store, &created(250), 7_000);
+        let repaired = job_row(&store, 8620);
+        assert_eq!(repaired.created_at_ms, 250);
+        assert_eq!(repaired.last_event_identity_ms, 250);
+
+        // Overlapping-prefix replay of the ORIGINAL created(100) (identity 100,
+        // below the 250 floor) must NOT regress creationTime back to 100.
+        apply_at(&store, &created(100), 9_000);
+        let after = job_row(&store, 8620);
+        assert_eq!(
+            after.created_at_ms, 250,
+            "an older-identity replayed CREATED must not regress a repaired creationTime"
+        );
+        assert_eq!(
+            after.last_update_ms,
+            Some(250),
+            "the repaired lastUpdateTime must likewise hold"
+        );
+        assert_eq!(after.last_event_identity_ms, 250);
+    }
+
     /// Defect-class guard (#1346 review, "replay of lock expiry moves
     /// `lastUpdateTime`"): a whole-prefix replay `[JobCreated, JobActivated,
     /// JobLockExpired]` over a job that genuinely returned to `Created` must be a
@@ -12264,7 +12350,10 @@ mod read_surface_tests {
         apply_at(&store, &created, 1_000);
         apply_at(&store, &activated(200, "w1"), 1_500);
         apply_at(&store, &lock_expired, 2_000);
-        assert_eq!(job_row(&store, 8610).state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(
+            job_row(&store, 8610).state,
+            nanobpmn_engine_core::JobState::Created
+        );
         // Genuine re-activation at a strictly-later instant (300 > the 200 floor).
         apply_at(&store, &activated(300, "w2"), 2_500);
         let row = job_row(&store, 8610);

@@ -96,15 +96,21 @@ struct Spec {
 
 /// Loads `spec-patches/patches.yaml`, grouping each action by its `file` so a
 /// file's overlays can be applied the moment it is first read. Missing file =>
-/// no patches (the guard still works against the raw spec).
+/// no patches (the guard still works against the raw spec). An EMPTY document
+/// parses to `Value::Null`, which `preprocess-spec.py::_load_patches` treats as
+/// no patches (`if loaded is None: return {}`) — mirror that, or the guard would
+/// reject a patch file the real preprocessor accepts (a drift surface).
 fn load_patches(root: &Path) -> HashMap<String, Vec<Value>> {
     let path = root.join("spec-patches/patches.yaml");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return HashMap::new();
     };
-    let Value::Sequence(entries) =
-        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
-    else {
+    let parsed: Value =
+        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    if parsed.is_null() {
+        return HashMap::new();
+    }
+    let Value::Sequence(entries) = parsed else {
         panic!("{}: expected a top-level list of patches", path.display());
     };
     let mut by_file: HashMap<String, Vec<Value>> = HashMap::new();
@@ -701,6 +707,36 @@ fn load_patches_fails_loud_on_an_empty_file() {
     assert!(
         message.contains("missing a string 'file'"),
         "the panic must reject the empty file, got: {message}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Defect-class guard (#1346 review, "empty YAML document causes guard panic"):
+/// an EMPTY `patches.yaml` parses to `Value::Null`, which
+/// `preprocess-spec.py::_load_patches` treats as no patches (`if loaded is None:
+/// return {}`). The guard must mirror that — return an empty map rather than
+/// panic on the non-sequence — or it would reject a patch file the real
+/// preprocessor accepts (a drift surface between the guarded spec and the served
+/// one).
+#[test]
+fn load_patches_treats_an_empty_document_as_no_patches() {
+    let dir = std::env::temp_dir().join(format!(
+        "request-field-guard-empty-doc-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("spec-patches")).unwrap();
+    // An empty document (only a comment / whitespace) parses to Value::Null.
+    std::fs::write(dir.join("spec-patches/patches.yaml"), "# no patches yet\n").unwrap();
+
+    let patches = load_patches(&dir);
+    assert!(
+        patches.is_empty(),
+        "an empty patches.yaml must yield no patches, got: {patches:?}"
     );
 
     std::fs::remove_dir_all(&dir).ok();
