@@ -4925,10 +4925,14 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // transition, so a re-delivery is a no-op (#1344). The `end_ms`-guard
             // is redundant with the `state = Activated` guard (a terminal job is
             // never Activated) but is kept for class-uniformity with the other
-            // subsequent-event projections.
+            // subsequent-event projections; the `state IN (2, 3)` arm is likewise
+            // class-uniform (a Failed/Errored job is never Activated either).
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL, \
-                 last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?4 END \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN state IN (2, 3) THEN last_update_ms \
+                     ELSE ?4 END \
                  WHERE key = ?1 AND state = ?3",
                 params![
                     *job_key as i64,
@@ -4952,12 +4956,18 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // frozen once the job is terminal (#1344): a re-delivered / replayed
             // FAILED for a job that has already ended must NOT push
             // `lastUpdateTime` past `endTime` (the `lastUpdateTime == endTime`
-            // invariant + the "re-delivery doesn't move the times" contract) —
-            // same `end_ms`-guard the terminal transitions and `JobCreated` use.
+            // invariant + the "re-delivery doesn't move the times" contract).
+            // Frozen at `endTime` when it is set (Completed/Canceled), and held
+            // at its current value once the job is in a terminal state that has
+            // NO `endTime` (Failed/Errored) — a re-delivered FAILED must not move
+            // `lastUpdateTime` off the first terminal transition.
             tx.cexecute(
                 "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
                  has_failed_with_retries_left = ?3, \
-                 last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?4 END \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN state IN (2, 3) THEN last_update_ms \
+                     ELSE ?4 END \
                  WHERE key = ?1",
                 params![
                     *job_key as i64,
@@ -5008,10 +5018,21 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // Zeebe parity (#1327): the thrown code and message land on the job;
             // the exporter keys `jobFailedWithRetriesLeft` off the record's
             // (unchanged) retries for ERROR_THROWN as well as FAILED.
+            // `lastUpdateTime` freeze (#1344): ERROR_THROWN transitions the job to
+            // terminal `Errored` but deliberately leaves `end_ms` NULL (Camunda
+            // stamps no `endTime` for an errored job), so the `end_ms`-guard alone
+            // never engages here and a re-delivered/replayed ERROR_THROWN would
+            // stamp a fresh `now_ms` every time. Freeze at `endTime` when set
+            // (Completed/Canceled), and hold the current value once the job is in
+            // a terminal `endTime`-less state (Failed/Errored) — the first
+            // transition still stamps `now_ms`, a re-delivery is then a no-op.
             tx.cexecute(
                 "UPDATE jobs SET error_code = ?2, error_message = COALESCE(?3, error_message), \
                  has_failed_with_retries_left = (retries > 0), \
-                 last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?4 END \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN state IN (2, 3) THEN last_update_ms \
+                     ELSE ?4 END \
                  WHERE key = ?1",
                 params![*job_key as i64, error_code, error_message, now_ms as i64],
             )?;
@@ -5088,10 +5109,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // RETRIES_UPDATED is a projected job event: refresh `lastUpdateTime`
             // (#1344). It never ends the job, so `end_ms` is untouched; the
             // `end_ms`-guard freezes `lastUpdateTime` at `endTime` should this
-            // arrive (via re-delivery/replay) for an already-terminal job.
+            // arrive (via re-delivery/replay) for an already-terminal job, and the
+            // `state IN (2, 3)` arm holds it for a terminal job with NO `endTime`
+            // (Failed/Errored) — a replayed RETRIES_UPDATED must not move it.
             tx.cexecute(
                 "UPDATE jobs SET retries = ?2, \
-                 last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?3 END \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN state IN (2, 3) THEN last_update_ms \
+                     ELSE ?3 END \
                  WHERE key = ?1",
                 params![*job_key as i64, retries, now_ms as i64],
             )?;
@@ -5102,11 +5128,16 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         } => {
             // TIMEOUT_UPDATED is a projected job event: refresh `lastUpdateTime`
             // alongside the extended deadline (#1344). The `end_ms`-guard freezes
-            // `lastUpdateTime` at `endTime` for an already-terminal job, so a
-            // re-delivery/replay cannot push it past `endTime`.
+            // `lastUpdateTime` at `endTime` for an already-terminal job, and the
+            // `state IN (2, 3)` arm holds it for a terminal job with NO `endTime`
+            // (Failed/Errored), so a re-delivery/replay cannot push it past the
+            // terminal transition.
             tx.cexecute(
                 "UPDATE jobs SET deadline_ms = ?2, \
-                 last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?3 END \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN state IN (2, 3) THEN last_update_ms \
+                     ELSE ?3 END \
                  WHERE key = ?1",
                 params![*job_key as i64, *deadline as i64, now_ms as i64],
             )?;
@@ -10628,6 +10659,120 @@ mod element_instance_tests {
             Some(canceled_end),
             "lastUpdateTime stays frozen at endTime for a cancelled job"
         );
+    }
+
+    #[test]
+    fn job_timing_last_update_frozen_for_terminal_states_without_end_time() {
+        // #1344 regression — a FAILED (retries exhausted) or ERROR_THROWN job is
+        // TERMINAL but deliberately keeps `end_ms` NULL (Camunda stamps no
+        // `endTime` for a failed/errored job). The `end_ms`-guard alone therefore
+        // never engages for these states, so re-delivering the SAME terminal event
+        // (the overlapping-prefix replay `export` promises is idempotent) would
+        // stamp a fresh `now_ms` onto `lastUpdateTime` every time. The freeze must
+        // ALSO hold the value once the job sits in a terminal `endTime`-less state
+        // (Failed/Errored), while still stamping the FIRST transition.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key, eik, element_id: &str| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+            job_type: "worker".to_string(),
+            created_at: 123,
+            priority: 0,
+            retries: 3,
+        };
+        let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
+
+        // Terminal FAILED (retries exhausted): first delivery stamps, re-delivery
+        // must NOT move `lastUpdateTime`.
+        store
+            .export(&[&deploy(), &created(), &job(8201, TASK_EI, "t")])
+            .unwrap();
+        let fail = |key| Event::JobFailed {
+            job_key: key,
+            instance_key: INST,
+            retries: 0,
+            worker: None,
+            error_message: Some("boom".into()),
+        };
+        store.export(&[&fail(8201)]).unwrap();
+        let failed = get(8201);
+        assert_eq!(failed.end_ms, None, "a failed job has no endTime");
+        let failed_lu = failed
+            .last_update_ms
+            .expect("a failed job has a lastUpdateTime");
+        assert!(
+            failed_lu > 123,
+            "the first terminal transition stamps lastUpdateTime"
+        );
+        store.export(&[&fail(8201)]).unwrap();
+        assert_eq!(
+            get(8201).last_update_ms,
+            Some(failed_lu),
+            "re-delivering FAILED must not move lastUpdateTime (no endTime to freeze at)"
+        );
+
+        // Terminal ERROR_THROWN: same contract — first stamps, re-delivery frozen.
+        store.export(&[&job(8202, 1002, "t")]).unwrap();
+        let throw = |key| Event::JobErrorThrown {
+            job_key: key,
+            instance_key: INST,
+            error_code: "E".into(),
+            worker: None,
+            error_message: None,
+        };
+        store.export(&[&throw(8202)]).unwrap();
+        let errored = get(8202);
+        assert_eq!(errored.end_ms, None, "an errored job has no endTime");
+        let errored_lu = errored
+            .last_update_ms
+            .expect("an errored job has a lastUpdateTime");
+        store.export(&[&throw(8202)]).unwrap();
+        assert_eq!(
+            get(8202).last_update_ms,
+            Some(errored_lu),
+            "re-delivering ERROR_THROWN must not move lastUpdateTime"
+        );
+
+        // A terminal-state job must ALSO be frozen against EVERY stray
+        // non-terminal event replayed after it (FAILED/ERROR_THROWN/
+        // RETRIES_UPDATED/TIMEOUT_UPDATED) — none may move `lastUpdateTime`.
+        for stray in [
+            Event::JobFailed {
+                job_key: 8202,
+                instance_key: INST,
+                retries: 0,
+                worker: None,
+                error_message: Some("stray".into()),
+            },
+            Event::JobErrorThrown {
+                job_key: 8202,
+                instance_key: INST,
+                error_code: "E2".into(),
+                worker: None,
+                error_message: None,
+            },
+            Event::JobRetriesUpdated {
+                job_key: 8202,
+                instance_key: INST,
+                retries: 9,
+                operation_reference: None,
+            },
+            Event::JobTimeoutUpdated {
+                job_key: 8202,
+                instance_key: INST,
+                deadline: 77,
+                operation_reference: None,
+            },
+        ] {
+            store.export(&[&stray]).unwrap();
+            assert_eq!(
+                get(8202).last_update_ms,
+                Some(errored_lu),
+                "a stray non-terminal event must not move an errored job's lastUpdateTime"
+            );
+        }
     }
 
     #[test]

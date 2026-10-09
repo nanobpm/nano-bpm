@@ -12192,8 +12192,13 @@ impl ServerImpl {
                             job.last_update_ms.map(|v| v as i64),
                         )
                         && query::match_date_time_ms(&f.end_time, job.end_ms.map(|v| v as i64))
+                        // `deadline` is the one NULLABLE job filter (#1344): an
+                        // explicit `{"deadline": null}` is a real filter value that
+                        // selects jobs with NO deadline, distinct from omitting the
+                        // filter entirely (which matches everything).
                         && match &f.deadline {
-                            None | Some(types::Nullable::Null) => true,
+                            None => true,
+                            Some(types::Nullable::Null) => job.deadline_ms.is_none(),
                             Some(types::Nullable::Present(d)) => query::match_date_time_ms(
                                 &Some(d.clone()),
                                 job.deadline_ms.map(|v| v as i64),
@@ -37322,6 +37327,77 @@ mod clustered_startup_tests {
                 .iter()
                 .all(|j| j.job_key.0 != job_key),
             "a completed job must NOT match endTime: {{$exists: false}}"
+        );
+    }
+
+    /// #1344 — `deadline` is the one NULLABLE job filter: an explicit
+    /// `{"deadline": null}` must select jobs with NO deadline, NOT be treated as
+    /// an omitted filter (which would return every job, including ones carrying a
+    /// deadline). A freshly created (not yet activated) job has no deadline; an
+    /// activated one does.
+    #[tokio::test]
+    async fn job_search_null_deadline_filter_selects_jobs_without_a_deadline() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await.to_string();
+
+        use apis::job::SearchJobsResponse as SResp;
+        let has_job = |filter: models::JobFilter| {
+            let server = &server;
+            let job_key = job_key.clone();
+            async move {
+                let mut q = models::JobSearchQuery::new();
+                q.filter = Some(filter);
+                let SResp::Status200_TheJobSearchResult(r) = server
+                    .search_jobs_impl(&Some(q))
+                    .await
+                    .expect("search runs")
+                else {
+                    panic!("expected 200 from job search");
+                };
+                r.items.iter().any(|j| j.job_key.0 == job_key)
+            }
+        };
+
+        // Before activation the job has no deadline: `deadline: null` matches it.
+        let mut null_deadline = models::JobFilter::new();
+        null_deadline.deadline = Some(types::Nullable::Null);
+        assert!(
+            has_job(null_deadline).await,
+            "a job with no deadline must match an explicit deadline:null filter"
+        );
+
+        // Activate with a deadline; now `deadline: null` must NOT match it.
+        // Activate WITH A LEASE so the activation is durable (`JobActivated` is
+        // journaled + exported, stamping the deadline onto the read-model row);
+        // the demo job otherwise takes the leader-local soft path, which never
+        // exports `JobActivated` and leaves the read-model deadline NULL.
+        server
+            .activate_for_stream_with_lease("demo-work", "worker-d", 10, 60_000, None, true)
+            .await;
+        let mut null_deadline_after = models::JobFilter::new();
+        null_deadline_after.deadline = Some(types::Nullable::Null);
+        // Poll until the activation (and its deadline) is projected.
+        let mut still_matches = true;
+        for _ in 0..200 {
+            still_matches = has_job(null_deadline_after.clone()).await;
+            if !still_matches {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !still_matches,
+            "an activated job WITH a deadline must NOT match deadline:null"
+        );
+
+        // An omitted deadline filter still matches regardless.
+        assert!(
+            has_job(models::JobFilter::new()).await,
+            "omitting the deadline filter must match a job regardless of its deadline"
         );
     }
 

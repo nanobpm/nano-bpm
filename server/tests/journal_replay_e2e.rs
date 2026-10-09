@@ -1849,7 +1849,34 @@ fn job_search_surfaces_creation_last_update_and_end_times() {
         "a completed job must surface an endTime: {item}"
     );
 
+    // Durability (#1344): the read model is a file-backed projection beside the
+    // journal, so the projected timestamps must survive a restart over the SAME
+    // journal/read-model — a regression in the persistence/recovery wiring must
+    // not pass CI. Capture the values, reboot, and re-assert them unchanged.
+    let creation = item["creationTime"].as_str().unwrap().to_string();
+    let last_update = item["lastUpdateTime"].as_str().unwrap().to_string();
+    let end = item["endTime"].as_str().unwrap().to_string();
     server.shutdown();
+
+    let restarted = boot_replicated_activation(&scratch.journal_path());
+    let recovered = searched_job_item(&restarted, &job_key);
+    assert_eq!(
+        recovered["creationTime"].as_str(),
+        Some(creation.as_str()),
+        "creationTime must survive a restart unchanged: {recovered}"
+    );
+    assert_eq!(
+        recovered["lastUpdateTime"].as_str(),
+        Some(last_update.as_str()),
+        "lastUpdateTime must survive a restart unchanged: {recovered}"
+    );
+    assert_eq!(
+        recovered["endTime"].as_str(),
+        Some(end.as_str()),
+        "endTime must survive a restart unchanged: {recovered}"
+    );
+
+    restarted.shutdown();
 }
 
 #[test]
