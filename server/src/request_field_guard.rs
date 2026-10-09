@@ -173,12 +173,24 @@ fn apply_patch(doc: &mut Value, patch: &Value) {
         .unwrap_or_else(|| panic!("target parent of '{target}' is not a mapping"));
 
     if let Some(addition) = patch.get("merge") {
+        // Mirror `preprocess-spec.py::_apply_patch` exactly: a non-mapping
+        // `merge` payload is rejected, and an existing non-mapping target is
+        // rejected (only an absent/null target is created). Silently returning
+        // from `deep_merge` in either case would let this guard derive the
+        // unpatched request surface and pass even though the real generator
+        // fails — a drift surface between the guarded spec and the served one.
+        if !addition.is_mapping() {
+            panic!("'merge' for target '{target}' must be a mapping");
+        }
         if !parent.contains_key(last.as_str())
             || parent.get(last.as_str()).is_some_and(Value::is_null)
         {
             parent.insert(Value::String(last.clone()), Value::Mapping(Mapping::new()));
         }
         let node = parent.get_mut(last.as_str()).expect("merge node ensured");
+        if !node.is_mapping() {
+            panic!("cannot merge into non-mapping at target '{target}'");
+        }
         deep_merge(node, addition);
     } else if let Some(items) = patch.get("append").and_then(Value::as_sequence) {
         if !parent.contains_key(last.as_str()) {
@@ -507,4 +519,53 @@ fn apply_patch_remove_removes_present_items() {
         .collect::<Option<Vec<_>>>()
         .unwrap();
     assert_eq!(remaining, ["keep"], "only the requested item is removed");
+}
+
+/// Defect-class guard (#1346 review): the guard's `merge` must mirror
+/// `preprocess-spec.py::_apply_patch` and FAIL LOUD on a non-mapping `merge`
+/// payload. Silently returning (the pre-fix `deep_merge` behaviour) would let a
+/// malformed patch pass this guard even though the real generator rejects it —
+/// the same drift surface as a stale `remove`.
+#[test]
+fn apply_patch_merge_fails_loud_on_a_non_mapping_payload() {
+    let mut doc = serde_yaml::from_str::<Value>("properties: {}\n").unwrap();
+    let patch =
+        serde_yaml::from_str::<Value>("target: properties\nmerge:\n  - not-a-mapping\n").unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_patch(&mut doc, &patch);
+    }));
+    let payload = outcome.expect_err("a non-mapping merge payload must panic, not be skipped");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("must be a mapping") && message.contains("properties"),
+        "the panic must name the target, got: {message}"
+    );
+}
+
+/// The sibling failure mode: an EXISTING non-mapping target (a scalar/sequence
+/// already at the target key) must also fail loud, not be silently skipped by
+/// `deep_merge`. Only an absent/null target is created fresh (mirroring
+/// `preprocess-spec.py`).
+#[test]
+fn apply_patch_merge_fails_loud_on_a_non_mapping_target() {
+    let mut doc = serde_yaml::from_str::<Value>("properties: not-a-mapping\n").unwrap();
+    let patch =
+        serde_yaml::from_str::<Value>("target: properties\nmerge:\n  new-field: {}\n").unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_patch(&mut doc, &patch);
+    }));
+    let payload = outcome.expect_err("merging into a non-mapping target must panic");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("cannot merge into non-mapping") && message.contains("properties"),
+        "the panic must name the target, got: {message}"
+    );
 }

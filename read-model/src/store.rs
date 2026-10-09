@@ -4927,6 +4927,68 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        Event::TaskListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            job_type,
+            event_type,
+            retries,
+            created_at,
+            ..
+        } => {
+            let (def_id, def_key) = instance_def(tx, *instance_key);
+            let (kind_code, event_code) = job_kind_codes(&JobKind::TaskListener {
+                event_type: *event_type,
+                index: 0,
+                user_task_key: 0,
+            });
+            let last_update = if *created_at != 0 {
+                *created_at
+            } else {
+                now_ms
+            };
+            let creation_ms = last_update;
+            // See `JobCreated`: the ON CONFLICT path is a replay no-op that must
+            // not move `created_at_ms`/`last_update_ms` for a legacy re-delivery
+            // nor regress an advanced/terminal row (#1344).
+            tx.cexecute(
+                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, \
+                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
+                 ON CONFLICT(key) DO UPDATE SET \
+                 state = CASE WHEN jobs.state = ?6 THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.deadline_ms END, \
+                 created_at_ms = CASE WHEN ?14 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 last_update_ms = CASE \
+                     WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                     WHEN jobs.state <> ?6 THEN jobs.last_update_ms \
+                     WHEN ?14 <> 0 THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END",
+                params![
+                    *job_key as i64,
+                    *instance_key as i64,
+                    *element_instance_key as i64,
+                    element_id,
+                    job_type,
+                    job_state_code(JobState::Created),
+                    *retries,
+                    def_id,
+                    def_key,
+                    kind_code,
+                    event_code,
+                    creation_ms as i64,
+                    last_update as i64,
+                    *created_at as i64,
+                ],
+            )?;
+        }
+
         Event::JobActivated {
             job_key,
             worker,
@@ -6045,7 +6107,6 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
         | Event::StartInstanceDispatched { .. }
-        | Event::TaskListenerJobCreated { .. }
         | Event::UserTaskCorrectionsApplied { .. }
         | Event::UserTaskTransitionDeferred { .. }
         | Event::UserTaskTransitionResolved { .. }
@@ -9241,7 +9302,7 @@ mod decision_deletion_tests {
 mod element_instance_tests {
     use std::collections::HashMap;
 
-    use nanobpmn_engine_core::{Event, JobState, Key, ProcessBuilder};
+    use nanobpmn_engine_core::{Event, JobKind, JobState, Key, ProcessBuilder};
 
     use super::{ElementInstanceState, ReadStore};
 
@@ -10932,6 +10993,63 @@ mod element_instance_tests {
             row.last_update_ms,
             "creationTime == lastUpdateTime for a legacy job"
         );
+    }
+
+    /// Defect-class guard (#1344 review): every job-creation variant the engine
+    /// emits must land a row in the durable jobs table — a creation event routed
+    /// to the projector's no-op arm leaves the job invisible to the jobs read
+    /// surface (and to every subsequent timing projection). `JobCreated` and
+    /// `ExecutionListenerJobCreated` were covered; `TaskListenerJobCreated`
+    /// (ADR 0037 §6) was silently dropped. This pins the task-listener variant:
+    /// creation projects the row with `JobKind::TaskListener` and seeds
+    /// `creationTime`/`lastUpdateTime` from the engine-carried `created_at`,
+    /// exactly like its siblings.
+    #[test]
+    fn task_listener_job_created_projects_into_the_jobs_table() {
+        use nanobpmn_engine_core::TaskListenerEventType;
+        let store = ReadStore::open(None).unwrap();
+        let created = || Event::TaskListenerJobCreated {
+            job_key: 8151,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "ut".to_string(),
+            user_task_key: 8150,
+            job_type: "task-listener".to_string(),
+            event_type: TaskListenerEventType::Completing,
+            listener_index: 0,
+            created_at: 1_234,
+            retries: 3,
+        };
+        store.export(&[&deploy(), &created(), &created()]).unwrap();
+
+        let row = store
+            .jobs()
+            .into_iter()
+            .find(|j| j.key == 8151)
+            .expect("a task-listener job must be projected into the jobs table");
+        assert_eq!(row.state, JobState::Created);
+        assert_eq!(
+            row.kind,
+            JobKind::TaskListener {
+                event_type: TaskListenerEventType::Completing,
+                index: 0,
+                user_task_key: 0,
+            },
+            "the kind discriminant + listener event type survive the projection"
+        );
+        assert_eq!(row.created_at_ms, 1_234);
+        assert_eq!(
+            row.last_update_ms,
+            Some(1_234),
+            "creationTime == lastUpdateTime at creation (#1344)"
+        );
+
+        // The ON CONFLICT replay no-op is shared with the sibling creation
+        // variants: a re-delivery must not move either timestamp.
+        store.export(&[&created()]).unwrap();
+        let again = store.jobs().into_iter().find(|j| j.key == 8151).unwrap();
+        assert_eq!(again.created_at_ms, 1_234);
+        assert_eq!(again.last_update_ms, Some(1_234));
     }
 
     #[test]
