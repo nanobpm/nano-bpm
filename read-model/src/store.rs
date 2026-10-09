@@ -5174,21 +5174,32 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             job_key, retries, ..
         } => {
             // RETRIES_UPDATED is a projected job event: refresh `lastUpdateTime`
-            // (#1344). It never ends the job, so `end_ms` is untouched; the
-            // `end_ms`-guard freezes `lastUpdateTime` at `endTime` should this
-            // arrive (via re-delivery/replay) for an already-terminal job, and the
-            // `state IN (2, 3)` arm holds it for a terminal job with NO `endTime`
-            // (Failed/Errored) — a replayed RETRIES_UPDATED must not move it.
+            // (#1344). It never ends the job, so `end_ms` is untouched.
+            //
+            // Unlike `JobTimeoutUpdated` (which the engine gates to an Activated
+            // job), the engine *permits* a retries update on a parked
+            // `Failed`/`Errored` job — `update_job_properties` only rejects
+            // Completed/Canceled, and incident resolution explicitly requires
+            // topping up retries on the parked job first. So a RETRIES_UPDATED
+            // observed in a terminal `endTime`-less state is NOT necessarily a
+            // re-delivery: it can be a genuine, newer update. Camunda parity
+            // (#1344: `lastUpdateTime` = the record timestamp of *every*
+            // projected job event) therefore requires stamping `now_ms` here even
+            // for a Failed/Errored job — the `state IN (2, 3)` freeze arm used by
+            // the genuinely-terminal-event projections must NOT apply. A
+            // re-delivered RETRIES_UPDATED re-stamps `now_ms` too, matching
+            // Camunda's last-writer-wins exporter (which applies every record);
+            // in practice batch times are monotonic, so this never moves
+            // `lastUpdateTime` backwards.
+            //
+            // The `end_ms`-guard is kept: a Completed/Canceled job can never
+            // legitimately receive a retries update (the engine rejects it), so
+            // one observed there is always a replay, and `lastUpdateTime` stays
+            // frozen at `endTime`.
             tx.cexecute(
-                &format!(
-                    "UPDATE jobs SET retries = ?2, \
-                 last_update_ms = CASE \
-                     WHEN end_ms IS NOT NULL THEN end_ms \
-                     WHEN {freeze} THEN last_update_ms \
-                     ELSE ?3 END \
+                "UPDATE jobs SET retries = ?2, \
+                 last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?3 END \
                  WHERE key = ?1",
-                    freeze = endtimeless_terminal_job_predicate("state"),
-                ),
                 params![*job_key as i64, retries, now_ms as i64],
             )?;
         }
@@ -10847,8 +10858,12 @@ mod element_instance_tests {
         );
 
         // A terminal-state job must ALSO be frozen against EVERY stray
-        // non-terminal event replayed after it (FAILED/ERROR_THROWN/
-        // RETRIES_UPDATED/TIMEOUT_UPDATED) — none may move `lastUpdateTime`.
+        // genuinely-terminal event replayed after it (a re-delivered FAILED /
+        // ERROR_THROWN / TIMEOUT_UPDATED) — none may move `lastUpdateTime`.
+        // `RETRIES_UPDATED` is deliberately NOT in this set: the engine permits a
+        // genuine retries top-up on a parked Failed/Errored job (incident
+        // recovery), so it is not always a re-delivery — see the dedicated test
+        // `retries_update_on_a_parked_terminal_job_stamps_last_update`.
         for stray in [
             Event::JobFailed {
                 job_key: 8202,
@@ -10864,12 +10879,6 @@ mod element_instance_tests {
                 worker: None,
                 error_message: None,
             },
-            Event::JobRetriesUpdated {
-                job_key: 8202,
-                instance_key: INST,
-                retries: 9,
-                operation_reference: None,
-            },
             Event::JobTimeoutUpdated {
                 job_key: 8202,
                 instance_key: INST,
@@ -10881,7 +10890,7 @@ mod element_instance_tests {
             assert_eq!(
                 get(8202).last_update_ms,
                 Some(errored_lu),
-                "a stray non-terminal event must not move an errored job's lastUpdateTime"
+                "a stray terminal-event re-delivery must not move an errored job's lastUpdateTime"
             );
         }
     }
@@ -11673,6 +11682,61 @@ mod read_surface_tests {
                 "whole-prefix replay must leave lastUpdateTime frozen"
             );
         }
+    }
+
+    /// #1344 review regression — a GENUINE `RETRIES_UPDATED` on a parked
+    /// `Failed`/`Errored` job is a real, newer event (the engine's
+    /// `update_job_properties` permits it and incident resolution requires
+    /// topping up retries before resolving), NOT a re-delivery. Camunda parity
+    /// (`lastUpdateTime` = the record timestamp of every projected job event)
+    /// requires it to stamp `lastUpdateTime`; the terminal freeze must not pin it
+    /// to the earlier failure/error instant. Uses explicit batch times via
+    /// `apply_at` so the move is deterministic.
+    #[test]
+    fn retries_update_on_a_parked_terminal_job_stamps_last_update() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8500,
+            instance_key: 7500,
+            element_instance_key: 7501,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 123,
+            priority: 0,
+            retries: 1,
+        };
+        let fail = Event::JobFailed {
+            job_key: 8500,
+            instance_key: 7500,
+            retries: 0,
+            worker: None,
+            error_message: Some("boom".into()),
+        };
+
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &fail, 2_000);
+        let parked = job_row(&store, 8500);
+        assert_eq!(parked.state, nanobpmn_engine_core::JobState::Failed);
+        assert_eq!(parked.end_ms, None, "a failed job has no endTime");
+        assert_eq!(parked.last_update_ms, Some(2_000));
+
+        // The incident-recovery top-up: a genuine retries update on the parked
+        // job. It must refresh `retries` AND stamp `lastUpdateTime` to the new
+        // batch time — not leave it frozen at the failure instant.
+        let top_up = Event::JobRetriesUpdated {
+            job_key: 8500,
+            instance_key: 7500,
+            retries: 3,
+            operation_reference: None,
+        };
+        apply_at(&store, &top_up, 3_500);
+        let updated = job_row(&store, 8500);
+        assert_eq!(updated.retries, 3, "the retries top-up lands");
+        assert_eq!(
+            updated.last_update_ms,
+            Some(3_500),
+            "a genuine retries update on a parked terminal job stamps lastUpdateTime (Camunda parity)"
+        );
     }
 
     /// Defect-class guard: `created_at_ms` is persisted as a signed `INTEGER`,

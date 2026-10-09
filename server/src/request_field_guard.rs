@@ -199,9 +199,14 @@ fn apply_patch(doc: &mut Value, patch: &Value) {
             .and_then(Value::as_sequence_mut)
             .unwrap_or_else(|| panic!("cannot remove from non-list at target '{target}'"));
         for item in items {
-            if let Some(pos) = node.iter().position(|e| e == item) {
-                node.remove(pos);
-            }
+            // Fail loud on a stale removal, mirroring `preprocess-spec.py`: after
+            // an upstream re-sync a `remove` that no longer matches is a stale
+            // patch that must be revisited, not silently ignored — otherwise this
+            // guard would pass a patch the real generator rejects.
+            let pos = node.iter().position(|e| e == item).unwrap_or_else(|| {
+                panic!("stale patch: {item:?} not present at target '{target}'")
+            });
+            node.remove(pos);
         }
     } else {
         panic!("patch for target '{target}' has none of 'merge', 'append', 'remove'");
@@ -457,4 +462,49 @@ fn request_fields_of_served_operations_are_all_triaged() {
             );
         }
     }
+}
+
+/// Defect-class guard (#1346 review): the guard's `remove` must mirror
+/// `preprocess-spec.py::_apply_patch` and FAIL LOUD on a stale removal (an item
+/// that is no longer present at the target). A silent skip would let a stale
+/// patch pass this guard even though the real generator rejects it — a drift
+/// surface between the guarded spec and the served one.
+#[test]
+fn apply_patch_remove_fails_loud_on_a_stale_removal() {
+    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
+    let patch =
+        serde_yaml::from_str::<Value>("target: required\nremove:\n  - already-gone-upstream\n")
+            .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_patch(&mut doc, &patch);
+    }));
+    let payload = outcome.expect_err("a stale removal must panic, not be silently ignored");
+    let message = payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        message.contains("stale patch") && message.contains("already-gone-upstream"),
+        "the panic must name the stale item and target, got: {message}"
+    );
+}
+
+/// The happy-path counterpart: a `remove` whose items ARE present applies
+/// cleanly (and stays a no-panic), so tightening stale-removal handling does not
+/// break the two live `remove` patches in `spec-patches/patches.yaml`.
+#[test]
+fn apply_patch_remove_removes_present_items() {
+    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n  - drop\n").unwrap();
+    let patch = serde_yaml::from_str::<Value>("target: required\nremove:\n  - drop\n").unwrap();
+    apply_patch(&mut doc, &patch);
+    let remaining: Vec<&str> = doc
+        .get("required")
+        .and_then(Value::as_sequence)
+        .unwrap()
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .unwrap();
+    assert_eq!(remaining, ["keep"], "only the requested item is removed");
 }
