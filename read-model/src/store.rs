@@ -5204,6 +5204,18 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // at its current value once the job is in a terminal state that has
             // NO `endTime` (Failed/Errored) — a re-delivered FAILED must not move
             // `lastUpdateTime` off the first terminal transition.
+            //
+            // Retryable path (#1346): a retryable FAILED (retries > 0) is a
+            // genuine Activated→Created transition — the direct sibling of
+            // `JobLockExpired`. Stamp `lastUpdateTime` only on that genuine
+            // transition (`state = Activated`), so a whole-prefix replay that the
+            // `JobActivated` gate holds in `Created` leaves the stamp a no-op
+            // rather than re-stamping `lastUpdateTime` off the genuine failure
+            // instant. This is NOT a last-writer-wins admin op like
+            // `JobRetriesUpdated`: a re-delivered FAILED carries no newer
+            // information. The terminal path (retries == 0) is unaffected — its
+            // `end_ms`/terminal freeze arms already hold the re-delivery.
+            let retryable = *retries > 0;
             tx.cexecute(
                 &format!(
                     "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
@@ -5211,6 +5223,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                  last_update_ms = CASE \
                      WHEN end_ms IS NOT NULL THEN end_ms \
                      WHEN {freeze} THEN last_update_ms \
+                     WHEN ?5 AND state <> ?6 THEN last_update_ms \
                      ELSE ?4 END \
                  WHERE key = ?1",
                     freeze = endtimeless_terminal_job_predicate("state"),
@@ -5219,10 +5232,12 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     *job_key as i64,
                     error_message,
                     i64::from(*retries > 0),
-                    now_ms as i64
+                    now_ms as i64,
+                    i64::from(retryable),
+                    job_state_code(JobState::Activated),
                 ],
             )?;
-            if *retries > 0 {
+            if retryable {
                 // Back to the activatable pool — drop the last activating worker.
                 tx.cexecute(
                     "UPDATE jobs SET state = ?2, retries = ?3, worker = NULL, deadline_ms = NULL \
@@ -12087,6 +12102,11 @@ mod read_surface_tests {
         assert_eq!(replayed.state, nanobpmn_engine_core::JobState::Created);
         assert_eq!(replayed.retries, 2);
         assert_eq!(replayed.last_event_identity_ms, 200);
+        assert_eq!(
+            replayed.last_update_ms,
+            Some(3_000),
+            "replayed FAILED must not re-stamp lastUpdateTime off the genuine failure instant"
+        );
     }
 
     /// The identity floor only suppresses a replayed CREATED at/below what was
