@@ -12216,33 +12216,7 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |job, field| match field {
-                "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
-                "elementId" => query::SortVal::Str(job.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i64),
-                "type" => query::SortVal::Str(job.job_type.clone()),
-                "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
-                "retries" => query::SortVal::Num(job.retries as i64),
-                "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
-                "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
-                // `processDefinitionKey` is a numeric key stored as its decimal
-                // string; parse it so sorting is numeric (`"2"` < `"10"`), not
-                // lexicographic — matching the sibling search handlers (#1344).
-                "processDefinitionKey" => {
-                    query::SortVal::Num(job.process_definition_key.parse().unwrap_or(0))
-                }
-                "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
-                "errorMessage" => {
-                    query::SortVal::Str(job.error_message.clone().unwrap_or_default())
-                }
-                // Camunda-parity timing sort fields (#1344). Missing values sort
-                // as 0 (epoch), so jobs lacking a timestamp group first ascending.
-                "creationTime" => query::SortVal::Num(job.created_at_ms as i64),
-                "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
-                "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
-                "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
-                _ => query::SortVal::Num(job.key as i64),
-            },
+            |job, field| job_sort_val(job, field),
             |job| job.key,
         );
 
@@ -21775,6 +21749,39 @@ fn job_kind_enums(
                 TaskListenerEventType::Canceling => models::JobListenerEventTypeEnum::Canceling,
             },
         ),
+    }
+}
+
+/// Maps a [`JobRow`] field name to its sort key for `/v2/jobs/search`. Numeric
+/// keys (including `processDefinitionKey`, a numeric key stored as its decimal
+/// string) sort as [`query::SortVal::Num`] so `"2"` precedes `"10"` instead of
+/// lexicographically; timing fields project their millisecond columns with a
+/// missing value sorting as `0` (#1344). Unknown fields fall back to the stable
+/// `job.key` tiebreak. Extracted from the handler so the ordering contract is
+/// unit-testable without a full deploy (the search harness can only mint
+/// same-length definition keys, which hide the numeric-vs-lexicographic bug).
+fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
+    match field {
+        "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
+        "elementId" => query::SortVal::Str(job.element_id.clone()),
+        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i64),
+        "type" => query::SortVal::Str(job.job_type.clone()),
+        "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
+        "retries" => query::SortVal::Num(job.retries as i64),
+        "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
+        "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
+        "processDefinitionKey" => {
+            query::SortVal::Num(job.process_definition_key.parse().unwrap_or(0))
+        }
+        "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
+        "errorMessage" => query::SortVal::Str(job.error_message.clone().unwrap_or_default()),
+        // Camunda-parity timing sort fields (#1344). Missing values sort as 0
+        // (epoch), so jobs lacking a timestamp group first ascending.
+        "creationTime" => query::SortVal::Num(job.created_at_ms as i64),
+        "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
+        "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
+        "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
+        _ => query::SortVal::Num(job.key as i64),
     }
 }
 
@@ -37327,6 +37334,80 @@ mod clustered_startup_tests {
                 .iter()
                 .all(|j| j.job_key.0 != job_key),
             "a completed job must NOT match endTime: {{$exists: false}}"
+        );
+    }
+
+    /// #1344 — regression for the numeric `processDefinitionKey` sort. The key
+    /// is a numeric id stored as its decimal string; sorting it lexicographically
+    /// put `"10"` before `"2"`. The full search harness can only mint same-length
+    /// definition keys (where lexicographic == numeric), so it cannot exercise
+    /// this bug — this drives the extracted [`job_sort_val`] ordering contract
+    /// directly with crafted keys. Guards the whole numeric-key sort class.
+    #[test]
+    fn job_sort_processdefinitionkey_is_numeric_not_lexicographic() {
+        fn job_row_with_def_key(key: Key, def_key: &str) -> readstore::JobRow {
+            readstore::JobRow {
+                key,
+                instance_key: 1,
+                element_instance_key: 1,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: nanobpmn_engine_core::JobState::Created,
+                retries: 3,
+                worker: None,
+                deadline_ms: None,
+                process_definition_id: "proc".to_string(),
+                process_definition_key: def_key.to_string(),
+                kind: nanobpmn_engine_core::JobKind::BpmnElement,
+                created_at_ms: 0,
+                last_update_ms: None,
+                end_ms: None,
+                read_set: Vec::new(),
+                lease_token: None,
+                business_id: None,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+            }
+        }
+
+        let two = job_row_with_def_key(100, "2");
+        let ten = job_row_with_def_key(200, "10");
+
+        // Unit contract: the key projects as a number, so `2 < 10`.
+        assert!(matches!(
+            job_sort_val(&two, "processDefinitionKey"),
+            query::SortVal::Num(2)
+        ));
+        assert!(matches!(
+            job_sort_val(&ten, "processDefinitionKey"),
+            query::SortVal::Num(10)
+        ));
+
+        // End-to-end through the shared sorter: ascending puts "2" before "10"
+        // (a lexicographic sort would invert them); descending is the mirror.
+        let sorted = |descending: bool| {
+            let mut rows: Vec<&readstore::JobRow> = vec![&ten, &two];
+            query::sort_items(
+                &mut rows,
+                &[query::SortKey {
+                    field: "processDefinitionKey".to_string(),
+                    descending,
+                }],
+                |job, field| job_sort_val(job, field),
+                |job| job.key,
+            );
+            rows.iter().map(|j| j.key).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sorted(false),
+            vec![100, 200],
+            "ascending numeric sort: processDefinitionKey 2 before 10"
+        );
+        assert_eq!(
+            sorted(true),
+            vec![200, 100],
+            "descending numeric sort: processDefinitionKey 10 before 2"
         );
     }
 

@@ -2,13 +2,21 @@
 //!
 //! Every re-sync of the vendored Camunda spec (`spec/`) can add request fields
 //! to operations Nano already serves. The generator happily deserializes them,
-//! so an unhandled new field is *silently ignored* - the request "works" but
-//! the field has no effect. This guard makes every such field an explicit
+//! This guard makes every such field an explicit
 //! decision: it derives the set of `Schema.property` pairs reachable from the
 //! request body of every served operation (the `OVERRIDES` table in
 //! `scripts/gen-stub-server.py` - the single source of which operations are
 //! wired to the engine) and requires it to equal the checked-in manifest
 //! `spec-patches/request-fields.txt`.
+//!
+//! The derivation reads the spec exactly as the gateway *serves* it: the raw
+//! `spec/` files **with `spec-patches/patches.yaml` applied** (mirroring
+//! `scripts/preprocess-spec.py`). A nano extension added only by a patch - e.g.
+//! the `lastUpdateTime` job sort value, or the deprecated `leaseToken` /
+//! `jobLease` aliases - is request surface the generated server accepts, so it
+//! must be triaged here too; reading the unpatched spec would blind the guard to
+//! exactly those fields (a drift surface between the guarded spec and the served
+//! one).
 //!
 //! Manifest lines are `Schema.property`, optionally followed by
 //! `unhonoured #<issue>` for a field Nano accepts but does not act on yet.
@@ -24,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use serde_yaml::Value;
+use serde_yaml::{Mapping, Value};
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -76,20 +84,145 @@ fn served_operations() -> BTreeSet<String> {
     ops
 }
 
-/// Lazily-loaded multi-file spec with cross-file `$ref` resolution.
+/// Lazily-loaded multi-file spec with cross-file `$ref` resolution. Files are
+/// loaded with `spec-patches/patches.yaml` applied, so the derived field set
+/// matches the spec the gateway actually serves (see module docs).
 struct Spec {
     dir: PathBuf,
     files: HashMap<String, Value>,
+    /// `patches.yaml` actions grouped by their target `file` (relative to `dir`).
+    patches: HashMap<String, Vec<Value>>,
+}
+
+/// Loads `spec-patches/patches.yaml`, grouping each action by its `file` so a
+/// file's overlays can be applied the moment it is first read. Missing file =>
+/// no patches (the guard still works against the raw spec).
+fn load_patches(root: &Path) -> HashMap<String, Vec<Value>> {
+    let path = root.join("spec-patches/patches.yaml");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Value::Sequence(entries) =
+        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+    else {
+        panic!("{}: expected a top-level list of patches", path.display());
+    };
+    let mut by_file: HashMap<String, Vec<Value>> = HashMap::new();
+    for entry in entries {
+        let file = entry
+            .get("file")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("patch missing a string 'file': {entry:?}"))
+            .to_string();
+        by_file.entry(file).or_default().push(entry);
+    }
+    by_file
+}
+
+/// Deep-merges `addition` into `target` additively (mirrors
+/// `preprocess-spec.py::_deep_merge`): where both hold a mapping the merge
+/// recurses, otherwise the addition's value overwrites.
+fn deep_merge(target: &mut Value, addition: &Value) {
+    let (Some(t), Some(a)) = (target.as_mapping_mut(), addition.as_mapping()) else {
+        return;
+    };
+    for (key, value) in a {
+        match t.get_mut(key) {
+            Some(existing) if existing.is_mapping() && value.is_mapping() => {
+                deep_merge(existing, value)
+            }
+            _ => {
+                t.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Walks the dotted `target` (e.g. `components.schemas.Foo.required`), creating
+/// intermediate mappings on demand, and returns `(parent_container, last_key)` -
+/// mirrors `preprocess-spec.py::_resolve_parent` (naive split on `.`).
+fn resolve_parent<'a>(doc: &'a mut Value, dotted: &str) -> (&'a mut Value, String) {
+    let parts: Vec<&str> = dotted.split('.').collect();
+    let (last, parents) = parts.split_last().expect("patch target is non-empty");
+    let mut node = doc;
+    for part in parents {
+        let map = node
+            .as_mapping_mut()
+            .unwrap_or_else(|| panic!("cannot descend into non-mapping at '{part}' in '{dotted}'"));
+        if !map.contains_key(*part) || map.get(*part).is_some_and(Value::is_null) {
+            map.insert(
+                Value::String((*part).to_string()),
+                Value::Mapping(Mapping::new()),
+            );
+        }
+        node = map.get_mut(*part).expect("intermediate node just ensured");
+    }
+    (node, (*last).to_string())
+}
+
+/// Applies a single `patches.yaml` action to a parsed file document, mirroring
+/// `preprocess-spec.py::_apply_patch` (`merge` / `append` / `remove`).
+fn apply_patch(doc: &mut Value, patch: &Value) {
+    let target = patch
+        .get("target")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("patch missing a string 'target': {patch:?}"));
+    let (parent, last) = resolve_parent(doc, target);
+    let parent = parent
+        .as_mapping_mut()
+        .unwrap_or_else(|| panic!("target parent of '{target}' is not a mapping"));
+
+    if let Some(addition) = patch.get("merge") {
+        if !parent.contains_key(last.as_str())
+            || parent.get(last.as_str()).is_some_and(Value::is_null)
+        {
+            parent.insert(Value::String(last.clone()), Value::Mapping(Mapping::new()));
+        }
+        let node = parent.get_mut(last.as_str()).expect("merge node ensured");
+        deep_merge(node, addition);
+    } else if let Some(items) = patch.get("append").and_then(Value::as_sequence) {
+        if !parent.contains_key(last.as_str()) {
+            parent.insert(Value::String(last.clone()), Value::Sequence(Vec::new()));
+        }
+        let node = parent
+            .get_mut(last.as_str())
+            .and_then(Value::as_sequence_mut)
+            .unwrap_or_else(|| panic!("cannot append to non-list at target '{target}'"));
+        for item in items {
+            if !node.contains(item) {
+                node.push(item.clone());
+            }
+        }
+    } else if let Some(items) = patch.get("remove").and_then(Value::as_sequence) {
+        let node = parent
+            .get_mut(last.as_str())
+            .and_then(Value::as_sequence_mut)
+            .unwrap_or_else(|| panic!("cannot remove from non-list at target '{target}'"));
+        for item in items {
+            if let Some(pos) = node.iter().position(|e| e == item) {
+                node.remove(pos);
+            }
+        }
+    } else {
+        panic!("patch for target '{target}' has none of 'merge', 'append', 'remove'");
+    }
 }
 
 impl Spec {
     fn file(&mut self, name: &str) -> &Value {
-        let dir = self.dir.clone();
-        self.files.entry(name.to_string()).or_insert_with(|| {
-            let text = std::fs::read_to_string(dir.join(name))
+        if !self.files.contains_key(name) {
+            let text = std::fs::read_to_string(self.dir.join(name))
                 .unwrap_or_else(|e| panic!("read spec/{name}: {e}"));
-            serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse spec/{name}: {e}"))
-        })
+            let mut doc: Value =
+                serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse spec/{name}: {e}"));
+            if let Some(patches) = self.patches.get(name) {
+                for patch in patches.clone() {
+                    apply_patch(&mut doc, &patch);
+                }
+            }
+            self.files.insert(name.to_string(), doc);
+        }
+        self.files.get(name).expect("file just inserted")
     }
 
     /// Resolves `file.yaml#/a/b` (or `#/a/b` relative to `cur`) to
@@ -186,6 +319,7 @@ fn served_request_fields() -> (BTreeSet<String>, BTreeSet<String>) {
     let mut spec = Spec {
         dir: repo_root().join("spec"),
         files: HashMap::new(),
+        patches: load_patches(&repo_root()),
     };
     let paths = spec
         .file("rest-api.yaml")

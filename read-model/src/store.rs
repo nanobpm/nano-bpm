@@ -4813,16 +4813,41 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 now_ms
             };
             let last_update = creation_ms;
+            // The ON CONFLICT path fires only on re-delivery / overlapping-prefix
+            // replay — a job's single genuine CREATED already landed — so it must
+            // be a replay no-op and must never regress a row that has since
+            // advanced (#1344 projection idempotency):
+            // - `created_at_ms`: keep the stored value unless THIS event carries a
+            //   real (nonzero) `created_at`. A legacy (`created_at == 0`)
+            //   re-delivery must NOT re-stamp a fresh batch-time fallback (that
+            //   would move `creationTime` every replay); a later real timestamp
+            //   still repairs a stale fallback.
+            // - state/retries/worker/deadline: preserved once the row has left
+            //   `Created` (Activated or any terminal state), so replaying CREATED
+            //   after a later event cannot resurrect an advanced/terminal job.
+            // - `last_update_ms`: frozen at `end_ms` when set; held once the row
+            //   advanced (so an endTime-less terminal Failed/Errored is never
+            //   un-frozen by a replayed CREATED — the overlapping-prefix case); and
+            //   for a still-`Created` row, re-seeded only from a real `created_at`
+            //   (a legacy fallback is held), preserving `lastUpdateTime ==
+            //   creationTime` without moving it on a bare re-delivery.
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
                  created_at_ms, last_update_ms, business_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, \
                  (SELECT business_id FROM process_instances WHERE key = ?2)) \
-                 ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms, \
-                 last_update_ms = CASE WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
-                 ELSE excluded.last_update_ms END",
+                 ON CONFLICT(key) DO UPDATE SET \
+                 state = CASE WHEN jobs.state = ?6 THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.deadline_ms END, \
+                 created_at_ms = CASE WHEN ?12 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 last_update_ms = CASE \
+                     WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                     WHEN jobs.state <> ?6 THEN jobs.last_update_ms \
+                     WHEN ?12 <> 0 THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4835,6 +4860,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     def_key,
                     creation_ms as i64,
                     last_update as i64,
+                    *created_at as i64,
                 ],
             )?;
         }
@@ -4862,16 +4888,26 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 now_ms
             };
             let creation_ms = last_update;
+            // See `JobCreated`: the ON CONFLICT path is a replay no-op that must
+            // not move `created_at_ms`/`last_update_ms` for a legacy re-delivery
+            // nor regress an advanced/terminal row (#1344).
             tx.cexecute(
                 "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
                  job_kind, listener_event_type, created_at_ms, last_update_ms, business_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, \
                  (SELECT business_id FROM process_instances WHERE key = ?2)) \
-                 ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms, \
-                 last_update_ms = CASE WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
-                 ELSE excluded.last_update_ms END",
+                 ON CONFLICT(key) DO UPDATE SET \
+                 state = CASE WHEN jobs.state = ?6 THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.deadline_ms END, \
+                 created_at_ms = CASE WHEN ?14 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 last_update_ms = CASE \
+                     WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                     WHEN jobs.state <> ?6 THEN jobs.last_update_ms \
+                     WHEN ?14 <> 0 THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END",
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4886,6 +4922,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     event_code,
                     creation_ms as i64,
                     last_update as i64,
+                    *created_at as i64,
                 ],
             )?;
         }
@@ -11506,6 +11543,136 @@ mod read_surface_tests {
             1_724_000_000_000,
             "ON CONFLICT must refresh created_at_ms so statistics stop under-counting"
         );
+    }
+
+    /// Apply one event at an explicit `now_ms` (bypassing wall clock) so a
+    /// re-delivery/replay in a *later* batch can be modelled deterministically.
+    fn apply_at(store: &ReadStore, event: &Event, now_ms: u64) {
+        let mut conn = store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        super::project(&tx, event, now_ms).unwrap();
+        tx.commit().unwrap();
+    }
+
+    fn job_row(store: &ReadStore, key: Key) -> super::JobRow {
+        store
+            .jobs()
+            .into_iter()
+            .find(|j| j.key == key)
+            .expect("job present")
+    }
+
+    /// Defect-class guard (#1344, finding 1): a legacy (`created_at == 0`)
+    /// `JobCreated` seeds its `creationTime`/`lastUpdateTime` from the
+    /// *batch-observation* fallback. Re-delivering or replaying that SAME legacy
+    /// event in a later batch must be an idempotent no-op — the `ON CONFLICT`
+    /// upsert must NOT overwrite the already-seeded timestamps with a fresh
+    /// `now_ms`, or `creationTime` (and a live row's `lastUpdateTime`) would
+    /// jump on every re-delivery. The sibling `ExecutionListenerJobCreated`
+    /// upsert shares the class and the same guard clause.
+    #[test]
+    fn legacy_job_created_redelivery_does_not_move_timestamps() {
+        let store = ReadStore::open(None).unwrap();
+        let legacy = Event::JobCreated {
+            job_key: 8300,
+            instance_key: 7300,
+            element_instance_key: 7301,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 0,
+            priority: 0,
+            retries: 3,
+        };
+        // First delivery stamps the batch-time fallback for both timestamps.
+        apply_at(&store, &legacy, 1_000);
+        let first = job_row(&store, 8300);
+        assert_eq!(first.created_at_ms, 1_000);
+        assert_eq!(first.last_update_ms, Some(1_000));
+
+        // A later-batch re-delivery (different `now_ms`) of the SAME legacy
+        // CREATED must not move either timestamp.
+        apply_at(&store, &legacy, 9_999);
+        let again = job_row(&store, 8300);
+        assert_eq!(
+            again.created_at_ms, 1_000,
+            "legacy re-delivery must not move creationTime"
+        );
+        assert_eq!(
+            again.last_update_ms,
+            Some(1_000),
+            "legacy re-delivery must not move lastUpdateTime"
+        );
+    }
+
+    /// Defect-class guard (#1344, finding 2): replaying a whole committed prefix
+    /// `[JobCreated, JobFailed]` (or `[JobCreated, JobErrorThrown]`) must not
+    /// resurrect a terminal, end-time-less job back to `Created` nor un-freeze
+    /// its `lastUpdateTime`. The replayed `JobCreated` hits the `ON CONFLICT`
+    /// path, which must preserve the advanced/terminal state and its frozen
+    /// timestamp so the trailing terminal event stays an idempotent no-op.
+    #[test]
+    fn whole_prefix_replay_keeps_terminal_job_frozen() {
+        for terminal in [
+            Event::JobFailed {
+                job_key: 8400,
+                instance_key: 7400,
+                retries: 0,
+                worker: None,
+                error_message: Some("boom".to_string()),
+            },
+            Event::JobErrorThrown {
+                job_key: 8400,
+                instance_key: 7400,
+                error_code: "ERR".to_string(),
+                worker: None,
+                error_message: Some("boom".to_string()),
+            },
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            let created = Event::JobCreated {
+                job_key: 8400,
+                instance_key: 7400,
+                element_instance_key: 7401,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 123,
+                priority: 0,
+                retries: 0,
+            };
+            apply_at(&store, &created, 1_000);
+            apply_at(&store, &terminal, 2_000);
+            let frozen = job_row(&store, 8400);
+            assert_eq!(frozen.end_ms, None, "terminal park carries no endTime");
+            assert_eq!(
+                frozen.last_update_ms,
+                Some(2_000),
+                "the terminal event stamps lastUpdateTime"
+            );
+            let terminal_state = frozen.state;
+
+            // Replay the WHOLE prefix in a later batch: the replayed CREATED must
+            // not regress the terminal state nor un-freeze lastUpdateTime, so the
+            // trailing terminal event stays a no-op.
+            apply_at(&store, &created, 5_000);
+            let after_created = job_row(&store, 8400);
+            assert_eq!(
+                after_created.state, terminal_state,
+                "replayed CREATED must not regress a terminal job to Created"
+            );
+            assert_eq!(
+                after_created.last_update_ms,
+                Some(2_000),
+                "replayed CREATED must not move a terminal job's lastUpdateTime"
+            );
+
+            apply_at(&store, &terminal, 6_000);
+            let after_terminal = job_row(&store, 8400);
+            assert_eq!(
+                after_terminal.last_update_ms,
+                Some(2_000),
+                "whole-prefix replay must leave lastUpdateTime frozen"
+            );
+        }
     }
 
     /// Defect-class guard: `created_at_ms` is persisted as a signed `INTEGER`,
