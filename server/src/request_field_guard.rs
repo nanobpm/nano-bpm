@@ -192,7 +192,17 @@ fn apply_patch(doc: &mut Value, patch: &Value) {
             panic!("cannot merge into non-mapping at target '{target}'");
         }
         deep_merge(node, addition);
-    } else if let Some(items) = patch.get("append").and_then(Value::as_sequence) {
+    } else if patch.get("append").is_some() {
+        // Mirror `preprocess-spec.py::_apply_patch`'s `elif "append" in patch`:
+        // branch selection is on the PRESENCE of `append`, then its value must be
+        // a list. Selecting on `as_sequence()` instead would let a patch carrying
+        // a NON-list `append` (plus a valid `remove`) fall through to the `remove`
+        // arm and pass this guard, while the real preprocessor enters `append` and
+        // rejects it — a drift surface between the guarded spec and the served one.
+        let items = patch
+            .get("append")
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("'append' for target '{target}' must be a list"));
         if !parent.contains_key(last.as_str()) {
             parent.insert(Value::String(last.clone()), Value::Sequence(Vec::new()));
         }
@@ -205,7 +215,14 @@ fn apply_patch(doc: &mut Value, patch: &Value) {
                 node.push(item.clone());
             }
         }
-    } else if let Some(items) = patch.get("remove").and_then(Value::as_sequence) {
+    } else if patch.get("remove").is_some() {
+        // Same presence-first selection as `append` (mirroring
+        // `preprocess-spec.py`): a non-list `remove` payload is rejected, not
+        // silently skipped to the `else`.
+        let items = patch
+            .get("remove")
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("'remove' for target '{target}' must be a list"));
         let node = parent
             .get_mut(last.as_str())
             .and_then(Value::as_sequence_mut)
@@ -567,5 +584,82 @@ fn apply_patch_merge_fails_loud_on_a_non_mapping_target() {
     assert!(
         message.contains("cannot merge into non-mapping") && message.contains("properties"),
         "the panic must name the target, got: {message}"
+    );
+}
+
+/// Panic-message extraction shared by the fail-loud patch tests.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
+        .unwrap_or_default()
+}
+
+/// Defect-class guard (#1346 review, "previously missed"): the guard's branch
+/// selection must mirror `preprocess-spec.py::_apply_patch`, which dispatches on
+/// the PRESENCE of `append` (`elif "append" in patch`) and only then validates
+/// that its value is a list. Selecting on `as_sequence()` instead would let a
+/// patch carrying a NON-list `append` (plus a valid `remove`) fall through to
+/// the `remove` arm and pass this guard, while the real preprocessor enters
+/// `append` and rejects it — the exact drift the guard exists to catch.
+#[test]
+fn apply_patch_append_fails_loud_on_a_non_list_payload() {
+    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
+    let patch =
+        serde_yaml::from_str::<Value>("target: required\nappend: not-a-list\nremove:\n  - keep\n")
+            .unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_patch(&mut doc, &patch);
+    }));
+    let payload =
+        outcome.expect_err("a non-list append payload must panic, not fall through to remove");
+    let message = panic_message(payload);
+    assert!(
+        message.contains("'append' for target 'required' must be a list"),
+        "the panic must reject the non-list append, got: {message}"
+    );
+}
+
+/// The sibling failure mode: a non-list `remove` payload must also fail loud on
+/// presence-first selection, not be silently skipped to the `else` (which would
+/// report a confusing "none of merge/append/remove" for a patch that HAS a
+/// `remove`).
+#[test]
+fn apply_patch_remove_fails_loud_on_a_non_list_payload() {
+    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
+    let patch = serde_yaml::from_str::<Value>("target: required\nremove: not-a-list\n").unwrap();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_patch(&mut doc, &patch);
+    }));
+    let payload = outcome.expect_err("a non-list remove payload must panic");
+    let message = panic_message(payload);
+    assert!(
+        message.contains("'remove' for target 'required' must be a list"),
+        "the panic must reject the non-list remove, got: {message}"
+    );
+}
+
+/// The happy-path counterpart for `append`: a list payload applies (deduping
+/// against existing items), so presence-first selection does not break the live
+/// `append` patches in `spec-patches/patches.yaml`.
+#[test]
+fn apply_patch_append_appends_new_items() {
+    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
+    let patch =
+        serde_yaml::from_str::<Value>("target: required\nappend:\n  - keep\n  - added\n").unwrap();
+    apply_patch(&mut doc, &patch);
+    let items: Vec<&str> = doc
+        .get("required")
+        .and_then(Value::as_sequence)
+        .unwrap()
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        items,
+        ["keep", "added"],
+        "append adds new items, dedupes existing"
     );
 }

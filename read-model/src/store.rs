@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -52,7 +52,7 @@ const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = 9054396959573802666;
+const SCHEMA_FINGERPRINT: i64 = 4239213449374020042;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -146,6 +146,21 @@ CREATE TABLE jobs (
     -- NULL). Both are NULL for rows migrated from a pre-#1344 database.
     last_update_ms         INTEGER,
     end_ms                 INTEGER,
+    -- Replay identity of the last projected job event (#1344 overlapping-prefix
+    -- idempotency): the engine-carried logical instant of the most recent event
+    -- that had one (CREATED's `created_at`, ACTIVATED's `activated_at`), else
+    -- `0`. `state` cannot carry this identity — lock expiry, a retryable
+    -- failure and incident resolution all RETURN a job to `Created`, so a
+    -- state-guarded upsert cannot tell a replayed `JobCreated` from the genuine
+    -- one. A replayed prefix re-stamps the SAME identity, never a larger one
+    -- (a genuine new event is always later), so the job-CREATION upsert gates
+    -- its state/retries/worker/deadline refresh on `created_at >=
+    -- COALESCE(last_event_identity_ms, 0)` and ACTIVATED raises the floor —
+    -- making a replayed `JobCreated` over a returned-to-`Created` row a no-op
+    -- while a genuine later event still applies. `0`/NULL (legacy events and
+    -- migrated rows that carry no timestamp) disables the gate, preserving the
+    -- prior last-writer-wins behaviour for pre-field journals.
+    last_event_identity_ms INTEGER NOT NULL DEFAULT 0,
     -- Declared read-set (`fetchVariables`) recorded on the durable
     -- `JobActivated` event: the variable names the worker asked for on the most
     -- recent activation that declared a non-empty set. Preserved across a later
@@ -1373,6 +1388,14 @@ pub struct JobRow {
     /// (failed / errored). Stamped once; a re-delivery of the terminal event is a
     /// no-op.
     pub end_ms: Option<u64>,
+    /// Replay identity of the last projected job event (#1344): the
+    /// engine-carried logical instant of the most recent event that had one
+    /// (CREATED's `created_at`, ACTIVATED's `activated_at`), else `0`. Internal
+    /// to the projection — it is the monotone floor that lets a replayed
+    /// event be told from a genuine new one (which `state` alone cannot: lock
+    /// expiry / a retryable failure / incident resolution all return a job to
+    /// `Created`). `0` for legacy events and migrated rows.
+    pub last_event_identity_ms: u64,
     /// The declared read-set (`fetchVariables`) recorded on the most recent
     /// durable [`crate::Event::JobActivated`] for this job that declared a
     /// non-empty set — the variable names the worker was handed. Preserved across
@@ -2719,7 +2742,7 @@ impl ReadStore {
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
                  job_kind, listener_event_type, created_at_ms, read_set, CAST(lease_token AS TEXT), \
                  business_id, error_message, error_code, has_failed_with_retries_left, \
-                 last_update_ms, end_ms FROM jobs",
+                 last_update_ms, end_ms, last_event_identity_ms FROM jobs",
             )
             .expect("prepare jobs");
         let rows = stmt.query_map([], map_job).expect("query jobs");
@@ -3271,6 +3294,7 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         has_failed_with_retries_left: r.get::<_, i64>(19)? != 0,
         last_update_ms: r.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u64),
         end_ms: r.get::<_, Option<i64>>(21)?.map(|v| v.max(0) as u64),
+        last_event_identity_ms: r.get::<_, i64>(22)?.max(0) as u64,
     })
 }
 
@@ -4005,6 +4029,10 @@ fn project_engine_state(
         // fallback as `last_update_ms` when the snapshot predates `created_at`
         // (legacy `0`), so a recovered legacy job surfaces a non-null
         // `creationTime` (== `lastUpdateTime`) rather than a null creation time.
+        // Seed the replay-identity floor with the same `created_at` (the only
+        // engine-carried instant the snapshot has): a subsequent replayed
+        // `JobCreated` then re-stamps the SAME identity (a no-op), and a genuine
+        // later activation raises it. On CONFLICT the floor is never lowered.
         let last_update = if job.created_at != 0 {
             job.created_at
         } else {
@@ -4015,14 +4043,16 @@ fn project_engine_state(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
              job_kind, listener_event_type, lease_token, error_message, error_code, \
-             has_failed_with_retries_left, created_at_ms, last_update_ms, business_id) \
+             has_failed_with_retries_left, created_at_ms, last_update_ms, business_id, \
+             last_event_identity_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2)) \
+             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2), ?20) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
              worker = excluded.worker, deadline_ms = excluded.deadline_ms, \
              lease_token = excluded.lease_token, error_message = excluded.error_message, \
              error_code = excluded.error_code, \
-             has_failed_with_retries_left = excluded.has_failed_with_retries_left",
+             has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
+             last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
             params![
                 job.key as i64,
                 job.instance_key as i64,
@@ -4053,6 +4083,7 @@ fn project_engine_state(
                 i64::from(job.has_failed_with_retries_left),
                 creation_ms as i64,
                 last_update as i64,
+                job.created_at as i64,
             ],
         )?;
     }
@@ -4816,38 +4847,58 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // The ON CONFLICT path fires only on re-delivery / overlapping-prefix
             // replay — a job's single genuine CREATED already landed — so it must
             // be a replay no-op and must never regress a row that has since
-            // advanced (#1344 projection idempotency):
+            // advanced (#1344 projection idempotency). `state` alone cannot carry
+            // that identity: lock expiry, a retryable failure and incident
+            // resolution all RETURN a job to `Created`, so a state-guarded upsert
+            // would mistake the replayed CREATED for the genuine one and
+            // overwrite state/retries/worker/deadline and re-stamp
+            // `last_update_ms`. The replay discriminator is the event's
+            // engine-carried `created_at` against the stored
+            // `last_event_identity_ms` floor (the logical instant of the most
+            // recent event that carried one): a replayed prefix re-stamps the
+            // SAME identity, a genuine new event is always later.
             // - `created_at_ms`: keep the stored value unless THIS event carries a
             //   real (nonzero) `created_at`. A legacy (`created_at == 0`)
             //   re-delivery must NOT re-stamp a fresh batch-time fallback (that
             //   would move `creationTime` every replay); a later real timestamp
             //   still repairs a stale fallback.
-            // - state/retries/worker/deadline: preserved once the row has left
-            //   `Created` (Activated or any terminal state), so replaying CREATED
-            //   after a later event cannot resurrect an advanced/terminal job.
-            // - `last_update_ms`: frozen at `end_ms` when set; held once the row
-            //   advanced (so an endTime-less terminal Failed/Errored is never
-            //   un-frozen by a replayed CREATED — the overlapping-prefix case); and
-            //   for a still-`Created` row, re-seeded only from a real `created_at`
-            //   (a legacy fallback is held), preserving `lastUpdateTime ==
-            //   creationTime` without moving it on a bare re-delivery.
+            // - state/retries/worker/deadline: refreshed only when this CREATED
+            //   is the newest event seen (`?12 >= last_event_identity_ms`) AND
+            //   the row is still live-and-unactivated (`jobs.state = ?6`). The
+            //   identity gate alone is not enough for a TERMINAL row: a replayed
+            //   CREATED re-stamps the SAME identity the genuine creation set
+            //   (equal, so `>=` passes), and without the state guard it would
+            //   resurrect a Completed/Failed job back to `Created`. Requiring
+            //   `jobs.state = ?6` (Created) keeps the refresh to the genuine
+            //   creation / a repair on a still-created row; a replayed CREATED
+            //   over an advanced (Activated) or terminal row leaves it untouched.
+            // - `last_update_ms`: frozen at `end_ms` when set; otherwise moved
+            //   only when this CREATED is the newest event seen (a replay holds
+            //   it), preserving `lastUpdateTime == creationTime` on the genuine
+            //   creation without moving it on a re-delivery.
+            // - `last_event_identity_ms`: raised to this event's `created_at`
+            //   (never lowered); a legacy `0` leaves the floor where it is.
             tx.cexecute(
-                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                &format!(
+                    "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 created_at_ms, last_update_ms, business_id) \
+                 created_at_ms, last_update_ms, business_id, last_event_identity_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, \
-                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
+                 (SELECT business_id FROM process_instances WHERE key = ?2), ?12) \
                  ON CONFLICT(key) DO UPDATE SET \
-                 state = CASE WHEN jobs.state = ?6 THEN excluded.state ELSE jobs.state END, \
-                 retries = CASE WHEN jobs.state = ?6 THEN excluded.retries ELSE jobs.retries END, \
-                 worker = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.worker END, \
-                 deadline_ms = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.deadline_ms END, \
+                 state = CASE WHEN jobs.state = ?6 AND ?12 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 AND ?12 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 AND ?12 >= COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 AND ?12 >= COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
                  created_at_ms = CASE WHEN ?12 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
                  last_update_ms = CASE \
                      WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
-                     WHEN jobs.state <> ?6 THEN jobs.last_update_ms \
-                     WHEN ?12 <> 0 THEN excluded.last_update_ms \
-                     ELSE jobs.last_update_ms END",
+                     WHEN {freeze_jobs} THEN jobs.last_update_ms \
+                     WHEN ?12 <> 0 AND ?12 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END, \
+                 last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), ?12)",
+                    freeze_jobs = endtimeless_terminal_job_predicate("jobs.state"),
+                ),
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4890,24 +4941,32 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             let creation_ms = last_update;
             // See `JobCreated`: the ON CONFLICT path is a replay no-op that must
             // not move `created_at_ms`/`last_update_ms` for a legacy re-delivery
-            // nor regress an advanced/terminal row (#1344).
+            // nor regress an advanced/terminal row (#1344). The replay
+            // discriminator is the event's `created_at` against the stored
+            // `last_event_identity_ms` floor (state alone cannot carry it — a
+            // job is legitimately RETURNED to `Created` by lock expiry, a
+            // retryable failure and incident resolution).
             tx.cexecute(
-                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                &format!(
+                    "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id) \
+                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id, last_event_identity_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, \
-                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
+                 (SELECT business_id FROM process_instances WHERE key = ?2), ?14) \
                  ON CONFLICT(key) DO UPDATE SET \
-                 state = CASE WHEN jobs.state = ?6 THEN excluded.state ELSE jobs.state END, \
-                 retries = CASE WHEN jobs.state = ?6 THEN excluded.retries ELSE jobs.retries END, \
-                 worker = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.worker END, \
-                 deadline_ms = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.deadline_ms END, \
+                 state = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
                  created_at_ms = CASE WHEN ?14 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
                  last_update_ms = CASE \
                      WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
-                     WHEN jobs.state <> ?6 THEN jobs.last_update_ms \
-                     WHEN ?14 <> 0 THEN excluded.last_update_ms \
-                     ELSE jobs.last_update_ms END",
+                     WHEN {freeze_jobs} THEN jobs.last_update_ms \
+                     WHEN ?14 <> 0 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END, \
+                 last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), ?14)",
+                    freeze_jobs = endtimeless_terminal_job_predicate("jobs.state"),
+                ),
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4952,24 +5011,32 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             let creation_ms = last_update;
             // See `JobCreated`: the ON CONFLICT path is a replay no-op that must
             // not move `created_at_ms`/`last_update_ms` for a legacy re-delivery
-            // nor regress an advanced/terminal row (#1344).
+            // nor regress an advanced/terminal row (#1344). The replay
+            // discriminator is the event's `created_at` against the stored
+            // `last_event_identity_ms` floor (state alone cannot carry it — a
+            // job is legitimately RETURNED to `Created` by lock expiry, a
+            // retryable failure and incident resolution).
             tx.cexecute(
-                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                &format!(
+                    "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id) \
+                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id, last_event_identity_ms) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, \
-                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
+                 (SELECT business_id FROM process_instances WHERE key = ?2), ?14) \
                  ON CONFLICT(key) DO UPDATE SET \
-                 state = CASE WHEN jobs.state = ?6 THEN excluded.state ELSE jobs.state END, \
-                 retries = CASE WHEN jobs.state = ?6 THEN excluded.retries ELSE jobs.retries END, \
-                 worker = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.worker END, \
-                 deadline_ms = CASE WHEN jobs.state = ?6 THEN NULL ELSE jobs.deadline_ms END, \
+                 state = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
                  created_at_ms = CASE WHEN ?14 <> 0 THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
                  last_update_ms = CASE \
                      WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
-                     WHEN jobs.state <> ?6 THEN jobs.last_update_ms \
-                     WHEN ?14 <> 0 THEN excluded.last_update_ms \
-                     ELSE jobs.last_update_ms END",
+                     WHEN {freeze_jobs} THEN jobs.last_update_ms \
+                     WHEN ?14 <> 0 AND ?14 >= COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END, \
+                 last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), ?14)",
+                    freeze_jobs = endtimeless_terminal_job_predicate("jobs.state"),
+                ),
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4995,21 +5062,23 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             deadline,
             fetch_variables,
             lease_token,
+            activated_at,
             ..
         } => {
-            // Record the declared read-set alongside the activation. Serialized as
-            // a JSON array (mirrors `candidate_groups`); empty stays '[]'. Only
-            // overwritten when this activation declared a set, so a subsequent
-            // fetch-all re-activation of the same job does not erase the last
-            // declared provenance.
-            //
-            // The `worker` binding is normalized through `worker_attribution`: an
-            // *empty* activation worker (`""`, e.g. an explicitly-supplied empty
-            // string, or replayed from a `JobActivated` written before the engine
-            // reducer normalized it) is not an attribution and must land as SQL
-            // NULL, not `""`. Otherwise the terminal `COALESCE(?, worker)` on a
-            // completion that carries no attribution would preserve that `""`,
-            // pinning the completed row to an empty worker (#1191).
+            // Raise the replay-identity floor (#1344): `activated_at` is the
+            // engine-carried logical instant of this activation, so it orders
+            // strictly AFTER the job's `created_at`. Recording it lets a later
+            // replayed `JobCreated` (same identity as the stored floor's origin)
+            // be told from the genuine creation even after the job returned to
+            // `Created` — the replayed CREATED's identity is then BELOW the
+            // floor and its upsert becomes a no-op. `MAX` never lowers the
+            // floor; a legacy `None` (`activated_at` predates the field) leaves
+            // it where it is.
+            tx.cexecute(
+                "UPDATE jobs SET last_event_identity_ms = \
+                 MAX(COALESCE(last_event_identity_ms, 0), ?2) WHERE key = ?1",
+                params![*job_key as i64, activated_at.unwrap_or(0) as i64],
+            )?;
             if fetch_variables.is_empty() {
                 tx.cexecute(
                     "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, lease_token = ?5 WHERE key = ?1",
@@ -11800,6 +11869,228 @@ mod read_surface_tests {
                 "whole-prefix replay must leave lastUpdateTime frozen"
             );
         }
+    }
+
+    /// Defect-class guard (#1344 review, overlapping-prefix replay): `Created`
+    /// does NOT mean "this row never advanced" — lock expiry, a retryable
+    /// failure and incident resolution all RETURN a job to `Created`. Replaying
+    /// the whole prefix `[JobCreated, JobActivated, JobLockExpired]` over such a
+    /// row must not let the replayed `JobCreated` overwrite
+    /// state/retries/worker/deadline nor re-stamp `creationTime`/`lastUpdateTime`.
+    /// The discriminator is the engine-carried event identity (`created_at` /
+    /// `activated_at`) against the stored `last_event_identity_ms` floor — a
+    /// replayed prefix re-stamps the SAME identity, never a larger one. (The
+    /// replayed `JobLockExpired` timing write is not identity-gated — a TIMED_OUT
+    /// carries no engine timestamp, so a replay is indistinguishable from a
+    /// genuine legacy expiry; the finding's overwrite vector is the CREATED.)
+    #[test]
+    fn whole_prefix_replay_ending_in_a_live_created_job_is_a_no_op() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8600,
+            instance_key: 7600,
+            element_instance_key: 7601,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8600,
+            instance_key: 7600,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8600,
+            instance_key: 7600,
+        };
+
+        // Genuine history: create (t=100) -> activate (t=200) -> lock expiry
+        // (batch 2_000) returns the job to Created.
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        let live = job_row(&store, 8600);
+        assert_eq!(
+            live.state,
+            nanobpmn_engine_core::JobState::Created,
+            "lock expiry returns to Created"
+        );
+        assert_eq!(live.worker, None);
+        assert_eq!(live.deadline_ms, None);
+        assert_eq!(live.last_update_ms, Some(2_000));
+        assert_eq!(live.created_at_ms, 100);
+        assert_eq!(
+            live.last_event_identity_ms, 200,
+            "the activation raised the replay-identity floor"
+        );
+
+        // Replay the WHOLE prefix in a later batch (batch 6_000). The replayed
+        // CREATED is a no-op (its identity 100 is below the floor 200 the
+        // activation raised): it must NOT overwrite state/retries/worker/deadline
+        // nor re-stamp creationTime/lastUpdateTime. The replayed ACTIVATED and
+        // LOCK_EXPIRED re-apply their (identical) payload; LOCK_EXPIRED's timing
+        // write is not identity-gated (a TIMED_OUT carries no engine timestamp, so
+        // a replay is indistinguishable from a genuine legacy expiry), but the
+        // replayed CREATED — the event the finding cites — is held.
+        apply_at(&store, &created, 6_000);
+        let after_created = job_row(&store, 8600);
+        assert_eq!(after_created.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(
+            after_created.retries, 3,
+            "replayed CREATED must not touch retries"
+        );
+        assert_eq!(after_created.worker, None);
+        assert_eq!(after_created.deadline_ms, None);
+        assert_eq!(
+            after_created.created_at_ms, 100,
+            "replayed CREATED must not move creationTime"
+        );
+        assert_eq!(
+            after_created.last_update_ms,
+            Some(2_000),
+            "replayed CREATED must not re-stamp lastUpdateTime"
+        );
+        assert_eq!(after_created.last_event_identity_ms, 200);
+        // The rest of the prefix replays without regressing the row.
+        apply_at(&store, &activated, 6_000);
+        apply_at(&store, &lock_expired, 6_000);
+        let replayed = job_row(&store, 8600);
+        assert_eq!(replayed.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(replayed.retries, 3);
+        assert_eq!(replayed.created_at_ms, 100);
+        assert_eq!(replayed.last_event_identity_ms, 200);
+    }
+
+    /// The sibling return-to-`Created` path (#1344): a retryable `JobFailed`
+    /// (retries > 0) parks the job back in the activatable pool. A whole-prefix
+    /// replay `[JobCreated, JobActivated, JobFailed]` must not re-stamp
+    /// `lastUpdateTime` off the genuine failure instant.
+    #[test]
+    fn whole_prefix_replay_through_a_retryable_failure_is_a_no_op() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8601,
+            instance_key: 7601,
+            element_instance_key: 7602,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8601,
+            instance_key: 7601,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let failed = Event::JobFailed {
+            job_key: 8601,
+            instance_key: 7601,
+            retries: 2,
+            worker: Some("w1".to_string()),
+            error_message: Some("boom".to_string()),
+        };
+
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &failed, 3_000);
+        let live = job_row(&store, 8601);
+        assert_eq!(
+            live.state,
+            nanobpmn_engine_core::JobState::Created,
+            "a retryable failure returns to Created"
+        );
+        assert_eq!(live.retries, 2);
+        assert_eq!(live.last_update_ms, Some(3_000));
+
+        apply_at(&store, &created, 7_000);
+        let after_created = job_row(&store, 8601);
+        assert_eq!(after_created.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(
+            after_created.retries, 2,
+            "replayed CREATED must not reset retries"
+        );
+        assert_eq!(
+            after_created.last_update_ms,
+            Some(3_000),
+            "replayed CREATED must not re-stamp lastUpdateTime"
+        );
+        apply_at(&store, &activated, 7_000);
+        apply_at(&store, &failed, 7_000);
+        let replayed = job_row(&store, 8601);
+        assert_eq!(replayed.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(replayed.retries, 2);
+        assert_eq!(replayed.last_event_identity_ms, 200);
+    }
+
+    /// The identity floor only suppresses a replayed CREATED at/below what was
+    /// already seen — a CREATED carrying a LATER `created_at` (a repair, or a
+    /// genuinely newer record) still refreshes the row. This pins that the floor
+    /// is a *replay* guard, not a freeze of a live `Created` job: a newer
+    /// creation event re-applies state/retries and re-stamps the timestamps.
+    #[test]
+    fn newer_created_still_refreshes_a_returned_to_created_job() {
+        let store = ReadStore::open(None).unwrap();
+        let created = |at: u64| Event::JobCreated {
+            job_key: 8602,
+            instance_key: 7602,
+            element_instance_key: 7603,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: at,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8602,
+            instance_key: 7602,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8602,
+            instance_key: 7602,
+        };
+
+        apply_at(&store, &created(100), 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        assert_eq!(job_row(&store, 8602).last_event_identity_ms, 200);
+
+        // A replayed CREATED (identity 100, below the floor) is a no-op…
+        apply_at(&store, &created(100), 6_000);
+        assert_eq!(job_row(&store, 8602).created_at_ms, 100);
+        assert_eq!(job_row(&store, 8602).last_update_ms, Some(2_000));
+
+        // …but a CREATED carrying a NEWER `created_at` (250 > the 200 floor)
+        // refreshes the row and raises the floor.
+        apply_at(&store, &created(250), 7_000);
+        let row = job_row(&store, 8602);
+        assert_eq!(
+            row.created_at_ms, 250,
+            "a newer created_at repairs creationTime"
+        );
+        assert_eq!(row.last_update_ms, Some(250));
+        assert_eq!(
+            row.last_event_identity_ms, 250,
+            "the floor follows the newer event"
+        );
     }
 
     /// #1344 review regression — a GENUINE `RETRIES_UPDATED` on a parked

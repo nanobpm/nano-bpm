@@ -37368,6 +37368,7 @@ mod clustered_startup_tests {
                 error_message: None,
                 error_code: None,
                 has_failed_with_retries_left: false,
+                last_event_identity_ms: 0,
             }
         }
 
