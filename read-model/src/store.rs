@@ -4064,11 +4064,16 @@ fn project_engine_state(
         // creation alone: a job snapshotted while ACTIVATED carries its current
         // activation instant in `activated_at`, and seeding only from creation
         // would leave the floor below it. The journal tail then replays that
-        // same activation (`activated_at == floor`): the activation gate's
-        // `at == prior_floor` arm applies only on a row that never left
-        // `Created` (`fresh`), and the seeded row IS Activated (not fresh), so
-        // the replayed activation is correctly held instead of re-stamping
-        // worker/deadline. On CONFLICT the floor is never lowered.
+        // same activation (`activated_at == floor`). The seeded row sets
+        // `last_update_ms == created_at_ms`, so the gate's `fresh` discriminator
+        // (`COALESCE(last_update_ms, created_at_ms) <= created_at_ms`) reads
+        // TRUE and the `at == prior_floor && fresh` arm APPLIES the replay —
+        // a no-op only because the replayed worker/deadline equal the seeded
+        // values (value-idempotence), not because the gate holds a non-fresh
+        // row. (The genuinely-held non-fresh path — a returned-to-`Created` row
+        // with `last_update_ms > created_at_ms` — is covered by
+        // `replayed_activation_is_held_on_a_non_fresh_row`.) On CONFLICT the
+        // floor is never lowered.
         let last_update = if job.created_at != 0 {
             job.created_at
         } else {
@@ -7770,7 +7775,12 @@ mod definition_xml_tests {
     /// already-seeded Activated row — and over a row that has since returned to
     /// `Created` it would restore stale worker/deadline data. With the floor at
     /// the activation instant, the replayed activation lands at
-    /// `at == prior_floor` on a NON-fresh (Activated) row and is held.
+    /// `at == prior_floor`. The seeded row is still `fresh` (`last_update_ms ==
+    /// created_at_ms`), so the gate APPLIES that replay — a no-op only because
+    /// the replayed worker/deadline equal the seeded values (value-idempotence).
+    /// The genuinely-HELD case is a returned-to-`Created` row whose
+    /// `last_update_ms` has advanced past `created_at_ms` (non-fresh); see
+    /// `replayed_activation_is_held_on_a_non_fresh_row`.
     #[test]
     fn seed_from_engine_state_seeds_the_replay_floor_from_the_max_job_instant() {
         use nanobpmn_engine_core::{Job, JobKind, ProcessInstance, State};
@@ -7848,8 +7858,14 @@ mod definition_xml_tests {
 
         // The journal tail then replays the SAME activation (identity 200). With
         // a creation-only floor (100) the gate would pass (`200 > 100`); with the
-        // max-instant floor the replay lands at `at == prior_floor` on a
-        // non-fresh Activated row and must be held — no worker/deadline re-stamp.
+        // max-instant floor the replay lands at `at == prior_floor`. The seeded
+        // row is still `fresh` (`last_update_ms == created_at_ms`: the seed sets
+        // both from `created_at`), so the gate's `at == prior_floor && fresh`
+        // arm APPLIES the transition rather than holding it — the replay is a
+        // no-op only because the replayed worker/deadline equal the seeded
+        // values (value-idempotence), NOT because the gate holds a non-fresh
+        // row. The genuinely-held (non-fresh) path is exercised separately by
+        // `replayed_activation_is_held_on_a_non_fresh_row` below.
         let replayed_activation = Event::JobActivated {
             job_key: 8_700,
             instance_key: 7_700,
@@ -7863,6 +7879,114 @@ mod definition_xml_tests {
         apply_at(&store, &replayed_activation, 9_000);
         let after = job_row(&store, 8_700);
         assert_eq!(after.state, nanobpmn_engine_core::JobState::Activated);
+        assert_eq!(after.last_event_identity_ms, 200);
+    }
+
+    /// Defect-class guard (#1346 adversarial): the activation gate's
+    /// `at == prior_floor && fresh` arm must APPLY on a fresh row but HOLD on a
+    /// non-fresh one. The discriminator is
+    /// `fresh = COALESCE(last_update_ms, created_at_ms) <= created_at_ms`: a row
+    /// that left `Created` and returned (lock expiry / retryable failure) has
+    /// its `last_update_ms` advanced PAST `created_at_ms`, i.e. non-fresh. A
+    /// replayed activation landing at exactly the floor on such a row must be
+    /// HELD — it must not re-stamp worker/deadline onto the returned-to-
+    /// `Created` row. Seed that non-fresh state directly (`last_update_ms >
+    /// created_at_ms`) so this test exercises the held branch the seed test's
+    /// fresh row cannot.
+    #[test]
+    fn replayed_activation_is_held_on_a_non_fresh_row() {
+        let store = ReadStore::open(None).unwrap();
+
+        // A genuine creation (identity 100) then a genuine activation (identity
+        // 200) project the row to Activated with floor 200.
+        apply_at(
+            &store,
+            &Event::JobCreated {
+                job_key: 8_800,
+                instance_key: 7_800,
+                element_instance_key: 7_801,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 100,
+                priority: 0,
+                retries: 3,
+            },
+            100,
+        );
+        apply_at(
+            &store,
+            &Event::JobActivated {
+                job_key: 8_800,
+                instance_key: 7_800,
+                durable: false,
+                worker: "w1".to_string(),
+                deadline: 60_000,
+                activated_at: Some(200),
+                fetch_variables: Vec::new(),
+                lease_token: None,
+            },
+            200,
+        );
+        let activated = job_row(&store, 8_800);
+        assert_eq!(activated.state, nanobpmn_engine_core::JobState::Activated);
+        assert_eq!(activated.last_event_identity_ms, 200);
+
+        // The job's lock then expires (or it fails retryably) and it returns to
+        // `Created`: the engine clears worker/deadline and advances
+        // `last_update_ms` PAST `created_at_ms`, marking the row non-fresh.
+        // Model that returned-to-`Created` state directly so the gate's
+        // `fresh` discriminator reads false.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL, \
+                 lease_token = NULL, last_update_ms = ?3 WHERE key = ?1",
+                rusqlite::params![
+                    8_800i64,
+                    super::job_state_code(nanobpmn_engine_core::JobState::Created),
+                    300i64 // last_update_ms advanced past created_at_ms (100) -> non-fresh
+                ],
+            )
+            .unwrap();
+        }
+        let returned = job_row(&store, 8_800);
+        assert_eq!(returned.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(returned.worker, None);
+        assert_eq!(returned.last_update_ms, Some(300));
+        assert!(returned.last_update_ms.unwrap() > returned.created_at_ms);
+
+        // The journal tail now REPLAYS the same activation (identity 200 ==
+        // floor). On a non-fresh row the gate must HOLD it: the row stays
+        // `Created` with cleared worker/deadline, NOT re-stamped to the stale
+        // activation's w1/60000.
+        apply_at(
+            &store,
+            &Event::JobActivated {
+                job_key: 8_800,
+                instance_key: 7_800,
+                durable: false,
+                worker: "w1".to_string(),
+                deadline: 60_000,
+                activated_at: Some(200),
+                fetch_variables: Vec::new(),
+                lease_token: None,
+            },
+            9_000,
+        );
+        let after = job_row(&store, 8_800);
+        assert_eq!(
+            after.state,
+            nanobpmn_engine_core::JobState::Created,
+            "a replayed activation at the floor is HELD on a non-fresh row"
+        );
+        assert_eq!(
+            after.worker, None,
+            "the held replay must not re-stamp the stale worker"
+        );
+        assert_eq!(
+            after.deadline_ms, None,
+            "the held replay must not re-stamp the stale deadline"
+        );
         assert_eq!(after.last_event_identity_ms, 200);
     }
 
