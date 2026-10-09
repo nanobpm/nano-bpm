@@ -5083,37 +5083,79 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // AT OR BELOW the floor and its upsert becomes a no-op. `MAX` never
             // lowers the floor; a legacy `None` (`activated_at` predates the
             // field) leaves it where it is.
+            //
+            // Gate the state transition (#1346): apply it only when this
+            // activation is genuinely new. The engine stamps `activated_at` from
+            // the activation command's monotonic `now`, so a genuine activation
+            // has `activated_at >=` the stored floor (`>` for a re-activation
+            // after a lock expiry / retryable failure, `==` only for the
+            // same-tick first activation). A REPLAYED `JobActivated` re-stamps
+            // the SAME identity, so it is either strictly below the floor (an
+            // earlier activation) or — for the most-recent activation — EQUAL to
+            // it. The equal case is ambiguous with the genuine same-tick first
+            // activation, so disambiguate by the row's progress: a fresh row has
+            // `last_update_ms == created_at_ms` (it has never left `Created`),
+            // whereas a replayed activation reaches a RETURNED-to-`Created` row
+            // whose `last_update_ms` the genuine lock-expiry/failure already
+            // advanced PAST `created_at_ms`. Apply the transition iff
+            // `activated_at > prior_floor` (a genuinely newer activation) OR
+            // (`activated_at == prior_floor` AND the row is still fresh). A
+            // replayed activation is then held — it no longer re-activates a
+            // returned-to-`Created` row, which in turn keeps a trailing replayed
+            // `state = Activated`-guarded event (`JobLockExpired`) a no-op rather
+            // than re-stamping `lastUpdateTime` with the replay batch's fresh
+            // `now_ms`. The floor-raise below is unconditional so the floor
+            // always reflects the newest activation seen.
+            let (prior_floor, fresh): (i64, bool) = tx.query_row(
+                "SELECT COALESCE(last_event_identity_ms, 0), \
+                 COALESCE(last_update_ms, created_at_ms) <= created_at_ms \
+                 FROM jobs WHERE key = ?1",
+                params![*job_key as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            // A legacy (`activated_at == None`, pre-field) activation carries no
+            // identity to gate on, so it always applies — gating it would break
+            // replay of a pre-#1344 journal. Only a `Some` identity is gated.
+            let apply_transition = match activated_at {
+                None => true,
+                Some(at) => {
+                    let at = *at as i64;
+                    at > prior_floor || (at == prior_floor && fresh)
+                }
+            };
             tx.cexecute(
                 "UPDATE jobs SET last_event_identity_ms = \
                  MAX(COALESCE(last_event_identity_ms, 0), ?2) WHERE key = ?1",
                 params![*job_key as i64, activated_at.unwrap_or(0) as i64],
             )?;
-            if fetch_variables.is_empty() {
-                tx.cexecute(
-                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, lease_token = ?5 WHERE key = ?1",
-                    params![
-                        *job_key as i64,
-                        job_state_code(JobState::Activated),
-                        worker_attribution(Some(worker.as_str())),
-                        *deadline as i64,
-                        lease_token,
-                    ],
-                )?;
-            } else {
-                let read_set =
-                    serde_json::to_string(fetch_variables).unwrap_or_else(|_| "[]".into());
-                tx.cexecute(
-                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, read_set = ?5, lease_token = ?6 \
-                     WHERE key = ?1",
-                    params![
-                        *job_key as i64,
-                        job_state_code(JobState::Activated),
-                        worker_attribution(Some(worker.as_str())),
-                        *deadline as i64,
-                        read_set,
-                        lease_token,
-                    ],
-                )?;
+            if apply_transition {
+                if fetch_variables.is_empty() {
+                    tx.cexecute(
+                        "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, lease_token = ?5 WHERE key = ?1",
+                        params![
+                            *job_key as i64,
+                            job_state_code(JobState::Activated),
+                            worker_attribution(Some(worker.as_str())),
+                            *deadline as i64,
+                            lease_token,
+                        ],
+                    )?;
+                } else {
+                    let read_set =
+                        serde_json::to_string(fetch_variables).unwrap_or_else(|_| "[]".into());
+                    tx.cexecute(
+                        "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, read_set = ?5, lease_token = ?6 \
+                         WHERE key = ?1",
+                        params![
+                            *job_key as i64,
+                            job_state_code(JobState::Activated),
+                            worker_attribution(Some(worker.as_str())),
+                            *deadline as i64,
+                            read_set,
+                            lease_token,
+                        ],
+                    )?;
+                }
             }
         }
 
@@ -10716,7 +10758,10 @@ mod element_instance_tests {
             instance_key: INST,
             worker: "W".into(),
             deadline,
-            activated_at: Some(1),
+            // `activated_at` is the engine's monotonic activation instant, always
+            // `>= created_at` (123) — a value below it is impossible in
+            // production and would trip the #1346 replay gate.
+            activated_at: Some(124),
             fetch_variables: Vec::new(),
             lease_token: None,
             durable: false,
@@ -12100,6 +12145,115 @@ mod read_surface_tests {
             row.last_event_identity_ms, 250,
             "the floor follows the newer event"
         );
+    }
+
+    /// Defect-class guard (#1346 review, "replay of lock expiry moves
+    /// `lastUpdateTime`"): a whole-prefix replay `[JobCreated, JobActivated,
+    /// JobLockExpired]` over a job that genuinely returned to `Created` must be a
+    /// no-op for `lastUpdateTime`. A TIMED_OUT carries no engine timestamp, so
+    /// the projection would otherwise stamp the replay batch's fresh `now_ms`.
+    /// The fix gates the `JobActivated` state transition: a replayed activation
+    /// (its identity at/below the floor, on a row the genuine expiry made
+    /// non-fresh) no longer re-activates the row, so the trailing replayed
+    /// `JobLockExpired`'s `state = Activated` guard keeps it a no-op.
+    #[test]
+    fn whole_prefix_replay_lock_expiry_does_not_move_last_update() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8605,
+            instance_key: 7605,
+            element_instance_key: 7606,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8605,
+            instance_key: 7605,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8605,
+            instance_key: 7605,
+        };
+
+        // Genuine history: create (t=100) -> activate (t=200) -> lock expiry
+        // (batch 2_000) returns the job to Created, stamping lastUpdateTime=2000.
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        let live = job_row(&store, 8605);
+        assert_eq!(live.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(live.last_update_ms, Some(2_000));
+
+        // Replay the WHOLE prefix in a later batch (batch 9_000). The replayed
+        // ACTIVATED must NOT re-activate the row, so the replayed LOCK_EXPIRED
+        // stays a no-op and does NOT re-stamp lastUpdateTime.
+        apply_at(&store, &created, 9_000);
+        apply_at(&store, &activated, 9_000);
+        apply_at(&store, &lock_expired, 9_000);
+        let replayed = job_row(&store, 8605);
+        assert_eq!(replayed.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(
+            replayed.last_update_ms,
+            Some(2_000),
+            "a replayed lock-expiry must not move lastUpdateTime to the replay batch time"
+        );
+    }
+
+    /// The `JobActivated` gate must not over-suppress a GENUINE re-activation:
+    /// after a lock expiry returns the job to `Created`, a worker genuinely
+    /// re-activates it at a strictly-later instant (a positive lock timeout makes
+    /// the re-activation's `activated_at` exceed the floor), and that activation
+    /// must land.
+    #[test]
+    fn genuine_reactivation_after_lock_expiry_still_applies() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8610,
+            instance_key: 7610,
+            element_instance_key: 7611,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = |at: u64, worker: &str| Event::JobActivated {
+            job_key: 8610,
+            instance_key: 7610,
+            durable: false,
+            worker: worker.to_string(),
+            deadline: 60_000,
+            activated_at: Some(at),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8610,
+            instance_key: 7610,
+        };
+
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated(200, "w1"), 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        assert_eq!(job_row(&store, 8610).state, nanobpmn_engine_core::JobState::Created);
+        // Genuine re-activation at a strictly-later instant (300 > the 200 floor).
+        apply_at(&store, &activated(300, "w2"), 2_500);
+        let row = job_row(&store, 8610);
+        assert_eq!(
+            row.state,
+            nanobpmn_engine_core::JobState::Activated,
+            "a genuine re-activation must apply"
+        );
+        assert_eq!(row.worker.as_deref(), Some("w2"));
     }
 
     /// Defect-class guard (#1344, equal-identity replay): the engine stamps both

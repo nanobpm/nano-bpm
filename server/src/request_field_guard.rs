@@ -1,7 +1,7 @@
 //! Request-field coverage guard (#1291).
 //!
 //! Every re-sync of the vendored Camunda spec (`spec/`) can add request fields
-//! to operations Nano already serves. The generator happily deserializes them,
+//! to operations Nano already serves. The generator happily deserializes them.
 //! This guard makes every such field an explicit
 //! decision: it derives the set of `Schema.property` pairs reachable from the
 //! request body of every served operation (the `OVERRIDES` table in
@@ -109,9 +109,15 @@ fn load_patches(root: &Path) -> HashMap<String, Vec<Value>> {
     };
     let mut by_file: HashMap<String, Vec<Value>> = HashMap::new();
     for entry in entries {
+        // Mirror `preprocess-spec.py::_load_patches` (`not isinstance(rel, str)
+        // or not rel`): an EMPTY `file` is rejected, not stored under an unused
+        // key. Accepting `file: ""` would let this guard derive the unpatched
+        // surface and pass a patch the real generator rejects — a drift surface
+        // between the guarded spec and the served one.
         let file = entry
             .get("file")
             .and_then(Value::as_str)
+            .filter(|f| !f.is_empty())
             .unwrap_or_else(|| panic!("patch missing a string 'file': {entry:?}"))
             .to_string();
         by_file.entry(file).or_default().push(entry);
@@ -662,4 +668,40 @@ fn apply_patch_append_appends_new_items() {
         ["keep", "added"],
         "append adds new items, dedupes existing"
     );
+}
+
+/// Defect-class guard (#1346 review): the patch loader must mirror
+/// `preprocess-spec.py::_load_patches` (`not isinstance(rel, str) or not rel`)
+/// and reject an EMPTY `file`. Accepting `file: ""` would store the patch under
+/// an unused key and let this guard derive the unpatched request surface while
+/// the real generator rejects it — a drift surface between the guarded spec and
+/// the served one.
+#[test]
+fn load_patches_fails_loud_on_an_empty_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "request-field-guard-empty-file-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("spec-patches")).unwrap();
+    std::fs::write(
+        dir.join("spec-patches/patches.yaml"),
+        "- file: \"\"\n  target: required\n  remove:\n    - keep\n",
+    )
+    .unwrap();
+
+    let outcome = std::panic::catch_unwind(|| {
+        load_patches(&dir);
+    });
+    let payload = outcome.expect_err("an empty patch `file` must panic, not be stored under ''");
+    let message = panic_message(payload);
+    assert!(
+        message.contains("missing a string 'file'"),
+        "the panic must reject the empty file, got: {message}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
