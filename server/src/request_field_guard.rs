@@ -9,36 +9,71 @@
 //! wired to the engine) and requires it to equal the checked-in manifest
 //! `spec-patches/request-fields.txt`.
 //!
-//! The derivation reads the spec exactly as the gateway *serves* it: the raw
-//! `spec/` files **with `spec-patches/patches.yaml` applied** (mirroring
-//! `scripts/preprocess-spec.py`). A nano extension added only by a patch - e.g.
-//! the `lastUpdateTime` job sort value, or the deprecated `leaseToken` /
-//! `jobLease` aliases - is request surface the generated server accepts, so it
-//! must be triaged here too; reading the unpatched spec would blind the guard to
-//! exactly those fields (a drift surface between the guarded spec and the served
-//! one).
+//! The derivation reads the spec exactly as the gateway *serves* it by reading
+//! the **preprocessed** spec tree under `build/spec/` - the output of
+//! `scripts/preprocess-spec.py` (sanitized, with `spec-patches/patches.yaml`
+//! applied) that the `rust-axum` generator consumes to produce the served
+//! `generated/` crate. That preprocessor is the *single source of truth* for
+//! patch application: the guard reads its output and does **not** re-implement
+//! the patch language. (An earlier version mirrored `preprocess-spec.py`'s
+//! `merge`/`append`/`remove` in Rust; the two implementations were a duplicate
+//! source of truth that drifted repeatedly - exactly the drift surface this
+//! guard exists to prevent elsewhere.) A nano extension added only by a patch -
+//! e.g. the `lastUpdateTime` job sort value, or the deprecated `leaseToken` /
+//! `jobLease` aliases - is already baked into `build/spec/`, so it is triaged
+//! here automatically; a bare, unpatched `spec/` would blind the guard to
+//! exactly those fields.
+//!
+//! `build/spec/` is a git-ignored codegen artifact produced by `make generate`
+//! alongside the `generated/` crate the server compiles against. Because this
+//! test lives in a crate that compiles against `generated/`, whenever it can
+//! build, `build/spec/` exists and is exactly as fresh as the served code. Run
+//! `make generate` first if it is absent.
 //!
 //! Manifest lines are `Schema.property`, optionally followed by
 //! `unhonoured #<issue>` for a field Nano accepts but does not act on yet.
 //! A new upstream field fails the guard until it is triaged into the manifest
 //! (implemented, or recorded as unhonoured with a tracking issue); a field
 //! upstream removed fails it as stale. Regenerate the field list (preserving
-//! annotations) with:
+//! annotations) with - first `make generate` so `build/spec/` reflects the
+//! current `spec/` + `spec-patches/`, then:
 //!
 //! ```text
+//! make generate
 //! UPDATE_REQUEST_FIELDS=1 cargo nextest run -p nanobpm-gateway-rest-server request_field
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
-use serde_yaml::{Mapping, Value};
+use serde_yaml::Value;
 
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("server/ has a parent")
         .to_path_buf()
+}
+
+/// The preprocessed spec tree the generator consumes (`build/spec/`, the output
+/// of `scripts/preprocess-spec.py` - sanitized, with `spec-patches/patches.yaml`
+/// applied). This is a git-ignored codegen artifact produced by `make generate`
+/// alongside the `generated/` crate the server compiles against, so it is
+/// present (and as fresh as the served code) whenever this test can build. Fail
+/// loud with an actionable message if it is missing rather than silently falling
+/// back to the unpatched `spec/` (which would blind the guard to patch-added
+/// request surface - a drift surface between the guarded spec and the served
+/// one).
+fn build_spec_dir() -> PathBuf {
+    let dir = repo_root().join("build/spec");
+    assert!(
+        dir.join("rest-api.yaml").is_file(),
+        "preprocessed spec not found at {} - run `make generate` first (it writes \
+         build/spec/ via scripts/preprocess-spec.py, the single source of truth \
+         for patch application)",
+        dir.display()
+    );
+    dir
 }
 
 /// `camelCase` / `PascalCase` -> `snake_case`, matching the generator's
@@ -85,197 +120,22 @@ fn served_operations() -> BTreeSet<String> {
 }
 
 /// Lazily-loaded multi-file spec with cross-file `$ref` resolution. Files are
-/// loaded with `spec-patches/patches.yaml` applied, so the derived field set
-/// matches the spec the gateway actually serves (see module docs).
+/// read from the preprocessed `build/spec/` tree (patches already applied by
+/// `scripts/preprocess-spec.py`), so the derived field set matches the spec the
+/// gateway actually serves (see module docs).
 struct Spec {
     dir: PathBuf,
     files: HashMap<String, Value>,
-    /// `patches.yaml` actions grouped by their target `file` (relative to `dir`).
-    patches: HashMap<String, Vec<Value>>,
-}
-
-/// Loads `spec-patches/patches.yaml`, grouping each action by its `file` so a
-/// file's overlays can be applied the moment it is first read. Missing file =>
-/// no patches (the guard still works against the raw spec). An EMPTY document
-/// parses to `Value::Null`, which `preprocess-spec.py::_load_patches` treats as
-/// no patches (`if loaded is None: return {}`) — mirror that, or the guard would
-/// reject a patch file the real preprocessor accepts (a drift surface).
-fn load_patches(root: &Path) -> HashMap<String, Vec<Value>> {
-    let path = root.join("spec-patches/patches.yaml");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    let parsed: Value =
-        serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
-    if parsed.is_null() {
-        return HashMap::new();
-    }
-    let Value::Sequence(entries) = parsed else {
-        panic!("{}: expected a top-level list of patches", path.display());
-    };
-    let mut by_file: HashMap<String, Vec<Value>> = HashMap::new();
-    for entry in entries {
-        // Mirror `preprocess-spec.py::_load_patches` (`not isinstance(rel, str)
-        // or not rel`): an EMPTY `file` is rejected, not stored under an unused
-        // key. Accepting `file: ""` would let this guard derive the unpatched
-        // surface and pass a patch the real generator rejects — a drift surface
-        // between the guarded spec and the served one.
-        let file = entry
-            .get("file")
-            .and_then(Value::as_str)
-            .filter(|f| !f.is_empty())
-            .unwrap_or_else(|| panic!("patch missing a string 'file': {entry:?}"))
-            .to_string();
-        by_file.entry(file).or_default().push(entry);
-    }
-    by_file
-}
-
-/// Deep-merges `addition` into `target` additively (mirrors
-/// `preprocess-spec.py::_deep_merge`): where both hold a mapping the merge
-/// recurses, otherwise the addition's value overwrites.
-fn deep_merge(target: &mut Value, addition: &Value) {
-    let (Some(t), Some(a)) = (target.as_mapping_mut(), addition.as_mapping()) else {
-        return;
-    };
-    for (key, value) in a {
-        match t.get_mut(key) {
-            Some(existing) if existing.is_mapping() && value.is_mapping() => {
-                deep_merge(existing, value)
-            }
-            _ => {
-                t.insert(key.clone(), value.clone());
-            }
-        }
-    }
-}
-
-/// Walks the dotted `target` (e.g. `components.schemas.Foo.required`), creating
-/// intermediate mappings on demand, and returns `(parent_container, last_key)` -
-/// mirrors `preprocess-spec.py::_resolve_parent` (naive split on `.`).
-fn resolve_parent<'a>(doc: &'a mut Value, dotted: &str) -> (&'a mut Value, String) {
-    let parts: Vec<&str> = dotted.split('.').collect();
-    let (last, parents) = parts.split_last().expect("patch target is non-empty");
-    let mut node = doc;
-    for part in parents {
-        let map = node
-            .as_mapping_mut()
-            .unwrap_or_else(|| panic!("cannot descend into non-mapping at '{part}' in '{dotted}'"));
-        if !map.contains_key(*part) || map.get(*part).is_some_and(Value::is_null) {
-            map.insert(
-                Value::String((*part).to_string()),
-                Value::Mapping(Mapping::new()),
-            );
-        }
-        node = map.get_mut(*part).expect("intermediate node just ensured");
-    }
-    (node, (*last).to_string())
-}
-
-/// Applies a single `patches.yaml` action to a parsed file document, mirroring
-/// `preprocess-spec.py::_apply_patch` (`merge` / `append` / `remove`).
-fn apply_patch(doc: &mut Value, patch: &Value) {
-    let target = patch
-        .get("target")
-        .and_then(Value::as_str)
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| panic!("patch missing a string 'target': {patch:?}"));
-    let (parent, last) = resolve_parent(doc, target);
-    let parent = parent
-        .as_mapping_mut()
-        .unwrap_or_else(|| panic!("target parent of '{target}' is not a mapping"));
-
-    if let Some(addition) = patch.get("merge") {
-        // Mirror `preprocess-spec.py::_apply_patch` exactly: a non-mapping
-        // `merge` payload is rejected, and an existing non-mapping target is
-        // rejected (only an absent/null target is created). Silently returning
-        // from `deep_merge` in either case would let this guard derive the
-        // unpatched request surface and pass even though the real generator
-        // fails — a drift surface between the guarded spec and the served one.
-        if !addition.is_mapping() {
-            panic!("'merge' for target '{target}' must be a mapping");
-        }
-        if !parent.contains_key(last.as_str())
-            || parent.get(last.as_str()).is_some_and(Value::is_null)
-        {
-            parent.insert(Value::String(last.clone()), Value::Mapping(Mapping::new()));
-        }
-        let node = parent.get_mut(last.as_str()).expect("merge node ensured");
-        if !node.is_mapping() {
-            panic!("cannot merge into non-mapping at target '{target}'");
-        }
-        deep_merge(node, addition);
-    } else if patch.get("append").is_some() {
-        // Mirror `preprocess-spec.py::_apply_patch`'s `elif "append" in patch`:
-        // branch selection is on the PRESENCE of `append`, then its value must be
-        // a list. Selecting on `as_sequence()` instead would let a patch carrying
-        // a NON-list `append` (plus a valid `remove`) fall through to the `remove`
-        // arm and pass this guard, while the real preprocessor enters `append` and
-        // rejects it — a drift surface between the guarded spec and the served one.
-        let items = patch
-            .get("append")
-            .and_then(Value::as_sequence)
-            .unwrap_or_else(|| panic!("'append' for target '{target}' must be a list"));
-        // Mirror `preprocess-spec.py::_apply_patch`'s `node = parent.get(last)` +
-        // `if node is None`: an EXPLICITLY NULL target (`required: null`) is
-        // treated exactly like an absent one and becomes a fresh list — Python's
-        // `dict.get` returns None for both. Treating null as "present" here would
-        // panic on the null→sequence conversion and reject a patch the real
-        // preprocessor accepts (the same parity rule the `merge` branch above
-        // already follows).
-        if !parent.contains_key(last.as_str())
-            || parent.get(last.as_str()).is_some_and(Value::is_null)
-        {
-            parent.insert(Value::String(last.clone()), Value::Sequence(Vec::new()));
-        }
-        let node = parent
-            .get_mut(last.as_str())
-            .and_then(Value::as_sequence_mut)
-            .unwrap_or_else(|| panic!("cannot append to non-list at target '{target}'"));
-        for item in items {
-            if !node.contains(item) {
-                node.push(item.clone());
-            }
-        }
-    } else if patch.get("remove").is_some() {
-        // Same presence-first selection as `append` (mirroring
-        // `preprocess-spec.py`): a non-list `remove` payload is rejected, not
-        // silently skipped to the `else`.
-        let items = patch
-            .get("remove")
-            .and_then(Value::as_sequence)
-            .unwrap_or_else(|| panic!("'remove' for target '{target}' must be a list"));
-        let node = parent
-            .get_mut(last.as_str())
-            .and_then(Value::as_sequence_mut)
-            .unwrap_or_else(|| panic!("cannot remove from non-list at target '{target}'"));
-        for item in items {
-            // Fail loud on a stale removal, mirroring `preprocess-spec.py`: after
-            // an upstream re-sync a `remove` that no longer matches is a stale
-            // patch that must be revisited, not silently ignored — otherwise this
-            // guard would pass a patch the real generator rejects.
-            let pos = node.iter().position(|e| e == item).unwrap_or_else(|| {
-                panic!("stale patch: {item:?} not present at target '{target}'")
-            });
-            node.remove(pos);
-        }
-    } else {
-        panic!("patch for target '{target}' has none of 'merge', 'append', 'remove'");
-    }
 }
 
 impl Spec {
     fn file(&mut self, name: &str) -> &Value {
         if !self.files.contains_key(name) {
-            let text = std::fs::read_to_string(self.dir.join(name))
-                .unwrap_or_else(|e| panic!("read spec/{name}: {e}"));
-            let mut doc: Value =
-                serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse spec/{name}: {e}"));
-            if let Some(patches) = self.patches.get(name) {
-                for patch in patches.clone() {
-                    apply_patch(&mut doc, &patch);
-                }
-            }
+            let path = self.dir.join(name);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let doc: Value = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
             self.files.insert(name.to_string(), doc);
         }
         self.files.get(name).expect("file just inserted")
@@ -373,9 +233,8 @@ fn walk(
 fn served_request_fields() -> (BTreeSet<String>, BTreeSet<String>) {
     let served = served_operations();
     let mut spec = Spec {
-        dir: repo_root().join("spec"),
+        dir: build_spec_dir(),
         files: HashMap::new(),
-        patches: load_patches(&repo_root()),
     };
     let paths = spec
         .file("rest-api.yaml")
@@ -513,292 +372,4 @@ fn request_fields_of_served_operations_are_all_triaged() {
             );
         }
     }
-}
-
-/// Defect-class guard (#1346 review): the guard's `remove` must mirror
-/// `preprocess-spec.py::_apply_patch` and FAIL LOUD on a stale removal (an item
-/// that is no longer present at the target). A silent skip would let a stale
-/// patch pass this guard even though the real generator rejects it — a drift
-/// surface between the guarded spec and the served one.
-#[test]
-fn apply_patch_remove_fails_loud_on_a_stale_removal() {
-    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
-    let patch =
-        serde_yaml::from_str::<Value>("target: required\nremove:\n  - already-gone-upstream\n")
-            .unwrap();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        apply_patch(&mut doc, &patch);
-    }));
-    let payload = outcome.expect_err("a stale removal must panic, not be silently ignored");
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or("");
-    assert!(
-        message.contains("stale patch") && message.contains("already-gone-upstream"),
-        "the panic must name the stale item and target, got: {message}"
-    );
-}
-
-/// The happy-path counterpart: a `remove` whose items ARE present applies
-/// cleanly (and stays a no-panic), so tightening stale-removal handling does not
-/// break the two live `remove` patches in `spec-patches/patches.yaml`.
-#[test]
-fn apply_patch_remove_removes_present_items() {
-    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n  - drop\n").unwrap();
-    let patch = serde_yaml::from_str::<Value>("target: required\nremove:\n  - drop\n").unwrap();
-    apply_patch(&mut doc, &patch);
-    let remaining: Vec<&str> = doc
-        .get("required")
-        .and_then(Value::as_sequence)
-        .unwrap()
-        .iter()
-        .map(Value::as_str)
-        .collect::<Option<Vec<_>>>()
-        .unwrap();
-    assert_eq!(remaining, ["keep"], "only the requested item is removed");
-}
-
-/// Defect-class guard (#1346 review): the guard's `merge` must mirror
-/// `preprocess-spec.py::_apply_patch` and FAIL LOUD on a non-mapping `merge`
-/// payload. Silently returning (the pre-fix `deep_merge` behaviour) would let a
-/// malformed patch pass this guard even though the real generator rejects it —
-/// the same drift surface as a stale `remove`.
-#[test]
-fn apply_patch_merge_fails_loud_on_a_non_mapping_payload() {
-    let mut doc = serde_yaml::from_str::<Value>("properties: {}\n").unwrap();
-    let patch =
-        serde_yaml::from_str::<Value>("target: properties\nmerge:\n  - not-a-mapping\n").unwrap();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        apply_patch(&mut doc, &patch);
-    }));
-    let payload = outcome.expect_err("a non-mapping merge payload must panic, not be skipped");
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or("");
-    assert!(
-        message.contains("must be a mapping") && message.contains("properties"),
-        "the panic must name the target, got: {message}"
-    );
-}
-
-/// The sibling failure mode: an EXISTING non-mapping target (a scalar/sequence
-/// already at the target key) must also fail loud, not be silently skipped by
-/// `deep_merge`. Only an absent/null target is created fresh (mirroring
-/// `preprocess-spec.py`).
-#[test]
-fn apply_patch_merge_fails_loud_on_a_non_mapping_target() {
-    let mut doc = serde_yaml::from_str::<Value>("properties: not-a-mapping\n").unwrap();
-    let patch =
-        serde_yaml::from_str::<Value>("target: properties\nmerge:\n  new-field: {}\n").unwrap();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        apply_patch(&mut doc, &patch);
-    }));
-    let payload = outcome.expect_err("merging into a non-mapping target must panic");
-    let message = payload
-        .downcast_ref::<String>()
-        .map(String::as_str)
-        .or_else(|| payload.downcast_ref::<&str>().copied())
-        .unwrap_or("");
-    assert!(
-        message.contains("cannot merge into non-mapping") && message.contains("properties"),
-        "the panic must name the target, got: {message}"
-    );
-}
-
-/// Panic-message extraction shared by the fail-loud patch tests.
-fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
-        .unwrap_or_default()
-}
-
-/// Defect-class guard (#1346 review, "previously missed"): the guard's branch
-/// selection must mirror `preprocess-spec.py::_apply_patch`, which dispatches on
-/// the PRESENCE of `append` (`elif "append" in patch`) and only then validates
-/// that its value is a list. Selecting on `as_sequence()` instead would let a
-/// patch carrying a NON-list `append` (plus a valid `remove`) fall through to
-/// the `remove` arm and pass this guard, while the real preprocessor enters
-/// `append` and rejects it — the exact drift the guard exists to catch.
-#[test]
-fn apply_patch_append_fails_loud_on_a_non_list_payload() {
-    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
-    let patch =
-        serde_yaml::from_str::<Value>("target: required\nappend: not-a-list\nremove:\n  - keep\n")
-            .unwrap();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        apply_patch(&mut doc, &patch);
-    }));
-    let payload =
-        outcome.expect_err("a non-list append payload must panic, not fall through to remove");
-    let message = panic_message(payload);
-    assert!(
-        message.contains("'append' for target 'required' must be a list"),
-        "the panic must reject the non-list append, got: {message}"
-    );
-}
-
-/// The sibling failure mode: a non-list `remove` payload must also fail loud on
-/// presence-first selection, not be silently skipped to the `else` (which would
-/// report a confusing "none of merge/append/remove" for a patch that HAS a
-/// `remove`).
-#[test]
-fn apply_patch_remove_fails_loud_on_a_non_list_payload() {
-    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
-    let patch = serde_yaml::from_str::<Value>("target: required\nremove: not-a-list\n").unwrap();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        apply_patch(&mut doc, &patch);
-    }));
-    let payload = outcome.expect_err("a non-list remove payload must panic");
-    let message = panic_message(payload);
-    assert!(
-        message.contains("'remove' for target 'required' must be a list"),
-        "the panic must reject the non-list remove, got: {message}"
-    );
-}
-
-/// The happy-path counterpart for `append`: a list payload applies (deduping
-/// against existing items), so presence-first selection does not break the live
-/// `append` patches in `spec-patches/patches.yaml`.
-#[test]
-fn apply_patch_append_appends_new_items() {
-    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
-    let patch =
-        serde_yaml::from_str::<Value>("target: required\nappend:\n  - keep\n  - added\n").unwrap();
-    apply_patch(&mut doc, &patch);
-    let items: Vec<&str> = doc
-        .get("required")
-        .and_then(Value::as_sequence)
-        .unwrap()
-        .iter()
-        .map(Value::as_str)
-        .collect::<Option<Vec<_>>>()
-        .unwrap();
-    assert_eq!(
-        items,
-        ["keep", "added"],
-        "append adds new items, dedupes existing"
-    );
-}
-
-/// Defect-class guard (#1346 review, "previously missed": handle null patch
-/// targets like absent targets): `preprocess-spec.py::_apply_patch`'s append
-/// branch resolves the target with `node = parent.get(last)` and creates a
-/// fresh list when `node is None` — which covers BOTH an absent key AND an
-/// explicitly null one (`required: null`). The guard must mirror that: treating
-/// a null target as "present" and then panicking on the null→sequence
-/// conversion would reject a patch the real preprocessor accepts (a drift
-/// surface between the guarded spec and the served one). The `merge` branch
-/// already treats null like absent; `append` must too.
-#[test]
-fn apply_patch_append_treats_a_null_target_as_absent() {
-    let mut doc = serde_yaml::from_str::<Value>("required: null\n").unwrap();
-    let patch = serde_yaml::from_str::<Value>("target: required\nappend:\n  - added\n").unwrap();
-    apply_patch(&mut doc, &patch);
-    let items: Vec<&str> = doc
-        .get("required")
-        .and_then(Value::as_sequence)
-        .unwrap()
-        .iter()
-        .map(Value::as_str)
-        .collect::<Option<Vec<_>>>()
-        .unwrap();
-    assert_eq!(
-        items,
-        ["added"],
-        "an explicitly null append target becomes a fresh list, mirroring Python"
-    );
-}
-
-/// Defect-class guard (#1346 review, "previously missed"): the patch target must
-/// be rejected when EMPTY, mirroring `preprocess-spec.py::_apply_patch`
-/// (`not isinstance(target, str) or not target`). Without the emptiness check,
-/// `"".split('.')` yields one empty component, so `resolve_parent` returns the
-/// document root and the guard would patch an empty YAML key — passing a patch
-/// the production preprocessor rejects (a drift surface between the guarded
-/// spec and the served one).
-#[test]
-fn apply_patch_fails_loud_on_an_empty_target() {
-    let mut doc = serde_yaml::from_str::<Value>("required:\n  - keep\n").unwrap();
-    let patch = serde_yaml::from_str::<Value>("target: \"\"\nappend:\n  - added\n").unwrap();
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        apply_patch(&mut doc, &patch);
-    }));
-    let payload = outcome.expect_err("an empty patch target must panic");
-    let message = panic_message(payload);
-    assert!(
-        message.contains("patch missing a string 'target'"),
-        "the panic must reject the empty target, got: {message}"
-    );
-}
-
-/// Defect-class guard (#1346 review): the patch loader must mirror
-/// `preprocess-spec.py::_load_patches` (`not isinstance(rel, str) or not rel`)
-/// and reject an EMPTY `file`. Accepting `file: ""` would store the patch under
-/// an unused key and let this guard derive the unpatched request surface while
-/// the real generator rejects it — a drift surface between the guarded spec and
-/// the served one.
-#[test]
-fn load_patches_fails_loud_on_an_empty_file() {
-    let dir = std::env::temp_dir().join(format!(
-        "request-field-guard-empty-file-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(dir.join("spec-patches")).unwrap();
-    std::fs::write(
-        dir.join("spec-patches/patches.yaml"),
-        "- file: \"\"\n  target: required\n  remove:\n    - keep\n",
-    )
-    .unwrap();
-
-    let outcome = std::panic::catch_unwind(|| {
-        load_patches(&dir);
-    });
-    let payload = outcome.expect_err("an empty patch `file` must panic, not be stored under ''");
-    let message = panic_message(payload);
-    assert!(
-        message.contains("missing a string 'file'"),
-        "the panic must reject the empty file, got: {message}"
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// Defect-class guard (#1346 review, "empty YAML document causes guard panic"):
-/// an EMPTY `patches.yaml` parses to `Value::Null`, which
-/// `preprocess-spec.py::_load_patches` treats as no patches (`if loaded is None:
-/// return {}`). The guard must mirror that — return an empty map rather than
-/// panic on the non-sequence — or it would reject a patch file the real
-/// preprocessor accepts (a drift surface between the guarded spec and the served
-/// one).
-#[test]
-fn load_patches_treats_an_empty_document_as_no_patches() {
-    let dir = std::env::temp_dir().join(format!(
-        "request-field-guard-empty-doc-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(dir.join("spec-patches")).unwrap();
-    // An empty document (only a comment / whitespace) parses to Value::Null.
-    std::fs::write(dir.join("spec-patches/patches.yaml"), "# no patches yet\n").unwrap();
-
-    let patches = load_patches(&dir);
-    assert!(
-        patches.is_empty(),
-        "an empty patches.yaml must yield no patches, got: {patches:?}"
-    );
-
-    std::fs::remove_dir_all(&dir).ok();
 }
