@@ -1,23 +1,45 @@
 //! Request-field coverage guard (#1291).
 //!
 //! Every re-sync of the vendored Camunda spec (`spec/`) can add request fields
-//! to operations Nano already serves. The generator happily deserializes them,
-//! so an unhandled new field is *silently ignored* - the request "works" but
-//! the field has no effect. This guard makes every such field an explicit
+//! to operations Nano already serves. The generator happily deserializes them.
+//! This guard makes every such field an explicit
 //! decision: it derives the set of `Schema.property` pairs reachable from the
 //! request body of every served operation (the `OVERRIDES` table in
 //! `scripts/gen-stub-server.py` - the single source of which operations are
 //! wired to the engine) and requires it to equal the checked-in manifest
 //! `spec-patches/request-fields.txt`.
 //!
+//! The derivation reads the spec exactly as the gateway *serves* it by reading
+//! the **preprocessed** spec tree under `build/spec/` - the output of
+//! `scripts/preprocess-spec.py` (sanitized, with `spec-patches/patches.yaml`
+//! applied) that the `rust-axum` generator consumes to produce the served
+//! `generated/` crate. That preprocessor is the *single source of truth* for
+//! patch application: the guard reads its output and does **not** re-implement
+//! the patch language. (An earlier version mirrored `preprocess-spec.py`'s
+//! `merge`/`append`/`remove` in Rust; the two implementations were a duplicate
+//! source of truth that drifted repeatedly - exactly the drift surface this
+//! guard exists to prevent elsewhere.) A nano extension added only by a patch -
+//! e.g. the `lastUpdateTime` job sort value, or the deprecated `leaseToken` /
+//! `jobLease` aliases - is already baked into `build/spec/`, so it is triaged
+//! here automatically; a bare, unpatched `spec/` would blind the guard to
+//! exactly those fields.
+//!
+//! `build/spec/` is a git-ignored codegen artifact produced by `make generate`
+//! alongside the `generated/` crate the server compiles against. Because this
+//! test lives in a crate that compiles against `generated/`, whenever it can
+//! build, `build/spec/` exists and is exactly as fresh as the served code. Run
+//! `make generate` first if it is absent.
+//!
 //! Manifest lines are `Schema.property`, optionally followed by
 //! `unhonoured #<issue>` for a field Nano accepts but does not act on yet.
 //! A new upstream field fails the guard until it is triaged into the manifest
 //! (implemented, or recorded as unhonoured with a tracking issue); a field
 //! upstream removed fails it as stale. Regenerate the field list (preserving
-//! annotations) with:
+//! annotations) with - first `make generate` so `build/spec/` reflects the
+//! current `spec/` + `spec-patches/`, then:
 //!
 //! ```text
+//! make generate
 //! UPDATE_REQUEST_FIELDS=1 cargo nextest run -p nanobpm-gateway-rest-server request_field
 //! ```
 
@@ -31,6 +53,27 @@ fn repo_root() -> PathBuf {
         .parent()
         .expect("server/ has a parent")
         .to_path_buf()
+}
+
+/// The preprocessed spec tree the generator consumes (`build/spec/`, the output
+/// of `scripts/preprocess-spec.py` - sanitized, with `spec-patches/patches.yaml`
+/// applied). This is a git-ignored codegen artifact produced by `make generate`
+/// alongside the `generated/` crate the server compiles against, so it is
+/// present (and as fresh as the served code) whenever this test can build. Fail
+/// loud with an actionable message if it is missing rather than silently falling
+/// back to the unpatched `spec/` (which would blind the guard to patch-added
+/// request surface - a drift surface between the guarded spec and the served
+/// one).
+fn build_spec_dir() -> PathBuf {
+    let dir = repo_root().join("build/spec");
+    assert!(
+        dir.join("rest-api.yaml").is_file(),
+        "preprocessed spec not found at {} - run `make generate` first (it writes \
+         build/spec/ via scripts/preprocess-spec.py, the single source of truth \
+         for patch application)",
+        dir.display()
+    );
+    dir
 }
 
 /// `camelCase` / `PascalCase` -> `snake_case`, matching the generator's
@@ -76,7 +119,10 @@ fn served_operations() -> BTreeSet<String> {
     ops
 }
 
-/// Lazily-loaded multi-file spec with cross-file `$ref` resolution.
+/// Lazily-loaded multi-file spec with cross-file `$ref` resolution. Files are
+/// read from the preprocessed `build/spec/` tree (patches already applied by
+/// `scripts/preprocess-spec.py`), so the derived field set matches the spec the
+/// gateway actually serves (see module docs).
 struct Spec {
     dir: PathBuf,
     files: HashMap<String, Value>,
@@ -84,12 +130,15 @@ struct Spec {
 
 impl Spec {
     fn file(&mut self, name: &str) -> &Value {
-        let dir = self.dir.clone();
-        self.files.entry(name.to_string()).or_insert_with(|| {
-            let text = std::fs::read_to_string(dir.join(name))
-                .unwrap_or_else(|e| panic!("read spec/{name}: {e}"));
-            serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse spec/{name}: {e}"))
-        })
+        if !self.files.contains_key(name) {
+            let path = self.dir.join(name);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let doc: Value = serde_yaml::from_str(&text)
+                .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+            self.files.insert(name.to_string(), doc);
+        }
+        self.files.get(name).expect("file just inserted")
     }
 
     /// Resolves `file.yaml#/a/b` (or `#/a/b` relative to `cur`) to
@@ -184,7 +233,7 @@ fn walk(
 fn served_request_fields() -> (BTreeSet<String>, BTreeSet<String>) {
     let served = served_operations();
     let mut spec = Spec {
-        dir: repo_root().join("spec"),
+        dir: build_spec_dir(),
         files: HashMap::new(),
     };
     let paths = spec

@@ -38,11 +38,17 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 12;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
 const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
+/// The schema version that introduced the job replay-identity floor
+/// (`jobs.last_event_identity_ms`, #1344). A database migrated across it
+/// receives the column as `0`, so its rows need the floor backfilled from the
+/// best instant the migrated row already carries (see
+/// [`ReadStore::ensure_schema_on`]).
+const JOB_REPLAY_FLOOR_SCHEMA_VERSION: i64 = 12;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -52,7 +58,7 @@ const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -6985736873706243559;
+const SCHEMA_FINGERPRINT: i64 = 4239213449374020042;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -137,6 +143,30 @@ CREATE TABLE jobs (
     job_kind               INTEGER NOT NULL DEFAULT 0,
     listener_event_type    INTEGER NOT NULL DEFAULT 0,
     created_at_ms          INTEGER NOT NULL DEFAULT 0,
+    -- Job timing for the Camunda-parity read model (#1344). `last_update_ms` is
+    -- the record-timestamp of the most recent projected job event (CREATED and
+    -- every subsequent FAILED / TIMED_OUT / RETRIES_UPDATED / TIMEOUT_UPDATED /
+    -- ERROR_THROWN / COMPLETED / CANCELED — activation is NOT projected, matching
+    -- Camunda). `end_ms` is the record-timestamp of the active→terminal
+    -- COMPLETED / CANCELED transition only (failures, timeouts and errors leave it
+    -- NULL). Both are NULL for rows migrated from a pre-#1344 database.
+    last_update_ms         INTEGER,
+    end_ms                 INTEGER,
+    -- Replay identity of the last projected job event (#1344 overlapping-prefix
+    -- idempotency): the engine-carried logical instant of the most recent event
+    -- that had one (CREATED's `created_at`, ACTIVATED's `activated_at`), else
+    -- `0`. `state` cannot carry this identity — lock expiry, a retryable
+    -- failure and incident resolution all RETURN a job to `Created`, so a
+    -- state-guarded upsert cannot tell a replayed `JobCreated` from the genuine
+    -- one. A replayed prefix re-stamps the SAME identity, never a larger one
+    -- (a genuine new event is always later), so the job-CREATION upsert gates
+    -- its state/retries/worker/deadline refresh on `created_at >=
+    -- COALESCE(last_event_identity_ms, 0)` and ACTIVATED raises the floor —
+    -- making a replayed `JobCreated` over a returned-to-`Created` row a no-op
+    -- while a genuine later event still applies. `0`/NULL (legacy events and
+    -- migrated rows that carry no timestamp) disables the gate, preserving the
+    -- prior last-writer-wins behaviour for pre-field journals.
+    last_event_identity_ms INTEGER NOT NULL DEFAULT 0,
     -- Declared read-set (`fetchVariables`) recorded on the durable
     -- `JobActivated` event: the variable names the worker asked for on the most
     -- recent activation that declared a non-empty set. Preserved across a later
@@ -916,7 +946,7 @@ impl InstanceFilter {
     }
 }
 
-fn job_state_code(s: JobState) -> i64 {
+const fn job_state_code(s: JobState) -> i64 {
     match s {
         JobState::Created => 0,
         JobState::Activated => 1,
@@ -925,6 +955,27 @@ fn job_state_code(s: JobState) -> i64 {
         JobState::Completed => 4,
         JobState::Canceled => 5,
     }
+}
+
+/// The terminal job-state codes that carry **no** `endTime` (`Failed`,
+/// `Errored`), **derived** from the canonical [`job_state_code`] mapping rather
+/// than hard-coded. These are the states the `lastUpdateTime`-freeze arm must
+/// hold at (a terminal `endTime`-less job must not have `lastUpdateTime` pushed
+/// past its first terminal transition — #1344). Mirrors
+/// [`TERMINAL_INSTANCE_STATE_CODES`] so the SQL can never drift from the
+/// enum-to-int codes should [`job_state_code`] ever be renumbered.
+const ENDTIMELESS_TERMINAL_JOB_STATE_CODES: [i64; 2] = [
+    job_state_code(JobState::Failed),
+    job_state_code(JobState::Errored),
+];
+
+/// Builds a `<column> IN (<endTime-less terminal job codes>)` SQL predicate from
+/// [`ENDTIMELESS_TERMINAL_JOB_STATE_CODES`]. Use this instead of writing a
+/// literal `state IN (2, 3)`, so the freeze arm has one source of truth (mirrors
+/// [`terminal_state_predicate`]).
+fn endtimeless_terminal_job_predicate(column: &str) -> String {
+    let [failed, errored] = ENDTIMELESS_TERMINAL_JOB_STATE_CODES;
+    format!("{column} IN ({failed}, {errored})")
 }
 fn job_state_from(code: i64) -> JobState {
     match code {
@@ -1331,6 +1382,26 @@ pub struct JobRow {
     /// [`crate::Event::JobCreated`]. `0` for jobs created before the engine
     /// recorded the field. Feeds the `/v2/jobs/statistics/*` `created` counters.
     pub created_at_ms: u64,
+    /// Record-timestamp (epoch ms) of the most recent projected job event — the
+    /// Camunda `lastUpdateTime` (#1344). Set on `JobCreated` and every subsequent
+    /// projected job event (fail, timeout, retries update, timeout update, error,
+    /// completion, cancellation). `None` for rows migrated from a pre-#1344
+    /// database that never saw a fresh job event.
+    pub last_update_ms: Option<u64>,
+    /// Record-timestamp (epoch ms) of the active→terminal `JobCompleted` /
+    /// `JobCanceled` transition — the Camunda `endTime` (#1344). `None` while the
+    /// job is live, and for a job that reached a non-completing terminal state
+    /// (failed / errored). Stamped once; a re-delivery of the terminal event is a
+    /// no-op.
+    pub end_ms: Option<u64>,
+    /// Replay identity of the last projected job event (#1344): the
+    /// engine-carried logical instant of the most recent event that had one
+    /// (CREATED's `created_at`, ACTIVATED's `activated_at`), else `0`. Internal
+    /// to the projection — it is the monotone floor that lets a replayed
+    /// event be told from a genuine new one (which `state` alone cannot: lock
+    /// expiry / a retryable failure / incident resolution all return a job to
+    /// `Created`). `0` for legacy events and migrated rows.
+    pub last_event_identity_ms: u64,
     /// The declared read-set (`fetchVariables`) recorded on the most recent
     /// durable [`crate::Event::JobActivated`] for this job that declared a
     /// non-empty set — the variable names the worker was handed. Preserved across
@@ -1928,6 +1999,30 @@ impl ReadStore {
             conn.execute(
                 "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
                 params![EVENT_WAITS_BACKFILL_KEY],
+            )?;
+        }
+        // The job replay-identity floor (`last_event_identity_ms`, v12) is added
+        // by the reconcile above as `0` on every existing row, and a normal
+        // restart resumes from `exported_position` WITHOUT reseeding from engine
+        // state — so a migrated row would keep the disabled (`0`) floor while the
+        // journal tail replays. A replayed `JobCreated` (`created_at > 0`) would
+        // then pass the strict-newer gate over a job that had genuinely advanced
+        // before the upgrade and RETURNED to `Created` (lock expiry / retryable
+        // failure), regressing its retries and `lastUpdateTime`. Backfill the
+        // floor from the best instant the migrated row already carries: a
+        // pre-#1344 database has no `last_update_ms`, so `created_at_ms` (the
+        // job's genuine creation instant) is the only available lower bound. It
+        // is exact for a never-activated job (floor == creation identity, so the
+        // replayed genuine CREATED re-stamps the SAME value — a no-op) and the
+        // tightest available bound for a previously-activated one (the genuine
+        // activation instant is not recoverable from the migrated row). A legacy
+        // (`created_at_ms == 0`) row keeps floor `0`, preserving the pre-field
+        // last-writer-wins behaviour the `0` floor documents.
+        if stored_version.is_none_or(|v| v < JOB_REPLAY_FLOOR_SCHEMA_VERSION) {
+            conn.execute(
+                "UPDATE jobs SET last_event_identity_ms = \
+                 MAX(COALESCE(last_event_identity_ms, 0), COALESCE(created_at_ms, 0))",
+                [],
             )?;
         }
         let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
@@ -2676,7 +2771,8 @@ impl ReadStore {
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
                  retries, worker, deadline_ms, process_definition_id, process_definition_key, \
                  job_kind, listener_event_type, created_at_ms, read_set, CAST(lease_token AS TEXT), \
-                 business_id, error_message, error_code, has_failed_with_retries_left FROM jobs",
+                 business_id, error_message, error_code, has_failed_with_retries_left, \
+                 last_update_ms, end_ms, last_event_identity_ms FROM jobs",
             )
             .expect("prepare jobs");
         let rows = stmt.query_map([], map_job).expect("query jobs");
@@ -3226,6 +3322,9 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         error_message: r.get(17)?,
         error_code: r.get(18)?,
         has_failed_with_retries_left: r.get::<_, i64>(19)? != 0,
+        last_update_ms: r.get::<_, Option<i64>>(20)?.map(|v| v.max(0) as u64),
+        end_ms: r.get::<_, Option<i64>>(21)?.map(|v| v.max(0) as u64),
+        last_event_identity_ms: r.get::<_, i64>(22)?.max(0) as u64,
     })
 }
 
@@ -3949,18 +4048,53 @@ fn project_engine_state(
     for job in state.jobs.values() {
         let (def_id, def_key) = instance_def(tx, job.instance_key);
         let (kind_code, event_code) = job_kind_codes(&job.kind);
+        // Timing (#1344): a snapshotted job is still live (terminal jobs are
+        // evicted from engine state), so `end_ms` stays NULL and `last_update_ms`
+        // seeds from the creation instant — the best lower bound available without
+        // the per-event history, matching `creationTime <= lastUpdateTime`. On a
+        // CONFLICT we deliberately do NOT overwrite `created_at_ms` /
+        // `last_update_ms` / `end_ms`: an existing read-model row already carries
+        // the authoritative event-derived values, which a compaction-floor reseed
+        // must not clobber. Seed `created_at_ms` with the SAME batch-observation
+        // fallback as `last_update_ms` when the snapshot predates `created_at`
+        // (legacy `0`), so a recovered legacy job surfaces a non-null
+        // `creationTime` (== `lastUpdateTime`) rather than a null creation time.
+        // Seed the replay-identity floor with the NEWEST engine-carried instant
+        // the snapshot has for this job — `max(created_at, activated_at)`, not
+        // creation alone: a job snapshotted while ACTIVATED carries its current
+        // activation instant in `activated_at`, and seeding only from creation
+        // would leave the floor below it. The journal tail then replays that
+        // same activation (`activated_at == floor`). The seeded row sets
+        // `last_update_ms == created_at_ms`, so the gate's `fresh` discriminator
+        // (`COALESCE(last_update_ms, created_at_ms) <= created_at_ms`) reads
+        // TRUE and the `at == prior_floor && fresh` arm APPLIES the replay —
+        // a no-op only because the replayed worker/deadline equal the seeded
+        // values (value-idempotence), not because the gate holds a non-fresh
+        // row. (The genuinely-held non-fresh path — a returned-to-`Created` row
+        // with `last_update_ms > created_at_ms` — is covered by
+        // `replayed_activation_is_held_on_a_non_fresh_row`.) On CONFLICT the
+        // floor is never lowered.
+        let last_update = if job.created_at != 0 {
+            job.created_at
+        } else {
+            now_ms
+        };
+        let creation_ms = last_update;
+        let replay_floor = job.created_at.max(job.activated_at.unwrap_or(0));
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
              job_kind, listener_event_type, lease_token, error_message, error_code, \
-             has_failed_with_retries_left, business_id) \
+             has_failed_with_retries_left, created_at_ms, last_update_ms, business_id, \
+             last_event_identity_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             (SELECT business_id FROM process_instances WHERE key = ?2)) \
+             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2), ?20) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
              worker = excluded.worker, deadline_ms = excluded.deadline_ms, \
              lease_token = excluded.lease_token, error_message = excluded.error_message, \
              error_code = excluded.error_code, \
-             has_failed_with_retries_left = excluded.has_failed_with_retries_left",
+             has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
+             last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
             params![
                 job.key as i64,
                 job.instance_key as i64,
@@ -3989,6 +4123,9 @@ fn project_engine_state(
                 job.error_message,
                 job.error_code,
                 i64::from(job.has_failed_with_retries_left),
+                creation_ms as i64,
+                last_update as i64,
+                replay_floor as i64,
             ],
         )?;
     }
@@ -4736,14 +4873,84 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             ..
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
+            // Camunda seeds both `creationTime` and the first `lastUpdateTime`
+            // from the CREATED record timestamp. Prefer the engine-carried,
+            // replay-stable `created_at`; fall back to the batch observation time
+            // for older events that never recorded it (#1344). Seed BOTH columns
+            // from the same value so a legacy (created_at == 0) job surfaces a
+            // non-null `creationTime` (== `lastUpdateTime`) after recovery rather
+            // than a null creation time against a populated last-update time.
+            let creation_ms = if *created_at != 0 {
+                *created_at
+            } else {
+                now_ms
+            };
+            let last_update = creation_ms;
+            // The ON CONFLICT path fires only on re-delivery / overlapping-prefix
+            // replay — a job's single genuine CREATED already landed — so it must
+            // be a replay no-op and must never regress a row that has since
+            // advanced (#1344 projection idempotency). `state` alone cannot carry
+            // that identity: lock expiry, a retryable failure and incident
+            // resolution all RETURN a job to `Created`, so a state-guarded upsert
+            // would mistake the replayed CREATED for the genuine one and
+            // overwrite state/retries/worker/deadline and re-stamp
+            // `last_update_ms`. The replay discriminator is the event's
+            // engine-carried `created_at` against the stored
+            // `last_event_identity_ms` floor (the logical instant of the most
+            // recent event that carried one): a replayed prefix re-stamps the
+            // SAME identity, a genuine new event is always later. The gate is
+            // STRICTLY newer (`>`), not `>=`: a replay's identity is always `<=`
+            // the floor, and the floor is not always strictly above it — the
+            // engine stamps `created_at` and `activated_at` from the same
+            // per-command `self.now`, so a same-tick create+activate raises the
+            // floor only to a value EQUAL to `created_at`. A non-strict gate
+            // would then admit the replayed CREATED (equal passes) and re-stamp
+            // `lastUpdateTime` off a later lock-expiry/failure update.
+            // - `created_at_ms`: keep the stored value unless THIS event carries a
+            //   real (nonzero) `created_at` that is STRICTLY NEWER than the floor
+            //   (`?12 > last_event_identity_ms`). A legacy (`created_at == 0`)
+            //   re-delivery must NOT re-stamp a fresh batch-time fallback (that
+            //   would move `creationTime` every replay); a later real timestamp
+            //   still repairs a stale fallback. The strict-newer gate also stops an
+            //   OLDER-identity replayed CREATED from regressing a creationTime a
+            //   newer-created repair already advanced (#1346): the repair raises
+            //   the floor, so the replay's identity is at/below it and held.
+            // - state/retries/worker/deadline: refreshed only when this CREATED
+            //   is strictly newer than the floor (`?12 > last_event_identity_ms`)
+            //   AND the row is still live-and-unactivated (`jobs.state = ?6`). The
+            //   identity gate alone is not enough for a TERMINAL row: without the
+            //   state guard a replayed CREATED would resurrect a Completed/Failed
+            //   job back to `Created`. Requiring `jobs.state = ?6` (Created) keeps
+            //   the refresh to the genuine creation / a repair on a still-created
+            //   row; a replayed CREATED over an advanced (Activated) or terminal
+            //   row leaves it untouched.
+            // - `last_update_ms`: frozen at `end_ms` when set; otherwise moved
+            //   only when this CREATED is strictly newer than the floor (a replay
+            //   holds it), preserving `lastUpdateTime == creationTime` on the
+            //   genuine creation without moving it on a re-delivery.
+            // - `last_event_identity_ms`: raised to this event's `created_at`
+            //   (never lowered); a legacy `0` leaves the floor where it is.
             tx.cexecute(
-                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                &format!(
+                    "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 created_at_ms, business_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, \
-                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
-                 ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
+                 created_at_ms, last_update_ms, business_id, last_event_identity_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, \
+                 (SELECT business_id FROM process_instances WHERE key = ?2), ?12) \
+                 ON CONFLICT(key) DO UPDATE SET \
+                 state = CASE WHEN jobs.state = ?6 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
+                 created_at_ms = CASE WHEN ?12 <> 0 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 last_update_ms = CASE \
+                     WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                     WHEN {freeze_jobs} THEN jobs.last_update_ms \
+                     WHEN ?12 <> 0 AND ?12 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END, \
+                 last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), ?12)",
+                    freeze_jobs = endtimeless_terminal_job_predicate("jobs.state"),
+                ),
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4754,6 +4961,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     *retries,
                     def_id,
                     def_key,
+                    creation_ms as i64,
+                    last_update as i64,
                     *created_at as i64,
                 ],
             )?;
@@ -4776,14 +4985,40 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 index: 0,
                 scope: 0,
             });
+            let last_update = if *created_at != 0 {
+                *created_at
+            } else {
+                now_ms
+            };
+            let creation_ms = last_update;
+            // See `JobCreated`: the ON CONFLICT path is a replay no-op that must
+            // not move `created_at_ms`/`last_update_ms` for a legacy re-delivery
+            // nor regress an advanced/terminal row (#1344). The replay
+            // discriminator is the event's `created_at` against the stored
+            // `last_event_identity_ms` floor (state alone cannot carry it — a
+            // job is legitimately RETURNED to `Created` by lock expiry, a
+            // retryable failure and incident resolution).
             tx.cexecute(
-                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                &format!(
+                    "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
                  state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
-                 job_kind, listener_event_type, created_at_ms, business_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, \
-                 (SELECT business_id FROM process_instances WHERE key = ?2)) \
-                 ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
-                 worker = NULL, deadline_ms = NULL, created_at_ms = excluded.created_at_ms",
+                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id, last_event_identity_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, \
+                 (SELECT business_id FROM process_instances WHERE key = ?2), ?14) \
+                 ON CONFLICT(key) DO UPDATE SET \
+                 state = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
+                 created_at_ms = CASE WHEN ?14 <> 0 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 last_update_ms = CASE \
+                     WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                     WHEN {freeze_jobs} THEN jobs.last_update_ms \
+                     WHEN ?14 <> 0 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END, \
+                 last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), ?14)",
+                    freeze_jobs = endtimeless_terminal_job_predicate("jobs.state"),
+                ),
                 params![
                     *job_key as i64,
                     *instance_key as i64,
@@ -4796,6 +5031,78 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     def_key,
                     kind_code,
                     event_code,
+                    creation_ms as i64,
+                    last_update as i64,
+                    *created_at as i64,
+                ],
+            )?;
+        }
+
+        Event::TaskListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            job_type,
+            event_type,
+            retries,
+            created_at,
+            ..
+        } => {
+            let (def_id, def_key) = instance_def(tx, *instance_key);
+            let (kind_code, event_code) = job_kind_codes(&JobKind::TaskListener {
+                event_type: *event_type,
+                index: 0,
+                user_task_key: 0,
+            });
+            let last_update = if *created_at != 0 {
+                *created_at
+            } else {
+                now_ms
+            };
+            let creation_ms = last_update;
+            // See `JobCreated`: the ON CONFLICT path is a replay no-op that must
+            // not move `created_at_ms`/`last_update_ms` for a legacy re-delivery
+            // nor regress an advanced/terminal row (#1344). The replay
+            // discriminator is the event's `created_at` against the stored
+            // `last_event_identity_ms` floor (state alone cannot carry it — a
+            // job is legitimately RETURNED to `Created` by lock expiry, a
+            // retryable failure and incident resolution).
+            tx.cexecute(
+                &format!(
+                    "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+                 job_kind, listener_event_type, created_at_ms, last_update_ms, business_id, last_event_identity_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11, ?12, ?13, \
+                 (SELECT business_id FROM process_instances WHERE key = ?2), ?14) \
+                 ON CONFLICT(key) DO UPDATE SET \
+                 state = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.state ELSE jobs.state END, \
+                 retries = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.retries ELSE jobs.retries END, \
+                 worker = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.worker END, \
+                 deadline_ms = CASE WHEN jobs.state = ?6 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN NULL ELSE jobs.deadline_ms END, \
+                 created_at_ms = CASE WHEN ?14 <> 0 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.created_at_ms ELSE jobs.created_at_ms END, \
+                 last_update_ms = CASE \
+                     WHEN jobs.end_ms IS NOT NULL THEN jobs.end_ms \
+                     WHEN {freeze_jobs} THEN jobs.last_update_ms \
+                     WHEN ?14 <> 0 AND ?14 > COALESCE(jobs.last_event_identity_ms, 0) THEN excluded.last_update_ms \
+                     ELSE jobs.last_update_ms END, \
+                 last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), ?14)",
+                    freeze_jobs = endtimeless_terminal_job_predicate("jobs.state"),
+                ),
+                params![
+                    *job_key as i64,
+                    *instance_key as i64,
+                    *element_instance_key as i64,
+                    element_id,
+                    job_type,
+                    job_state_code(JobState::Created),
+                    *retries,
+                    def_id,
+                    def_key,
+                    kind_code,
+                    event_code,
+                    creation_ms as i64,
+                    last_update as i64,
                     *created_at as i64,
                 ],
             )?;
@@ -4807,58 +5114,137 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             deadline,
             fetch_variables,
             lease_token,
+            activated_at,
             ..
         } => {
-            // Record the declared read-set alongside the activation. Serialized as
-            // a JSON array (mirrors `candidate_groups`); empty stays '[]'. Only
-            // overwritten when this activation declared a set, so a subsequent
-            // fetch-all re-activation of the same job does not erase the last
-            // declared provenance.
+            // Raise the replay-identity floor (#1344): `activated_at` is the
+            // engine-carried logical instant of this activation, so it orders at
+            // or after the job's `created_at` (both derive from the engine's
+            // per-command `self.now`, so a same-tick create+activate makes them
+            // EQUAL — the floor then equals `created_at`, which is exactly why
+            // the creation-upsert gate is strict `>`, not `>=`). Recording it
+            // lets a later replayed `JobCreated` (same identity as the stored
+            // floor's origin) be told from the genuine creation even after the
+            // job returned to `Created` — the replayed CREATED's identity is then
+            // AT OR BELOW the floor and its upsert becomes a no-op. `MAX` never
+            // lowers the floor; a legacy `None` (`activated_at` predates the
+            // field) leaves it where it is.
             //
-            // The `worker` binding is normalized through `worker_attribution`: an
-            // *empty* activation worker (`""`, e.g. an explicitly-supplied empty
-            // string, or replayed from a `JobActivated` written before the engine
-            // reducer normalized it) is not an attribution and must land as SQL
-            // NULL, not `""`. Otherwise the terminal `COALESCE(?, worker)` on a
-            // completion that carries no attribution would preserve that `""`,
-            // pinning the completed row to an empty worker (#1191).
-            if fetch_variables.is_empty() {
-                tx.cexecute(
-                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, lease_token = ?5 WHERE key = ?1",
-                    params![
-                        *job_key as i64,
-                        job_state_code(JobState::Activated),
-                        worker_attribution(Some(worker.as_str())),
-                        *deadline as i64,
-                        lease_token,
-                    ],
-                )?;
-            } else {
-                let read_set =
-                    serde_json::to_string(fetch_variables).unwrap_or_else(|_| "[]".into());
-                tx.cexecute(
-                    "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, read_set = ?5, lease_token = ?6 \
-                     WHERE key = ?1",
-                    params![
-                        *job_key as i64,
-                        job_state_code(JobState::Activated),
-                        worker_attribution(Some(worker.as_str())),
-                        *deadline as i64,
-                        read_set,
-                        lease_token,
-                    ],
-                )?;
+            // Gate the state transition (#1346): apply it only when this
+            // activation is genuinely new. The engine stamps `activated_at` from
+            // the activation command's monotonic `now`, so a genuine activation
+            // has `activated_at >=` the stored floor (`>` for a re-activation
+            // after a lock expiry / retryable failure, `==` only for the
+            // same-tick first activation). A REPLAYED `JobActivated` re-stamps
+            // the SAME identity, so it is either strictly below the floor (an
+            // earlier activation) or — for the most-recent activation — EQUAL to
+            // it. The equal case is ambiguous with the genuine same-tick first
+            // activation, so disambiguate by the row's progress: a fresh row has
+            // `last_update_ms == created_at_ms` (it has never left `Created`),
+            // whereas a replayed activation reaches a RETURNED-to-`Created` row
+            // whose `last_update_ms` the genuine lock-expiry/failure already
+            // advanced PAST `created_at_ms`. Apply the transition iff
+            // `activated_at > prior_floor` (a genuinely newer activation) OR
+            // (`activated_at == prior_floor` AND the row is still fresh). A
+            // replayed activation is then held — it no longer re-activates a
+            // returned-to-`Created` row, which in turn keeps a trailing replayed
+            // `state = Activated`-guarded event (`JobLockExpired`) a no-op rather
+            // than re-stamping `lastUpdateTime` with the replay batch's fresh
+            // `now_ms`. The floor-raise below is unconditional so the floor
+            // always reflects the newest activation seen.
+            //
+            // KNOWN LIMITATION (#1346 review): the discriminator is a
+            // millisecond logical instant, not a unique event identity, and the
+            // host clock is not monotonic across commands
+            // (`Engine::apply_command_at` takes `now` as a host reading). A
+            // genuine re-activation that lands in the SAME millisecond as the
+            // failure/lock-expiry that returned the job to `Created` would have
+            // `activated_at == prior_floor` on a non-fresh row and be held (its
+            // worker/deadline/lease left stale). That requires a retryable
+            // failure and its re-activation to be processed within one
+            // wall-clock millisecond — a positive lock timeout makes a same-ms
+            // lock-expiry→re-activation unreachable, and the two are distinct
+            // commands. The correct discriminator is a unique persisted
+            // event/position identity, which `project` is not currently threaded
+            // with; that is a deliberate follow-up, not patched here with a
+            // heuristic that would weaken the replay no-op this gate exists to
+            // guarantee.
+            let (prior_floor, fresh): (i64, bool) = tx.query_row(
+                "SELECT COALESCE(last_event_identity_ms, 0), \
+                 COALESCE(last_update_ms, created_at_ms) <= created_at_ms \
+                 FROM jobs WHERE key = ?1",
+                params![*job_key as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            // A legacy (`activated_at == None`, pre-field) activation carries no
+            // identity to gate on, so it always applies — gating it would break
+            // replay of a pre-#1344 journal. Only a `Some` identity is gated.
+            let apply_transition = match activated_at {
+                None => true,
+                Some(at) => {
+                    let at = *at as i64;
+                    at > prior_floor || (at == prior_floor && fresh)
+                }
+            };
+            tx.cexecute(
+                "UPDATE jobs SET last_event_identity_ms = \
+                 MAX(COALESCE(last_event_identity_ms, 0), ?2) WHERE key = ?1",
+                params![*job_key as i64, activated_at.unwrap_or(0) as i64],
+            )?;
+            if apply_transition {
+                if fetch_variables.is_empty() {
+                    tx.cexecute(
+                        "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, lease_token = ?5 WHERE key = ?1",
+                        params![
+                            *job_key as i64,
+                            job_state_code(JobState::Activated),
+                            worker_attribution(Some(worker.as_str())),
+                            *deadline as i64,
+                            lease_token,
+                        ],
+                    )?;
+                } else {
+                    let read_set =
+                        serde_json::to_string(fetch_variables).unwrap_or_else(|_| "[]".into());
+                    tx.cexecute(
+                        "UPDATE jobs SET state = ?2, worker = ?3, deadline_ms = ?4, read_set = ?5, lease_token = ?6 \
+                         WHERE key = ?1",
+                        params![
+                            *job_key as i64,
+                            job_state_code(JobState::Activated),
+                            worker_attribution(Some(worker.as_str())),
+                            *deadline as i64,
+                            read_set,
+                            lease_token,
+                        ],
+                    )?;
+                }
             }
         }
 
         Event::JobLockExpired { job_key, .. } => {
+            // Camunda projects the TIMED_OUT record timestamp onto `lastUpdateTime`
+            // (not `endTime`). Stamped only on the genuine Activated→Created
+            // transition, so a re-delivery is a no-op (#1344). The `end_ms`-guard
+            // is redundant with the `state = Activated` guard (a terminal job is
+            // never Activated) but is kept for class-uniformity with the other
+            // subsequent-event projections; the `state IN (2, 3)` arm is likewise
+            // class-uniform (a Failed/Errored job is never Activated either).
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL \
+                &format!(
+                    "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL, \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN {freeze} THEN last_update_ms \
+                     ELSE ?4 END \
                  WHERE key = ?1 AND state = ?3",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Created),
                     job_state_code(JobState::Activated),
+                    now_ms as i64,
                 ],
             )?;
         }
@@ -4872,13 +5258,49 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         } => {
             // Zeebe parity (#1327): every fail records the worker's message and
             // whether retries remain. `COALESCE` keeps the last known message for
-            // events serialized before the field existed.
+            // events serialized before the field existed. `lastUpdateTime` is
+            // frozen once the job is terminal (#1344): a re-delivered / replayed
+            // FAILED for a job that has already ended must NOT push
+            // `lastUpdateTime` past `endTime` (the `lastUpdateTime == endTime`
+            // invariant + the "re-delivery doesn't move the times" contract).
+            // Frozen at `endTime` when it is set (Completed/Canceled), and held
+            // at its current value once the job is in a terminal state that has
+            // NO `endTime` (Failed/Errored) — a re-delivered FAILED must not move
+            // `lastUpdateTime` off the first terminal transition.
+            //
+            // Retryable path (#1346): a retryable FAILED (retries > 0) is a
+            // genuine Activated→Created transition — the direct sibling of
+            // `JobLockExpired`. Stamp `lastUpdateTime` only on that genuine
+            // transition (`state = Activated`), so a whole-prefix replay that the
+            // `JobActivated` gate holds in `Created` leaves the stamp a no-op
+            // rather than re-stamping `lastUpdateTime` off the genuine failure
+            // instant. This is NOT a last-writer-wins admin op like
+            // `JobRetriesUpdated`: a re-delivered FAILED carries no newer
+            // information. The terminal path (retries == 0) is unaffected — its
+            // `end_ms`/terminal freeze arms already hold the re-delivery.
+            let retryable = *retries > 0;
             tx.cexecute(
-                "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
-                 has_failed_with_retries_left = ?3 WHERE key = ?1",
-                params![*job_key as i64, error_message, i64::from(*retries > 0)],
+                &format!(
+                    "UPDATE jobs SET error_message = COALESCE(?2, error_message), \
+                 has_failed_with_retries_left = ?3, \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN {freeze} THEN last_update_ms \
+                     WHEN ?5 AND state <> ?6 THEN last_update_ms \
+                     ELSE ?4 END \
+                 WHERE key = ?1",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
+                params![
+                    *job_key as i64,
+                    error_message,
+                    i64::from(*retries > 0),
+                    now_ms as i64,
+                    i64::from(retryable),
+                    job_state_code(JobState::Activated),
+                ],
             )?;
-            if *retries > 0 {
+            if retryable {
                 // Back to the activatable pool — drop the last activating worker.
                 tx.cexecute(
                     "UPDATE jobs SET state = ?2, retries = ?3, worker = NULL, deadline_ms = NULL \
@@ -4920,10 +5342,26 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // Zeebe parity (#1327): the thrown code and message land on the job;
             // the exporter keys `jobFailedWithRetriesLeft` off the record's
             // (unchanged) retries for ERROR_THROWN as well as FAILED.
+            // `lastUpdateTime` freeze (#1344): ERROR_THROWN transitions the job to
+            // terminal `Errored` but deliberately leaves `end_ms` NULL (Camunda
+            // stamps no `endTime` for an errored job), so the `end_ms`-guard alone
+            // never engages here and a re-delivered/replayed ERROR_THROWN would
+            // stamp a fresh `now_ms` every time. Freeze at `endTime` when set
+            // (Completed/Canceled), and hold the current value once the job is in
+            // a terminal `endTime`-less state (Failed/Errored) — the first
+            // transition still stamps `now_ms`, a re-delivery is then a no-op.
             tx.cexecute(
-                "UPDATE jobs SET error_code = ?2, error_message = COALESCE(?3, error_message), \
-                 has_failed_with_retries_left = (retries > 0) WHERE key = ?1",
-                params![*job_key as i64, error_code, error_message],
+                &format!(
+                    "UPDATE jobs SET error_code = ?2, error_message = COALESCE(?3, error_message), \
+                 has_failed_with_retries_left = (retries > 0), \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN {freeze} THEN last_update_ms \
+                     ELSE ?4 END \
+                 WHERE key = ?1",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
+                params![*job_key as i64, error_code, error_message, now_ms as i64],
             )?;
             // Terminal, incident-bearing transition: set `worker` from the event
             // for attribution (see `JobFailed`); `COALESCE` keeps any existing
@@ -4954,39 +5392,98 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // makes a husked agent round (a COMPLETED job that minted no
             // AgentInstance) attributable via the
             // `AgentInstance.jobKey → completed Job.worker` join.
+            //
+            // Timing (#1344): stamp `lastUpdateTime` and `endTime` from the batch
+            // observation time, but only on the first active→terminal transition
+            // (`end_ms IS NULL`), so a re-delivery is a no-op — mirroring
+            // `ElementCompleted`. The deadline is NOT cleared: Camunda keeps the
+            // last projected deadline on a completed job.
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), deadline_ms = NULL \
+                "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
+                 last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
+                 end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
                  WHERE key = ?1",
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Completed),
-                    worker_attribution(worker.as_deref())
+                    worker_attribution(worker.as_deref()),
+                    now_ms as i64,
                 ],
             )?;
         }
 
         Event::JobCanceled { job_key, .. } => {
+            // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
+            // Guard on the first terminal transition so a re-delivery is a no-op;
+            // a job that was already FAILED/ERRORED (no `end_ms`) still gets its
+            // cancellation `endTime` here (#1344).
             tx.cexecute(
-                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
-                params![*job_key as i64, job_state_code(JobState::Canceled)],
+                "UPDATE jobs SET state = ?2, worker = NULL, \
+                 last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
+                 end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
+                 WHERE key = ?1",
+                params![
+                    *job_key as i64,
+                    job_state_code(JobState::Canceled),
+                    now_ms as i64,
+                ],
             )?;
         }
 
         Event::JobRetriesUpdated {
             job_key, retries, ..
         } => {
+            // RETRIES_UPDATED is a projected job event: refresh `lastUpdateTime`
+            // (#1344). It never ends the job, so `end_ms` is untouched.
+            //
+            // Unlike `JobTimeoutUpdated` (which the engine gates to an Activated
+            // job), the engine *permits* a retries update on a parked
+            // `Failed`/`Errored` job — `update_job_properties` only rejects
+            // Completed/Canceled, and incident resolution explicitly requires
+            // topping up retries on the parked job first. So a RETRIES_UPDATED
+            // observed in a terminal `endTime`-less state is NOT necessarily a
+            // re-delivery: it can be a genuine, newer update. Camunda parity
+            // (#1344: `lastUpdateTime` = the record timestamp of *every*
+            // projected job event) therefore requires stamping `now_ms` here even
+            // for a Failed/Errored job — the `state IN (2, 3)` freeze arm used by
+            // the genuinely-terminal-event projections must NOT apply. A
+            // re-delivered RETRIES_UPDATED re-stamps `now_ms` too, matching
+            // Camunda's last-writer-wins exporter (which applies every record);
+            // in practice batch times are monotonic, so this never moves
+            // `lastUpdateTime` backwards.
+            //
+            // The `end_ms`-guard is kept: a Completed/Canceled job can never
+            // legitimately receive a retries update (the engine rejects it), so
+            // one observed there is always a replay, and `lastUpdateTime` stays
+            // frozen at `endTime`.
             tx.cexecute(
-                "UPDATE jobs SET retries = ?2 WHERE key = ?1",
-                params![*job_key as i64, retries],
+                "UPDATE jobs SET retries = ?2, \
+                 last_update_ms = CASE WHEN end_ms IS NOT NULL THEN end_ms ELSE ?3 END \
+                 WHERE key = ?1",
+                params![*job_key as i64, retries, now_ms as i64],
             )?;
         }
 
         Event::JobTimeoutUpdated {
             job_key, deadline, ..
         } => {
+            // TIMEOUT_UPDATED is a projected job event: refresh `lastUpdateTime`
+            // alongside the extended deadline (#1344). The `end_ms`-guard freezes
+            // `lastUpdateTime` at `endTime` for an already-terminal job, and the
+            // `state IN (2, 3)` arm holds it for a terminal job with NO `endTime`
+            // (Failed/Errored), so a re-delivery/replay cannot push it past the
+            // terminal transition.
             tx.cexecute(
-                "UPDATE jobs SET deadline_ms = ?2 WHERE key = ?1",
-                params![*job_key as i64, *deadline as i64],
+                &format!(
+                    "UPDATE jobs SET deadline_ms = ?2, \
+                 last_update_ms = CASE \
+                     WHEN end_ms IS NOT NULL THEN end_ms \
+                     WHEN {freeze} THEN last_update_ms \
+                     ELSE ?3 END \
+                 WHERE key = ?1",
+                    freeze = endtimeless_terminal_job_predicate("state"),
+                ),
+                params![*job_key as i64, *deadline as i64, now_ms as i64],
             )?;
         }
 
@@ -5808,7 +6305,6 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
         | Event::StartInstanceDispatched { .. }
-        | Event::TaskListenerJobCreated { .. }
         | Event::UserTaskCorrectionsApplied { .. }
         | Event::UserTaskTransitionDeferred { .. }
         | Event::UserTaskTransitionResolved { .. }
@@ -6611,7 +7107,10 @@ impl ReadStore {
 mod writability_tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
+    use nanobpmn_engine_core::Event;
+
     use super::ReadStore;
+    use super::read_surface_tests::{apply_at, job_row};
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -6897,6 +7396,96 @@ mod writability_tests {
     }
 
     #[test]
+    fn migration_backfills_the_job_replay_identity_floor() {
+        // Defect-class guard (#1346 review): the additive migration adds
+        // `jobs.last_event_identity_ms` as `0` on every existing row, and a
+        // normal restart resumes from `exported_position` WITHOUT reseeding from
+        // engine state — so a migrated row would keep the disabled (`0`) floor
+        // while the journal tail replays. A replayed `JobCreated`
+        // (`created_at > 0`) would then pass the strict-newer gate over a job
+        // that had genuinely advanced before the upgrade and RETURNED to
+        // `Created` (lock expiry / retryable failure), regressing its retries
+        // and re-stamping `lastUpdateTime`. The migration must backfill the
+        // floor from the best instant the migrated row carries
+        // (`created_at_ms`), so the replayed CREATED re-stamps an identity at
+        // or below the floor and is held.
+        let path = scratch_db();
+        {
+            let store = ReadStore::open(Some(&path)).expect("fresh open");
+            let conn = store.conn.lock().unwrap();
+            // A job created at t=100, activated at t=200, then returned to
+            // `Created` by a retryable failure at t=3_000 (state Created,
+            // retries 2, last_update_ms 3_000, floor 200).
+            conn.execute(
+                "INSERT INTO jobs \
+                 (key, instance_key, element_instance_key, element_id, job_type, \
+                  state, retries, process_definition_id, process_definition_key, \
+                  created_at_ms, last_update_ms, last_event_identity_ms) \
+                 VALUES (12, 1, 1, 'e', 't', 0, 2, 'p', '1', 100, 3000, 200)",
+                [],
+            )
+            .unwrap();
+        }
+        // Regress the database to a pre-#1344 schema: drop the replay-identity
+        // floor (and the sibling timing columns a pre-#1344 database lacks) and
+        // stamp the version to just before the floor was introduced, so the
+        // next open runs the migration path across the v12 boundary.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE jobs DROP COLUMN last_event_identity_ms;
+                 ALTER TABLE jobs DROP COLUMN last_update_ms;
+                 UPDATE meta SET v = 11 WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let store = ReadStore::open(Some(&path)).expect("migration on open");
+        // The backfill raised the floor from the migration default `0` to the
+        // row's creation instant (the pre-#1344 row carried no later instant).
+        let floor: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT last_event_identity_ms FROM jobs WHERE key = 12",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            floor, 100,
+            "migration must backfill the replay floor from created_at_ms"
+        );
+
+        // The regression the finding cites: replaying the genuine CREATED
+        // (identity 100) over the migrated row must now be a no-op — with the
+        // migration-default `0` floor it would have passed the strict-newer
+        // gate and reset retries to the event's 3.
+        let created = Event::JobCreated {
+            job_key: 12,
+            instance_key: 1,
+            element_instance_key: 1,
+            element_id: "e".to_string(),
+            job_type: "t".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        apply_at(&store, &created, 9_000);
+        let row = job_row(&store, 12);
+        assert_eq!(
+            row.retries, 2,
+            "replayed CREATED must not reset retries on a migrated row"
+        );
+        assert_eq!(
+            row.last_event_identity_ms, 100,
+            "the replayed identity must not raise the backfilled floor"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn schema_fingerprint_is_stable_within_a_build() {
         // Derived purely from SCHEMA, so it is constant across calls and never
         // hand-maintained.
@@ -6995,6 +7584,7 @@ mod writability_tests {
 mod definition_xml_tests {
     use nanobpmn_engine_core::{Event, ProcessBuilder, ProcessDefinition};
 
+    use super::read_surface_tests::{apply_at, job_row};
     use super::{ReadStore, RootResolver};
 
     fn deployed_event(key: u64, xml: &str) -> Event {
@@ -7173,6 +7763,231 @@ mod definition_xml_tests {
             store.process_definition_xml(42).as_deref(),
             Some("<xml>latest</xml>")
         );
+    }
+
+    /// Defect-class guard (#1346 review): `seed_from_engine_state` must seed the
+    /// replay-identity floor from the NEWEST engine-carried instant the snapshot
+    /// has for the job — `max(created_at, activated_at)` — not creation alone.
+    /// A job snapshotted while ACTIVATED carries its current activation instant
+    /// in `Job::activated_at`; seeding only from creation leaves the floor below
+    /// it, so the journal tail's replayed `JobActivated` (`activated_at` ABOVE
+    /// the creation-seeded floor) would re-apply the transition over the
+    /// already-seeded Activated row — and over a row that has since returned to
+    /// `Created` it would restore stale worker/deadline data. With the floor at
+    /// the activation instant, the replayed activation lands at
+    /// `at == prior_floor`. The seeded row is still `fresh` (`last_update_ms ==
+    /// created_at_ms`), so the gate APPLIES that replay — a no-op only because
+    /// the replayed worker/deadline equal the seeded values (value-idempotence).
+    /// The genuinely-HELD case is a returned-to-`Created` row whose
+    /// `last_update_ms` has advanced past `created_at_ms` (non-fresh); see
+    /// `replayed_activation_is_held_on_a_non_fresh_row`.
+    #[test]
+    fn seed_from_engine_state_seeds_the_replay_floor_from_the_max_job_instant() {
+        use nanobpmn_engine_core::{Job, JobKind, ProcessInstance, State};
+
+        let mut state = State::default();
+        let mut inst = ProcessInstance {
+            key: 7_700,
+            process_id: "p".to_string(),
+            process_definition_key: 0,
+            state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            suspended_at: None,
+            created_at: 50,
+            tags: Vec::new(),
+            business_id: None,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+            active: Default::default(),
+            scopes: Default::default(),
+            variables: Default::default(),
+            join_counts: Default::default(),
+            join_flow_arrivals: Default::default(),
+            join_instances: Default::default(),
+            incidents: Vec::new(),
+            variables_spilled: false,
+            multi_instances: Default::default(),
+            adhoc_instances: Default::default(),
+            scope_parents: Default::default(),
+            scope_variables: Default::default(),
+            compensable: Vec::new(),
+            compensation_waits: Default::default(),
+            agent_instances: Default::default(),
+            agent_history: Default::default(),
+        };
+        inst.active.insert(7_701, "t".to_string());
+        state.instances.insert(7_700, inst);
+        state.jobs.insert(
+            8_700,
+            Job {
+                key: 8_700,
+                instance_key: 7_700,
+                element_instance_key: 7_701,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: nanobpmn_engine_core::JobState::Activated,
+                worker: Some("w1".to_string()),
+                deadline: Some(60_000),
+                activated_at: Some(200),
+                activation_timeout: Some(60_000),
+                lease_token: None,
+                durable_activation: false,
+                activated: true,
+                retries: 3,
+                priority: 0,
+                created_at: 100,
+                kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+            },
+        );
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
+        let seeded = job_row(&store, 8_700);
+        assert_eq!(
+            seeded.state,
+            nanobpmn_engine_core::JobState::Activated,
+            "the seed projects the snapshotted Activated state"
+        );
+        assert_eq!(
+            seeded.last_event_identity_ms, 200,
+            "the floor seeds from max(created_at, activated_at), not creation alone"
+        );
+
+        // The journal tail then replays the SAME activation (identity 200). With
+        // a creation-only floor (100) the gate would pass (`200 > 100`); with the
+        // max-instant floor the replay lands at `at == prior_floor`. The seeded
+        // row is still `fresh` (`last_update_ms == created_at_ms`: the seed sets
+        // both from `created_at`), so the gate's `at == prior_floor && fresh`
+        // arm APPLIES the transition rather than holding it — the replay is a
+        // no-op only because the replayed worker/deadline equal the seeded
+        // values (value-idempotence), NOT because the gate holds a non-fresh
+        // row. The genuinely-held (non-fresh) path is exercised separately by
+        // `replayed_activation_is_held_on_a_non_fresh_row` below.
+        let replayed_activation = Event::JobActivated {
+            job_key: 8_700,
+            instance_key: 7_700,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        apply_at(&store, &replayed_activation, 9_000);
+        let after = job_row(&store, 8_700);
+        assert_eq!(after.state, nanobpmn_engine_core::JobState::Activated);
+        assert_eq!(after.last_event_identity_ms, 200);
+    }
+
+    /// Defect-class guard (#1346 adversarial): the activation gate's
+    /// `at == prior_floor && fresh` arm must APPLY on a fresh row but HOLD on a
+    /// non-fresh one. The discriminator is
+    /// `fresh = COALESCE(last_update_ms, created_at_ms) <= created_at_ms`: a row
+    /// that left `Created` and returned (lock expiry / retryable failure) has
+    /// its `last_update_ms` advanced PAST `created_at_ms`, i.e. non-fresh. A
+    /// replayed activation landing at exactly the floor on such a row must be
+    /// HELD — it must not re-stamp worker/deadline onto the returned-to-
+    /// `Created` row. Seed that non-fresh state directly (`last_update_ms >
+    /// created_at_ms`) so this test exercises the held branch the seed test's
+    /// fresh row cannot.
+    #[test]
+    fn replayed_activation_is_held_on_a_non_fresh_row() {
+        let store = ReadStore::open(None).unwrap();
+
+        // A genuine creation (identity 100) then a genuine activation (identity
+        // 200) project the row to Activated with floor 200.
+        apply_at(
+            &store,
+            &Event::JobCreated {
+                job_key: 8_800,
+                instance_key: 7_800,
+                element_instance_key: 7_801,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 100,
+                priority: 0,
+                retries: 3,
+            },
+            100,
+        );
+        apply_at(
+            &store,
+            &Event::JobActivated {
+                job_key: 8_800,
+                instance_key: 7_800,
+                durable: false,
+                worker: "w1".to_string(),
+                deadline: 60_000,
+                activated_at: Some(200),
+                fetch_variables: Vec::new(),
+                lease_token: None,
+            },
+            200,
+        );
+        let activated = job_row(&store, 8_800);
+        assert_eq!(activated.state, nanobpmn_engine_core::JobState::Activated);
+        assert_eq!(activated.last_event_identity_ms, 200);
+
+        // The job's lock then expires (or it fails retryably) and it returns to
+        // `Created`: the engine clears worker/deadline and advances
+        // `last_update_ms` PAST `created_at_ms`, marking the row non-fresh.
+        // Model that returned-to-`Created` state directly so the gate's
+        // `fresh` discriminator reads false.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL, \
+                 lease_token = NULL, last_update_ms = ?3 WHERE key = ?1",
+                rusqlite::params![
+                    8_800i64,
+                    super::job_state_code(nanobpmn_engine_core::JobState::Created),
+                    300i64 // last_update_ms advanced past created_at_ms (100) -> non-fresh
+                ],
+            )
+            .unwrap();
+        }
+        let returned = job_row(&store, 8_800);
+        assert_eq!(returned.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(returned.worker, None);
+        assert_eq!(returned.last_update_ms, Some(300));
+        assert!(returned.last_update_ms.unwrap() > returned.created_at_ms);
+
+        // The journal tail now REPLAYS the same activation (identity 200 ==
+        // floor). On a non-fresh row the gate must HOLD it: the row stays
+        // `Created` with cleared worker/deadline, NOT re-stamped to the stale
+        // activation's w1/60000.
+        apply_at(
+            &store,
+            &Event::JobActivated {
+                job_key: 8_800,
+                instance_key: 7_800,
+                durable: false,
+                worker: "w1".to_string(),
+                deadline: 60_000,
+                activated_at: Some(200),
+                fetch_variables: Vec::new(),
+                lease_token: None,
+            },
+            9_000,
+        );
+        let after = job_row(&store, 8_800);
+        assert_eq!(
+            after.state,
+            nanobpmn_engine_core::JobState::Created,
+            "a replayed activation at the floor is HELD on a non-fresh row"
+        );
+        assert_eq!(
+            after.worker, None,
+            "the held replay must not re-stamp the stale worker"
+        );
+        assert_eq!(
+            after.deadline_ms, None,
+            "the held replay must not re-stamp the stale deadline"
+        );
+        assert_eq!(after.last_event_identity_ms, 200);
     }
 
     #[test]
@@ -8217,6 +9032,44 @@ mod definition_xml_tests {
     }
 
     #[test]
+    fn endtimeless_terminal_job_predicate_is_derived_from_the_canonical_job_codes() {
+        use nanobpmn_engine_core::JobState;
+
+        use super::{
+            ENDTIMELESS_TERMINAL_JOB_STATE_CODES, endtimeless_terminal_job_predicate,
+            job_state_code, job_state_from,
+        };
+
+        // Drift guard: the `lastUpdateTime`-freeze arm (#1344) in every
+        // subsequent-event job projection (JobLockExpired, JobFailed,
+        // JobErrorThrown, JobRetriesUpdated, JobTimeoutUpdated) builds its
+        // `state IN (...)` predicate from `ENDTIMELESS_TERMINAL_JOB_STATE_CODES`,
+        // itself derived from `job_state_code`. If the enum-to-int codes are ever
+        // renumbered the SQL follows automatically instead of a magic
+        // `state IN (2, 3)` literal silently freezing the wrong states.
+        assert_eq!(
+            ENDTIMELESS_TERMINAL_JOB_STATE_CODES,
+            [
+                job_state_code(JobState::Failed),
+                job_state_code(JobState::Errored),
+            ]
+        );
+        // The two codes must map back to the genuinely terminal, `endTime`-less
+        // states, never to a live or completed/canceled (`endTime`-bearing) one.
+        for code in ENDTIMELESS_TERMINAL_JOB_STATE_CODES {
+            assert!(matches!(
+                job_state_from(code),
+                JobState::Failed | JobState::Errored
+            ));
+        }
+        let [failed, errored] = ENDTIMELESS_TERMINAL_JOB_STATE_CODES;
+        assert_eq!(
+            endtimeless_terminal_job_predicate("state"),
+            format!("state IN ({failed}, {errored})")
+        );
+    }
+
+    #[test]
     fn process_instances_page_returns_newest_first_bounded_pages() {
         use super::InstanceFilter;
         let store = ReadStore::open(None).unwrap();
@@ -8966,7 +9819,7 @@ mod decision_deletion_tests {
 mod element_instance_tests {
     use std::collections::HashMap;
 
-    use nanobpmn_engine_core::{Event, JobState, Key, ProcessBuilder};
+    use nanobpmn_engine_core::{Event, JobKind, JobState, Key, ProcessBuilder};
 
     use super::{ElementInstanceState, ReadStore};
 
@@ -10281,6 +11134,493 @@ mod element_instance_tests {
     }
 
     #[test]
+    fn projects_job_timing_creation_last_update_and_end() {
+        // #1344 — Camunda-parity job timing. A created→completed job satisfies
+        // `creationTime <= lastUpdateTime == endTime`; a re-delivery is a no-op; a
+        // cancelled job carries an `endTime` while a failed or timed-out one does
+        // not; and the deadline is NOT cleared on completion.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key, eik, element_id: &str| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+            job_type: "worker".to_string(),
+            created_at: 123,
+            priority: 0,
+            retries: 3,
+        };
+        let activate = |key, deadline| Event::JobActivated {
+            job_key: key,
+            instance_key: INST,
+            worker: "W".into(),
+            deadline,
+            // `activated_at` is the engine's monotonic activation instant, always
+            // `>= created_at` (123) — a value below it is impossible in
+            // production and would trip the #1346 replay gate.
+            activated_at: Some(124),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+            durable: false,
+        };
+        let complete = |key| Event::JobCompleted {
+            job_key: key,
+            instance_key: INST,
+            created_at: 0,
+            job_type: String::new(),
+            worker: None,
+        };
+        let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
+
+        store
+            .export(&[&deploy(), &created(), &job(7001, TASK_EI, "t")])
+            .unwrap();
+        let created_row = get(7001);
+        assert_eq!(created_row.created_at_ms, 123);
+        // `lastUpdateTime` seeds from the (deterministic) creation instant; the
+        // job has not ended yet.
+        assert_eq!(created_row.last_update_ms, Some(123));
+        assert_eq!(created_row.end_ms, None);
+
+        // Activate (not projected onto the timing row — Camunda parity) then
+        // complete.
+        store.export(&[&activate(7001, 9999)]).unwrap();
+        assert_eq!(
+            get(7001).last_update_ms,
+            Some(123),
+            "activation must NOT move lastUpdateTime"
+        );
+        store.export(&[&complete(7001)]).unwrap();
+        let completed = get(7001);
+        assert!(completed.end_ms.is_some(), "a completed job has an endTime");
+        assert_eq!(
+            completed.last_update_ms, completed.end_ms,
+            "lastUpdateTime == endTime on completion"
+        );
+        assert!(
+            completed.created_at_ms <= completed.last_update_ms.unwrap(),
+            "creationTime <= lastUpdateTime"
+        );
+        assert_eq!(
+            completed.deadline_ms,
+            Some(9999),
+            "the deadline is kept on completion (Camunda parity)"
+        );
+
+        // Re-delivering the terminal event is a no-op for both timestamps.
+        store.export(&[&complete(7001)]).unwrap();
+        let redelivered = get(7001);
+        assert_eq!(redelivered.end_ms, completed.end_ms);
+        assert_eq!(redelivered.last_update_ms, completed.last_update_ms);
+
+        // A cancelled job gets an endTime.
+        store.export(&[&job(7002, 1002, "t")]).unwrap();
+        store
+            .export(&[&Event::JobCanceled {
+                job_key: 7002,
+                instance_key: INST,
+            }])
+            .unwrap();
+        assert!(get(7002).end_ms.is_some(), "a cancelled job has an endTime");
+
+        // A terminally failed job (retries exhausted) has NO endTime, but its
+        // lastUpdateTime moved off the creation instant.
+        store.export(&[&job(7003, 1003, "t")]).unwrap();
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 7003,
+                instance_key: INST,
+                retries: 0,
+                worker: None,
+                error_message: None,
+            }])
+            .unwrap();
+        let failed = get(7003);
+        assert_eq!(failed.end_ms, None, "a failed job has no endTime");
+        assert!(failed.last_update_ms.is_some());
+
+        // A timed-out (lock-expired) job likewise has no endTime.
+        store.export(&[&job(7004, 1004, "t")]).unwrap();
+        store.export(&[&activate(7004, 50)]).unwrap();
+        store
+            .export(&[&Event::JobLockExpired {
+                job_key: 7004,
+                instance_key: INST,
+            }])
+            .unwrap();
+        assert_eq!(get(7004).end_ms, None, "a timed-out job has no endTime");
+    }
+
+    #[test]
+    fn job_timing_last_update_frozen_once_terminal() {
+        // #1344 regression — the `lastUpdateTime == endTime` invariant + the
+        // "re-delivering events doesn't move the times" contract must survive a
+        // stray non-terminal job event landing on an ALREADY-terminal job (the
+        // overlapping-prefix replay the `export` docstring promises is idempotent
+        // re-projects the WHOLE prefix with a fresh batch `now_ms`, so a terminal
+        // job's earlier FAILED/RETRIES_UPDATED/TIMEOUT_UPDATED record re-runs
+        // after its COMPLETED/CANCELED). Without the `end_ms`-guard on
+        // `last_update_ms` these would push `lastUpdateTime` PAST `endTime`.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key, eik, element_id: &str| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+            job_type: "worker".to_string(),
+            created_at: 123,
+            priority: 0,
+            retries: 3,
+        };
+        let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
+
+        // Completed job, then every non-terminal job event re-delivered for it.
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &job(8001, TASK_EI, "t"),
+                &Event::JobCompleted {
+                    job_key: 8001,
+                    instance_key: INST,
+                    created_at: 0,
+                    job_type: String::new(),
+                    worker: None,
+                },
+            ])
+            .unwrap();
+        let completed = get(8001);
+        let end = completed.end_ms.expect("completed job has an endTime");
+        assert_eq!(completed.last_update_ms, Some(end));
+
+        for stray in [
+            Event::JobFailed {
+                job_key: 8001,
+                instance_key: INST,
+                retries: 2,
+                worker: None,
+                error_message: Some("late".into()),
+            },
+            Event::JobErrorThrown {
+                job_key: 8001,
+                instance_key: INST,
+                error_code: "E".into(),
+                worker: None,
+                error_message: None,
+            },
+            Event::JobRetriesUpdated {
+                job_key: 8001,
+                instance_key: INST,
+                retries: 5,
+                operation_reference: None,
+            },
+            Event::JobTimeoutUpdated {
+                job_key: 8001,
+                instance_key: INST,
+                deadline: 77,
+                operation_reference: None,
+            },
+        ] {
+            store.export(&[&stray]).unwrap();
+            let row = get(8001);
+            assert_eq!(
+                row.end_ms,
+                Some(end),
+                "a stray non-terminal event must not change endTime"
+            );
+            assert_eq!(
+                row.last_update_ms,
+                Some(end),
+                "lastUpdateTime stays frozen at endTime for a terminal job (no inversion)"
+            );
+            assert!(
+                row.last_update_ms.unwrap() <= row.end_ms.unwrap(),
+                "lastUpdateTime must never exceed endTime"
+            );
+        }
+
+        // A cancelled job (end set) is equally protected against a stray FAILED.
+        store.export(&[&job(8002, 1002, "t")]).unwrap();
+        store
+            .export(&[&Event::JobCanceled {
+                job_key: 8002,
+                instance_key: INST,
+            }])
+            .unwrap();
+        let canceled_end = get(8002).end_ms.expect("cancelled job has an endTime");
+        store
+            .export(&[&Event::JobFailed {
+                job_key: 8002,
+                instance_key: INST,
+                retries: 1,
+                worker: None,
+                error_message: None,
+            }])
+            .unwrap();
+        assert_eq!(
+            get(8002).last_update_ms,
+            Some(canceled_end),
+            "lastUpdateTime stays frozen at endTime for a cancelled job"
+        );
+    }
+
+    #[test]
+    fn job_timing_last_update_frozen_for_terminal_states_without_end_time() {
+        // #1344 regression — a FAILED (retries exhausted) or ERROR_THROWN job is
+        // TERMINAL but deliberately keeps `end_ms` NULL (Camunda stamps no
+        // `endTime` for a failed/errored job). The `end_ms`-guard alone therefore
+        // never engages for these states, so re-delivering the SAME terminal event
+        // (the overlapping-prefix replay `export` promises is idempotent) would
+        // stamp a fresh `now_ms` onto `lastUpdateTime` every time. The freeze must
+        // ALSO hold the value once the job sits in a terminal `endTime`-less state
+        // (Failed/Errored), while still stamping the FIRST transition.
+        let store = ReadStore::open(None).unwrap();
+        let job = |key, eik, element_id: &str| Event::JobCreated {
+            job_key: key,
+            instance_key: INST,
+            element_instance_key: eik,
+            element_id: element_id.to_string(),
+            job_type: "worker".to_string(),
+            created_at: 123,
+            priority: 0,
+            retries: 3,
+        };
+        let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
+
+        // Terminal FAILED (retries exhausted): first delivery stamps, re-delivery
+        // must NOT move `lastUpdateTime`.
+        store
+            .export(&[&deploy(), &created(), &job(8201, TASK_EI, "t")])
+            .unwrap();
+        let fail = |key| Event::JobFailed {
+            job_key: key,
+            instance_key: INST,
+            retries: 0,
+            worker: None,
+            error_message: Some("boom".into()),
+        };
+        store.export(&[&fail(8201)]).unwrap();
+        let failed = get(8201);
+        assert_eq!(failed.end_ms, None, "a failed job has no endTime");
+        let failed_lu = failed
+            .last_update_ms
+            .expect("a failed job has a lastUpdateTime");
+        assert!(
+            failed_lu > 123,
+            "the first terminal transition stamps lastUpdateTime"
+        );
+        store.export(&[&fail(8201)]).unwrap();
+        assert_eq!(
+            get(8201).last_update_ms,
+            Some(failed_lu),
+            "re-delivering FAILED must not move lastUpdateTime (no endTime to freeze at)"
+        );
+
+        // Terminal ERROR_THROWN: same contract — first stamps, re-delivery frozen.
+        store.export(&[&job(8202, 1002, "t")]).unwrap();
+        let throw = |key| Event::JobErrorThrown {
+            job_key: key,
+            instance_key: INST,
+            error_code: "E".into(),
+            worker: None,
+            error_message: None,
+        };
+        store.export(&[&throw(8202)]).unwrap();
+        let errored = get(8202);
+        assert_eq!(errored.end_ms, None, "an errored job has no endTime");
+        let errored_lu = errored
+            .last_update_ms
+            .expect("an errored job has a lastUpdateTime");
+        store.export(&[&throw(8202)]).unwrap();
+        assert_eq!(
+            get(8202).last_update_ms,
+            Some(errored_lu),
+            "re-delivering ERROR_THROWN must not move lastUpdateTime"
+        );
+
+        // A terminal-state job must ALSO be frozen against EVERY stray
+        // genuinely-terminal event replayed after it (a re-delivered FAILED /
+        // ERROR_THROWN / TIMEOUT_UPDATED) — none may move `lastUpdateTime`.
+        // `RETRIES_UPDATED` is deliberately NOT in this set: the engine permits a
+        // genuine retries top-up on a parked Failed/Errored job (incident
+        // recovery), so it is not always a re-delivery — see the dedicated test
+        // `retries_update_on_a_parked_terminal_job_stamps_last_update`.
+        for stray in [
+            Event::JobFailed {
+                job_key: 8202,
+                instance_key: INST,
+                retries: 0,
+                worker: None,
+                error_message: Some("stray".into()),
+            },
+            Event::JobErrorThrown {
+                job_key: 8202,
+                instance_key: INST,
+                error_code: "E2".into(),
+                worker: None,
+                error_message: None,
+            },
+            Event::JobTimeoutUpdated {
+                job_key: 8202,
+                instance_key: INST,
+                deadline: 77,
+                operation_reference: None,
+            },
+        ] {
+            store.export(&[&stray]).unwrap();
+            assert_eq!(
+                get(8202).last_update_ms,
+                Some(errored_lu),
+                "a stray terminal-event re-delivery must not move an errored job's lastUpdateTime"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_job_without_created_at_surfaces_non_null_creation_time() {
+        // #1344 — a legacy `JobCreated` (created_at == 0, serialized before the
+        // field existed) must still surface a non-null `creationTime`: both
+        // `created_at_ms` and `last_update_ms` fall back to the batch observation
+        // time, so `creationTime == lastUpdateTime` rather than a null creation
+        // time against a populated last-update time. Covers both the event path
+        // and the snapshot (`project_engine_state`) reseed path.
+        let store = ReadStore::open(None).unwrap();
+        let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
+
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::JobCreated {
+                    job_key: 8101,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 0,
+                    priority: 0,
+                    retries: 3,
+                },
+            ])
+            .unwrap();
+        let row = get(8101);
+        assert_ne!(
+            row.created_at_ms, 0,
+            "a legacy job must surface a non-null creationTime (batch-time fallback)"
+        );
+        assert_eq!(
+            Some(row.created_at_ms),
+            row.last_update_ms,
+            "creationTime == lastUpdateTime for a legacy job"
+        );
+    }
+
+    /// Defect-class guard (#1344 review): every job-creation variant the engine
+    /// emits must land a row in the durable jobs table — a creation event routed
+    /// to the projector's no-op arm leaves the job invisible to the jobs read
+    /// surface (and to every subsequent timing projection). `JobCreated` and
+    /// `ExecutionListenerJobCreated` were covered; `TaskListenerJobCreated`
+    /// (ADR 0037 §6) was silently dropped. This pins the task-listener variant:
+    /// creation projects the row with `JobKind::TaskListener` and seeds
+    /// `creationTime`/`lastUpdateTime` from the engine-carried `created_at`,
+    /// exactly like its siblings.
+    #[test]
+    fn task_listener_job_created_projects_into_the_jobs_table() {
+        use nanobpmn_engine_core::TaskListenerEventType;
+        let store = ReadStore::open(None).unwrap();
+        let created = || Event::TaskListenerJobCreated {
+            job_key: 8151,
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "ut".to_string(),
+            user_task_key: 8150,
+            job_type: "task-listener".to_string(),
+            event_type: TaskListenerEventType::Completing,
+            listener_index: 0,
+            created_at: 1_234,
+            retries: 3,
+        };
+        store.export(&[&deploy(), &created(), &created()]).unwrap();
+
+        let row = store
+            .jobs()
+            .into_iter()
+            .find(|j| j.key == 8151)
+            .expect("a task-listener job must be projected into the jobs table");
+        assert_eq!(row.state, JobState::Created);
+        assert_eq!(
+            row.kind,
+            JobKind::TaskListener {
+                event_type: TaskListenerEventType::Completing,
+                index: 0,
+                user_task_key: 0,
+            },
+            "the kind discriminant + listener event type survive the projection"
+        );
+        assert_eq!(row.created_at_ms, 1_234);
+        assert_eq!(
+            row.last_update_ms,
+            Some(1_234),
+            "creationTime == lastUpdateTime at creation (#1344)"
+        );
+
+        // The ON CONFLICT replay no-op is shared with the sibling creation
+        // variants: a re-delivery must not move either timestamp.
+        store.export(&[&created()]).unwrap();
+        let again = store.jobs().into_iter().find(|j| j.key == 8151).unwrap();
+        assert_eq!(again.created_at_ms, 1_234);
+        assert_eq!(again.last_update_ms, Some(1_234));
+    }
+
+    #[test]
+    fn legacy_snapshot_job_surfaces_non_null_creation_time() {
+        use nanobpmn_engine_core::{Job, JobKind, State};
+        // The snapshot reseed path (`project_engine_state`) must apply the same
+        // batch-time fallback to `created_at_ms` for a legacy job (created_at == 0)
+        // so a compaction-floor recovery does not leave `creationTime` null while
+        // `lastUpdateTime` is populated (#1344).
+        let mut state = State::default();
+        state.jobs.insert(
+            8201,
+            Job {
+                key: 8201,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: JobState::Created,
+                worker: None,
+                deadline: None,
+                activated_at: None,
+                activation_timeout: None,
+                lease_token: None,
+                durable_activation: false,
+                activated: false,
+                retries: 3,
+                priority: 0,
+                created_at: 0,
+                kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+            },
+        );
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+        let row = store.jobs().into_iter().find(|j| j.key == 8201).unwrap();
+        assert_ne!(
+            row.created_at_ms, 0,
+            "a legacy snapshot-seeded job must surface a non-null creationTime"
+        );
+        assert_eq!(
+            Some(row.created_at_ms),
+            row.last_update_ms,
+            "creationTime == lastUpdateTime for a legacy snapshot job"
+        );
+    }
+
+    #[test]
     fn projects_opaque_job_leases_for_both_activation_read_set_forms() {
         let store = ReadStore::open(None).unwrap();
         store
@@ -10793,12 +12133,16 @@ mod read_surface_tests {
     /// `created_at_ms`, so a row whose `created_at_ms` was persisted as `0` by an
     /// older projection (predating the column) would be under-counted forever if
     /// the upsert's `ON CONFLICT` clause did not overwrite it. Re-projecting the
-    /// same job with its real timestamp must repair the stale `0`.
+    /// same job with its real timestamp must repair the stale value. Since #1344
+    /// a legacy (`created_at == 0`) projection no longer lands a literal `0`
+    /// either — it seeds the batch-observation fallback so `creationTime` is
+    /// non-null — but the refresh-on-conflict contract is what this guards.
     #[test]
     fn job_created_replay_repairs_stale_created_at_ms() {
         let store = ReadStore::open(None).unwrap();
-        // Initial projection lands the row with a stale created_at_ms of 0, as an
-        // old DB predating the column would have.
+        // Initial projection of a legacy (created_at == 0) event lands a
+        // non-authoritative batch-time fallback (#1344), standing in for the
+        // stale value an old DB predating the column would carry.
         store
             .export(&[&Event::JobCreated {
                 job_key: 8001,
@@ -10811,15 +12155,15 @@ mod read_surface_tests {
                 retries: 3,
             }])
             .unwrap();
-        assert_eq!(
+        assert_ne!(
             store
                 .jobs()
                 .into_iter()
                 .find(|j| j.key == 8001)
                 .unwrap()
                 .created_at_ms,
-            0,
-            "precondition: stale row starts at created_at_ms = 0"
+            1_724_000_000_000,
+            "precondition: stale row does not yet carry the authoritative timestamp"
         );
 
         // A repair/replay re-projects the same job carrying its real creation time.
@@ -10845,6 +12189,672 @@ mod read_surface_tests {
                 .created_at_ms,
             1_724_000_000_000,
             "ON CONFLICT must refresh created_at_ms so statistics stop under-counting"
+        );
+    }
+
+    /// Apply one event at an explicit `now_ms` (bypassing wall clock) so a
+    /// re-delivery/replay in a *later* batch can be modelled deterministically.
+    /// `pub(super)` so the sibling migration/seed test modules can drive the
+    /// same deterministic-replay scenarios.
+    pub(super) fn apply_at(store: &ReadStore, event: &Event, now_ms: u64) {
+        let mut conn = store.conn.lock().unwrap();
+        let tx = conn.transaction().unwrap();
+        super::project(&tx, event, now_ms).unwrap();
+        tx.commit().unwrap();
+    }
+
+    pub(super) fn job_row(store: &ReadStore, key: Key) -> super::JobRow {
+        store
+            .jobs()
+            .into_iter()
+            .find(|j| j.key == key)
+            .expect("job present")
+    }
+
+    /// Defect-class guard (#1344, finding 1): a legacy (`created_at == 0`)
+    /// `JobCreated` seeds its `creationTime`/`lastUpdateTime` from the
+    /// *batch-observation* fallback. Re-delivering or replaying that SAME legacy
+    /// event in a later batch must be an idempotent no-op — the `ON CONFLICT`
+    /// upsert must NOT overwrite the already-seeded timestamps with a fresh
+    /// `now_ms`, or `creationTime` (and a live row's `lastUpdateTime`) would
+    /// jump on every re-delivery. The sibling `ExecutionListenerJobCreated`
+    /// upsert shares the class and the same guard clause.
+    #[test]
+    fn legacy_job_created_redelivery_does_not_move_timestamps() {
+        let store = ReadStore::open(None).unwrap();
+        let legacy = Event::JobCreated {
+            job_key: 8300,
+            instance_key: 7300,
+            element_instance_key: 7301,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 0,
+            priority: 0,
+            retries: 3,
+        };
+        // First delivery stamps the batch-time fallback for both timestamps.
+        apply_at(&store, &legacy, 1_000);
+        let first = job_row(&store, 8300);
+        assert_eq!(first.created_at_ms, 1_000);
+        assert_eq!(first.last_update_ms, Some(1_000));
+
+        // A later-batch re-delivery (different `now_ms`) of the SAME legacy
+        // CREATED must not move either timestamp.
+        apply_at(&store, &legacy, 9_999);
+        let again = job_row(&store, 8300);
+        assert_eq!(
+            again.created_at_ms, 1_000,
+            "legacy re-delivery must not move creationTime"
+        );
+        assert_eq!(
+            again.last_update_ms,
+            Some(1_000),
+            "legacy re-delivery must not move lastUpdateTime"
+        );
+    }
+
+    /// Defect-class guard (#1344, finding 2): replaying a whole committed prefix
+    /// `[JobCreated, JobFailed]` (or `[JobCreated, JobErrorThrown]`) must not
+    /// resurrect a terminal, end-time-less job back to `Created` nor un-freeze
+    /// its `lastUpdateTime`. The replayed `JobCreated` hits the `ON CONFLICT`
+    /// path, which must preserve the advanced/terminal state and its frozen
+    /// timestamp so the trailing terminal event stays an idempotent no-op.
+    #[test]
+    fn whole_prefix_replay_keeps_terminal_job_frozen() {
+        for terminal in [
+            Event::JobFailed {
+                job_key: 8400,
+                instance_key: 7400,
+                retries: 0,
+                worker: None,
+                error_message: Some("boom".to_string()),
+            },
+            Event::JobErrorThrown {
+                job_key: 8400,
+                instance_key: 7400,
+                error_code: "ERR".to_string(),
+                worker: None,
+                error_message: Some("boom".to_string()),
+            },
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            let created = Event::JobCreated {
+                job_key: 8400,
+                instance_key: 7400,
+                element_instance_key: 7401,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 123,
+                priority: 0,
+                retries: 0,
+            };
+            apply_at(&store, &created, 1_000);
+            apply_at(&store, &terminal, 2_000);
+            let frozen = job_row(&store, 8400);
+            assert_eq!(frozen.end_ms, None, "terminal park carries no endTime");
+            assert_eq!(
+                frozen.last_update_ms,
+                Some(2_000),
+                "the terminal event stamps lastUpdateTime"
+            );
+            let terminal_state = frozen.state;
+
+            // Replay the WHOLE prefix in a later batch: the replayed CREATED must
+            // not regress the terminal state nor un-freeze lastUpdateTime, so the
+            // trailing terminal event stays a no-op.
+            apply_at(&store, &created, 5_000);
+            let after_created = job_row(&store, 8400);
+            assert_eq!(
+                after_created.state, terminal_state,
+                "replayed CREATED must not regress a terminal job to Created"
+            );
+            assert_eq!(
+                after_created.last_update_ms,
+                Some(2_000),
+                "replayed CREATED must not move a terminal job's lastUpdateTime"
+            );
+
+            apply_at(&store, &terminal, 6_000);
+            let after_terminal = job_row(&store, 8400);
+            assert_eq!(
+                after_terminal.last_update_ms,
+                Some(2_000),
+                "whole-prefix replay must leave lastUpdateTime frozen"
+            );
+        }
+    }
+
+    /// Defect-class guard (#1344 review, overlapping-prefix replay): `Created`
+    /// does NOT mean "this row never advanced" — lock expiry, a retryable
+    /// failure and incident resolution all RETURN a job to `Created`. Replaying
+    /// the whole prefix `[JobCreated, JobActivated, JobLockExpired]` over such a
+    /// row must not let the replayed `JobCreated` overwrite
+    /// state/retries/worker/deadline nor re-stamp `creationTime`/`lastUpdateTime`.
+    /// The discriminator is the engine-carried event identity (`created_at` /
+    /// `activated_at`) against the stored `last_event_identity_ms` floor — a
+    /// replayed prefix re-stamps the SAME identity, never a larger one. (The
+    /// replayed `JobLockExpired` timing write is not identity-gated — a TIMED_OUT
+    /// carries no engine timestamp, so a replay is indistinguishable from a
+    /// genuine legacy expiry; the finding's overwrite vector is the CREATED.)
+    #[test]
+    fn whole_prefix_replay_ending_in_a_live_created_job_is_a_no_op() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8600,
+            instance_key: 7600,
+            element_instance_key: 7601,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8600,
+            instance_key: 7600,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8600,
+            instance_key: 7600,
+        };
+
+        // Genuine history: create (t=100) -> activate (t=200) -> lock expiry
+        // (batch 2_000) returns the job to Created.
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        let live = job_row(&store, 8600);
+        assert_eq!(
+            live.state,
+            nanobpmn_engine_core::JobState::Created,
+            "lock expiry returns to Created"
+        );
+        assert_eq!(live.worker, None);
+        assert_eq!(live.deadline_ms, None);
+        assert_eq!(live.last_update_ms, Some(2_000));
+        assert_eq!(live.created_at_ms, 100);
+        assert_eq!(
+            live.last_event_identity_ms, 200,
+            "the activation raised the replay-identity floor"
+        );
+
+        // Replay the WHOLE prefix in a later batch (batch 6_000). The replayed
+        // CREATED is a no-op (its identity 100 is below the floor 200 the
+        // activation raised): it must NOT overwrite state/retries/worker/deadline
+        // nor re-stamp creationTime/lastUpdateTime. The replayed ACTIVATED and
+        // LOCK_EXPIRED re-apply their (identical) payload; LOCK_EXPIRED's timing
+        // write is not identity-gated (a TIMED_OUT carries no engine timestamp, so
+        // a replay is indistinguishable from a genuine legacy expiry), but the
+        // replayed CREATED — the event the finding cites — is held.
+        apply_at(&store, &created, 6_000);
+        let after_created = job_row(&store, 8600);
+        assert_eq!(after_created.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(
+            after_created.retries, 3,
+            "replayed CREATED must not touch retries"
+        );
+        assert_eq!(after_created.worker, None);
+        assert_eq!(after_created.deadline_ms, None);
+        assert_eq!(
+            after_created.created_at_ms, 100,
+            "replayed CREATED must not move creationTime"
+        );
+        assert_eq!(
+            after_created.last_update_ms,
+            Some(2_000),
+            "replayed CREATED must not re-stamp lastUpdateTime"
+        );
+        assert_eq!(after_created.last_event_identity_ms, 200);
+        // The rest of the prefix replays without regressing the row.
+        apply_at(&store, &activated, 6_000);
+        apply_at(&store, &lock_expired, 6_000);
+        let replayed = job_row(&store, 8600);
+        assert_eq!(replayed.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(replayed.retries, 3);
+        assert_eq!(replayed.created_at_ms, 100);
+        assert_eq!(replayed.last_event_identity_ms, 200);
+    }
+
+    /// The sibling return-to-`Created` path (#1344): a retryable `JobFailed`
+    /// (retries > 0) parks the job back in the activatable pool. A whole-prefix
+    /// replay `[JobCreated, JobActivated, JobFailed]` must not re-stamp
+    /// `lastUpdateTime` off the genuine failure instant.
+    #[test]
+    fn whole_prefix_replay_through_a_retryable_failure_is_a_no_op() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8601,
+            instance_key: 7601,
+            element_instance_key: 7602,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8601,
+            instance_key: 7601,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let failed = Event::JobFailed {
+            job_key: 8601,
+            instance_key: 7601,
+            retries: 2,
+            worker: Some("w1".to_string()),
+            error_message: Some("boom".to_string()),
+        };
+
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &failed, 3_000);
+        let live = job_row(&store, 8601);
+        assert_eq!(
+            live.state,
+            nanobpmn_engine_core::JobState::Created,
+            "a retryable failure returns to Created"
+        );
+        assert_eq!(live.retries, 2);
+        assert_eq!(live.last_update_ms, Some(3_000));
+
+        apply_at(&store, &created, 7_000);
+        let after_created = job_row(&store, 8601);
+        assert_eq!(after_created.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(
+            after_created.retries, 2,
+            "replayed CREATED must not reset retries"
+        );
+        assert_eq!(
+            after_created.last_update_ms,
+            Some(3_000),
+            "replayed CREATED must not re-stamp lastUpdateTime"
+        );
+        apply_at(&store, &activated, 7_000);
+        apply_at(&store, &failed, 7_000);
+        let replayed = job_row(&store, 8601);
+        assert_eq!(replayed.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(replayed.retries, 2);
+        assert_eq!(replayed.last_event_identity_ms, 200);
+        assert_eq!(
+            replayed.last_update_ms,
+            Some(3_000),
+            "replayed FAILED must not re-stamp lastUpdateTime off the genuine failure instant"
+        );
+    }
+
+    /// The identity floor only suppresses a replayed CREATED at/below what was
+    /// already seen — a CREATED carrying a LATER `created_at` (a repair, or a
+    /// genuinely newer record) still refreshes the row. This pins that the floor
+    /// is a *replay* guard, not a freeze of a live `Created` job: a newer
+    /// creation event re-applies state/retries and re-stamps the timestamps.
+    #[test]
+    fn newer_created_still_refreshes_a_returned_to_created_job() {
+        let store = ReadStore::open(None).unwrap();
+        let created = |at: u64| Event::JobCreated {
+            job_key: 8602,
+            instance_key: 7602,
+            element_instance_key: 7603,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: at,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8602,
+            instance_key: 7602,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8602,
+            instance_key: 7602,
+        };
+
+        apply_at(&store, &created(100), 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        assert_eq!(job_row(&store, 8602).last_event_identity_ms, 200);
+
+        // A replayed CREATED (identity 100, below the floor) is a no-op…
+        apply_at(&store, &created(100), 6_000);
+        assert_eq!(job_row(&store, 8602).created_at_ms, 100);
+        assert_eq!(job_row(&store, 8602).last_update_ms, Some(2_000));
+
+        // …but a CREATED carrying a NEWER `created_at` (250 > the 200 floor)
+        // refreshes the row and raises the floor.
+        apply_at(&store, &created(250), 7_000);
+        let row = job_row(&store, 8602);
+        assert_eq!(
+            row.created_at_ms, 250,
+            "a newer created_at repairs creationTime"
+        );
+        assert_eq!(row.last_update_ms, Some(250));
+        assert_eq!(
+            row.last_event_identity_ms, 250,
+            "the floor follows the newer event"
+        );
+    }
+
+    /// Defect-class guard (#1346 review, "older JobCreated replay regresses
+    /// repaired creationTime"): after a newer-created repair raises both the
+    /// stored `created_at_ms` and the `last_event_identity_ms` floor to 250,
+    /// replaying the ORIGINAL `JobCreated` (identity 100, below the floor) must
+    /// be a no-op for `created_at_ms` — not regress it back to 100. The
+    /// `created_at_ms` arm previously gated only on `? <> 0` (nonzero), so any
+    /// real-timestamped replay overwrote a newer repaired value. The fix gates
+    /// the write on the same strict-newer comparison (`> floor`) that
+    /// `last_update_ms` already uses: a replay's identity is always `<=` the
+    /// floor, only a genuinely newer `created_at` (a repair) re-applies.
+    #[test]
+    fn older_created_replay_does_not_regress_repaired_creation_time() {
+        let store = ReadStore::open(None).unwrap();
+        let created = |at: u64| Event::JobCreated {
+            job_key: 8620,
+            instance_key: 7620,
+            element_instance_key: 7621,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: at,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8620,
+            instance_key: 7620,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8620,
+            instance_key: 7620,
+        };
+
+        // Genuine history: create (t=100) -> activate (t=200) -> lock expiry
+        // returns the job to Created. Then a newer-created repair (250) refreshes
+        // the row and raises the floor to 250.
+        apply_at(&store, &created(100), 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        apply_at(&store, &created(250), 7_000);
+        let repaired = job_row(&store, 8620);
+        assert_eq!(repaired.created_at_ms, 250);
+        assert_eq!(repaired.last_event_identity_ms, 250);
+
+        // Overlapping-prefix replay of the ORIGINAL created(100) (identity 100,
+        // below the 250 floor) must NOT regress creationTime back to 100.
+        apply_at(&store, &created(100), 9_000);
+        let after = job_row(&store, 8620);
+        assert_eq!(
+            after.created_at_ms, 250,
+            "an older-identity replayed CREATED must not regress a repaired creationTime"
+        );
+        assert_eq!(
+            after.last_update_ms,
+            Some(250),
+            "the repaired lastUpdateTime must likewise hold"
+        );
+        assert_eq!(after.last_event_identity_ms, 250);
+    }
+
+    /// Defect-class guard (#1346 review, "replay of lock expiry moves
+    /// `lastUpdateTime`"): a whole-prefix replay `[JobCreated, JobActivated,
+    /// JobLockExpired]` over a job that genuinely returned to `Created` must be a
+    /// no-op for `lastUpdateTime`. A TIMED_OUT carries no engine timestamp, so
+    /// the projection would otherwise stamp the replay batch's fresh `now_ms`.
+    /// The fix gates the `JobActivated` state transition: a replayed activation
+    /// (its identity at/below the floor, on a row the genuine expiry made
+    /// non-fresh) no longer re-activates the row, so the trailing replayed
+    /// `JobLockExpired`'s `state = Activated` guard keeps it a no-op.
+    #[test]
+    fn whole_prefix_replay_lock_expiry_does_not_move_last_update() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8605,
+            instance_key: 7605,
+            element_instance_key: 7606,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = Event::JobActivated {
+            job_key: 8605,
+            instance_key: 7605,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(200),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8605,
+            instance_key: 7605,
+        };
+
+        // Genuine history: create (t=100) -> activate (t=200) -> lock expiry
+        // (batch 2_000) returns the job to Created, stamping lastUpdateTime=2000.
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated, 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        let live = job_row(&store, 8605);
+        assert_eq!(live.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(live.last_update_ms, Some(2_000));
+
+        // Replay the WHOLE prefix in a later batch (batch 9_000). The replayed
+        // ACTIVATED must NOT re-activate the row, so the replayed LOCK_EXPIRED
+        // stays a no-op and does NOT re-stamp lastUpdateTime.
+        apply_at(&store, &created, 9_000);
+        apply_at(&store, &activated, 9_000);
+        apply_at(&store, &lock_expired, 9_000);
+        let replayed = job_row(&store, 8605);
+        assert_eq!(replayed.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(
+            replayed.last_update_ms,
+            Some(2_000),
+            "a replayed lock-expiry must not move lastUpdateTime to the replay batch time"
+        );
+    }
+
+    /// The `JobActivated` gate must not over-suppress a GENUINE re-activation:
+    /// after a lock expiry returns the job to `Created`, a worker genuinely
+    /// re-activates it at a strictly-later instant (a positive lock timeout makes
+    /// the re-activation's `activated_at` exceed the floor), and that activation
+    /// must land.
+    #[test]
+    fn genuine_reactivation_after_lock_expiry_still_applies() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8610,
+            instance_key: 7610,
+            element_instance_key: 7611,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        let activated = |at: u64, worker: &str| Event::JobActivated {
+            job_key: 8610,
+            instance_key: 7610,
+            durable: false,
+            worker: worker.to_string(),
+            deadline: 60_000,
+            activated_at: Some(at),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8610,
+            instance_key: 7610,
+        };
+
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated(200, "w1"), 1_500);
+        apply_at(&store, &lock_expired, 2_000);
+        assert_eq!(
+            job_row(&store, 8610).state,
+            nanobpmn_engine_core::JobState::Created
+        );
+        // Genuine re-activation at a strictly-later instant (300 > the 200 floor).
+        apply_at(&store, &activated(300, "w2"), 2_500);
+        let row = job_row(&store, 8610);
+        assert_eq!(
+            row.state,
+            nanobpmn_engine_core::JobState::Activated,
+            "a genuine re-activation must apply"
+        );
+        assert_eq!(row.worker.as_deref(), Some("w2"));
+    }
+
+    /// Defect-class guard (#1344, equal-identity replay): the engine stamps both
+    /// `created_at` and `activated_at` from the SAME per-command `self.now`, so a
+    /// job created and activated within one wall-clock millisecond has
+    /// `activated_at == created_at`. The activation then raises the
+    /// `last_event_identity_ms` floor only to that SAME value (`MAX` of equals),
+    /// leaving the floor EQUAL to the replayed CREATED's identity — not strictly
+    /// above it. If the job subsequently returns to `Created` (lock expiry), an
+    /// overlapping-prefix replay of that CREATED must STILL be a no-op: a
+    /// non-strict (`>=`) identity gate would admit it (equal passes) and re-stamp
+    /// `lastUpdateTime` back to `creationTime`, undoing the genuine lock-expiry
+    /// update. The gate is therefore strict (`>`): a replay's identity is always
+    /// `<=` the floor, and only a genuinely newer `created_at` (a repair — at
+    /// most one per job) may re-apply.
+    #[test]
+    fn same_tick_created_activated_replayed_created_is_a_no_op() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8603,
+            instance_key: 7603,
+            element_instance_key: 7604,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 100,
+            priority: 0,
+            retries: 3,
+        };
+        // Same-tick activation: `activated_at == created_at` (both from the
+        // engine's per-command `self.now`).
+        let activated = Event::JobActivated {
+            job_key: 8603,
+            instance_key: 7603,
+            durable: false,
+            worker: "w1".to_string(),
+            deadline: 60_000,
+            activated_at: Some(100),
+            fetch_variables: Vec::new(),
+            lease_token: None,
+        };
+        let lock_expired = Event::JobLockExpired {
+            job_key: 8603,
+            instance_key: 7603,
+        };
+
+        // Genuine history: create (t=100) -> same-tick activate (t=100) -> lock
+        // expiry (batch 2_000) returns the job to Created.
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &activated, 1_100);
+        apply_at(&store, &lock_expired, 2_000);
+        let live = job_row(&store, 8603);
+        assert_eq!(live.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(live.last_update_ms, Some(2_000));
+        assert_eq!(
+            live.last_event_identity_ms, 100,
+            "same-tick activation leaves the floor EQUAL to created_at"
+        );
+
+        // Overlapping-prefix replay of the CREATED (identity 100, EQUAL to the
+        // 100 floor) in a later batch. With a non-strict gate this passes
+        // `100 >= 100` and re-stamps `lastUpdateTime` 2_000 -> 100; with the
+        // strict gate it is held and the row is untouched.
+        apply_at(&store, &created, 6_000);
+        let after = job_row(&store, 8603);
+        assert_eq!(after.state, nanobpmn_engine_core::JobState::Created);
+        assert_eq!(after.retries, 3, "replayed CREATED must not touch retries");
+        assert_eq!(after.worker, None);
+        assert_eq!(after.deadline_ms, None);
+        assert_eq!(after.created_at_ms, 100);
+        assert_eq!(
+            after.last_update_ms,
+            Some(2_000),
+            "an equal-identity replayed CREATED must not re-stamp lastUpdateTime"
+        );
+        assert_eq!(after.last_event_identity_ms, 100);
+    }
+
+    /// #1344 review regression — a GENUINE `RETRIES_UPDATED` on a parked
+    /// `Failed`/`Errored` job is a real, newer event (the engine's
+    /// `update_job_properties` permits it and incident resolution requires
+    /// topping up retries before resolving), NOT a re-delivery. Camunda parity
+    /// (`lastUpdateTime` = the record timestamp of every projected job event)
+    /// requires it to stamp `lastUpdateTime`; the terminal freeze must not pin it
+    /// to the earlier failure/error instant. Uses explicit batch times via
+    /// `apply_at` so the move is deterministic.
+    #[test]
+    fn retries_update_on_a_parked_terminal_job_stamps_last_update() {
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::JobCreated {
+            job_key: 8500,
+            instance_key: 7500,
+            element_instance_key: 7501,
+            element_id: "t".to_string(),
+            job_type: "worker".to_string(),
+            created_at: 123,
+            priority: 0,
+            retries: 1,
+        };
+        let fail = Event::JobFailed {
+            job_key: 8500,
+            instance_key: 7500,
+            retries: 0,
+            worker: None,
+            error_message: Some("boom".into()),
+        };
+
+        apply_at(&store, &created, 1_000);
+        apply_at(&store, &fail, 2_000);
+        let parked = job_row(&store, 8500);
+        assert_eq!(parked.state, nanobpmn_engine_core::JobState::Failed);
+        assert_eq!(parked.end_ms, None, "a failed job has no endTime");
+        assert_eq!(parked.last_update_ms, Some(2_000));
+
+        // The incident-recovery top-up: a genuine retries update on the parked
+        // job. It must refresh `retries` AND stamp `lastUpdateTime` to the new
+        // batch time — not leave it frozen at the failure instant.
+        let top_up = Event::JobRetriesUpdated {
+            job_key: 8500,
+            instance_key: 7500,
+            retries: 3,
+            operation_reference: None,
+        };
+        apply_at(&store, &top_up, 3_500);
+        let updated = job_row(&store, 8500);
+        assert_eq!(updated.retries, 3, "the retries top-up lands");
+        assert_eq!(
+            updated.last_update_ms,
+            Some(3_500),
+            "a genuine retries update on a parked terminal job stamps lastUpdateTime (Camunda parity)"
         );
     }
 
