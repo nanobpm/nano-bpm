@@ -271,3 +271,14 @@
       type: array
       items:
         type: string
+
+# --- job search: lastUpdateTime sort field (#1344) ---------------------------
+#
+# The vendored spec's `JobSearchQuerySortRequest.field` enum predates the 8.9
+# `lastUpdateTime` job attribute: it lists `creationTime`/`endTime` but omits
+# `lastUpdateTime`, even though the gateway sorts by it. Advertise the supported
+# sort field so the published contract and generated clients accept it.
+- file: jobs.yaml
+  target: components.schemas.JobSearchQuerySortRequest.properties.field.enum
+  append:
+    - lastUpdateTime

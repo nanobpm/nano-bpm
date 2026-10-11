@@ -12182,10 +12182,33 @@ impl ServerImpl {
                         && query::match_string_opt(&f.error_code, job.error_code.as_deref())
                         && f.has_failed_with_retries_left
                             .is_none_or(|want| want == job.has_failed_with_retries_left)
+                        // Camunda-parity timing filters (#1344).
+                        && query::match_date_time_ms(
+                            &f.creation_time,
+                            (job.created_at_ms != 0).then_some(job.created_at_ms as i64),
+                        )
+                        && query::match_date_time_ms(
+                            &f.last_update_time,
+                            job.last_update_ms.map(|v| v as i64),
+                        )
+                        && query::match_date_time_ms(&f.end_time, job.end_ms.map(|v| v as i64))
+                        // `deadline` is the one NULLABLE job filter (#1344): an
+                        // explicit `{"deadline": null}` is a real filter value that
+                        // selects jobs with NO deadline, distinct from omitting the
+                        // filter entirely (which matches everything).
+                        && match &f.deadline {
+                            None => true,
+                            Some(types::Nullable::Null) => job.deadline_ms.is_none(),
+                            Some(types::Nullable::Present(d)) => query::match_date_time_ms(
+                                &Some(d.clone()),
+                                job.deadline_ms.map(|v| v as i64),
+                            ),
+                        }
                 }
             })
             .collect();
 
+        let roots = readstore::RootResolver::new(|k| self.store.process_instance(k));
         let sort = query::sort_keys(
             body.as_ref().and_then(|q| q.sort.as_ref()),
             |r: &models::JobSearchQuerySortRequest| (r.field.clone(), r.order),
@@ -12193,22 +12216,18 @@ impl ServerImpl {
         query::sort_items(
             &mut matched,
             &sort,
-            |job, field| match field {
-                "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
-                "elementId" => query::SortVal::Str(job.element_id.clone()),
-                "type" => query::SortVal::Str(job.job_type.clone()),
-                "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
-                "retries" => query::SortVal::Num(job.retries as i64),
-                _ => query::SortVal::Num(job.key as i64),
-            },
+            |job, field| job_sort_val(job, field),
             |job| job.key,
         );
 
         let sorted: Vec<(u64, &readstore::JobRow)> =
             matched.into_iter().map(|job| (job.key, job)).collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
-        let items: Vec<models::JobSearchResult> =
-            page.items.into_iter().map(job_search_result).collect();
+        let items: Vec<models::JobSearchResult> = page
+            .items
+            .into_iter()
+            .map(|job| job_search_result(job, &roots))
+            .collect();
 
         Ok(Resp::Status200_TheJobSearchResult(
             models::JobSearchQueryResult::new(page.response, items),
@@ -21733,9 +21752,45 @@ fn job_kind_enums(
     }
 }
 
+/// Maps a [`JobRow`] field name to its sort key for `/v2/jobs/search`. Numeric
+/// keys (including `processDefinitionKey`, a numeric key stored as its decimal
+/// string) sort as [`query::SortVal::Num`] so `"2"` precedes `"10"` instead of
+/// lexicographically; timing fields project their millisecond columns with a
+/// missing value sorting as `0` (#1344). Unknown fields fall back to the stable
+/// `job.key` tiebreak. Extracted from the handler so the ordering contract is
+/// unit-testable without a full deploy (the search harness can only mint
+/// same-length definition keys, which hide the numeric-vs-lexicographic bug).
+fn job_sort_val(job: &readstore::JobRow, field: &str) -> query::SortVal {
+    match field {
+        "processInstanceKey" => query::SortVal::Num(job.instance_key as i64),
+        "elementId" => query::SortVal::Str(job.element_id.clone()),
+        "elementInstanceKey" => query::SortVal::Num(job.element_instance_key as i64),
+        "type" => query::SortVal::Str(job.job_type.clone()),
+        "state" => query::SortVal::Str(job_state_enum(job.state).to_string()),
+        "retries" => query::SortVal::Num(job.retries as i64),
+        "worker" => query::SortVal::Str(job.worker.clone().unwrap_or_default()),
+        "processDefinitionId" => query::SortVal::Str(job.process_definition_id.clone()),
+        "processDefinitionKey" => {
+            query::SortVal::Num(job.process_definition_key.parse().unwrap_or(0))
+        }
+        "errorCode" => query::SortVal::Str(job.error_code.clone().unwrap_or_default()),
+        "errorMessage" => query::SortVal::Str(job.error_message.clone().unwrap_or_default()),
+        // Camunda-parity timing sort fields (#1344). Missing values sort as 0
+        // (epoch), so jobs lacking a timestamp group first ascending.
+        "creationTime" => query::SortVal::Num(job.created_at_ms as i64),
+        "lastUpdateTime" => query::SortVal::Num(job.last_update_ms.unwrap_or(0) as i64),
+        "endTime" => query::SortVal::Num(job.end_ms.unwrap_or(0) as i64),
+        "deadline" => query::SortVal::Num(job.deadline_ms.unwrap_or(0) as i64),
+        _ => query::SortVal::Num(job.key as i64),
+    }
+}
+
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
 /// process-definition identity is denormalized onto the row at projection time.
-fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
+fn job_search_result(
+    job: &readstore::JobRow,
+    roots: &readstore::RootResolver,
+) -> models::JobSearchResult {
     // The business id snapshotted when the job was created.
     let business_id = nullable_business_id(job.business_id.clone());
     let process_definition_id = job.process_definition_id.clone();
@@ -21748,6 +21803,20 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         None => types::Nullable::Null,
     };
 
+    // Camunda-parity job timing (#1344). `creationTime` is present once the
+    // engine recorded the creation instant (`created_at_ms > 0`); older jobs read
+    // as null. `lastUpdateTime` / `endTime` map from the projected columns.
+    let creation_time = batch_ms_to_datetime((job.created_at_ms != 0).then_some(job.created_at_ms));
+    let last_update_time = batch_ms_to_datetime(job.last_update_ms);
+    let end_time = batch_ms_to_datetime(job.end_ms);
+    // `rootProcessInstanceKey` walks the call-activity parent chain (Camunda sets
+    // it whenever > 0; a top-level instance is its own root).
+    let root_process_instance_key = types::Nullable::Present(models::ProcessInstanceKey(
+        roots
+            .root_process_instance_key(job.instance_key)
+            .to_string(),
+    ));
+
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
     let mut result = models::JobSearchResult {
@@ -21756,7 +21825,7 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         denied_reason: types::Nullable::Null,
         element_id: types::Nullable::Present(job.element_id.clone()),
         element_instance_key: models::ElementInstanceKey(job.element_instance_key.to_string()),
-        end_time: types::Nullable::Null,
+        end_time,
         // Zeebe job errorMessage / errorCode / hasFailedWithRetriesLeft (#1327).
         error_code: job
             .error_code
@@ -21774,15 +21843,15 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         process_definition_id,
         process_definition_key: models::ProcessDefinitionKey(process_definition_key),
         process_instance_key: models::ProcessInstanceKey(job.instance_key.to_string()),
-        root_process_instance_key: types::Nullable::Null,
+        root_process_instance_key,
         business_id,
         retries: job.retries,
         state: job_state_enum(job.state),
         tenant_id: "<default>".to_string(),
         r_type: job.job_type.clone(),
         worker: job.worker.clone().unwrap_or_default(),
-        creation_time: types::Nullable::Null,
-        last_update_time: types::Nullable::Null,
+        creation_time,
+        last_update_time,
         priority: 0,
         fetched_variables: None,
     };
@@ -37144,6 +37213,273 @@ mod clustered_startup_tests {
         assert!(
             search(other_code).await.is_empty(),
             "a different errorCode matches nothing"
+        );
+    }
+
+    /// #1344 — the Camunda-parity timing filters (`creationTime`,
+    /// `lastUpdateTime`, `endTime`) must actually select on the projected
+    /// timestamps, including the nullable `endTime` ($exists semantics): an
+    /// active job has a creation/last-update time but a NULL `endTime`, and only
+    /// a completed/cancelled job matches `endTime: {$exists: true}`. The existing
+    /// e2e only searches with `{}`, so this guards the filter wiring directly.
+    #[tokio::test]
+    async fn job_search_filters_timing_fields() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await;
+        let job_key = job_key.to_string();
+
+        use apis::job::SearchJobsResponse as SResp;
+        let search = |filter: models::JobFilter| {
+            let server = &server;
+            async move {
+                let mut q = models::JobSearchQuery::new();
+                q.filter = Some(filter);
+                let SResp::Status200_TheJobSearchResult(r) = server
+                    .search_jobs_impl(&Some(q))
+                    .await
+                    .expect("search runs")
+                else {
+                    panic!("expected 200 from job search");
+                };
+                r.items
+            }
+        };
+        let exists = |want: bool| {
+            Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                models::AdvancedDateTimeFilter {
+                    dollar_exists: Some(want),
+                    ..models::AdvancedDateTimeFilter::new()
+                },
+            ))
+        };
+
+        // Active job: creationTime + lastUpdateTime exist, endTime is NULL.
+        let mut creation_present = models::JobFilter::new();
+        creation_present.creation_time = exists(true);
+        assert!(
+            search(creation_present)
+                .await
+                .iter()
+                .any(|j| j.job_key.0 == job_key),
+            "an active job matches creationTime: {{$exists: true}}"
+        );
+        let mut last_update_present = models::JobFilter::new();
+        last_update_present.last_update_time = exists(true);
+        assert!(
+            search(last_update_present)
+                .await
+                .iter()
+                .any(|j| j.job_key.0 == job_key),
+            "an active job matches lastUpdateTime: {{$exists: true}}"
+        );
+        let mut end_absent = models::JobFilter::new();
+        end_absent.end_time = exists(false);
+        assert!(
+            search(end_absent)
+                .await
+                .iter()
+                .any(|j| j.job_key.0 == job_key),
+            "an active job matches endTime: {{$exists: false}}"
+        );
+        let mut end_present = models::JobFilter::new();
+        end_present.end_time = exists(true);
+        assert!(
+            search(end_present.clone())
+                .await
+                .iter()
+                .all(|j| j.job_key.0 != job_key),
+            "an active job must NOT match endTime: {{$exists: true}}"
+        );
+
+        // Complete the job; now endTime exists.
+        server
+            .activate_for_stream("demo-work", "worker-t", 10, 60_000, None)
+            .await;
+        use apis::job::CompleteJobResponse as CResp;
+        let done = server
+            .complete_job_impl(
+                &models::CompleteJobPathParams {
+                    job_key: job_key.clone(),
+                },
+                &None,
+            )
+            .await
+            .expect("completion runs");
+        assert!(matches!(
+            done,
+            CResp::Status204_TheJobWasCompletedSuccessfully
+        ));
+
+        let mut matched = Vec::new();
+        for _ in 0..200 {
+            matched = search(end_present.clone()).await;
+            if matched.iter().any(|j| j.job_key.0 == job_key) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            matched.iter().any(|j| j.job_key.0 == job_key),
+            "a completed job matches endTime: {{$exists: true}}"
+        );
+        let mut end_absent_after = models::JobFilter::new();
+        end_absent_after.end_time = exists(false);
+        assert!(
+            search(end_absent_after)
+                .await
+                .iter()
+                .all(|j| j.job_key.0 != job_key),
+            "a completed job must NOT match endTime: {{$exists: false}}"
+        );
+    }
+
+    /// #1344 — regression for the numeric `processDefinitionKey` sort. The key
+    /// is a numeric id stored as its decimal string; sorting it lexicographically
+    /// put `"10"` before `"2"`. The full search harness can only mint same-length
+    /// definition keys (where lexicographic == numeric), so it cannot exercise
+    /// this bug — this drives the extracted [`job_sort_val`] ordering contract
+    /// directly with crafted keys. Guards the whole numeric-key sort class.
+    #[test]
+    fn job_sort_processdefinitionkey_is_numeric_not_lexicographic() {
+        fn job_row_with_def_key(key: Key, def_key: &str) -> readstore::JobRow {
+            readstore::JobRow {
+                key,
+                instance_key: 1,
+                element_instance_key: 1,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: nanobpmn_engine_core::JobState::Created,
+                retries: 3,
+                worker: None,
+                deadline_ms: None,
+                process_definition_id: "proc".to_string(),
+                process_definition_key: def_key.to_string(),
+                kind: nanobpmn_engine_core::JobKind::BpmnElement,
+                created_at_ms: 0,
+                last_update_ms: None,
+                end_ms: None,
+                read_set: Vec::new(),
+                lease_token: None,
+                business_id: None,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+                last_event_identity_ms: 0,
+            }
+        }
+
+        let two = job_row_with_def_key(100, "2");
+        let ten = job_row_with_def_key(200, "10");
+
+        // Unit contract: the key projects as a number, so `2 < 10`.
+        assert!(matches!(
+            job_sort_val(&two, "processDefinitionKey"),
+            query::SortVal::Num(2)
+        ));
+        assert!(matches!(
+            job_sort_val(&ten, "processDefinitionKey"),
+            query::SortVal::Num(10)
+        ));
+
+        // End-to-end through the shared sorter: ascending puts "2" before "10"
+        // (a lexicographic sort would invert them); descending is the mirror.
+        let sorted = |descending: bool| {
+            let mut rows: Vec<&readstore::JobRow> = vec![&ten, &two];
+            query::sort_items(
+                &mut rows,
+                &[query::SortKey {
+                    field: "processDefinitionKey".to_string(),
+                    descending,
+                }],
+                |job, field| job_sort_val(job, field),
+                |job| job.key,
+            );
+            rows.iter().map(|j| j.key).collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sorted(false),
+            vec![100, 200],
+            "ascending numeric sort: processDefinitionKey 2 before 10"
+        );
+        assert_eq!(
+            sorted(true),
+            vec![200, 100],
+            "descending numeric sort: processDefinitionKey 10 before 2"
+        );
+    }
+
+    /// #1344 — `deadline` is the one NULLABLE job filter: an explicit
+    /// `{"deadline": null}` must select jobs with NO deadline, NOT be treated as
+    /// an omitted filter (which would return every job, including ones carrying a
+    /// deadline). A freshly created (not yet activated) job has no deadline; an
+    /// activated one does.
+    #[tokio::test]
+    async fn job_search_null_deadline_filter_selects_jobs_without_a_deadline() {
+        let server = ServerImpl::default();
+        server
+            .create_for_stream(Some("demo".into()), None, Default::default())
+            .await
+            .expect("create the demo instance");
+        let job_key = await_job_key(&server, "demo-work").await.to_string();
+
+        use apis::job::SearchJobsResponse as SResp;
+        let has_job = |filter: models::JobFilter| {
+            let server = &server;
+            let job_key = job_key.clone();
+            async move {
+                let mut q = models::JobSearchQuery::new();
+                q.filter = Some(filter);
+                let SResp::Status200_TheJobSearchResult(r) = server
+                    .search_jobs_impl(&Some(q))
+                    .await
+                    .expect("search runs")
+                else {
+                    panic!("expected 200 from job search");
+                };
+                r.items.iter().any(|j| j.job_key.0 == job_key)
+            }
+        };
+
+        // Before activation the job has no deadline: `deadline: null` matches it.
+        let mut null_deadline = models::JobFilter::new();
+        null_deadline.deadline = Some(types::Nullable::Null);
+        assert!(
+            has_job(null_deadline).await,
+            "a job with no deadline must match an explicit deadline:null filter"
+        );
+
+        // Activate with a deadline; now `deadline: null` must NOT match it.
+        // Activate WITH A LEASE so the activation is durable (`JobActivated` is
+        // journaled + exported, stamping the deadline onto the read-model row);
+        // the demo job otherwise takes the leader-local soft path, which never
+        // exports `JobActivated` and leaves the read-model deadline NULL.
+        server
+            .activate_for_stream_with_lease("demo-work", "worker-d", 10, 60_000, None, true)
+            .await;
+        let mut null_deadline_after = models::JobFilter::new();
+        null_deadline_after.deadline = Some(types::Nullable::Null);
+        // Poll until the activation (and its deadline) is projected.
+        let mut still_matches = true;
+        for _ in 0..200 {
+            still_matches = has_job(null_deadline_after.clone()).await;
+            if !still_matches {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !still_matches,
+            "an activated job WITH a deadline must NOT match deadline:null"
+        );
+
+        // An omitted deadline filter still matches regardless.
+        assert!(
+            has_job(models::JobFilter::new()).await,
+            "omitting the deadline filter must match a job regardless of its deadline"
         );
     }
 

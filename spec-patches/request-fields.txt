@@ -228,6 +228,7 @@ AdvancedWaitStateTypeFilter.$neq
 AgentInstanceCreationRequest.elementInstanceKey
 AgentInstanceCreationRequest.history
 AgentInstanceCreationRequest.jobKey
+AgentInstanceCreationRequest.jobLease
 AgentInstanceCreationRequest.jobLeaseToken
 AgentInstanceDocumentContent.contentType
 AgentInstanceDocumentContent.documentReference
@@ -307,6 +308,7 @@ AgentInstanceToolCall.toolName
 AgentInstanceUpdateRequest.elementInstanceKey
 AgentInstanceUpdateRequest.history
 AgentInstanceUpdateRequest.jobKey
+AgentInstanceUpdateRequest.jobLease
 AgentInstanceUpdateRequest.jobLeaseToken
 AgentInstanceUpdateRequest.status
 AgentTool.description
@@ -617,11 +619,13 @@ JobChangeset.retries
 JobChangeset.timeout
 JobCompletionRequest.businessId
 JobCompletionRequest.jobLeaseToken
+JobCompletionRequest.leaseToken
 JobCompletionRequest.result
 JobCompletionRequest.variables
 JobErrorRequest.errorCode
 JobErrorRequest.errorMessage
 JobErrorRequest.jobLeaseToken
+JobErrorRequest.leaseToken
 JobErrorRequest.variables
 JobErrorStatisticsFilter.errorCode
 JobErrorStatisticsFilter.errorMessage
@@ -632,6 +636,7 @@ JobErrorStatisticsQuery.filter
 JobErrorStatisticsQuery.page
 JobFailRequest.errorMessage
 JobFailRequest.jobLeaseToken
+JobFailRequest.leaseToken
 JobFailRequest.retries
 JobFailRequest.retryBackOff
 JobFailRequest.variables
@@ -677,28 +682,29 @@ JobResultUserTask.type
 JobSearchQuery.filter
 JobSearchQuery.sort
 JobSearchQuerySortRequest.field
-JobSearchQuerySortRequest.field=creationTime unhonoured #1298
-JobSearchQuerySortRequest.field=deadline unhonoured #1298
+JobSearchQuerySortRequest.field=creationTime
+JobSearchQuerySortRequest.field=deadline
 JobSearchQuerySortRequest.field=deniedReason unhonoured #1298
 JobSearchQuerySortRequest.field=elementId
-JobSearchQuerySortRequest.field=elementInstanceKey unhonoured #1298
-JobSearchQuerySortRequest.field=endTime unhonoured #1298
-JobSearchQuerySortRequest.field=errorCode unhonoured #1298
-JobSearchQuerySortRequest.field=errorMessage unhonoured #1298
+JobSearchQuerySortRequest.field=elementInstanceKey
+JobSearchQuerySortRequest.field=endTime
+JobSearchQuerySortRequest.field=errorCode
+JobSearchQuerySortRequest.field=errorMessage
 JobSearchQuerySortRequest.field=hasFailedWithRetriesLeft unhonoured #1298
 JobSearchQuerySortRequest.field=isDenied unhonoured #1298
 JobSearchQuerySortRequest.field=jobKey
 JobSearchQuerySortRequest.field=kind unhonoured #1298
+JobSearchQuerySortRequest.field=lastUpdateTime
 JobSearchQuerySortRequest.field=listenerEventType unhonoured #1298
 JobSearchQuerySortRequest.field=priority unhonoured #1298
-JobSearchQuerySortRequest.field=processDefinitionId unhonoured #1298
-JobSearchQuerySortRequest.field=processDefinitionKey unhonoured #1298
+JobSearchQuerySortRequest.field=processDefinitionId
+JobSearchQuerySortRequest.field=processDefinitionKey
 JobSearchQuerySortRequest.field=processInstanceKey
 JobSearchQuerySortRequest.field=retries
 JobSearchQuerySortRequest.field=state
 JobSearchQuerySortRequest.field=tenantId
 JobSearchQuerySortRequest.field=type
-JobSearchQuerySortRequest.field=worker unhonoured #1298
+JobSearchQuerySortRequest.field=worker
 JobSearchQuerySortRequest.order
 JobTimeSeriesStatisticsFilter.from
 JobTimeSeriesStatisticsFilter.jobType
@@ -713,6 +719,7 @@ JobTypeStatisticsQuery.filter
 JobTypeStatisticsQuery.page
 JobUpdateRequest.changeset
 JobUpdateRequest.jobLeaseToken
+JobUpdateRequest.leaseToken
 JobUpdateRequest.operationReference
 JobWorkerStatisticsFilter.from
 JobWorkerStatisticsFilter.jobType
