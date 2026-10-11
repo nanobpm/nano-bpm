@@ -4065,17 +4065,30 @@ fn project_engine_state(
     for job in state.jobs.values() {
         let (def_id, def_key) = instance_def(tx, job.instance_key);
         let (kind_code, event_code) = job_kind_codes(&job.kind);
-        // Timing (#1344): a snapshotted job is still live (terminal jobs are
-        // evicted from engine state), so `end_ms` stays NULL and `last_update_ms`
-        // seeds from the creation instant — the best lower bound available without
-        // the per-event history, matching `creationTime <= lastUpdateTime`. On a
-        // CONFLICT we deliberately do NOT overwrite `created_at_ms` /
-        // `last_update_ms` / `end_ms`: an existing read-model row already carries
-        // the authoritative event-derived values, which a compaction-floor reseed
-        // must not clobber. Seed `created_at_ms` with the SAME batch-observation
-        // fallback as `last_update_ms` when the snapshot predates `created_at`
-        // (legacy `0`), so a recovered legacy job surfaces a non-null
-        // `creationTime` (== `lastUpdateTime`) rather than a null creation time.
+        // Timing (#1344): a snapshotted job is USUALLY live — a terminal job is
+        // evicted from engine state together with its owning instance — so
+        // `end_ms` stays NULL and `last_update_ms` seeds from the creation
+        // instant, the best lower bound available without the per-event
+        // history, matching `creationTime <= lastUpdateTime`. KNOWN LIMITATION
+        // (#1346 review): the engine drops a job only when its owning INSTANCE
+        // goes terminal (`evict_instance`), so a parallel/multi-instance
+        // process can be snapshotted with a COMPLETED/CANCELED job whose
+        // sibling branch is still active. Such a job is seeded here as
+        // terminal with `end_ms = NULL` and `last_update_ms = creation_ms`,
+        // and its retained deadline is already gone from engine state
+        // (`JobCompleted` clears `Job::deadline`) — the terminal timing and
+        // deadline are event-derived and not recoverable from a snapshot.
+        // Pinned by
+        // `seed_from_engine_state_cannot_recover_terminal_job_timing`; the
+        // durable fix is the persisted per-event identity tracked in #1347.
+        // On a CONFLICT we deliberately do NOT overwrite `created_at_ms` /
+        // `last_update_ms` / `end_ms`: an existing read-model row already
+        // carries the authoritative event-derived values, which a
+        // compaction-floor reseed must not clobber. Seed `created_at_ms` with
+        // the SAME batch-observation fallback as `last_update_ms` when the
+        // snapshot predates `created_at` (legacy `0`), so a recovered legacy
+        // job surfaces a non-null `creationTime` (== `lastUpdateTime`) rather
+        // than a null creation time.
         // Seed the replay-identity floor with the NEWEST engine-carried instant
         // the snapshot has for this job — `max(created_at, activated_at)`, not
         // creation alone: a job snapshotted while ACTIVATED carries its current
@@ -5441,6 +5454,18 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // (`end_ms IS NULL`), so a re-delivery is a no-op — mirroring
             // `ElementCompleted`. The deadline is NOT cleared: Camunda keeps the
             // last projected deadline on a completed job.
+            //
+            // KNOWN LIMITATION (#1346 review): the retained deadline is only
+            // replay-safe when the journal prefix replays in true order. A job
+            // that failed and was recovered before completing replays
+            // `[JobFailed, JobRetriesUpdated, IncidentResolved, JobActivated,
+            // JobCompleted]`: the failure/resolution prefix clears
+            // `deadline_ms`, the replayed final activation is held by the
+            // `JobActivated` identity gate (`at == floor` on a non-fresh row),
+            // and this completion cannot restore the deadline — it ends NULL
+            // instead of the retained value. Order-aware prefix transitions
+            // need the durable per-event identity tracked in #1347; pinned by
+            // `a_recovered_then_completed_replay_loses_the_retained_deadline`.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
@@ -8078,6 +8103,238 @@ mod definition_xml_tests {
             }])
             .expect("a JobLockExpired over an absent job row must not error the batch");
         assert!(store.jobs().into_iter().all(|j| j.key != 9_900));
+    }
+
+    /// Defect-class guard (#1346 review): `seed_from_engine_state` cannot recover
+    /// terminal-job timing. The engine drops a job only when its owning INSTANCE
+    /// goes terminal (`evict_instance`), so a parallel process can be snapshotted
+    /// with a COMPLETED job whose sibling branch is still ACTIVE. Seeding that
+    /// snapshot recreates the job as terminal with `end_ms = NULL` and
+    /// `last_update_ms = creation_ms` (and the retained deadline already gone
+    /// from engine state — `JobCompleted` clears `Job::deadline`). This pins the
+    /// current (lossy) behaviour so the gap is explicit and covered; the durable
+    /// fix is the persisted per-event identity tracked in #1347.
+    #[test]
+    fn seed_from_engine_state_cannot_recover_terminal_job_timing() {
+        use nanobpmn_engine_core::{Job, JobKind, ProcessInstance, State};
+
+        let mut state = State::default();
+        // A still-ACTIVE owning instance (a parallel branch is still running)…
+        let mut inst = ProcessInstance {
+            key: 7_600,
+            process_id: "p".to_string(),
+            process_definition_key: 0,
+            state: nanobpmn_engine_core::ProcessInstanceState::Active,
+            suspended_at: None,
+            created_at: 50,
+            tags: Vec::new(),
+            business_id: None,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+            active: Default::default(),
+            scopes: Default::default(),
+            variables: Default::default(),
+            join_counts: Default::default(),
+            join_flow_arrivals: Default::default(),
+            join_instances: Default::default(),
+            incidents: Vec::new(),
+            variables_spilled: false,
+            multi_instances: Default::default(),
+            adhoc_instances: Default::default(),
+            scope_parents: Default::default(),
+            scope_variables: Default::default(),
+            compensable: Vec::new(),
+            compensation_waits: Default::default(),
+            agent_instances: Default::default(),
+            agent_history: Default::default(),
+        };
+        inst.active.insert(7_601, "t".to_string());
+        state.instances.insert(7_600, inst);
+        // …holding a COMPLETED job (engine kept it: `JobCompleted` only flips
+        // `state`; eviction happens with the instance, which is still active).
+        // The engine has already cleared `deadline`/`activated_at` on completion.
+        state.jobs.insert(
+            8_600,
+            Job {
+                key: 8_600,
+                instance_key: 7_600,
+                element_instance_key: 7_601,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                state: nanobpmn_engine_core::JobState::Completed,
+                worker: None,
+                deadline: None,
+                activated_at: None,
+                activation_timeout: None,
+                lease_token: None,
+                durable_activation: false,
+                activated: false,
+                retries: 3,
+                priority: 0,
+                created_at: 100,
+                kind: JobKind::BpmnElement,
+                error_message: None,
+                error_code: None,
+                has_failed_with_retries_left: false,
+            },
+        );
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
+        let seeded = job_row(&store, 8_600);
+        assert_eq!(
+            seeded.state,
+            nanobpmn_engine_core::JobState::Completed,
+            "the seed projects the snapshotted terminal state"
+        );
+        // The lossy gap: no `endTime`, `lastUpdateTime` falls back to creation,
+        // and the retained deadline is gone — none are derivable from a snapshot.
+        assert_eq!(
+            seeded.end_ms, None,
+            "a snapshot carries no completion instant, so endTime is unrecoverable"
+        );
+        assert_eq!(
+            seeded.last_update_ms,
+            Some(seeded.created_at_ms),
+            "lastUpdateTime degrades to the creation instant"
+        );
+        assert_eq!(
+            seeded.deadline_ms, None,
+            "the retained deadline is already gone from engine state"
+        );
+    }
+
+    /// Defect-class guard (#1346 review): a job that failed and was RECOVERED
+    /// before completing replays `[JobFailed, JobRetriesUpdated,
+    /// IncidentResolved, JobActivated, JobCompleted]`. The failure/resolution
+    /// prefix clears `deadline_ms`, the replayed final activation is HELD by the
+    /// identity gate (`at == floor` on a non-fresh row), and the completion
+    /// cannot restore the deadline — so the retained deadline is lost (NULL).
+    /// This pins the current (lossy) behaviour so the gap is explicit; the
+    /// order-aware fix needs the durable per-event identity tracked in #1347.
+    #[test]
+    fn a_recovered_then_completed_replay_loses_the_retained_deadline() {
+        let store = ReadStore::open(None).unwrap();
+
+        // Genuine history: create (100) → activate (200, deadline 60_000).
+        apply_at(
+            &store,
+            &Event::JobCreated {
+                job_key: 8_900,
+                instance_key: 7_900,
+                element_instance_key: 7_901,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 100,
+                priority: 0,
+                retries: 3,
+            },
+            100,
+        );
+        apply_at(
+            &store,
+            &Event::JobActivated {
+                job_key: 8_900,
+                instance_key: 7_900,
+                durable: false,
+                worker: "w1".to_string(),
+                deadline: 60_000,
+                activated_at: Some(200),
+                fetch_variables: Vec::new(),
+                lease_token: None,
+            },
+            200,
+        );
+        // Genuine completion at 300 — the deadline is RETAINED on the row.
+        apply_at(
+            &store,
+            &Event::JobCompleted {
+                job_key: 8_900,
+                instance_key: 7_900,
+                created_at: 300,
+                job_type: "worker".to_string(),
+                worker: Some("w1".to_string()),
+            },
+            300,
+        );
+        let completed = job_row(&store, 8_900);
+        assert_eq!(completed.state, nanobpmn_engine_core::JobState::Completed);
+        assert_eq!(
+            completed.deadline_ms,
+            Some(60_000),
+            "Camunda keeps the last projected deadline on a completed job"
+        );
+
+        // Now REPLAY the recovered-then-completed prefix over the completed row:
+        // the older failure/resolution clear the deadline…
+        apply_at(
+            &store,
+            &Event::JobFailed {
+                job_key: 8_900,
+                instance_key: 7_900,
+                retries: 0,
+                worker: Some("w1".to_string()),
+                error_message: None,
+            },
+            9_000,
+        );
+        apply_at(
+            &store,
+            &Event::JobRetriesUpdated {
+                job_key: 8_900,
+                instance_key: 7_900,
+                retries: 1,
+                operation_reference: None,
+            },
+            9_001,
+        );
+        apply_at(
+            &store,
+            &Event::IncidentResolved {
+                incident_key: 55_000,
+                instance_key: 7_900,
+                job_key: Some(8_900),
+                resolved_at: 9_002,
+                operation_reference: None,
+            },
+            9_002,
+        );
+        // …the replayed final activation (identity 200 == floor) is HELD on the
+        // now non-fresh row…
+        apply_at(
+            &store,
+            &Event::JobActivated {
+                job_key: 8_900,
+                instance_key: 7_900,
+                durable: false,
+                worker: "w1".to_string(),
+                deadline: 60_000,
+                activated_at: Some(200),
+                fetch_variables: Vec::new(),
+                lease_token: None,
+            },
+            9_003,
+        );
+        // …and the replayed completion cannot restore the deadline.
+        apply_at(
+            &store,
+            &Event::JobCompleted {
+                job_key: 8_900,
+                instance_key: 7_900,
+                created_at: 300,
+                job_type: "worker".to_string(),
+                worker: Some("w1".to_string()),
+            },
+            9_004,
+        );
+
+        let after = job_row(&store, 8_900);
+        assert_eq!(
+            after.deadline_ms, None,
+            "the replayed failure/resolution prefix clears the retained deadline \
+             and neither the held activation nor the completion can restore it (#1347)"
+        );
     }
 
     #[test]
