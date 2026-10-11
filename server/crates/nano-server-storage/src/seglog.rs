@@ -2337,6 +2337,23 @@ pub fn catch_up_shard(
                      after the read-model schema upgrade"
                 );
             }
+            // A store migrated across the job replay-floor boundary (schema v12)
+            // backfilled `last_event_identity_ms` from `created_at_ms` alone —
+            // below the genuine activation instant of a job that was activated and
+            // returned to `Created` before the upgrade. Refine it from the engine
+            // snapshot's `Job::activated_at` BEFORE replaying the tail it already
+            // reflects, so a replayed `JobActivated` is held and a trailing
+            // replayed `JobLockExpired` stays a no-op (#1346).
+            if let Some(state) = reseed_state
+                && shard
+                    .refine_job_replay_floor_from_state(state)
+                    .expect("refine job replay floor from engine snapshot")
+            {
+                tracing::info!(
+                    "refined the job replay-identity floor from the engine snapshot \
+                     after the read-model schema upgrade"
+                );
+            }
             if skip < surviving.len() {
                 shard
                     .export(&surviving[skip..])
