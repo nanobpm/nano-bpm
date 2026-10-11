@@ -49,9 +49,6 @@ const EVENT_WAITS_BACKFILL_KEY: &str = "event_waits_backfill_pending";
 /// best instant the migrated row already carries (see
 /// [`ReadStore::ensure_schema_on`]).
 const JOB_REPLAY_FLOOR_SCHEMA_VERSION: i64 = 12;
-/// `meta` key flagging that the job replay-identity floor awaits an
-/// engine-state refinement (see [`ReadStore::refine_job_replay_floor_from_state`]).
-const JOB_REPLAY_FLOOR_BACKFILL_KEY: &str = "job_replay_floor_backfill_pending";
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -2022,26 +2019,27 @@ impl ReadStore {
         // (`created_at_ms == 0`) row keeps floor `0`, preserving the pre-field
         // last-writer-wins behaviour the `0` floor documents.
         //
-        // That creation-only bound is NOT overlap-safe for a job that was
-        // activated and then returned to `Created` before the upgrade: its
-        // genuine activation instant exceeds `created_at_ms`, so a replayed
-        // `JobActivated` would pass the strict-newer gate and re-activate the
-        // row, letting a trailing replayed `JobLockExpired` re-stamp
-        // `lastUpdateTime`. The activation instant IS recoverable — the boot
-        // engine snapshot retains `Job::activated_at` even for a
-        // returned-to-`Created` job — so flag the backfill here and let the boot
-        // catch-up refine the floor from that snapshot
-        // (`refine_job_replay_floor_from_state`) BEFORE replaying the tail it
-        // already reflects (the same pattern as `event_waits`, v9, above).
+        // KNOWN MIGRATION LIMITATION (#1346 review, tracked in #1347): the
+        // creation-only floor is NOT overlap-safe for a job that was activated
+        // and then returned to `Created` (lock expiry / retryable failure) before
+        // the upgrade. Its genuine activation instant exceeds `created_at_ms` but
+        // is not recoverable from the migrated row, so a replayed `JobActivated`
+        // can pass the strict-newer gate and re-apply (worker/deadline refreshed,
+        // a trailing replayed `JobLockExpired` re-stamping `lastUpdateTime`).
+        // Recovering the true floor needs a persisted per-event identity the
+        // read model does not yet thread through `project` (round-13 tried to
+        // rebuild it from the boot engine snapshot, but `Job::activated_at` is
+        // cleared on return-to-`Created`, so that reconstruction was a no-op for
+        // exactly the case it targeted). That identity is the deliberate
+        // follow-up #1347; this migration ships the tightest recoverable bound
+        // and accepts the overlap window until then. A separate consequence —
+        // a pre-existing task-listener job has no row at all after upgrade — is
+        // handled by the absent-row tolerance in the `JobActivated` projector.
         if stored_version.is_none_or(|v| v < JOB_REPLAY_FLOOR_SCHEMA_VERSION) {
             conn.execute(
                 "UPDATE jobs SET last_event_identity_ms = \
                  MAX(COALESCE(last_event_identity_ms, 0), COALESCE(created_at_ms, 0))",
                 [],
-            )?;
-            conn.execute(
-                "INSERT OR REPLACE INTO meta (k, v) VALUES (?1, 1)",
-                params![JOB_REPLAY_FLOOR_BACKFILL_KEY],
             )?;
         }
         let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
@@ -2336,73 +2334,6 @@ impl ReadStore {
             tx.execute(
                 "DELETE FROM meta WHERE k = ?1",
                 params![EVENT_WAITS_BACKFILL_KEY],
-            )?;
-        }
-        tx.commit()?;
-        Ok(pending)
-    }
-
-    /// Refines the job replay-identity floor (`last_event_identity_ms`) from the
-    /// boot engine `state` when this store was migrated across the v12 boundary
-    /// (see [`Self::ensure_schema_on`]), then clears the pending flag. The
-    /// migration backfills the floor from `created_at_ms` — the only instant the
-    /// migrated row carries — but that bound is below the genuine activation
-    /// instant of a job that was activated and then returned to `Created` before
-    /// the upgrade. The engine snapshot retains `Job::activated_at` even for such
-    /// a job, so raise each live job's floor to the newest instant the snapshot
-    /// holds (`max(created_at, activated_at)`), never lowering it.
-    ///
-    /// The migration also leaves `last_update_ms` NULL (a pre-#1344 database has
-    /// no such column), which the `JobActivated` gate's `fresh` discriminator
-    /// (`COALESCE(last_update_ms, created_at_ms) <= created_at_ms`) reads as
-    /// "never advanced" — so a replayed activation at the floor would still apply
-    /// on a NULL-`last_update_ms` row. Because the snapshot proves the job
-    /// advanced (it was activated), restore the non-fresh signal too: raise
-    /// `last_update_ms` to the same refined instant (a genuine event time, never
-    /// lowering an existing value). Call it BEFORE replaying the journal tail the
-    /// `state` already reflects: a replayed `JobActivated` is then at-or-below
-    /// the refined floor on a non-fresh row and held, so a trailing replayed
-    /// `JobLockExpired` stays a no-op instead of re-stamping `lastUpdateTime`.
-    /// Returns whether a refinement ran.
-    pub fn refine_job_replay_floor_from_state(
-        &self,
-        state: &nanobpmn_engine_core::State,
-    ) -> rusqlite::Result<bool> {
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
-        let mut conn = self.conn.lock().expect("read store poisoned");
-        let tx = conn.transaction()?;
-        let pending = tx
-            .query_row(
-                "SELECT v FROM meta WHERE k = ?1",
-                params![JOB_REPLAY_FLOOR_BACKFILL_KEY],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .is_some();
-        if pending {
-            for job in state.jobs.values() {
-                let floor = job.created_at.max(job.activated_at.unwrap_or(0));
-                if floor != 0 {
-                    // `last_update_ms` uses `>` (not `MAX`'s `>=`) so a fresh
-                    // never-activated row (`last_update_ms == created_at_ms`) is
-                    // left reading fresh; only a genuinely-advanced job (the
-                    // snapshot carries a later instant) is marked non-fresh.
-                    tx.execute(
-                        "UPDATE jobs SET \
-                         last_event_identity_ms = MAX(COALESCE(last_event_identity_ms, 0), ?2), \
-                         last_update_ms = CASE WHEN ?2 > COALESCE(last_update_ms, 0) THEN ?2 \
-                                               ELSE last_update_ms END \
-                         WHERE key = ?1",
-                        params![job.key as i64, floor as i64],
-                    )?;
-                }
-            }
-            tx.execute(
-                "DELETE FROM meta WHERE k = ?1",
-                params![JOB_REPLAY_FLOOR_BACKFILL_KEY],
             )?;
         }
         tx.commit()?;
@@ -5252,25 +5183,51 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // lock-expiry→re-activation unreachable, and the two are distinct
             // commands. The correct discriminator is a unique persisted
             // event/position identity, which `project` is not currently threaded
-            // with; that is a deliberate follow-up, not patched here with a
-            // heuristic that would weaken the replay no-op this gate exists to
+            // with; that is a deliberate follow-up (#1347), not patched here with
+            // a heuristic that would weaken the replay no-op this gate exists to
             // guarantee.
-            let (prior_floor, fresh): (i64, bool) = tx.query_row(
-                "SELECT COALESCE(last_event_identity_ms, 0), \
-                 COALESCE(last_update_ms, created_at_ms) <= created_at_ms \
-                 FROM jobs WHERE key = ?1",
-                params![*job_key as i64],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )?;
-            // A legacy (`activated_at == None`, pre-field) activation carries no
-            // identity to gate on, so it always applies — gating it would break
-            // replay of a pre-#1344 journal. Only a `Some` identity is gated.
-            let apply_transition = match activated_at {
-                None => true,
-                Some(at) => {
-                    let at = *at as i64;
-                    at > prior_floor || (at == prior_floor && fresh)
-                }
+            //
+            // ABSENT-ROW TOLERANCE (#1346 review): a task-listener job created
+            // before this PR projected `TaskListenerJobCreated` into a `jobs` row
+            // (on `main` that event was a no-op) has NO row — its creation
+            // predates the projecting code and already sits below
+            // `exported_position`, so it is never replayed to create the row.
+            // Its surviving `JobActivated` tail then replays against an absent
+            // row. Read the gate columns with `.optional()` so that is `None`
+            // rather than a `QueryReturnedNoRows` error — a bare `?` here would
+            // propagate out of `project` and roll back the ENTIRE export batch,
+            // wedging the exporter on the first activation after upgrade. Both
+            // the floor-raise and the transition UPDATEs below are
+            // `WHERE key = ?1`, so an absent row leaves the whole handler a clean
+            // no-op: the job simply does not appear in the read model, exactly as
+            // on `main`. This is the documented migration limitation (see
+            // `ensure_schema_on`); recovering these rows needs the persisted
+            // event identity tracked in #1347.
+            let gate: Option<(i64, bool)> = tx
+                .query_row(
+                    "SELECT COALESCE(last_event_identity_ms, 0), \
+                     COALESCE(last_update_ms, created_at_ms) <= created_at_ms \
+                     FROM jobs WHERE key = ?1",
+                    params![*job_key as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let apply_transition = match gate {
+                // Absent row: nothing to gate and nothing to update (the UPDATEs
+                // below no-op on a missing key) — stay a clean no-op, never
+                // erroring.
+                None => false,
+                // A legacy (`activated_at == None`, pre-field) activation carries
+                // no identity to gate on, so it always applies — gating it would
+                // break replay of a pre-#1344 journal. Only a `Some` identity is
+                // gated.
+                Some((prior_floor, fresh)) => match activated_at {
+                    None => true,
+                    Some(at) => {
+                        let at = *at as i64;
+                        at > prior_floor || (at == prior_floor && fresh)
+                    }
+                },
             };
             tx.cexecute(
                 "UPDATE jobs SET last_event_identity_ms = \
@@ -7572,147 +7529,6 @@ mod writability_tests {
     }
 
     #[test]
-    fn migration_refines_the_job_replay_floor_from_engine_state() {
-        use nanobpmn_engine_core::{Job, JobKind, State};
-
-        // Defect-class guard (#1346 review): the migration backfills
-        // `last_event_identity_ms` from `created_at_ms` alone, which is BELOW the
-        // genuine activation instant of a job that was activated and then
-        // returned to `Created` before the upgrade. Replaying the prefix then
-        // accepts `JobActivated(200)` as new (re-activating the row) and the
-        // trailing `JobLockExpired` re-stamps `lastUpdateTime`. The boot engine
-        // snapshot retains `Job::activated_at` even for a returned-to-`Created`
-        // job, so the catch-up must refine the floor from it BEFORE replaying the
-        // tail — then the replayed activation is held and the lock-expiry stays a
-        // no-op.
-        let path = scratch_db();
-        {
-            let store = ReadStore::open(Some(&path)).expect("fresh open");
-            let conn = store.conn.lock().unwrap();
-            // A job created at t=100, activated at t=200, then returned to
-            // `Created` by a lock expiry at t=250 (state Created, last_update_ms
-            // 250). A pre-#1344 row carries no replay floor.
-            conn.execute(
-                "INSERT INTO jobs \
-                 (key, instance_key, element_instance_key, element_id, job_type, \
-                  state, retries, process_definition_id, process_definition_key, \
-                  created_at_ms, last_update_ms) \
-                 VALUES (12, 1, 1, 'e', 't', 0, 3, 'p', '1', 100, 250)",
-                [],
-            )
-            .unwrap();
-        }
-        // Regress the database to a pre-#1344 schema (drop the floor and the
-        // sibling timing columns a pre-#1344 database lacks) and stamp the version
-        // to just before the floor was introduced, so the next open migrates
-        // across the v12 boundary and flags the engine-state refinement.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "ALTER TABLE jobs DROP COLUMN last_event_identity_ms;
-                 ALTER TABLE jobs DROP COLUMN last_update_ms;
-                 UPDATE meta SET v = 11 WHERE k = 'schema_version';",
-            )
-            .unwrap();
-        }
-        let store = ReadStore::open(Some(&path)).expect("migration on open");
-        // The migration backfills the floor from creation alone (the only instant
-        // the migrated row carries) and flags the refinement.
-        assert_eq!(job_row(&store, 12).last_event_identity_ms, 100);
-
-        // The boot engine snapshot retains the job's last activation instant even
-        // though the job is currently back in `Created`.
-        let mut state = State::default();
-        state.jobs.insert(
-            12,
-            Job {
-                key: 12,
-                instance_key: 1,
-                element_instance_key: 1,
-                element_id: "e".to_string(),
-                job_type: "t".to_string(),
-                state: nanobpmn_engine_core::JobState::Created,
-                worker: None,
-                deadline: None,
-                activated_at: Some(200),
-                activation_timeout: None,
-                lease_token: None,
-                durable_activation: false,
-                activated: true,
-                retries: 3,
-                priority: 0,
-                created_at: 100,
-                kind: JobKind::BpmnElement,
-                error_message: None,
-                error_code: None,
-                has_failed_with_retries_left: false,
-            },
-        );
-        assert!(
-            store.refine_job_replay_floor_from_state(&state).unwrap(),
-            "a migrated store must run the engine-state floor refinement"
-        );
-        assert_eq!(
-            job_row(&store, 12).last_event_identity_ms,
-            200,
-            "the floor must be refined to the snapshot's activation instant"
-        );
-        assert_eq!(
-            job_row(&store, 12).last_update_ms,
-            Some(200),
-            "the refinement must restore the non-fresh signal (the job advanced)"
-        );
-        // The refinement is a one-shot: the pending flag is cleared.
-        assert!(
-            !store.refine_job_replay_floor_from_state(&state).unwrap(),
-            "the refinement clears its pending flag"
-        );
-
-        // The regression the finding cites: replaying the prefix
-        // [JobActivated(200), JobLockExpired] over the migrated row must now be a
-        // no-op. With the creation-only floor (100) the replayed activation would
-        // have re-activated the row and the lock-expiry would have re-stamped
-        // `lastUpdateTime` with the replay batch's fresh `now_ms`.
-        apply_at(
-            &store,
-            &Event::JobActivated {
-                job_key: 12,
-                instance_key: 1,
-                durable: false,
-                worker: "w".to_string(),
-                deadline: 300,
-                activated_at: Some(200),
-                fetch_variables: Vec::new(),
-                lease_token: None,
-            },
-            9_000,
-        );
-        let row = job_row(&store, 12);
-        assert_eq!(
-            row.state,
-            nanobpmn_engine_core::JobState::Created,
-            "the replayed activation must be held on the refined (non-fresh) row"
-        );
-        apply_at(
-            &store,
-            &Event::JobLockExpired {
-                job_key: 12,
-                instance_key: 1,
-            },
-            9_001,
-        );
-        let row = job_row(&store, 12);
-        assert_eq!(
-            row.last_update_ms,
-            Some(200),
-            "the replayed lock-expiry must not re-stamp lastUpdateTime past the refined floor"
-        );
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
-        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
-    }
-
-    #[test]
     fn schema_fingerprint_is_stable_within_a_build() {
         // Derived purely from SCHEMA, so it is constant across calls and never
         // hand-maintained.
@@ -8215,6 +8031,53 @@ mod definition_xml_tests {
             "the held replay must not re-stamp the stale deadline"
         );
         assert_eq!(after.last_event_identity_ms, 200);
+    }
+
+    #[test]
+    fn replayed_activation_over_an_absent_job_row_is_a_no_op_not_a_batch_failure() {
+        // Defect-class guard (#1346 review, finding #1): this PR newly projects
+        // `TaskListenerJobCreated` into a `jobs` row, but on `main` that event
+        // was a no-op — so a task-listener job created before the upgrade has NO
+        // row (its create predates the projecting code and already sits below
+        // `exported_position`, so it is never replayed to create the row). Its
+        // surviving `JobActivated` tail then replays against an ABSENT row. The
+        // gate's identity lookup must tolerate that: a bare `?` on
+        // `QueryReturnedNoRows` would propagate out of `project` and roll back
+        // the ENTIRE export batch, wedging the exporter on the first activation
+        // after upgrade. The handler must instead be a clean no-op.
+        let store = ReadStore::open(None).unwrap();
+
+        // No `JobCreated`/`TaskListenerJobCreated` was projected for this job, so
+        // its row is absent. Export a batch whose sole event is the activation.
+        let outcome = store
+            .export(&[&Event::JobActivated {
+                job_key: 9_900,
+                instance_key: 7_900,
+                durable: false,
+                worker: "w".to_string(),
+                deadline: 60_000,
+                activated_at: Some(200),
+                fetch_variables: Vec::new(),
+                lease_token: None,
+            }])
+            .expect("a JobActivated over an absent job row must not error the batch");
+
+        // The batch committed and the absent job stayed absent (exactly as on
+        // `main`, where these jobs never appear in the read model).
+        assert_eq!(outcome.inflight_delta, 0);
+        assert!(
+            store.jobs().into_iter().all(|j| j.key != 9_900),
+            "the activation over an absent row must not fabricate a job row"
+        );
+
+        // A trailing JobLockExpired over the same absent row is likewise inert.
+        store
+            .export(&[&Event::JobLockExpired {
+                job_key: 9_900,
+                instance_key: 7_900,
+            }])
+            .expect("a JobLockExpired over an absent job row must not error the batch");
+        assert!(store.jobs().into_iter().all(|j| j.key != 9_900));
     }
 
     #[test]
