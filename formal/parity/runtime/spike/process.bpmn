@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  id="parity-spike-defs"
+                  targetNamespace="http://nanobpm.io/parity/spike">
+  <!-- Self-contained environment probe: start -> end, no service task, so it
+       runs to completion with no job worker. Variables passed at creation flow
+       through to completion, exercising the `completed` + `variables` surface
+       that a bare Zeebe gateway exposes over v2 REST (awaitCompletion). -->
+  <bpmn:process id="parity-spike" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>flow</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="flow" sourceRef="start" targetRef="end" />
+    <bpmn:endEvent id="end">
+      <bpmn:incoming>flow</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="diagram">
+    <bpmndi:BPMNPlane id="plane" bpmnElement="parity-spike">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="80" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="280" y="80" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="flow_di" bpmnElement="flow">
+        <di:waypoint x="196" y="98" />
+        <di:waypoint x="280" y="98" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

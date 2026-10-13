@@ -1,0 +1,172 @@
+# Runtime parity environment spike (#1280) — NON-REQUIRED, manual only.
+#
+# INSTALL: this file ships as formal/parity/runtime/spike/
+# parity-runtime-spike.workflow.yml and must be moved to
+# .github/workflows/parity-runtime-spike.yml by a maintainer with the GitHub
+# `workflow` OAuth scope (the bot that opened the PR does not have it). See
+# formal/parity/runtime/spike/README.md.
+#
+# This is the infrastructure go/no-go harness for the runtime half of the
+# nano <-> Camunda 8 parity suite (#1240). It answers, on the ACTUAL GitHub
+# runner, the question a maintainer must decide before #1270 (live differential)
+# and #1247 (JVM/JaCoCo coverage) can flip on:
+#
+#   Can our CI runners host Docker + a live bare Camunda 8 reachable over v2 REST,
+#   and attach a JaCoCo agent to a JVM — deterministically and within budget?
+#
+# It is deliberately:
+#   * workflow_dispatch ONLY — it never runs on push/PR/merge_group, so it can
+#     NEVER block a sibling PR. (A workflow_dispatch run also does not satisfy
+#     branch protection, which is correct: this must never become a merge gate
+#     without the full procedure in AGENTS.md -> "Merging PRs".)
+#   * a DISTINCT workflow file — it shares no job with ci.yml's `formal` block
+#     (#1230) or any code gate.
+#   * self-contained — the probes here (formal/parity/runtime/spike/) do not
+#     depend on #1271's not-yet-merged driver; once #1271 lands, a maintainer
+#     points step "corpus" at formal/parity/runtime/run.mjs.
+#
+# Record the resulting GO / NO-GO (with the run link + the numbers this prints to
+# the job summary) in formal/parity/runtime/spike/README.md.
+name: parity-runtime-spike
+
+on:
+  workflow_dispatch:
+    inputs:
+      camunda_image:
+        description: 'Bare Camunda/Zeebe gateway image to probe (v2 REST).'
+        type: string
+        default: 'camunda/zeebe:8.10.0'
+      rest_port:
+        description: 'Host port the gateway serves the v2 REST API on.'
+        type: string
+        default: '8080'
+      extra_docker_env:
+        description: 'Extra `-e KEY=VAL` docker flags (auth/config knobs to iterate the spike).'
+        type: string
+        default: ''
+      ready_timeout_ms:
+        description: 'Gateway readiness budget for the REST probe.'
+        type: string
+        default: '120000'
+
+# A spike must never race a second copy of itself for the same evidence.
+concurrency:
+  group: parity-runtime-spike
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  camunda-runtime:
+    name: spike / Docker + live Camunda 8 (v2 REST)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: Time the image pull (pull cost)
+        id: pull
+        env:
+          IMAGE: ${{ inputs.camunda_image }}
+        run: |
+          start=$(date +%s)
+          docker pull "$IMAGE"
+          end=$(date +%s)
+          size=$(docker image inspect "$IMAGE" --format '{{.Size}}')
+          echo "pull_seconds=$((end - start))" >> "$GITHUB_OUTPUT"
+          echo "image_bytes=$size" >> "$GITHUB_OUTPUT"
+
+      - name: Start the bare gateway
+        env:
+          IMAGE: ${{ inputs.camunda_image }}
+          REST_PORT: ${{ inputs.rest_port }}
+          EXTRA_ENV: ${{ inputs.extra_docker_env }}
+        run: |
+          # Disable auth for the spike so the v2 REST probe needs no token. The
+          # exact flags are version-sensitive and are part of what this spike
+          # confirms; iterate them via the `extra_docker_env` dispatch input.
+          docker run -d --name camunda \
+            -p "${REST_PORT}:8080" \
+            -e CAMUNDA_SECURITY_AUTHENTICATION_UNPROTECTEDAPI=true \
+            -e CAMUNDA_SECURITY_AUTHORIZATIONS_ENABLED=false \
+            $EXTRA_ENV \
+            "$IMAGE"
+
+      - name: Probe v2 REST (deploy + createInstance awaitCompletion)
+        id: probe
+        env:
+          CAMUNDA_REST_ADDRESS: http://localhost:${{ inputs.rest_port }}/v2
+          PROBE_READY_TIMEOUT_MS: ${{ inputs.ready_timeout_ms }}
+        run: |
+          set -o pipefail
+          node formal/parity/runtime/spike/rest-probe.mjs | tee "$RUNNER_TEMP/probe.log"
+          findings=$(grep -o '::PROBE_FINDINGS::.*' "$RUNNER_TEMP/probe.log" | sed 's/::PROBE_FINDINGS:://' || echo '{}')
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+
+      - name: Resource + log notes (always)
+        if: ${{ always() }}
+        run: |
+          echo "## container stats"
+          docker stats --no-stream camunda || true
+          echo "## last 60 log lines"
+          docker logs --tail 60 camunda 2>&1 || true
+
+      - name: Go/no-go summary
+        if: ${{ always() }}
+        env:
+          PULL_SECONDS: ${{ steps.pull.outputs.pull_seconds }}
+          IMAGE_BYTES: ${{ steps.pull.outputs.image_bytes }}
+          FINDINGS: ${{ steps.probe.outputs.findings }}
+          OUTCOME: ${{ steps.probe.outcome }}
+        run: |
+          {
+            echo "### Docker + live Camunda 8 (v2 REST) — task 1 & 2"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| image | \`${{ inputs.camunda_image }}\` |"
+            echo "| image size (bytes) | ${IMAGE_BYTES:-n/a} |"
+            echo "| pull seconds | ${PULL_SECONDS:-n/a} |"
+            echo "| probe outcome | ${OUTCOME:-n/a} |"
+            echo "| probe findings | \`${FINDINGS:-{}}\` |"
+            echo ""
+            echo "Record this run's link + numbers in \`formal/parity/runtime/spike/README.md\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop the gateway (always)
+        if: ${{ always() }}
+        run: docker rm -f camunda || true
+
+  jacoco-feasibility:
+    name: spike / JVM + JaCoCo agent (for #1247)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Probe JaCoCo agent attach + coverage dump
+        id: jacoco
+        run: |
+          set -o pipefail
+          formal/parity/runtime/spike/jacoco-probe.sh | tee "$RUNNER_TEMP/jacoco.log"
+          findings=$(grep -o '::JACOCO_FINDINGS::.*' "$RUNNER_TEMP/jacoco.log" | sed 's/::JACOCO_FINDINGS:://' || echo '{}')
+          echo "findings=$findings" >> "$GITHUB_OUTPUT"
+      - name: Go/no-go summary
+        if: ${{ always() }}
+        env:
+          FINDINGS: ${{ steps.jacoco.outputs.findings }}
+          OUTCOME: ${{ steps.jacoco.outcome }}
+        run: |
+          {
+            echo "### JVM + JaCoCo agent — task 3 (feeds #1247)"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| probe outcome | ${OUTCOME:-n/a} |"
+            echo "| probe findings | \`${FINDINGS:-{}}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
