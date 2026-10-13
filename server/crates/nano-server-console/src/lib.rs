@@ -3474,9 +3474,18 @@ defineWorker({{
 /// the `@lib/` alias to the shared workspace library, so a worker can both
 /// `import { defineWorker } from "@nanobpm/worker"` and reuse shared logic with
 /// `import { fmt } from "@lib/money.ts"`.
+///
+/// The target is `<gen>/worker-sdk.ts` — the file the standalone supervisor
+/// materialises (`workers::ensure_sdk_written`). A standalone worker directory is
+/// `<workspace>/workers/<name>/`, so the relative specifier climbs to the
+/// workspace root and back down. **Do not** point this at `workers.ts`: that
+/// typed re-export exists only inside a RAD project (magic `{GEN}` dir next to
+/// the worker), so a standalone worker would fail module resolution before it
+/// ever connects. `worker-sdk.ts` is self-contained (no imports of its own), so
+/// it is a complete replacement for `workers.ts`'s `export *`.
 const WORKER_NODE_JSON: &str = r#"{
   "imports": {
-    "@nanobpm/worker": "../../nano-generated/workers.ts",
+    "@nanobpm/worker": "../../nano-generated/worker-sdk.ts",
     "@lib/": "../../lib/"
   }
 }
@@ -6418,6 +6427,70 @@ mod asset_encoding_tests {
                 .get(header::CONTENT_ENCODING)
                 .and_then(|v| v.to_str().ok()),
             Some("gzip")
+        );
+    }
+}
+
+#[cfg(test)]
+mod standalone_worker_scaffold_tests {
+    //! A standalone (Workers-tab) worker is scaffolded **outside** any RAD
+    //! project: its directory is `<workspace>/workers/<name>/`, and the only SDK
+    //! the supervisor materialises is `<workspace>/nano-generated/worker-sdk.ts`.
+    //! The scaffold's `node.json` import map therefore has to resolve
+    //! `@nanobpm/worker` to *that* file — pointing it at a RAD-project-only
+    //! `workers.ts` leaves the freshly created worker unresolvable, so it dies at
+    //! module load before it can connect (the "it scaffolded but never ran"
+    //! failure mode).
+    use std::path::{Component, Path, PathBuf};
+
+    use super::{WORKER_NODE_JSON, worker_scaffold_ts};
+
+    /// Lexical `..`/`.` collapse (the dirs need not exist), mirroring how Node
+    /// resolves a relative import specifier.
+    fn normalize(p: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn worker_scaffold_import_map_resolves_against_a_real_standalone_worker_dir() {
+        let sdk = "worker-sdk.ts";
+        let root = Path::new("/tmp/nanobpm-workspace");
+        let worker = root.join("workers").join("echo");
+        let import_map: serde_json::Value = serde_json::from_str(WORKER_NODE_JSON)
+            .expect("the scaffolded node.json must be valid JSON");
+        let target = import_map["imports"]["@nanobpm/worker"]
+            .as_str()
+            .expect("@nanobpm/worker alias");
+        // Resolve the relative specifier the way Node does: from the worker dir.
+        let resolved = normalize(&worker.join(target));
+        assert_eq!(
+            resolved,
+            root.join("nano-generated").join(sdk),
+            "@nanobpm/worker must resolve to the SDK the supervisor actually writes"
+        );
+        assert!(
+            !target.ends_with("workers.ts"),
+            "workers.ts is written only inside a RAD project; a standalone worker \
+             would fail module resolution (got {target})"
+        );
+    }
+
+    #[test]
+    fn worker_scaffold_imports_the_worker_sdk_specifier_it_maps() {
+        let ts = worker_scaffold_ts("my-job");
+        assert!(
+            ts.contains(r#"from "@nanobpm/worker""#),
+            "the scaffold must import the bare specifier the import map defines"
         );
     }
 }

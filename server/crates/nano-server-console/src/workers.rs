@@ -225,20 +225,33 @@ fn ensure_lib_alias(dir: &std::path::Path) {
 }
 
 /// Minimum Node that can run workers: `--experimental-strip-types` (TS erasure)
-/// landed in 22.6; `node:sqlite` (22.5) and a global `WebSocket` (22.4) are
-/// older still, so 22.6 is the effective floor.
+/// landed in 22.6. `node:sqlite` (22.5) and a global `WebSocket` (22.4) are older
+/// still — and `node:sqlite` stays behind `--experimental-sqlite` until 22.13, so
+/// the launch command passes that flag ([`super::projects::node_fallback_command`])
+/// rather than raising this floor and stranding 22.6–22.12 installs.
 const NODE_MIN: (u32, u32) = (22, 6);
 
-/// Locates a Node binary for the worker fallback runtime: `NANOBPMN_NODE_BIN`
-/// (exported by the npm launcher — its own `process.execPath`), then `PATH`,
-/// then `~/.local/bin`. Presence only; see [`usable_node`] for the version gate.
-pub(crate) fn find_node() -> Option<PathBuf> {
+/// One Node candidate to consider, with the one-line `--version` output it
+/// produced (`None` when it did not spawn or exited non-zero).
+type NodeProbe = (PathBuf, Option<String>);
+
+/// Every Node binary worth trying, in resolution order: `NANOBPMN_NODE_BIN`
+/// (exported by the npm launcher — its own `process.execPath`), then `node` on
+/// `PATH`, then `~/.local/bin/node`.
+///
+/// A **list**, not first-match: a stale `NANOBPMN_NODE_BIN` must not mask a
+/// supported Node further down. This is the single source of the candidate order
+/// — [`find_node`] (presence) and [`usable_node`] (version-gated) both derive
+/// from it, so they can never disagree, and ProcessOS's `select_node` applies the
+/// same first-supported policy in its own crate.
+fn node_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
     if let Ok(p) = std::env::var("NANOBPMN_NODE_BIN")
         && !p.is_empty()
     {
         let pb = PathBuf::from(p);
         if pb.is_file() {
-            return Some(pb);
+            out.push(pb);
         }
     }
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
@@ -246,17 +259,23 @@ pub(crate) fn find_node() -> Option<PathBuf> {
         for dir in std::env::split_paths(&path) {
             let cand = dir.join(exe);
             if cand.is_file() {
-                return Some(cand);
+                out.push(cand);
             }
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
         let cand = PathBuf::from(home).join(".local").join("bin").join(exe);
         if cand.is_file() {
-            return Some(cand);
+            out.push(cand);
         }
     }
-    None
+    out
+}
+
+/// Locates a Node binary for the worker fallback runtime, by **presence** only
+/// (the first existing candidate). See [`usable_node`] for the version gate.
+pub(crate) fn find_node() -> Option<PathBuf> {
+    node_candidates().into_iter().next()
 }
 
 /// Parses a `node --version` string (`"v24.15.0\n"`) into `(major, minor)`.
@@ -268,19 +287,49 @@ fn parse_node_version(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
-/// The Node binary iff present **and** new enough ([`NODE_MIN`]) to run workers.
-/// Probes `node --version`; returns `None` on any older/unparseable/erroring Node.
-pub(crate) fn usable_node() -> Option<PathBuf> {
-    let bin = find_node()?;
-    let out = std::process::Command::new(&bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+/// The first candidate whose `--version` parses as **>= [`NODE_MIN`]**, skipping
+/// anything older, unparseable, or that fails to spawn — so an outdated
+/// `NANOBPMN_NODE_BIN` cannot make workers unavailable when a supported Node is
+/// later on `PATH`. A candidate is always preferred to none: if *nothing* on the
+/// host clears the floor, the first that at least ran is used, so a supported
+/// floor lowered or a host behind it degrades to a version-specific runtime error
+/// rather than a "no runtime installed" one.
+fn first_supported(probed: &[NodeProbe]) -> Option<PathBuf> {
+    let mut fallback: Option<PathBuf> = None;
+    for (bin, raw) in probed {
+        if let Some(raw) = raw {
+            match parse_node_version(raw) {
+                Some(v) if v >= NODE_MIN => return Some(bin.clone()),
+                _ => fallback = Some(bin.clone()),
+            }
+        }
     }
-    let ver = parse_node_version(&String::from_utf8_lossy(&out.stdout))?;
-    (ver >= NODE_MIN).then_some(bin)
+    fallback
+}
+
+/// The Node binary iff present **and** new enough ([`NODE_MIN`]) to run workers.
+/// Probes each candidate's `--version` and takes the first that clears the floor;
+/// returns `None` only when no Node was found at all (or every candidate failed).
+pub(crate) fn usable_node() -> Option<PathBuf> {
+    first_supported(&probe_candidates())
+}
+
+/// Runs `--version` on every candidate in resolution order. Kept separate from
+/// the pure [`first_supported`] policy so the selection is unit-testable without
+/// spawning.
+fn probe_candidates() -> Vec<NodeProbe> {
+    node_candidates()
+        .into_iter()
+        .map(|bin| {
+            let raw = std::process::Command::new(&bin)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            (bin, raw)
+        })
+        .collect()
 }
 
 impl WorkerSupervisor {
@@ -512,7 +561,11 @@ struct StatusLine {
 
 #[cfg(test)]
 mod node_runtime_tests {
-    use super::{NODE_MIN, find_node, parse_node_version};
+    use super::{NODE_MIN, find_node, first_supported, parse_node_version};
+
+    fn p(s: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(s)
+    }
 
     #[test]
     fn parse_node_version_reads_major_minor() {
@@ -554,5 +607,52 @@ mod node_runtime_tests {
         );
         unsafe { std::env::remove_var("NANOBPMN_NODE_BIN") };
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_supported_skips_a_stale_override_for_a_newer_path_node() {
+        // The defect class: a first-match resolver (the old `find_node` + probe)
+        // binds an outdated `NANOBPMN_NODE_BIN` and reports the host as having no
+        // runtime, even though a supported Node sits later on PATH — while
+        // ProcessOS selects by version and reports the host ready. One policy:
+        // first candidate that *clears the floor* wins.
+        let probed = vec![
+            (p("/usr/local/bin/node"), Some("v18.20.0\n".to_string())),
+            (p("/opt/node/bin/node"), Some("v22.6.0\n".to_string())),
+        ];
+        assert_eq!(first_supported(&probed), Some(p("/opt/node/bin/node")));
+    }
+
+    #[test]
+    fn first_supported_prefers_the_newest_eligible_in_order() {
+        let probed = vec![
+            (p("a"), None), // did not spawn — skipped, not selected
+            (p("b"), Some("v22.6.1".to_string())),
+            (p("c"), Some("v24.15.0".to_string())),
+        ];
+        assert_eq!(first_supported(&probed), Some(p("b")));
+    }
+
+    #[test]
+    fn first_supported_falls_back_to_a_present_but_older_node() {
+        // Nothing clears the floor: still return a Node so the failure is a
+        // version-specific runtime error, never a false "not installed".
+        let probed = vec![(p("old"), Some("v20.11.0".to_string()))];
+        assert_eq!(first_supported(&probed), Some(p("old")));
+    }
+
+    #[test]
+    fn first_supported_is_none_without_any_node() {
+        assert_eq!(first_supported(&[]), None);
+        assert_eq!(first_supported(&[(p("x"), None)]), None);
+    }
+
+    #[test]
+    fn first_supported_ignores_unparseable_versions() {
+        let probed = vec![
+            (p("weird"), Some("not-a-version".to_string())),
+            (p("ok"), Some("v23.1.0".to_string())),
+        ];
+        assert_eq!(first_supported(&probed), Some(p("ok")));
     }
 }

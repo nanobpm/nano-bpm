@@ -1422,8 +1422,20 @@ pub(crate) fn resolve_entrypoint(dir: &Path, cfg: &ProjectConfig) -> String {
 pub(crate) const GEN_DIR: &str = "nano-generated";
 
 /// Append the Node fallback runtime flags to `cmd`: strip TS types, silence the
-/// `--experimental-strip-types` warning, and preload the loader bootstrap
+/// experimental-feature warnings, and preload the loader bootstrap
 /// (`node-register.mjs`, ADR 0065) via `--import`.
+///
+/// `--experimental-sqlite` is included because the generated `data-sdk.ts`
+/// (`@nanobpm/data`) imports the `node:sqlite` built-in at module load, and that
+/// built-in is gated behind the flag on Node **22.6–22.12**: the supported floor
+/// is 22.6 ([`super::workers::NODE_MIN`]), so without the flag a host on the
+/// floor would pass the version preflight and then die the moment an Urban app or
+/// a data operation is started. Node **22.13+** (and 23+/24) enable `node:sqlite`
+/// by default; the flag is still accepted there (harmless and non-deprecated), so
+/// it is unconditional rather than a per-version branch — the flag set cannot
+/// drift from the floor it is derived from. Covering a *newer* runtime than the
+/// floor is deliberate: raising the minimum would strand existing 22.6–22.12
+/// installs.
 ///
 /// `register` is the **absolute** path to the bootstrap module. It is always
 /// handed to Node as a `file://` URL (see [`file_url_arg`]): a raw absolute path
@@ -1437,6 +1449,7 @@ pub(crate) const GEN_DIR: &str = "nano-generated";
 /// it so their flags can't drift apart.
 pub(crate) fn node_fallback_command<'a>(cmd: &'a mut Command, register: &Path) -> &'a mut Command {
     cmd.arg("--experimental-strip-types")
+        .arg("--experimental-sqlite")
         .arg("--no-warnings")
         .arg("--import")
         .arg(file_url_arg(register))
@@ -1457,6 +1470,39 @@ pub(crate) fn file_url_arg(path: &Path) -> String {
 /// from one constant.
 fn gendir(template: &str) -> String {
     template.replace("{GEN}", GEN_DIR)
+}
+
+#[cfg(test)]
+mod node_flag_tests {
+    use std::path::Path;
+
+    use tokio::process::Command;
+
+    use super::node_fallback_command;
+
+    /// The generated `data-sdk.ts` imports `node:sqlite` at module load, and the
+    /// `NODE_MIN` floor is 22.6 — where `node:sqlite` is still gated behind
+    /// `--experimental-sqlite`. The single-source launch incantation must carry
+    /// that flag, or a host on the floor passes the version preflight and then
+    /// dies when an Urban app or a data operation starts.
+    #[test]
+    fn launch_flags_include_experimental_sqlite_for_the_supported_floor() {
+        let mut cmd = Command::new("node");
+        node_fallback_command(&mut cmd, Path::new("/w/nano-generated/node-register.mjs"));
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.iter().any(|a| a == "--experimental-sqlite"),
+            "node:sqlite is flag-gated on 22.6–22.12 (the supported floor): {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--experimental-strip-types"),
+            "TS type stripping is still required: {args:?}"
+        );
+    }
 }
 
 /// Default project `node.json`: import map for the SDK + shared library, and a
@@ -1611,13 +1657,84 @@ pub(crate) fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
     Some((name.to_string(), range.to_string()))
 }
 
+/// Strip the two JSONC extensions — `//` line and `/* … */` block comments, and
+/// trailing commas — so a `.jsonc` import map parses as JSON. Quote-aware: a `//`
+/// inside a string value (`"https://host/x"`) is preserved, and only a comma whose
+/// next structural token is `}`/`]` is dropped.
+///
+/// Mirrors `stripJsonc` in `node_loader.mjs` (keep the two in lockstep): the
+/// loader advertises `node.jsonc`/`deno.jsonc` as candidates, and the Rust
+/// dependency derivation reads the same files, so both must accept a real JSONC
+/// body rather than silently failing the parse (the loader would skip the file and
+/// leave the project's imports unresolved).
+fn strip_jsonc(input: &str) -> String {
+    let chars: Vec<char> = input.chars().collect();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+                i += 1;
+            }
+            '/' if chars.get(i + 1) == Some(&'/') => {
+                i += 2;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+                    i += 1;
+                }
+                i = (i + 2).min(chars.len());
+            }
+            ',' => {
+                let mut j = i + 1;
+                while j < chars.len() && chars[j].is_whitespace() {
+                    j += 1;
+                }
+                if matches!(chars.get(j), Some('}') | Some(']')) {
+                    i += 1; // trailing comma — drop it
+                } else {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// Parse a `node.json`/`node.jsonc` body into its npm dependency set, or `None`
 /// when the body does not parse as a JSON object. `Some(empty)` means "parsed,
 /// but no `npm:` imports" — distinct from a parse failure, so callers can mirror
 /// `node-loader.mjs`, which falls through to the next candidate file only on a
 /// read/parse error, not on a valid-but-import-less map.
 fn parse_npm_deps(manifest_json: &str) -> Option<BTreeMap<String, String>> {
-    let serde_json::Value::Object(root) = serde_json::from_str(manifest_json).ok()? else {
+    let serde_json::Value::Object(root) = serde_json::from_str(&strip_jsonc(manifest_json)).ok()?
+    else {
         return None;
     };
     let mut deps = BTreeMap::new();
@@ -3189,7 +3306,7 @@ database in production with no source change.\n\n\
 Declare an LLM job worker in the manifest — no handler code needed \
 (ADR 0022 §E). Each `workers[]` entry with an `llm` id resolves `llm.<id>` and \
 registers a Falcon worker on its `taskType` whose handler calls the model:\n\n\
-```jsonc\n\
+```json\n\
 \"workers\": [{{ \"taskType\": \"classify\", \"llm\": \"classifier\" }}],\n\
 \"llm\": {{ \"classifier\": {{ \"provider\": \"env\", \"model\": \"${{NANO_APP_LLM_MODEL}}\" }} }}\n\
 ```\n\n\
@@ -6267,7 +6384,7 @@ fn synthesize_generate_import_map(dir: &std::path::Path) -> String {
     for name in ["node.json", "node.jsonc", "deno.json", "deno.jsonc"] {
         if let Ok(txt) = std::fs::read_to_string(dir.join(name))
             && let Ok(serde_json::Value::Object(obj)) =
-                serde_json::from_str::<serde_json::Value>(&txt)
+                serde_json::from_str::<serde_json::Value>(&strip_jsonc(&txt))
             && let Some(serde_json::Value::Object(im)) = obj.get("imports")
         {
             imports = im.clone();
@@ -13462,6 +13579,48 @@ mod tests {
             !deps.contains_key("@nanobpm/nano-sdk"),
             "node.json must shadow the legacy deno.json, not merge with it"
         );
+    }
+
+    /// `node.jsonc` is advertised as a candidate by both the loader and
+    /// `required_npm_deps`, so a *real* JSONC body (comments + trailing commas)
+    /// must parse — otherwise the reader silently skips the file (JSON.parse
+    /// throws) and the project's deps go unhealed, while the loader likewise fails
+    /// to resolve the imports. Mirror of `stripJsonc` in `node_loader.mjs`.
+    #[test]
+    fn required_npm_deps_reads_a_commented_node_jsonc() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("jsonc");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("node.jsonc"),
+            "{\n  // the SDK, resolved via npm\n  \"imports\": {\n    \
+             \"@nanobpm/nano-sdk\": \"npm:@nanobpm/nano-sdk@^1\",\n  },\n}\n",
+        )
+        .unwrap();
+        let deps = required_npm_deps(&dir);
+        assert_eq!(
+            deps.get("@nanobpm/nano-sdk").map(String::as_str),
+            Some("^1"),
+            "a JSONC body must be read, not silently skipped"
+        );
+    }
+
+    /// Quote-awareness is part of the shared contract: a `//` inside a string
+    /// value (a URL) is not a comment, and only a comma followed by `}`/`]` is a
+    /// trailing comma. Divergence here would make the loader and the dependency
+    /// derivation read different maps from the same file.
+    #[test]
+    fn strip_jsonc_is_quote_aware_and_only_drops_trailing_commas() {
+        let src = r#"{
+  "url": "https://host/x", // a real comment
+  "glob": "a/*b*/c",
+  "list": [1, 2,],
+}"#;
+        let v: serde_json::Value = serde_json::from_str(&strip_jsonc(src)).unwrap();
+        assert_eq!(v["url"], "https://host/x");
+        assert_eq!(v["glob"], "a/*b*/c");
+        assert_eq!(v["list"], serde_json::json!([1, 2]));
     }
 
     // ── update-from-template overlay / 3-way merge (issue #573) ────────────

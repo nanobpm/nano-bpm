@@ -936,7 +936,7 @@ under `projects/` as a self-contained, runnable Node application:
 | --- | --- |
 | `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (holds the standalone `workers/` plus, by default, `projects/` — unless `NANOBPMN_PROJECTS_DIR` moves the projects root). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
 | `NANOBPMN_PROJECTS_DIR=<dir>` | Override the projects root directly. Default `<workspace>/projects`. |
-| `NANOBPMN_NODE_BIN=<path>` | Explicit path to the Node (≥ 22.6) binary used to run workers and projects. Default: `node` on `PATH`, else `~/.nvm`/`~/.local/bin/node`. |
+| `NANOBPMN_NODE_BIN=<path>` | Explicit path to the Node (≥ 22.6) binary used to run workers and projects. Tried first, but **skipped if it is too old** — the next supported candidate (on `PATH`, then `~/.local/bin/node`) wins, so a stale override cannot mask a good Node. |
 
 ### Embedded workers (Node)
 
@@ -977,7 +977,10 @@ The downloaded `nano-workers-app.zip` unpacks to:
 ```text
 nano-workers-app/
 ├── main.ts                 # entrypoint: deploys models, then starts the workers
-├── node.json               # import map (@nanobpm/worker) + `npm start`
+├── package.json            # npm identity (engines: node >= 22.6) + `npm start`
+├── node.json               # import map: @nanobpm/worker + every worker's npm deps
+├── node-register.mjs       # `--import` bootstrap that registers the loader
+├── node-loader.mjs         # ESM loader that makes Node honour node.json's imports
 ├── README.md               # how to configure and run it
 ├── sdk/worker-sdk.ts       # the embedded worker SDK (same source as the console)
 ├── workers/<name>/…        # each selected worker's source

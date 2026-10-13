@@ -393,19 +393,21 @@ Workers don't have to run inside the console. From the **Workers** tab, click
 shipping a worker fleet to another machine or running it outside Nano.
 
 The downloaded `nano-workers-app.zip` unpacks to a project with a `main.ts`
-entrypoint, a `node.json` (import map + `npm start`), a `README.md`, the
-worker SDK, each selected worker's source, and a `resources/` folder.
+entrypoint, a `package.json` (`engines: node >= 22.6` and the `npm start`
+script), a `node.json` import map, the `node-register.mjs` / `node-loader.mjs`
+pair that makes Node honour that import map, a `README.md`, the worker SDK, each
+selected worker's source, and a `resources/` folder.
 
 On startup the app **deploys every `.bpmn` file in `resources/`** to the target
 engine, then runs the bundled workers. Drop your own models into `resources/`
-before starting. Run it with Node:
+before starting. Run it with Node ≥ 22.6:
 
 ```bash
 cd nano-workers-app
 # Point at your Nano gateway (defaults to http://127.0.0.1:8080):
 export NANOBPMN_BASE_URL=http://127.0.0.1:8080
 npm install
-npm start                  # node --experimental-strip-types main.ts
+npm start   # node --experimental-strip-types --import ./node-register.mjs main.ts
 ```
 
 **Dependencies travel with the app.** The exporter scans the selected workers'

@@ -39,12 +39,60 @@ function readImportMap() {
   for (const name of candidates) {
     try {
       const raw = readFileSync(resolvePath(baseDir, name), "utf8");
-      return JSON.parse(raw).imports ?? {};
+      return JSON.parse(stripJsonc(raw)).imports ?? {};
     } catch {
       // not present / unreadable — try the next candidate
     }
   }
   return {};
+}
+
+// Strip the two JSONC extensions — `//` line and `/* … */` block comments, and
+// trailing commas — so a `.jsonc` import map parses as JSON. Quote-aware so a `//`
+// inside a string value (`"https://host/x"`) survives. Mirrors `strip_jsonc` in
+// projects.rs (keep the two in lockstep): the candidate list advertises
+// `node.jsonc`/`deno.jsonc`, so the loader must accept a real JSONC body rather
+// than skip the file and leave the project's imports unresolved.
+export function stripJsonc(input) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  let i = 0;
+  while (i < input.length) {
+    const c = input[i];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      i += 1;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+      i += 1;
+    } else if (c === "/" && input[i + 1] === "/") {
+      i += 2;
+      while (i < input.length && input[i] !== "\n") i += 1;
+    } else if (c === "/" && input[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < input.length && !(input[i] === "*" && input[i + 1] === "/")) i += 1;
+      i = Math.min(i + 2, input.length);
+    } else if (c === ",") {
+      let j = i + 1;
+      while (j < input.length && /\s/.test(input[j])) j += 1;
+      if (input[j] === "}" || input[j] === "]") i += 1; // trailing comma — drop it
+      else {
+        out += c;
+        i += 1;
+      }
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
 }
 const MAP = readImportMap();
 

@@ -2,7 +2,7 @@
 // Run: `node --experimental-strip-types --test server/crates/nano-server-console/src/app_pages_test.ts`
 import { test } from "node:test";
 import { assert, assertEquals } from "./test_support.ts";
-import { createPagesHandler, servePages, type PagesContext } from "./app_pages.ts";
+import { createPagesHandler, sendInternalError, servePages, type PagesContext } from "./app_pages.ts";
 
 function ctx(over: Partial<PagesContext> & { port?: number } = {}): PagesContext {
   return {
@@ -333,4 +333,124 @@ test("servePages rejects an over-limit request body with 413 (no buffering)", as
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test("GET /app/data query failure does not leak the driver error to the client", async () => {
+  // Defect class: an unexpected handler/database error must be logged and
+  // answered generically, never echoed to a public caller. The route's
+  // introspection failures already answer `{"error":"schema introspection
+  // failed"}`; a failure in the whitelisted `SELECT` itself used to escape the
+  // handler entirely and surface the raw driver text (SQLite messages carry the
+  // database file path and the failing SQL).
+  const secret = "SQLITE_ERROR: no such column: ssn (/srv/app/secrets/urban.db)";
+  const handle = createPagesHandler(
+    ctx({
+      db: {
+        schema: () => Promise.resolve([{ name: "pull_requests" }]),
+        query: (sql: string) =>
+          /table_info/.test(sql)
+            ? Promise.resolve([{ name: "pr_key" }, { name: "status" }])
+            : Promise.reject(new Error(secret)),
+      },
+    }),
+  );
+  const res = await handle(new Request("http://x/app/data/app/pull_requests"));
+  assertEquals(res.status, 500);
+  const text = await res.text();
+  assert(!text.includes("urban.db"), `must not leak the driver error: ${text}`);
+  assert(!text.includes("SQLITE_ERROR"), `must not leak the driver error: ${text}`);
+});
+
+test("servePages never echoes a failing /app/data query", async () => {
+  // True end-to-end path for the leaked-error defect: a failing whitelisted
+  // `SELECT` used to escape the handler entirely, so the `node:http` adapter's
+  // catch echoed the raw driver message (`SQLITE_ERROR … (/srv/app/secrets/urban.db)`)
+  // to a public caller. The route now answers generically; the adapter's sink
+  // (`sendInternalError`, unit-tested below) remains the last line of defence.
+  const secret = "SQLITE_ERROR: no such column: ssn (/srv/app/secrets/urban.db)";
+  const server = servePages(
+    ctx({
+      port: 0,
+      homePage: "home",
+      db: {
+        schema: () => Promise.resolve([{ name: "pull_requests" }]),
+        query: (sql: string) =>
+          /table_info/.test(sql)
+            ? Promise.resolve([{ name: "pr_key" }, { name: "status" }])
+            : Promise.reject(new Error(secret)),
+      },
+    }),
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      if (server.listening) resolve();
+      else {
+        server.once("listening", resolve);
+        server.once("error", reject);
+      }
+    });
+    const { port } = server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${port}/app/data/app/pull_requests`);
+    const text = await res.text();
+    assertEquals(res.status, 500);
+    assert(!text.includes("urban.db"), `must not leak the driver error: ${text}`);
+    assert(!text.includes("SQLITE_ERROR"), `must not leak the driver error: ${text}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("sendInternalError answers generically and destroys a committed response", () => {
+  // The sink's two branches: an uncommitted response gets an opaque 500; a
+  // response whose headers were already sent must be destroyed rather than
+  // re-headed (a second `writeHead` throws ERR_HTTP_HEADERS_SENT, after which
+  // nothing is answered at all).
+  const secret = "boom at /srv/app/secrets/urban.db";
+
+  const fresh = { status: 0, body: "", destroyed: false, headersSent: false };
+  sendInternalError(
+    {
+      get headersSent() {
+        return fresh.headersSent;
+      },
+      writeHead(status: number) {
+        fresh.status = status;
+        fresh.headersSent = true;
+        return this;
+      },
+      end(body?: string) {
+        fresh.body = body ?? "";
+        return this;
+      },
+      destroy() {
+        fresh.destroyed = true;
+        return this;
+      },
+    } as never,
+    new Error(secret),
+  );
+  assertEquals(fresh.status, 500);
+  assert(!fresh.body.includes("urban.db"), `must not leak the exception: ${fresh.body}`);
+
+  const committed = { destroyed: false, wrote: false };
+  sendInternalError(
+    {
+      headersSent: true,
+      writeHead() {
+        committed.wrote = true;
+        throw new Error("ERR_HTTP_HEADERS_SENT");
+      },
+      end() {
+        committed.wrote = true;
+        return this;
+      },
+      destroy() {
+        committed.destroyed = true;
+        return this;
+      },
+    } as never,
+    new Error(secret),
+  );
+  assert(committed.destroyed, "a committed response must be destroyed, not re-headed");
+  assert(!committed.wrote, "no second status line may be attempted");
 });

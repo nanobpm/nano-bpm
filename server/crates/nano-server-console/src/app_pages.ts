@@ -218,10 +218,19 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
         orderSql = ` ORDER BY ${field} ${dir}`;
       }
       const whereSql = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
-      const rows = await ctx.db.query(
-        `SELECT * FROM ${table}${whereSql}${orderSql} LIMIT ${rowLimit}`,
-        params,
-      );
+      let rows: unknown[];
+      try {
+        rows = await ctx.db.query(
+          `SELECT * FROM ${table}${whereSql}${orderSql} LIMIT ${rowLimit}`,
+          params,
+        );
+      } catch (e) {
+        // The column/table whitelist above already made the SQL safe; a failure
+        // here is a driver problem (locked/missing database), whose message can
+        // carry the database path. Log it, answer generically — never echo it.
+        console.error(`[app-pages] query failed for "${table}":`, e);
+        return json({ error: "query failed" }, 500);
+      }
       return json({ rows });
     }
 
@@ -361,12 +370,41 @@ export function servePages(
       const response = await handle(request);
       res.writeHead(response.status, Object.fromEntries(response.headers));
       res.end(Buffer.from(await response.arrayBuffer()));
-    })().catch((e) => {
-      res.writeHead(500, { "content-type": "text/plain" });
-      res.end(String((e as Error)?.message ?? e));
-    });
+    })().catch((e) => sendInternalError(res, e));
   });
   return server.listen(ctx.port ?? 8090);
+}
+
+/// The minimum of a `node:http` response this module needs, kept structural so
+/// the error path is unit-testable without a socket.
+export interface ErrorSink {
+  headersSent: boolean;
+  writeHead(status: number, headers?: Record<string, string>): unknown;
+  end(body?: string): unknown;
+  destroy(): unknown;
+}
+
+/// Answer an unexpected server-side failure **without leaking its text**. The
+/// detail is logged server-side; the client gets an opaque 500. This is the last
+/// line of defence for the public port — an exception's message can carry a
+/// filesystem path, SQL fragment, or backend text, so it must never be echoed.
+///
+/// If the response is already committed (`headersSent`) a second `writeHead`
+/// throws `ERR_HTTP_HEADERS_SENT`; destroy the socket instead. Any failure inside
+/// this handler also degrades to a destroy rather than escaping the socket
+/// callback.
+export function sendInternalError(res: ErrorSink, err: unknown): void {
+  console.error("[app-pages] unhandled request error:", err);
+  try {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    res.writeHead(500, { "content-type": "text/plain", connection: "close" });
+    res.end("internal server error");
+  } catch {
+    res.destroy();
+  }
 }
 
 function escapeAttr(s: string): string {

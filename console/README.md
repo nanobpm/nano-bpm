@@ -63,7 +63,8 @@ and a generated entry point that ties them together.
 ```
 <projectsRoot>/<project>/
   nanobpm.project.json   # name, description, deployTarget, main, export platforms
-  node.json              # import map (@nanobpm/worker, @lib/) + `npm start`
+  node.json              # import map (@nanobpm/worker, @lib/); package.json runs it
+  package.json           # npm identity (engines: node >= 22.6) + `npm start`
   main.ts                # deploys resources/processes/*.bpmn, then starts workers
   resources/
     processes/  *.bpmn   # deployed to the engine on Run
@@ -113,5 +114,7 @@ The center pane dispatches on file extension:
 
 Running and compiling require a Node (≥ 22.6) runtime on the gateway host; when
 none is detected the editors and Export still work, but Run and Compile are
-disabled.
+disabled. The `NANOBPMN_NODE_BIN` environment variable names an explicit binary,
+but a version older than 22.6 is skipped in favour of a supported Node on
+`PATH`/`~/.local/bin`.
 
