@@ -51,7 +51,9 @@ Concretely:
 ### 1. Runtime: one selection path
 
 `find_deno()` and the `deno_available()` flag are gone. `workers::usable_node()` is the single
-runtime resolver (`NANOBPMN_NODE_BIN`, `PATH`, `~/.nvm`, `~/.local/bin/node`). The three run paths
+runtime resolver (`NANOBPMN_NODE_BIN`, then every `node` on `PATH`, then `~/.local/bin/node` — no
+`~/.nvm`; a `NANOBPMN_NODE_BIN` older than the floor is skipped, so a supported Node further down
+still wins). The three run paths
 (`workers::start`, `projects::run`, `projects::run_data_op`) and the trigger-driver supervisor
 (`trigger_sources.rs`) launch Node unconditionally and report a single "no Node runtime" error
 (`DataError::NoRuntime`) when it is absent. TypeScript runs natively via
@@ -62,12 +64,13 @@ runtime resolver (`NANOBPMN_NODE_BIN`, `PATH`, `~/.nvm`, `~/.local/bin/node`). T
 The manifest/import-map file is **`node.json`** (with a `node.jsonc` variant), not `deno.json`.
 `NANOBPMN_DENO_BIN` becomes **`NANOBPMN_NODE_BIN`**; the language-pack config key is **`nodeBin`**;
 the built-in packs are **`node`** and **`node-gui`**; `default_lang()` is `"node"`. The specifier
-loader is `node_loader.mjs` + `node_register.mjs` (already Node-only; the `deno.json`-reading
-compatibility shim is deleted alongside `node_deno_shim.mjs`).
+loader is `node_loader.mjs` + `node_register.mjs` (already Node-only; the `deno.json`- and
+`deno.jsonc`-reading compatibility shim is deleted alongside `node_deno_shim.mjs`).
 
 **Legacy ids still resolve.** A project config scaffolded before this ADR (`lang: "deno"`, or an app
 pack `deno-gui`) keeps working: `extensions::lang_pack`/`pack` alias the legacy ids onto the
-built-in Node packs, and the loader treats a `deno.json` left on disk as an alias of `node.json`.
+built-in Node packs, and the loader treats a `deno.json`/`deno.jsonc` left on disk as an alias of
+`node.json`/`node.jsonc`.
 This is a **compatibility alias, not a second runtime** — the alias only fixes the *file name / id*;
 execution is Node either way.
 

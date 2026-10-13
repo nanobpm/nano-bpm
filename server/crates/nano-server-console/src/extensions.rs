@@ -659,7 +659,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 key: "nodeBin".into(),
                 label: "Node binary".into(),
                 description: Some(
-                    "Path to the Node runtime used to run a project (`node --experimental-strip-types`). Auto-resolved from PATH / ~/.nvm / ~/.local/bin when unset.".into(),
+                    "Path to the Node runtime used to run a project (`node --experimental-strip-types`). Auto-resolved from NANOBPMN_NODE_BIN, then PATH, then ~/.local/bin when unset.".into(),
                 ),
                 env: Some("NANOBPMN_NODE_BIN".into()),
                 default: Some("node (on PATH)".into()),

@@ -3901,6 +3901,13 @@ async fn recv_live(
 // is itself a runnable Node app. See `projects`.
 // ---------------------------------------------------------------------------
 
+/// Public wrapper over [`urban::urban_available`] for the server crate's
+/// hand-written-to-generated response adapter (`console_api.rs`), which must
+/// supply the required `urbanAvailable` field on its error fallback.
+pub fn urban_available() -> bool {
+    urban::urban_available()
+}
+
 /// `GET /console/api/projects` — list projects (tiles) with resource counts and
 /// live run status.
 pub async fn projects_list() -> ApiResult {

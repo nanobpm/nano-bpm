@@ -49,6 +49,26 @@ fn from_val<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
     serde_json::from_value(v).expect("generated model matches value shape")
 }
 
+/// The empty-project-listing body served when [`nano_server_console::projects_list`]
+/// fails. Kept as its own function so it can be held to the generated model's
+/// shape: `projects_list` answers `200` only, and the adapter round-trips the body
+/// through [`from_val`], which `expect`s a match — so a missing **required** field
+/// (`urbanAvailable` on the spec's list response) would panic the handler instead
+/// of serving the intended empty list. Returning the typed model's body here makes
+/// that drift a compile error rather than a runtime panic.
+fn list_projects_fallback() -> serde_json::Value {
+    let empty = nanobpm_console_api::models::ProjectsResponse::new(
+        Vec::new(),
+        false,
+        nano_server_console::urban_available(),
+        nano_server_console::projects::PLATFORMS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    serde_json::to_value(empty).expect("fallback response serializes")
+}
+
 /// Remap the project run `status` `crashed` → `error` on every `RunState`
 /// object (identified by the `compiling` discriminator key) nested in `v`.
 fn fix_run_status(v: &mut serde_json::Value) {
@@ -1246,13 +1266,7 @@ impl apis::projects::Projects for ServerImpl {
         // Only 200 is declared; on error fall back to empty.
         let mut v = nano_server_console::projects_list()
             .await
-            .unwrap_or_else(|_| {
-                serde_json::json!({
-                    "projects": [],
-                    "nodeAvailable": false,
-                    "platforms": nano_server_console::projects::PLATFORMS,
-                })
-            });
+            .unwrap_or_else(|_| list_projects_fallback());
         fix_run_status(&mut v);
         Ok(
             apis::projects::ListProjectsResponse::Status200_ProjectsPlusRuntimeAvailability(
@@ -1891,5 +1905,40 @@ impl nano_server_console::ConsoleServer for ServerImpl {
                 m
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the error path of `GET /console/api/projects`: the response
+    /// model marks `urbanAvailable` **required**, and the adapter deserializes the
+    /// body with [`from_val`] (which `expect`s a match). Before this test the
+    /// fallback omitted that field, so a project-listing error *panicked* the
+    /// handler instead of returning the intended empty 200.
+    #[test]
+    fn list_projects_fallback_satisfies_the_required_response_shape() {
+        let body = list_projects_fallback();
+        assert_eq!(body["projects"], serde_json::json!([]));
+        // Every required field is present with the right type — the property the
+        // generated `expect` relies on.
+        assert!(body["nodeAvailable"].is_boolean());
+        assert!(body["urbanAvailable"].is_boolean());
+        assert!(body["platforms"].is_array());
+    }
+
+    /// The fallback round-trips through the exact conversion the handler performs,
+    /// so a missing field fails here (loudly) rather than at request time.
+    #[test]
+    fn list_projects_fallback_deserializes_into_the_generated_model() {
+        let model: nanobpm_console_api::models::ProjectsResponse =
+            from_val(list_projects_fallback());
+        assert!(model.projects.is_empty());
+        assert!(!model.node_available);
+        assert_eq!(
+            model.platforms.len(),
+            nano_server_console::projects::PLATFORMS.len()
+        );
     }
 }

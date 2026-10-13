@@ -996,7 +996,7 @@ cd nano-workers-app
 # Point at your Nano gateway (defaults to http://127.0.0.1:8080):
 export NANOBPMN_BASE_URL=http://127.0.0.1:8080
 npm install
-npm start                  # node --experimental-strip-types main.ts
+npm start                  # node --experimental-strip-types --import ./node-register.mjs main.ts
 ```
 
 The bundled `README.md` documents the same steps.

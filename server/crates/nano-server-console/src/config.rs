@@ -368,10 +368,26 @@ fn probe(bin: &str) -> Option<String> {
 /// Projects and workers run on Node (>= 22.6). Mirrors the engine's resolution
 /// order (`NANOBPMN_NODE_BIN`, PATH, `~/.local/bin/node`).
 fn check_node() -> Dependency {
-    let bin = super::workers::find_node()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "node".to_string());
-    let version = probe(&bin).filter(|s| !s.is_empty());
+    // Report the binary/version that the runtime **actually selects**
+    // (`selected_node`), so `present: true` can never sit beside an older or
+    // nonexistent pick. Only when nothing clears the floor do we fall back to a
+    // mere presence probe (`find_node`) — then `present` is false but the IDE can
+    // still show which Node was found and how old it is.
+    let (bin, version) = match super::workers::selected_node() {
+        Some((bin, version)) => (
+            bin.display().to_string(),
+            version
+                .map(|v| v.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        ),
+        None => {
+            let bin = super::workers::find_node()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "node".to_string());
+            let version = probe(&bin).filter(|s| !s.is_empty());
+            (bin, version)
+        }
+    };
     let present = super::workers::usable_node().is_some();
     Dependency {
         id: "node".into(),

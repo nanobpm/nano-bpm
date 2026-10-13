@@ -84,10 +84,12 @@ one project, surfaced as a tile on the Projects home.
 Open a project to get a file browser, graphical/code editors, the run console,
 and a toolbar:
 
-- **Run** — `node --experimental-strip-types main.ts`: deploys every
-  `resources/processes/*.bpmn` to the configured deploy target, then imports and
-  starts each worker. Stdout/stderr stream live into the Output panel. **Stop**
-  terminates the application.
+- **Run** — `node --experimental-strip-types --import <project>/nano-generated/node-register.mjs main.ts`:
+  deploys every `resources/processes/*.bpmn` to the configured deploy target,
+  then imports and starts each worker. (The supervisor also passes
+  `--experimental-sqlite` on the supported Node floor; that is the same command
+  the generated `package.json` `start` script runs.) Stdout/stderr stream live
+  into the Output panel. **Stop** terminates the application.
 - **Compile** — runs the project's configured compile command (lang pack or
   toolchain argv), producing standalone binaries under `dist/`.
 - **Configure** — edits the deploy target (`<target>/v2` is the REST API the app
@@ -112,9 +114,13 @@ The center pane dispatches on file extension:
 > `.dmn`/`.form` resources graphically and they travel with the project (and its
 > export zip), but only `resources/processes/*.bpmn` are deployed and executed.
 
-Running and compiling require a Node (≥ 22.6) runtime on the gateway host; when
-none is detected the editors and Export still work, but Run and Compile are
-disabled. The `NANOBPMN_NODE_BIN` environment variable names an explicit binary,
-but a version older than 22.6 is skipped in favour of a supported Node on
-`PATH`/`~/.local/bin`.
+Running a **Node-runtime** project (the default scaffold and any lang pack that
+uses Node as its runtime) requires Node (≥ 22.6) on the gateway host; when none
+is detected the editors and Export still work, but Run is disabled for those
+projects. Compiling runs whatever compile command the project's lang pack /
+toolchain declares — a Node project with no compile command reports "no compile
+command configured", and a pack with its own toolchain (e.g. the Rust pack) is
+unaffected by Node availability. The `NANOBPMN_NODE_BIN` environment variable
+names an explicit binary, but a version older than 22.6 is skipped in favour of a
+supported Node on `PATH`/`~/.local/bin`.
 

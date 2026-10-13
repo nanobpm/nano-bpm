@@ -244,9 +244,37 @@ type NodeProbe = (PathBuf, Option<String>);
 /// — [`find_node`] (presence) and [`usable_node`] (version-gated) both derive
 /// from it, so they can never disagree, and ProcessOS's `select_node` applies the
 /// same first-supported policy in its own crate.
+///
+/// The environment is read once, here, and handed to the pure
+/// [`node_candidates_from`] — so the selection logic itself is testable without
+/// mutating the process-global environment (which `cargo test` runs in parallel).
 fn node_candidates() -> Vec<PathBuf> {
+    let override_bin = std::env::var("NANOBPMN_NODE_BIN").ok();
+    let path = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME");
+    node_candidates_from(NodeEnv {
+        override_bin: override_bin.as_deref(),
+        path: path.as_deref(),
+        home: home.as_deref(),
+    })
+}
+
+/// The parts of the environment candidate resolution depends on, injected so the
+/// ordering is pure and testable.
+struct NodeEnv<'a> {
+    /// `NANOBPMN_NODE_BIN`, if set and non-empty.
+    override_bin: Option<&'a str>,
+    /// `PATH`.
+    path: Option<&'a std::ffi::OsStr>,
+    /// `HOME`, for the `~/.local/bin/node` fallback.
+    home: Option<&'a std::ffi::OsStr>,
+}
+
+/// Pure candidate resolution: override, then every `node` on `PATH`, then
+/// `~/.local/bin/node` — keeping only paths that exist. No environment access.
+fn node_candidates_from(env: NodeEnv<'_>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(p) = std::env::var("NANOBPMN_NODE_BIN")
+    if let Some(p) = env.override_bin
         && !p.is_empty()
     {
         let pb = PathBuf::from(p);
@@ -255,15 +283,15 @@ fn node_candidates() -> Vec<PathBuf> {
         }
     }
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
+    if let Some(path) = env.path {
+        for dir in std::env::split_paths(path) {
             let cand = dir.join(exe);
             if cand.is_file() {
                 out.push(cand);
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = env.home {
         let cand = PathBuf::from(home).join(".local").join("bin").join(exe);
         if cand.is_file() {
             out.push(cand);
@@ -290,44 +318,52 @@ fn parse_node_version(s: &str) -> Option<(u32, u32)> {
 /// The first candidate whose `--version` parses as **>= [`NODE_MIN`]**, skipping
 /// anything older, unparseable, or that fails to spawn — so an outdated
 /// `NANOBPMN_NODE_BIN` cannot make workers unavailable when a supported Node is
-/// later on `PATH`. A candidate is always preferred to none: if *nothing* on the
-/// host clears the floor, the first that at least ran is used, so a supported
-/// floor lowered or a host behind it degrades to a version-specific runtime error
-/// rather than a "no runtime installed" one.
+/// later on `PATH`.
+///
+/// `None` when *nothing* clears the floor: an older Node must be reported as
+/// unavailable, not launched with flags it does not support. This matches
+/// ProcessOS's `select_node`, which rejects the same host.
+fn first_supported_probe(probed: &[NodeProbe]) -> Option<&NodeProbe> {
+    probed.iter().find(|(_, raw)| {
+        raw.as_ref()
+            .and_then(|r| parse_node_version(r))
+            .is_some_and(|v| v >= NODE_MIN)
+    })
+}
+
+/// The binary of [`first_supported_probe`] — the path the workers launch.
 fn first_supported(probed: &[NodeProbe]) -> Option<PathBuf> {
-    let mut fallback: Option<PathBuf> = None;
-    for (bin, raw) in probed {
-        if let Some(raw) = raw {
-            match parse_node_version(raw) {
-                Some(v) if v >= NODE_MIN => return Some(bin.clone()),
-                _ => fallback = Some(bin.clone()),
-            }
-        }
-    }
-    fallback
+    first_supported_probe(probed).map(|(bin, _)| bin.clone())
 }
 
 /// The Node binary iff present **and** new enough ([`NODE_MIN`]) to run workers.
 /// Probes each candidate's `--version` and takes the first that clears the floor;
-/// returns `None` only when no Node was found at all (or every candidate failed).
+/// `None` when no candidate does.
 pub(crate) fn usable_node() -> Option<PathBuf> {
-    first_supported(&probe_candidates())
+    first_supported(&probe_candidates(&node_candidates()))
 }
 
-/// Runs `--version` on every candidate in resolution order. Kept separate from
-/// the pure [`first_supported`] policy so the selection is unit-testable without
-/// spawning.
-fn probe_candidates() -> Vec<NodeProbe> {
-    node_candidates()
-        .into_iter()
+/// The selected usable Node together with the `--version` line it reported —
+/// the single source for both the launch path ([`usable_node`]) and the IDE's
+/// runtime report (`config::check_node`), so the reported binary/version can
+/// never disagree with `present: true`.
+pub(crate) fn selected_node() -> Option<NodeProbe> {
+    first_supported_probe(&probe_candidates(&node_candidates())).cloned()
+}
+
+/// Runs `--version` on every candidate in order. Kept separate from the pure
+/// [`first_supported`] policy so the selection is unit-testable without spawning.
+fn probe_candidates(candidates: &[PathBuf]) -> Vec<NodeProbe> {
+    candidates
+        .iter()
         .map(|bin| {
-            let raw = std::process::Command::new(&bin)
+            let raw = std::process::Command::new(bin)
                 .arg("--version")
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-            (bin, raw)
+            (bin.clone(), raw)
         })
         .collect()
 }
@@ -561,7 +597,7 @@ struct StatusLine {
 
 #[cfg(test)]
 mod node_runtime_tests {
-    use super::{NODE_MIN, find_node, first_supported, parse_node_version};
+    use super::{NODE_MIN, NodeEnv, first_supported, node_candidates_from, parse_node_version};
 
     fn p(s: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(s)
@@ -589,24 +625,55 @@ mod node_runtime_tests {
         assert!(parse_node_version("v22.6.0").unwrap() >= NODE_MIN);
     }
 
+    /// The candidate order is pure over an injected environment, so this needs no
+    /// process-global mutation (which `cargo test` runs in parallel and which is
+    /// exactly why `set_var`/`remove_var` are `unsafe`).
     #[test]
-    fn find_node_honors_explicit_bin_env() {
-        // A non-existent path is ignored; a real file is returned.
-        let dir = std::env::temp_dir().join(format!("nbpm-node-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
-        std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
-        // SAFETY: single-threaded test; scoped env mutation.
-        unsafe { std::env::set_var("NANOBPMN_NODE_BIN", &fake) };
-        assert_eq!(find_node(), Some(fake));
-        unsafe { std::env::set_var("NANOBPMN_NODE_BIN", "/nonexistent/definitely/not/node") };
-        // Falls through to PATH/HOME; just assert it doesn't return the bogus path.
-        assert_ne!(
-            find_node(),
-            Some(std::path::PathBuf::from("/nonexistent/definitely/not/node"))
+    fn node_candidates_from_orders_override_then_path_then_local_bin() {
+        let tmp = std::env::temp_dir().join(format!("nbpm-env-{}", std::process::id()));
+        let override_dir = tmp.join("override");
+        let path_dir = tmp.join("pathdir");
+        let home_dir = tmp.join("home");
+        for d in [&override_dir, &path_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let exe = if cfg!(windows) { "node.exe" } else { "node" };
+        let override_bin = override_dir.join(exe);
+        std::fs::write(&override_bin, b"#!/bin/sh\n").unwrap();
+        let path_bin = path_dir.join(exe);
+        std::fs::write(&path_bin, b"#!/bin/sh\n").unwrap();
+        let local_bin = home_dir.join(".local").join("bin").join(exe);
+        std::fs::create_dir_all(local_bin.parent().unwrap()).unwrap();
+        std::fs::write(&local_bin, b"#!/bin/sh\n").unwrap();
+
+        let override_str = override_bin.to_string_lossy().into_owned();
+        let got = node_candidates_from(NodeEnv {
+            override_bin: Some(&override_str),
+            path: Some(path_dir.as_os_str()),
+            home: Some(home_dir.as_os_str()),
+        });
+        assert_eq!(got, vec![override_bin.clone(), path_bin, local_bin]);
+
+        // A non-existent override (and empty string) is ignored, never returned.
+        let missing = tmp.join("missing").join(exe);
+        let missing_str = missing.to_string_lossy().into_owned();
+        let got = node_candidates_from(NodeEnv {
+            override_bin: Some(&missing_str),
+            path: None,
+            home: None,
+        });
+        assert!(
+            got.is_empty(),
+            "a missing override must not be listed: {got:?}"
         );
-        unsafe { std::env::remove_var("NANOBPMN_NODE_BIN") };
-        std::fs::remove_dir_all(&dir).ok();
+        let got = node_candidates_from(NodeEnv {
+            override_bin: Some(""),
+            path: None,
+            home: None,
+        });
+        assert!(got.is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
@@ -634,11 +701,18 @@ mod node_runtime_tests {
     }
 
     #[test]
-    fn first_supported_falls_back_to_a_present_but_older_node() {
-        // Nothing clears the floor: still return a Node so the failure is a
-        // version-specific runtime error, never a false "not installed".
-        let probed = vec![(p("old"), Some("v20.11.0".to_string()))];
-        assert_eq!(first_supported(&probed), Some(p("old")));
+    fn first_supported_rejects_a_host_that_only_has_an_older_node() {
+        // Nothing clears the floor: report unavailable rather than launching a
+        // Node that cannot strip types / load `node:sqlite`. ProcessOS
+        // (`select_node`) rejects the same host, so the two resolvers agree.
+        assert_eq!(
+            first_supported(&[(p("old"), Some("v20.11.0".to_string()))]),
+            None
+        );
+        assert_eq!(
+            first_supported(&[(p("almost"), Some("v22.5.0".to_string()))]),
+            None
+        );
     }
 
     #[test]
