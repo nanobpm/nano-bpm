@@ -66,6 +66,16 @@ const json = (body: unknown, status = 200): Response =>
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
+ * Hard cap on a request body the `node:http` adapter will buffer. The page
+ * runtime's handler never reads a request body (every route is addressed by path
+ * and query), so nothing legitimate approaches this — but the adapter sits on a
+ * public port, and an unbounded `for await (chunk of req)` would let a remote
+ * client force memory growth at request-body speed. Over the cap: answer 413
+ * without accumulating, and tear the socket down.
+ */
+const MAX_REQUEST_BODY_BYTES = 1 << 20; // 1 MiB
+
+/**
  * The request handler, factored out of `servePages` so it is pure over its context
  * (injected `db`/`nano`/`readPage`) and unit-testable without a real HTTP server.
  */
@@ -317,9 +327,30 @@ export function servePages(
     void (async () => {
       // node:http gives a Node request/response, not a web `Request`; rebuild a
       // web `Request` so `createPagesHandler` stays the single request-handling
-      // path (no second, drifting router).
+      // path (no second, drifting router). Bodies are capped: nothing the handler
+      // routes on reads one, so an over-cap body is refused (413) rather than
+      // buffered — the adapter sits on a public port and must not let a client
+      // force unbounded allocation.
       const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(chunk as Buffer);
+      let total = 0;
+      let over = false;
+      for await (const chunk of req) {
+        total += (chunk as Buffer).length;
+        if (total > MAX_REQUEST_BODY_BYTES) {
+          over = true;
+          break;
+        }
+        chunks.push(chunk as Buffer);
+      }
+      if (over) {
+        // Stop reading (the `break` above leaves the rest unread) and answer; the
+        // connection is closed by `Connection: close` so the client is not left
+        // blocked writing into a socket we have stopped draining.
+        res.writeHead(413, { "content-type": "text/plain", connection: "close" });
+        res.end("request body too large");
+        req.destroy();
+        return;
+      }
       const body = chunks.length ? Buffer.concat(chunks) : undefined;
       const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
       const request = new Request(url, {

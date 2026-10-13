@@ -305,3 +305,32 @@ test("servePages starts a node:http server that serves the page runtime", async 
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+test("servePages rejects an over-limit request body with 413 (no buffering)", async () => {
+  // Defect class: the `node:http` adapter must not buffer an unbounded body into
+  // memory before routing — a remote client could then force unbounded allocation
+  // on a public port. The handler never reads a request body, so cap it at the
+  // socket and answer 413 without accumulating. Regression guard for the
+  // replaced-`Deno.serve` adapter (ADR 0065).
+  const server = servePages(ctx({ port: 0, homePage: "home" }));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      if (server.listening) resolve();
+      else {
+        server.once("listening", resolve);
+        server.once("error", reject);
+      }
+    });
+    const { port } = server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${port}/app/actions/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1), // one byte past the cap
+    });
+    assertEquals(res.status, 413);
+    // The socket must be drained/closed so the client is not left hanging.
+    await res.text();
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
