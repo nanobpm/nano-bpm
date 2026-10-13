@@ -158,7 +158,6 @@ export default function ProjectWorkspace() {
   const [runState, setRunState] = useState<RunState | null>(null);
   const [logs, setLogs] = useState<ProjectLogLine[]>([]);
   const [showConfig, setShowConfig] = useState(false);
-  const [showCompile, setShowCompile] = useState(false);
   // Single source of truth for the mutually-exclusive auxiliary panels; `null`
   // means the file-content editor is showing. Opening a file clears it (#485).
   const [activePanel, setActivePanel] = useState<ActivePanel>(null);
@@ -312,7 +311,7 @@ export default function ProjectWorkspace() {
   }, [logs]);
 
   const runnable = detail?.runnable ?? false;
-  const lang = detail?.config.lang ?? "deno";
+  const lang = detail?.config.lang ?? "node";
   // Categorical edit gate (issue #889): mirror the server's "running" set so
   // the banner + disabled affordances match exactly what it refuses with 409.
   const running = appIsRunning(runState?.status);
@@ -398,39 +397,23 @@ export default function ProjectWorkspace() {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
-  // The cross-compile modal is Deno-specific — its copy talks about downloading
-  // the Deno runtime per target, and its picker only knows Deno target triples.
-  // Skip it whenever this project isn't Deno: either it has a snapshotted
-  // toolchain (Java/Rust/… scaffolded from an app pack that declared its own
-  // compile argv) OR its lang pack drives compile (cfg.lang != "deno"). Either
-  // way there's one canonical compile invocation and no per-platform variant
-  // for the user to choose from.
+  // Compile runs the project's one canonical compile invocation: a snapshotted
+  // toolchain (flat `compile` or a runConfig with compile argv) or the lang
+  // pack's. The old Deno `compile` — with its per-target cross-compile modal —
+  // was the only built-in cross-compiler and was removed with Deno (ADR 0065);
+  // a project with no compile command surfaces the server's "no compile
+  // command" error.
   const handleCompile = async () => {
-    // A project is Deno-scaffolded when neither the snapshotted toolchain
-    // (flat `compile` or any runConfig with compile argv) nor its lang pack
-    // drives compile — i.e. lang == "deno" and no argv override. Anything
-    // else has a canonical compile and skips the cross-compile modal.
-    const hasRunConfigCompile = (
-      detail?.config.toolchain?.runConfigs ?? []
-    ).some((c) => (c.compile?.length ?? 0) > 0);
-    const isDenoProject =
-      !detail?.config.toolchain?.compile?.length &&
-      !hasRunConfigCompile &&
-      (!detail?.config.lang || detail.config.lang === "deno");
-    if (!isDenoProject) {
-      try {
-        await compileProject({
-          path: { name },
-          body: { targets: [] },
-          throwOnError: true,
-        });
-        void load();
-      } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
-      }
-      return;
+    try {
+      await compileProject({
+        path: { name },
+        body: { targets: [] },
+        throwOnError: true,
+      });
+      void load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
-    setShowCompile(true);
   };
 
   if (error) {
@@ -641,8 +624,7 @@ export default function ProjectWorkspace() {
                     .map((p) => `\u201C${p}\u201D`)
                     .join(" or ")} on your PATH.`
                 : "";
-            const who =
-              mt?.displayName ?? (lang === "deno" ? "Deno or Node" : lang);
+            const who = mt?.displayName ?? lang;
             return (
               <>
                 No {who} toolchain detected — Run and Compile for this project
@@ -780,23 +762,10 @@ export default function ProjectWorkspace() {
         <ConfigModal
           name={name}
           config={detail.config}
-          platforms={detail.platforms}
           onClose={() => setShowConfig(false)}
           onSaved={(cfg) => {
             setDetail((d) => (d ? { ...d, config: cfg } : d));
             setShowConfig(false);
-          }}
-        />
-      )}
-      {showCompile && (
-        <CompileModal
-          name={name}
-          config={detail.config}
-          platforms={detail.platforms}
-          onClose={() => setShowCompile(false)}
-          onStarted={() => {
-            setShowCompile(false);
-            void load();
           }}
         />
       )}
@@ -2892,20 +2861,17 @@ function DebugRow({ entry }: { entry: DebugEntry }) {
 function ConfigModal({
   name,
   config,
-  platforms,
   onClose,
   onSaved,
 }: {
   name: string;
   config: ProjectConfig;
-  platforms: string[];
   onClose: () => void;
   onSaved: (cfg: ProjectConfig) => void;
 }) {
   const [deployTarget, setDeployTarget] = useState(config.deployTarget);
   const [main, setMain] = useState(config.main);
   const [desc, setDesc] = useState(config.description);
-  const [selected, setSelected] = useState<string[]>(config.platforms);
   // Env editor state: array of {key,value} rows, kept ordered so that adding
   // a fresh empty row doesn't reshuffle the user's typing. We serialise back
   // to an object on save, dropping rows with an empty key.
@@ -2916,9 +2882,6 @@ function ConfigModal({
         .map(([key, value]) => ({ key, value })),
   );
   const [busy, setBusy] = useState(false);
-
-  const toggle = (t: string) =>
-    setSelected((s) => (s.includes(t) ? s.filter((x) => x !== t) : [...s, t]));
 
   const addEnvRow = () =>
     setEnvRows((rows) => [...rows, { key: "", value: "" }]);
@@ -2948,7 +2911,6 @@ function ConfigModal({
             description: desc,
             deployTarget,
             main,
-            platforms: selected,
             env,
           },
           throwOnError: true,
@@ -3044,14 +3006,6 @@ function ConfigModal({
           ))}
         </div>
       )}
-      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
-        Export platforms
-      </label>
-      <PlatformPicker
-        platforms={platforms}
-        selected={selected}
-        onToggle={toggle}
-      />
       <div className="mt-5 flex justify-end gap-2">
         <Button onClick={onClose}>Cancel</Button>
         <Button variant="primary" onClick={() => void save()} disabled={busy}>
@@ -3059,111 +3013,6 @@ function ConfigModal({
         </Button>
       </div>
     </Modal>
-  );
-}
-
-// --- Compile modal ---------------------------------------------------------
-
-function CompileModal({
-  name,
-  config,
-  platforms,
-  onClose,
-  onStarted,
-}: {
-  name: string;
-  config: ProjectConfig;
-  platforms: string[];
-  onClose: () => void;
-  onStarted: () => void;
-}) {
-  const [selected, setSelected] = useState<string[]>(
-    config.platforms.length ? config.platforms : [],
-  );
-  const [busy, setBusy] = useState(false);
-  const toggle = (t: string) =>
-    setSelected((s) => (s.includes(t) ? s.filter((x) => x !== t) : [...s, t]));
-
-  const compile = async () => {
-    setBusy(true);
-    try {
-      await compileProject({
-        path: { name },
-        body: { targets: selected },
-        throwOnError: true,
-      });
-      onStarted();
-    } catch (e) {
-      alert(e instanceof Error ? e.message : String(e));
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal title="Compile application" onClose={onClose}>
-      <p className="text-sm text-fg-muted">
-        Produces standalone binaries under{" "}
-        <span className="font-mono text-fg">dist/</span>. Leave all unchecked to
-        compile for this host only. Cross-compiling downloads the Deno runtime
-        per target and may take a few minutes — progress streams to the Output
-        panel.
-      </p>
-      <div className="mt-3">
-        <PlatformPicker
-          platforms={platforms}
-          selected={selected}
-          onToggle={toggle}
-        />
-      </div>
-      <div className="mt-5 flex justify-end gap-2">
-        <Button onClick={onClose}>Cancel</Button>
-        <Button
-          variant="primary"
-          onClick={() => void compile()}
-          disabled={busy}
-        >
-          {busy ? "Starting…" : "Compile"}
-        </Button>
-      </div>
-    </Modal>
-  );
-}
-
-/// Human labels for the Deno target triples the backend advertises.
-const PLATFORM_LABELS: Record<string, string> = {
-  "aarch64-apple-darwin": "macOS (Apple Silicon)",
-  "x86_64-apple-darwin": "macOS (Intel)",
-  "x86_64-unknown-linux-gnu": "Linux (x64)",
-  "aarch64-unknown-linux-gnu": "Linux (ARM64)",
-  "x86_64-pc-windows-msvc": "Windows (x64)",
-};
-
-function PlatformPicker({
-  platforms,
-  selected,
-  onToggle,
-}: {
-  platforms: string[];
-  selected: string[];
-  onToggle: (t: string) => void;
-}) {
-  return (
-    <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
-      {platforms.map((t) => (
-        <label
-          key={t}
-          className="flex cursor-pointer items-center gap-2 rounded-md border border-edge px-3 py-2 text-sm text-fg-muted hover:border-edge-strong"
-        >
-          <input
-            type="checkbox"
-            checked={selected.includes(t)}
-            onChange={() => onToggle(t)}
-            className="accent-accent"
-          />
-          <span>{PLATFORM_LABELS[t] ?? t}</span>
-        </label>
-      ))}
-    </div>
   );
 }
 

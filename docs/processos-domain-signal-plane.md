@@ -194,7 +194,7 @@ The lift rests on one observation about what already exists in urban:
 
 **The single enabling urban change: ambient instance/element stamping.** Thread the
 active job's context into the DataLayer (an ambient `data.forJob(job)` scope, or
-`AsyncLocalStorage` — Node and Deno both have it) so `insert()` auto-stamps two
+`AsyncLocalStorage` — a Node builtin) so `insert()` auto-stamps two
 **domain-agnostic** columns, `__instance` and `__element`, on every row written
 during a job. It is purely mechanical and knows nothing about any domain. With it:
 
@@ -352,7 +352,7 @@ the same plans cannot see.
 
 | Stage | Deliverable | Depends on |
 |---|---|---|
-| **D0** | **Urban lift** (§3.1): ambient `__instance`/`__element` stamping on `DataLayer.insert`; expose the fused-domain schema registry to ingest. Domain-free; benefits every urban app. | urban (Node/Deno ALS) |
+| **D0** | **Urban lift** (§3.1): ambient `__instance`/`__element` stamping on `DataLayer.insert`; expose the fused-domain schema registry to ingest. Domain-free; benefits every urban app. | urban (Node ALS) |
 | **D1** | `domainSignals`/`outcomeTruth` schema slot + G1 convention projection (any DataLayer table, joined on `__instance`) + generic outcome-truth = instance terminal status | Tier-A trace (exists); D0 for the ambient key |
 | **D2** | **Prototype**: nano-workforce over one recorded plan corpus — blackboard signals (free via S7 or a stand-in binding) + optional G3 outcome/collision; content aggregations in the report; demonstrate win #1 | D1; a recorded plan corpus |
 | **D3** | `__signal.<ns>` push channel (worker-emitted signals) | D1 |

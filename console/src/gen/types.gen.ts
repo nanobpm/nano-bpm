@@ -392,7 +392,6 @@ export type WorkerSummary = {
 
 export type WorkersResponse = {
     workers: Array<WorkerSummary>;
-    denoAvailable: boolean;
     nodeAvailable: boolean;
 };
 
@@ -501,7 +500,7 @@ export type ProjectSummary = {
      */
     source: 'workspace' | 'path';
     /**
-     * Language pack id driving the project (e.g. "deno", "rust", "java"). The console resolves the card's language icon by matching this to an Extension of kind "lang".
+     * Language pack id driving the project (e.g. "node", "rust", "java"). The console resolves the card's language icon by matching this to an Extension of kind "lang".
      */
     lang: string;
     /**
@@ -634,7 +633,7 @@ export type ProjectTemplate = {
      */
     description: string;
     /**
-     * Language pack id the scaffolded project runs on (e.g. "deno", "rust", "java"). The console resolves the card's language icon by matching this to an Extension of kind "lang".
+     * Language pack id the scaffolded project runs on (e.g. "node", "rust", "java"). The console resolves the card's language icon by matching this to an Extension of kind "lang".
      */
     lang: string;
     /**
@@ -646,7 +645,7 @@ export type ProjectTemplate = {
      */
     pack?: string;
     /**
-     * Per-template creation options the New Project picker renders as controls on the selected card (e.g. a Node/Deno runtime toggle). Generic: any built-in or pack template may declare options; the console renders each control and echoes the chosen values back in `CreateProjectRequest.options`. Absent or empty for templates with no options.
+     * Per-template creation options the New Project picker renders as controls on the selected card (e.g. a runtime toggle). Generic: any built-in or pack template may declare options; the console renders each control and echoes the chosen values back in `CreateProjectRequest.options`. Absent or empty for templates with no options.
      */
     options?: Array<TemplateOption>;
     /**
@@ -678,7 +677,7 @@ export type TemplateOptionChoice = {
     value: string;
     label: string;
     /**
-     * Host capability this choice requires; the console disables the choice (with an install hint) when the capability is absent. Recognised: "deno" (gated on `denoAvailable`), "node" (gated on `nodeAvailable`). Absent = always selectable.
+     * Host capability this choice requires; the console disables the choice (with an install hint) when the capability is absent. Recognised: "node" (gated on `nodeAvailable`). Absent = always selectable.
      */
     requires?: string | null;
 };
@@ -695,7 +694,6 @@ export type ProjectDetail = {
      * Absolute path of the project directory on the host running the server. Surfaced so users can locate the project's files on disk (header display + "copy path" actions in the file tree). When the console talks to a remote/containerized gateway this is the server's path, not the client's, so treat it as informational.
      */
     rootPath: string;
-    denoAvailable: boolean;
     nodeAvailable: boolean;
     urbanAvailable: boolean;
     runnable: boolean;
@@ -711,11 +709,11 @@ export type ProjectDetail = {
  */
 export type MissingToolchain = {
     /**
-     * Human name of the missing toolchain (e.g. "Rust", "Deno / Node").
+     * Human name of the missing toolchain (e.g. "Rust", "Node").
      */
     displayName?: string | null;
     /**
-     * Executable names searched for on PATH; finding ANY one satisfies the probe (e.g. ["cargo"] for a Rust pack, ["deno", "node"] for Deno).
+     * Executable names searched for on PATH; finding ANY one satisfies the probe (e.g. ["cargo"] for a Rust pack, ["node"] for the Node pack).
      */
     probes: Array<string>;
     /**
@@ -730,7 +728,6 @@ export type MissingToolchain = {
 
 export type ProjectsResponse = {
     projects: Array<ProjectSummary>;
-    denoAvailable: boolean;
     nodeAvailable: boolean;
     urbanAvailable: boolean;
     platforms: Array<string>;
@@ -746,7 +743,7 @@ export type CreateProjectRequest = {
     description?: string;
     template?: string | null;
     /**
-     * Chosen values for the selected template's declared options, keyed by `TemplateOption.id` (e.g. {"runtime":"deno"}). Omitted keys fall back to each option's `default`. Ignored for templates that declare no options.
+     * Chosen values for the selected template's declared options, keyed by `TemplateOption.id` (e.g. {"runtime":"node"}). Omitted keys fall back to each option's `default`. Ignored for templates that declare no options.
      */
     options?: {
         [key: string]: string;
@@ -2400,22 +2397,6 @@ export type GetWorkerSdkResponses = {
 };
 
 export type GetWorkerSdkResponse = GetWorkerSdkResponses[keyof GetWorkerSdkResponses];
-
-export type GetDenoTypesData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/deno-types';
-};
-
-export type GetDenoTypesResponses = {
-    /**
-     * Deno type declarations
-     */
-    200: string;
-};
-
-export type GetDenoTypesResponse = GetDenoTypesResponses[keyof GetDenoTypesResponses];
 
 export type ListLibFilesData = {
     body?: never;

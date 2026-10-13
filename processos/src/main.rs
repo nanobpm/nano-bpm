@@ -2913,7 +2913,7 @@ async fn sidecar_context_window(port: u16) -> Option<u64> {
 }
 
 /// `GET /api/system/dependencies` — preflight the external CLI tools ProcessOS
-/// shells out to (Deno for embedded Nano workers; llama.cpp's `llama-server` for
+/// shells out to (Node for embedded Nano workers; llama.cpp's `llama-server` for
 /// local LLM sidecars). Reports each tool's presence, resolved binary, version,
 /// purpose, and — when missing — an actionable hint plus an OS-aware install URL,
 /// so the Console can warn the operator instead of failing later with a cryptic

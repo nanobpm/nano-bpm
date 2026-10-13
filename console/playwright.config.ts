@@ -15,7 +15,7 @@
 // browser sized to a phone can.
 //
 // The suite never talks to a real gateway. Every test stubs the console API, so a
-// run is deterministic and needs no engine, no Deno, and no scaffolded project —
+// run is deterministic and needs no engine, no Node, and no scaffolded project —
 // which is what keeps it honest under this repo's no-intermittent-failures,
 // no-retries rule.
 

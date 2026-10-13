@@ -764,7 +764,7 @@ low-priority scans), so scraping them never touches the create/complete path.
 
 **Nano Studio** (the **Studio** tab) is the home of Nano's **Rapid Application
 Development** environment and replaces the old standalone "Modeler" tab. A
-project is a self-contained, runnable Deno application directory (see [Workspace
+project is a self-contained, runnable Node application directory (see [Workspace
 vs cluster data](#workspace-vs-cluster-data)); the Studio view is a tile gallery
 with a **New project** template picker, and opening a project drops you into its
 workspace. First-party project templates and example apps are themselves shipped
@@ -785,8 +785,8 @@ editor:
 From a BPMN file you can **Deploy** the model to the engine (idempotent), **Start
 instance** (optionally supplying initial variables as JSON) once the saved XML
 matches what is deployed, and **Test** it entirely in the browser. At the project
-level a **Run / Stop / Compile / Configure / Export** toolbar spawns
-`deno run main.ts`, cross-compiles a binary, or zips the whole project — none of
+level a **Run / Stop / Compile / Configure / Export** toolbar runs `main.ts`
+under Node, compiles the project, or zips the whole project — none of
 which touches the engine data dir.
 
 **Test** executes a model entirely in the browser, with no cluster round-trip and
@@ -858,12 +858,12 @@ each instance got there.
 
 ### Workers
 
-Author TypeScript job workers in the browser and run them as sandboxed **Deno**
+Author TypeScript job workers in the browser and run them as **Node** (≥ 22.6)
 subprocesses over the Falcon protocol, with a live "Running" fleet view (status,
 throughput, completed/failed, uptime, restarts) and streamed logs. **Running
-workers requires [Deno](https://deno.com) installed on the host** (see below); the
-tab still authors code without it. Selected workers can also be **exported as a
-standalone application** you run yourself — see
+workers requires [Node](https://nodejs.org) installed on the host** (see below);
+the tab still authors code without it. Selected workers can also be **exported as
+a standalone application** you run yourself — see
 [Exporting workers as an application](#exporting-workers-as-an-application).
 
 #### A 90s IDE, on purpose
@@ -897,8 +897,8 @@ handler body. That ethos drives the code intelligence:
   list) and import it from anywhere with the `@lib/` alias —
   `import { fmtMoney } from "@lib/money.ts"`. In keeping with the invisible-wiring
   ethos, there is nothing to configure: the `@lib/` import map alias is injected
-  into every worker's `deno.json` automatically, so the same import resolves in
-  the editor (IntelliSense), at runtime (the Deno supervisor), and in an exported
+  into every worker's `node.json` automatically, so the same import resolves in
+  the editor (IntelliSense), at runtime (the Node supervisor), and in an exported
   app (the bundled `lib/` folder).
 
 ### Workspace vs cluster data
@@ -907,17 +907,17 @@ The console keeps the user's **authoring source of truth** in a *workspace*
 directory, deliberately separate from the engine's data dir so that deleting
 cluster data leaves your projects and workers intact. The workspace holds the
 standalone **Workers** tab's files at the top level, and every RAD **project**
-under `projects/` as a self-contained, runnable Deno application:
+under `projects/` as a self-contained, runnable Node application:
 
 ```text
 <workspace>/
-├── workers/<name>/              # standalone Workers-tab workers (worker.ts, deno.json, …)
+├── workers/<name>/              # standalone Workers-tab workers (worker.ts, node.json, …)
 ├── lib/                         # shared library modules for those workers (@lib/…)
-├── nano-generated/worker-sdk.ts # embedded Deno worker SDK (auto-written)
-├── .deno-cache/                 # DENO_DIR for worker dependency caching
-└── projects/<project>/          # one directory per RAD project (a runnable Deno app)
+├── nano-generated/worker-sdk.ts # embedded Node worker SDK (auto-written)
+├── node_modules/                # `npm install` output for the workers' bare deps
+└── projects/<project>/          # one directory per RAD project (a runnable Node app)
     ├── nanobpm.project.json      # project config (name, deploy target, platforms)
-    ├── deno.json                 # import map (@nanobpm/worker, @lib/) + start task
+    ├── node.json                 # import map (@nanobpm/worker, @lib/) + start task
     ├── tsconfig.json             # standard-tooling type resolution
     ├── package.json              # npm identity + `npm install` deps
     ├── main.ts                   # entrypoint: deploys processes + starts workers
@@ -926,19 +926,19 @@ under `projects/` as a self-contained, runnable Deno application:
     │   ├── decisions/<name>.dmn  # DMN decisions
     │   └── forms/<name>.form     # forms
     ├── pages/<name>.page.json    # Page Composer pages
-    ├── workers/<name>/           # the project's own workers (worker.ts, deno.json, …)
+    ├── workers/<name>/           # the project's own workers (worker.ts, node.json, …)
     ├── lib/                      # the project's shared library modules (@lib/…)
-    ├── nano-generated/worker-sdk.ts  # embedded Deno worker SDK (auto-written)
-    └── .deno-cache/              # DENO_DIR for dependency caching
+    ├── nano-generated/worker-sdk.ts  # embedded Node worker SDK (auto-written)
+    └── node_modules/             # `npm install` output for the project's bare deps
 ```
 
 | Variable | Meaning |
 | --- | --- |
 | `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (holds the standalone `workers/` plus, by default, `projects/` — unless `NANOBPMN_PROJECTS_DIR` moves the projects root). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
 | `NANOBPMN_PROJECTS_DIR=<dir>` | Override the projects root directly. Default `<workspace>/projects`. |
-| `NANOBPMN_DENO_BIN=<path>` | Explicit path to the Deno binary used to run workers. Default: `deno` on `PATH`, else `~/.deno/bin/deno`. |
+| `NANOBPMN_NODE_BIN=<path>` | Explicit path to the Node (≥ 22.6) binary used to run workers and projects. Default: `node` on `PATH`, else `~/.nvm`/`~/.local/bin/node`. |
 
-### Embedded workers (Deno)
+### Embedded workers (Node)
 
 Each worker is a directory under `workers/<name>/` whose `worker.ts` imports the
 embedded SDK and declares a handler:
@@ -958,12 +958,12 @@ defineWorker({
 });
 ```
 
-The supervisor runs one sandboxed `deno run` subprocess per enabled worker that
-speaks the Falcon protocol directly. **Deno is required to *run* workers** (in the
-console or as an exported app): install it from <https://deno.com> so the `deno`
-binary is on `PATH`, or point `NANOBPMN_DENO_BIN` at it. If Deno is not installed
-the Workers tab still authors and exports code, but starting a worker reports the
-runtime as unavailable.
+The supervisor runs one `node --experimental-strip-types` subprocess per enabled
+worker that speaks the Falcon protocol directly. **Node ≥ 22.6 is required to
+*run* workers** (in the console or as an exported app): install it from
+<https://nodejs.org> so the `node` binary is on `PATH`, or point
+`NANOBPMN_NODE_BIN` at it. If Node is not installed the Workers tab still authors
+and exports code, but starting a worker reports the runtime as unavailable.
 
 ### Exporting workers as an application
 
@@ -977,7 +977,7 @@ The downloaded `nano-workers-app.zip` unpacks to:
 ```text
 nano-workers-app/
 ├── main.ts                 # entrypoint: deploys models, then starts the workers
-├── deno.json               # import map (@nanobpm/worker) + `deno task start`
+├── node.json               # import map (@nanobpm/worker) + `npm start`
 ├── README.md               # how to configure and run it
 ├── sdk/worker-sdk.ts       # the embedded worker SDK (same source as the console)
 ├── workers/<name>/…        # each selected worker's source
@@ -986,21 +986,22 @@ nano-workers-app/
 
 On startup the app **deploys every `.bpmn` file in `resources/`** to the target
 engine, then runs the bundled workers. Add your own models by dropping their
-`.bpmn` files into `resources/` before starting. Run it with Deno:
+`.bpmn` files into `resources/` before starting. Run it with Node:
 
 ```bash
 cd nano-workers-app
 # Point at your Nano gateway (defaults to http://127.0.0.1:8080):
 export NANOBPMN_BASE_URL=http://127.0.0.1:8080
-deno task start            # runs with --allow-net --allow-read --allow-env
+npm install
+npm start                  # node --experimental-strip-types main.ts
 ```
 
-The bundled `README.md` documents the same steps and the required permissions.
+The bundled `README.md` documents the same steps.
 
 **Dependencies travel with the app.** The exporter scans the selected workers'
 source for `import`/`import(...)` specifiers, resolves each to its npm package
-(handling scoped names, subpath imports, and `npm:` specifiers), and writes a
-dependency manifest into the app's `deno.json` import map. So a worker that
+(handling scoped names, subpath imports, and bare specifiers), and writes a
+dependency manifest into the app's `package.json`/`node.json` import map. So a worker that
 imports `lodash` or `@camunda8/orchestration-cluster-api` produces an export
 whose `npm:` resolution works out of the box — no manual dependency wrangling.
 

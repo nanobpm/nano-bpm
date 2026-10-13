@@ -38,7 +38,6 @@ export interface TourContext {
   /** Current react-router pathname. */
   route: string;
   projects: ProjectSummary[];
-  denoAvailable: boolean;
   nodeAvailable: boolean;
   templates: ProjectTemplate[];
   extensions: Extension[];

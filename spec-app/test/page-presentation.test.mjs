@@ -1,5 +1,5 @@
 // Tests for the responsive-presentation vocabulary (issue #1005) — `node --test`.
-// Pure constants/guards, so this runs CI-safe without a browser/Deno. These lock
+// Pure constants/guards, so this runs CI-safe without a browser or a JS runtime. These lock
 // the enum members, the defaults, and the narrowing guards that both consumers
 // (the console Page Composer / `pageSchema` and the Urban runtime) bind against.
 import { test } from "node:test";

@@ -1,5 +1,5 @@
 //! "Export workers as an application" — bundles a selection of the console's
-//! embedded workers into a **standalone, runnable Deno application**, downloaded
+//! embedded workers into a **standalone, runnable Node application**, downloaded
 //! as a single `.zip` the user can run and manage themselves.
 //!
 //! The generated app is self-contained:
@@ -7,7 +7,7 @@
 //! ```text
 //! nano-workers-app/
 //!   README.md              how to run it
-//!   deno.json              import map + `start` task (network + file permissions)
+//!   node.json              import map + `start` script
 //!   main.ts                entrypoint: deploy resources/*.bpmn, then run the workers
 //!   sdk/worker-sdk.ts      the embedded Nano worker SDK (verbatim)
 //!   workers/<name>/…       one folder per selected worker (worker.ts + helpers)
@@ -49,10 +49,10 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
     let at = |path: &str| format!("{APP_ROOT}/{path}");
 
     // npm packages the selected workers import, gathered for the generated
-    // dependency manifest (deno.json import map).
+    // dependency manifest (node.json import map).
     let mut packages: BTreeSet<String> = BTreeSet::new();
 
-    // Validate + collect each worker's source files (skip its deno.json — the app
+    // Validate + collect each worker's source files (skip its node.json — the app
     // uses a single root import map instead).
     let mut valid_names: Vec<String> = Vec::new();
     for name in worker_names {
@@ -66,7 +66,7 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
             .map_err(|e| format!("could not read worker '{name}': {e}"))?;
         let mut copied_entrypoint = false;
         for file in files {
-            if file == "deno.json" {
+            if file == "node.json" {
                 continue;
             }
             let Some(path) = workspace::worker_file_path(name, &file) else {
@@ -111,7 +111,7 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
 
     // Generated app scaffolding.
     entries.push((at("sdk/worker-sdk.ts"), WORKER_SDK_TS.as_bytes().to_vec()));
-    entries.push((at("deno.json"), deno_json(&packages, has_lib).into_bytes()));
+    entries.push((at("node.json"), node_json(&packages, has_lib).into_bytes()));
     entries.push((at("main.ts"), main_ts(&valid_names).into_bytes()));
     entries.push((at("README.md"), readme_md(&valid_names).into_bytes()));
     entries.push((
@@ -136,36 +136,25 @@ pub fn worker_sdk_source() -> &'static str {
     WORKER_SDK_TS
 }
 
-/// Ambient `Deno.*` namespace types (extracted from `deno types`) served to the
-/// console editor as a Monaco extra-lib so worker/`main.ts` code that uses
-/// `Deno.env`, `Deno.readDir`, etc. type-checks instead of erroring with
-/// "Cannot find name 'Deno'". Web globals are intentionally omitted so they
-/// don't collide with the editor's `dom` lib.
-pub fn deno_namespace_types() -> &'static str {
-    DENO_NS_DTS
-}
-
 /// The vendored `@nanobpm/urban` type surface, served to the Studio editor as a
 /// Monaco extra-lib so an Urban app's `@nanobpm/urban` imports (`AppJobHandler`,
 /// `OperationHandler`, `runFromEnv`, `selectHost`, the engine client, …) resolve
-/// with full IntelliSense — fully offline, like the worker SDK and Deno types.
+/// with full IntelliSense — fully offline, like the worker SDK.
 pub fn urban_types_source() -> &'static str {
     URBAN_TYPES_DTS
 }
 
-const DENO_NS_DTS: &str = include_str!("deno_ns.d.ts");
-
-const DENO_JSON_HEAD: &str =
+const NODE_JSON_HEAD: &str =
     "{\n  \"imports\": {\n    \"@nanobpm/worker\": \"./sdk/worker-sdk.ts\"";
 
-/// Build the app's `deno.json`: an import map aliasing `@nanobpm/worker` to the
+/// Build the app's `node.json`: an import map aliasing `@nanobpm/worker` to the
 /// bundled SDK plus a generated **dependency manifest** — every npm package the
 /// selected workers import, mapped to its `npm:` specifier (and a trailing-slash
-/// form for subpath imports) so Deno resolves bare imports without edits. Also
-/// declares the `start` task with the network + file-read permissions the app
-/// needs to deploy models and run workers.
-fn deno_json(packages: &BTreeSet<String>, has_lib: bool) -> String {
-    let mut s = String::from(DENO_JSON_HEAD);
+/// form for subpath imports) so the Node loader resolves bare imports without
+/// edits. Also declares the `start` script the app needs to deploy models and
+/// run workers.
+fn node_json(packages: &BTreeSet<String>, has_lib: bool) -> String {
+    let mut s = String::from(NODE_JSON_HEAD);
     if has_lib {
         s.push_str(",\n    ");
         s.push_str(&format!(
@@ -185,7 +174,7 @@ fn deno_json(packages: &BTreeSet<String>, has_lib: bool) -> String {
         s.push_str(&format!("{key_slash}: {val_slash}"));
     }
     s.push_str(
-        "\n  },\n  \"tasks\": {\n    \"start\": \"deno run --allow-net --allow-read --allow-env main.ts\"\n  }\n}\n",
+        "\n  },\n  \"scripts\": {\n    \"start\": \"node --experimental-strip-types main.ts\"\n  }\n}\n",
     );
     s
 }
@@ -338,9 +327,11 @@ fn main_ts(names: &[String]) -> String {
 // On startup it (1) deploys every BPMN model in ./resources to the gateway, then
 // (2) starts each bundled worker, which connects to the gateway's Falcon protocol
 // and processes its job type. Point it at your gateway with NANOBPMN_BASE_URL
-// (default http://127.0.0.1:8080). Run it with `deno task start`.
+// (default http://127.0.0.1:8080). Run it with `npm start`.
 
-const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://127.0.0.1:8080").replace(/\/+$/, "");
+import {{ readdir, readFile }} from "node:fs/promises";
+
+const BASE_URL = (process.env.NANOBPMN_BASE_URL ?? "http://127.0.0.1:8080").replace(/\/+$/, "");
 
 // One folder under ./workers per worker bundled into this app.
 const WORKERS: string[] = [
@@ -348,24 +339,23 @@ const WORKERS: string[] = [
 ];
 
 async function deployResources(): Promise<void> {{
-  let dirEntries: Deno.DirEntry[];
+  let models: string[];
   try {{
-    dirEntries = [...Deno.readDirSync("resources")];
+    models = (await readdir("resources", {{ withFileTypes: true }}))
+      .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".bpmn"))
+      .map((e) => e.name)
+      .sort();
   }} catch {{
     console.log("[deploy] no ./resources directory — nothing to deploy");
     return;
   }}
-  const models = dirEntries
-    .filter((e) => e.isFile && e.name.toLowerCase().endsWith(".bpmn"))
-    .map((e) => e.name)
-    .sort();
   if (models.length === 0) {{
     console.log("[deploy] no .bpmn models in ./resources — add your models there and restart");
     return;
   }}
   for (const name of models) {{
     try {{
-      const xml = await Deno.readTextFile(`resources/${{name}}`);
+      const xml = await readFile(`resources/${{name}}`, "utf8");
       const form = new FormData();
       form.append("resources", new Blob([xml], {{ type: "text/xml" }}), name);
       const res = await fetch(`${{BASE_URL}}/v2/deployments`, {{ method: "POST", body: form }});
@@ -385,7 +375,7 @@ async function startWorkers(): Promise<void> {{
   for (const name of WORKERS) {{
     try {{
       // Label this worker's falcon activations with its folder name.
-      Deno.env.set("NANOBPMN_WORKER_NAME", name);
+      process.env.NANOBPMN_WORKER_NAME = name;
       await import(`./workers/${{name}}/worker.ts`);
       console.log(`[worker] ${{name}} started`);
     }} catch (err) {{
@@ -418,7 +408,7 @@ no Console required.
 
 ## Prerequisites
 
-- **[Deno](https://deno.com)** — the runtime the workers run on (`curl -fsSL https://deno.land/install.sh | sh`).
+- **[Node](https://nodejs.org) >= 22.6** — the runtime the workers run on.
 - A running **Nano BPM** gateway (default `http://127.0.0.1:8080`).
 
 ## 1. Add your models
@@ -438,10 +428,10 @@ export NANOBPMN_BASE_URL=http://my-gateway:8080
 ## 3. Run
 
 ```sh
-deno task start
+npm start
 ```
 
-(equivalently: `deno run --allow-net --allow-read --allow-env main.ts`)
+(equivalently: `node --experimental-strip-types main.ts`)
 
 The app deploys `resources/*.bpmn`, then starts these workers:
 
@@ -455,7 +445,7 @@ alongside their own `console.log` output. Press **Ctrl+C** to stop.
 
 ```text
 main.ts              entrypoint (deploy models, then run workers)
-deno.json            import map + `start` task (network + file permissions)
+node.json            import map + `start` task (network + file permissions)
 sdk/worker-sdk.ts    the embedded Nano worker SDK
 lib/                 shared library modules (imported as `@lib/…`, if any)
 workers/<name>/      one folder per worker (worker.ts + any helpers)
@@ -620,7 +610,7 @@ mod tests {
             const x = await import("@scope/dyn/sub");
             import rel from "./helper.ts";
             import shared from "@lib/money.ts";
-            import url from "https://deno.land/std/x.ts";
+            import url from "https://example.com/x.ts";
             import sub from "lodash/fp";
         "#;
         let mut got = BTreeSet::new();
@@ -657,11 +647,11 @@ mod tests {
     }
 
     #[test]
-    fn deno_json_emits_dependency_manifest() {
+    fn node_json_emits_dependency_manifest() {
         let mut pkgs = BTreeSet::new();
         pkgs.insert("@camunda8/sdk".to_string());
         pkgs.insert("lodash".to_string());
-        let json = deno_json(&pkgs, false);
+        let json = node_json(&pkgs, false);
         // SDK alias is always present.
         assert!(json.contains("\"@nanobpm/worker\": \"./sdk/worker-sdk.ts\""));
         // Each package maps to its npm: specifier, plus a subpath form.
@@ -675,15 +665,15 @@ mod tests {
     }
 
     #[test]
-    fn deno_json_without_packages_is_valid() {
-        let json = deno_json(&BTreeSet::new(), false);
+    fn node_json_without_packages_is_valid() {
+        let json = node_json(&BTreeSet::new(), false);
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
-        assert!(json.contains("--allow-net"));
+        assert!(json.contains("node --experimental-strip-types main.ts"));
     }
 
     #[test]
-    fn deno_json_maps_shared_library_when_present() {
-        let json = deno_json(&BTreeSet::new(), true);
+    fn node_json_maps_shared_library_when_present() {
+        let json = node_json(&BTreeSet::new(), true);
         // The @lib/ alias points at the bundled lib/ folder.
         assert!(json.contains("\"@lib/\": \"./lib/\""));
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());

@@ -9,7 +9,7 @@
 //
 // IMPORT-SAFETY: no top-level import of the `@xenova/transformers` optional dependency —
 // it is loaded LAZILY via a non-literal dynamic `import()` inside the opt-in-gated
-// `createLocalModelAdapters` factory only. Importing this module on the default/Deno lane
+// `createLocalModelAdapters` factory only. Importing this module on the default lane
 // never resolves it.
 //
 // LIVE activation requires the `URBAN_TESTKIT_AI_REAL` opt-in (see ./env.ts). Model weights

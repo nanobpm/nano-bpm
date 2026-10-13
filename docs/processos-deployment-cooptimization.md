@@ -170,7 +170,7 @@ is a *Nano (or worker-fleet) public-API* design on its own merits, not a
 privileged ProcessOS hook.
 
 > Note the actuation target differs from the engine: scaling commands the
-> **worker side** (and possibly the cluster), not the process. For embedded Deno
+> **worker side** (and possibly the cluster), not the process. For embedded Node
 > workers (`server/src/console/workers.rs`) ProcessOS could drive the supervisor;
 > for customer-owned workers it emits a recommendation or a signal the customer's
 > autoscaler consumes. Either way it then **measures the real-time effect on

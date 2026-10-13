@@ -3,7 +3,7 @@
 // explicit opt-in — all with ZERO network and the optional deps absent.
 //
 // These tests import the `/ai` barrel (which eagerly imports the real-adapter module) and
-// run on both the Node and Deno lanes with no opt-in env set.
+// run on the Node lane with no opt-in env set.
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -232,26 +232,10 @@ test("LocalChatModelAdapter.chat folds the system preamble ahead of the vision-c
   assert.deepEqual(seen, ["be terse\n\ndescribe\n\nIMAGE: a cat"]);
 });
 
-test("readEnvVar treats a Deno --allow-env denial as unset (safe by default, never throws)", () => {
+test("readEnvVar reports an absent key as undefined (safe by default, never throws)", () => {
   const key = "URBAN_TESTKIT_AI_REAL_ENV_PERMISSION_PROBE";
-  const original = Reflect.get(globalThis, "Deno");
-  Reflect.set(globalThis, "Deno", {
-    env: {
-      get() {
-        throw new Error("Requires env access to \"" + key + "\", run again with the --allow-env flag");
-      },
-    },
-  });
-  try {
-    assert.doesNotThrow(() => readEnvVar(key));
-    assert.equal(readEnvVar(key), undefined);
-  } finally {
-    if (original === undefined) {
-      Reflect.deleteProperty(globalThis, "Deno");
-    } else {
-      Reflect.set(globalThis, "Deno", original);
-    }
-  }
+  assert.doesNotThrow(() => readEnvVar(key));
+  assert.equal(readEnvVar(key), undefined);
 });
 
 test("createRealAdapters throws on an unknown provider before any import/network (opt-in set)", async () => {

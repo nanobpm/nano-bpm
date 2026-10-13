@@ -1,5 +1,5 @@
 // Tests for the canonical --nano-* token palette (issue #1005) — `node --test`.
-// Pure constants, so this runs CI-safe without a browser/Deno. These lock the
+// Pure constants, so this runs CI-safe without a browser or a JS runtime. These lock the
 // palette map, the CSS-variable naming, and — critically — that the committed
 // `tokens.css` artifact is exactly what the map renders, so the ./tokens.css and
 // ./tokens subpath exports can never drift from each other.

@@ -25,7 +25,7 @@ and `server/src/console/projects.rs` (`TEMPLATES`, `create_project`, the scaffol
 
 The RAD (Urban, ADR 0022) is **model-first**: a developer authors a BPMN diagram in the modeller,
 and the system *derives* the wiring — worker I/O from the data envelope (ADR 0040), the domain
-model, forms, pages — stamping it into `nano-generated/` so `deno.json`-mapped specifiers
+model, forms, pages — stamping it into `nano-generated/` so `node.json`-mapped specifiers
 (`@nanobpm/worker`, `@nanobpm/domain`, …) resolve. The authoring act is *drawing the model*; the
 code is derived.
 
@@ -82,7 +82,7 @@ stubs, etc.). It stamps a lean tree:
 
 ```
 <project>/
-  deno.json          import map: @nanobpm/workflow → npm:@nanobpm/workflow ; start task
+  node.json          import map: @nanobpm/workflow → npm:@nanobpm/workflow ; start task
   package.json       node identity + @nanobpm/workflow dependency
   tsconfig.json      authoring-time types
   main.ts            standalone worker-host service: deploy the workflow(s) + Worker.start(), run forever

@@ -71,12 +71,12 @@ Nano Studio gives you a first-class **New Urban App** button. The Urban toolkit 
 2. Open Studio.
 3. Select **New Urban App**.
 4. Select the **model-first** card, or the **code-first** card.
-5. Select the runtime. Choose **Node**, or choose **Deno**.
+5. Select the runtime: **Node**.
 6. Create the app. Studio scaffolds the app from the toolkit.
 7. Deploy the app.
 8. Observe the instances in the Explorer.
 
-The Deno option needs Deno on your machine. When Deno is absent, that option stays disabled — install Deno from `deno.com` to enable it.
+Running an app needs [Node](https://nodejs.org) ≥ 22.6 on your machine — the sole JS/TS runtime.
 
 ### Pathway B — Your own IDE or CLI
 
@@ -84,13 +84,12 @@ Here you write TypeScript, and Nano does the rest. Nano derives the executable m
 
 1. Scaffold the app. Run `npm create urban-app@latest my-app`.
 2. To author code-first, add `--style code`. The default style is model-first.
-3. To target Deno, add `--deno`. The default runtime is Node.
-4. Change into the app directory. Run `cd my-app`.
-5. Install the dependencies. Run `npm install`.
-6. Write the flow with `@nanobpm/workflow`.
-7. Run the app. Run `npm run dev`.
-8. Deploy the app to the node. Run `npm run deploy`.
-9. Observe the app in Studio.
+3. Change into the app directory. Run `cd my-app`.
+4. Install the dependencies. Run `npm install`.
+5. Write the flow with `@nanobpm/workflow`.
+6. Run the app. Run `npm run dev`.
+7. Deploy the app to the node. Run `npm run deploy`.
+8. Observe the app in Studio.
 
 ### Pathway C — The agent endpoint
 

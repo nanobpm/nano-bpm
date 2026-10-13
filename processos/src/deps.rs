@@ -2,7 +2,7 @@
 //!
 //! ProcessOS shells out to two optional CLI tools that are **not** bundled: the
 //! llama.cpp `llama-server` (which powers the local LLM sidecars used for
-//! investigations and chat) and **Deno** (which the Nano engine ProcessOS
+//! investigations and chat) and **Node** (which the Nano engine ProcessOS
 //! supervises uses to run its embedded job workers). When either is absent the
 //! failure otherwise surfaces deep inside a spawn as a cryptic
 //! "No such file or directory". This module detects both up front so the Console
@@ -14,14 +14,14 @@ use std::process::Command;
 use serde::Serialize;
 
 /// OS-aware install instructions (cover macOS/Linux/Windows package managers).
-const DENO_INSTALL_URL: &str = "https://docs.deno.com/runtime/getting_started/installation/";
+const NODE_INSTALL_URL: &str = "https://nodejs.org/en/download";
 const LLAMA_INSTALL_URL: &str = "https://github.com/ggml-org/llama.cpp/blob/master/docs/install.md";
 
 /// One external tool ProcessOS depends on, and whether it is available.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dependency {
-    /// Stable identifier (`deno` | `llama`).
+    /// Stable identifier (`node` | `llama`).
     pub id: &'static str,
     /// Human-facing name.
     pub name: &'static str,
@@ -39,7 +39,7 @@ pub struct Dependency {
     pub hint: String,
     /// Whether the tool is a hardware-accelerated build, when it can be determined.
     /// `Some(true)` = a GPU/Metal/Vulkan/… backend is available; `Some(false)` = a
-    /// CPU-only build; `None` = not applicable (Deno) or undeterminable (older
+    /// CPU-only build; `None` = not applicable (Node) or undeterminable (older
     /// `llama-server` without `--list-devices`).
     pub accelerated: Option<bool>,
     /// A non-blocking advisory shown even when the tool is present (e.g. a CPU-only
@@ -52,7 +52,7 @@ pub struct Dependency {
 /// binary ran (presence), or `None` when it could not be spawned (missing).
 ///
 /// Presence is "did it spawn", *not* the exit code — some tools print their
-/// version and exit non-zero. `deno` prints to stdout; `llama-server` to stderr,
+/// version and exit non-zero. `node` prints to stdout; `llama-server` to stderr,
 /// so both streams are considered.
 fn probe(bin: &str) -> Option<String> {
     let out = Command::new(bin).arg("--version").output().ok()?;
@@ -70,21 +70,21 @@ fn probe(bin: &str) -> Option<String> {
     Some(line)
 }
 
-/// Resolve the Deno binary the supervised Nano engine would use, mirroring that
-/// engine's own resolution order: `NANOBPMN_DENO_BIN`, then `deno` on `PATH`,
-/// then the default `~/.deno/bin/deno` install location.
-fn check_deno() -> Dependency {
+/// Resolve the Node binary the supervised Nano engine would use, mirroring that
+/// engine's own resolution order: `NANOBPMN_NODE_BIN`, then `node` on `PATH`,
+/// then the default `~/.local/bin/node` install location.
+fn check_node() -> Dependency {
     let mut candidates: Vec<String> = Vec::new();
-    if let Ok(b) = std::env::var("NANOBPMN_DENO_BIN") {
+    if let Ok(b) = std::env::var("NANOBPMN_NODE_BIN") {
         let b = b.trim().to_string();
         if !b.is_empty() {
             candidates.push(b);
         }
     }
-    candidates.push("deno".to_string());
+    candidates.push("node".to_string());
     if let Ok(home) = std::env::var("HOME") {
         if !home.is_empty() {
-            candidates.push(format!("{home}/.deno/bin/deno"));
+            candidates.push(format!("{home}/.local/bin/node"));
         }
     }
 
@@ -101,17 +101,17 @@ fn check_deno() -> Dependency {
     let present = version.is_some() || probe(&bin).is_some();
 
     Dependency {
-        id: "deno",
-        name: "Deno",
-        purpose: "Running Nano's embedded job workers — the Nano engine ProcessOS supervises spawns sandboxed Deno worker processes.",
+        id: "node",
+        name: "Node",
+        purpose: "Running Nano's embedded job workers — the Nano engine ProcessOS supervises spawns Node worker processes.",
         bin,
         present,
         version,
-        install_url: DENO_INSTALL_URL,
+        install_url: NODE_INSTALL_URL,
         hint: if present {
             String::new()
         } else {
-            "Deno was not found. Install it (see the link) so `deno` is on PATH, or set NANOBPMN_DENO_BIN to its path. Until then, embedded Nano workers cannot run."
+            "Node was not found. Install it (see the link) so `node` is on PATH, or set NANOBPMN_NODE_BIN to its path. Until then, embedded Nano workers cannot run."
                 .to_string()
         },
         accelerated: None,
@@ -200,7 +200,7 @@ fn check_llama(llama_bin: Option<&str>) -> Dependency {
 /// Check every external dependency. `llama_bin` is the operator-configured path
 /// from settings (or `None` to use `llama-server` on `PATH`).
 pub fn check(llama_bin: Option<&str>) -> Vec<Dependency> {
-    vec![check_deno(), check_llama(llama_bin)]
+    vec![check_node(), check_llama(llama_bin)]
 }
 
 #[cfg(test)]
@@ -223,12 +223,12 @@ mod tests {
     fn check_returns_both_dependencies_with_install_links() {
         let deps = check(None);
         assert_eq!(deps.len(), 2);
-        let deno = deps.iter().find(|d| d.id == "deno").expect("deno entry");
+        let node = deps.iter().find(|d| d.id == "node").expect("node entry");
         let llama = deps.iter().find(|d| d.id == "llama").expect("llama entry");
-        assert!(deno.install_url.starts_with("https://"));
+        assert!(node.install_url.starts_with("https://"));
         assert!(llama.install_url.starts_with("https://"));
         // A missing tool always carries an actionable hint; a present one does not.
-        assert_eq!(deno.present, deno.hint.is_empty());
+        assert_eq!(node.present, node.hint.is_empty());
         assert_eq!(llama.present, llama.hint.is_empty());
     }
 

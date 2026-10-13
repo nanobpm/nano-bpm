@@ -88,7 +88,7 @@ either — the adapter is selected at load, not baked into app code.
 
 `npm create urban-app@latest my-app` (Node) / `deno run -A npm:create-urban-app my-app` (Deno).
 Pure code-generation, **zero runtime logic**: it materializes a repo — a `nano.app.json`, one
-process, one form, a datasource migration, a worker module, and the `deno.json`/`package.json` that
+process, one form, a datasource migration, a worker module, and the `node.json`/`package.json` that
 wires `@nanobpm/urban-runtime` and an `urban` task. The output is a repo that **already knows how to
 run itself** (`urban run`). It seeds from the existing `packages/app-deno-gui` template and the
 Nano Workforce layout, and offers a couple of presets (headless workers-only vs. workers+surfaces).

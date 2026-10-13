@@ -3,7 +3,7 @@
 // multi-MB Monaco bundle out of its lazy-loaded chunk.
 //
 // Two sources feed the mapping:
-// - A static table below for the runtimes we've always shipped (Deno/TS, Rust)
+// - A static table below for the runtimes we've always shipped (Node/TS, Rust)
 //   and the common companions we don't want to be silent about (Java, XML,
 //   YAML, Python, Go, C/C++, Shell, Dockerfile). Monaco's default bundle
 //   already ships tokenisers for all of these via basic-languages; the map
@@ -114,8 +114,8 @@ export function languageForFile(file: string): string {
   const statBase = STATIC_BASENAME_TO_LANG[lower];
   if (statBase) return statBase;
   // Files without any known extension fall through to TypeScript because the
-  // console's original worker surface was Deno-only and unmarked files were
-  // always TS. Kept for back-compat; anything with a real extension or a
+  // console's original worker surface was TypeScript-only and unmarked files
+  // were always TS. Kept for back-compat; anything with a real extension or a
   // recognised basename is routed via the tables above.
   return "typescript";
 }

@@ -1,6 +1,6 @@
 // Generate the TypeScript AppManifest types from nano-app.schema.json
 // (ADR 0027 §3, spec-first). The manifest is consumed only by TypeScript —
-// the console App panels and the Deno App loader — so this emits TS, not Rust
+// the console App panels and the Node App loader — so this emits TS, not Rust
 // (ADR 0027 §1: nano.app.json is read by the compiled App + console panels,
 // not the Rust server).
 //

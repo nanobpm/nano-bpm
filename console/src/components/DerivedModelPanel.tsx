@@ -83,7 +83,7 @@ export default function DerivedModelPanel({ name }: { name: string }) {
             <p className="mt-3 text-xs text-fg-faint">
               The model is derived by running this project&apos;s{" "}
               <code>workflows/*.ts</code> through <code>@nanobpm/workflow</code>{" "}
-              with Deno. Make sure the Deno toolchain is installed and the
+              with Node. Make sure the Node toolchain is installed and the
               workflows type-check.
             </p>
           </div>

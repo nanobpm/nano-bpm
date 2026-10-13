@@ -14,9 +14,9 @@
 export const REAL_AI_OPT_IN_ENV = "URBAN_TESTKIT_AI_REAL";
 
 /**
- * Runtime-neutral env read (Node `process.env`, Deno `Deno.env`). Uses `Reflect` so it
- * needs no `as` cast and stays green under both lanes; returns `undefined` when the host
- * exposes no env or the key is absent.
+ * Env read over Node's `process.env` (the sole JS/TS runtime, ADR 0065). Uses `Reflect` so
+ * it needs no `as` cast; returns `undefined` when the host exposes no env or the key is
+ * absent.
  */
 export function readEnvVar(name: string): string | undefined {
   const globalObject: unknown = globalThis;
@@ -30,25 +30,6 @@ export function readEnvVar(name: string): string | undefined {
       const value = Reflect.get(env, name);
       if (typeof value === "string") {
         return value;
-      }
-    }
-  }
-  const deno = Reflect.get(globalObject, "Deno");
-  if (typeof deno === "object" && deno !== null) {
-    const env = Reflect.get(deno, "env");
-    if (typeof env === "object" && env !== null) {
-      const getter = Reflect.get(env, "get");
-      if (typeof getter === "function") {
-        // Deno's `env.get` throws when the process lacks `--allow-env`; treat that denial
-        // as "unset" so the "safe by default" contract holds instead of surfacing a throw.
-        try {
-          const value = Reflect.apply(getter, env, [name]);
-          if (typeof value === "string") {
-            return value;
-          }
-        } catch {
-          return undefined;
-        }
       }
     }
   }

@@ -1,0 +1,30 @@
+{
+  // Type-checks the embedded server-console TypeScript (the JS half of the
+  // console gateway that ships inside the Rust binary via `include_str!`).
+  // `deno test` used to type-check this whole import graph; Node's
+  // `--experimental-strip-types` erases types WITHOUT checking them, so this
+  // config restores the check on the Node side (`tsc -p
+  // server/crates/nano-server-console`). `@types/node` is resolved from the
+  // console's installed devDependencies (the only place in the repo that
+  // `npm ci`s them); see the `console-ts` CI job.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "typeRoots": ["../../../console/node_modules/@types"]
+  },
+  "include": ["src/**/*.ts"],
+  // `data_cli.ts` is the materialisation entrypoint: it imports the SDK's
+  // hyphenated emit-time filenames (`./data-sdk.ts` / `./domain-types.ts`) that
+  // only exist in a rendered project, so it is not type-checkable in-tree and no
+  // test imports it (the same exclusion the old `deno test` lane documented).
+  "exclude": ["src/data_cli.ts"]
+}

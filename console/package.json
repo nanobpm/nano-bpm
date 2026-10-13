@@ -42,7 +42,7 @@
     "dmn-js": "^17.8.1",
     "driver.js": "^1.8.0",
     "markdown-it": "^14.2.0",
-    "monaco-editor": "^0.52.2",
+    "monaco-editor": "^0.57.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.27.0",

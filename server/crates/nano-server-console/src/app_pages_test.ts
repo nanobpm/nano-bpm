@@ -1,9 +1,10 @@
 // Unit tests for the Urban App page runtime (ADR 0042 §3).
-// Run: `deno test --allow-read server/src/console/app_pages_test.ts`
-import { assert, assertEquals } from "jsr:@std/assert";
-import { createPagesHandler, type PagesContext } from "./app_pages.ts";
+// Run: `node --experimental-strip-types --test server/crates/nano-server-console/src/app_pages_test.ts`
+import { test } from "node:test";
+import { assert, assertEquals } from "./test_support.ts";
+import { createPagesHandler, servePages, type PagesContext } from "./app_pages.ts";
 
-function ctx(over: Partial<PagesContext> = {}): PagesContext {
+function ctx(over: Partial<PagesContext> & { port?: number } = {}): PagesContext {
   return {
     db: {
       schema: () => Promise.resolve([{ name: "pull_requests" }]),
@@ -30,7 +31,7 @@ function fakeEngine(over: Partial<PagesContext["nano"]> = {}): PagesContext["nan
   };
 }
 
-Deno.test("GET / serves the renderer shell with the home page id", async () => {
+test("GET / serves the renderer shell with the home page id", async () => {
   const res = await createPagesHandler(ctx({ homePage: "home" }))(new Request("http://x/"));
   assertEquals(res.status, 200);
   const html = await res.text();
@@ -38,19 +39,19 @@ Deno.test("GET / serves the renderer shell with the home page id", async () => {
   assert(html.includes("/app/runtime.js"));
 });
 
-Deno.test("GET /app/pages/home returns the page.json", async () => {
+test("GET /app/pages/home returns the page.json", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/pages/home"));
   assertEquals(res.status, 200);
   const doc = await res.json();
   assertEquals(doc.title, "T");
 });
 
-Deno.test("GET /app/pages/missing is 404", async () => {
+test("GET /app/pages/missing is 404", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/pages/missing"));
   assertEquals(res.status, 404);
 });
 
-Deno.test("GET /app/data returns rows for a known table", async () => {
+test("GET /app/data returns rows for a known table", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/data/app/pull_requests"));
   assertEquals(res.status, 200);
   const body = await res.json();
@@ -58,18 +59,18 @@ Deno.test("GET /app/data returns rows for a known table", async () => {
   assertEquals(body.rows[0].pr_key, "o/r#1");
 });
 
-Deno.test("GET /app/data rejects an unknown table (no SQL injection surface)", async () => {
+test("GET /app/data rejects an unknown table (no SQL injection surface)", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/data/app/secrets"));
   assertEquals(res.status, 404);
 });
 
-Deno.test("GET /app/data rejects a source other than the injected default", async () => {
+test("GET /app/data rejects a source other than the injected default", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/data/other/pull_requests"));
   assertEquals(res.status, 404);
   assertEquals((await res.json()).error, 'unknown datasource "other"');
 });
 
-Deno.test("POST /app/actions/start starts a process with the posted variables", async () => {
+test("POST /app/actions/start starts a process with the posted variables", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -91,7 +92,7 @@ Deno.test("POST /app/actions/start starts a process with the posted variables", 
   assertEquals(seen, { processDefinitionId: "convergence-loop", variables: { pr: "o/r#1" } });
 });
 
-Deno.test("POST /app/actions/start defaults a non-object `variables` to {}", async () => {
+test("POST /app/actions/start defaults a non-object `variables` to {}", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -112,7 +113,7 @@ Deno.test("POST /app/actions/start defaults a non-object `variables` to {}", asy
   assertEquals(seen, { processDefinitionId: "p", variables: {} });
 });
 
-Deno.test("POST /app/actions/start surfaces an engine error as 502", async () => {
+test("POST /app/actions/start surfaces an engine error as 502", async () => {
   const c = ctx({
     nano: fakeEngine({ createProcessInstance: () => Promise.reject(new Error("engine down")) }),
   });
@@ -127,12 +128,12 @@ Deno.test("POST /app/actions/start surfaces an engine error as 502", async () =>
   assert((await res.json()).error.includes("engine down"));
 });
 
-Deno.test("unknown route is 404", async () => {
+test("unknown route is 404", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/nope"));
   assertEquals(res.status, 404);
 });
 
-Deno.test("GET /app/data retries schema introspection after a transient failure", async () => {
+test("GET /app/data retries schema introspection after a transient failure", async () => {
   let calls = 0;
   const handle = createPagesHandler(
     ctx({
@@ -156,7 +157,7 @@ Deno.test("GET /app/data retries schema introspection after a transient failure"
   assertEquals(calls, 2);
 });
 
-Deno.test("GET /app/data applies whitelisted where + order as bound params", async () => {
+test("GET /app/data applies whitelisted where + order as bound params", async () => {
   let seenSql = "";
   let seenParams: unknown[] = [];
   const c = ctx({
@@ -181,14 +182,14 @@ Deno.test("GET /app/data applies whitelisted where + order as bound params", asy
   assertEquals(seenParams, ["converging"]);
 });
 
-Deno.test("GET /app/data rejects a where column not on the table (no injection)", async () => {
+test("GET /app/data rejects a where column not on the table (no injection)", async () => {
   const res = await createPagesHandler(ctx())(
     new Request("http://x/app/data/app/pull_requests?where=evil'--:1"),
   );
   assertEquals(res.status, 400);
 });
 
-Deno.test("POST /app/actions/cancel cancels the posted instance", async () => {
+test("POST /app/actions/cancel cancels the posted instance", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -210,7 +211,7 @@ Deno.test("POST /app/actions/cancel cancels the posted instance", async () => {
   assertEquals(seen, { processInstanceKey: "123" });
 });
 
-Deno.test("POST /app/actions/cancel requires a key", async () => {
+test("POST /app/actions/cancel requires a key", async () => {
   const res = await createPagesHandler(ctx())(
     new Request("http://x/app/actions/cancel", {
       method: "POST",
@@ -221,7 +222,7 @@ Deno.test("POST /app/actions/cancel requires a key", async () => {
   assertEquals(res.status, 400);
 });
 
-Deno.test("POST /app/actions/message publishes a correlated message", async () => {
+test("POST /app/actions/message publishes a correlated message", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -242,7 +243,7 @@ Deno.test("POST /app/actions/message publishes a correlated message", async () =
   assertEquals(seen, { name: "escalation-answered", correlationKey: "o/r#1", variables: { answer: "yes" } });
 });
 
-Deno.test("POST /app/actions/message requires name and correlationKey", async () => {
+test("POST /app/actions/message requires name and correlationKey", async () => {
   const res = await createPagesHandler(ctx())(
     new Request("http://x/app/actions/message", {
       method: "POST",
@@ -253,7 +254,7 @@ Deno.test("POST /app/actions/message requires name and correlationKey", async ()
   assertEquals(res.status, 400);
 });
 
-Deno.test("GET /app/data supports a whitelisted IN filter (set membership)", async () => {
+test("GET /app/data supports a whitelisted IN filter (set membership)", async () => {
   let seenSql = "";
   let seenParams: unknown[] = [];
   const c = ctx({
@@ -273,4 +274,34 @@ Deno.test("GET /app/data supports a whitelisted IN filter (set membership)", asy
   assertEquals(res.status, 200);
   assert(seenSql.includes("status IN (?, ?, ?)"));
   assertEquals(seenParams, ["converging", "escalated", "waiting_review"]);
+});
+
+test("servePages starts a node:http server that serves the page runtime", async () => {
+  // Red/green guard for the Node-only runtime (ADR 0065): `servePages` used to be
+  // `Deno.serve`, which is undefined under Node, so a scaffolded Urban app's real
+  // `main.ts` (`servePages({ db, nano, port })`) would throw the moment it served.
+  // This drives the actual socket path — the one the unit handler tests skip.
+  const server = servePages(ctx({ port: 0, homePage: "home" }));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      if (server.listening) resolve();
+      else {
+        server.once("listening", resolve);
+        server.once("error", reject);
+      }
+    });
+    const addr = server.address();
+    assert(addr && typeof addr === "object", "server must expose its bound address");
+    const port = (addr as { port: number }).port;
+    // GET / — the renderer shell.
+    const home = await fetch(`http://127.0.0.1:${port}/`);
+    assertEquals(home.status, 200);
+    assert((await home.text()).includes("/app/runtime.js"));
+    // GET /app/data/<source>/<table> — the data bridge.
+    const data = await fetch(`http://127.0.0.1:${port}/app/data/app/pull_requests`);
+    assertEquals(data.status, 200);
+    assertEquals((await data.json()).rows.length, 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

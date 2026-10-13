@@ -47,7 +47,7 @@ function project(p: Partial<ProjectSummary>): ProjectSummary {
     workers: 0,
     running: false,
     source: "workspace",
-    lang: "deno",
+    lang: "node",
     updateAvailable: false,
     ...p,
   } as ProjectSummary;

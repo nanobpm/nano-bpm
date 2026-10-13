@@ -19,7 +19,7 @@
 //!   emit endpoint** any external producer can POST to.
 //! - **Pack sources** (`nano-ide-trigger-*`, ADR 0007 / §6) are declared by an
 //!   installed extension via `nano-ide.ext.json` `triggerSources[]`. Their
-//!   driver runs out-of-process (Node/Deno, ADR 0036) and emits over the same
+//!   driver runs out-of-process (Node) and emits over the same
 //!   ingress. The runtime *recognises* the kind (so validation/status treat it
 //!   as first-class) and owns the inbox/dispatch/retry — the pack only produces
 //!   events. A community source therefore adds a `type` without touching core,
@@ -454,7 +454,7 @@ const DRIVER_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const DRIVER_HEALTHY_UPTIME: Duration = DRIVER_BACKOFF_MAX;
 
 /// Supervise one pack source's out-of-process driver (ADR 0025 phase 4): launch
-/// it (Node-first, ADR 0038), pipe its logs, and on crash restart with capped
+/// it (Node-only, ADR 0065), pipe its logs, and on crash restart with capped
 /// exponential backoff — until [`LoopHandle::stopped`] fires, at which point the
 /// child is killed. The driver emits its events over the trigger ingress using
 /// the env contract below; this function owns only its lifecycle.
@@ -541,7 +541,7 @@ async fn run_pack_driver(
     }
 }
 
-/// Build + spawn the driver child, selecting the runtime Node-first (ADR 0038)
+/// Build + spawn the driver child on the Node runtime (ADR 0065)
 /// and stripping TS types for a `.ts` entrypoint. Streams stdout/stderr to the
 /// tracing log. Returns the spawned [`tokio::process::Child`].
 #[allow(clippy::too_many_arguments)]
@@ -570,17 +570,8 @@ fn spawn_driver_child(
             cmd.arg("--experimental-strip-types").arg("--no-warnings");
         }
         cmd.arg(entry);
-    } else if let Some(deno) = super::workers::find_deno() {
-        cmd = Command::new(deno);
-        cmd.current_dir(&driver.dir)
-            .arg("run")
-            .arg("--no-prompt")
-            .arg("--allow-net")
-            .arg("--allow-env")
-            .arg(format!("--allow-read={}", driver.dir.display()))
-            .arg(entry);
     } else {
-        return Err("no JS runtime (Node >=22.6 or Deno) available".to_string());
+        return Err("no JS runtime (Node >=22.6) available".to_string());
     }
 
     cmd.env("NO_COLOR", "1")
@@ -686,7 +677,7 @@ pub(crate) fn spawn_workers(project: &str, manifest: &Json, handle: Arc<LoopHand
 }
 
 /// Supervise one connector worker's out-of-process child (ADR 0050 §4): launch
-/// it (Node-first, ADR 0038), pipe its logs, and on crash restart with capped
+/// it (Node-only, ADR 0065), pipe its logs, and on crash restart with capped
 /// exponential backoff — until [`LoopHandle::stopped`] fires, at which point the
 /// child is killed. The worker subscribes to its job `type` over the base URL
 /// using `@nanobpm/worker`; this function owns only its lifecycle. Mirrors
@@ -747,7 +738,7 @@ async fn run_pack_worker(
     }
 }
 
-/// Build + spawn the worker child, selecting the runtime Node-first (ADR 0038)
+/// Build + spawn the worker child on the Node runtime (ADR 0065)
 /// and stripping TS types for a `.ts` entrypoint, streaming its logs. The child
 /// inherits the host env (so the connector's configured token env pointers flow
 /// through) plus the base URL + worker name. Mirrors [`spawn_driver_child`].
@@ -772,17 +763,8 @@ fn spawn_worker_child(
             cmd.arg("--experimental-strip-types").arg("--no-warnings");
         }
         cmd.arg(entry);
-    } else if let Some(deno) = super::workers::find_deno() {
-        cmd = Command::new(deno);
-        cmd.current_dir(&driver.dir)
-            .arg("run")
-            .arg("--no-prompt")
-            .arg("--allow-net")
-            .arg("--allow-env")
-            .arg(format!("--allow-read={}", driver.dir.display()))
-            .arg(entry);
     } else {
-        return Err("no JS runtime (Node >=22.6 or Deno) available".to_string());
+        return Err("no JS runtime (Node >=22.6) available".to_string());
     }
 
     cmd.env("NO_COLOR", "1")

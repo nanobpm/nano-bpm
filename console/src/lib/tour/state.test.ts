@@ -275,7 +275,6 @@ test("baseContext: a missing snapshot reads runtimes as ABSENT", () => {
   // Guessing "probably fine" is the defect ADR 0049 exists to fix: an unknown
   // runtime must repair the Run step, not promise it works.
   const c = baseContext({ profile: "studio", route: "/projects" });
-  assert.equal(c.denoAvailable, false);
   assert.equal(c.nodeAvailable, false);
   assert.deepEqual(c.projects, []);
   assert.deepEqual(c.templates, []);
@@ -289,14 +288,12 @@ test("baseContext: unwraps the listProjects snapshot, including nested extension
     route: "/projects",
     snapshot: {
       projects: [{ name: "p" } as never],
-      denoAvailable: true,
       nodeAvailable: false,
       templates: [{ id: "starter" } as never],
       extensions: { extensions: [{ id: "rust" } as never] },
     },
   });
   assert.equal(c.projects.length, 1);
-  assert.equal(c.denoAvailable, true);
   assert.equal(c.nodeAvailable, false);
   assert.equal(c.templates.length, 1);
   assert.equal(c.extensions.length, 1);

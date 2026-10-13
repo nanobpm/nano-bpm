@@ -2,29 +2,30 @@
 //! "Rapid Application Development" environment.
 //!
 //! A project is a **self-contained directory** under the projects root that is
-//! itself a runnable Deno application:
+//! itself a runnable Node application:
 //!
 //! ```text
 //! <projectsRoot>/<project>/
 //!   nanobpm.project.json      project config (name, deploy target, platforms)
-//!   deno.json                 import map (@nanobpm/worker, @lib/) + start task
+//!   node.json                 import map (@nanobpm/worker, @lib/) + start task
 //!   tsconfig.json             standard-tooling type resolution (paths mirror the map)
-//!   package.json              Node-first manifest: npm identity + `npm install` deps
+//!   package.json              npm manifest: npm identity + `npm install` deps
 //!   main.ts                   entrypoint: deploys processes + starts workers
 //!   resources/
 //!     processes/  *.bpmn       deployed to the engine on run
 //!     decisions/  *.dmn        authored + bundled (engine does not execute DMN)
 //!     forms/      *.form       authored + bundled (engine does not execute forms)
-//!   workers/<name>/{worker.ts, deno.json}
+//!   workers/<name>/{worker.ts, node.json}
 //!   lib/                       shared TS/JS importable via @lib/
-//!   nano-generated/worker-sdk.ts     embedded Deno worker SDK (materialised on disk)
-//!   .deno-cache/               DENO_DIR for dependency caching
+//!   nano-generated/worker-sdk.ts     embedded Node worker SDK (materialised on disk)
+//!   node_modules/              `npm install` output for bare npm deps
 //! ```
 //!
-//! "Run" spawns `deno run main.ts`; "compile" runs `deno compile` (optionally
-//! cross-compiling for selected targets); "export" zips the whole project. All
-//! of this is feature-gated behind `console` and never touches the engine data
-//! dir.
+//! "Run" spawns `node --experimental-strip-types main.ts`; "export" zips the
+//! whole project. Node (>= 22.6) is the sole JS/TS runtime — Deno was removed
+//! (ADR 0065), which also removed `deno compile` (there is no Node equivalent,
+//! so Compile is no longer offered). All of this is feature-gated behind
+//! `console` and never touches the engine data dir.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -226,11 +227,10 @@ export function meta(key: string): string | undefined {
   return (appMeta as Record<string, string>)[key];
 }
 "#;
-/// Node fallback runtime loader + bootstrap (ADR 0036), materialised next to the
-/// SDK so `deno.json` import maps resolve under Node (no Deno build required).
+/// Node runtime loader + bootstrap (ADR 0065), materialised next to the SDK so a
+/// project's `node.json` import map resolves in the Node runtime.
 const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
 const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
-const NODE_DENO_SHIM_MJS: &str = include_str!("node_deno_shim.mjs");
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 /// ADR 0057 boot handshake: a supervised Urban app announces the port it
@@ -258,7 +258,10 @@ const STOP_ALL_TIMEOUT_MS: u64 = 250;
 /// The config file name at the root of every project.
 pub const CONFIG_FILE: &str = "nanobpm.project.json";
 
-/// Deno `--target` triples we support for cross-compilation.
+/// Legacy cross-compilation target triples carried in a project's `platforms`
+/// config. Deno removal (ADR 0065) dropped `deno compile`, so these are no
+/// longer selectable/buildable; the list is retained only so old project
+/// configs still deserialize and the Console's platform list stays non-empty.
 pub const PLATFORMS: &[&str] = &[
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
@@ -271,7 +274,7 @@ pub const PLATFORMS: &[&str] = &[
 /// short title (`label`), one-line `description`, and the language pack id the
 /// scaffolded project runs on (drives the card's language icon). `options`
 /// declares per-template creation controls the picker renders on the selected
-/// card (e.g. a Node/Deno runtime toggle) — see [`TemplateOptionSpec`].
+/// card (e.g. a runtime toggle) — see [`TemplateOptionSpec`].
 pub struct BuiltinTemplate {
     pub id: &'static str,
     pub label: &'static str,
@@ -300,7 +303,7 @@ pub struct TemplateOptionSpec {
 }
 
 /// One selectable value of a [`TemplateOptionSpec`]. `requires` names a host
-/// capability the choice needs (`deno`/`node`); the console disables the choice
+/// capability the choice needs (e.g. `node`); the console disables the choice
 /// when that capability is absent.
 pub struct TemplateChoice {
     pub value: &'static str,
@@ -311,24 +314,16 @@ pub struct TemplateChoice {
 /// Shared "no creation options" for templates that declare none.
 const NO_OPTIONS: &[TemplateOptionSpec] = &[];
 
-/// The Node/Deno runtime toggle offered by Urban templates. Node is the
-/// default (always available, ADR 0038); the Deno choice is gated on
-/// `denoAvailable` so the console disables it when Deno isn't installed.
+/// The runtime choices offered by Urban templates. Node is the sole JS/TS
+/// runtime (ADR 0065), so the list carries one always-selectable choice.
 const RUNTIME_OPTIONS: &[TemplateOptionSpec] = &[TemplateOptionSpec {
     id: "runtime",
     label: "Runtime",
-    choices: &[
-        TemplateChoice {
-            value: "node",
-            label: "Node",
-            requires: None,
-        },
-        TemplateChoice {
-            value: "deno",
-            label: "Deno",
-            requires: Some("deno"),
-        },
-    ],
+    choices: &[TemplateChoice {
+        value: "node",
+        label: "Node",
+        requires: None,
+    }],
     default: Some("node"),
 }];
 
@@ -338,7 +333,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         id: "starter",
         label: "Starter app",
         description: "One process, one worker",
-        lang: "deno",
+        lang: "node",
         options: NO_OPTIONS,
         needs_urban: false,
     },
@@ -346,7 +341,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         id: "throughput",
         label: "Throughput (REST)",
         description: "30s ramp benchmark over the HTTP API",
-        lang: "deno",
+        lang: "node",
         options: NO_OPTIONS,
         needs_urban: false,
     },
@@ -354,15 +349,15 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         id: "throughput-stream",
         label: "Throughput (falcon)",
         description: "Same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
-        lang: "deno",
+        lang: "node",
         options: NO_OPTIONS,
         needs_urban: false,
     },
     BuiltinTemplate {
         id: "gui-starter",
         label: "GUI app",
-        description: "Served-UI binary (Deno.serve) for a process application",
-        lang: "deno",
+        description: "Served-UI app (Node HTTP server) for a process application",
+        lang: "node",
         options: NO_OPTIONS,
         needs_urban: false,
     },
@@ -370,7 +365,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         id: "urban-starter",
         label: "Urban App",
         description: "A RAD application (nano.app.json) with models, data, triggers & surfaces",
-        lang: "deno",
+        lang: "node",
         options: RUNTIME_OPTIONS,
         needs_urban: true,
     },
@@ -378,7 +373,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         id: "workflow-starter",
         label: "Code-first workflow",
         description: "Durable orchestration authored as code (@nanobpm/workflow), model derived",
-        lang: "deno",
+        lang: "node",
         options: NO_OPTIONS,
         needs_urban: false,
     },
@@ -465,7 +460,7 @@ pub fn project_templates() -> Vec<serde_json::Value> {
             ext.requires
                 .first()
                 .cloned()
-                .unwrap_or_else(|| "deno".to_string())
+                .unwrap_or_else(|| "node".to_string())
         };
         for t in &ext.templates {
             if seen.insert(t.id.clone()) {
@@ -1050,15 +1045,17 @@ pub struct ProjectConfig {
     /// The entrypoint module run on "Run"/"Compile". Default `main.ts`.
     #[serde(default = "default_main")]
     pub main: String,
-    /// Cross-compilation targets selected for export (Deno `--target` triples).
+    /// Legacy cross-compilation targets carried from before Deno removal
+    /// (ADR 0065). Retained for config compatibility; no longer used to build.
     #[serde(default)]
     pub platforms: Vec<String>,
     /// Language pack id driving editor grammar + toolchain (ADR 0008). Default
-    /// `deno` (TypeScript) — the legacy runtime, zero regression.
+    /// `node` (TypeScript) — the built-in Node/TypeScript pack id. A legacy
+    /// config that still says `deno` resolves to the same pack.
     #[serde(default = "default_lang")]
     pub lang: String,
-    /// App/output pack id (ADR 0009). `console` (today) or e.g. `deno-gui` for a
-    /// served-UI binary. Default `console`.
+    /// App/output pack id (ADR 0009). `console` (today) or e.g. `node-gui` for a
+    /// served-UI app. Default `console`.
     #[serde(default = "default_app")]
     pub app: String,
     /// Project-relative directories the supervisor sweeps for deployable
@@ -1083,7 +1080,7 @@ pub struct ProjectConfig {
     /// or be uninstalled). Precedence for Run/Compile:
     ///   1. `cfg.toolchain` when present (this snapshot)
     ///   2. lang pack's toolchain (lang-pack starter templates that don't override)
-    ///   3. built-in Deno runner
+    ///   3. built-in Node runner
     ///
     /// Users may hand-edit these argv in `nanobpm.project.json`; a future
     /// "Reset toolchain from pack" action can opt into upstream updates.
@@ -1103,9 +1100,8 @@ pub struct ProjectConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
     /// The runtime the project was created to target, chosen from the
-    /// template's `runtime` creation option at scaffold time (`node` or
-    /// `deno`). Provenance today; the forthcoming `create-urban-app`
-    /// delegation reads it to pass `--deno`. Absent when the template
+    /// template's `runtime` creation option at scaffold time (always `node`
+    /// since ADR 0065 removed Deno). Provenance only. Absent when the template
     /// declares no runtime option or the choice defaulted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
@@ -1117,19 +1113,19 @@ pub struct ProjectConfig {
 
 /// Project-owned copy of the pack toolchain at scaffold time. Only the argv
 /// the supervisor actually spawns — no `detect` (project doesn't gate on
-/// tool presence; the spawn error is the diagnostic) or `targets` (Deno-only
-/// today; belongs on the pack, not the project).
+/// tool presence; the spawn error is the diagnostic) or `targets` (compile-
+/// only; belongs on the pack, not the project).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectToolchain {
     /// Argv the "Run" button spawns in the project dir. Empty => fall through
-    /// to the lang-pack toolchain / Deno runner. Also serves as a fallback
+    /// to the lang-pack toolchain / built-in Node runner. Also serves as a fallback
     /// when a run config is active but its own `run` argv is empty.
     #[serde(default)]
     pub run: Vec<String>,
     /// Argv the "Compile" button spawns in the project dir. Empty => fall
-    /// through to the lang-pack toolchain / Deno compile. Also serves as a
-    /// fallback when a run config is active but its own `compile` is empty.
+    /// through to the lang-pack toolchain / built-in Node compile. Also serves
+    /// as a fallback when a run config is active but its own `compile` is empty.
     #[serde(default)]
     pub compile: Vec<String>,
     /// Named run configurations snapshotted from the scaffolding pack.
@@ -1207,8 +1203,11 @@ fn default_main() -> String {
     "main.ts".to_string()
 }
 
+/// The default language pack id: Node (TypeScript). Deno removal (ADR 0065)
+/// renamed the built-in pack `deno` -> `node`; a legacy config that still says
+/// `lang: "deno"` resolves to the same pack via [`super::extensions::lang_pack`].
 fn default_lang() -> String {
-    "deno".to_string()
+    "node".to_string()
 }
 
 fn default_app() -> String {
@@ -1247,8 +1246,8 @@ impl ProjectConfig {
     }
 }
 
-/// Best-effort guess at the host's Deno target triple, used as the default
-/// selected platform for a new project.
+/// Best-effort guess at the host's target triple, used as the default selected
+/// platform for a new project.
 fn host_target() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "aarch64-apple-darwin",
@@ -1286,7 +1285,7 @@ pub fn read_config(name: &str) -> Option<ProjectConfig> {
 /// the snapshot design. Best-effort — silent no-op when we can't tell which
 /// pack scaffolded it. The heuristic uses `cfg.main` (Maven multi-module
 /// projects put the POM under `microservice/`, GUI-served bins point at
-/// `main.ts` in `deno-gui`, etc.); anything unrecognised is left alone.
+/// `main.ts` in `node-gui`, etc.); anything unrecognised is left alone.
 fn autoheal_toolchain(cfg: &mut ProjectConfig) {
     if cfg.toolchain.is_some() {
         return;
@@ -1355,7 +1354,7 @@ fn manifest_entrypoint(dir: &Path) -> Option<String> {
         return None;
     }
     // The manifest is app-owned, portable data whose entrypoint is resolved
-    // against the app root and handed straight to Node / `deno compile`. An
+    // against the app root and handed straight to Node. An
     // absolute path or a `..` traversal would escape the project root (and
     // `Path::join` silently *ignores* `dir` for an absolute path), so reject
     // any non-relative/traversing value and fall back to the default rather
@@ -1424,7 +1423,7 @@ pub(crate) const GEN_DIR: &str = "nano-generated";
 
 /// Append the Node fallback runtime flags to `cmd`: strip TS types, silence the
 /// `--experimental-strip-types` warning, and preload the loader bootstrap
-/// (`node-register.mjs`, ADR 0036) via `--import`.
+/// (`node-register.mjs`, ADR 0065) via `--import`.
 ///
 /// `register` is the **absolute** path to the bootstrap module. It is always
 /// handed to Node as a `file://` URL (see [`file_url_arg`]): a raw absolute path
@@ -1460,9 +1459,9 @@ fn gendir(template: &str) -> String {
     template.replace("{GEN}", GEN_DIR)
 }
 
-/// Default project `deno.json`: import map for the SDK + shared library, and a
-/// `start` task that runs the entrypoint with the right permissions.
-const PROJECT_DENO_JSON: &str = r#"{
+/// Default project `node.json`: import map for the SDK + shared library, and a
+/// `start` task that runs the entrypoint under Node.
+const PROJECT_NODE_JSON: &str = r#"{
   "imports": {
     "@nanobpm/worker": "./{GEN}/workers.ts",
     "@nanobpm/messages": "./{GEN}/messages.ts",
@@ -1474,16 +1473,16 @@ const PROJECT_DENO_JSON: &str = r#"{
     "@lib/": "./lib/"
   },
   "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-write --allow-env main.ts"
+    "start": "node --experimental-strip-types main.ts"
   }
 }
 "#;
 
 /// Default project `tsconfig.json`: gives standard TypeScript tooling (VS Code,
 /// `tsc`, any editor) native type resolution for the `@nanobpm/*` SDK and `@lib/*`
-/// specifiers, mirroring the `deno.json` import map. The runtime resolves those
-/// specifiers via `deno.json` (Deno + `deno compile`) or the Node loader; this
-/// file is authoring-time only (`noEmit`). `@types/node` (a `package.json`
+/// specifiers, mirroring the `node.json` import map. The runtime resolves those
+/// specifiers via `node.json` and the Node loader; this file is authoring-time
+/// only (`noEmit`). `@types/node` (a `package.json`
 /// devDependency) types the `node:*` builtins once `npm install` has run.
 const PROJECT_TSCONFIG_JSON: &str = r#"{
   "compilerOptions": {
@@ -1517,11 +1516,11 @@ const PROJECT_TSCONFIG_JSON: &str = r#"{
 /// (`npm install <pkg>`), and pulls `@types/node` so `node:*` builtins type-check
 /// under standard tooling. It does *not* carry the `@nanobpm/*` alias map —
 /// `package.json` cannot express it (`imports` keys must be `#`-prefixed); that
-/// lives in `deno.json` (runtime) and `tsconfig.json` (types).
+/// lives in `node.json` (runtime) and `tsconfig.json` (types).
 ///
 /// `deps` are the npm dependencies **derived** from the project's final
-/// `deno.json` import map (the single source of truth — see
-/// [`npm_deps_from_deno_json`]), rendered into `dependencies` so `npm install`
+/// `node.json` import map (the single source of truth — see
+/// [`npm_deps_from_manifest`]), rendered into `dependencies` so `npm install`
 /// materialises them into `node_modules` for the Node fallback loader to resolve
 /// (issue #437). Passing an empty map yields the depless base manifest.
 fn project_package_json(name: &str, deps: &BTreeMap<String, String>) -> String {
@@ -1543,7 +1542,7 @@ fn project_package_json(name: &str, deps: &BTreeMap<String, String>) -> String {
   "type": "module",
   "main": "main.ts",
   "scripts": {{
-    "start": "deno task start"
+    "start": "node --experimental-strip-types main.ts"
   }},
 {}  "devDependencies": {{
     "@types/node": "^22"
@@ -1555,11 +1554,11 @@ fn project_package_json(name: &str, deps: &BTreeMap<String, String>) -> String {
     )
 }
 
-/// Parse a `deno.json` import-map value into the **installable npm dependency**
+/// Parse a `node.json` import-map value into the **installable npm dependency**
 /// `(name, range)` it needs in `package.json` so `npm install` materialises it
 /// into `node_modules` for the Node fallback loader (issue #437).
 ///
-/// Handles the full Deno `npm:` specifier grammar —
+/// Handles the full `npm:` specifier grammar —
 /// `npm:[/]<name>[@<range>][/<subpath>]`, where `<name>` may be `@scope/pkg` —
 /// and reduces it to the coordinate `npm install` needs:
 /// * the optional leading `/` (`npm:/pkg`) is stripped;
@@ -1571,13 +1570,13 @@ fn project_package_json(name: &str, deps: &BTreeMap<String, String>) -> String {
 /// `node-loader.mjs`'s specifier stripping, but where they differ the loader
 /// keeps the module specifier (`lodash/fp`) while `package.json` must name the
 /// installable **package** (`lodash`). Returns `None` for any non-`npm:` value
-/// (relative `./`/`../`, `jsr:`, `http(s):`) — those are not `node_modules`
+/// (relative `./`/`../`, `http(s):`) — those are not `node_modules`
 /// dependencies. This is the lone build-time reader of the `npm:` grammar, so
-/// `package.json` **derives** its deps from `deno.json` rather than hand-mirroring
+/// `package.json` **derives** its deps from `node.json` rather than hand-mirroring
 /// them (which silently drifts).
 fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
     let spec = value.strip_prefix("npm:")?;
-    // Deno accepts an optional leading slash: `npm:/pkg@range`.
+    // The specifier grammar accepts an optional leading slash: `npm:/pkg@range`.
     let spec = spec.strip_prefix('/').unwrap_or(spec);
     // The package name is the first segment (`pkg`) or first two for a scope
     // (`@scope/pkg`); it ends at the `@` that starts the range or the `/` that
@@ -1612,13 +1611,13 @@ fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
     Some((name.to_string(), range.to_string()))
 }
 
-/// Parse a `deno.json`/`deno.jsonc` body into its npm dependency set, or `None`
+/// Parse a `node.json`/`node.jsonc` body into its npm dependency set, or `None`
 /// when the body does not parse as a JSON object. `Some(empty)` means "parsed,
 /// but no `npm:` imports" — distinct from a parse failure, so callers can mirror
 /// `node-loader.mjs`, which falls through to the next candidate file only on a
 /// read/parse error, not on a valid-but-import-less map.
-fn parse_npm_deps(deno_json: &str) -> Option<BTreeMap<String, String>> {
-    let serde_json::Value::Object(root) = serde_json::from_str(deno_json).ok()? else {
+fn parse_npm_deps(manifest_json: &str) -> Option<BTreeMap<String, String>> {
+    let serde_json::Value::Object(root) = serde_json::from_str(manifest_json).ok()? else {
         return None;
     };
     let mut deps = BTreeMap::new();
@@ -1632,22 +1631,22 @@ fn parse_npm_deps(deno_json: &str) -> Option<BTreeMap<String, String>> {
     Some(deps)
 }
 
-/// Derive the npm dependencies a project's Node fallback needs from a `deno.json`
+/// Derive the npm dependencies a project's Node fallback needs from a `node.json`
 /// import map — the single source of truth (issue #437). Every `npm:`-mapped
 /// specifier the loader strips must exist in `node_modules`, so it must be a
 /// `package.json` dependency; non-`npm:` entries (relative/jsr/http) are skipped.
 /// A body that does not parse yields no deps.
-fn npm_deps_from_deno_json(deno_json: &str) -> BTreeMap<String, String> {
-    parse_npm_deps(deno_json).unwrap_or_default()
+fn npm_deps_from_manifest(manifest_json: &str) -> BTreeMap<String, String> {
+    parse_npm_deps(manifest_json).unwrap_or_default()
 }
 
-/// Read the npm deps a project requires from its on-disk `deno.json`/`deno.jsonc`,
+/// Read the npm deps a project requires from its on-disk `node.json`/`node.jsonc`,
 /// mirroring `node-loader.mjs`'s file lookup **exactly**: try each candidate in
 /// order and fall through to the next on a read **or parse** failure, stopping at
 /// the first that parses (even to an import-less map). Neither present/parseable
 /// → empty.
 fn required_npm_deps(dir: &Path) -> BTreeMap<String, String> {
-    for name in ["deno.json", "deno.jsonc"] {
+    for name in ["node.json", "node.jsonc"] {
         if let Ok(raw) = std::fs::read_to_string(dir.join(name))
             && let Some(deps) = parse_npm_deps(&raw)
         {
@@ -1658,7 +1657,7 @@ fn required_npm_deps(dir: &Path) -> BTreeMap<String, String> {
 }
 
 /// The Node-fallback safety net: ensure `dir/package.json` declares every npm
-/// dependency the project's `deno.json` import map requires, so `npm install`
+/// dependency the project's `node.json` import map requires, so `npm install`
 /// materialises them into `node_modules` and the Node loader can resolve the
 /// `npm:` specifiers it strips (issue #437). Additive and non-destructive:
 ///
@@ -1670,7 +1669,7 @@ fn required_npm_deps(dir: &Path) -> BTreeMap<String, String> {
 ///   maker-edited manifests are never reformatted.
 ///
 /// No-op when either file is absent/unparseable (Rust/Java packs have no
-/// `deno.json`; a pack may ship no `package.json`). Run on every project build
+/// `node.json`; a pack may ship no `package.json`). Run on every project build
 /// (via [`ensure_project_sdk`]) it heals projects scaffolded before this fix.
 fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
     let required = required_npm_deps(dir);
@@ -1735,7 +1734,7 @@ fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
 ///
 /// Empty when there is no `package.json`, it is unreadable or not valid JSON, it
 /// declares no `dependencies`, or every declared dep is already present and in
-/// range — so a healthy app, a Deno-fetched project, or a non-Node pack
+/// range — so a healthy app, an already-populated project, or a non-Node pack
 /// (Rust/Java: no `package.json` deps) is a no-op. A malformed `package.json`
 /// therefore skips the install attempt rather than aborting the run. Dependency
 /// keys that are not syntactically valid npm names are ignored (see
@@ -1944,9 +1943,10 @@ console.log("application running.");
 /// Shared bootstrap helpers, written into every project's lib/ and imported via
 /// `@lib/nano.ts`. Keeps entrypoints (main.ts) free of deploy/worker plumbing.
 const NANO_LIB_TS: &str = r#"// Shared bootstrap helpers for a Nano application. Imported via @lib/nano.ts.
+import { readdir, readFile } from "node:fs/promises";
 
 /// Base URL of the engine; honours NANOBPMN_BASE_URL, defaults to localhost.
-export const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+export const BASE_URL = (process.env.NANOBPMN_BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
 
 /// Deploys every BPMN process under resources/processes/ to the engine. Returns
 /// the number of resources deployed (0 if the folder is empty/missing).
@@ -1955,9 +1955,9 @@ export async function deployAllResources(): Promise<number> {
   const form = new FormData();
   let count = 0;
   try {
-    for await (const e of Deno.readDir(dir)) {
-      if (!e.isFile || !e.name.endsWith(".bpmn")) continue;
-      const xml = await Deno.readTextFile(`${dir}/${e.name}`);
+    for (const e of await readdir(dir, { withFileTypes: true })) {
+      if (!e.isFile() || !e.name.endsWith(".bpmn")) continue;
+      const xml = await readFile(`${dir}/${e.name}`, "utf8");
       form.append("resources", new Blob([xml], { type: "text/xml" }), e.name);
       count++;
     }
@@ -1983,8 +1983,8 @@ export type WorkerSelection = { exclude: string[] } | { include: string[] };
 export async function startWorkers(workers?: WorkerSelection): Promise<string[]> {
   let names: string[] = [];
   try {
-    for await (const e of Deno.readDir("workers")) {
-      if (e.isDirectory) names.push(e.name);
+    for (const e of await readdir("workers", { withFileTypes: true })) {
+      if (e.isDirectory()) names.push(e.name);
     }
   } catch {
     return []; // no workers folder yet
@@ -2000,8 +2000,8 @@ export async function startWorkers(workers?: WorkerSelection): Promise<string[]>
   const started: string[] = [];
   for (const name of names) {
     try {
-      Deno.env.set("NANOBPMN_BASE_URL", BASE_URL);
-      Deno.env.set("NANOBPMN_WORKER_NAME", name);
+      process.env.NANOBPMN_BASE_URL = BASE_URL;
+      process.env.NANOBPMN_WORKER_NAME = name;
       await import(`../workers/${name}/worker.ts`);
       console.log(`started worker: ${name}`);
       started.push(name);
@@ -2020,7 +2020,7 @@ export async function startWorkers(workers?: WorkerSelection): Promise<string[]>
 export async function startLlmWorkers(manifestPath = "./nano.app.json"): Promise<string[]> {
   let manifest;
   try {
-    manifest = JSON.parse(await Deno.readTextFile(manifestPath));
+    manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch {
     return []; // no manifest — nothing to start
   }
@@ -2039,11 +2039,11 @@ A Nano BPM application created with the RAD environment.\n\n\
 - `resources/processes/` — BPMN processes, deployed to the engine on run.\n\
 - `resources/decisions/` — DMN decisions (authoring/bundling; the engine does not execute DMN).\n\
 - `resources/forms/` — forms (authoring/bundling; the engine does not execute forms).\n\
-- `workers/<name>/` — Deno job workers.\n\
+- `workers/<name>/` — Node job workers.\n\
 - `lib/` — shared TS/JS, importable via `@lib/` (e.g. `lib/nano.ts` deploy/worker helpers).\n\
 - `main.ts` — entrypoint; calls `deployAllResources()` and `startWorkers()` from `@lib/nano.ts`.\n\n\
 ## Run\n\n\
-```sh\ndeno task start\n```\n"
+```sh\nnpm start\n```\n"
     )
 }
 
@@ -2219,7 +2219,7 @@ defineWorker({
 });
 "#;
 
-const WORKER_DENO_JSON: &str = r#"{
+const WORKER_NODE_JSON: &str = r#"{
   "imports": {
     "@nanobpm/worker": "../../{GEN}/workers.ts",
     "@nanobpm/messages": "../../{GEN}/messages.ts",
@@ -2240,18 +2240,18 @@ const WORKER_DENO_JSON: &str = r#"{
 // ---------------------------------------------------------------------------
 
 /// Import map for a code-first project: the real published SDK (resolved via
-/// `npm:` under Deno / `node_modules` under Node) plus a `start` task that runs
-/// the entrypoint (which deploys the workflows and hosts a Worker).
-const WORKFLOW_DENO_JSON: &str = r#"{
+/// `npm:` through the Node loader) plus a `start` task that runs the entrypoint
+/// (which deploys the workflows and hosts a Worker).
+const WORKFLOW_NODE_JSON: &str = r#"{
   "imports": {
     "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.3.0",
     "bpmn-auto-layout": "npm:bpmn-auto-layout@^2.0.0-alpha.2"
   },
   "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-env main.ts",
-    "start-instance": "deno run --allow-net --allow-read --allow-env scripts/start-instance.ts",
-    "approve": "deno run --allow-net --allow-read --allow-env scripts/approve.ts",
-    "job-types": "deno run --allow-net --allow-read --allow-env scripts/job-types.ts"
+    "start": "node --experimental-strip-types main.ts",
+    "start-instance": "node --experimental-strip-types scripts/start-instance.ts",
+    "approve": "node --experimental-strip-types scripts/approve.ts",
+    "job-types": "node --experimental-strip-types scripts/job-types.ts"
   }
 }
 "#;
@@ -2285,10 +2285,10 @@ fn workflow_package_json(name: &str) -> String {
   "type": "module",
   "main": "main.ts",
   "scripts": {{
-    "start": "deno task start",
-    "start-instance": "deno task start-instance",
-    "approve": "deno task approve",
-    "job-types": "deno task job-types"
+    "start": "node --experimental-strip-types main.ts",
+    "start-instance": "node --experimental-strip-types scripts/start-instance.ts",
+    "approve": "node --experimental-strip-types scripts/approve.ts",
+    "job-types": "node --experimental-strip-types scripts/job-types.ts"
   }},
   "dependencies": {{
     "@nanobpm/workflow": "^0.3.0"
@@ -2397,12 +2397,12 @@ const WORKFLOW_MAIN_TS: &str = r#"// Code-first durable workflows on Nano (ADR 0
 // model, the job types, and hosts a generic Worker.
 //
 // This is the whole application: it deploys the workflows and hosts their
-// workers in-process, then runs forever. Run it standalone (`deno task start`)
+// workers in-process, then runs forever. Run it standalone (`npm start`)
 // or with the console/IDE "Run" button — same artifact, same entrypoint.
 import { WorkflowClient, Worker } from "@nanobpm/workflow";
 import { prReview } from "./workflows/pr-review.ts";
 
-const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const baseUrl = (process.env.NANOBPMN_BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
 const workflows = [prReview];
 
 // 1) Deploy the derived BPMN for each workflow (idempotent — safe to redeploy).
@@ -2429,16 +2429,14 @@ const drainAndExit = async () => {
   shuttingDown = true;
   console.log("\nshutting down…");
   await worker.stop();
-  Deno.exit(0);
+  process.exit(0);
 };
-// Deno.addSignalListener expects a synchronous handler (() => void), so wrap
-// the async drain logic in a sync closure rather than passing it directly.
 const shutdown = (): void => {
   void drainAndExit();
 };
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   try {
-    Deno.addSignalListener(sig, shutdown);
+    process.on(sig, shutdown);
   } catch {
     // Signal not supported on this OS (e.g. SIGTERM on Windows) — skip it.
   }
@@ -2448,16 +2446,16 @@ await new Promise<void>(() => {}); // keep the process alive until a signal fire
 
 /// Example script that kicks off a single workflow instance against the running
 /// app/gateway. Kept OUT of `main.ts` so the app is a pure long-running service:
-/// start the host with `deno task start`, then run this to create work.
+/// start the host with `npm start`, then run this to create work.
 const WORKFLOW_START_INSTANCE_TS: &str = r#"// Kick off one `pr-review` instance against the running app/gateway.
 //
-//   deno task start                 # in one shell: the worker-host service
-//   deno task start-instance PR-42  # in another: create an instance
+//   npm start                 # in one shell: the worker-host service
+//   npm run start-instance -- PR-42  # in another: create an instance
 import { WorkflowClient } from "@nanobpm/workflow";
 import { prReview } from "../workflows/pr-review.ts";
 
-const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
-const prId = Deno.args[0] ?? "PR-1234";
+const baseUrl = (process.env.NANOBPMN_BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
+const prId = process.argv[2] ?? "PR-1234";
 
 const client = new WorkflowClient({ baseUrl });
 const { processInstanceKey } = await client.start(prReview, { prId });
@@ -2470,9 +2468,9 @@ console.log(`started ${prReview.id} instance ${processInstanceKey} (prId=${prId}
 const WORKFLOW_APPROVE_TS: &str = r#"// Approve a parked `pr-review` instance: correlate the `humanApproval` signal on
 // its prId so the flow proceeds from the durable wait to `merge`.
 //
-//   deno task start                 # the worker-host service
-//   deno task start-instance PR-42  # create an instance (parks on `review`, then humanApproval)
-//   deno task approve PR-42         # resume it past the human-in-the-loop wait
+//   npm start                        # the worker-host service
+//   npm run start-instance -- PR-42  # create an instance (parks on `review`, then humanApproval)
+//   npm run approve -- PR-42         # resume it past the human-in-the-loop wait
 //
 // Note: the instance first parks on the external `review` w.task until a harness
 // services `pr-review:review`; only then does it reach the humanApproval wait
@@ -2480,8 +2478,8 @@ const WORKFLOW_APPROVE_TS: &str = r#"// Approve a parked `pr-review` instance: c
 import { WorkflowClient } from "@nanobpm/workflow";
 import { prReview } from "../workflows/pr-review.ts";
 
-const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
-const prId = Deno.args[0] ?? "PR-1234";
+const baseUrl = (process.env.NANOBPMN_BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
+const prId = process.argv[2] ?? "PR-1234";
 
 const client = new WorkflowClient({ baseUrl });
 try {
@@ -2494,9 +2492,9 @@ try {
   console.error(
     `could not approve ${prReview.id} (prId=${prId}): ${err instanceof Error ? err.message : err}\n` +
       "Is the instance still parked on `review`? Host a worker for `pr-review:review` " +
-      "(deno task job-types) so it advances to the humanApproval wait, then retry.",
+      "(npm run job-types) so it advances to the humanApproval wait, then retry.",
   );
-  Deno.exit(1);
+  process.exit(1);
 }
 "#;
 
@@ -2506,7 +2504,7 @@ try {
 /// the code, never hand-copied (a mismatch would silently park instances).
 const WORKFLOW_JOB_TYPES_TS: &str = r#"// Print the EXTERNAL job types this app expects a harness to service.
 //
-//   deno task job-types            # -> pr-review:review
+//   npm run job-types              # -> pr-review:review
 //
 // Point a coding-agent harness at exactly these (see README): until one is
 // hosted, instances park on the `review` step. No gateway needed — this only
@@ -2518,7 +2516,7 @@ const types = externalJobTypes(prReview);
 if (types.length === 0) {
   console.log("no external (w.task) steps — every step is hosted in-process");
 } else {
-  // One bare job type per line, so `deno task job-types` output is exactly what
+  // One bare job type per line, so `npm run job-types` output is exactly what
   // the README tells you to hire against (copy/paste straight into a harness).
   for (const t of types) console.log(t);
 }
@@ -2541,7 +2539,7 @@ artifact whether you run it from a shell or with the console/IDE **Run** button.
 ## Run
 
 ```sh
-deno task start          # or: npm install && npm start
+npm install && npm start
 ```
 
 That starts the long-running worker-host service (Ctrl-C to stop). Point it at a
@@ -2551,7 +2549,7 @@ To drive an instance through the flow, in another shell (the host must be
 running):
 
 ```sh
-deno task start-instance PR-42     # kicks off one pr-review instance
+npm run start-instance -- PR-42    # kicks off one pr-review instance
 ```
 
 The instance first parks on the **`review`** step — an external `w.task` (see
@@ -2560,7 +2558,7 @@ job. Only then does it advance to the human-in-the-loop wait, which you resume
 with:
 
 ```sh
-deno task approve PR-42            # resume it past the human-in-the-loop wait
+npm run approve -- PR-42           # resume it past the human-in-the-loop wait
 ```
 
 > If nothing seems to happen after `start-instance`, that's expected: the
@@ -2581,7 +2579,7 @@ pr-review:review
 Confirm it straight from the code (never hand-copy it):
 
 ```sh
-deno task job-types      # -> pr-review:review
+npm run job-types        # -> pr-review:review
 ```
 
 > **This starter does not run end-to-end on its own — by design.** A fresh
@@ -2600,7 +2598,7 @@ c8ctl nano work <name>   # host it — it services the job type pr-review:review
 
 Once a worker completes the `review` job (returning the `PrReviewOut` envelope —
 `verdict` + `notes`), the instance advances to the `humanApproval` wait, and
-`deno task approve` carries it to `merge`.
+`npm run approve` carries it to `merge`.
 
 ## Author
 
@@ -2802,7 +2800,7 @@ setTimeout(async () => {
   console.log(`\n=== peak ${peak} instances/sec (single-task, fire-and-forget) ===`);
   console.log(`=== ${created} instances created in 30s, ~${Math.round(created / 30)}/s average ===`);
   console.log(`=== peak engine memory ${peakMem.toFixed(0)}MB ===`);
-  Deno.exit(0);
+  process.exit(0);
 }, DURATION_MS);
 "#;
 
@@ -2831,7 +2829,7 @@ Pair this with **Throughput (falcon)** (same benchmark via \
 REST wins raw throughput (pooled HTTP connections parallelise well); the \
 Falcon protocol uses ~4x less engine memory. Run each on a fresh engine \
 (`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
-> **Note:** in JavaScript/Deno there is no falcon *throughput* win — \
+> **Note:** in JavaScript there is no falcon *throughput* win — \
 even across two processes (separate producer + worker) the SDK awaits one \
 create at a time over a single socket (~2–3k/s) while pooled REST fans out \
 across many connections (~20k/s). The stream's only JS benefit is ~4x lower \
@@ -2846,16 +2844,16 @@ or, equivalently:\n\n\
         .into()
 }
 
-/// Stream variant deno.json: pulls the Nano SDK (drop-in C8 client) which
+/// Stream variant node.json: pulls the Nano SDK (drop-in C8 client) which
 /// auto-upgrades to the Falcon protocol against a Nano server.
-const DEMO_STREAM_DENO_JSON: &str = r#"{
+const DEMO_STREAM_NODE_JSON: &str = r#"{
   "imports": {
     "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1",
     "@nanobpm/llm": "./{GEN}/llm-worker.ts",
     "@lib/": "./lib/"
   },
   "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-sys main.ts"
+    "start": "node --experimental-strip-types main.ts"
   }
 }
 "#;
@@ -2871,7 +2869,7 @@ const DEMO_STREAM_MAIN_TS: &str = r#"// Throughput (falcon) — same benchmark, 
 import { createCamundaClient } from "@nanobpm/nano-sdk";
 import { deployAllResources } from "@lib/nano.ts";
 
-const BASE_URL = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const BASE_URL = (process.env.NANOBPMN_BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
 const PROCESS_ID = "throughput-demo";
 const DURATION_MS = 30_000;
 const RAMP_EVERY_MS = 2_000;
@@ -2937,7 +2935,7 @@ setTimeout(() => {
   console.log(`=== ${created} instances created in 30s, ~${Math.round(created / 30)}/s average ===`);
   console.log(`=== peak engine memory ${peakMem.toFixed(0)}MB ===`);
   client.stopAllWorkers?.();
-  Deno.exit(0);
+  process.exit(0);
 }, DURATION_MS);
 "#;
 
@@ -2962,7 +2960,7 @@ On a clean engine (30s ramp, fire-and-forget):\n\n\
 The Falcon protocol trades raw throughput for ~4x lower engine memory; REST \
 parallelises better over pooled HTTP connections. Run each on a fresh engine \
 (`c8ctl nano stop --purge` between runs) for a fair comparison.\n\n\
-> **Note:** in JavaScript/Deno the stream does *not* win on throughput — even \
+> **Note:** in JavaScript the stream does *not* win on throughput — even \
 splitting producer and worker into two processes, the SDK awaits one create \
 at a time over a single socket (~2–3k/s) vs pooled REST (~20k/s). Pick the \
 stream here for low engine memory, not speed; its throughput edge needs a \
@@ -2973,32 +2971,41 @@ pipelining native producer (Rust beats REST ~32k vs ~20k).\n\n\
 }
 
 // ---------------------------------------------------------------------------
-// GUI app template (app pack: deno-gui) — served-UI binary
+// GUI app template (app pack: node-gui) — served-UI app
 // ---------------------------------------------------------------------------
 
-const GUI_DENO_JSON: &str = r#"{
+const GUI_NODE_JSON: &str = r#"{
   "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/llm": "./{GEN}/llm-worker.ts", "@lib/": "./lib/" },
-  "tasks": { "start": "deno run --allow-net --allow-read --allow-env main.ts" }
+  "tasks": { "start": "node --experimental-strip-types main.ts" }
 }
 "#;
 
-const GUI_MAIN_TS: &str = r#"// GUI app — a self-contained binary serving a UI for your process application.
-// deno compile bundles this + ./public into one binary (deno compile --include public).
+const GUI_MAIN_TS: &str = r#"// GUI app — a self-contained Node service serving a UI for your process
+// application, alongside its deployed processes and workers.
+import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
 import { deployAllResources } from "@lib/nano.ts";
-const BASE = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
-const PORT = Number(Deno.env.get("PORT") ?? 8090);
+const BASE = (process.env.NANOBPMN_BASE_URL ?? "http://localhost:8080").replace(/\/+$/, "");
+const PORT = Number(process.env.PORT ?? 8090);
 await deployAllResources();
-Deno.serve({ port: PORT }, async (req) => {
-  const url = new URL(req.url);
+createServer(async (req, res) => {
+  const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
   if (url.pathname === "/api/start") {
     const r = await fetch(`${BASE}/v2/process-instances`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ processDefinitionId: "starter", awaitCompletion: false }) });
-    return new Response(await r.text(), { headers: { "content-type": "application/json" } });
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(await r.text());
+    return;
   }
   const path = url.pathname === "/" ? "/index.html" : url.pathname;
-  try { return new Response(await Deno.readTextFile(`./public${path}`), { headers: { "content-type": path.endsWith(".html") ? "text/html" : "text/plain" } }); }
-  catch { return new Response("not found", { status: 404 }); }
-});
-console.log(`GUI app serving on :${PORT}`);
+  try {
+    const body = await readFile(`./public${path}`, "utf8");
+    res.writeHead(200, { "content-type": path.endsWith(".html") ? "text/html" : "text/plain" });
+    res.end(body);
+  } catch {
+    res.writeHead(404, { "content-type": "text/plain" });
+    res.end("not found");
+  }
+}).listen(PORT, () => console.log(`GUI app serving on :${PORT}`));
 "#;
 
 const GUI_INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Nano GUI App</title>
@@ -3011,25 +3018,24 @@ const GUI_INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"
 fn gui_readme(name: &str) -> String {
     format!(
         "# {name} (GUI app)\n\n\
-A served-UI process application. `main.ts` runs `Deno.serve`, deploys processes \
-and serves `public/`. Press **Run**, open the port, or **Compile** to a binary \
-(`deno compile --include public`). Future: one-click *Embed Nano* (ADR 0005) \
-for a self-contained engine+UI binary.\n"
+A served-UI process application. `main.ts` runs a Node HTTP server, deploys \
+processes and serves `public/`. Press **Run** and open the served port. Future: \
+one-click *Embed Nano* (ADR 0005) for a self-contained engine+UI binary.\n"
     )
 }
 
 // ── Urban App template (ADR 0022/0026/0027) ───────────────────────────────
-// An Urban App is a Deno/TypeScript RAD application: a `nano.app.json` manifest
+// An Urban App is a Node/TypeScript RAD application: a `nano.app.json` manifest
 // (the source of truth, ADR 0027) declares its models, datasources, triggers
-// and surfaces; a Deno binary serves the generated UI and boots the App. The
+// and surfaces; a Node process serves the generated UI and boots the App. The
 // scaffold lays down the manifest + the resource dirs the Console's model
 // editors read from (`resources/processes|decisions|forms`) + `db/migrations`
 // for the sqlite datasource + `pages/` for the composed screens (ADR 0042).
 
-const URBAN_DENO_JSON: &str = r#"{
+const URBAN_NODE_JSON: &str = r#"{
   "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/worker": "./{GEN}/workers.ts", "@nanobpm/messages": "./{GEN}/messages.ts", "@nanobpm/meta": "./{GEN}/meta.ts", "@nanobpm/llm": "./{GEN}/llm-worker.ts", "@nanobpm/data": "./{GEN}/data-sdk.ts", "@nanobpm/domain": "./{GEN}/domain.ts", "@nanobpm/app": "./{GEN}/app-pages.ts", "@lib/": "./lib/" },
   "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-write --allow-env main.ts"
+    "start": "node --experimental-strip-types main.ts"
   }
 }
 "#;
@@ -3039,8 +3045,7 @@ const URBAN_DENO_JSON: &str = r#"{
 // serves the app's composed screen (`pages/home.page.json`) via the generic
 // `@nanobpm/app` runtime (ADR 0042) — no hand-written frontend or JSON API.
 const URBAN_MAIN_TS: &str = r#"// Urban App entrypoint. The `nano.app.json` manifest is the source of truth for
-// this application (models, datasources, triggers, surfaces). `deno compile
-// --include nano.app.json --include pages` bundles it into a single binary.
+// this application (models, datasources, triggers, surfaces).
 //
 // The UI is a composed screen: `pages/home.page.json` is authored in the Console
 // Page Composer (ADR 0042) and served by the generic `@nanobpm/app` runtime — no
@@ -3051,7 +3056,7 @@ import { servePages } from "@nanobpm/app";
 import { openDataSource } from "@nanobpm/data";
 import { createCamundaClient } from "@nanobpm/nano-sdk";
 
-const PORT = Number(Deno.env.get("PORT") ?? 8090);
+const PORT = Number(process.env.PORT ?? 8090);
 
 await deployAllResources();
 await startWorkers();
@@ -3156,8 +3161,7 @@ A Nano RAD application (ADR 0022). `nano.app.json` is the source of truth: it \
 declares the app's **models** (`resources/processes|decisions|forms`), \
 **data** (a sqlite datasource with migrations under `db/`), **triggers** and \
 **surfaces**, and compose its **screen** (`pages/home.page.json`) in the Console \
-Page Composer. Then **Run** the Deno binary or **Compile** it \
-(`deno compile --include nano.app.json --include pages`).\n\n\
+Page Composer. Then **Run** it with the Console's Run button.\n\n\
 ## Screen\n\n\
 `pages/home.page.json` is the app's composed UI (ADR 0042) — a titled, ordered \
 list of controls (`text`, `actionForm`, `dataGrid`). The `@nanobpm/app` runtime \
@@ -3302,7 +3306,6 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     }
     std::fs::write(nano.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(nano.join("node-register.mjs"), NODE_REGISTER_MJS)?;
-    std::fs::write(nano.join("node-deno-shim.mjs"), NODE_DENO_SHIM_MJS)?;
     std::fs::write(nano.join("llm-worker.ts"), LLM_WORKER_TS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)?;
     // Seed the standard-tooling config (VS Code / `tsc`) and the Node-first
@@ -3320,7 +3323,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
             project_package_json(name, &required_npm_deps(&dir)),
         )?;
     }
-    // Heal projects scaffolded before deps were derived from `deno.json`: add any
+    // Heal projects scaffolded before deps were derived from `node.json`: add any
     // `npm:` import-map dependency missing from `package.json` so `npm install`
     // materialises it and the Node fallback loader resolves the stripped `npm:`
     // specifier (issue #437). Additive + no-op when already covered — this runs
@@ -3334,8 +3337,8 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
 pub enum DataError {
     /// The project name doesn't resolve to a directory.
     NoProject,
-    /// No JavaScript runtime (Node >= 22.6 or Deno) is available to host the
-    /// datasource seam.
+    /// No JavaScript runtime (Node >= 22.6) is available to host the datasource
+    /// seam.
     NoRuntime,
     /// The subprocess failed to spawn or produced unparseable output.
     Gateway(String),
@@ -3349,7 +3352,7 @@ pub enum DataError {
 /// `@nanobpm/urban` toolkit understands (`urban gen` reads `nano.app.json` + the
 /// `models.processes` globs), so it is the gate for delegating code generation
 /// out-of-process instead of running the console's embedded emitters (#514
-/// dry-out). A legacy `nanobpm.project.json`/`deno.json` project is *not*
+/// dry-out). A legacy `nanobpm.project.json`/`node.json` project is *not*
 /// Urban-shaped and keeps the embedded path.
 pub fn is_urban_app(name: &str) -> bool {
     project_dir(name).is_some_and(|d| d.join("nano.app.json").is_file())
@@ -3527,8 +3530,8 @@ async fn urban_gen_is_fresh(urban: &Path, dir: &Path) -> bool {
 ///
 /// 1. **Deps** — materialise any declared dependency missing from `node_modules`
 ///    (or out of its declared range), *regardless of the eventual spawn runtime*.
-///    Unlike the legacy non-Urban lazy install (Node arm only), this fires on the
-///    Deno arm too, because `urban` itself resolves from the app's own
+///    Unlike the legacy non-Urban lazy install, this fires for an Urban app too,
+///    because `urban` itself resolves from the app's own
 ///    `node_modules/.bin/urban` (#776) — without deps there is no toolkit to gen
 ///    with.
 /// 2. **Gen** — probe the derived facade with `urban gen --check` and, when it is
@@ -3798,7 +3801,7 @@ async fn pipe_data_gateway(
 /// gateway — the host never materialises or spawns the vendored
 /// `nano-generated/data-cli.ts` for it, and persisting derivation stays with
 /// `urban gen` (the one deriver). A **legacy** project keeps the embedded
-/// `data-cli.ts` under Deno (or the Node >= 22.6 fallback, ADR 0036/0037; ADR
+/// `data-cli.ts` under Node >= 22.6 (ADR 0065/0037; ADR
 /// 0024 §4). Either way the panel's every read/write goes through this one seam
 /// so it targets whatever the named datasource resolves to — never a parallel
 /// SQLite-only path. `request` is the gateway's JSON protocol object
@@ -3923,53 +3926,21 @@ pub async fn run_data_op(
 
     // Embedded `data-cli.ts` (legacy-shaped project, or transitional Urban
     // fallback while the pack's toolkit is unresolved).
-    // The gateway runs the data CLI Node-first: Node (>= 22.6) is always present
-    // (the npm launcher is Node), so it is the primary path; Deno is an equal
-    // alternative. Both the CLI and the `@nanobpm/data` SDK carry the runtime
-    // shim, so the Data panel works with only Node installed. See ADR 0038/0036.
-    enum CliRuntime {
-        Deno(std::path::PathBuf),
-        Node(std::path::PathBuf),
-    }
-    let runtime = if let Some(n) = workers::usable_node() {
-        CliRuntime::Node(n)
-    } else if let Some(d) = workers::find_deno() {
-        CliRuntime::Deno(d)
-    } else {
-        return Err(DataError::NoRuntime);
-    };
+    // Node (>= 22.6) is the sole JS/TS runtime (ADR 0065), so it is the only way
+    // the gateway runs the data CLI. The Node path strips TS types + registers
+    // the import-map loader (materialised in nano-generated/ by
+    // ensure_project_sdk) so the CLI's `./data-sdk.ts` and `node:sqlite`
+    // specifiers resolve. Node has no capability sandbox; the gateway only
+    // touches the project dir.
+    let node = workers::usable_node().ok_or(DataError::NoRuntime)?;
     ensure_project_sdk(project).map_err(|e| DataError::Gateway(format!("materialise SDK: {e}")))?;
-
-    let cache = dir.join(".deno-cache");
-    let _ = std::fs::create_dir_all(&cache);
     let cli = dir.join(GEN_DIR).join("data-cli.ts");
 
-    let cmd = match &runtime {
-        CliRuntime::Deno(deno) => {
-            let mut c = Command::new(deno);
-            c.current_dir(&dir)
-                .arg("run")
-                .arg("--no-prompt")
-                .arg(format!("--allow-read={}", dir.display()))
-                .arg(format!("--allow-write={}", dir.display()))
-                .arg("--allow-env")
-                .arg(&cli)
-                .env("DENO_DIR", &cache);
-            c
-        }
-        CliRuntime::Node(node) => {
-            // Node fallback: strip TS types + register the import-map loader
-            // (materialised in nano-generated/ by ensure_project_sdk) so the CLI's
-            // `./data-sdk.ts` and `node:sqlite` specifiers resolve. Node has no
-            // capability sandbox; the gateway only touches the project dir.
-            let mut c = Command::new(node);
-            c.current_dir(&dir);
-            node_fallback_command(&mut c, &dir.join(GEN_DIR).join("node-register.mjs"));
-            c.arg(&cli);
-            c
-        }
-    };
-    pipe_data_gateway(cmd, &request).await
+    let mut c = Command::new(node);
+    c.current_dir(&dir);
+    node_fallback_command(&mut c, &dir.join(GEN_DIR).join("node-register.mjs"));
+    c.arg(&cli);
+    pipe_data_gateway(c, &request).await
 }
 
 /// Case-insensitive project-name collision guard, the server-side half of the
@@ -4076,9 +4047,9 @@ pub fn create_project_with_options(
 
     // ── Pack template short-circuit ───────────────────────────────────────
     // If `template` names an installed pack template (or an example pack's
-    // own id), stamp out ONLY that pack's contents. The Deno-flavoured
-    // built-in files below would otherwise leak into a Java/Rust/etc.
-    // project — the caller ended up with a Deno starter with pack files
+    // own id), stamp out ONLY that pack's contents. The Node built-in files
+    // below would otherwise leak into a Java/Rust/etc. project — the caller
+    // ended up with a Node starter with pack files
     // sprinkled on top, and any BPMN the pack shipped got shadowed by
     // resources/processes/*.bpmn from the built-in fallthrough.
     let is_builtin_template = matches!(
@@ -4097,7 +4068,7 @@ pub fn create_project_with_options(
         // an explicit per-template `lang` in the manifest wins; otherwise a LANG
         // pack's own template implies the pack itself, and app/example packs
         // name their language via `requires` (first entry = the lang pack id).
-        // Only with none of those do we fall back to the built-in Deno runtime.
+        // Only with none of those do we fall back to the built-in Node runtime.
         let spec_lang = m
             .templates
             .iter()
@@ -4108,10 +4079,7 @@ pub fn create_project_with_options(
             if m.kind == super::extensions::ExtKind::Lang {
                 m.id.clone()
             } else {
-                m.requires
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "deno".to_string())
+                m.requires.first().cloned().unwrap_or_else(default_lang)
             }
         });
         // Best-effort detection of the "main" entrypoint the console
@@ -4166,7 +4134,7 @@ pub fn create_project_with_options(
         let w = |p: PathBuf, body: &str| {
             std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"))
         };
-        w(dir.join("deno.json"), WORKFLOW_DENO_JSON)?;
+        w(dir.join("node.json"), WORKFLOW_NODE_JSON)?;
         w(dir.join("tsconfig.json"), WORKFLOW_TSCONFIG_JSON)?;
         w(dir.join("package.json"), &workflow_package_json(name))?;
         w(dir.join("main.ts"), WORKFLOW_MAIN_TS)?;
@@ -4186,7 +4154,7 @@ pub fn create_project_with_options(
         w(dir.join("README.md"), &workflow_readme(&display))?;
         let mut cfg = ProjectConfig::new(name, description);
         cfg.display_name = display_name.clone();
-        cfg.lang = "deno".to_string();
+        cfg.lang = default_lang();
         cfg.app = "console".to_string();
         cfg.main = "main.ts".to_string();
         cfg.template = Some("workflow-starter".to_string());
@@ -4195,7 +4163,7 @@ pub fn create_project_with_options(
         return Ok(cfg);
     }
 
-    // ── Built-in (Deno-flavoured) scaffolds ───────────────────────────────
+    // ── Built-in (Node) scaffolds ────────────────────────────────────────
     mk(dir.join("resources").join("processes"))?;
     mk(dir.join("resources").join("decisions"))?;
     mk(dir.join("resources").join("forms"))?;
@@ -4204,7 +4172,7 @@ pub fn create_project_with_options(
 
     let w =
         |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
-    w(dir.join("deno.json"), &gendir(PROJECT_DENO_JSON))?;
+    w(dir.join("node.json"), &gendir(PROJECT_NODE_JSON))?;
     w(dir.join("tsconfig.json"), &gendir(PROJECT_TSCONFIG_JSON))?;
     w(dir.join(GEN_DIR).join("data-sdk.ts"), DATA_SDK_TS)?;
     w(dir.join(GEN_DIR).join("app-pages.ts"), APP_PAGES_TS)?;
@@ -4221,17 +4189,13 @@ pub fn create_project_with_options(
         dir.join(GEN_DIR).join("node-register.mjs"),
         NODE_REGISTER_MJS,
     )?;
-    w(
-        dir.join(GEN_DIR).join("node-deno-shim.mjs"),
-        NODE_DENO_SHIM_MJS,
-    )?;
     w(dir.join(GEN_DIR).join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join(GEN_DIR).join("llm-worker.ts"), LLM_WORKER_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
-    // All remaining built-in scaffolds are Deno-flavoured (Rust/Java are
-    // pack-provided), so lang/main are fixed; only `gui-starter` varies `app`.
-    let cfg_lang = "deno".to_string();
+    // All remaining built-in scaffolds are Node (Rust/Java are pack-provided),
+    // so lang/main are fixed; only `gui-starter` varies `app`.
+    let cfg_lang = default_lang();
     let mut cfg_app = "console";
     let cfg_main = "main.ts".to_string();
 
@@ -4247,9 +4211,9 @@ pub fn create_project_with_options(
             DEMO_PROCESS_BPMN,
         )?;
         w(worker.join("worker.ts"), DEMO_WORKER_TS)?;
-        w(worker.join("deno.json"), &gendir(WORKER_DENO_JSON))?;
+        w(worker.join("node.json"), &gendir(WORKER_NODE_JSON))?;
     } else if template == "throughput-stream" {
-        w(dir.join("deno.json"), &gendir(DEMO_STREAM_DENO_JSON))?;
+        w(dir.join("node.json"), &gendir(DEMO_STREAM_NODE_JSON))?;
         w(dir.join("main.ts"), DEMO_STREAM_MAIN_TS)?;
         w(dir.join("README.md"), &demo_stream_readme())?;
         w(
@@ -4260,7 +4224,7 @@ pub fn create_project_with_options(
         )?;
     } else if template == "gui-starter" {
         mk(dir.join("public"))?;
-        w(dir.join("deno.json"), &gendir(GUI_DENO_JSON))?;
+        w(dir.join("node.json"), &gendir(GUI_NODE_JSON))?;
         w(dir.join("main.ts"), GUI_MAIN_TS)?;
         w(dir.join("public").join("index.html"), GUI_INDEX_HTML)?;
         w(dir.join("README.md"), &gui_readme(&display))?;
@@ -4270,12 +4234,12 @@ pub fn create_project_with_options(
                 .join(format!("{name}.bpmn")),
             &starter_process(name),
         )?;
-        cfg_app = "deno-gui";
+        cfg_app = "node-gui";
     } else if template == "urban-starter" {
         mk(dir.join("pages"))?;
         mk(dir.join("db").join("migrations"))?;
         let app_id = slugify_app_id(name);
-        w(dir.join("deno.json"), &gendir(URBAN_DENO_JSON))?;
+        w(dir.join("node.json"), &gendir(URBAN_NODE_JSON))?;
         w(dir.join("main.ts"), URBAN_MAIN_TS)?;
         w(
             dir.join("nano.app.json"),
@@ -4314,21 +4278,21 @@ pub fn create_project_with_options(
             &starter_process(name),
         )?;
         w(starter_worker.join("worker.ts"), STARTER_WORKER_TS)?;
-        w(starter_worker.join("deno.json"), &gendir(WORKER_DENO_JSON))?;
+        w(starter_worker.join("node.json"), &gendir(WORKER_NODE_JSON))?;
     }
 
-    // Derive the Node manifest's npm deps from the project's *final* `deno.json`
-    // — the SDK templates in the branch above overwrite `deno.json`, so read it
+    // Derive the Node manifest's npm deps from the project's *final* `node.json`
+    // — the SDK templates in the branch above overwrite `node.json`, so read it
     // back as the single source of truth (issue #437) rather than hand-mirroring.
     // Every `npm:` specifier the Node loader strips is declared here so
-    // `npm install` can materialise it into `node_modules`. `deno.json` was just
+    // `npm install` can materialise it into `node_modules`. `node.json` was just
     // written above, so a read failure is unexpected — surface it rather than
     // silently emit a depless manifest (which would reintroduce the crash).
-    let deno_json = std::fs::read_to_string(dir.join("deno.json"))
-        .map_err(|e| format!("read deno.json: {e}"))?;
+    let manifest_json = std::fs::read_to_string(dir.join("node.json"))
+        .map_err(|e| format!("read node.json: {e}"))?;
     w(
         dir.join("package.json"),
-        &project_package_json(name, &npm_deps_from_deno_json(&deno_json)),
+        &project_package_json(name, &npm_deps_from_manifest(&manifest_json)),
     )?;
 
     let mut cfg = ProjectConfig::new(name, description);
@@ -4488,7 +4452,7 @@ pub struct ProjectSummary {
     /// Where the project lives: `"workspace"` (a directory under the projects
     /// root) or `"path"` (an external directory imported by reference, ADR 0041).
     pub source: String,
-    /// Language pack id (from the project config; default "deno"). The Console
+    /// Language pack id (from the project config; default "node"). The Console
     /// resolves the card's language icon by matching this to a lang Extension.
     pub lang: String,
     /// Scaffold template id, when recorded. Absent on projects created before
@@ -4646,7 +4610,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
                 workers: 0,
                 running: false,
                 source: "path".to_string(),
-                lang: "deno".to_string(),
+                lang: default_lang(),
                 template: None,
                 scaffolded_from: None,
                 update_available: false,
@@ -5646,7 +5610,7 @@ fn collect_files(dir: &Path, prefix: &str, include_dist: bool, out: &mut Vec<(St
     };
     for entry in rd.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == ".deno-cache" || name == "node_modules" {
+        if name == "node_modules" {
             continue;
         }
         if name == "dist" && !include_dist {
@@ -5704,7 +5668,7 @@ struct GenerateResult {
 }
 
 /// Resolve a derivation-capable `urban` binary for `name`, or `None` to fall back
-/// to the embedded Deno driver. All three conditions must hold: the project is
+/// to the embedded Node driver. All three conditions must hold: the project is
 /// Urban-shaped (`nano.app.json`), a binary resolves, and it supports the
 /// `derive` surface (nano-ide#92). Gating on all three keeps the delegation
 /// **additive + non-regressing** (issue #522): a legacy project, a missing
@@ -5727,7 +5691,7 @@ async fn urban_derive_capable(name: &str) -> Option<PathBuf> {
 }
 
 /// Derive a project's executable BPMN models by spawning `urban derive --stdout`
-/// (nano-ide#92), returning the same [`GenerateResult`] the embedded Deno driver
+/// (nano-ide#92), returning the same [`GenerateResult`] the embedded Node driver
 /// produces — the contract JSON `{"models":[{"id","kind","xml"}],"incomplete"}`
 /// (frozen on #522) maps byte-for-byte onto it, so no downstream code cares which
 /// deriver ran. `--stdout` is non-writing: the console remains the single writer
@@ -5752,7 +5716,7 @@ async fn derive_via_urban(dir: &Path, urban: &Path) -> Result<GenerateResult, St
     // failed to derive) yet still prints the well-formed `{models,incomplete}`
     // body — and `incomplete` is a first-class, non-fatal signal here (it makes
     // `finalize_generated_models` write the partial models but SKIP the stale
-    // sweep), exactly as it is for the embedded Deno driver. So a parseable body
+    // sweep), exactly as it is for the embedded Node driver. So a parseable body
     // is authoritative; only a missing/garbage body is a hard error. Take the
     // last `{`-prefixed stdout line so a leading diagnostic can't corrupt the
     // parse.
@@ -5793,7 +5757,7 @@ async fn derive_via_urban(dir: &Path, urban: &Path) -> Result<GenerateResult, St
 /// unique temporary driver filename (see the collision note there).
 static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Deno driver that imports a code-first project's `workflows/*.ts`, filters the
+/// Node driver that imports a code-first project's `workflows/*.ts`, filters the
 /// exported values that are `@nanobpm/workflow` Workflows (structural check: an
 /// object with a string `id` and `kind` in {imperative, declarative}), runs each
 /// through the SDK's `toBpmn` and then `layoutBpmn` (adding a `bpmndi:` diagram,
@@ -5805,17 +5769,18 @@ static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// `toBpmn`/`layoutBpmn` (published `@nanobpm/workflow@^0.3.0`). Only
 /// `workflows/*.ts` are imported — never `main.ts`, whose top-level `deploy()`
 /// would hit the network.
-const DERIVE_MODELS_DRIVER: &str = r#"import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
+const DERIVE_MODELS_DRIVER: &str = r#"import { readdir } from "node:fs/promises";
+import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
 import { layoutProcess } from "bpmn-auto-layout";
 
-const root = Deno.args[0] ?? ".";
+const root = process.argv[2] ?? ".";
 const wfDir = `${root}/workflows`;
 const out: Array<{ id: string; kind: string; xml: string }> = [];
 const seen = new Set<string>();
 
 // Add a `bpmndi:` diagram to a DI-less BPMN string. The SDK's `layoutBpmn`
 // dynamically `import("bpmn-auto-layout")`s the optional peer from WITHIN its own
-// package scope, which the sandbox's `--import-map` does not reach — so under the
+// package scope, which the loader's `NANOBPMN_IMPORT_MAP` does not reach into — so under the
 // console it fails with "requires the optional peer dependency". Importing
 // `layoutProcess` here, in the DRIVER's own module graph, DOES resolve via the
 // map, so we lay out directly and only fall back to the SDK. Returns null if
@@ -5845,8 +5810,8 @@ function isWorkflow(v: unknown): v is { id: string; kind: string } {
 }
 
 try {
-  for await (const entry of Deno.readDir(wfDir)) {
-    if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
+  for (const entry of await readdir(wfDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
     let mod: Record<string, unknown>;
     try {
       // Encode the path so a project dir / filename with spaces or other
@@ -5877,7 +5842,7 @@ try {
     }
   }
 } catch (e) {
-  console.error(`readDir(${wfDir}) failed: ${e}`);
+  console.error(`readdir(${wfDir}) failed: ${e}`);
 }
 
 console.log(JSON.stringify(out));
@@ -5918,7 +5883,7 @@ fn process_id_from_bpmn(xml: &str) -> Option<String> {
 /// `resources/processes/`. Only provenance-marked files (ours) are returned, so
 /// an authored `.bpmn` is never surfaced as "derived". The id is parsed from the
 /// model (falling back to the filename); `kind` is not stored on disk and is
-/// reported as `generated`. Used as the viewer's fallback when the live Deno
+/// reported as `generated`. Used as the viewer's fallback when the live Node
 /// derivation is unavailable or empty — these models already carry `bpmndi:`, so
 /// the panel renders without re-running the toolchain.
 fn ondisk_generated_models(proc_dir: &std::path::Path) -> Vec<DerivedModel> {
@@ -5960,11 +5925,11 @@ fn ondisk_generated_models(proc_dir: &std::path::Path) -> Vec<DerivedModel> {
 /// Code-first projects have no authored `.bpmn`; the model is DERIVED from the
 /// `workflows/*.ts` via `@nanobpm/workflow`'s `toBpmn`, then auto-laid-out
 /// (`layoutBpmn`) so the returned XML carries a diagram even for a project that
-/// has never been saved. This runs that derivation under Deno (with a synthesized
+/// has never been saved. This runs that derivation under Node (with a synthesized
 /// import map that resolves the SDK + layout dep) and returns the resulting
 /// models for the console's read-only viewer. The XML is further overlaid with
 /// the on-disk auto-laid-out model (ADR 0048) when present so the on-save,
-/// provenance-marked model wins; a missing Deno toolchain or a failed/empty live
+/// provenance-marked model wins; a missing Node runtime or a failed/empty live
 /// derivation falls back to those on-disk models, and only truly bare projects
 /// surface an `Err` string (never a panic).
 pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
@@ -5983,7 +5948,7 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     // toolkit supports derivation (nano-ide#92): it returns the same
     // `{id,kind,xml}` models this preview serves, with a diagram (urban lays out).
     // Non-writing, so it's safe for a read-only viewer refresh. A failure falls
-    // through to the on-disk models (below), then the embedded Deno path, so the
+    // through to the on-disk models (below), then the embedded Node path, so the
     // panel still renders — additive + non-regressing (#522).
     if let Some(urban) = urban_derive_capable(name).await {
         match derive_via_urban(&dir, &urban).await {
@@ -6003,49 +5968,42 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
                 if !disk.is_empty() {
                     return Ok(disk);
                 }
-                // else fall through to the embedded Deno derivation below.
+                // else fall through to the embedded Node derivation below.
             }
         }
     }
 
-    // If the Deno toolchain is missing we can't re-derive live, but the on-disk
+    // Without a Node runtime we can't re-derive live, but the on-disk
     // auto-laid-out models (ADR 0048) already carry a `bpmndi:` diagram, so serve
     // those directly instead of erroring — the panel still renders.
-    let deno = match super::extensions::find_program("deno") {
-        Some(d) => d,
+    let node = match workers::usable_node() {
+        Some(n) => n,
         None => {
             let disk = ondisk_generated_models(&proc_dir);
             return if disk.is_empty() {
-                Err("deno toolchain not found on PATH".into())
+                Err("no Node runtime (>= 22.6) found on PATH".into())
             } else {
                 Ok(disk)
             };
         }
     };
 
-    let cache = dir.join(".deno-cache");
-    let _ = std::fs::create_dir_all(&cache);
-
     let seq = DERIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // The derivation now auto-lays-out each model (so an imported, never-saved
     // project still renders a diagram), which needs the `bpmn-auto-layout` peer
-    // dep. An older project's `deno.json` isn't guaranteed to declare it, so —
+    // dep. An older project's `node.json` isn't guaranteed to declare it, so —
     // exactly like `generate_models` — synthesize an import map that merges the
-    // project's own imports and defaults in the SDK + layout dep, and pass it via
-    // `--import-map --no-config` (Deno forbids a map from both a discovered
-    // `deno.json` and the flag).
+    // project's own imports and defaults in the SDK + layout dep, and point the
+    // Node loader at it via `NANOBPMN_IMPORT_MAP` (the loader honours that before
+    // the project's own `node.json`).
     //
-    // Write it at the PROJECT ROOT (like the driver below), NOT in `.deno-cache`:
-    // Deno resolves an import map's relative values against the map file's own
-    // URL, and a code-first project's `deno.json` maps its generated local
-    // modules with relative specifiers (e.g. `"@nanobpm/domain":
-    // "./nano-generated/domain.ts"`). From `.deno-cache/` those resolve to
-    // `<project>/.deno-cache/nano-generated/...` (missing), so every workflow
-    // that imports a generated module fails to load and is silently skipped —
-    // the derivation returns `[]` and the panel shows "No workflows found".
-    // Rooted at the project dir, the relative specifiers resolve exactly as they
-    // do for the project's own `deno.json`, spaces in the path and all.
+    // Write it at the PROJECT ROOT (like the driver below): the loader resolves
+    // the map's relative values against its base dir (the project root, our CWD),
+    // and a code-first project's `node.json` maps its generated local modules with
+    // relative specifiers (e.g. `"@nanobpm/domain": "./nano-generated/domain.ts"`).
+    // Rooted at the project dir, those resolve exactly as they do for the
+    // project's own `node.json`, spaces in the path and all.
     let map_name = format!(".nano-derivemap-{}-{}.json", std::process::id(), seq);
     let map_path = dir.join(&map_name);
     std::fs::write(&map_path, synthesize_generate_import_map(&dir))
@@ -6060,39 +6018,27 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     std::fs::write(&driver_path, DERIVE_MODELS_DRIVER)
         .map_err(|e| format!("write derivation driver: {e}"))?;
 
-    // Least-privilege sandbox for a *read-only* derivation: read the project (to
-    // import `workflows/*.ts` + resolve the import map), fetch the SDK from the
-    // npm registry, and write ONLY to the Deno cache. Network is scoped to the
-    // registry host(s) `npm:` resolution needs (default the public registry; a
-    // private-registry user widens it via NANOBPMN_DERIVE_ALLOW_NET, comma-
-    // separated) so a workflow module can't exfiltrate to arbitrary hosts. No
-    // `--allow-env` (module top-level code must not read the server's
-    // environment) and `--no-lock` (never mutate a `deno.lock` in the project) —
-    // so a "Model" refresh can't touch arbitrary project files, hosts, or env.
-    let allow_net = std::env::var("NANOBPMN_DERIVE_ALLOW_NET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "registry.npmjs.org".to_string());
-    let result = Command::new(&deno)
-        .current_dir(&dir)
-        .arg("run")
-        .arg("--no-prompt")
-        .arg("--no-lock")
-        .arg("--no-config")
-        .arg(format!("--import-map={}", map_path.display()))
-        .arg(format!("--allow-net={allow_net}"))
-        .arg(format!("--allow-read={}", dir.display()))
-        .arg(format!("--allow-write={}", cache.display()))
-        .arg(&driver_name)
-        .arg(&dir)
-        .env("DENO_DIR", &cache)
-        .output()
-        .await;
+    // A read-only derivation: read the project (to import `workflows/*.ts` +
+    // resolve the import map) and load the SDK/layout deps from `node_modules`.
+    // Node has no capability sandbox, so — unlike the previous Deno `--allow-*`
+    // scope — the derivation runs with the host's ambient access; it is trusted
+    // project code, the same surface Run already exposes. Point the loader at the
+    // synthesized map and run the driver through the Node loader bootstrap.
+    let mut cmd = Command::new(&node);
+    cmd.current_dir(&dir)
+        .env("NANOBPMN_IMPORT_MAP", &map_name)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    node_fallback_command(&mut cmd, &dir.join(GEN_DIR).join("node-register.mjs"));
+    cmd.arg(&driver_name).arg(&dir);
+    let result = cmd.output().await;
 
     let _ = std::fs::remove_file(&driver_path);
     let _ = std::fs::remove_file(&map_path);
 
-    let output = result.map_err(|e| format!("spawn deno: {e}"))?;
+    let output = result.map_err(|e| format!("spawn node: {e}"))?;
     if !output.status.success() {
         // Live re-derivation failed (e.g. a transient type error). Fall back to
         // the last-generated on-disk models so the viewer still renders what was
@@ -6124,7 +6070,7 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
                 return Ok(disk);
             }
             return Err(format!(
-                "parse derived models: {e}; deno output: {}",
+                "parse derived models: {e}; derivation output: {}",
                 stdout.trim()
             ));
         }
@@ -6159,7 +6105,7 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     Ok(models)
 }
 
-/// Deno driver that imports a code-first project's `workflows/*.ts`, derives the
+/// Node driver that imports a code-first project's `workflows/*.ts`, derives the
 /// executable BPMN for each exported Workflow via `toBpmn`, then AUTO-LAYS-OUT it
 /// (adds a `bpmndi:` diagram) via `layoutBpmn`, and prints `[{id, kind, xml}]` as
 /// JSON. Both this and `DERIVE_MODELS_DRIVER` lay out their models; the
@@ -6171,10 +6117,11 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
 /// surface. Structural workflow detection matches the derive driver; only
 /// `workflows/*.ts` are imported — never `main.ts` (its top-level `deploy()`
 /// would hit the network).
-const GENERATE_MODELS_DRIVER: &str = r#"import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
+const GENERATE_MODELS_DRIVER: &str = r#"import { readdir } from "node:fs/promises";
+import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
 import { layoutProcess } from "bpmn-auto-layout";
 
-const root = Deno.args[0] ?? ".";
+const root = process.argv[2] ?? ".";
 const wfDir = `${root}/workflows`;
 const out: Array<{ id: string; kind: string; xml: string }> = [];
 const seen = new Set<string>();
@@ -6185,7 +6132,7 @@ let incomplete = false;
 
 // Add a `bpmndi:` diagram to a DI-less BPMN string. The SDK's `layoutBpmn`
 // dynamically `import("bpmn-auto-layout")`s the optional peer from WITHIN its own
-// package scope, which the sandbox's `--import-map` does not reach; importing
+// package scope, which the loader's `NANOBPMN_IMPORT_MAP` does not reach into; importing
 // `layoutProcess` here (in the DRIVER's own module graph) DOES resolve via the
 // map. Try the direct call first, fall back to the SDK, and return null on total
 // failure so the caller can mark the run incomplete rather than write a model.
@@ -6214,8 +6161,8 @@ function isWorkflow(v: unknown): v is { id: string; kind: string } {
 }
 
 try {
-  for await (const entry of Deno.readDir(wfDir)) {
-    if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
+  for (const entry of await readdir(wfDir, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
     let mod: Record<string, unknown>;
     try {
       // Encode the path so a project dir / filename with spaces or other
@@ -6245,7 +6192,7 @@ try {
     }
   }
 } catch (e) {
-  console.error(`readDir(${wfDir}) failed: ${e}`);
+  console.error(`readdir(${wfDir}) failed: ${e}`);
   incomplete = true;
 }
 
@@ -6302,14 +6249,14 @@ fn with_provenance(xml: &str) -> String {
 /// Synthesize the import map used for model *generation*. The layout helpers
 /// (`layoutBpmn`) ship in `@nanobpm/workflow >= 0.3.0` and lazily import the
 /// optional `bpmn-auto-layout` peer dep — neither of which an older project's
-/// `deno.json` is guaranteed to declare. We merge the project's own imports (so
+/// `node.json` is guaranteed to declare. We merge the project's own imports (so
 /// a workflow module's other bare imports still resolve) and *default in* the SDK
 /// and layout dep when absent, without overriding a project's explicit pins.
-/// Emitted into the cache dir and passed via `--import-map --no-config` (Deno
-/// forbids an import map from both a discovered `deno.json` and the flag).
+/// Written at the project root and pointed at via `NANOBPMN_IMPORT_MAP`, which
+/// the Node loader honours before any discovered `node.json`.
 fn synthesize_generate_import_map(dir: &std::path::Path) -> String {
     let mut imports = serde_json::Map::new();
-    if let Ok(txt) = std::fs::read_to_string(dir.join("deno.json"))
+    if let Ok(txt) = std::fs::read_to_string(dir.join("node.json"))
         && let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(&txt)
         && let Some(serde_json::Value::Object(im)) = obj.get("imports")
     {
@@ -6325,12 +6272,12 @@ fn synthesize_generate_import_map(dir: &std::path::Path) -> String {
 }
 
 /// Generate on-disk, auto-laid-out BPMN models for a code-first workflow project
-/// (ADR 0048) and return the ids written. Runs the derivation under Deno like
+/// (ADR 0048) and return the ids written. Runs the derivation under Node like
 /// [`derive_models`], but layers `bpmn-auto-layout` to add diagram interchange
 /// and WRITES each model to `resources/processes/<id>.bpmn` — the model-first
 /// scan surface — so a code-first flow becomes visually inspectable,
 /// round-trippable in a modeller, and feeds the envelope/domaintypes derivation
-/// exactly as an authored model does. Best-effort: a missing Deno toolchain, a
+/// exactly as an authored model does. Best-effort: a missing Node runtime, a
 /// non-workflow project, or a layout failure surface as an `Err` string rather
 /// than panicking (the semantic in-memory derivation still works).
 pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
@@ -6350,10 +6297,10 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     // Delegate model derivation to `urban derive --stdout` when the project is
     // Urban-shaped and the toolkit supports derivation (nano-ide#92). The parsed
     // `GenerateResult` feeds the SAME write+sweep tail (`finalize_generated_models`)
-    // as the Deno path, so the console keeps its provenance marking, filename-
+    // as the Node path, so the console keeps its provenance marking, filename-
     // collision handling and stale sweep — one canonical writer for the scan
     // surface, no drift onto urban's own writer. A failed `urban derive` logs and
-    // falls THROUGH to the embedded Deno driver below (additive + non-regressing,
+    // falls THROUGH to the embedded Node driver below (additive + non-regressing,
     // like `derive_models`): a broken/older toolkit must never leave the user
     // worse off than the pre-delegation path. An older toolkit or a legacy
     // project skips the branch entirely (`urban_derive_capable` → None).
@@ -6364,26 +6311,22 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
                 tracing::debug!(
                     project = name,
                     error = %e,
-                    "urban derive failed; falling back to the embedded deno driver"
+                    "urban derive failed; falling back to the embedded Node driver"
                 );
             }
         }
     }
 
-    let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
-    let cache = dir.join(".deno-cache");
-    let _ = std::fs::create_dir_all(&cache);
+    let node = workers::usable_node().ok_or("no Node runtime (>= 22.6) found on PATH")?;
 
     let seq = DERIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // Synthesized import map, written at the PROJECT ROOT (not `.deno-cache`) so
-    // its relative values resolve against the project dir — a code-first
-    // project's `deno.json` maps generated local modules with relative specifiers
-    // (`"@nanobpm/domain": "./nano-generated/domain.ts"`), and Deno resolves an
-    // import map's relative values against the MAP FILE's own URL. From the cache
-    // dir they would resolve to `<project>/.deno-cache/nano-generated/...`
-    // (missing), silently skipping every workflow that imports one. `--no-config`
-    // disables `deno.json` discovery so the flag map is the sole map.
+    // Synthesized import map, written at the PROJECT ROOT so its relative values
+    // resolve against the project dir — a code-first project's `node.json` maps
+    // generated local modules with relative specifiers (`"@nanobpm/domain":
+    // "./nano-generated/domain.ts"`), and the loader resolves the map's relative
+    // values against its base dir (the project root, our CWD). Pointed at via
+    // `NANOBPMN_IMPORT_MAP`, which takes precedence over `node.json` discovery.
     let map_name = format!(".nano-genmap-{}-{}.json", std::process::id(), seq);
     let map_path = dir.join(&map_name);
     std::fs::write(&map_path, synthesize_generate_import_map(&dir))
@@ -6397,33 +6340,24 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     std::fs::write(&driver_path, GENERATE_MODELS_DRIVER)
         .map_err(|e| format!("write generation driver: {e}"))?;
 
-    // Same least-privilege sandbox as `derive_models`: read the project, fetch the
-    // SDK + layout dep from the registry, write ONLY to the Deno cache (the model
-    // files are written by the server below, not the sandbox). No `--allow-env`.
-    let allow_net = std::env::var("NANOBPMN_DERIVE_ALLOW_NET")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "registry.npmjs.org".to_string());
-    let result = Command::new(&deno)
-        .current_dir(&dir)
-        .arg("run")
-        .arg("--no-prompt")
-        .arg("--no-lock")
-        .arg("--no-config")
-        .arg(format!("--import-map={}", map_path.display()))
-        .arg(format!("--allow-net={allow_net}"))
-        .arg(format!("--allow-read={}", dir.display()))
-        .arg(format!("--allow-write={}", cache.display()))
-        .arg(&driver_name)
-        .arg(&dir)
-        .env("DENO_DIR", &cache)
-        .output()
-        .await;
+    // The model files are written by the server below, not the driver; load the
+    // SDK + layout dep from `node_modules` and run the driver through the Node
+    // loader bootstrap, pointed at the synthesized map.
+    let mut cmd = Command::new(&node);
+    cmd.current_dir(&dir)
+        .env("NANOBPMN_IMPORT_MAP", &map_name)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    node_fallback_command(&mut cmd, &dir.join(GEN_DIR).join("node-register.mjs"));
+    cmd.arg(&driver_name).arg(&dir);
+    let result = cmd.output().await;
 
     let _ = std::fs::remove_file(&driver_path);
     let _ = std::fs::remove_file(&map_path);
 
-    let output = result.map_err(|e| format!("spawn deno: {e}"))?;
+    let output = result.map_err(|e| format!("spawn node: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("model generation failed: {}", stderr.trim()));
@@ -6436,7 +6370,7 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
         .unwrap_or("{}");
     let result: GenerateResult = serde_json::from_str(json).map_err(|e| {
         format!(
-            "parse generated models: {e}; deno output: {}",
+            "parse generated models: {e}; derivation output: {}",
             stdout.trim()
         )
     })?;
@@ -6444,7 +6378,7 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     finalize_generated_models(name, &dir, result)
 }
 
-/// Persist a [`GenerateResult`] (from either the Deno driver or `urban derive
+/// Persist a [`GenerateResult`] (from either the Node driver or `urban derive
 /// --stdout`) onto the model-first scan surface and return the ids written. This
 /// is the SINGLE canonical writer for `resources/processes/*.bpmn`: it stamps the
 /// [`PROVENANCE_MARKER`], skips ids that sanitize to a colliding filename, and —
@@ -6787,7 +6721,7 @@ fn snapshot_trust_id_for_config(
 ///      identical argv (see [`snapshot_trust_id`]); otherwise `cfg.lang`.
 ///   3. Lang pack's `toolchain.run` (covers lang-pack starter templates that
 ///      don't override, e.g. plain Rust) — trust binds to the lang pack.
-///   4. `None` — the caller falls through to the built-in Deno runner.
+///   4. `None` — the caller falls through to the built-in Node runner.
 fn resolve_run_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
     if let Some(tc) = cfg.toolchain.as_ref() {
         if let Some(rc) = active_run_config(tc)
@@ -6801,7 +6735,7 @@ fn resolve_run_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
             return Some((tc.run.clone(), trust));
         }
     }
-    if cfg.lang != "deno"
+    if cfg.lang != "node"
         && let Some(pack) = super::extensions::lang_pack(&cfg.lang)
         && !pack.toolchain.run.is_empty()
     {
@@ -6824,7 +6758,7 @@ fn resolve_compile_argv(cfg: &ProjectConfig) -> Option<(Vec<String>, String)> {
             return Some((tc.compile.clone(), trust));
         }
     }
-    if cfg.lang != "deno"
+    if cfg.lang != "node"
         && let Some(pack) = super::extensions::lang_pack(&cfg.lang)
         && !pack.toolchain.compile.is_empty()
     {
@@ -6949,13 +6883,8 @@ pub fn supervisor() -> &'static ProjectSupervisor {
 }
 
 impl ProjectSupervisor {
-    pub fn deno_available(&self) -> bool {
-        workers::find_deno().is_some()
-    }
-
-    /// Whether a usable Node fallback runtime is available (Deno absent hosts,
-    /// e.g. 32-bit ARM). Node must be new enough to strip `.ts` types. See
-    /// ADR 0036.
+    /// Whether a usable Node runtime is available to run a project. Node is the
+    /// sole JS/TS runtime (ADR 0065) and must be new enough to strip `.ts` types.
     pub fn node_available(&self) -> bool {
         workers::usable_node().is_some()
     }
@@ -7280,7 +7209,7 @@ impl ProjectSupervisor {
         }
     }
 
-    /// Spawns `deno run main.ts` for a project. Idempotent if already running.
+    /// Spawns the project's entrypoint under Node. Idempotent if already running.
     pub async fn run(&self, name: &str) -> Result<(), String> {
         let dir = project_dir(name).ok_or("invalid project name")?;
         if !dir.is_dir() {
@@ -7312,27 +7241,18 @@ impl ProjectSupervisor {
         // invocation via `cfg.toolchain` — snapshotted from the scaffolding pack
         // so pack updates or uninstalls don't break existing projects. A
         // lang-pack-scaffolded project (e.g. Rust starter) has no snapshot and
-        // falls back to the lang pack. Only plain `deno` with nothing declared
-        // falls through to the built-in Deno runner below.
+        // falls back to the lang pack. Only a plain project with nothing declared
+        // falls through to the built-in Node runner below.
         if let Some((argv, trust_id)) = resolve_run_argv(&cfg) {
             return self.run_toolchain(name, &cfg, &dir, argv, trust_id).await;
         }
-        // Runtime for a plain (non-toolchain) project: Node-first. Node (>= 22.6)
-        // is always present (the npm launcher is Node), so it is the primary run
-        // path on every host including 32-bit ARM. Deno is an equal alternative
-        // for Run and is required only for Compile (`deno compile`). See ADR 0038.
-        enum RunRuntime {
-            Deno(PathBuf),
-            Node(PathBuf),
-        }
-        let runtime = if let Some(n) = workers::usable_node() {
-            RunRuntime::Node(n)
-        } else if let Some(d) = workers::find_deno() {
-            RunRuntime::Deno(d)
-        } else {
+        // Runtime for a plain (non-toolchain) project: Node (>= 22.6) is the
+        // sole JS/TS runtime (ADR 0065). It is always present (the npm launcher
+        // is Node), so it is the only run path on every host including 32-bit ARM.
+        let Some(node) = workers::usable_node() else {
             return Err(
                 "No JavaScript runtime found to run this project. Install Node \
-                 >= 22.6 (the npm launcher provides one), or Deno (https://deno.com)."
+                 >= 22.6 (the npm launcher provides one)."
                     .to_string(),
             );
         };
@@ -7358,11 +7278,9 @@ impl ProjectSupervisor {
                 entry.display()
             ));
         }
-        // Canonicalize so the --allow-read/-write scope matches the path Deno
-        // resolves (e.g. macOS /tmp -> /private/tmp), otherwise access is denied.
+        // Canonicalize so the loader's base dir (the CWD we spawn with) matches
+        // the path the runtime resolves (e.g. macOS /tmp -> /private/tmp).
         let dir = dunce::canonicalize(&dir).unwrap_or(dir);
-        let cache = dir.join(".deno-cache");
-        let _ = std::fs::create_dir_all(&cache);
         let base_url = Self::base_url(&cfg);
 
         Self::auto_deploy_resources(&cfg, &dir, &base_url, &inner).await;
@@ -7373,21 +7291,20 @@ impl ProjectSupervisor {
         //   neither `node_modules/` nor the derived `nano-generated/` facade, so
         //   the first OpenAPI request 500s with "delegate failed to load" until
         //   `npm i && urban gen` run by hand. `ensure_urban_boot_ready` heals the
-        //   whole class here — deps (on *either* runtime, since `urban` itself
-        //   resolves from `node_modules/.bin/urban`) plus a `urban gen --check`
+        //   whole class here — deps (since `urban` itself resolves from
+        //   `node_modules/.bin/urban`) plus a `urban gen --check`
         //   guarded regen — so the first endpoint hit works. Best-effort: every
         //   step warns rather than blocks Run.
         // * **Legacy Node project**: Node resolves npm `dependencies` as bare
-        //   specifiers from `node_modules`; unlike Deno (which fetches `npm:` on
-        //   demand) the host never populates it, so a missing/out-of-range dep
-        //   fails with ERR_MODULE_NOT_FOUND. Lazily materialise them before the
-        //   Node spawn (Node arm only — Deno needs no local install). A failure
-        //   is logged, not fatal: the spawn then surfaces the underlying error.
+        //   specifiers from `node_modules`, and the host never populates it, so a
+        //   missing/out-of-range dep fails with ERR_MODULE_NOT_FOUND. Lazily
+        //   materialise them before the Node spawn. A failure is logged, not
+        //   fatal: the spawn then surfaces the underlying error.
         if is_urban_app(name) {
             for (stream, text) in ensure_urban_boot_ready(name).await {
                 inner.push_log(stream, text).await;
             }
-        } else if let RunRuntime::Node(_) = &runtime {
+        } else {
             let needing = node_modules_needing_install(&dir);
             if !needing.is_empty() {
                 inner
@@ -7418,48 +7335,25 @@ impl ProjectSupervisor {
             }
         }
 
-        let runtime_label;
-        let mut cmd;
-        match &runtime {
-            RunRuntime::Deno(deno) => {
-                runtime_label = "deno";
-                cmd = Command::new(deno);
-                cmd.current_dir(&dir)
-                    .arg("run")
-                    .arg("--no-prompt")
-                    .arg("--allow-net")
-                    .arg(format!("--allow-read={}", dir.display()))
-                    // The whole project root (which includes .deno-cache) so an Urban
-                    // App datasource can create/write its embedded SQLite file, e.g.
-                    // `file:./app.db` (ADR 0024). App code is the maker's own trusted code.
-                    .arg(format!("--allow-write={}", dir.display()))
-                    .arg("--allow-env")
-                    .arg(&cfg.main)
-                    .env("DENO_DIR", &cache);
-            }
-            RunRuntime::Node(node) => {
-                // Node fallback: strip TS types + register the import-map loader
-                // (materialised in nano-generated/) so `deno.json`-mapped specifiers and
-                // `.ts` sources resolve. `node:sqlite`/WebSocket are built in. Node
-                // has no capability sandbox — App code is the maker's own trusted code.
-                runtime_label = "node";
-                cmd = Command::new(node);
-                cmd.current_dir(&dir);
-                node_fallback_command(&mut cmd, &dir.join(GEN_DIR).join("node-register.mjs"));
-                cmd.arg(&cfg.main);
-            }
-        }
+        // Strip TS types + register the import-map loader (materialised in
+        // nano-generated/) so `node.json`-mapped specifiers and `.ts` sources
+        // resolve. `node:sqlite`/WebSocket are built in. Node has no capability
+        // sandbox — App code is the maker's own trusted code.
+        let mut cmd = Command::new(&node);
+        cmd.current_dir(&dir);
+        node_fallback_command(&mut cmd, &dir.join(GEN_DIR).join("node-register.mjs"));
+        cmd.arg(&cfg.main);
         cmd.env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        // Even when the toolchain argv resolves to the built-in Deno runner,
+        // Even when the toolchain argv resolves to the built-in Node runner,
         // an active run config's `env` must still be honored — otherwise
         // env-only runConfigs (e.g. different NANOBPMN_BASE_URL per target)
-        // silently no-op for Deno projects. Same precedence as run_toolchain:
-        // base spawn env above, then active-config env last-wins.
+        // silently no-op. Same precedence as run_toolchain: base spawn env
+        // above, then active-config env last-wins.
         for (k, v) in resolve_run_env(&cfg) {
             cmd.env(k, v);
         }
@@ -7475,7 +7369,7 @@ impl ProjectSupervisor {
             Ok(c) => c,
             Err(e) => {
                 *inner.phase.lock().await = Phase::Stopped;
-                return Err(format!("failed to spawn {runtime_label}: {e}"));
+                return Err(format!("failed to spawn node: {e}"));
             }
         };
         let pid = child.id().unwrap_or(0);
@@ -7488,10 +7382,7 @@ impl ProjectSupervisor {
         inner
             .push_log(
                 "sys",
-                format!(
-                    "running {} via {runtime_label} (pid {pid}) -> {base_url}",
-                    cfg.main
-                ),
+                format!("running {} via node (pid {pid}) -> {base_url}", cfg.main),
             )
             .await;
 
@@ -7781,161 +7672,29 @@ impl ProjectSupervisor {
             ..cfg
         };
         // binary bundles source that types against the current schema + manifest
-        // `types` registry (ADR 0029 §6). Best-effort and erased at `deno compile`
-        // — a failure never blocks the build.
+        // `types` registry (ADR 0029 §6). Best-effort; a failure never blocks the
+        // build.
         let _ = ensure_project_sdk(name);
         let _ = run_data_op(name, serde_json::json!({ "op": "domaintypes" })).await;
-        // Same dispatch as run(): project snapshot > lang pack > built-in Deno.
-        // The old `cfg.lang != "deno"` gate meant a project scaffolded before
-        // requires[] was mandatory got its Java source pumped through
-        // `deno compile`.
+        // Same dispatch as run(): project snapshot > lang pack > built-in Node.
         if let Some((argv, trust_id)) = resolve_compile_argv(&cfg) {
             return self
                 .compile_toolchain(name, &cfg, &dir, argv, trust_id)
                 .await;
         }
-        let deno = workers::find_deno().ok_or_else(|| {
-            // Compile builds a standalone single-file binary via `deno compile`,
-            // which is Deno-specific — there is no Node equivalent. Run still works
-            // on the Node fallback (ADR 0036); only Compile requires Deno.
-            "Compile requires the Deno runtime (it builds a standalone binary). \
-             Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN. Run works \
-             without Deno on Node >= 22.6."
-                .to_string()
-        })?;
-        let inner = self.entry(name).await;
-        if inner.compiling.swap(true, Ordering::Relaxed) {
-            return Err("a compile is already in progress".into());
-        }
-
-        let dist = dir.join("dist");
-        let _ = std::fs::create_dir_all(&dist);
-        let cache = dir.join(".deno-cache");
-        let _ = std::fs::create_dir_all(&cache);
-
-        // Empty target list => compile for the host only.
-        let mut effective: Vec<Option<String>> = Vec::new();
-        if targets.is_empty() {
-            effective.push(None);
-        } else {
-            let allowed: BTreeSet<&str> = PLATFORMS.iter().copied().collect();
-            for t in targets {
-                if !allowed.contains(t.as_str()) {
-                    inner.compiling.store(false, Ordering::Relaxed);
-                    return Err(format!("unsupported target: {t}"));
-                }
-                effective.push(Some(t.clone()));
-            }
-        }
-
-        let mut produced = Vec::new();
-        let mut failure: Option<String> = None;
-        for target in &effective {
-            let out_name = match target {
-                Some(t) => format!("{name}-{t}"),
-                None => name.to_string(),
-            };
-            let mut out_path = dist.join(&out_name);
-            if matches!(target.as_deref(), Some(t) if t.contains("windows")) {
-                out_path.set_extension("exe");
-            }
-            inner
-                .push_log(
-                    "sys",
-                    match target {
-                        Some(t) => format!("compiling for {t}..."),
-                        None => "compiling for host...".to_string(),
-                    },
-                )
-                .await;
-
-            let mut cmd = Command::new(&deno);
-            cmd.current_dir(&dir)
-                .arg("compile")
-                .arg("--allow-net")
-                .arg("--allow-read")
-                .arg("--allow-write")
-                .arg("--allow-env")
-                .arg("--no-prompt");
-            if let Some(t) = target {
-                cmd.arg("--target").arg(t);
-            }
-            cmd.arg("--output")
-                .arg(&out_path)
-                .arg(&cfg.main)
-                .env("DENO_DIR", &cache)
-                .env("NO_COLOR", "1")
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            // Layer active run-config env onto the built-in Deno compile too;
-            // otherwise env-only runConfigs no-op on Deno projects during
-            // Compile (see run() for the symmetric fix and rationale).
-            for (k, v) in resolve_run_env(&cfg) {
-                cmd.env(k, v);
-            }
-
-            let child = cmd
-                .spawn()
-                .map_err(|e| format!("failed to spawn deno: {e}"));
-            let mut child = match child {
-                Ok(c) => c,
-                Err(e) => {
-                    failure = Some(e);
-                    break;
-                }
-            };
-            if let Some(stdout) = child.stdout.take() {
-                let inner = inner.clone();
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        inner.push_log("out", line).await;
-                    }
-                });
-            }
-            if let Some(stderr) = child.stderr.take() {
-                let inner = inner.clone();
-                tokio::spawn(async move {
-                    let mut lines = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = lines.next_line().await {
-                        inner.push_log("err", line).await;
-                    }
-                });
-            }
-            match child.wait().await {
-                Ok(st) if st.success() => {
-                    let rel = format!("dist/{}", out_path.file_name().unwrap().to_string_lossy());
-                    inner.push_log("sys", format!("built {rel}")).await;
-                    produced.push(rel);
-                }
-                Ok(st) => {
-                    failure = Some(format!("deno compile failed (code {:?})", st.code()));
-                    break;
-                }
-                Err(e) => {
-                    failure = Some(format!("deno compile error: {e}"));
-                    break;
-                }
-            }
-        }
-
-        inner.compiling.store(false, Ordering::Relaxed);
-        match failure {
-            Some(e) => {
-                inner.push_log("sys", format!("compile failed: {e}")).await;
-                Err(e)
-            }
-            None => {
-                inner
-                    .push_log(
-                        "sys",
-                        format!("compile complete ({} artifact(s))", produced.len()),
-                    )
-                    .await;
-                Ok(produced)
-            }
-        }
+        // Compile builds a standalone single-file binary. `deno compile` was the
+        // only built-in compile step; Deno removal (ADR 0065) left none — Node has
+        // no equivalent. A project that needs a build must declare a `compile`
+        // argv through its toolchain or language pack, handled above by
+        // `resolve_compile_argv` / `compile_toolchain`.
+        let _ = targets;
+        Err(
+            "no compile command configured for this project: the built-in \
+             `deno compile` step was removed with Deno (ADR 0065) and Node has no \
+             built-in compile step. Declare a `compile` command in the project's \
+             toolchain or language pack."
+                .to_string(),
+        )
     }
 
     /// Compiles a project via its resolved toolchain argv (from `cfg.toolchain`
@@ -8082,17 +7841,17 @@ mod tests {
 
     #[test]
     fn synthesize_import_map_keeps_relative_specifiers_and_adds_defaults() {
-        // A code-first project's deno.json maps its generated local modules with
+        // A code-first project's node.json maps its generated local modules with
         // RELATIVE specifiers. The synthesized map must preserve them verbatim
         // (the map is written at the project root, so they resolve there) and add
         // the SDK + layout defaults only when the project didn't declare them.
         // Regression guard for "No workflows found" — see derive_models: a map in
-        // .deno-cache/ made `./nano-generated/*` resolve to the wrong dir and
+        // the wrong dir made `./nano-generated/*` resolve the wrong way and
         // every workflow importing a generated module was silently skipped.
         let _g = lock();
         let dir = temp_root();
         std::fs::write(
-            dir.join("deno.json"),
+            dir.join("node.json"),
             r#"{ "imports": {
                 "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.4.0",
                 "@nanobpm/domain": "./nano-generated/domain.ts",
@@ -8130,7 +7889,7 @@ mod tests {
 
     #[test]
     fn synthesize_import_map_defaults_sdk_when_project_omits_it() {
-        // A project with no deno.json imports still gets both defaults so the
+        // A project with no node.json imports still gets both defaults so the
         // derivation driver's own `@nanobpm/workflow` + `bpmn-auto-layout` imports
         // resolve. Uses `scratch_dir` (not `temp_root`) so it doesn't mutate the
         // process-global `NANOBPMN_PROJECTS_DIR` without holding `lock()` — that
@@ -9144,7 +8903,7 @@ mod tests {
         let _g = lock();
         let root = temp_root();
         let cfg = create_project("gdemo", "", "gui-starter").expect("create");
-        assert_eq!(cfg.app, "deno-gui");
+        assert_eq!(cfg.app, "node-gui");
         let dir = root.join("gdemo");
         assert!(dir.join("public/index.html").is_file());
         assert!(dir.join("main.ts").is_file());
@@ -9215,11 +8974,11 @@ mod tests {
             dir.join("nano-generated/data-sdk.ts").is_file(),
             "nano-generated/data-sdk.ts must be materialised"
         );
-        let deno_json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("deno.json")).unwrap())
-                .expect("deno.json parses");
+        let import_map: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("node.json")).unwrap())
+                .expect("node.json parses");
         assert_eq!(
-            deno_json["imports"]["@nanobpm/data"], "./nano-generated/data-sdk.ts",
+            import_map["imports"]["@nanobpm/data"], "./nano-generated/data-sdk.ts",
             "@nanobpm/data must be import-mapped"
         );
         // ADR 0029 §6: the typed data-object accessor is seeded and aliased so
@@ -9229,7 +8988,7 @@ mod tests {
             "nano-generated/domain.ts must be seeded"
         );
         assert_eq!(
-            deno_json["imports"]["@nanobpm/domain"], "./nano-generated/domain.ts",
+            import_map["imports"]["@nanobpm/domain"], "./nano-generated/domain.ts",
             "@nanobpm/domain must be import-mapped"
         );
         // ADR 0033 §3: the typed `defineWorker` wrapper is materialised and
@@ -9243,7 +9002,7 @@ mod tests {
             "nano-generated/worker-io.d.ts must be seeded"
         );
         assert_eq!(
-            deno_json["imports"]["@nanobpm/worker"], "./nano-generated/workers.ts",
+            import_map["imports"]["@nanobpm/worker"], "./nano-generated/workers.ts",
             "@nanobpm/worker must resolve to the typed wrapper"
         );
         // ADR 0022 §E role 1: the LLM-as-worker runtime is materialised and
@@ -9253,14 +9012,14 @@ mod tests {
             "nano-generated/llm-worker.ts must be materialised"
         );
         assert_eq!(
-            deno_json["imports"]["@nanobpm/llm"], "./nano-generated/llm-worker.ts",
+            import_map["imports"]["@nanobpm/llm"], "./nano-generated/llm-worker.ts",
             "@nanobpm/llm must be import-mapped"
         );
         // Node-first standard-tooling parity: the scaffold emits a `tsconfig.json`
         // (so VS Code / `tsc` resolve `@nanobpm/*` natively via `paths`, mirroring
-        // the `deno.json` import map) and a `package.json` (npm identity + a place
+        // the `node.json` import map) and a `package.json` (npm identity + a place
         // for `npm install` deps, with `@types/node` for `node:*` builtins). The
-        // `@nanobpm/*` alias stays in `deno.json`/`tsconfig.json` — `package.json`
+        // `@nanobpm/*` alias stays in `node.json`/`tsconfig.json` — `package.json`
         // cannot express it (`imports` keys must be `#`-prefixed).
         let tsconfig: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("tsconfig.json")).unwrap())
@@ -9320,10 +9079,10 @@ mod tests {
 
     #[test]
     fn urban_template_exposes_runtime_option_only() {
-        // The urban-starter template declares the Node/Deno runtime toggle via
-        // `options`; every other builtin declares none. The wire projection
-        // carries the option id, its choices, and the Deno choice's `requires`
-        // capability so the console can gate it on `denoAvailable`.
+        // The urban-starter template declares the runtime toggle via
+        // `options`; every other builtin declares none. Node is the sole JS/TS
+        // runtime (ADR 0065), so the projection carries a single always-selectable
+        // Node choice (no `requires`).
         let templates = project_templates();
         let urban = templates
             .iter()
@@ -9340,8 +9099,7 @@ mod tests {
             node.get("requires").is_none(),
             "Node is always available (no `requires`)"
         );
-        let deno = choices.iter().find(|c| c["value"] == "deno").unwrap();
-        assert_eq!(deno["requires"], "deno");
+        assert_eq!(choices.len(), 1, "Node is the sole runtime choice");
         // Urban apps flag their reliance on the @nanobpm/urban toolkit so the
         // picker can surface the install hint.
         assert_eq!(urban["needsUrban"], true);
@@ -9363,12 +9121,12 @@ mod tests {
         let _g = lock();
         let _root = temp_root();
         let mut opts = std::collections::HashMap::new();
-        opts.insert("runtime".to_string(), "deno".to_string());
+        opts.insert("runtime".to_string(), "node".to_string());
         let cfg = create_project_with_options("runtime_demo", "", "urban-starter", &opts)
             .expect("create");
         assert_eq!(
             cfg.runtime.as_deref(),
-            Some("deno"),
+            Some("node"),
             "the chosen runtime is recorded on the project config"
         );
     }
@@ -9378,10 +9136,10 @@ mod tests {
         let _g = lock();
         let root = temp_root();
         let cfg = create_project("pr_bot", "", "workflow-starter").expect("create");
-        // Recorded as its own template; a Deno console app (the run supervisor
-        // drives it as `deno task start`).
+        // Recorded as its own template; a Node console app (the run supervisor
+        // drives it via `node --experimental-strip-types`).
         assert_eq!(cfg.template.as_deref(), Some("workflow-starter"));
-        assert_eq!(cfg.lang, "deno");
+        assert_eq!(cfg.lang, "node");
         assert_eq!(cfg.app, "console");
         assert_eq!(cfg.main, "main.ts");
         let dir = root.join("pr_bot");
@@ -9406,11 +9164,11 @@ mod tests {
         );
         // The import map + package.json depend on the real published SDK, not a
         // generated-file alias.
-        let deno_json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("deno.json")).unwrap())
-                .expect("deno.json parses");
+        let import_map: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("node.json")).unwrap())
+                .expect("node.json parses");
         assert!(
-            deno_json["imports"]["@nanobpm/workflow"]
+            import_map["imports"]["@nanobpm/workflow"]
                 .as_str()
                 .unwrap_or_default()
                 .starts_with("npm:@nanobpm/workflow"),
@@ -9453,13 +9211,13 @@ mod tests {
         );
         let job_types = std::fs::read_to_string(dir.join("scripts/job-types.ts")).unwrap();
         assert!(job_types.contains("externalJobTypes(prReview)"));
-        // The README instructs `deno task job-types`, so the package.json script
-        // parity must exist or the `npm run job-types` alternative silently breaks
-        // (the deno.json task itself is asserted below alongside the other tasks).
+        // The README instructs `npm run job-types`, so the package.json script
+        // parity must exist or the `npm run job-types` invocation silently breaks
+        // (the node.json task itself is asserted below alongside the other tasks).
         let package_json = std::fs::read_to_string(dir.join("package.json")).unwrap();
         assert!(
             package_json.contains("\"job-types\""),
-            "package.json scripts must keep parity with the deno.json job-types task"
+            "package.json scripts must keep parity with the node.json job-types task"
         );
         assert!(
             !example.contains("defineWorkflow"),
@@ -9484,11 +9242,11 @@ mod tests {
             approve.contains("client.signal("),
             "the approve script should correlate the human-in-the-loop signal"
         );
-        // All Deno tasks are defined (incl. the job-types task the README advertises).
-        assert!(deno_json["tasks"]["start"].is_string());
-        assert!(deno_json["tasks"]["start-instance"].is_string());
-        assert!(deno_json["tasks"]["approve"].is_string());
-        assert!(deno_json["tasks"]["job-types"].is_string());
+        // All node.json tasks are defined (incl. the job-types task the README advertises).
+        assert!(import_map["tasks"]["start"].is_string());
+        assert!(import_map["tasks"]["start-instance"].is_string());
+        assert!(import_map["tasks"]["approve"].is_string());
+        assert!(import_map["tasks"]["job-types"].is_string());
     }
 
     #[tokio::test]
@@ -9504,12 +9262,12 @@ mod tests {
         );
 
         // A real project WITHOUT a workflows/ dir (not code-first) -> a clear
-        // "not a code-first workflow project" error rather than spawning Deno.
+        // "not a code-first workflow project" error rather than spawning a runtime.
         create_project("plain_app", "", "starter").expect("create");
         let err = derive_models("plain_app").await.unwrap_err();
         assert!(
             err.contains("not a code-first"),
-            "a non-workflow project should be rejected before spawning Deno, got: {err}"
+            "a non-workflow project should be rejected before spawning a runtime, got: {err}"
         );
     }
 
@@ -9730,9 +9488,9 @@ mod tests {
         assert_eq!(pack_hits[0]["source"].as_str(), Some("pack"));
         assert_eq!(pack_hits[0]["pack"].as_str(), Some("embedded-nano"));
         assert_eq!(pack_hits[0]["label"].as_str(), Some("Embedded engine"));
-        // An app pack with no `requires` implies the Deno runtime — mirrored
-        // from create_project's cfg.lang derivation.
-        assert_eq!(pack_hits[0]["lang"].as_str(), Some("deno"));
+        // An app pack with no `requires` implies the built-in Node runtime —
+        // mirrored from create_project's cfg.lang derivation.
+        assert_eq!(pack_hits[0]["lang"].as_str(), Some("node"));
         // The shadowing pack's `starter` must not have overridden the built-in
         // (only one entry with id="starter", and its source is "builtin").
         let starter_hits: Vec<_> = templates.iter().filter(|t| t["id"] == "starter").collect();
@@ -9893,12 +9651,12 @@ mod tests {
         assert!(dir.join("src/main.rs").is_file());
     }
 
-    /// Regression: a Java pack scaffold must NOT get the Deno-flavoured
-    /// built-in files (main.ts, deno.json, workers/do-work, lib/nano.ts,
+    /// Regression: a Java pack scaffold must NOT get the Node built-in files
+    /// (main.ts, node.json, workers/do-work, lib/nano.ts,
     /// nano-generated/worker-sdk.ts, resources/processes/*.bpmn from the built-in
     /// starter). Everything must come from the pack.
     #[test]
-    fn java_pack_scaffold_does_not_get_deno_files() {
+    fn java_pack_scaffold_does_not_get_node_files() {
         let _g = lock();
         let root = temp_root();
         let ext = root.join("ext-store");
@@ -9931,10 +9689,13 @@ mod tests {
         assert!(dir.join("pom.xml").is_file());
         assert!(dir.join("src/main/java/com/example/Main.java").is_file());
         assert!(dir.join("src/main/resources/throughput.bpmn").is_file());
-        // Deno-flavoured built-ins must NOT be present.
-        assert!(!dir.join("main.ts").exists(), "Deno main.ts leaked");
-        assert!(!dir.join("deno.json").exists(), "Deno deno.json leaked");
-        assert!(!dir.join("lib/nano.ts").exists(), "Deno lib/nano.ts leaked");
+        // Legacy built-in scaffolds must NOT be present.
+        assert!(!dir.join("main.ts").exists(), "legacy main.ts leaked");
+        assert!(!dir.join("node.json").exists(), "legacy node.json leaked");
+        assert!(
+            !dir.join("lib/nano.ts").exists(),
+            "legacy lib/nano.ts leaked"
+        );
         assert!(
             !dir.join("nano-generated/worker-sdk.ts").exists(),
             "nano-generated/worker-sdk.ts leaked"
@@ -9949,11 +9710,11 @@ mod tests {
         );
     }
 
-    /// Regression for the "Java template creates a Deno app" bug: the
+    /// Regression for the "Java template creates a JS/TS runtime app" bug: the
     /// extensions root ALWAYS holds non-pack entries in real installs — the
     /// trust store (trust.json), `.DS_Store`, a mid-install tarball — and
     /// template_source() used to abort its whole scan on the first one,
-    /// so create_project silently fell back to the built-in Deno starter.
+    /// so create_project silently fell back to the built-in JS/TS starter.
     /// With litter present, an installed example pack must still scaffold.
     #[test]
     fn pack_template_survives_stray_files_in_extensions_root() {
@@ -9981,22 +9742,22 @@ mod tests {
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
         assert_eq!(
             cfg.lang, "java",
-            "lang must come from the pack, not the Deno fallback"
+            "lang must come from the pack, not the built-in fallback"
         );
         let dir = root.join("jt");
         assert!(dir.join("pom.xml").is_file(), "pack files must be copied");
         assert!(dir.join("src/main/java/Main.java").is_file());
         assert!(
             !dir.join("main.ts").exists(),
-            "must not fall back to the Deno starter"
+            "must not fall back to the built-in starter"
         );
-        assert!(!dir.join("deno.json").exists());
+        assert!(!dir.join("node.json").exists());
     }
 
     /// A LANG pack's own starter template (e.g. lang-java's `java-starter`)
     /// implies the pack itself as the project language — lang packs don't
     /// declare `requires`, so the old requires-only derivation left these
-    /// projects on the Deno runtime.
+    /// projects on the JS/TS runtime.
     #[test]
     fn lang_pack_template_sets_lang_to_the_pack_id() {
         let _g = lock();
@@ -10109,7 +9870,7 @@ mod tests {
         assert_eq!(reread.scaffolded_from, cfg.scaffolded_from);
     }
 
-    /// The resolver picks project snapshot > lang pack > None (built-in Deno).
+    /// The resolver picks project snapshot > lang pack > None (built-in Node).
     /// A pack-scaffolded project runs even if the source pack has been
     /// uninstalled since — the whole point of snapshotting.
     #[test]
@@ -10185,10 +9946,10 @@ mod tests {
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 
-    /// A plain Deno project (no snapshot, `lang=deno`) resolves to `None` so
-    /// the caller falls through to the built-in Deno runner — no regression.
+    /// A plain Node project (no snapshot, `lang=node`) resolves to `None` so
+    /// the caller falls through to the built-in Node runner — no regression.
     #[test]
-    fn resolve_run_argv_none_for_plain_deno_project() {
+    fn resolve_run_argv_none_for_plain_node_project() {
         let cfg = ProjectConfig::new("p", "");
         assert!(resolve_run_argv(&cfg).is_none());
         assert!(resolve_compile_argv(&cfg).is_none());
@@ -10379,7 +10140,7 @@ mod tests {
             workers: 0,
             running: true,
             source: "workspace".into(),
-            lang: "deno".into(),
+            lang: "node".into(),
             template: None,
             scaffolded_from: None,
             update_available: false,
@@ -10411,7 +10172,7 @@ mod tests {
             workers: 0,
             running: false,
             source: "workspace".into(),
-            lang: "deno".into(),
+            lang: "node".into(),
             template: None,
             scaffolded_from: None,
             update_available: false,
@@ -10569,12 +10330,12 @@ mod tests {
             .into_iter()
             .find(|p| p.name == "demo")
             .expect("demo listed");
-        assert_eq!(summary.lang, "deno");
+        assert_eq!(summary.lang, "node");
         assert_eq!(summary.template.as_deref(), Some("starter"));
         assert!(summary.scaffolded_from.is_none());
         let dir = root.join("demo");
         assert!(dir.join("main.ts").is_file());
-        assert!(dir.join("deno.json").is_file());
+        assert!(dir.join("node.json").is_file());
         assert!(dir.join(CONFIG_FILE).is_file());
         assert!(dir.join("nano-generated/worker-sdk.ts").is_file());
         assert!(dir.join("nano-generated/llm-worker.ts").is_file());
@@ -10585,8 +10346,8 @@ mod tests {
         assert!(main_ts.contains("startLlmWorkers()"));
         // The import map exposes @nanobpm/llm → the materialised runtime.
         let ddj: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("deno.json")).unwrap())
-                .expect("deno.json parses");
+            serde_json::from_str(&std::fs::read_to_string(dir.join("node.json")).unwrap())
+                .expect("node.json parses");
         assert_eq!(
             ddj["imports"]["@nanobpm/llm"],
             "./nano-generated/llm-worker.ts"
@@ -10594,9 +10355,9 @@ mod tests {
         // Worker import map carries the datasource alias so handlers can
         // `import { openDataSource } from "@nanobpm/data"` (ADR 0024).
         let wdj: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.join("workers/do-work/deno.json")).unwrap(),
+            &std::fs::read_to_string(dir.join("workers/do-work/node.json")).unwrap(),
         )
-        .expect("worker deno.json parses");
+        .expect("worker node.json parses");
         assert_eq!(
             wdj["imports"]["@nanobpm/data"],
             "../../nano-generated/data-sdk.ts"
@@ -10640,8 +10401,8 @@ mod tests {
         assert!(!dir.join("workers/tick").exists());
         let main = std::fs::read_to_string(dir.join("main.ts")).unwrap();
         assert!(main.contains("@nanobpm/nano-sdk") && main.contains("createCamundaClient"));
-        let deno = std::fs::read_to_string(dir.join("deno.json")).unwrap();
-        assert!(deno.contains("@nanobpm/nano-sdk"));
+        let manifest = std::fs::read_to_string(dir.join("node.json")).unwrap();
+        assert!(manifest.contains("@nanobpm/nano-sdk"));
     }
 
     #[test]
@@ -10684,8 +10445,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn export_bundles_regenerated_domain_types() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -10784,15 +10545,15 @@ mod tests {
 
     /// End-to-end datasource gateway: materialise a project, run migrations,
     /// then schema/query/exec through the real `data-cli.ts` against an embedded
-    /// SQLite file (ADR 0024 §4). Runtime-agnostic (ADR 0038): runs under Node
-    /// (preferred) or Deno; skipped only when neither is present (CI). The SDK
+    /// SQLite file (ADR 0024 §4). Runs under Node (ADR 0065); skipped only when
+    /// it is absent (CI). The SDK
     /// internals are covered locally by `data_sdk_test.ts`.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op awaits
     async fn run_data_op_roundtrips_through_the_data_gateway() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -10949,8 +10710,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op awaits
     async fn domaintypes_does_not_auto_migrate_urban_shaped_apps() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -11030,8 +10791,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn domaintypes_op_reifies_the_schema_to_a_dts() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -11123,8 +10884,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_emits_typed_worker_bindings() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -11703,7 +11464,7 @@ mod tests {
 
     /// The happy path: `urban derive --stdout` exits 0 with the contract JSON, and
     /// `derive_via_urban` parses it into a `GenerateResult` (the JSON maps
-    /// byte-for-byte onto the struct the Deno driver produces — no drift).
+    /// byte-for-byte onto the struct the driver produces — no drift).
     #[cfg(unix)]
     #[tokio::test]
     async fn derive_via_urban_parses_the_contract_json() {
@@ -12225,8 +11986,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_resolves_a_composed_shape_into_the_registry() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12291,8 +12052,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_consumes_model_meta_and_writes_the_fuse_cache() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12392,8 +12153,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn domaintypes_meta_round_trips_a_proto_key() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12448,8 +12209,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn domaintypes_op_meta_accessor_matches_the_stub_when_no_meta() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12480,8 +12241,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn domaintypes_preview_uses_caller_shapes_over_the_scan_and_writes_nothing() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12564,8 +12325,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_preview_meta_absent_falls_back_but_empty_previews_empty() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12632,8 +12393,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_reports_a_shape_with_an_unresolved_reference() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12668,8 +12429,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_reports_duplicate_shape_ids_and_omits_them() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12707,8 +12468,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_rejects_a_nominal_reference_to_a_table() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12751,8 +12512,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_warns_on_a_type_table_name_collision_and_prefers_the_type() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12806,8 +12567,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_validates_a_qualified_via_path_through_a_fk() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12865,8 +12626,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_derives_message_payload_from_the_model() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12914,8 +12675,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_emits_named_message_with_no_envelope() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12946,8 +12707,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_derives_worker_io_from_the_model() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -12987,8 +12748,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_model_worker_io_overrides_a_stale_manifest_projection() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -13036,8 +12797,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn domaintypes_op_unions_every_datasource() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -13089,8 +12850,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn domaintypes_op_folds_in_the_manifest_types_registry() {
         let _g = lock();
-        if workers::usable_node().is_none() && workers::find_deno().is_none() {
-            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+        if workers::usable_node().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6) installed");
             return;
         }
         let root = temp_root();
@@ -13142,7 +12903,7 @@ mod tests {
         assert!(text.contains("lines: DomainTypes[\"tax-line\"][];")); // ref + list
     }
 
-    // ── Node fallback: package.json npm deps derived from deno.json (#437) ──
+    // ── Node fallback: package.json npm deps derived from node.json (#437) ──
 
     /// The `npm:` grammar parser must mirror `node-loader.mjs` exactly: strip the
     /// scheme, split a trailing `@range` while preserving a leading `@scope`, and
@@ -13174,13 +12935,13 @@ mod tests {
         assert_eq!(npm_dep_from_import("jsr:@std/assert@^1"), None);
         assert_eq!(npm_dep_from_import("https://esm.sh/x"), None);
 
-        // Full Deno grammar: leading slash, subpaths, and an empty range must
+        // Full node.json specifier grammar: leading slash, subpaths, and an empty range must
         // reduce to the installable package coordinate (never an invalid key).
         assert_eq!(
             npm_dep_from_import("npm:/@scope/pkg"),
             Some(("@scope/pkg".into(), "*".into()))
         );
-        // `@range` precedes the subpath in Deno's grammar; the subpath is dropped.
+        // `@range` precedes the subpath; the subpath is dropped.
         assert_eq!(
             npm_dep_from_import("npm:lodash@^4/fp"),
             Some(("lodash".into(), "^4".into()))
@@ -13217,7 +12978,7 @@ mod tests {
     }
 
     /// Red/Green repro for #437: the SDK template (`throughput-stream`) mapped
-    /// `@nanobpm/nano-sdk` only in `deno.json`, leaving `package.json` depless —
+    /// `@nanobpm/nano-sdk` only in `node.json`, leaving `package.json` depless —
     /// so the Node fallback's `npm install` had nothing to fetch and the loader
     /// crashed with `ERR_MODULE_NOT_FOUND`. The scaffold must now declare it.
     #[test]
@@ -13232,7 +12993,7 @@ mod tests {
         assert_eq!(
             pkg["dependencies"]["@nanobpm/nano-sdk"].as_str(),
             Some("^1"),
-            "package.json must declare the npm: dep from deno.json so npm install materialises it"
+            "package.json must declare the npm: dep from node.json so npm install materialises it"
         );
     }
 
@@ -13456,12 +13217,12 @@ mod tests {
 
     /// off the `TEMPLATES` registry, so a new template is covered automatically).
     /// Guards *both* Node-fallback failure modes for every template:
-    ///   (a) every `npm:` import in the project `deno.json` is declared in
+    ///   (a) every `npm:` import in the project `node.json` is declared in
     ///       `package.json` (`dependencies` ∪ `devDependencies`) — the #437 crash;
     ///   (b) every import value anywhere in the project (root + `workers/*`
-    ///       `deno.json`) is Node-loader-resolvable: relative or `npm:`, never
+    ///       `node.json`) is Node-loader-resolvable: relative or `npm:`, never
     ///       `jsr:`/`http(s):` (which `node-loader.mjs` throws on); and every
-    ///       `npm:` import — including in a worker `deno.json` — is declared in
+    ///       `npm:` import — including in a worker `node.json` — is declared in
     ///       the ROOT `package.json` (workers have no own manifest and resolve
     ///       `node_modules` up-tree), so the #437 crash is guarded across workers.
     #[test]
@@ -13474,8 +13235,8 @@ mod tests {
             let dir = project_dir(&name).unwrap();
 
             // (a) package.json covers every npm: dep the root import map requires.
-            let deno_raw = std::fs::read_to_string(dir.join("deno.json"))
-                .unwrap_or_else(|e| panic!("{}: read deno.json: {e}", t.id));
+            let manifest_raw = std::fs::read_to_string(dir.join("node.json"))
+                .unwrap_or_else(|e| panic!("{}: read node.json: {e}", t.id));
             let pkg: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap())
                     .unwrap_or_else(|e| panic!("{}: package.json parses: {e}", t.id));
@@ -13484,15 +13245,15 @@ mod tests {
                     .iter()
                     .any(|b| pkg[b].get(name).map(|v| v.is_string()).unwrap_or(false))
             };
-            for (dep, _range) in npm_deps_from_deno_json(&deno_raw) {
+            for (dep, _range) in npm_deps_from_manifest(&manifest_raw) {
                 assert!(
                     declared(&dep),
-                    "{}: npm dep `{dep}` is in deno.json but missing from package.json",
+                    "{}: npm dep `{dep}` is in node.json but missing from package.json",
                     t.id
                 );
             }
 
-            // (b) every import ANYWHERE (root + `workers/*` `deno.json`) is
+            // (b) every import ANYWHERE (root + `workers/*` `node.json`) is
             // Node-fallback-safe. Workers have no own `package.json`, so a worker
             // run's `npm install` and `node_modules` resolution walk up to the
             // project ROOT — hence a worker `npm:` import must be backed by the
@@ -13502,18 +13263,18 @@ mod tests {
             //   - any `npm:` value is declared in the root `package.json` — the
             //     #437 crash, now guarded across workers, not just the root. This
             //     also cross-checks `npm_dep_from_import` against the `declared`
-            //     set derived from `npm_deps_from_deno_json` in (a).
-            let mut deno_files = vec![dir.join("deno.json")];
+            //     set derived from `npm_deps_from_manifest` in (a).
+            let mut manifest_files = vec![dir.join("node.json")];
             let workers = dir.join("workers");
             if workers.is_dir() {
                 for entry in std::fs::read_dir(&workers).unwrap().flatten() {
-                    let dj = entry.path().join("deno.json");
+                    let dj = entry.path().join("node.json");
                     if dj.is_file() {
-                        deno_files.push(dj);
+                        manifest_files.push(dj);
                     }
                 }
             }
-            for dj in deno_files {
+            for dj in manifest_files {
                 let raw = std::fs::read_to_string(&dj).unwrap();
                 let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
                 if let Some(imports) = v["imports"].as_object() {
@@ -13556,7 +13317,7 @@ mod tests {
     }
 
     /// The chokepoint heals an already-scaffolded broken project on its next
-    /// build: a project with an SDK `deno.json` but a depless `package.json`
+    /// build: a project with an SDK `node.json` but a depless `package.json`
     /// (the exact #437 state on disk) gains the missing dep via
     /// `ensure_project_sdk`, without clobbering the maker's other fields.
     #[test]
@@ -13566,7 +13327,7 @@ mod tests {
         let dir = root.join("legacy");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("deno.json"),
+            dir.join("node.json"),
             r#"{"imports":{"@nanobpm/nano-sdk":"npm:@nanobpm/nano-sdk@^1","@lib/":"./lib/"}}"#,
         )
         .unwrap();
@@ -13606,7 +13367,7 @@ mod tests {
         let dir = root.join("covered");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join("deno.json"),
+            dir.join("node.json"),
             r#"{"imports":{"bpmn-auto-layout":"npm:bpmn-auto-layout@^2"}}"#,
         )
         .unwrap();
@@ -13623,17 +13384,17 @@ mod tests {
     }
 
     /// `required_npm_deps` must mirror `node-loader.mjs`'s file lookup: an
-    /// unparseable `deno.json` falls through to a valid `deno.jsonc` (rather than
+    /// unparseable `node.json` falls through to a valid `node.jsonc` (rather than
     /// stopping at the first readable-but-broken file and dropping deps).
     #[test]
-    fn required_npm_deps_falls_through_a_broken_deno_json_to_deno_jsonc() {
+    fn required_npm_deps_falls_through_a_broken_node_json_to_node_jsonc() {
         let _g = lock();
         let root = temp_root();
         let dir = root.join("mixed");
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("deno.json"), "{ not valid json ").unwrap();
+        std::fs::write(dir.join("node.json"), "{ not valid json ").unwrap();
         std::fs::write(
-            dir.join("deno.jsonc"),
+            dir.join("node.jsonc"),
             r#"{"imports":{"@nanobpm/nano-sdk":"npm:@nanobpm/nano-sdk@^1"}}"#,
         )
         .unwrap();
@@ -13641,15 +13402,15 @@ mod tests {
         assert_eq!(
             deps.get("@nanobpm/nano-sdk").map(String::as_str),
             Some("^1"),
-            "a broken deno.json must fall through to a valid deno.jsonc"
+            "a broken node.json must fall through to a valid node.jsonc"
         );
 
-        // A valid-but-import-less deno.json STOPS the lookup (mirrors the loader's
-        // `?? {}`): it does not fall through to deno.jsonc.
-        std::fs::write(dir.join("deno.json"), r#"{"tasks":{}}"#).unwrap();
+        // A valid-but-import-less node.json STOPS the lookup (mirrors the loader's
+        // `?? {}`): it does not fall through to node.jsonc.
+        std::fs::write(dir.join("node.json"), r#"{"tasks":{}}"#).unwrap();
         assert!(
             required_npm_deps(&dir).is_empty(),
-            "a valid import-less deno.json must not fall through to deno.jsonc"
+            "a valid import-less node.json must not fall through to node.jsonc"
         );
     }
 

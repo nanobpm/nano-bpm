@@ -27,7 +27,6 @@ function ctx(over: Partial<TourContext> = {}): TourContext {
     profile: "studio",
     route: "/explorer",
     projects: [],
-    denoAvailable: true,
     nodeAvailable: true,
     templates: [],
     extensions: [],

@@ -2,8 +2,8 @@
 //
 // The repair path is the one that matters most: it is the structural fix for the
 // spike's defect of promising "hit Run to boot the engine" on a host with no
-// JavaScript runtime, using data (`denoAvailable`/`nodeAvailable`) the console
-// already had in hand.
+// JavaScript runtime, using data (`nodeAvailable`) the console already had in
+// hand.
 //
 // Node-native: `node --experimental-strip-types --test src/lib/tour/resolution.test.ts`.
 
@@ -29,7 +29,6 @@ function ctx(over: Partial<TourContext> = {}): TourContext {
     profile: "studio",
     route: "/projects",
     projects: [],
-    denoAvailable: true,
     nodeAvailable: true,
     templates: [],
     extensions: [],
@@ -55,18 +54,11 @@ function journey(over: Partial<Journey> = {}): Journey {
 
 // ── preconditions ────────────────────────────────────────────────────────────
 
-test("hasJsRuntime: ok with either runtime, repair with neither", () => {
+test("hasJsRuntime: ok with Node, repair without it", () => {
   assert.equal(hasJsRuntime.test(ctx()), "ok");
+  assert.equal(hasJsRuntime.test(ctx({ nodeAvailable: true })), "ok");
   assert.equal(
-    hasJsRuntime.test(ctx({ denoAvailable: true, nodeAvailable: false })),
-    "ok",
-  );
-  assert.equal(
-    hasJsRuntime.test(ctx({ denoAvailable: false, nodeAvailable: true })),
-    "ok",
-  );
-  assert.equal(
-    hasJsRuntime.test(ctx({ denoAvailable: false, nodeAvailable: false })),
+    hasJsRuntime.test(ctx({ nodeAvailable: false })),
     "repair",
     "with no runtime the Run step must repair into an install hint, never promise Run",
   );
@@ -128,10 +120,7 @@ test("resolveSteps: substitutes the repair step and reports it", () => {
       }),
     ],
   });
-  const r = resolveSteps(
-    j,
-    ctx({ denoAvailable: false, nodeAvailable: false }),
-  );
+  const r = resolveSteps(j, ctx({ nodeAvailable: false }));
   assert.equal(r.steps.length, 1);
   assert.equal(r.steps[0].step.id, "install-runtime");
   assert.equal(r.steps[0].repaired, "has-js-runtime");
@@ -147,10 +136,7 @@ test("resolveSteps: a repair verdict with no repair step skips instead of showin
   // Showing the original would assert exactly what the precondition just said is
   // untrue, so skipping is the safe degradation.
   const j = journey({ steps: [note("run", { precondition: hasJsRuntime })] });
-  const r = resolveSteps(
-    j,
-    ctx({ denoAvailable: false, nodeAvailable: false }),
-  );
+  const r = resolveSteps(j, ctx({ nodeAvailable: false }));
   assert.equal(r.steps.length, 0);
   assert.deepEqual(r.skipped, [
     { stepId: "run", preconditionId: "has-js-runtime" },

@@ -22,7 +22,6 @@ function ctx(over: Partial<TourContext> = {}): TourContext {
     profile: "studio",
     route: "/projects",
     projects: [],
-    denoAvailable: true,
     nodeAvailable: true,
     templates: [],
     extensions: [],
@@ -344,7 +343,7 @@ const MQTT_PILOT = {
         id: "need-a-runtime",
         kind: "note",
         title: "Install a JavaScript runtime first",
-        body: "Running an app needs Node ≥ 22.6 (the npm launcher ships one) or Deno. Until then you can still author the trigger — only starting it is unavailable.",
+        body: "Running an app needs Node ≥ 22.6 (the npm launcher ships one). Until then you can still author the trigger — only starting it is unavailable.",
       },
     },
     {
@@ -387,7 +386,7 @@ test("the real MQTT pilot tour converts into a runnable journey", () => {
     ["note", "spotlight", "handoff", "spotlight"],
   );
 
-  // The runtime-gated step carries its repair, so a host with no Node/Deno gets an
+  // The runtime-gated step carries its repair, so a host with no Node gets an
   // install hint instead of being told to press Run.
   const gated = j.steps[1];
   assert.equal(gated.precondition?.id, "has-js-runtime");

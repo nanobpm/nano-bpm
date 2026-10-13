@@ -910,31 +910,50 @@ jobs:
           path: console/test-results/
           retention-days: 7
 
-  console-deno:
-    name: console (deno typecheck + test)
+  console-ts:
+    name: console-ts (server TS typecheck + test)
     runs-on: ubuntu-24.04
     needs: changes
-    if: *code_gate
+    # Runs for any Rust `code` change (the embedded TS lives under
+    # `server/crates/nano-server-console/src/`) AND for any `console` change:
+    # the typecheck resolves its `typescript` + `@types/node` from
+    # `console/node_modules` (single source of truth, no second pin), so a
+    # console dependency bump can move this lane's type surface. Skipped
+    # otherwise, matching the other change-gated checks.
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true' || needs.changes.outputs.console == 'true' }}
     steps:
       - uses: actions/checkout@v5
-      - uses: denoland/setup-deno@v2
+      - uses: actions/setup-node@v5
         with:
-          deno-version: v2.x
+          # `node --experimental-strip-types --test` imports the `.ts` sources
+          # directly, so this job needs a Node with TypeScript type-stripping on
+          # by default (>= 23.6). Matches the console/spec-app jobs.
+          node-version: '24'
+      - name: Install console deps (typecheck + @types/node)
+        # The embedded server TS is type-checked with the console's own pinned
+        # `typescript` + `@types/node` (the one place in the repo that `npm ci`s
+        # them), so there is a single source of truth for the Node ambient
+        # surface — no second TypeScript/@types/node pin to drift.
+        working-directory: console
+        run: npm ci
       - name: Typecheck + unit-test the server console TS (ADR 0040)
-        # server/crates/nano-server-console/src/*.ts is the JS half of the console gateway — the fuse
-        # composition algebra (`resolveShapes`), the typed model-metadata accessor
-        # (`emitMeta`), and the structured Fused Domain Model emitter
-        # (`emitDomainModelJson`) — embedded into the Rust binary via `include_str!`
-        # and run under Deno/Node at runtime. The `server` job only exercises it
-        # end-to-end through slow integration tests; this gate type-checks it and
-        # runs the fast pure-function unit tests directly. `deno test` type-checks
-        # its whole import graph by default, so this also guards `domain_types.ts`
-        # (imported by the `*_test.ts` files). The materialisation entrypoint
-        # `data_cli.ts` is intentionally excluded: it imports the SDK's hyphenated
-        # emit-time filenames (`./domain-types.ts`) that only exist post-render, so
-        # it is not type-checkable in-tree and no test imports it.
-        run: deno test --allow-read --allow-write --allow-env server/crates/nano-server-console/src/
-
+        # server/crates/nano-server-console/src/*.ts is the JS half of the console
+        # gateway — the fuse composition algebra (`resolveShapes`), the typed
+        # model-metadata accessor (`emitMeta`), and the structured Fused Domain
+        # Model emitter (`emitDomainModelJson`) — embedded into the Rust binary via
+        # `include_str!` and run under Node at runtime. The `server` job only
+        # exercises it end-to-end through slow integration tests; this lane
+        # type-checks it (`tsc -p tsconfig.json`, restoring the whole-import-graph
+        # check `deno test` used to give, since type stripping erases without
+        # checking) and runs the fast pure-function unit tests directly on Node's
+        # built-in runner. The materialisation entrypoint `data_cli.ts` is
+        # intentionally excluded: it imports the SDK's hyphenated emit-time
+        # filenames (`./data-sdk.ts` / `./domain-types.ts`) that only exist
+        # post-render, so it is not type-checkable in-tree and no test imports it.
+        working-directory: server/crates/nano-server-console
+        run: |
+          ../../../console/node_modules/.bin/tsc -p tsconfig.json
+          node --experimental-strip-types --test "src/*_test.ts"
 
   engine-wasm-release-guard:
     name: engine-wasm (release drift guard)

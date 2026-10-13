@@ -1,6 +1,6 @@
 // Tests for the `data.query()` runtime pre-resolution engine (ADR 0024 §5) —
 // `node --test`. Pure logic: a fake `resolve` stands in for the datasource
-// gateway, so this runs CI-safe without a browser/Deno.
+// gateway, so this runs CI-safe without a browser or a JS runtime.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {

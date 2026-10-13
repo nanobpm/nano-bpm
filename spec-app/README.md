@@ -27,7 +27,7 @@ wire shape.
 ## The symbol index & validator (ADR 0029 + 0027 §4)
 
 Beyond the schema, this package is the **manifest library** consumed by the
-console App panels and the Deno App loader/compile gate:
+console App panels and the Node App loader/compile gate:
 
 ```ts
 import { buildSymbolIndex, validateManifest } from "@nanobpm/nano-app-schema";
@@ -52,7 +52,7 @@ returns those errors and stops; otherwise the cross-reference rules run: every i
 the manifest names (`triggers[].action.start`/`.message`, `surfaces.chat.agent`,
 `workers[].llm`, `llm[].output.decision`, `data.default`, connections) must
 resolve — within the manifest or against the symbol index. These are the same §4
-rules the three gates (console save, `deno compile`, App boot) enforce, so a
+rules the three gates (console save, the App compile, App boot) enforce, so a
 mistyped id becomes an inline marker instead of a silent runtime no-op.
 
 
@@ -83,8 +83,8 @@ these exports — the build-time guard that replaces the old runtime-only bridge
 
 ## TypeScript-only, by design
 
-The Urban App is a **Deno/TypeScript** binary, so the manifest is consumed only
-by TypeScript — the console **App panels** (authoring) and the **Deno App
+The Urban App is a **Node/TypeScript** binary, so the manifest is consumed only
+by TypeScript — the console **App panels** (authoring) and the **Node App
 loader** (running). It is *not* read by the Rust server, which handles project
 files as opaque bytes (ADR 0027 §1). So this schema generates **TypeScript**
 types only; there is no Rust emitter.

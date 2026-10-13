@@ -296,7 +296,7 @@ The loop is identical; only *where instances run* changes:
   cost. Fast, deterministic, zero orchestration, CI-friendly. **This is the MVP
   backend** — it isolates the *algorithm* from infrastructure noise, so we can prove
   "can we find better candidates?" cheaply and repeatably.
-- **`ClusterRunner` (real Nano engine(s) + embedded Deno workers)** — runs the same
+- **`ClusterRunner` (real Nano engine(s) + embedded Node workers)** — runs the same
   scenario on actual gateways for realistic latency/throughput. It doubles as a
   **Nano stress test** and as the **demo** that shows the live data ProcessOS reasons
   over. (Reuses the existing perf-matrix-style load path.)
@@ -315,7 +315,7 @@ The MVP builds the synthetic `SimRunner` path; the live path is already half-bui
 | **M0** | `Scenario` schema + `SimRunner` (engine-core native, seeded mock workers, virtual clock) collecting `(output, latency, cost)` → base dataset | deterministic capture + cost/latency modelling work | ✅ done |
 | **M1** | **Baked** candidate generator (enumerate latent worker-swaps) + BPMN validate + evaluate-all + **ranking** (incl. golden-as-candidate + distance-to-golden) | the measurement + ranking rig is correct end-to-end, *no LLM yet* | ✅ done |
 | **M2** | The **LLM hypothesis** step: the model proposes candidates (worker-swaps and optional structural BPMN rewrites), which are validated then run through the same SimRunner + ranking | the search method can discover improvements/the golden | ✅ done |
-| **M3** | `ClusterRunner` (real Nano + Deno workers) for scale/latency realism, Nano stress-test, demo; wire the **production** (live-source, generation-skipped) path | realism, stress, and the production loop | ⏳ next |
+| **M3** | `ClusterRunner` (real Nano + Node workers) for scale/latency realism, Nano stress-test, demo; wire the **production** (live-source, generation-skipped) path | realism, stress, and the production loop | ⏳ next |
 
 **Start at M0+M1.** They need no cluster orchestration and no LLM, embed the real
 engine for trustworthy numbers, and directly answer the core question. Only once the

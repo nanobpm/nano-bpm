@@ -1,14 +1,15 @@
 //! Worker supervisor for the console.
 //!
-//! Runs each enabled worker as a sandboxed **Deno** subprocess (one process per
-//! worker), independent of any browser. The worker code (`workers/<name>/worker.ts`)
+//! Runs each enabled worker as a **Node** subprocess (one process per worker),
+//! independent of any browser. The worker code (`workers/<name>/worker.ts`)
 //! imports the embedded SDK (`nano-generated/worker-sdk.ts`), which speaks the
 //! falcon protocol and prints structured metric/status lines that this
 //! supervisor parses. Everything here is feature-gated behind `console`; the
-//! base gateway build never spawns Deno and does not require it on PATH.
+//! base gateway build never spawns Node and does not require it on PATH.
 //!
-//! Deno is **optional**: if it is not installed, the Workers tab still authors
-//! code but `start` reports the runtime as unavailable.
+//! Node (>= 22.6) is the sole JS/TS runtime (ADR 0065 removed Deno). If it is
+//! too old or absent, the Workers tab still authors code but `start` reports the
+//! runtime as unavailable.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -27,11 +28,10 @@ use super::workspace;
 /// worker code can import it. Kept in sync with the binary on every supervisor
 /// init (overwritten), so upgrading the server upgrades the SDK.
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
-/// Node fallback runtime loader + bootstrap (ADR 0036), materialised beside the
-/// SDK so `deno.json` import maps resolve under Node when no Deno build exists.
+/// Node runtime loader + bootstrap, materialised beside the SDK so the
+/// project's import-map manifest resolves under Node.
 const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
 const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
-const NODE_DENO_SHIM_MJS: &str = include_str!("node_deno_shim.mjs");
 
 /// Control-line prefixes emitted by the SDK on stdout (see `worker_sdk.ts`).
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
@@ -194,16 +194,15 @@ fn ensure_sdk_written() -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(dir.join("node-register.mjs"), NODE_REGISTER_MJS)?;
-    std::fs::write(dir.join("node-deno-shim.mjs"), NODE_DENO_SHIM_MJS)?;
     std::fs::write(workspace::sdk_path(), WORKER_SDK_TS)
 }
 
-/// Backfills the `@lib/` import-map alias into a worker's `deno.json` so workers
+/// Backfills the `@lib/` import-map alias into a worker's `node.json` so workers
 /// scaffolded before shared-library support can still `import "@lib/…"`. Only
 /// adds the missing alias; never disturbs other user-defined imports. Best
-/// effort — a malformed or missing `deno.json` is left untouched.
+/// effort — a malformed or missing `node.json` is left untouched.
 fn ensure_lib_alias(dir: &std::path::Path) {
-    let path = dir.join("deno.json");
+    let path = dir.join("node.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
@@ -225,36 +224,9 @@ fn ensure_lib_alias(dir: &std::path::Path) {
     }
 }
 
-/// Locates the Deno binary: `NANOBPMN_DENO_BIN`, then `PATH`, then `~/.deno/bin`.
-pub(crate) fn find_deno() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NANOBPMN_DENO_BIN")
-        && !p.is_empty()
-    {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let cand = dir.join("deno");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let cand = PathBuf::from(home).join(".deno").join("bin").join("deno");
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
-}
-
 /// Minimum Node that can run workers: `--experimental-strip-types` (TS erasure)
 /// landed in 22.6; `node:sqlite` (22.5) and a global `WebSocket` (22.4) are
-/// older still, so 22.6 is the effective floor. See ADR 0036.
+/// older still, so 22.6 is the effective floor.
 const NODE_MIN: (u32, u32) = (22, 6);
 
 /// Locates a Node binary for the worker fallback runtime: `NANOBPMN_NODE_BIN`
@@ -312,14 +284,8 @@ pub(crate) fn usable_node() -> Option<PathBuf> {
 }
 
 impl WorkerSupervisor {
-    /// Whether a Deno runtime is available. Node-first (ADR 0038): Deno is
-    /// needed only for `deno compile`; workers run on Node.
-    pub fn deno_available(&self) -> bool {
-        find_deno().is_some()
-    }
-
-    /// Whether a usable Node (>= 22.6) runtime is available — the primary
-    /// runtime for running workers. See ADR 0038.
+    /// Whether a usable Node (>= 22.6) runtime is available — the sole runtime
+    /// for running workers (ADR 0065 removed Deno).
     pub fn node_available(&self) -> bool {
         usable_node().is_some()
     }
@@ -356,21 +322,11 @@ impl WorkerSupervisor {
         if !dir.is_dir() {
             return Err("no such worker".into());
         }
-        // Node-first: Node (>= 22.6) is the runtime the npm launcher always
-        // provides, so it is the primary path. Deno is preferred only when a
-        // project needs `deno compile`; for Run it is an equal alternative and
-        // no longer required. See ADR 0038 (Node-first) / 0036.
-        enum WorkerRuntime {
-            Deno(PathBuf),
-            Node(PathBuf),
-        }
-        let runtime = if let Some(n) = usable_node() {
-            WorkerRuntime::Node(n)
-        } else if let Some(d) = find_deno() {
-            WorkerRuntime::Deno(d)
-        } else {
+        // Node (>= 22.6) is the sole runtime — the npm launcher always provides
+        // one (ADR 0065 removed Deno).
+        let Some(node) = usable_node() else {
             return Err("No JavaScript runtime found to run workers. Install Node \
-                 >= 22.6 (the npm launcher provides one), or Deno (https://deno.com)."
+                 >= 22.6 (the npm launcher provides one)."
                 .to_string());
         };
 
@@ -393,41 +349,18 @@ impl WorkerSupervisor {
         if !entrypoint.is_file() {
             return Err("worker has no worker.ts entrypoint".into());
         }
-        let cache = workspace::deno_cache_dir();
-        let _ = std::fs::create_dir_all(&cache);
-        let ws_root = workspace::workspace_dir();
         let port = self.gateway_port.load(Ordering::Relaxed);
         let base_url = format!("http://127.0.0.1:{port}");
 
-        let mut cmd;
-        let runtime_label;
-        match &runtime {
-            WorkerRuntime::Deno(deno) => {
-                runtime_label = "deno";
-                cmd = Command::new(deno);
-                cmd.current_dir(&dir)
-                    .arg("run")
-                    .arg("--no-prompt")
-                    .arg("--allow-net")
-                    .arg(format!("--allow-read={}", ws_root.display()))
-                    .arg(format!("--allow-write={}", cache.display()))
-                    .arg("--allow-env")
-                    .arg("worker.ts")
-                    .env("DENO_DIR", &cache);
-            }
-            WorkerRuntime::Node(node) => {
-                // Node fallback: strip TS types + register the import-map loader
-                // (materialised beside the SDK). `node:sqlite`/WebSocket are built in.
-                runtime_label = "node";
-                cmd = Command::new(node);
-                cmd.current_dir(&dir);
-                super::projects::node_fallback_command(
-                    &mut cmd,
-                    &workspace::sdk_dir().join("node-register.mjs"),
-                );
-                cmd.arg("worker.ts");
-            }
-        }
+        // Strip TS types + register the import-map loader (materialised beside the
+        // SDK). `node:sqlite`/WebSocket are built in.
+        let mut cmd = Command::new(node);
+        cmd.current_dir(&dir);
+        super::projects::node_fallback_command(
+            &mut cmd,
+            &workspace::sdk_dir().join("node-register.mjs"),
+        );
+        cmd.arg("worker.ts");
         cmd.env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
             .env("NANOBPMN_WORKER_NAME", name)
@@ -438,7 +371,7 @@ impl WorkerSupervisor {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn {runtime_label}: {e}"))?;
+            .map_err(|e| format!("failed to spawn node: {e}"))?;
 
         let pid = child.id().unwrap_or(0);
         inner.pid.store(pid, Ordering::Relaxed);
@@ -488,10 +421,10 @@ impl WorkerSupervisor {
                 }
             });
         }
-        // stderr reader: log lines. Deno writes informational progress
-        // (`Download`, `Check`, ...) to stderr too, so these are surfaced as
-        // logs but NOT recorded as `last_error`; genuine errors come from the
-        // SDK's status/metric lines and the process exit code.
+        // stderr reader: log lines. Node writes informational warnings to
+        // stderr too, so these are surfaced as logs but NOT recorded as
+        // `last_error`; genuine errors come from the SDK's status/metric lines
+        // and the process exit code.
         if let Some(stderr) = child.stderr.take() {
             let inner = inner.clone();
             tokio::spawn(async move {

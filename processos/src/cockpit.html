@@ -419,7 +419,7 @@
   .pylink { color: var(--po-accent-strong); cursor: pointer; text-decoration: underline; }
   .btn.warn { background: var(--po-danger-wash); border: 1px solid var(--po-danger-edge); color: var(--po-danger-soft); }
   .btn.warn:hover { background: var(--po-danger-edge); }
-  /* Missing-dependency banner (Deno / llama-server preflight). */
+  /* Missing-dependency banner (Node / llama-server preflight). */
   #depBanner { display: flex; flex-direction: column; gap: 8px; }
   #depBanner:not(:empty) { margin: 12px 18px 0; }
   .dep-warn { display: flex; align-items: flex-start; gap: 10px; background: var(--po-warn-wash); border: 1px solid var(--po-warn-edge); border-radius: 10px; padding: 10px 12px; color: var(--po-warn-soft); font-size: 13px; line-height: 1.5; }
@@ -1076,7 +1076,7 @@ function startLlamaDotPoll(){
   LLAMA_DOT_TIMER = setInterval(refreshLlamaDot, 4000);
 }
 
-// External-tool preflight banner. ProcessOS shells out to Deno (embedded Nano
+// External-tool preflight banner. ProcessOS shells out to Node (embedded Nano
 // workers) and llama.cpp's llama-server (local LLM sidecars); when either is
 // missing we surface a clear, dismissible banner naming the tool, why it's
 // needed, and a link to OS-aware install instructions — rather than letting it

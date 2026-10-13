@@ -290,7 +290,7 @@ from the internet).
 | **Metrics** | both | A live performance dashboard — process starts/s, jobs/s, active processes, connected clients, commit-pipeline depth, journal/fsync timings, memory — with sparklines, and a per-node breakdown in a cluster. |
 | **Explorer** | both | A live process-instance explorer — variables, jobs, incidents, and the BPMN XML for each running or completed instance. |
 | **Traces** | both | **Execution traces** folded from the engine event stream — a per-instance timeline of elements visited, jobs created/completed, and variable snapshots. |
-| **Workers** | both | Author TypeScript job workers in the browser, run them as sandboxed Deno processes, watch a live fleet view, and export them as a standalone app. See [Write and run job workers](#write-and-run-job-workers). |
+| **Workers** | both | Author TypeScript job workers in the browser, run them as Node processes, watch a live fleet view, and export them as a standalone app. See [Write and run job workers](#write-and-run-job-workers). |
 
 (Two more views, **Config** and **Credits**, are reachable by route but are not on
 the navigation rail.)
@@ -334,13 +334,13 @@ To run a test and inspect what happened:
 
 A *worker* is the code that performs a process's service tasks. The **Workers**
 tab lets you author them in TypeScript right in the browser and run them as
-sandboxed **Deno** subprocesses, with a live fleet view (status, throughput,
+**Node** subprocesses, with a live fleet view (status, throughput,
 completed/failed, uptime, restarts) and streamed logs.
 
-> **Running workers needs [Deno](https://deno.com) installed** on the host (the
-> `deno` binary on `PATH`, or pointed to by `NANOBPMN_DENO_BIN`). Without it you
-> can still author and export worker code; only *starting* a worker is
-> unavailable. Install Deno from <https://deno.com>.
+> **Running workers needs [Node](https://nodejs.org) ≥ 22.6 installed** on the host
+> (the `node` binary on `PATH`, or pointed to by `NANOBPMN_NODE_BIN`). Without it
+> you can still author and export worker code; only *starting* a worker is
+> unavailable. Install Node from <https://nodejs.org>.
 
 A worker is a directory with a `worker.ts` that declares a handler:
 
@@ -393,22 +393,23 @@ Workers don't have to run inside the console. From the **Workers** tab, click
 shipping a worker fleet to another machine or running it outside Nano.
 
 The downloaded `nano-workers-app.zip` unpacks to a project with a `main.ts`
-entrypoint, a `deno.json` (import map + `deno task start`), a `README.md`, the
+entrypoint, a `node.json` (import map + `npm start`), a `README.md`, the
 worker SDK, each selected worker's source, and a `resources/` folder.
 
 On startup the app **deploys every `.bpmn` file in `resources/`** to the target
 engine, then runs the bundled workers. Drop your own models into `resources/`
-before starting. Run it with Deno:
+before starting. Run it with Node:
 
 ```bash
 cd nano-workers-app
 # Point at your Nano gateway (defaults to http://127.0.0.1:8080):
 export NANOBPMN_BASE_URL=http://127.0.0.1:8080
-deno task start            # runs with --allow-net --allow-read --allow-env
+npm install
+npm start                  # node --experimental-strip-types main.ts
 ```
 
 **Dependencies travel with the app.** The exporter scans the selected workers'
-imports and writes a dependency manifest into the app's `deno.json`, so a worker
+imports and writes a dependency manifest into the app's `node.json`, so a worker
 that imports `lodash` or `@camunda8/orchestration-cluster-api` works out of the
 box — no manual dependency wrangling.
 
@@ -677,10 +678,10 @@ reconstruct state exactly.
 
 ## Troubleshooting
 
-**"Running workers requires Deno" / a worker won't start.** Install
-[Deno](https://deno.com) so the `deno` binary is on `PATH`, or set
-`NANOBPMN_DENO_BIN` to its full path, then reload the Workers tab. You can author
-and export workers without Deno; only running them needs it.
+**"Running workers requires Node" / a worker won't start.** Install
+[Node](https://nodejs.org) so the `node` binary is on `PATH`, or set
+`NANOBPMN_NODE_BIN` to its full path, then reload the Workers tab. You can author
+and export workers without Node; only running them needs it.
 
 **Everything was lost after a restart.** The server runs in-memory unless you set
 `NANOBPMN_DATA_DIR` (or use `c8ctl nano`, which configures persistence for you).

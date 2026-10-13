@@ -4,8 +4,8 @@
 // own APIs — `AppJobHandler`, `OperationHandler`, `runFromEnv`, `selectHost`,
 // `createNanoSdkEngineClient`, `UrbanApp`, `AppApi`, the engine client, etc.
 //
-// This mirrors the offline-embedded model of worker_sdk.ts / the Deno namespace
-// types: no network, no node_modules read — the gateway stays self-contained.
+// This mirrors the offline-embedded model of worker_sdk.ts: no network, no
+// node_modules read — the gateway stays self-contained.
 //
 // Provenance: @nanobpm/urban@0.38.0, dist/runtime/index.d.ts rolled up with
 // rollup-plugin-dts (respectExternal:true, inlining @nanobpm/nano-sdk +

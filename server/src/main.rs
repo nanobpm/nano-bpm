@@ -23262,7 +23262,6 @@ const CONSOLE_AUTHORING_PREFIXES: &[&str] = &[
     "/console/api/lib",
     "/console/api/extensions",
     "/console/api/worker-sdk",
-    "/console/api/deno-types",
     "/console/api/urban-types",
     "/console/api/config/ide",
 ];
@@ -23365,7 +23364,6 @@ mod console_observe_guard_tests {
             "/console/api/extensions",
             "/console/api/extensions/marketplace",
             "/console/api/worker-sdk",
-            "/console/api/deno-types",
             "/console/api/urban-types",
             "/console/api/urban-types/index.d.ts",
             "/console/api/config/ide",
@@ -24841,7 +24839,7 @@ async fn main() {
         tracing::info!("DEBUG_REST enabled: logging every REST request and response");
     }
 
-    // CORS: the gateway is often addressed cross-origin (Nano IDE Deno GUI on
+    // CORS: the gateway is often addressed cross-origin (Nano IDE GUI on
     // its own port, vite dev at :5173, a hosted console). The REST /v2 surface
     // is a *dev-target* API — the same-origin restriction browsers apply by
     // default is more friction than protection here (the alternative is asking
@@ -25687,7 +25685,7 @@ async fn main() {
     }
 
     // Tell the console worker supervisor which port to dial for the command
-    // stream when it spawns Deno worker subprocesses.
+    // stream when it spawns worker subprocesses.
     #[cfg(feature = "console")]
     nano_server_console::workers::set_gateway_port(local_port);
 

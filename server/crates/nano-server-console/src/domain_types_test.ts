@@ -1,15 +1,23 @@
-// Deno unit tests for the Urban domain-type reifier (ADR 0029 §4.1) and the Fused
+// Node unit tests for the Urban domain-type reifier (ADR 0029 §4.1) and the Fused
 // Domain Model emitters (ADR 0040 §1/§5).
 //
-// Run in CI by the `console-deno` job (`deno test` type-checks its whole import
-// graph, so this also type-checks domain_types.ts), and locally with:
-//   deno test --allow-read --allow-write --allow-env server/src/console/
+// Run in CI by the `console-ts` job, and locally with:
+//   node --experimental-strip-types --test server/crates/nano-server-console/src/
 //
 // They cover the SQLite-affinity → TS mapping, interface-name sanitising, the
 // `domain-rows.d.ts` emitter, a full schema() → emit → write roundtrip against a
 // temp manifest + SQLite db, and the model-metadata / domain.json fuse emitters.
 
-import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
+import { test } from "node:test";
+import {
+  assertEquals,
+  assertStringIncludes,
+  makeTempDir,
+  mkdir,
+  readTextFile,
+  remove,
+  writeTextFile,
+} from "./test_support.ts";
 import type { TableMeta } from "./data_sdk.ts";
 import type { ShapeDecl } from "./domain_types.ts";
 import {
@@ -32,7 +40,7 @@ import {
   WORKER_BINDINGS_TS,
 } from "./domain_types.ts";
 
-Deno.test("sqliteAffinityToTs applies affinity rules + Urban overrides", () => {
+test("sqliteAffinityToTs applies affinity rules + Urban overrides", () => {
   assertEquals(sqliteAffinityToTs("INTEGER"), "number");
   assertEquals(sqliteAffinityToTs("BIGINT"), "number");
   assertEquals(sqliteAffinityToTs("TEXT"), "string");
@@ -48,13 +56,13 @@ Deno.test("sqliteAffinityToTs applies affinity rules + Urban overrides", () => {
   assertEquals(sqliteAffinityToTs("DATE"), "string");
 });
 
-Deno.test("interfaceName PascalCases and sanitises to an identifier", () => {
+test("interfaceName PascalCases and sanitises to an identifier", () => {
   assertEquals(interfaceName("customers"), "Customers");
   assertEquals(interfaceName("order_items"), "OrderItems");
   assertEquals(interfaceName("2fa-tokens"), "T_2faTokens");
 });
 
-Deno.test("emitDomainDts renders interfaces + a DomainTables map", () => {
+test("emitDomainDts renders interfaces + a DomainTables map", () => {
   const tables: TableMeta[] = [
     {
       name: "customers",
@@ -77,7 +85,7 @@ Deno.test("emitDomainDts renders interfaces + a DomainTables map", () => {
   assertStringIncludes(dts, '"customers": Customers;');
 });
 
-Deno.test("emitDomainDts quotes non-identifier column names", () => {
+test("emitDomainDts quotes non-identifier column names", () => {
   const dts = emitDomainDts([
     {
       name: "t",
@@ -88,11 +96,11 @@ Deno.test("emitDomainDts quotes non-identifier column names", () => {
   assertStringIncludes(dts, '"first name": string;');
 });
 
-Deno.test("emitDomainDts handles an empty schema", () => {
+test("emitDomainDts handles an empty schema", () => {
   assertStringIncludes(emitDomainDts([]), "export interface DomainTables {}");
 });
 
-Deno.test("emitDomainDtsForSources is byte-identical to emitDomainDts for one source", () => {
+test("emitDomainDtsForSources is byte-identical to emitDomainDts for one source", () => {
   const tables: TableMeta[] = [{
     name: "customers",
     indexes: [], foreignKeys: [],
@@ -109,7 +117,7 @@ Deno.test("emitDomainDtsForSources is byte-identical to emitDomainDts for one so
   assertEquals(emitDomainDtsForSources([], "app"), emitDomainDts([]));
 });
 
-Deno.test("emitDomainDtsForSources unions sources + resolves name collisions", () => {
+test("emitDomainDtsForSources unions sources + resolves name collisions", () => {
   const customers: TableMeta[] = [{
     name: "customers",
     indexes: [], foreignKeys: [],
@@ -137,7 +145,7 @@ Deno.test("emitDomainDtsForSources unions sources + resolves name collisions", (
   assertStringIncludes(dts, 'export type DomainTables = DomainSources["analytics"];');
 });
 
-Deno.test("emitDomainDtsForSources emits an empty object for a source with no tables", () => {
+test("emitDomainDtsForSources emits an empty object for a source with no tables", () => {
   const dts = emitDomainDtsForSources(
     [
       { source: "app", tables: [{ name: "t", indexes: [], foreignKeys: [], columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }] }] },
@@ -157,7 +165,7 @@ Deno.test("emitDomainDtsForSources emits an empty object for a source with no ta
   assertStringIncludes(dts2, 'export type DomainTables = DomainSources["a"];');
 });
 
-Deno.test("emitDomainTypeRegistry renders declared types with refs, optional + list", () => {
+test("emitDomainTypeRegistry renders declared types with refs, optional + list", () => {
   const dts = emitDomainTypeRegistry({
     taxLine: { fields: { amount: { type: "number" }, note: { type: "string", optional: true } } },
     taxSubmission: {
@@ -183,11 +191,11 @@ Deno.test("emitDomainTypeRegistry renders declared types with refs, optional + l
   assertStringIncludes(dts, "ref: unknown;"); // unresolved ref degrades
 });
 
-Deno.test("emitDomainTypeRegistry is empty for an empty registry", () => {
+test("emitDomainTypeRegistry is empty for an empty registry", () => {
   assertEquals(emitDomainTypeRegistry({}), "");
 });
 
-Deno.test("emitDomainModel appends the registry to the table spine", () => {
+test("emitDomainModel appends the registry to the table spine", () => {
   const tables: TableMeta[] = [{
     name: "customers",
     indexes: [], foreignKeys: [],
@@ -209,16 +217,16 @@ Deno.test("emitDomainModel appends the registry to the table spine", () => {
   assertStringIncludes(full, '"note": {');
 });
 
-Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () => {
-  const root = await Deno.makeTempDir();
-  await Deno.writeTextFile(
+test("schema() → emit → write roundtrip (the CLI op's path)", async () => {
+  const root = await makeTempDir();
+  await writeTextFile(
     `${root}/nano.app.json`,
     JSON.stringify({
       data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
     }),
   );
   const cwd = `${root}/workers/gen`;
-  await Deno.mkdir(cwd, { recursive: true });
+  await mkdir(cwd, { recursive: true });
 
   const { openDataSource } = await import("./data_sdk.ts");
   const db = await openDataSource("app", { cwd });
@@ -231,12 +239,12 @@ Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () 
   // Mirror the data-cli `domaintypes` op: emit from schema() and write.
   const text = emitDomainDts(tables);
   const outDir = `${root}/nano-generated`;
-  await Deno.mkdir(outDir, { recursive: true });
+  await mkdir(outDir, { recursive: true });
   const path = `${outDir}/${DOMAIN_DTS}`;
-  await Deno.writeTextFile(path, text);
+  await writeTextFile(path, text);
 
   assertEquals(tables.length, 1);
-  const written = await Deno.readTextFile(path);
+  const written = await readTextFile(path);
   assertEquals(written, text);
   assertStringIncludes(written, "export interface Customers {");
   assertStringIncludes(written, "id: number;");
@@ -244,10 +252,10 @@ Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () 
   assertStringIncludes(written, "credit: number | null;");
   assertStringIncludes(written, '"customers": Customers;');
 
-  await Deno.remove(root, { recursive: true });
+  await remove(root);
 });
 
-Deno.test("emitDomainBindings renders openDomain with a typed Table per table", () => {
+test("emitDomainBindings renders openDomain with a typed Table per table", () => {
   const tables: TableMeta[] = [
     {
       name: "orders",
@@ -262,7 +270,7 @@ Deno.test("emitDomainBindings renders openDomain with a typed Table per table", 
   ];
   const out = emitDomainBindings([{ source: "app", tables }], "app");
   // Imports only the sibling SDK (relative) + a type-only domain-rows.d.ts — no
-  // jsr:/https: so it survives the Node fallback loader (ADR 0036).
+  // jsr:/https: so it survives the Node loader (ADR 0065).
   assertStringIncludes(out, 'import { openDataSource, type DataSource, type Table } from "./data-sdk.ts";');
   assertStringIncludes(out, `import type { Orders } from "./${DOMAIN_DTS}";`);
   assertStringIncludes(out, "export interface Domain {");
@@ -275,7 +283,7 @@ Deno.test("emitDomainBindings renders openDomain with a typed Table per table", 
   assertEquals(DOMAIN_BINDINGS, "domain.ts");
 });
 
-Deno.test("emitDomainBindings drops reserved-named tables (raw/close) from the typed surface", () => {
+test("emitDomainBindings drops reserved-named tables (raw/close) from the typed surface", () => {
   const tables: TableMeta[] = [
     {
       name: "raw",
@@ -329,7 +337,7 @@ Deno.test("emitDomainBindings drops reserved-named tables (raw/close) from the t
   assertStringIncludes(multi, 'as K extends "raw" | "close" ? never : K');
 });
 
-Deno.test("emitDomainBindings uses the first declared PK (not always id)", () => {
+test("emitDomainBindings uses the first declared PK (not always id)", () => {
   const tables: TableMeta[] = [
     {
       name: "sessions",
@@ -345,7 +353,7 @@ Deno.test("emitDomainBindings uses the first declared PK (not always id)", () =>
   assertStringIncludes(out, 'sessions: raw.table<Sessions>("sessions", "token"),');
 });
 
-Deno.test("emitDomainBindings handles an empty schema (raw-only Domain)", () => {
+test("emitDomainBindings handles an empty schema (raw-only Domain)", () => {
   const out = emitDomainBindings([{ source: "app", tables: [] }], "app");
   assertStringIncludes(out, "export interface Domain {");
   assertStringIncludes(out, "readonly raw: DataSource;");
@@ -355,7 +363,7 @@ Deno.test("emitDomainBindings handles an empty schema (raw-only Domain)", () => 
   assertEquals(out.includes("raw.table<"), false);
 });
 
-Deno.test("emitDomainBindings emits a keyed openDomain<K> for multiple datasources", () => {
+test("emitDomainBindings emits a keyed openDomain<K> for multiple datasources", () => {
   const appTables: TableMeta[] = [
     {
       name: "orders",
@@ -398,9 +406,9 @@ Deno.test("emitDomainBindings emits a keyed openDomain<K> for multiple datasourc
   assertEquals(out.includes("export interface Domain {"), false);
 });
 
-Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () => {
-  const root = await Deno.makeTempDir();
-  await Deno.writeTextFile(
+test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () => {
+  const root = await makeTempDir();
+  await writeTextFile(
     `${root}/nano.app.json`,
     JSON.stringify({
       data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
@@ -439,7 +447,7 @@ Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () =>
     assertEquals(await orders.get(id), undefined);
   } finally {
     db.close();
-    await Deno.remove(root, { recursive: true });
+    await remove(root);
   }
 });
 
@@ -447,7 +455,7 @@ Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () =>
 // an interface (unlike an inline type literal) has no implicit string index
 // signature — so it is NOT assignable to `Record<string, unknown>`. The Table
 // bound must therefore be `T extends object` (ADR 0029 §6.1), or every worker
-// that imports the reified `domain.ts` fails `deno check` with TS2344. This test
+// that imports the reified `domain.ts` fails a TypeScript check with TS2344. This test
 // passes an `interface` through `db.table<T>()`, so the harness's own type-check
 // is the guard (a regression to `T extends Row` would fail to compile here).
 interface RegOrderRow {
@@ -457,9 +465,9 @@ interface RegOrderRow {
   status: string | null;
 }
 
-Deno.test("Table<T> accepts an interface row type (ADR 0029 §6.1 — the domain-rows.d.ts shape)", async () => {
-  const root = await Deno.makeTempDir();
-  await Deno.writeTextFile(
+test("Table<T> accepts an interface row type (ADR 0029 §6.1 — the domain-rows.d.ts shape)", async () => {
+  const root = await makeTempDir();
+  await writeTextFile(
     `${root}/nano.app.json`,
     JSON.stringify({
       data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
@@ -481,11 +489,11 @@ Deno.test("Table<T> accepts an interface row type (ADR 0029 §6.1 — the domain
     assertEquals(await orders.count({ item: "Widget" }), 1);
   } finally {
     db.close();
-    await Deno.remove(root, { recursive: true });
+    await remove(root);
   }
 });
 
-Deno.test("emitWorkerBindings maps taskType → declared input/output types (ADR 0033 §3)", () => {
+test("emitWorkerBindings maps taskType → declared input/output types (ADR 0033 §3)", () => {
   const out = emitWorkerBindings(
     [
       { taskType: "save-order", inputType: "orderRequest", outputType: "savedOrder" },
@@ -514,7 +522,7 @@ Deno.test("emitWorkerBindings maps taskType → declared input/output types (ADR
   assertEquals(out.split(`"review-order": DomainTypes`).length, 2);
 });
 
-Deno.test("emitWorkerBindings maps header keys → typed customHeaders shape (ADR 0033 §3)", () => {
+test("emitWorkerBindings maps header keys → typed customHeaders shape (ADR 0033 §3)", () => {
   const out = emitWorkerBindings(
     [
       { taskType: "charge", headerKeys: ["region", "priority"] },
@@ -539,7 +547,7 @@ Deno.test("emitWorkerBindings maps header keys → typed customHeaders shape (AD
   assertEquals(out.includes('"noop": {'), false);
 });
 
-Deno.test("emitWorkerBindings with no declared worker types is a valid empty map", () => {
+test("emitWorkerBindings with no declared worker types is a valid empty map", () => {
   const out = emitWorkerBindings([{ taskType: "noop" }], []);
   assertStringIncludes(out, "export interface WorkerInputs {}");
   assertStringIncludes(out, "export interface WorkerOutputs {}");
@@ -552,19 +560,19 @@ Deno.test("emitWorkerBindings with no declared worker types is a valid empty map
   assertEquals(out.includes("import type { DomainTypes }"), false);
 });
 
-Deno.test("emitWorkerBindings with no workers at all yields a permissive WorkerTaskType", () => {
+test("emitWorkerBindings with no workers at all yields a permissive WorkerTaskType", () => {
   const out = emitWorkerBindings([], []);
   assertStringIncludes(out, "export type WorkerTaskType = string;");
 });
 
-Deno.test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrapper", () => {
+test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrapper", () => {
   const out = emitWorkerBindingsRuntime();
   assertStringIncludes(out, `export * from "./worker-sdk.ts";`);
   assertStringIncludes(out, `import type { WorkerInputs, WorkerOutputs, WorkerHeaders, WorkerTaskType, WorkerVars, WorkerHdrs } from "./${WORKER_BINDINGS_DTS}";`);
   assertStringIncludes(out, "export function defineWorker<K extends WorkerTaskType>(");
   assertStringIncludes(out, "opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object, HdrFor<K> & object>,");
   assertStringIncludes(out, "type HdrFor<K extends WorkerTaskType> = K extends keyof WorkerHeaders ? WorkerHeaders[K] : WorkerHdrs;");
-  // Node strip-only safety (ADR 0036): no TS parameter properties/enums.
+  // Node strip-only safety (ADR 0065): no TS parameter properties/enums.
   assertEquals(out.includes("constructor(private"), false);
   assertEquals(out.includes("enum "), false);
   // File basenames are stable.
@@ -574,7 +582,7 @@ Deno.test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrap
 
 // --- model-level metadata: foldMeta / emitMeta (ADR 0040 §5) -----------------
 
-Deno.test("foldMeta is last-wins over duplicate keys and skips empty keys", () => {
+test("foldMeta is last-wins over duplicate keys and skips empty keys", () => {
   const folded = foldMeta([
     { key: "owner", value: "ops" },
     { key: "owner", value: "sre" }, // later declaration wins
@@ -586,7 +594,7 @@ Deno.test("foldMeta is last-wins over duplicate keys and skips empty keys", () =
   assertEquals(Object.keys(folded).sort(), ["owner", "region"]);
 });
 
-Deno.test("foldMeta uses a null-prototype dict so a __proto__ key round-trips", () => {
+test("foldMeta uses a null-prototype dict so a __proto__ key round-trips", () => {
   const folded = foldMeta([{ key: "__proto__", value: "polluted" }]);
   // A plain `{}` would route this through Object.prototype's setter and create no
   // own property; the null-proto dict makes it a real, enumerable own key.
@@ -597,7 +605,7 @@ Deno.test("foldMeta uses a null-prototype dict so a __proto__ key round-trips", 
   assertEquals(folded["toString"] as unknown, undefined);
 });
 
-Deno.test("emitMeta builds the AppMeta interface + a null-prototype accessor dict", () => {
+test("emitMeta builds the AppMeta interface + a null-prototype accessor dict", () => {
   const out = emitMeta([
     { key: "classification", value: "internal" },
     { key: "owner", value: "sre" },
@@ -608,17 +616,17 @@ Deno.test("emitMeta builds the AppMeta interface + a null-prototype accessor dic
   assertStringIncludes(out, "const m: Record<string, string> = Object.create(null);");
   assertStringIncludes(out, `m["classification"] = "internal";`);
   assertStringIncludes(out, `m["owner"] = "sre";`);
-  // Node strip-only safety (ADR 0036): no enums, plain JS + erased annotations.
+  // Node strip-only safety (ADR 0065): no enums, plain JS + erased annotations.
   assertEquals(out.includes("enum "), false);
 });
 
-Deno.test("emitMeta emits an empty null-prototype accessor when no metadata is declared", () => {
+test("emitMeta emits an empty null-prototype accessor when no metadata is declared", () => {
   const out = emitMeta([]);
   assertStringIncludes(out, "export interface AppMeta {}");
   assertStringIncludes(out, "export const appMeta: AppMeta = Object.create(null) as AppMeta;");
 });
 
-Deno.test("emitMeta assigns a user-authored __proto__ key by bracket notation, not bare", () => {
+test("emitMeta assigns a user-authored __proto__ key by bracket notation, not bare", () => {
   const out = emitMeta([{ key: "__proto__", value: "polluted" }]);
   // Bracket assignment on the null-proto dict makes __proto__ an own data property;
   // a bare `__proto__: "…"` in an object literal would instead set the prototype.
@@ -628,7 +636,7 @@ Deno.test("emitMeta assigns a user-authored __proto__ key by bracket notation, n
 
 // --- the structured fused domain model: domain.json (ADR 0040 §1) ------------
 
-Deno.test("emitDomainModelJson fuses tables, manifest types, shapes, and metadata", () => {
+test("emitDomainModelJson fuses tables, manifest types, shapes, and metadata", () => {
   const json = emitDomainModelJson({
     sources: [{
       source: "app",
@@ -665,7 +673,7 @@ Deno.test("emitDomainModelJson fuses tables, manifest types, shapes, and metadat
   assertEquals(model.meta, [{ process: "orders", key: "classification", value: "internal" }]);
 });
 
-Deno.test("emitDomainModelJson inputsHash is stable across calls and shifts on any change", () => {
+test("emitDomainModelJson inputsHash is stable across calls and shifts on any change", () => {
   const base = {
     sources: [],
     manifestTypes: { Order: { fields: { item: { type: "string" } } } },
@@ -692,7 +700,7 @@ Deno.test("emitDomainModelJson inputsHash is stable across calls and shifts on a
 // rather than silently shadowing it ("derive, don't duplicate; drift-guard
 // anything that is not derived").
 
-Deno.test("resolveShapes reifies an all-extend shape into a flat domain type", () => {
+test("resolveShapes reifies an all-extend shape into a flat domain type", () => {
   const shapes: ShapeDecl[] = [{
     id: "PrReviewRoundIn",
     name: "PR review round — input",
@@ -716,7 +724,7 @@ Deno.test("resolveShapes reifies an all-extend shape into a flat domain type", (
   });
 });
 
-Deno.test("resolveShapes drift-guards a shape id colliding with a manifest type", () => {
+test("resolveShapes drift-guards a shape id colliding with a manifest type", () => {
   // A pure-extend shape whose id also names a manifest type it does not compose is
   // duplication, not a fuse: reject it (error) and omit it, leaving the manifest
   // type as the single source of truth.
@@ -733,7 +741,7 @@ Deno.test("resolveShapes drift-guards a shape id colliding with a manifest type"
   assertEquals(diagnostics[0].shape, "Order");
 });
 
-Deno.test("resolveShapes rejects a duplicate shape id as a fuse-identity collision", () => {
+test("resolveShapes rejects a duplicate shape id as a fuse-identity collision", () => {
   const shapes: ShapeDecl[] = [
     { id: "Dup", ops: [{ op: "extend", name: "a", type: "string" }] },
     { id: "Dup", ops: [{ op: "extend", name: "b", type: "string" }] },
@@ -745,7 +753,7 @@ Deno.test("resolveShapes rejects a duplicate shape id as a fuse-identity collisi
   assertEquals(diagnostics[0].severity, "error");
 });
 
-Deno.test("resolveShapes flags an extend whose type is neither scalar nor a fused entity", () => {
+test("resolveShapes flags an extend whose type is neither scalar nor a fused entity", () => {
   const shapes: ShapeDecl[] = [{
     id: "Bad",
     ops: [{ op: "extend", name: "ref", type: "NoSuchType" }],
@@ -757,7 +765,7 @@ Deno.test("resolveShapes flags an extend whose type is neither scalar nor a fuse
   assertEquals(diagnostics[0].severity, "error");
 });
 
-Deno.test("resolveShapes returns an empty resolution for no shapes", () => {
+test("resolveShapes returns an empty resolution for no shapes", () => {
   const { types, diagnostics } = resolveShapes([], { Order: { fields: { item: { type: "string" } } } }, []);
   assertEquals(types, {});
   assertEquals(diagnostics, []);

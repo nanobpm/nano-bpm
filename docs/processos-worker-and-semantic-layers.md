@@ -131,7 +131,7 @@ observe:
 |---|---|
 | **Opaque customer code** | **Observe + recommend** ("your handler does 5 sequential calls; batch them") |
 | **SDK-managed primitives** (batching / caching / hedging wrappers) | **Configure** (turn the primitive on/tune it) |
-| **Declarative / generated workers** (embedded Deno workers, connectors) | **Transform** — like BPMN, behind the verifier + sandbox (`process-optimization-design.md` §5.3) |
+| **Declarative / generated workers** (embedded Node workers, connectors) | **Transform** — like BPMN, behind the verifier + sandbox (`process-optimization-design.md` §5.3) |
 
 ## 2. The physical business process — the semantic layer
 

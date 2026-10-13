@@ -194,8 +194,8 @@ A directory counts as a Nano app/project when it contains **`nano.app.json`**
 **`@nanobpm/urban` is the one toolchain** that scaffolds, derives, validates and runs
 an Urban app; this node's console is a thin host over it (the manifest is the contract,
 `urban` is the single interpreter). Don't start from a blank directory — scaffold with
-**`create-urban-app`**. It emits a **Node** app by default (Node is guaranteed present;
-Deno is not) — pass `--deno` to additionally emit a `deno.json`.
+**`create-urban-app`**. It emits a **Node** app — Node (>= 22.6) is the sole JS/TS
+runtime.
 
 ### 1. Scaffold — `create-urban-app`
 
@@ -205,7 +205,6 @@ Pick an authoring style:
 
 ```
 npm create urban-app@latest my-app
-# or:  deno run -A npm:create-urban-app my-app
 ```
 
 **Code-first** — the process is authored in TypeScript with `defineFlow` in `workflows/*.ts`
@@ -216,7 +215,7 @@ npm create urban-app@latest my-app --code-first
 ```
 
 Flags: `--dir <path>`, `--id <slug>`, `--preset full|headless`,
-`--style model|code` (`--code-first` is shorthand for `--style code`), `--deno`.
+`--style model|code` (`--code-first` is shorthand for `--style code`).
 
 What you get — **model-first `my-app/`**:
 
@@ -401,8 +400,9 @@ mod tests {
         assert!(md.contains("## Local development loop"));
         assert!(md.contains("urban check"));
         assert!(md.contains("urban gen --check"));
-        // Node-first hosting is the blessed path — the old Deno entrypoint must not drift back.
+        // Node hosting is the sole path — the defunct Deno entrypoint must not drift back.
         assert!(!md.contains("deno run main.ts"));
+        assert!(md.contains("npm start"));
         // The engine REST address the toolchain must target on this node.
         assert!(md.contains("CAMUNDA_REST_ADDRESS"));
         assert!(md.contains("https://nano.example.test/v2"));

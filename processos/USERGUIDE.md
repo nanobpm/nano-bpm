@@ -39,7 +39,7 @@ extra requirements, and ProcessOS tells you about them when they matter:
   installed. You only need this if you want ProcessOS to run a model on your own
   machine instead of calling a hosted API.
 - **Workers** (the code that runs process tasks) need
-  [Deno](https://deno.com/) installed.
+  [Node](https://nodejs.org/) ≥ 22.6 installed.
 
 If either tool is missing when you try to use it, a banner appears at the top of
 the console explaining what's missing and linking to install instructions for
@@ -506,7 +506,7 @@ special icon, so you can pick up and replay their session locally.
 
 ## Troubleshooting
 
-**A banner says Deno or llama.cpp is missing.** You tried to use a capability
+**A banner says Node or llama.cpp is missing.** You tried to use a capability
 that needs an external tool. The banner links to install instructions for your
 operating system — install the tool, then reload the console. Everything that
 doesn't need that tool keeps working in the meantime.

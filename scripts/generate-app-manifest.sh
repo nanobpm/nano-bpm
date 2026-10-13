@@ -6,8 +6,8 @@
 # single source of truth, and the TypeScript types are generated from it so a
 # hand-written DTO can never drift from the schema.
 #
-# The Urban App is a Deno/TypeScript binary, so the manifest is consumed only by
-# TypeScript (the console App panels + the Deno App loader) — this emits TS, not
+# The Urban App is a Node/TypeScript binary, so the manifest is consumed only by
+# TypeScript (the console App panels + the Node App loader) — this emits TS, not
 # Rust (ADR 0027 §1/§3).
 #
 # Output: spec-app/gen/nano-app.d.ts (committed). Also validates the example

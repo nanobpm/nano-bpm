@@ -1,6 +1,6 @@
 # @nanobpm/nano-bernd
 
-Embedded Nano BPMN engine for Node, Deno and the browser. Codename **Bernd** — see [ADR 0005](../../docs/adr/0005-embedded-u-nano.md).
+Embedded Nano BPMN engine for Node and the browser. Codename **Bernd** — see [ADR 0005](../../docs/adr/0005-embedded-u-nano.md).
 
 Runs `nano_engine.wasm` (ABI v2) in-process — no server, no network, no native binaries. Same engine, same lifecycle model as the `nanobpm-gateway-rest-server` binary, just embedded.
 
@@ -19,7 +19,7 @@ Runs `nano_engine.wasm` (ABI v2) in-process — no server, no network, no native
      Artists sign their work. See ADR 0015.
 ```
 
-## Usage (Node/Deno)
+## Usage (Node)
 
 ```ts
 import { EmbeddedEngine } from '@nanobpm/nano-bernd';

@@ -104,9 +104,9 @@ immediately rather than after the cache TTL. The Extensions tab's **Check now**
 button bypasses the cache TTL (still single-flight) for an on-demand refresh.
 Re-installing replaces the directory cleanly (no stale files).
 
-**Built-ins.** The `deno` language runtime and the `deno-gui` app template ship
+**Built-ins.** The `node` language runtime and the `node-gui` app template ship
 **built into the server binary**, so the console works offline with zero installs
-and existing Deno projects are unchanged. Built-ins cannot be removed; every other
+(configs that still say `deno`/`deno-gui` resolve to these built-ins). Built-ins cannot be removed; every other
 pack (including `rust`) is installed from npm.
 
 ### Trust and consent
@@ -278,7 +278,7 @@ one of three `kind`s:
           "title": "Open Workers", "body": "This is where connected workers appear." },
         { "id": "start-worker", "kind": "handoff", "title": "Start the worker",
           "body": "Run this in your project, then come back.",
-          "copy": "deno run -A worker.ts", "verifyPollingJobType": "greet" }
+          "copy": "node --experimental-strip-types worker.ts", "verifyPollingJobType": "greet" }
       ]
     }
   ]
@@ -347,9 +347,9 @@ plus a `toolchain` run/compile profile (often reusing a lang pack's runtime).
   "kind": "app",
   "displayName": "Camunda 8 · REST worker",
   "templates": [
-    { "id": "c8-rest", "label": "Camunda 8 REST worker", "description": "Poll and complete jobs over REST.", "lang": "deno" }
+    { "id": "c8-rest", "label": "Camunda 8 REST worker", "description": "Poll and complete jobs over REST.", "lang": "node" }
   ],
-  "toolchain": { "run": ["deno", "run", "-A", "main.ts"] }
+  "toolchain": { "run": ["node", "--experimental-strip-types", "main.ts"] }
 }
 ```
 
@@ -366,7 +366,7 @@ directory** into a new project. Declare the lang packs it needs via `requires[]`
   "kind": "example",
   "displayName": "Urban PR Review — model-first",
   "appDir": ".",
-  "requires": ["deno"],
+  "requires": ["node"],
   "summary": "A durable multi-round loop driving a GitHub PR to convergence against an automated reviewer."
 }
 ```
@@ -433,7 +433,7 @@ using that trigger runs.
 - `transport` is `webhook` (the universal ingress) in v1 — the driver POSTs each
   event to the trigger ingress. It is forward-declared so a pack states its
   contract explicitly.
-- With a `driver`, the runtime launches `driver.ts` (a Node/Deno
+- With a `driver`, the runtime launches `driver.ts` (a Node
   `.ts`/`.js`/`.mjs`) with the **pack directory as its working directory**,
   restarts it with backoff on crash, and kills it when the app stops. Omit
   `driver` for a declaration-only source you run out-of-band.

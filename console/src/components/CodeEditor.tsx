@@ -7,9 +7,13 @@ import { useTheme } from "../theme/ThemeProvider";
 // separate chunk) instead of fetching them from a CDN. This keeps the console
 // fully self-contained: everything is embedded in the gateway binary and works
 // offline, with no network round-trips when the editor mounts.
-import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
-import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+//
+// The subpaths go through monaco-editor's `exports` map (`./*` → `esm/vs/*.js`);
+// monaco-editor 0.57 made the package exports-only, so the old
+// `monaco-editor/esm/vs/…` deep paths no longer resolve.
+import editorWorker from "monaco-editor/editor/editor.worker.js?worker";
+import jsonWorker from "monaco-editor/language/json/json.worker.js?worker";
+import tsWorker from "monaco-editor/language/typescript/ts.worker.js?worker";
 
 (
   self as unknown as { MonacoEnvironment: monaco.Environment }
@@ -25,58 +29,81 @@ import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker"
 // letting it lazy-load the AMD build from jsdelivr (the default).
 loader.config({ monaco });
 
-// Worker code targets Deno: ESM modules, npm:/jsr:/https: import specifiers, and
-// top-level await. Configure the TS language service to match and silence the
-// "cannot find module" diagnostics that those non-resolvable specifiers produce.
-monaco.languages.typescript.typescriptDefaults.setCompilerOptions({
-  target: monaco.languages.typescript.ScriptTarget.ESNext,
-  module: monaco.languages.typescript.ModuleKind.ESNext,
-  moduleResolution: monaco.languages.typescript.ModuleResolutionKind.NodeJs,
+// Worker code targets Node: ESM modules and top-level await. Configure the TS
+// language service to match and silence the "cannot find module" diagnostics
+// that non-resolvable specifiers (e.g. a not-yet-acquired npm package) produce.
+monaco.typescript.typescriptDefaults.setCompilerOptions({
+  target: monaco.typescript.ScriptTarget.ESNext,
+  module: monaco.typescript.ModuleKind.ESNext,
+  moduleResolution: monaco.typescript.ModuleResolutionKind.NodeJs,
   allowNonTsExtensions: true,
   allowJs: true,
-  // Match Deno/modern bundler semantics so default imports of CommonJS-typed
-  // npm packages (e.g. `import _ from "lodash"`) resolve to their members.
+  // Match Node/bundler semantics so default imports of CommonJS-typed npm
+  // packages (e.g. `import _ from "lodash"`) resolve to their members.
   esModuleInterop: true,
   allowSyntheticDefaultImports: true,
   noEmit: true,
   lib: ["esnext", "dom"],
-  // Mirror the worker `deno.json` import map's `@lib/` alias so that
+  // Mirror the worker `node.json` import map's `@lib/` alias so that
   // `import { fmt } from "@lib/money.ts"` resolves to the shared-library models
   // registered at `file:///lib/*` (see `registerModels`).
   baseUrl: "file:///",
   paths: { "@lib/*": ["lib/*"] },
 });
-monaco.languages.typescript.typescriptDefaults.setDiagnosticsOptions({
+monaco.typescript.typescriptDefaults.setDiagnosticsOptions({
   diagnosticCodesToIgnore: [
-    2307, // Cannot find module '...' (Deno URL / npm: specifiers)
+    2307, // Cannot find module '...' (an npm package not yet acquired via ATA)
     2792, // Cannot find module — consider moduleResolution
-    1375, // Top-level await "needs imports/exports": Deno runs every file as an
-    //       ES module, so top-level await is always valid here.
+    1375, // Top-level await "needs imports/exports": every worker file is an ES
+    //       module, so top-level await is always valid here.
   ],
 });
 
-// --- IntelliSense: ambient Deno types --------------------------------------
-// Worker and main.ts code runs on Deno, so `Deno.env`, `Deno.readDir`,
-// `Deno.serve`, etc. must resolve. Fetch the embedded Deno namespace types once
-// and register them as a Monaco extra-lib. Fully offline (served by the gateway
-// from its embedded copy of `deno types`).
-let denoLibRegistered = false;
-async function ensureDenoLib(): Promise<void> {
-  if (denoLibRegistered) return;
-  denoLibRegistered = true;
+// --- IntelliSense: ambient Node.js types ------------------------------------
+// Worker and `main.ts` code runs on Node, so `process`, `Buffer`, and the
+// `node:*` builtin modules must resolve with real types. Historically this came
+// from a vendored Deno namespace `.d.ts`; Node has no single
+// ambient-namespace equivalent, so the ambient types are derived from the
+// console's own pinned `@types/node` devDependency and registered as Monaco
+// extra-libs — a single source of truth, with nothing vendored to drift.
+//
+// Vite inlines each `.d.ts` as a string at build time via a *lazy* `?raw` glob
+// (no `eager`): the definitions split into per-file chunks that load only when
+// the editor first registers them, so the console's initial bundle is
+// untouched. `@types/node`'s root `index.d.ts` targets the TypeScript the editor
+// bundles (Monaco 0.57 ships TS 5.9); its versioned `ts5.6/` / `ts5.7/` trees
+// target older compilers and are excluded to avoid duplicate global
+// declarations.
+const nodeTypeModules = import.meta.glob(
+  [
+    "../../node_modules/@types/node/**/*.d.ts",
+    "../../node_modules/undici-types/**/*.d.ts",
+    "!../../node_modules/@types/node/ts5.6/**",
+    "!../../node_modules/@types/node/ts5.7/**",
+  ],
+  { query: "?raw", import: "default" },
+);
+let nodeLibRegistered = false;
+async function ensureNodeTypes(): Promise<void> {
+  if (nodeLibRegistered) return;
+  nodeLibRegistered = true;
   try {
-    const res = await fetch("/console/api/deno-types");
-    if (!res.ok) {
-      denoLibRegistered = false;
-      return;
-    }
-    const src = await res.text();
-    monaco.languages.typescript.typescriptDefaults.addExtraLib(
-      src,
-      "file:///node_modules/@types/deno/index.d.ts",
-    );
+    const paths = Object.keys(nodeTypeModules);
+    const sources = await Promise.all(paths.map((p) => nodeTypeModules[p]()));
+    paths.forEach((p, i) => {
+      const src = sources[i];
+      if (typeof src !== "string") return;
+      // `../../node_modules/@types/node/http.d.ts` →
+      // `file:///node_modules/@types/node/http.d.ts`, so a bare
+      // `import ... from "undici-types"` and the relative references inside the
+      // definitions resolve exactly as they do on disk.
+      monaco.typescript.typescriptDefaults.addExtraLib(
+        src,
+        "file:///" + p.replace(/^\.\.\/\.\.\//, ""),
+      );
+    });
   } catch {
-    denoLibRegistered = false; // let a later mount retry
+    nodeLibRegistered = false; // let a later mount retry
   }
 }
 
@@ -95,7 +122,7 @@ async function ensureSdkLib(): Promise<void> {
       return;
     }
     const src = await res.text();
-    monaco.languages.typescript.typescriptDefaults.addExtraLib(
+    monaco.typescript.typescriptDefaults.addExtraLib(
       src,
       "file:///node_modules/@nanobpm/worker/index.ts",
     );
@@ -124,7 +151,7 @@ async function ensureUrbanLib(): Promise<void> {
       return;
     }
     const src = await res.text();
-    monaco.languages.typescript.typescriptDefaults.addExtraLib(
+    monaco.typescript.typescriptDefaults.addExtraLib(
       src,
       "file:///node_modules/@nanobpm/urban/index.d.ts",
     );
@@ -133,7 +160,7 @@ async function ensureUrbanLib(): Promise<void> {
     // directory with just `index.d.ts` (and no manifest) fails with TS2307, so
     // every symbol would silently fall back to `any`. Register a minimal
     // manifest so the specifier resolves with full types.
-    monaco.languages.typescript.typescriptDefaults.addExtraLib(
+    monaco.typescript.typescriptDefaults.addExtraLib(
       JSON.stringify({
         name: "@nanobpm/urban",
         types: "index.d.ts",
@@ -186,7 +213,7 @@ export async function ensureProjectSdkLibs(
     ]);
   const add = (content: string | null, path: string) => {
     if (content == null) return;
-    monaco.languages.typescript.typescriptDefaults.addExtraLib(content, path);
+    monaco.typescript.typescriptDefaults.addExtraLib(content, path);
   };
   // @nanobpm/worker → the typed `defineWorker` wrapper + the relative modules it
   // (and its `worker-io.d.ts`) import, co-located so `./worker-sdk.ts`,
@@ -239,7 +266,7 @@ function ensureAta(): Promise<AtaRun | null> {
           typescript: ts as any,
           delegate: {
             receivedFile: (code: string, path: string) => {
-              monaco.languages.typescript.typescriptDefaults.addExtraLib(
+              monaco.typescript.typescriptDefaults.addExtraLib(
                 code,
                 `file://${path}`,
               );
@@ -361,8 +388,8 @@ export default function CodeEditor({
   }, [extraKey, path]);
 
   useEffect(() => {
+    void ensureNodeTypes();
     void ensureSdkLib();
-    void ensureDenoLib();
     void ensureUrbanLib();
     if (isCode) {
       void ensureProjectSdkLibs(sdkProject);

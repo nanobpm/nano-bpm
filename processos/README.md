@@ -197,7 +197,7 @@ restructure a process — it will call `draft_ir` and propose the drafted model.
 **drafter** chip while selected.
 
 **Missing-tool preflight.** ProcessOS shells out to two optional CLI tools it does **not** bundle:
-**`llama-server`** (llama.cpp — the local LLM sidecars above) and **Deno** (which the supervised
+**`llama-server`** (llama.cpp — the local LLM sidecars above) and **Node** (which the supervised
 Nano engine uses to run its embedded job workers). On startup the Console checks both via
 `GET /api/system/dependencies` and, if either is missing, shows a dismissible banner naming the
 tool, what it's for, and a link to the official OS-aware install instructions — so you get a clear
@@ -840,7 +840,7 @@ for it automatically.
 | `POST` | `/api/llama/stop` | Stop one sidecar (`{profileId}`) or **all** of them (empty body). Returns the resulting pool state |
 | `GET` | `/api/llama/logs?profileId=…&since=N` | Tail a sidecar's combined stdout/stderr from offset `N`; returns `{lines, text, nextOffset, running}` for incremental polling |
 | `GET` | `/api/llama/reasoning-control?profileId=…` | Probe whether the active (or named) profile's endpoint exposes the optional reasoning-control surface (`/v1/chat/completions/control`). Returns `{supported, ready, baseUrl}`; wrap-up/monitor use it for a mid-thinking halt when present, else fall back to the round-boundary cancel |
-| `GET` | `/api/system/dependencies` | Preflight the external CLI tools ProcessOS shells out to (Deno; llama.cpp `llama-server`). Returns `{allPresent, missing[], dependencies[]}` where each entry has `id`, `name`, `purpose`, `bin`, `present`, `version`, `installUrl`, `hint` — drives the Console's missing-tool banner |
+| `GET` | `/api/system/dependencies` | Preflight the external CLI tools ProcessOS shells out to (Node; llama.cpp `llama-server`). Returns `{allPresent, missing[], dependencies[]}` where each entry has `id`, `name`, `purpose`, `bin`, `present`, `version`, `installUrl`, `hint` — drives the Console's missing-tool banner |
 
 ## Layout
 

@@ -14,7 +14,7 @@ import { queryData } from "../gen";
 
 // Live form preview with data-aware controls (ADR 0024 §5). Renders a form-js
 // *viewer* of the current schema, but first resolves every field's `dataSource`
-// binding through the Deno data gateway (ADR 0024 phase 2): each bound choice
+// binding through the Node data gateway (ADR 0024 phase 2): each bound choice
 // field's option list comes live from `SELECT …` against a named datasource,
 // exactly the Borland data-aware control — bound to an alias, so it survives the
 // SQLite→Postgres flip. Unbound forms just render.

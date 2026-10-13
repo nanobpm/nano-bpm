@@ -888,19 +888,6 @@ impl apis::workers::Workers for ServerImpl {
         }
     }
 
-    async fn get_deno_types(
-        &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-    ) -> Result<apis::workers::GetDenoTypesResponse, ()> {
-        Ok(
-            apis::workers::GetDenoTypesResponse::Status200_DenoTypeDeclarations(
-                nano_server_console::deno_types_source(),
-            ),
-        )
-    }
-
     async fn get_worker(
         &self,
         _method: &Method,
@@ -959,7 +946,7 @@ impl apis::workers::Workers for ServerImpl {
         // Only 200 is declared; on a workspace error fall back to empty.
         let v = nano_server_console::workers_list()
             .await
-            .unwrap_or_else(|_| serde_json::json!({ "workers": [], "denoAvailable": false }));
+            .unwrap_or_else(|_| serde_json::json!({ "workers": [], "nodeAvailable": false }));
         Ok(
             apis::workers::ListWorkersResponse::Status200_WorkersPlusRuntimeAvailability(from_val(
                 v,
@@ -1055,10 +1042,10 @@ impl apis::projects::Projects for ServerImpl {
                 // Code-first projects (ADR 0048): generate the initial laid-out
                 // `resources/processes/*.bpmn` from the scaffolded `workflows/*.ts`
                 // so a brand-new project opens with a rendered model. It needs a
-                // Deno round-trip (npm fetch); both paths below are best-effort and
+                // Node round-trip (npm fetch); both paths below are best-effort and
                 // only log on failure — they never fail the create. How they run
                 // differs per template: the `workflow-starter` path is fire-and-
-                // forget (spawned, so the create response isn't blocked on the Deno
+                // forget (spawned, so the create response isn't blocked on the Node
                 // round-trip), while the pack-template path awaits (see below).
                 //
                 // Both post-create refresh paths key off the created config's
@@ -1262,7 +1249,7 @@ impl apis::projects::Projects for ServerImpl {
             .unwrap_or_else(|_| {
                 serde_json::json!({
                     "projects": [],
-                    "denoAvailable": false,
+                    "nodeAvailable": false,
                     "platforms": nano_server_console::projects::PLATFORMS,
                 })
             });
@@ -1424,7 +1411,7 @@ impl apis::projects::Projects for ServerImpl {
                     // Code-first inverse (ADR 0048): a `workflows/*.ts` save
                     // (re)generates the laid-out `resources/processes/*.bpmn` the
                     // SDK derives, then refreshes the types from them. Fire-and-
-                    // forget — it needs a Deno round-trip (npm fetch + auto-layout)
+                    // forget — it needs a Node round-trip (npm fetch + auto-layout)
                     // we must not block the save response on; best-effort.
                     let project = path_params.name.clone();
                     tokio::spawn(async move {
@@ -1484,7 +1471,7 @@ impl apis::projects::Projects for ServerImpl {
 
 /// Map a datasource `ApiResult` error to a data response's collapsed status set
 /// (only 400/404 exist on these operations): `NOT_FOUND` → 404, everything else
-/// (bad SQL/unknown source → 400; no-Deno → 503; gateway → 500) → 400.
+/// (bad SQL/unknown source → 400; no-runtime → 503; gateway → 500) → 400.
 macro_rules! data_ok_or {
     ($res:expr, $ok:path, $bad:path, $nf:path) => {
         match $res {

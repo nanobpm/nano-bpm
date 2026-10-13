@@ -1,6 +1,6 @@
 // Builds the browser-consumable package artifact from the library source.
 //
-// The library is authored as raw TypeScript (Node/Deno run it via type-stripping;
+// The library is authored as raw TypeScript (Node runs it via type-stripping;
 // see README). TypeScript/Vite consumers like the console, however, must not
 // re-bundle the moddle parsers themselves — dmn-moddle is CJS (no ESM default
 // export for Rollup) and its zeebe.json import carries `type: "json"` attributes

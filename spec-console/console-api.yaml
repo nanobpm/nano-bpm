@@ -22,7 +22,7 @@ tags:
   - name: models
     description: Workspace-backed BPMN models (modeler)
   - name: workers
-    description: Embedded Deno job workers
+    description: Embedded job workers
   - name: lib
     description: Shared worker library files
   - name: projects
@@ -529,18 +529,6 @@ paths:
       responses:
         '200':
           description: Worker SDK source
-          content:
-            text/plain:
-              schema: { type: string }
-
-  /deno-types:
-    get:
-      operationId: getDenoTypes
-      tags: [workers]
-      summary: Ambient Deno type declarations (text)
-      responses:
-        '200':
-          description: Deno type declarations
           content:
             text/plain:
               schema: { type: string }
@@ -1096,7 +1084,7 @@ paths:
         workers type against the current tables. Also runs automatically after a
         schema change (script/DDL exec/migrate) and at App boot; this endpoint is
         the maker's explicit "regenerate now" affordance. Types are erased at
-        `deno compile` — this is an authoring-time convenience only.
+        the run/compile toolchain — this is an authoring-time convenience only.
       parameters:
         - { $ref: '#/components/parameters/NamePath' }
         - { $ref: '#/components/parameters/SourcePath' }
@@ -2085,15 +2073,13 @@ components:
         runtime: { $ref: '#/components/schemas/WorkerRuntime' }
     WorkersResponse:
       type: object
-      required: [workers, denoAvailable, nodeAvailable]
+      required: [workers, nodeAvailable]
       properties:
         workers:
           type: array
           items: { $ref: '#/components/schemas/WorkerSummary' }
-        # Deno present. Node-first (ADR 0038): Deno is optional, needed only to
-        # compile a project to a standalone binary; workers RUN on Node.
-        denoAvailable: { type: boolean }
-        # Node >= 22.6 present — the primary runtime for running workers/projects.
+        # Node >= 22.6 present — the sole JS/TS runtime for workers/projects
+        # (ADR 0065).
         nodeAvailable: { type: boolean }
     CreateWorkerRequest:
       type: object
@@ -2246,7 +2232,7 @@ components:
         lang:
           type: string
           description: >-
-            Language pack id driving the project (e.g. "deno", "rust", "java").
+            Language pack id driving the project (e.g. "node", "rust", "java").
             The console resolves the card's language icon by matching this to an
             Extension of kind "lang".
         template:
@@ -2442,7 +2428,7 @@ components:
         lang:
           type: string
           description: >-
-            Language pack id the scaffolded project runs on (e.g. "deno",
+            Language pack id the scaffolded project runs on (e.g. "node",
             "rust", "java"). The console resolves the card's language icon by
             matching this to an Extension of kind "lang".
         source:
@@ -2460,7 +2446,7 @@ components:
           type: array
           description: >-
             Per-template creation options the New Project picker renders as
-            controls on the selected card (e.g. a Node/Deno runtime toggle).
+            controls on the selected card (e.g. a runtime toggle).
             Generic: any built-in or pack template may declare options; the
             console renders each control and echoes the chosen values back in
             `CreateProjectRequest.options`. Absent or empty for templates with
@@ -2509,11 +2495,11 @@ components:
           description: >-
             Host capability this choice requires; the console disables the
             choice (with an install hint) when the capability is absent.
-            Recognised: "deno" (gated on `denoAvailable`), "node" (gated on
-            `nodeAvailable`). Absent = always selectable.
+            Recognised: "node" (gated on `nodeAvailable`). Absent = always
+            selectable.
     ProjectDetail:
       type: object
-      required: [config, files, runState, denoAvailable, nodeAvailable, urbanAvailable, runnable, platforms, rootPath]
+      required: [config, files, runState, nodeAvailable, urbanAvailable, runnable, platforms, rootPath]
       properties:
         config: { $ref: '#/components/schemas/ProjectConfig' }
         files:
@@ -2534,9 +2520,7 @@ components:
             (header display + "copy path" actions in the file tree). When the
             console talks to a remote/containerized gateway this is the server's
             path, not the client's, so treat it as informational.
-        # Deno present (needed only for `deno compile`, ADR 0038).
-        denoAvailable: { type: boolean }
-        # Node >= 22.6 present — the primary Run runtime.
+        # Node >= 22.6 present — the sole JS/TS Run runtime (ADR 0065).
         nodeAvailable: { type: boolean }
         # `@nanobpm/urban` CLI present — gates urban-app affordances in the
         # Studio (epic #514 host dry-out). Delivered by the marketplace pack
@@ -2563,12 +2547,12 @@ components:
         displayName:
           type: string
           nullable: true
-          description: Human name of the missing toolchain (e.g. "Rust", "Deno / Node").
+          description: Human name of the missing toolchain (e.g. "Rust", "Node").
         probes:
           type: array
           description: >-
             Executable names searched for on PATH; finding ANY one satisfies the
-            probe (e.g. ["cargo"] for a Rust pack, ["deno", "node"] for Deno).
+            probe (e.g. ["cargo"] for a Rust pack, ["node"] for the Node pack).
           items: { type: string }
         installHint:
           type: string
@@ -2580,14 +2564,12 @@ components:
           description: Official install page for the missing toolchain.
     ProjectsResponse:
       type: object
-      required: [projects, denoAvailable, nodeAvailable, urbanAvailable, platforms]
+      required: [projects, nodeAvailable, urbanAvailable, platforms]
       properties:
         projects:
           type: array
           items: { $ref: '#/components/schemas/ProjectSummary' }
-        # Deno present (needed only for `deno compile`, ADR 0038).
-        denoAvailable: { type: boolean }
-        # Node >= 22.6 present — the primary Run runtime.
+        # Node >= 22.6 present — the sole JS/TS Run runtime (ADR 0065).
         nodeAvailable: { type: boolean }
         # `@nanobpm/urban` CLI present — gates Urban-app affordances (the New
         # Project picker offers to install the first-party pack when absent).
@@ -2618,7 +2600,7 @@ components:
           additionalProperties: { type: string }
           description: >-
             Chosen values for the selected template's declared options, keyed by
-            `TemplateOption.id` (e.g. {"runtime":"deno"}). Omitted keys fall back
+            `TemplateOption.id` (e.g. {"runtime":"node"}). Omitted keys fall back
             to each option's `default`. Ignored for templates that declare no
             options.
     ImportProjectRequest:

@@ -1,6 +1,7 @@
 # ADR 0038 — Node-first runtime: Deno optional, only for `deno compile`
 
-Status: **Accepted.**
+Status: **Superseded by [ADR 0065](0065-deno-removal.md)** — Deno is removed entirely; Node (≥ 22.6) is
+the sole JS/TS runtime, and `deno compile` is gone with it. (Historically: **Accepted.**)
 Date: 2026-07-24.
 Relates to / refines:
 ADR 0036 (`0036-dual-runtime-workers-deno-node-fallback.md`, which made workers dual-runtime with
