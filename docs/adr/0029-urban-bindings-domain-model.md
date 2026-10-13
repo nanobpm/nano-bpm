@@ -118,7 +118,7 @@ Types come from two sources, in priority order:
    > accessors `domain.ts`/`workers.ts` present, a project `tsconfig.json` `paths` map made the
    > accessor importing its own row types read as a circular self-import (TS2303/TS2459), breaking
    > type resolution under standard tooling (VS Code/`tsc`). Distinct stems avoid the pairing; the
-   > scaffolder emits a `tsconfig.json` (paths mirroring the `node.json` map) + `package.json`
+   > scaffolder emits a `tsconfig.json` (paths mirroring the `deno.json` map) + `package.json`
    > (`@types/node`) so `@nanobpm/*` and `node:*` resolve natively without the console's Monaco
    > extra-libs (ADR 0038 Node-first tooling parity).
 2. **A manifest type registry** — a small `types` block for **transient, non-persisted** shapes

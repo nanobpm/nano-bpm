@@ -63,8 +63,8 @@ Concretely:
   files are written by the server, not the sandbox. No `--allow-env`.
 - **Layout resolution.** `layoutBpmn` lazily `import()`s the optional `bpmn-auto-layout` peer dep, and
   the layout helpers ship in `@nanobpm/workflow >= 0.3.0`. Neither is guaranteed in an older project's
-  `node.json`, so generation runs under a **synthesized import map** (`--import-map` + `--no-config`,
-  since Deno forbids a map from both a discovered `node.json` and the flag). The map merges the
+  `deno.json`, so generation runs under a **synthesized import map** (`--import-map` + `--no-config`,
+  since Deno forbids a map from both a discovered `deno.json` and the flag). The map merges the
   project's own imports and *defaults in* the SDK (`^0.3.0`) and `bpmn-auto-layout`
   (`^2.0.0-alpha.2`) when absent, never overriding an explicit project pin.
 - **Trigger (`is_workflow_source` + `regenerate_workflow_models`).** The code-first inverse of
@@ -76,7 +76,7 @@ Concretely:
   `io.nanobpm.dataEnvelope` carrier (ADR 0047) through the round-trip, so the generated models are a
   valid scan surface: the typed envelopes authored in code flow straight into the Fused Domain Model.
 - **Scaffold pins.** The `workflow-starter` scaffold pins `@nanobpm/workflow@^0.3.0` and adds
-  `bpmn-auto-layout` (node.json import + package.json devDependency) so local `deno task`/`npm` layout
+  `bpmn-auto-layout` (deno.json import + package.json devDependency) so local `deno task`/`npm` layout
   works too.
 
 Best-effort throughout: a missing Deno toolchain, an unpublished SDK, or a layout failure surface as a

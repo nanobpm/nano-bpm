@@ -1,7 +1,8 @@
 // nanobpmn Node ESM loader (ADR 0065).
 //
 // Makes Node honor the project's `node.json` import map — the single manifest
-// the scaffolder writes and the runtime reads. Node's built-in type stripping
+// the scaffolder writes and the runtime reads (a legacy `deno.json` is accepted
+// as an alias). Node's built-in type stripping
 // (`--experimental-strip-types`) handles the `.ts` sources; this loader only
 // rewrites *specifiers*. Registered off-thread by `node-register.mjs`.
 import { readFileSync } from "node:fs";
@@ -14,6 +15,17 @@ import { resolve as resolvePath } from "node:path";
 // its relative values are resolved against it.
 const baseDir = process.cwd();
 
+// The import-map file names the loader reads, in precedence order. `deno.json`/
+// `deno.jsonc` are the **legacy alias** for a project scaffolded before Deno
+// removal (ADR 0065): the *file name* maps onto the same import map, but
+// execution is Node either way. Last so a real `node.json` always wins.
+const IMPORT_MAP_FILES = [
+  "node.json",
+  "node.jsonc",
+  "deno.json",
+  "deno.jsonc",
+];
+
 function readImportMap() {
   // A one-shot derivation (`derive-models` / `generate-models`) needs an SDK +
   // layout dependency the project's own `node.json` may not yet declare. It points
@@ -22,8 +34,8 @@ function readImportMap() {
   // root, for exactly this reason).
   const override = process.env.NANOBPMN_IMPORT_MAP;
   const candidates = override
-    ? [override, "node.json", "node.jsonc"]
-    : ["node.json", "node.jsonc"];
+    ? [override, ...IMPORT_MAP_FILES]
+    : [...IMPORT_MAP_FILES];
   for (const name of candidates) {
     try {
       const raw = readFileSync(resolvePath(baseDir, name), "utf8");

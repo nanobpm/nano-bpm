@@ -17,8 +17,10 @@ interpreter — the `node.json` import map this now names).
 
 ## Context
 
-Deno was deprecated and reached **end of life** in 2026. The Nano stack had carried Deno support for
-two reasons, both now moot:
+Deno was **deprecated** in October 2026 — the Deno team joined Cloudflare, and the project entered a
+wind-down (monthly releases continue for a transitional period, but there is no forward roadmap and
+the ecosystem's migration targets are Node). The Nano stack had carried Deno support for two reasons,
+both now moot:
 
 1. **ADR 0036** made TypeScript workers *dual-runtime* (**Deno preferred, Node fallback ≥ 22.6**) so
    they ran on 32-bit ARM, where Deno publishes no `linux-armv7l` build.
@@ -34,7 +36,7 @@ surfaces is a **drift surface**: two sources of truth for "what runs TypeScript,
 cost paid on every change and the bug surface (a shim that misses a call site, a type file that goes
 stale) accruing silently.
 
-With Deno end-of-life, the "alternative runtime" is a liability, not a fallback: nobody should be
+With Deno deprecated, the "alternative runtime" is a liability, not a fallback: nobody should be
 selecting it, and supporting it keeps an entire parallel path (and its type surface) alive.
 
 ## Decision

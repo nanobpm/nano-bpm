@@ -1574,7 +1574,7 @@ fn project_package_json(name: &str, deps: &BTreeMap<String, String>) -> String {
 /// dependencies. This is the lone build-time reader of the `npm:` grammar, so
 /// `package.json` **derives** its deps from `node.json` rather than hand-mirroring
 /// them (which silently drifts).
-fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
+pub(crate) fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
     let spec = value.strip_prefix("npm:")?;
     // The specifier grammar accepts an optional leading slash: `npm:/pkg@range`.
     let spec = spec.strip_prefix('/').unwrap_or(spec);
@@ -1640,13 +1640,18 @@ fn npm_deps_from_manifest(manifest_json: &str) -> BTreeMap<String, String> {
     parse_npm_deps(manifest_json).unwrap_or_default()
 }
 
-/// Read the npm deps a project requires from its on-disk `node.json`/`node.jsonc`,
+/// Read the npm deps a project requires from its on-disk import map,
 /// mirroring `node-loader.mjs`'s file lookup **exactly**: try each candidate in
 /// order and fall through to the next on a read **or parse** failure, stopping at
 /// the first that parses (even to an import-less map). Neither present/parseable
 /// → empty.
+///
+/// `deno.json`/`deno.jsonc` are the **legacy alias** for a project scaffolded
+/// before Deno removal (ADR 0065): the *file name* names the same import map, so
+/// the deps must be healed onto `package.json` just as for `node.json`. Kept in
+/// lockstep with `IMPORT_MAP_FILES` in `node_loader.mjs`.
 fn required_npm_deps(dir: &Path) -> BTreeMap<String, String> {
-    for name in ["node.json", "node.jsonc"] {
+    for name in ["node.json", "node.jsonc", "deno.json", "deno.jsonc"] {
         if let Ok(raw) = std::fs::read_to_string(dir.join(name))
             && let Some(deps) = parse_npm_deps(&raw)
         {
@@ -6256,11 +6261,18 @@ fn with_provenance(xml: &str) -> String {
 /// the Node loader honours before any discovered `node.json`.
 fn synthesize_generate_import_map(dir: &std::path::Path) -> String {
     let mut imports = serde_json::Map::new();
-    if let Ok(txt) = std::fs::read_to_string(dir.join("node.json"))
-        && let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(&txt)
-        && let Some(serde_json::Value::Object(im)) = obj.get("imports")
-    {
-        imports = im.clone();
+    // Read the project's own imports from its import map — `node.json` first, then
+    // the legacy `deno.json` alias (ADR 0065), so an upgraded project's other bare
+    // imports still resolve. Mirrors `node_loader.mjs`'s candidate order.
+    for name in ["node.json", "node.jsonc", "deno.json", "deno.jsonc"] {
+        if let Ok(txt) = std::fs::read_to_string(dir.join(name))
+            && let Ok(serde_json::Value::Object(obj)) =
+                serde_json::from_str::<serde_json::Value>(&txt)
+            && let Some(serde_json::Value::Object(im)) = obj.get("imports")
+        {
+            imports = im.clone();
+            break;
+        }
     }
     imports
         .entry("@nanobpm/workflow".to_string())
@@ -13411,6 +13423,44 @@ mod tests {
         assert!(
             required_npm_deps(&dir).is_empty(),
             "a valid import-less node.json must not fall through to node.jsonc"
+        );
+    }
+
+    /// A project scaffolded before Deno removal carries a legacy `deno.json`
+    /// import map (ADR 0065). `required_npm_deps` must read it exactly as
+    /// `node_loader.mjs` does, so its npm deps still get healed onto
+    /// `package.json` — otherwise the loader resolves a specifier for a package
+    /// `npm install` never fetched, and the worker fails at import time.
+    #[test]
+    fn required_npm_deps_reads_the_legacy_deno_json_alias() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("deno.json"),
+            r#"{"imports":{"@nanobpm/nano-sdk":"npm:@nanobpm/nano-sdk@^1"}}"#,
+        )
+        .unwrap();
+        let deps = required_npm_deps(&dir);
+        assert_eq!(
+            deps.get("@nanobpm/nano-sdk").map(String::as_str),
+            Some("^1"),
+            "a legacy deno.json import map must be read as node.json"
+        );
+
+        // A real node.json still wins over the legacy alias, exactly as the
+        // loader's candidate order prescribes.
+        std::fs::write(
+            dir.join("node.json"),
+            r#"{"imports":{"lodash":"npm:lodash@^4"}}"#,
+        )
+        .unwrap();
+        let deps = required_npm_deps(&dir);
+        assert_eq!(deps.get("lodash").map(String::as_str), Some("^4"));
+        assert!(
+            !deps.contains_key("@nanobpm/nano-sdk"),
+            "node.json must shadow the legacy deno.json, not merge with it"
         );
     }
 

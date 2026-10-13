@@ -7,7 +7,10 @@
 //! ```text
 //! nano-workers-app/
 //!   README.md              how to run it
-//!   node.json              import map + `start` script
+//!   package.json           npm identity + `start` script (the documented entry)
+//!   node.json              import map declaring each worker's npm dependencies
+//!   node-register.mjs      `--import` bootstrap that registers the loader
+//!   node-loader.mjs        ESM loader that makes Node honour node.json's imports
 //!   main.ts                entrypoint: deploy resources/*.bpmn, then run the workers
 //!   sdk/worker-sdk.ts      the embedded Nano worker SDK (verbatim)
 //!   workers/<name>/…       one folder per selected worker (worker.ts + helpers)
@@ -29,6 +32,14 @@ use super::workspace;
 /// materialises to disk). Shipped verbatim into the exported app's `sdk/` so it
 /// stays a single source of truth with the running server.
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
+
+/// The Node ESM loader + its `--import` bootstrap, baked into the binary and
+/// materialised into every scaffolded project's `nano-generated/` (ADR 0065).
+/// Shipped verbatim into the exported app so its `node.json` import map resolves
+/// bare specifiers exactly as it does in a managed project — no second, drifting
+/// loader implementation.
+const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
+const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
 
 /// The vendored `@nanobpm/urban` public type surface, baked into the binary and
 /// served to the Studio editor so Monaco resolves an Urban app's `@nanobpm/urban`
@@ -112,6 +123,12 @@ pub fn build_app(worker_names: &[String]) -> Result<Vec<u8>, String> {
     // Generated app scaffolding.
     entries.push((at("sdk/worker-sdk.ts"), WORKER_SDK_TS.as_bytes().to_vec()));
     entries.push((at("node.json"), node_json(&packages, has_lib).into_bytes()));
+    entries.push((at("package.json"), package_json(&packages).into_bytes()));
+    entries.push((
+        at("node-register.mjs"),
+        NODE_REGISTER_MJS.as_bytes().to_vec(),
+    ));
+    entries.push((at("node-loader.mjs"), NODE_LOADER_MJS.as_bytes().to_vec()));
     entries.push((at("main.ts"), main_ts(&valid_names).into_bytes()));
     entries.push((at("README.md"), readme_md(&valid_names).into_bytes()));
     entries.push((
@@ -147,12 +164,12 @@ pub fn urban_types_source() -> &'static str {
 const NODE_JSON_HEAD: &str =
     "{\n  \"imports\": {\n    \"@nanobpm/worker\": \"./sdk/worker-sdk.ts\"";
 
-/// Build the app's `node.json`: an import map aliasing `@nanobpm/worker` to the
-/// bundled SDK plus a generated **dependency manifest** — every npm package the
-/// selected workers import, mapped to its `npm:` specifier (and a trailing-slash
-/// form for subpath imports) so the Node loader resolves bare imports without
-/// edits. Also declares the `start` script the app needs to deploy models and
-/// run workers.
+/// Build the app's `node.json`: a pure **import map** (no scripts — `start`
+/// lives once in `package.json`, so the run command cannot drift). It aliases the
+/// bundled worker SDK under `@nanobpm/worker`, the shared library under `@lib/`
+/// when present, and every npm package the selected workers import, mapped to its
+/// `npm:` specifier (plus a trailing-slash subpath form) so the Node loader
+/// resolves bare imports without edits.
 fn node_json(packages: &BTreeSet<String>, has_lib: bool) -> String {
     let mut s = String::from(NODE_JSON_HEAD);
     if has_lib {
@@ -173,10 +190,63 @@ fn node_json(packages: &BTreeSet<String>, has_lib: bool) -> String {
         s.push_str(",\n    ");
         s.push_str(&format!("{key_slash}: {val_slash}"));
     }
-    s.push_str(
-        "\n  },\n  \"scripts\": {\n    \"start\": \"node --experimental-strip-types main.ts\"\n  }\n}\n",
-    );
+    s.push_str("\n  }\n}\n");
     s
+}
+
+/// The exported app's `package.json`. The documented run flow is `npm install`
+/// (materialises the `node.json` import map's `npm:` deps into `node_modules`)
+/// then `npm start`, so this is where both the dependency list and the
+/// `--import` loader bootstrap live.
+///
+/// The loader is what makes Node honour `node.json`'s import map: `npm start`
+/// runs Node with `--import ./node-register.mjs`, which registers
+/// `node-loader.mjs` on the module-resolution thread. Without it the
+/// `@nanobpm/worker` alias (and every `npm:` alias) would not resolve, so the
+/// bundled `node.json` would be inert.
+///
+/// Dependencies **derive** from the same import map the loader reads — a single
+/// source of truth: each `npm:` value is reduced to its installable coordinate by
+/// [`super::projects::npm_dep_from_import`], the one grammar reader shared with
+/// the managed-project path.
+fn package_json(packages: &BTreeSet<String>) -> String {
+    let mut deps: Vec<String> = Vec::new();
+    // The SDK alias the bundled workers import lives in `node.json` too, but it
+    // maps to the bundled `./sdk/worker-sdk.ts`, so only `npm:` values install.
+    for pkg in packages {
+        if let Some((name, range)) = super::projects::npm_dep_from_import(&format!("npm:{pkg}")) {
+            deps.push(format!(
+                "    {}: {}",
+                json_string(&name),
+                json_string(&range)
+            ));
+        }
+    }
+    let dependencies = if deps.is_empty() {
+        String::new()
+    } else {
+        format!("  \"dependencies\": {{\n{}\n  }},\n", deps.join(",\n"))
+    };
+    let dev_dependencies = format!(
+        "  \"devDependencies\": {{\n    {}: \"^22\"\n  }}\n",
+        json_string("@types/node")
+    );
+    format!(
+        r#"{{
+  "name": "nano-workers-app",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "main.ts",
+  "engines": {{
+    "node": ">=22.6"
+  }},
+  "scripts": {{
+    "start": "node --experimental-strip-types --import ./node-register.mjs main.ts"
+  }},
+{dependencies}{dev_dependencies}}}
+"#
+    )
 }
 
 /// True for TypeScript/JavaScript files whose imports we scan.
@@ -428,10 +498,11 @@ export NANOBPMN_BASE_URL=http://my-gateway:8080
 ## 3. Run
 
 ```sh
+npm install
 npm start
 ```
 
-(equivalently: `node --experimental-strip-types main.ts`)
+(equivalently: `node --experimental-strip-types --import ./node-register.mjs main.ts`)
 
 The app deploys `resources/*.bpmn`, then starts these workers:
 
@@ -445,7 +516,10 @@ alongside their own `console.log` output. Press **Ctrl+C** to stop.
 
 ```text
 main.ts              entrypoint (deploy models, then run workers)
-node.json            import map + `start` task (network + file permissions)
+package.json         npm identity + `start` script (this is the entrypoint)
+node.json            import map declaring each worker's npm dependencies
+node-register.mjs    `--import` bootstrap that registers the loader below
+node-loader.mjs      ESM loader that makes Node honour node.json's imports
 sdk/worker-sdk.ts    the embedded Nano worker SDK
 lib/                 shared library modules (imported as `@lib/…`, if any)
 workers/<name>/      one folder per worker (worker.ts + any helpers)
@@ -455,7 +529,9 @@ resources/           drop your .bpmn models here
 ## Editing workers
 
 Each `workers/<name>/worker.ts` imports `@nanobpm/worker` and calls `defineWorker`.
-Edit the handler, add `npm:`/`jsr:` dependencies as needed, and re-run.
+Edit the handler, add `npm:` dependencies as needed, and re-run. A new `npm:`
+dependency must be added to **both** `node.json` (the import map the loader reads)
+and `package.json` (so `npm install` fetches it) — the two are paired by hand.
 "#
     )
 }
@@ -668,7 +744,10 @@ mod tests {
     fn node_json_without_packages_is_valid() {
         let json = node_json(&BTreeSet::new(), false);
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
-        assert!(json.contains("node --experimental-strip-types main.ts"));
+        // node.json is a pure import map: the run command lives once, in
+        // package.json, so it cannot drift between the two files.
+        assert!(!json.contains("scripts"));
+        assert!(!json.contains("node "));
     }
 
     #[test]
@@ -677,5 +756,176 @@ mod tests {
         // The @lib/ alias points at the bundled lib/ folder.
         assert!(json.contains("\"@lib/\": \"./lib/\""));
         assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
+    }
+
+    #[test]
+    fn package_json_installs_the_import_maps_npm_deps() {
+        let mut pkgs = BTreeSet::new();
+        pkgs.insert("@camunda8/sdk".to_string());
+        pkgs.insert("lodash".to_string());
+        let json = package_json(&pkgs);
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        // Dependencies derive from the same packages node.json aliases.
+        assert_eq!(v["dependencies"]["lodash"], "*");
+        assert_eq!(v["dependencies"]["@camunda8/sdk"], "*");
+        // The documented run flow must carry the loader bootstrap: without
+        // `--import ./node-register.mjs` the node.json import map is inert.
+        assert_eq!(
+            v["scripts"]["start"],
+            "node --experimental-strip-types --import ./node-register.mjs main.ts"
+        );
+        assert_eq!(v["engines"]["node"], ">=22.6");
+        assert_eq!(v["devDependencies"]["@types/node"], "^22");
+    }
+
+    #[test]
+    fn package_json_without_packages_still_runs() {
+        let json = package_json(&BTreeSet::new());
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(v.get("dependencies").is_none());
+        assert!(
+            v["scripts"]["start"]
+                .as_str()
+                .unwrap()
+                .contains("node-register.mjs")
+        );
+    }
+
+    /// The archive the Console hands the user must carry everything the Run
+    /// section documents: an npm manifest, the loader + its bootstrap, and a
+    /// `main.ts` that deploys then starts the workers.
+    #[test]
+    fn exported_app_contains_the_runnable_scaffolding() {
+        // The loader + register sources baked into the binary are the real ones
+        // (single source of truth with the managed-project path), not placeholders.
+        assert!(NODE_LOADER_MJS.contains("export async function resolve"));
+        assert!(NODE_REGISTER_MJS.contains("register("));
+        // The app root is a single top-level folder so unzipping never splats.
+        assert_eq!(APP_ROOT, "nano-workers-app");
+    }
+
+    /// End-to-end: `build_app` over a real on-disk workspace must emit, under
+    /// `nano-workers-app/`, every file the README documents as runnable — and the
+    /// generated `package.json` must carry the `--import` bootstrap. This is the
+    /// regression guard for a "downloads but will not run" export (no npm
+    /// manifest, no loader → the bundled `node.json` import map is inert).
+    ///
+    /// `build_app` reads the workspace from `NANOBPMN_WORKSPACE_DIR`, so this is
+    /// serialized against every other env-mutating test by [`crate::projects::env_lock`].
+    #[test]
+    fn build_app_ships_a_runnable_app() {
+        let _guard = crate::projects::env_lock();
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nano-wexport-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("workers/acme")).unwrap();
+        std::fs::write(
+            root.join("workers/acme/worker.ts"),
+            "import { defineWorker } from \"@nanobpm/worker\";\nimport _ from \"npm:lodash@4\";\ndefineWorker({});\n",
+        )
+        .unwrap();
+        let prev = std::env::var("NANOBPMN_WORKSPACE_DIR").ok();
+        unsafe { std::env::set_var("NANOBPMN_WORKSPACE_DIR", &root) };
+
+        let zip = build_app(&["acme".to_string()]).expect("build_app succeeds");
+        let names = zip_entry_names(&zip);
+        for want in [
+            "nano-workers-app/package.json",
+            "nano-workers-app/node.json",
+            "nano-workers-app/node-register.mjs",
+            "nano-workers-app/node-loader.mjs",
+            "nano-workers-app/main.ts",
+            "nano-workers-app/README.md",
+            "nano-workers-app/workers/acme/worker.ts",
+        ] {
+            assert!(
+                names.contains(&want.to_string()),
+                "missing {want} in {names:?}"
+            );
+        }
+
+        // The bootstrap the entrypoint needs is really in the manifest.
+        let pkg = String::from_utf8(
+            read_zip_entry(&zip, "nano-workers-app/package.json").expect("package.json entry"),
+        )
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&pkg).expect("valid JSON");
+        assert!(
+            v["scripts"]["start"]
+                .as_str()
+                .unwrap()
+                .contains("--import ./node-register.mjs")
+        );
+        // Its deps derive from the import map the loader reads: worker_export's
+        // node.json aliases `lodash` as `npm:lodash`, so the manifest installs it
+        // as `*` — the two files agree rather than drifting apart.
+        let nj = String::from_utf8(
+            read_zip_entry(&zip, "nano-workers-app/node.json").expect("node.json entry"),
+        )
+        .unwrap();
+        assert!(nj.contains("\"lodash\": \"npm:lodash\""));
+        assert_eq!(v["dependencies"]["lodash"], "*");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("NANOBPMN_WORKSPACE_DIR", v) },
+            None => unsafe { std::env::remove_var("NANOBPMN_WORKSPACE_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Enumerate the file names in a STORED zip by walking its central directory.
+    fn zip_entry_names(zip: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        // Locate EOCD (signature 0x06054b50) scanning back over the comment.
+        let eocd = zip
+            .windows(4)
+            .rposition(|w| w == 0x0605_4b50u32.to_le_bytes())
+            .expect("EOCD");
+        let count = u16::from_le_bytes([zip[eocd + 10], zip[eocd + 11]]) as usize;
+        let mut off = u32::from_le_bytes([
+            zip[eocd + 16],
+            zip[eocd + 17],
+            zip[eocd + 18],
+            zip[eocd + 19],
+        ]) as usize;
+        for _ in 0..count {
+            assert_eq!(&zip[off..off + 4], &0x0201_4b50u32.to_le_bytes());
+            let name_len = u16::from_le_bytes([zip[off + 28], zip[off + 29]]) as usize;
+            let extra_len = u16::from_le_bytes([zip[off + 30], zip[off + 31]]) as usize;
+            let comment_len = u16::from_le_bytes([zip[off + 32], zip[off + 33]]) as usize;
+            let name = String::from_utf8(zip[off + 46..off + 46 + name_len].to_vec()).unwrap();
+            names.push(name);
+            off += 46 + name_len + extra_len + comment_len;
+        }
+        names
+    }
+
+    /// Read entry `name`'s bytes from a STORED zip via its local file header.
+    fn read_zip_entry(zip: &[u8], name: &str) -> Option<Vec<u8>> {
+        let mut off = 0usize;
+        while off + 4 <= zip.len() {
+            if zip[off..off + 4] != 0x0403_4b50u32.to_le_bytes() {
+                break;
+            }
+            let method = u16::from_le_bytes([zip[off + 8], zip[off + 9]]);
+            assert_eq!(method, 0, "expected STORED entry");
+            let comp =
+                u32::from_le_bytes([zip[off + 18], zip[off + 19], zip[off + 20], zip[off + 21]])
+                    as usize;
+            let name_len = u16::from_le_bytes([zip[off + 26], zip[off + 27]]) as usize;
+            let extra_len = u16::from_le_bytes([zip[off + 28], zip[off + 29]]) as usize;
+            let entry_name =
+                String::from_utf8(zip[off + 30..off + 30 + name_len].to_vec()).unwrap();
+            let data_at = off + 30 + name_len + extra_len;
+            if entry_name == name {
+                return Some(zip[data_at..data_at + comp].to_vec());
+            }
+            off = data_at + comp;
+        }
+        None
     }
 }
