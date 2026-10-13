@@ -69,7 +69,7 @@ fn project_urban_bin(project_dir: &Path) -> PathBuf {
         .join(URBAN_EXE)
 }
 
-/// Locates the `urban` CLI binary, mirroring [`super::workers::find_deno`].
+/// Locates the `urban` CLI binary, mirroring [`super::workers::find_node`].
 /// The resolution order is `NANOBPMN_URBAN_BIN` (explicit override) → the
 /// first-party marketplace pack ([`pack_urban_bin`]) → `PATH`.
 ///
@@ -170,9 +170,9 @@ fn resolve_urban(
 }
 
 /// Whether the `urban` CLI is available on this host — surfaced as
-/// `urbanAvailable` next to `denoAvailable`/`nodeAvailable` in the project
-/// status JSON so the Studio can gate urban-app affordances (mirrors
-/// [`super::workers::WorkerSupervisor::deno_available`]). Presence only; the
+/// `urbanAvailable` next to `nodeAvailable` in the project status JSON so the
+/// Studio can gate urban-app affordances (mirrors
+/// [`super::workers::WorkerSupervisor::node_available`]). Presence only; the
 /// binary is not executed. Host-global (override/pack/`PATH`); a project-local
 /// install is not counted here — see [`urban_available_for`].
 pub(crate) fn urban_available() -> bool {
@@ -197,7 +197,7 @@ pub(crate) fn urban_available_for(project_dir: &Path) -> bool {
 /// The delegation call sites (`derive_models`/`generate_models` →
 /// `urban derive --stdout`; `regenerate_domain_types` → `urban gen --no-models`)
 /// gate on this so an older toolkit that predates derivation falls back to the
-/// console's embedded Deno driver / bare `urban gen` — additive + non-regressing,
+/// console's embedded driver / bare `urban gen` — additive + non-regressing,
 /// exactly like #530. Derived from the memoised [`urban_help_text`] read, so we
 /// never re-spawn the binary per capability we gate on (see its doc for the
 /// bounded, benign duplication when several *concurrent first* calls race before

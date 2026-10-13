@@ -1,6 +1,5 @@
 // Real, opt-in adapters behind the S1 seams (issue #297, slice S4). This file REPLACES the
-// S1 placeholder and is eagerly imported by the `/ai` barrel on the default Node lane AND
-// the Deno lane (`npm run test:deno`).
+// S1 placeholder and is eagerly imported by the `/ai` barrel on the default Node lane.
 //
 // IMPORT-SAFETY CONTRACT (preserved from S1 — do not break):
 //   (i)   NO top-level `import` of any optional/heavy dependency (`openai`,

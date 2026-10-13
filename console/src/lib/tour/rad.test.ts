@@ -24,7 +24,6 @@ function ctx(over: Partial<TourContext> = {}): TourContext {
     profile: "studio",
     route: "/projects",
     projects: [],
-    denoAvailable: true,
     nodeAvailable: true,
     templates: [],
     extensions: [],
@@ -126,7 +125,7 @@ test("the run-and-serve step gates on a JS runtime and authors an install-hint r
 });
 
 test("with no runtime, resolveSteps substitutes the install-hint repair for the serve step", () => {
-  const noRuntime = ctx({ denoAvailable: false, nodeAvailable: false });
+  const noRuntime = ctx({ nodeAvailable: false });
   const resolved = resolveSteps(rad, noRuntime);
   assert.ok(
     resolved.steps.some((s) => s.step.id === "served-app-needs-runtime"),

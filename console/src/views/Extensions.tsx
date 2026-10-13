@@ -358,7 +358,7 @@ export default function Extensions() {
   const remove = async (id: string, label: string) => {
     if (
       !window.confirm(
-        `Uninstall extension "${label}"?\n\nProjects scaffolded from it will keep their files but lose their toolchain (Run/Compile may fall back to Deno).`,
+        `Uninstall extension "${label}"?\n\nProjects scaffolded from it will keep their files but lose their toolchain (Run/Compile may fall back to Node).`,
       )
     ) {
       return;

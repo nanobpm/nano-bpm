@@ -8,7 +8,7 @@
 // IMPORT-SAFETY: this module performs NO top-level import of the `openai` optional
 // dependency. The SDK is loaded LAZILY via a non-literal dynamic `import()` inside the
 // opt-in-gated `createHostedProviderAdapters` factory only, so importing this module on the
-// default/Deno lane (where `openai` is absent) never resolves it and never hits the network.
+// default lane (where `openai` is absent) never resolves it and never hits the network.
 //
 // LIVE activation requires the `URBAN_TESTKIT_AI_REAL` opt-in (see ./env.ts) plus an API
 // key (config `apiKey` or the provider's own `OPENAI_API_KEY`).

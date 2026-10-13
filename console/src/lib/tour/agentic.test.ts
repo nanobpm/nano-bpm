@@ -30,7 +30,6 @@ function ctx(over: Partial<TourContext> = {}): TourContext {
     profile: "studio",
     route: "/projects",
     projects: [],
-    denoAvailable: true,
     nodeAvailable: true,
     templates: [],
     extensions: [],
@@ -181,10 +180,7 @@ test("isParkedOnHumanApproval: a completed or incident-bearing instance is never
 // ── honest-Run invariant on 0a's final step ──────────────────────────────────
 
 test("agenticAuthor: with no runtime, the Run step repairs into an install hint", () => {
-  const r = resolveSteps(
-    agenticAuthor,
-    ctx({ denoAvailable: false, nodeAvailable: false }),
-  );
+  const r = resolveSteps(agenticAuthor, ctx({ nodeAvailable: false }));
   const runStep = r.steps.find((s) => s.repaired === "has-js-runtime");
   assert.ok(runStep, "the run step should have been repaired with no runtime");
   assert.equal(runStep!.step.id, "author-run-repair");

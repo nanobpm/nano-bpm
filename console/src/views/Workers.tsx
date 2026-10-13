@@ -137,7 +137,6 @@ export default function Workers() {
     refetchInterval: 1500,
   });
   const workers = data?.workers ?? [];
-  const denoAvailable = data?.denoAvailable ?? true;
   const nodeAvailable = data?.nodeAvailable ?? true;
   const current = workers.find((w) => w.name === selected);
 
@@ -251,8 +250,8 @@ export default function Workers() {
           title="Embedded Workers"
           subtitle={
             IS_STUDIO
-              ? "Author TypeScript job workers and run them as isolated processes (Node, or sandboxed Deno) over the Falcon."
-              : "Monitor job workers running as isolated processes (Node, or sandboxed Deno) over the Falcon."
+              ? "Author TypeScript job workers and run them as isolated processes on Node over the Falcon."
+              : "Monitor job workers running as isolated processes on Node over the Falcon."
           }
           actions={
             <div className="flex gap-1 rounded-lg bg-inset p-1 text-sm">
@@ -277,11 +276,11 @@ export default function Workers() {
         />
       </div>
 
-      {!nodeAvailable && !denoAvailable && (
+      {!nodeAvailable && (
         <div className="border-b border-warn/30 bg-warn/10 px-6 py-2 text-xs text-warn">
           No JavaScript runtime found — you can author workers, but starting
-          them needs Node ≥ 22.6 (the npm launcher provides one) or Deno.
-          Install Node from https://nodejs.org.
+          them needs Node ≥ 22.6 (the npm launcher provides one). Install Node
+          from https://nodejs.org.
         </div>
       )}
       {message && (
@@ -315,7 +314,7 @@ export default function Workers() {
                 <button
                   onClick={openExport}
                   disabled={busy || workers.length === 0}
-                  title="Export selected workers as a standalone Deno application"
+                  title="Export selected workers as a standalone Node application"
                   className="rounded border border-edge-strong bg-raised px-2 py-0.5 text-xs text-fg hover:bg-hover disabled:opacity-50"
                 >
                   Export app
@@ -416,10 +415,10 @@ export default function Workers() {
                 Export workers as an application
               </h2>
               <p className="mt-1 text-xs text-fg-faint">
-                Bundle the selected workers into a self-contained Deno app. The
+                Bundle the selected workers into a self-contained Node app. The
                 downloaded zip deploys every model in its{" "}
                 <code>resources/</code> folder on startup, then runs the
-                workers. Requires Deno to run.
+                workers. Requires Node ≥ 22.6 to run.
               </p>
             </div>
             <ul className="max-h-64 overflow-auto px-5 py-3">

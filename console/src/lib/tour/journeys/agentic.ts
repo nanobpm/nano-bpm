@@ -141,7 +141,7 @@ export const agenticAuthor: Journey = {
         kind: "note",
         id: "author-run-repair",
         title: "First, a JavaScript runtime",
-        body: "This template runs on Deno or Node, and the console doesn't see either on your PATH yet. Install Deno (deno.com) or Node (nodejs.org), reopen the project, and the worker host will boot from the run output.",
+        body: "This template runs on Node, and the console doesn't see Node on your PATH yet. Install Node ≥ 22.6 (nodejs.org), reopen the project, and the worker host will boot from the run output.",
       },
     },
   ],

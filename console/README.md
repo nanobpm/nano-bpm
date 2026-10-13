@@ -54,7 +54,7 @@ npm run build   # → console/dist, embedded by the gateway's `console` feature
 
 The **Projects** view (the console's home) is a Rapid Application Development
 environment. A project is a self-contained
-[Deno](https://deno.com) application directory holding everything an automation
+[Node](https://nodejs.org) application directory holding everything an automation
 needs: process models, the workers that service their jobs, shared libraries,
 and a generated entry point that ties them together.
 
@@ -63,15 +63,16 @@ and a generated entry point that ties them together.
 ```
 <projectsRoot>/<project>/
   nanobpm.project.json   # name, description, deployTarget, main, export platforms
-  deno.json              # import map (@nanobpm/worker, @lib/) + `start` task
+  node.json              # import map (@nanobpm/worker, @lib/); package.json runs it
+  package.json           # npm identity (engines: node >= 22.6) + `npm start`
   main.ts                # deploys resources/processes/*.bpmn, then starts workers
   resources/
     processes/  *.bpmn   # deployed to the engine on Run
     decisions/  *.dmn    # authored + exported (see note below)
     forms/      *.form    # authored + exported (see note below)
-  workers/<name>/        # one folder per worker (worker.ts + deno.json)
+  workers/<name>/        # one folder per worker (worker.ts + node.json)
   lib/                   # shared @lib/… modules usable from every worker
-  .nanobpm/worker-sdk.ts # embedded worker SDK
+  nano-generated/worker-sdk.ts # embedded worker SDK
 ```
 
 `<projectsRoot>` defaults to `<workspace>/projects` and can be overridden with
@@ -83,12 +84,14 @@ one project, surfaced as a tile on the Projects home.
 Open a project to get a file browser, graphical/code editors, the run console,
 and a toolbar:
 
-- **Run** — `deno run main.ts`: deploys every `resources/processes/*.bpmn` to the
-  configured deploy target, then imports and starts each worker. Stdout/stderr
-  stream live into the Output panel. **Stop** terminates the application.
-- **Compile** — `deno compile`: produces standalone binaries under `dist/`.
-  Selecting export platforms cross-compiles for them (this downloads the Deno
-  runtime per target and can take a few minutes; progress streams to Output).
+- **Run** — `node --experimental-strip-types --import <project>/nano-generated/node-register.mjs main.ts`:
+  deploys every `resources/processes/*.bpmn` to the configured deploy target,
+  then imports and starts each worker. (The supervisor also passes
+  `--experimental-sqlite` on the supported Node floor; that is the same command
+  the generated `package.json` `start` script runs.) Stdout/stderr stream live
+  into the Output panel. **Stop** terminates the application.
+- **Compile** — runs the project's configured compile command (lang pack or
+  toolchain argv), producing standalone binaries under `dist/`.
 - **Configure** — edits the deploy target (`<target>/v2` is the REST API the app
   deploys to and dials the Falcon protocol on), the entry point, and the set of
   export platforms.
@@ -111,6 +114,13 @@ The center pane dispatches on file extension:
 > `.dmn`/`.form` resources graphically and they travel with the project (and its
 > export zip), but only `resources/processes/*.bpmn` are deployed and executed.
 
-Running and compiling require a Deno runtime on the gateway host; when none is
-detected the editors and Export still work, but Run and Compile are disabled.
+Running a **Node-runtime** project (the default scaffold and any lang pack that
+uses Node as its runtime) requires Node (≥ 22.6) on the gateway host; when none
+is detected the editors and Export still work, but Run is disabled for those
+projects. Compiling runs whatever compile command the project's lang pack /
+toolchain declares — a Node project with no compile command reports "no compile
+command configured", and a pack with its own toolchain (e.g. the Rust pack) is
+unaffected by Node availability. The `NANOBPMN_NODE_BIN` environment variable
+names an explicit binary, but a version older than 22.6 is skipped in favour of a
+supported Node on `PATH`/`~/.local/bin`.
 

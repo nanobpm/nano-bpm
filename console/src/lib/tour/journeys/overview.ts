@@ -52,7 +52,7 @@ export const overviewStudio: Journey = {
       route: "/projects",
       selector: tourSelector(TOUR_ANCHOR.newProject),
       title: "Scaffold a project",
-      body: "Pick a template — each one wires up a runnable toolchain (Node, Deno, JVM, …) so Run works with zero setup.",
+      body: "Pick a template — each one wires up a runnable toolchain (Node, JVM, Rust, …) so Run works with zero setup.",
       side: "bottom",
       align: "end",
     },

@@ -106,16 +106,11 @@ export interface ChatMessage {
 
 type Env = (key: string) => string | undefined;
 
-// Default environment reader: Deno first, Node fallback. Mirrors worker-sdk's RT
-// adapter but only needs env reads here.
+// Default environment reader: Node's `process.env`. Mirrors worker-sdk's RT
+// adapter, which is Node-only since ADR 0065 removed Deno.
 const defaultEnv: Env = (key) => {
-  const g = globalThis as unknown as {
-    Deno?: { env: { get(k: string): string | undefined } };
-    process?: { env: Record<string, string | undefined> };
-  };
-  if (g.Deno) return g.Deno.env.get(key);
-  if (g.process) return g.process.env[key];
-  return undefined;
+  const g = globalThis as unknown as { process?: { env: Record<string, string | undefined> } };
+  return g.process?.env[key];
 };
 
 // --- Provider resolution ---------------------------------------------------
@@ -341,7 +336,7 @@ export interface StartLlmWorkersOptions {
   manifestPath?: string;
   /** Engine base URL (default env NANOBPMN_BASE_URL or http://127.0.0.1:8080). */
   baseUrl?: string;
-  /** Env reader (default Deno/Node). */
+  /** Env reader (default `process.env`). */
   env?: Env;
   /** Fetch impl (default global). */
   fetch?: typeof fetch;
@@ -362,14 +357,8 @@ export async function startLlmWorkers(
   let manifest = opts.manifest;
   if (!manifest) {
     const path = opts.manifestPath ?? "./nano.app.json";
-    const text = await (globalThis as unknown as {
-      Deno?: { readTextFile(p: string): Promise<string> };
-    }).Deno?.readTextFile(path);
-    if (text === undefined) {
-      throw new Error(
-        "startLlmWorkers: no manifest provided and Deno.readTextFile unavailable",
-      );
-    }
+    const { readFile } = await import("node:fs/promises");
+    const text = await readFile(path, "utf8");
     manifest = JSON.parse(text) as AppManifest;
   }
 

@@ -4,8 +4,8 @@
 // tour's preconditions are computed from `listProjects()`, so stubbing it is the
 // only way to drive a *repair* path on purpose (flip both runtime flags to false
 // and assert the journey offers an install hint instead of telling the user to
-// press Run). It also means a run needs no engine, no Deno and no scaffolded
-// project, which is what keeps this suite fast and non-flaky.
+// press Run). It also means a run needs no engine, no Node toolchain and no
+// scaffolded project, which is what keeps this suite fast and non-flaky.
 //
 // Every stub returns a SHAPED payload, not `{}`. An earlier version of this file
 // fulfilled unknown routes with an empty object and the Explorer view crashed on
@@ -28,7 +28,6 @@ import type {
 
 export interface StubOptions {
   /** Both false ⇒ `hasJsRuntime` resolves to "repair". */
-  denoAvailable?: boolean;
   nodeAvailable?: boolean;
   urbanAvailable?: boolean;
   /** 0 ⇒ `hasTraces` resolves to "skip". */
@@ -43,7 +42,7 @@ const template = (id: string, label: string) => ({
   id,
   label,
   description: `${label} description`,
-  lang: "deno",
+  lang: "node",
   source: "builtin",
 });
 
@@ -95,12 +94,11 @@ export async function stubConsoleApi(
   options: StubOptions = {},
 ): Promise<void> {
   const {
-    denoAvailable = true,
     nodeAvailable = true,
     urbanAvailable = true,
     traceCount = 0,
     nodeCount = 1,
-    projects = [{ name: "demo", lang: "deno" }],
+    projects = [{ name: "demo", lang: "node" }],
   } = options;
 
   const projectsBody = {
@@ -115,9 +113,8 @@ export async function stubConsoleApi(
       workers: 0,
       running: p.running ?? false,
       source: "workspace",
-      lang: p.lang ?? "deno",
+      lang: p.lang ?? "node",
     })),
-    denoAvailable,
     nodeAvailable,
     urbanAvailable,
     platforms: [],
@@ -191,7 +188,7 @@ export async function stubConsoleApi(
       });
     }
     if (url.endsWith("/console/api/workers")) {
-      return json({ workers: [], denoAvailable, nodeAvailable });
+      return json({ workers: [], nodeAvailable });
     }
     if (url.endsWith("/console/api/extensions")) {
       return json({ extensions: [], yolo: false });
@@ -527,7 +524,7 @@ function makeProjectDetail(
     deployTarget: "http://localhost:8080",
     main: "main.ts",
     platforms: [],
-    lang: "deno",
+    lang: "node",
     app: "urban",
     createdMs: 0,
     updatedMs: 0,
@@ -548,7 +545,6 @@ function makeProjectDetail(
     runState,
     appUi,
     rootPath: `/tmp/${name}`,
-    denoAvailable: true,
     nodeAvailable: true,
     urbanAvailable: true,
     runnable: true,

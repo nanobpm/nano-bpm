@@ -16,6 +16,8 @@
 //   POST /app/actions/message                   → publishMessage (row/detail answer)
 //   GET  /  (+ /app/runtime.js)                 → the schema-driven browser renderer
 
+import { createServer } from "node:http";
+
 /** The subset of the `@nanobpm/data` DataSource the runtime needs. */
 export interface PagesDataSource {
   query(sql: string, params?: unknown[]): Promise<Record<string, unknown>[]>;
@@ -52,7 +54,7 @@ export interface PagesContext {
   rowLimit?: number;
   /** The name of the injected default datasource (the alias apps bind to). Default `app`. */
   sourceName?: string;
-  /** Read a page file; injectable for tests. Defaults to `Deno.readTextFile`. */
+  /** Read a page file; injectable for tests. Defaults to `node:fs` readFile. */
   readPage?: (path: string) => Promise<string>;
 }
 
@@ -64,15 +66,26 @@ const json = (body: unknown, status = 200): Response =>
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
+ * Hard cap on a request body the `node:http` adapter will buffer. The page
+ * runtime's handler never reads a request body (every route is addressed by path
+ * and query), so nothing legitimate approaches this — but the adapter sits on a
+ * public port, and an unbounded `for await (chunk of req)` would let a remote
+ * client force memory growth at request-body speed. Over the cap: answer 413
+ * without accumulating, and tear the socket down.
+ */
+const MAX_REQUEST_BODY_BYTES = 1 << 20; // 1 MiB
+
+/**
  * The request handler, factored out of `servePages` so it is pure over its context
- * (injected `db`/`nano`/`readPage`) and unit-testable without a real `Deno.serve`.
+ * (injected `db`/`nano`/`readPage`) and unit-testable without a real HTTP server.
  */
 export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise<Response> {
   const pagesDir = ctx.pagesDir ?? "pages";
   const homePage = ctx.homePage ?? "home";
   const rowLimit = Math.max(0, Math.floor(Number(ctx.rowLimit) || 200));
   const sourceName = ctx.sourceName ?? "app";
-  const readPage = ctx.readPage ?? ((p: string) => Deno.readTextFile(p));
+  const readPage = ctx.readPage ??
+    (async (p: string) => (await import("node:fs/promises")).readFile(p, "utf8"));
 
   // The table-name whitelist is memoised: an Urban app runs its migrations at
   // boot (before `servePages`), so the schema is stable for the process lifetime,
@@ -205,10 +218,19 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
         orderSql = ` ORDER BY ${field} ${dir}`;
       }
       const whereSql = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
-      const rows = await ctx.db.query(
-        `SELECT * FROM ${table}${whereSql}${orderSql} LIMIT ${rowLimit}`,
-        params,
-      );
+      let rows: unknown[];
+      try {
+        rows = await ctx.db.query(
+          `SELECT * FROM ${table}${whereSql}${orderSql} LIMIT ${rowLimit}`,
+          params,
+        );
+      } catch (e) {
+        // The column/table whitelist above already made the SQL safe; a failure
+        // here is a driver problem (locked/missing database), whose message can
+        // carry the database path. Log it, answer generically — never echo it.
+        console.error(`[app-pages] query failed for "${table}":`, e);
+        return json({ error: "query failed" }, 500);
+      }
       return json({ rows });
     }
 
@@ -298,12 +320,91 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
 }
 
 /**
- * Start the page runtime on `port`. Returns the `Deno.HttpServer` handle. The app's
- * `main.ts` typically does: `servePages({ db, nano, port })`.
+ * Start the page runtime on `port`, returning the `node:http` server handle. The
+ * app's `main.ts` typically does: `servePages({ db, nano, port })`.
+ *
+ * Node is the sole JS/TS runtime (ADR 0065): the handler is a web-standard
+ * `Request → Response` function (so it stays unit-testable without a socket), and
+ * this adapter bridges it onto `node:http` — the one place a real HTTP server is
+ * needed. The old `Deno.serve` binding is gone with the runtime.
  */
-export function servePages(ctx: PagesContext & { port?: number }): Deno.HttpServer {
+export function servePages(
+  ctx: PagesContext & { port?: number },
+): import("node:http").Server {
   const handle = createPagesHandler(ctx);
-  return Deno.serve({ port: ctx.port ?? 8090 }, handle);
+  const server = createServer((req, res) => {
+    void (async () => {
+      // node:http gives a Node request/response, not a web `Request`; rebuild a
+      // web `Request` so `createPagesHandler` stays the single request-handling
+      // path (no second, drifting router). Bodies are capped: nothing the handler
+      // routes on reads one, so an over-cap body is refused (413) rather than
+      // buffered — the adapter sits on a public port and must not let a client
+      // force unbounded allocation.
+      const chunks: Buffer[] = [];
+      let total = 0;
+      let over = false;
+      for await (const chunk of req) {
+        total += (chunk as Buffer).length;
+        if (total > MAX_REQUEST_BODY_BYTES) {
+          over = true;
+          break;
+        }
+        chunks.push(chunk as Buffer);
+      }
+      if (over) {
+        // Stop reading (the `break` above leaves the rest unread) and answer; the
+        // connection is closed by `Connection: close` so the client is not left
+        // blocked writing into a socket we have stopped draining.
+        res.writeHead(413, { "content-type": "text/plain", connection: "close" });
+        res.end("request body too large");
+        req.destroy();
+        return;
+      }
+      const body = chunks.length ? Buffer.concat(chunks) : undefined;
+      const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
+      const request = new Request(url, {
+        method: req.method,
+        headers: req.headers as Record<string, string>,
+        body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
+      });
+      const response = await handle(request);
+      res.writeHead(response.status, Object.fromEntries(response.headers));
+      res.end(Buffer.from(await response.arrayBuffer()));
+    })().catch((e) => sendInternalError(res, e));
+  });
+  return server.listen(ctx.port ?? 8090);
+}
+
+/// The minimum of a `node:http` response this module needs, kept structural so
+/// the error path is unit-testable without a socket.
+export interface ErrorSink {
+  headersSent: boolean;
+  writeHead(status: number, headers?: Record<string, string>): unknown;
+  end(body?: string): unknown;
+  destroy(): unknown;
+}
+
+/// Answer an unexpected server-side failure **without leaking its text**. The
+/// detail is logged server-side; the client gets an opaque 500. This is the last
+/// line of defence for the public port — an exception's message can carry a
+/// filesystem path, SQL fragment, or backend text, so it must never be echoed.
+///
+/// If the response is already committed (`headersSent`) a second `writeHead`
+/// throws `ERR_HTTP_HEADERS_SENT`; destroy the socket instead. Any failure inside
+/// this handler also degrades to a destroy rather than escaping the socket
+/// callback.
+export function sendInternalError(res: ErrorSink, err: unknown): void {
+  console.error("[app-pages] unhandled request error:", err);
+  try {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    res.writeHead(500, { "content-type": "text/plain", connection: "close" });
+    res.end("internal server error");
+  } catch {
+    res.destroy();
+  }
 }
 
 function escapeAttr(s: string): string {

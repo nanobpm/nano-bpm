@@ -1,34 +1,102 @@
-// nanobpmn Node ESM loader (ADR 0036).
+// nanobpmn Node ESM loader (ADR 0065).
 //
-// Makes Node honor the project's `deno.json` import map so worker/App code
-// authored for Deno runs unchanged under Node — the fallback worker runtime on
-// hosts with no Deno build (e.g. 32-bit ARM). Node's built-in type stripping
+// Makes Node honor the project's `node.json` import map — the single manifest
+// the scaffolder writes and the runtime reads (a legacy `deno.json` is accepted
+// as an alias). Node's built-in type stripping
 // (`--experimental-strip-types`) handles the `.ts` sources; this loader only
 // rewrites *specifiers*. Registered off-thread by `node-register.mjs`.
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { resolve as resolvePath } from "node:path";
 
-// The run's working directory is the directory that holds the `deno.json` whose
+// The run's working directory is the directory that holds the `node.json` whose
 // import map applies — the project root for a RAD project run (`main.ts`), or the
 // worker directory for a standalone worker (`worker.ts`). Both the map file and
 // its relative values are resolved against it.
 const baseDir = process.cwd();
 
+// The import-map file names the loader reads, in precedence order. `deno.json`/
+// `deno.jsonc` are the **legacy alias** for a project scaffolded before Deno
+// removal (ADR 0065): the *file name* maps onto the same import map, but
+// execution is Node either way. Last so a real `node.json` always wins.
+const IMPORT_MAP_FILES = [
+  "node.json",
+  "node.jsonc",
+  "deno.json",
+  "deno.jsonc",
+];
+
 function readImportMap() {
-  for (const name of ["deno.json", "deno.jsonc"]) {
+  // A one-shot derivation (`derive-models` / `generate-models`) needs an SDK +
+  // layout dependency the project's own `node.json` may not yet declare. It points
+  // us at a synthesized map via `NANOBPMN_IMPORT_MAP`; its relative values
+  // resolve against the same base dir (the derivation writes it at the project
+  // root, for exactly this reason).
+  const override = process.env.NANOBPMN_IMPORT_MAP;
+  const candidates = override
+    ? [override, ...IMPORT_MAP_FILES]
+    : [...IMPORT_MAP_FILES];
+  for (const name of candidates) {
     try {
       const raw = readFileSync(resolvePath(baseDir, name), "utf8");
-      return JSON.parse(raw).imports ?? {};
+      return JSON.parse(stripJsonc(raw)).imports ?? {};
     } catch {
       // not present / unreadable — try the next candidate
     }
   }
   return {};
 }
+
+// Strip the two JSONC extensions — `//` line and `/* … */` block comments, and
+// trailing commas — so a `.jsonc` import map parses as JSON. Quote-aware so a `//`
+// inside a string value (`"https://host/x"`) survives. Mirrors `strip_jsonc` in
+// projects.rs (keep the two in lockstep): the candidate list advertises
+// `node.jsonc`/`deno.jsonc`, so the loader must accept a real JSONC body rather
+// than skip the file and leave the project's imports unresolved.
+export function stripJsonc(input) {
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  let i = 0;
+  while (i < input.length) {
+    const c = input[i];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === "\\") escaped = true;
+      else if (c === '"') inString = false;
+      i += 1;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      out += c;
+      i += 1;
+    } else if (c === "/" && input[i + 1] === "/") {
+      i += 2;
+      while (i < input.length && input[i] !== "\n") i += 1;
+    } else if (c === "/" && input[i + 1] === "*") {
+      i += 2;
+      while (i + 1 < input.length && !(input[i] === "*" && input[i + 1] === "/")) i += 1;
+      i = Math.min(i + 2, input.length);
+    } else if (c === ",") {
+      let j = i + 1;
+      while (j < input.length && /\s/.test(input[j])) j += 1;
+      if (input[j] === "}" || input[j] === "]") i += 1; // trailing comma — drop it
+      else {
+        out += c;
+        i += 1;
+      }
+    } else {
+      out += c;
+      i += 1;
+    }
+  }
+  return out;
+}
 const MAP = readImportMap();
 
-// Deno import maps support exact keys and "prefix" keys ending in `/`.
+// Import maps support exact keys and "prefix" keys ending in `/`.
 function mapSpecifier(spec) {
   if (Object.prototype.hasOwnProperty.call(MAP, spec)) return MAP[spec];
   for (const [key, val] of Object.entries(MAP)) {
@@ -42,7 +110,7 @@ export async function resolve(specifier, context, next) {
   if (mapped == null) return next(specifier, context);
 
   if (mapped.startsWith("npm:")) {
-    // Resolve a Deno `npm:[/]<name>[@<range>][/<subpath>]` specifier to the module
+    // Resolve an `npm:[/]<name>[@<range>][/<subpath>]` specifier to the module
     // specifier Node resolves from `node_modules`: strip the scheme + optional
     // leading slash, DROP the version range, and KEEP the package name and any
     // subpath (`npm:lodash@^4/fp` -> `lodash/fp`). `npm install` provides the
@@ -62,8 +130,8 @@ export async function resolve(specifier, context, next) {
   }
   if (mapped.startsWith("jsr:") || mapped.startsWith("http:") || mapped.startsWith("https:")) {
     throw new Error(
-      `Node worker runtime cannot resolve '${specifier}' -> '${mapped}': ` +
-        `jsr:/https: imports require Deno. Install Deno, or vendor the dependency via npm.`,
+      `Node runtime cannot resolve '${specifier}' -> '${mapped}': ` +
+        `jsr:/https: imports are not supported. Vendor the dependency via npm.`,
     );
   }
   // A relative path from the import map, resolved against the base dir.

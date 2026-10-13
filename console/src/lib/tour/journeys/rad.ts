@@ -181,7 +181,7 @@ const runtimeRepair: Step = {
   kind: "note",
   id: "served-app-needs-runtime",
   title: "Run needs a JavaScript runtime",
-  body: 'This machine has no Deno or Node on its PATH, so Run — which boots the app and its web server — cannot start. Install <a href="https://deno.com/" target="_blank" rel="noreferrer noopener">Deno</a> (the default) or Node, then reopen this journey. Authoring the process, the screen and the data still works without a runtime; only serving the app needs one.',
+  body: 'This machine has no Node on its PATH, so Run — which boots the app and its web server — cannot start. Install <a href="https://nodejs.org/" target="_blank" rel="noreferrer noopener">Node</a> ≥ 22.6, then reopen this journey. Authoring the process, the screen and the data still works without a runtime; only serving the app needs one.',
 };
 
 export const rad: Journey = {
@@ -260,7 +260,7 @@ export const rad: Journey = {
       route: "/explorer",
       selector: tourSelector(TOUR_ANCHOR.explorerNav),
       title: "See what the UI started",
-      body: `Every action in the served UI drives the engine: the submit box you saw <em>created a process instance</em>, and here it is — its variables and current state. Next: <strong>Compile</strong> bundles the whole app into a single binary (<code>deno compile</code>), and <a href="${REFERENCE_APP_URL}" target="_blank" rel="noreferrer noopener">urban-pr-review</a> is a full Urban app built this way.`,
+      body: `Every action in the served UI drives the engine: the submit box you saw <em>created a process instance</em>, and here it is — its variables and current state. Next: give the app a db and deploy it — <a href="${REFERENCE_APP_URL}" target="_blank" rel="noreferrer noopener">urban-pr-review</a> is a full Urban app built this way.`,
       side: "right",
       align: "start",
     },

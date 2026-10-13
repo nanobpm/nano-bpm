@@ -1427,7 +1427,7 @@ matchTags(result.error, {
   <p>Two reasons, and neither is a knock on Effect — they’re about <em>our</em> layer.</p>
   <p><strong>1. Bundle weight against a polyglot, embed-everywhere surface.</strong> Urban’s
   published value isn’t a TS runtime — it’s a portable app model plus a client renderer that
-  ships to <em>many</em> runtimes: Node, and embedded hosts on the JVM, GraalVM, and Deno,
+  ships to <em>many</em> runtimes: Node, and embedded hosts on the JVM, GraalVM, and more,
   feeding language kits for Java, Rust, Python, C# and more. The imperative glue that benefits
   from Effect’s ergonomics is a <em>thin seam</em> around a declarative core. Pulling a full
   effect runtime into that seam is weight in exactly the place we work hardest to keep light.</p>

@@ -14,8 +14,8 @@
 /**
  * The urban-starter scaffold's default served port. Single-sourced here with a
  * citation so the fallback is the scaffold's real default, not a magic number:
- * `URBAN_MAIN_TS` in server/src/console/projects.rs does
- * `Number(Deno.env.get("PORT") ?? 8090)` and `servePages({ port })`.
+ * `URBAN_MAIN_TS` in server/crates/nano-server-console/src/projects.rs does
+ * `Number(process.env.PORT ?? 8090)` and `servePages({ port })`.
  */
 export const URBAN_APP_DEFAULT_PORT = 8090;
 

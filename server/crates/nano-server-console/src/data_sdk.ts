@@ -1,4 +1,4 @@
-// nanobpmn embedded datasource SDK (Deno-preferred, Node-capable) — ADR 0024.
+// nanobpmn embedded datasource SDK (Node runtime) — ADR 0024.
 //
 // Materialised verbatim to <workspace>/<project>/nano-generated/data-sdk.ts and
 // imported as `@nanobpm/data` (or `./data-sdk.ts` from the sibling worker SDK).
@@ -21,30 +21,20 @@
 //   }});
 //
 // Core ships SQLite only (the `node:sqlite` built-in — embedded, single-file —
-// present in both Deno and Node >= 22.5). Other drivers arrive as ADR 0007 packs
-// on the `nano-ide-data-*` axis; an unknown driver throws a pack-install hint.
+// available on Node >= 22.5). Other drivers arrive as ADR 0007 packs on the
+// `nano-ide-data-*` axis; an unknown driver throws a pack-install hint. Deno
+// support was removed in ADR 0065.
 
-// Runtime adapter: the few host calls that differ between Deno (native `Deno.*`)
-// and Node (`process` / `node:fs`). Detected once at load; see ADR 0036.
+// Runtime adapter: the host calls the SDK needs (cwd, env, file read). Deno
+// support was removed in ADR 0065 — Node's `process` / `node:fs` is the only
+// runtime.
 interface DataRuntime {
   cwd(): string;
   env(key: string): string | undefined;
   readTextFile(path: string): Promise<string>;
 }
 const RT: DataRuntime = ((): DataRuntime => {
-  const g = globalThis as unknown as {
-    Deno?: {
-      cwd(): string;
-      env: { get(k: string): string | undefined };
-      readTextFile(p: string): Promise<string>;
-    };
-    process?: { cwd(): string; env: Record<string, string | undefined> };
-  };
-  if (g.Deno) {
-    const d = g.Deno;
-    return { cwd: () => d.cwd(), env: (k) => d.env.get(k), readTextFile: (p) => d.readTextFile(p) };
-  }
-  const p = g.process!;
+  const p = (globalThis as unknown as { process: NonNullable<NodeJS.Process> }).process;
   return {
     cwd: () => p.cwd(),
     env: (k) => p.env[k],
@@ -358,8 +348,8 @@ function whereClause(where: object): { clause: string; params: unknown[] } {
 /// idea, ADR 0029 §6). It builds parameterised SQL from a typed row object's own
 /// keys, so callers manipulate rows as records. `T` comes from the generated
 /// `domain-rows.d.ts`; this class is generic *runtime* and knows nothing about any
-/// specific schema, so it stays a plain dual-runtime (Node + Deno) module — no
-/// codegen, no Deno-only APIs. `pk` is the primary-key column (default `id`).
+/// specific schema, so it stays a plain runtime module — no codegen, no
+/// runtime-specific APIs. `pk` is the primary-key column (default `id`).
 export class Table<T extends object = Row> {
   readonly name: string;
   readonly pk: string;

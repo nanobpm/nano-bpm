@@ -50,7 +50,7 @@ const STUDIO_JOURNEYS = allJourneys().filter((j) =>
  * Routes reachable without backend state a stub cannot fake.
  *
  * A step inside a project workspace (`/projects/:name`) needs a scaffolded,
- * running project; asserting those would mean building and running a Deno app on
+ * running project; asserting those would mean building and running a Node app on
  * every CI run, and a flaky guard is worse than a shallower reliable one. Those
  * steps are reported as uncovered rather than silently ignored — see the
  * coverage-report test at the bottom.
@@ -197,7 +197,7 @@ test.describe("?tour= deep links", () => {
 
 test.describe("preconditions", () => {
   // The defect ADR 0049 exists to fix: the tour used to promise "hit Run to boot
-  // the engine" on a host with neither Node nor Deno, using data it already had.
+  // the engine" on a host with no Node runtime, using data it already had.
   // Any journey with a runtime-gated step must show its repair step instead.
   const gated = STUDIO_JOURNEYS.flatMap((j) =>
     j.steps
@@ -219,7 +219,6 @@ test.describe("preconditions", () => {
       page,
     }) => {
       await stubConsoleApi(page, {
-        denoAvailable: false,
         nodeAvailable: false,
       });
       // Resume straight to the gated step instead of clicking through: these
@@ -325,7 +324,7 @@ test.describe("resume and exit", () => {
 test("reports steps this suite deliberately does not assert", () => {
   // Not a pass/fail gate — a visible ledger. A step inside a project workspace
   // needs a scaffolded, running project; asserting it would mean building and
-  // running a Deno app per CI run. Printing the gap keeps it honest, so nobody
+  // running a Node app per CI run. Printing the gap keeps it honest, so nobody
   // reads a green suite as "every anchor is checked".
   const uncovered = STUDIO_JOURNEYS.flatMap((j) =>
     spotlights(j)

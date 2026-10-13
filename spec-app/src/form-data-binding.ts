@@ -10,7 +10,7 @@
 // This module is the pure, runtime-agnostic core: it *collects* the bindings
 // out of a form schema, maps query rows to form-js option `values`, and applies
 // resolved options back onto a schema clone. The actual query execution (which
-// needs the Deno data gateway, ADR 0024 phase 2) lives in the console; keeping
+// needs the datasource gateway, ADR 0024 phase 2) lives in the console; keeping
 // the shape + mapping here makes it spec-first and unit-testable, and lets the
 // validator and the console preview agree on one contract.
 

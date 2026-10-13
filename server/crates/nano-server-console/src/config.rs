@@ -11,10 +11,10 @@
 //!   the environment) — the panel surfaces them for visibility.
 //!
 //! * **IDE config** ([`ide_config`]) — the language-pack toolchains and the
-//!   external system dependencies they need. Any missing dependency (e.g. Deno
+//!   external system dependencies they need. Any missing dependency (e.g. Node
 //!   for embedded workers, or `cargo` for the Rust pack) is surfaced with
 //!   OS-aware install guidance, mirroring what ProcessOS does — so a user whose
-//!   Deno is not installed is told exactly what to install and why. Language
+//!   Node is not installed is told exactly what to install and why. Language
 //!   packs can extend this panel with their own config fields
 //!   ([`extensions::ConfigField`]).
 
@@ -267,11 +267,11 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
         "Where console projects, workers, and installed extensions live.",
     ),
     (
-        "NANOBPMN_DENO_BIN",
+        "NANOBPMN_NODE_BIN",
         "Paths & runtime",
-        "Deno binary",
-        "deno (on PATH)",
-        "Deno runtime, used only to compile a project to a standalone binary (`deno compile`). Auto-resolved when unset.",
+        "Node binary",
+        "node (on PATH)",
+        "Node.js (>= 22.6) runtime that runs projects and workers. Auto-resolved when unset.",
     ),
 ];
 
@@ -327,7 +327,7 @@ pub fn server_config_json(current: SlaMode) -> serde_json::Value {
 // IDE config: toolchain dependencies + language-pack config
 // ---------------------------------------------------------------------------
 
-const DENO_INSTALL_URL: &str = "https://docs.deno.com/runtime/getting_started/installation/";
+const NODE_INSTALL_URL: &str = "https://nodejs.org/en/download";
 
 /// One external toolchain the IDE needs, and whether it is available — the
 /// deps-preflight shape ProcessOS uses so missing tools come with guidance.
@@ -364,38 +364,53 @@ fn probe(bin: &str) -> Option<String> {
     Some(line)
 }
 
-/// The Deno runtime dependency. Node-first (ADR 0038): Deno is now **optional**
-/// — needed only to compile a project to a single-file binary (`deno compile`),
-/// which Node has no equivalent for. Run uses Node. Mirrors the engine's
-/// resolution order (`NANOBPMN_DENO_BIN`, PATH, `~/.deno/bin/deno`).
-fn check_deno() -> Dependency {
-    let bin = super::workers::find_deno()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "deno".to_string());
-    let version = probe(&bin).filter(|s| !s.is_empty());
-    let present = super::workers::supervisor().deno_available();
+/// The Node runtime dependency — the sole JS/TS runtime (ADR 0065 removed Deno).
+/// Projects and workers run on Node (>= 22.6). Mirrors the engine's resolution
+/// order (`NANOBPMN_NODE_BIN`, PATH, `~/.local/bin/node`).
+fn check_node() -> Dependency {
+    // Report the binary/version that the runtime **actually selects**
+    // (`selected_node`), so `present: true` can never sit beside an older or
+    // nonexistent pick. Only when nothing clears the floor do we fall back to a
+    // mere presence probe (`find_node`) — then `present` is false but the IDE can
+    // still show which Node was found and how old it is.
+    let (bin, version) = match super::workers::selected_node() {
+        Some((bin, version)) => (
+            bin.display().to_string(),
+            version
+                .map(|v| v.trim().to_string())
+                .filter(|s| !s.is_empty()),
+        ),
+        None => {
+            let bin = super::workers::find_node()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "node".to_string());
+            let version = probe(&bin).filter(|s| !s.is_empty());
+            (bin, version)
+        }
+    };
+    let present = super::workers::usable_node().is_some();
     Dependency {
-        id: "deno".into(),
-        name: "Deno".into(),
+        id: "node".into(),
+        name: "Node.js".into(),
         purpose:
-            "Optional runtime. Nano runs projects and workers on Node (>= 22.6); Deno is needed only to compile a project to a standalone single-file binary (`deno compile`), which has no Node equivalent."
+            "The JavaScript/TypeScript runtime. Nano runs projects and workers on Node (>= 22.6)."
                 .into(),
         bin,
         present,
         version,
-        install_url: DENO_INSTALL_URL.into(),
+        install_url: NODE_INSTALL_URL.into(),
         hint: if present {
             String::new()
         } else {
-            "Deno was not found. It is optional — install it (see the link) only if you want to compile a project to a standalone binary; everything else runs on Node."
+            "Node >= 22.6 was not found. Install it (see the link) to run projects and workers."
                 .into()
         },
     }
 }
 
 /// Toolchain dependency derived from a language pack's `detect` probe (e.g.
-/// `cargo` for the Rust pack). Built-in packs with an empty toolchain (Deno) are
-/// reported via [`check_deno`] instead.
+/// `cargo` for the Rust pack). Built-in packs with an empty toolchain are
+/// reported via [`check_node`] instead.
 fn check_pack_toolchain(m: &extensions::ExtManifest) -> Option<Dependency> {
     let bin = m.toolchain.detect.first()?.clone();
     let version = probe(&bin).filter(|s| !s.is_empty());
@@ -434,7 +449,7 @@ struct LangPackConfig {
     id: String,
     display_name: String,
     builtin: bool,
-    /// The probe argv (empty for the internal Deno path).
+    /// The probe argv (empty for the internal Node path).
     detect: Vec<String>,
     /// Whether the pack's toolchain is usable on this machine.
     available: bool,
@@ -458,10 +473,10 @@ struct ResolvedConfigField {
 pub fn ide_config_json() -> serde_json::Value {
     let packs = extensions::all_extensions();
 
-    // Missing-dependency guidance: the Deno runtime plus each lang pack's
-    // toolchain probe. This is the surface that tells a user their Deno (or
+    // Missing-dependency guidance: the Node runtime plus each lang pack's
+    // toolchain probe. This is the surface that tells a user their Node (or
     // cargo, etc.) is missing and how to install it.
-    let mut deps = vec![check_deno()];
+    let mut deps = vec![check_node()];
     for m in &packs {
         if matches!(m.kind, extensions::ExtKind::Lang)
             && let Some(d) = check_pack_toolchain(m)
@@ -527,26 +542,26 @@ mod tests {
     }
 
     #[test]
-    fn ide_config_surfaces_deno_dependency_with_guidance() {
+    fn ide_config_surfaces_node_dependency_with_guidance() {
         let v = ide_config_json();
         let deps = v["dependencies"].as_array().unwrap();
-        let deno = deps.iter().find(|d| d["id"] == "deno").expect("deno dep");
-        assert!(deno["installUrl"].as_str().unwrap().starts_with("https://"));
+        let node = deps.iter().find(|d| d["id"] == "node").expect("node dep");
+        assert!(node["installUrl"].as_str().unwrap().starts_with("https://"));
         // A missing tool always carries an actionable hint; a present one does not.
         assert_eq!(
-            deno["present"].as_bool().unwrap(),
-            deno["hint"].as_str().unwrap().is_empty()
+            node["present"].as_bool().unwrap(),
+            node["hint"].as_str().unwrap().is_empty()
         );
     }
 
     #[test]
     fn ide_config_lists_lang_packs_with_toolchains() {
-        // Only Deno ships in-box now; Rust/Java are externalised to installed
-        // packs, so the built-in listing just needs to surface the Deno runtime.
+        // Only Node ships in-box now; Rust/Java are externalised to installed
+        // packs, so the built-in listing just needs to surface the Node runtime.
         let v = ide_config_json();
         let packs = v["langPacks"].as_array().unwrap();
-        let deno = packs.iter().find(|p| p["id"] == "deno").expect("deno pack");
-        assert_eq!(deno["builtin"], true);
+        let node = packs.iter().find(|p| p["id"] == "node").expect("node pack");
+        assert_eq!(node["builtin"], true);
     }
 
     #[test]

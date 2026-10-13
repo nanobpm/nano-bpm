@@ -7,7 +7,7 @@ is, where each piece lives, and how they depend on one another.
 | --- | --- | --- |
 | [`nanobpm/nano-bpm`](https://github.com/nanobpm/nano-bpm) | **Nano BPM** | The core product: engine, gateway server, web console, embeddable engine libraries (`nano-bernd`, `engine-wasm`), and schemas. The source of truth. |
 | [`nanobpm/nano-ide`](https://github.com/nanobpm/nano-ide) | **Nano IDE** | Console extension packs (languages, app templates, examples, themes, triggers/connectors) **and** the published code-first stack: the Urban app runtime (`@nanobpm/urban`), the `create-urban-app` scaffolder, and the code-first workflow SDK (`@nanobpm/workflow`). Published to npm. |
-| [`jwulf/nano-sdk-js`](https://github.com/jwulf/nano-sdk-js) | **Nano SDK (JS)** | `@nanobpm/nano-sdk` — the **engine-transport spine**: a drop-in replacement for `@camunda8/orchestration-cluster-api` that transparently upgrades the hot paths to Nano's **Falcon** protocol (and offers an in-process `embedded` transport). Cross-runtime (Node, Deno, Bun). Published to npm. |
+| [`jwulf/nano-sdk-js`](https://github.com/jwulf/nano-sdk-js) | **Nano SDK (JS)** | `@nanobpm/nano-sdk` — the **engine-transport spine**: a drop-in replacement for `@camunda8/orchestration-cluster-api` that transparently upgrades the hot paths to Nano's **Falcon** protocol (and offers an in-process `embedded` transport). Cross-runtime (Node, Bun). Published to npm. |
 | [`jwulf/c8ctl-plugin-nano`](https://github.com/jwulf/c8ctl-plugin-nano) | **c8ctl Nano plugin** | A `c8ctl` CLI plugin that installs, runs, and manages a local Nano BPM cluster; ships the prebuilt gateway binary; and turns CLI agents into job workers. |
 | [`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) | **Bojtos** | The publishable in-browser BPMN demo framework: `@nanobpm/bojtos-kit` (framework-agnostic) and `@nanobpm/bojtos-react` (React bindings), built on `@nanobpm/engine-wasm`. Extracted from nano-bpm (ADR 0043); public, published to npm. |
 
@@ -95,7 +95,7 @@ Each pack is a self-contained extension; it is not a running service.
 - **Discovery.** The console finds packs by the `nano-ide-ext` npm keyword,
   installs the tarball into the workspace, reads the manifest, and wires the pack
   in. No `preinstall`/`postinstall` scripts run.
-- **Baseline.** The `deno` runtime and the `deno-gui` app template ship built
+- **Baseline.** The `node` runtime and the `node-gui` app template ship built
   into the server so the console works offline with zero installs; every other
   pack (including `rust`) is installed from here.
 - **Pack kinds:** `lang` (file types + toolchain + templates), `app` (a runnable
@@ -113,10 +113,10 @@ transport spine, `@nanobpm/nano-sdk` (repo 3; ADR 0055):
 
 - **`@nanobpm/urban`** — the Urban app runtime, derivation toolkit, and CLI in
   one: a decoupled manifest interpreter that runs a `nano.app.json` app (durable
-  processes, typed datasource, forms, triggers, surfaces) on Node or Deno, with
+  processes, typed datasource, forms, triggers, surfaces) on Node, with
   interchangeable hosts (CLI / IDE / standalone) (ADR 0052).
 - **`create-urban-app`** — the scaffolder: `npm create urban-app@latest` /
-  `deno run -A npm:create-urban-app` produces a repo that already knows how to run
+  `npm create urban-app@latest` produces a repo that already knows how to run
   itself against a Nano gateway (ADR 0052).
 - **`@nanobpm/workflow`** — the code-first durable-orchestration SDK
   (`defineFlow`): derives an executable BPMN model, job types, and correlation
@@ -144,7 +144,7 @@ the two throughput-critical paths — `createProcessInstance` and `createJobWork
 — to Nano's **Falcon** streaming protocol (crash-resilient reconnect with
 backoff), with REST for everything else. It also offers an **`embedded`**
 transport (an in-process engine host, no separate gateway). It is **cross-runtime**
-— verified on Node, Deno, and Bun (Web `fetch` transport + a global-`WebSocket`-first
+— verified on Node and Bun (Web `fetch` transport + a global-`WebSocket`-first
 Falcon client).
 
 Instead of each code-first library hand-rolling its own deploy / create / job /

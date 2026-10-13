@@ -1,9 +1,10 @@
 // Unit tests for the Urban App page runtime (ADR 0042 §3).
-// Run: `deno test --allow-read server/src/console/app_pages_test.ts`
-import { assert, assertEquals } from "jsr:@std/assert";
-import { createPagesHandler, type PagesContext } from "./app_pages.ts";
+// Run: `node --experimental-strip-types --test server/crates/nano-server-console/src/app_pages_test.ts`
+import { test } from "node:test";
+import { assert, assertEquals } from "./test_support.ts";
+import { createPagesHandler, sendInternalError, servePages, type PagesContext } from "./app_pages.ts";
 
-function ctx(over: Partial<PagesContext> = {}): PagesContext {
+function ctx(over: Partial<PagesContext> & { port?: number } = {}): PagesContext {
   return {
     db: {
       schema: () => Promise.resolve([{ name: "pull_requests" }]),
@@ -30,7 +31,7 @@ function fakeEngine(over: Partial<PagesContext["nano"]> = {}): PagesContext["nan
   };
 }
 
-Deno.test("GET / serves the renderer shell with the home page id", async () => {
+test("GET / serves the renderer shell with the home page id", async () => {
   const res = await createPagesHandler(ctx({ homePage: "home" }))(new Request("http://x/"));
   assertEquals(res.status, 200);
   const html = await res.text();
@@ -38,19 +39,19 @@ Deno.test("GET / serves the renderer shell with the home page id", async () => {
   assert(html.includes("/app/runtime.js"));
 });
 
-Deno.test("GET /app/pages/home returns the page.json", async () => {
+test("GET /app/pages/home returns the page.json", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/pages/home"));
   assertEquals(res.status, 200);
   const doc = await res.json();
   assertEquals(doc.title, "T");
 });
 
-Deno.test("GET /app/pages/missing is 404", async () => {
+test("GET /app/pages/missing is 404", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/pages/missing"));
   assertEquals(res.status, 404);
 });
 
-Deno.test("GET /app/data returns rows for a known table", async () => {
+test("GET /app/data returns rows for a known table", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/data/app/pull_requests"));
   assertEquals(res.status, 200);
   const body = await res.json();
@@ -58,18 +59,18 @@ Deno.test("GET /app/data returns rows for a known table", async () => {
   assertEquals(body.rows[0].pr_key, "o/r#1");
 });
 
-Deno.test("GET /app/data rejects an unknown table (no SQL injection surface)", async () => {
+test("GET /app/data rejects an unknown table (no SQL injection surface)", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/data/app/secrets"));
   assertEquals(res.status, 404);
 });
 
-Deno.test("GET /app/data rejects a source other than the injected default", async () => {
+test("GET /app/data rejects a source other than the injected default", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/app/data/other/pull_requests"));
   assertEquals(res.status, 404);
   assertEquals((await res.json()).error, 'unknown datasource "other"');
 });
 
-Deno.test("POST /app/actions/start starts a process with the posted variables", async () => {
+test("POST /app/actions/start starts a process with the posted variables", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -91,7 +92,7 @@ Deno.test("POST /app/actions/start starts a process with the posted variables", 
   assertEquals(seen, { processDefinitionId: "convergence-loop", variables: { pr: "o/r#1" } });
 });
 
-Deno.test("POST /app/actions/start defaults a non-object `variables` to {}", async () => {
+test("POST /app/actions/start defaults a non-object `variables` to {}", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -112,7 +113,7 @@ Deno.test("POST /app/actions/start defaults a non-object `variables` to {}", asy
   assertEquals(seen, { processDefinitionId: "p", variables: {} });
 });
 
-Deno.test("POST /app/actions/start surfaces an engine error as 502", async () => {
+test("POST /app/actions/start surfaces an engine error as 502", async () => {
   const c = ctx({
     nano: fakeEngine({ createProcessInstance: () => Promise.reject(new Error("engine down")) }),
   });
@@ -127,12 +128,12 @@ Deno.test("POST /app/actions/start surfaces an engine error as 502", async () =>
   assert((await res.json()).error.includes("engine down"));
 });
 
-Deno.test("unknown route is 404", async () => {
+test("unknown route is 404", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/nope"));
   assertEquals(res.status, 404);
 });
 
-Deno.test("GET /app/data retries schema introspection after a transient failure", async () => {
+test("GET /app/data retries schema introspection after a transient failure", async () => {
   let calls = 0;
   const handle = createPagesHandler(
     ctx({
@@ -156,7 +157,7 @@ Deno.test("GET /app/data retries schema introspection after a transient failure"
   assertEquals(calls, 2);
 });
 
-Deno.test("GET /app/data applies whitelisted where + order as bound params", async () => {
+test("GET /app/data applies whitelisted where + order as bound params", async () => {
   let seenSql = "";
   let seenParams: unknown[] = [];
   const c = ctx({
@@ -181,14 +182,14 @@ Deno.test("GET /app/data applies whitelisted where + order as bound params", asy
   assertEquals(seenParams, ["converging"]);
 });
 
-Deno.test("GET /app/data rejects a where column not on the table (no injection)", async () => {
+test("GET /app/data rejects a where column not on the table (no injection)", async () => {
   const res = await createPagesHandler(ctx())(
     new Request("http://x/app/data/app/pull_requests?where=evil'--:1"),
   );
   assertEquals(res.status, 400);
 });
 
-Deno.test("POST /app/actions/cancel cancels the posted instance", async () => {
+test("POST /app/actions/cancel cancels the posted instance", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -210,7 +211,7 @@ Deno.test("POST /app/actions/cancel cancels the posted instance", async () => {
   assertEquals(seen, { processInstanceKey: "123" });
 });
 
-Deno.test("POST /app/actions/cancel requires a key", async () => {
+test("POST /app/actions/cancel requires a key", async () => {
   const res = await createPagesHandler(ctx())(
     new Request("http://x/app/actions/cancel", {
       method: "POST",
@@ -221,7 +222,7 @@ Deno.test("POST /app/actions/cancel requires a key", async () => {
   assertEquals(res.status, 400);
 });
 
-Deno.test("POST /app/actions/message publishes a correlated message", async () => {
+test("POST /app/actions/message publishes a correlated message", async () => {
   let seen: unknown = null;
   const c = ctx({
     nano: fakeEngine({
@@ -242,7 +243,7 @@ Deno.test("POST /app/actions/message publishes a correlated message", async () =
   assertEquals(seen, { name: "escalation-answered", correlationKey: "o/r#1", variables: { answer: "yes" } });
 });
 
-Deno.test("POST /app/actions/message requires name and correlationKey", async () => {
+test("POST /app/actions/message requires name and correlationKey", async () => {
   const res = await createPagesHandler(ctx())(
     new Request("http://x/app/actions/message", {
       method: "POST",
@@ -253,7 +254,7 @@ Deno.test("POST /app/actions/message requires name and correlationKey", async ()
   assertEquals(res.status, 400);
 });
 
-Deno.test("GET /app/data supports a whitelisted IN filter (set membership)", async () => {
+test("GET /app/data supports a whitelisted IN filter (set membership)", async () => {
   let seenSql = "";
   let seenParams: unknown[] = [];
   const c = ctx({
@@ -273,4 +274,183 @@ Deno.test("GET /app/data supports a whitelisted IN filter (set membership)", asy
   assertEquals(res.status, 200);
   assert(seenSql.includes("status IN (?, ?, ?)"));
   assertEquals(seenParams, ["converging", "escalated", "waiting_review"]);
+});
+
+test("servePages starts a node:http server that serves the page runtime", async () => {
+  // Red/green guard for the Node-only runtime (ADR 0065): `servePages` used to be
+  // `Deno.serve`, which is undefined under Node, so a scaffolded Urban app's real
+  // `main.ts` (`servePages({ db, nano, port })`) would throw the moment it served.
+  // This drives the actual socket path — the one the unit handler tests skip.
+  const server = servePages(ctx({ port: 0, homePage: "home" }));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      if (server.listening) resolve();
+      else {
+        server.once("listening", resolve);
+        server.once("error", reject);
+      }
+    });
+    const addr = server.address();
+    assert(addr && typeof addr === "object", "server must expose its bound address");
+    const port = (addr as { port: number }).port;
+    // GET / — the renderer shell.
+    const home = await fetch(`http://127.0.0.1:${port}/`);
+    assertEquals(home.status, 200);
+    assert((await home.text()).includes("/app/runtime.js"));
+    // GET /app/data/<source>/<table> — the data bridge.
+    const data = await fetch(`http://127.0.0.1:${port}/app/data/app/pull_requests`);
+    assertEquals(data.status, 200);
+    assertEquals((await data.json()).rows.length, 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("servePages rejects an over-limit request body with 413 (no buffering)", async () => {
+  // Defect class: the `node:http` adapter must not buffer an unbounded body into
+  // memory before routing — a remote client could then force unbounded allocation
+  // on a public port. The handler never reads a request body, so cap it at the
+  // socket and answer 413 without accumulating. Regression guard for the
+  // replaced-`Deno.serve` adapter (ADR 0065).
+  const server = servePages(ctx({ port: 0, homePage: "home" }));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      if (server.listening) resolve();
+      else {
+        server.once("listening", resolve);
+        server.once("error", reject);
+      }
+    });
+    const { port } = server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${port}/app/actions/message`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "x".repeat(1024 * 1024 + 1), // one byte past the cap
+    });
+    assertEquals(res.status, 413);
+    // The socket must be drained/closed so the client is not left hanging.
+    await res.text();
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("GET /app/data query failure does not leak the driver error to the client", async () => {
+  // Defect class: an unexpected handler/database error must be logged and
+  // answered generically, never echoed to a public caller. The route's
+  // introspection failures already answer `{"error":"schema introspection
+  // failed"}`; a failure in the whitelisted `SELECT` itself used to escape the
+  // handler entirely and surface the raw driver text (SQLite messages carry the
+  // database file path and the failing SQL).
+  const secret = "SQLITE_ERROR: no such column: ssn (/srv/app/secrets/urban.db)";
+  const handle = createPagesHandler(
+    ctx({
+      db: {
+        schema: () => Promise.resolve([{ name: "pull_requests" }]),
+        query: (sql: string) =>
+          /table_info/.test(sql)
+            ? Promise.resolve([{ name: "pr_key" }, { name: "status" }])
+            : Promise.reject(new Error(secret)),
+      },
+    }),
+  );
+  const res = await handle(new Request("http://x/app/data/app/pull_requests"));
+  assertEquals(res.status, 500);
+  const text = await res.text();
+  assert(!text.includes("urban.db"), `must not leak the driver error: ${text}`);
+  assert(!text.includes("SQLITE_ERROR"), `must not leak the driver error: ${text}`);
+});
+
+test("servePages never echoes a failing /app/data query", async () => {
+  // True end-to-end path for the leaked-error defect: a failing whitelisted
+  // `SELECT` used to escape the handler entirely, so the `node:http` adapter's
+  // catch echoed the raw driver message (`SQLITE_ERROR … (/srv/app/secrets/urban.db)`)
+  // to a public caller. The route now answers generically; the adapter's sink
+  // (`sendInternalError`, unit-tested below) remains the last line of defence.
+  const secret = "SQLITE_ERROR: no such column: ssn (/srv/app/secrets/urban.db)";
+  const server = servePages(
+    ctx({
+      port: 0,
+      homePage: "home",
+      db: {
+        schema: () => Promise.resolve([{ name: "pull_requests" }]),
+        query: (sql: string) =>
+          /table_info/.test(sql)
+            ? Promise.resolve([{ name: "pr_key" }, { name: "status" }])
+            : Promise.reject(new Error(secret)),
+      },
+    }),
+  );
+  try {
+    await new Promise<void>((resolve, reject) => {
+      if (server.listening) resolve();
+      else {
+        server.once("listening", resolve);
+        server.once("error", reject);
+      }
+    });
+    const { port } = server.address() as { port: number };
+    const res = await fetch(`http://127.0.0.1:${port}/app/data/app/pull_requests`);
+    const text = await res.text();
+    assertEquals(res.status, 500);
+    assert(!text.includes("urban.db"), `must not leak the driver error: ${text}`);
+    assert(!text.includes("SQLITE_ERROR"), `must not leak the driver error: ${text}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test("sendInternalError answers generically and destroys a committed response", () => {
+  // The sink's two branches: an uncommitted response gets an opaque 500; a
+  // response whose headers were already sent must be destroyed rather than
+  // re-headed (a second `writeHead` throws ERR_HTTP_HEADERS_SENT, after which
+  // nothing is answered at all).
+  const secret = "boom at /srv/app/secrets/urban.db";
+
+  const fresh = { status: 0, body: "", destroyed: false, headersSent: false };
+  sendInternalError(
+    {
+      get headersSent() {
+        return fresh.headersSent;
+      },
+      writeHead(status: number) {
+        fresh.status = status;
+        fresh.headersSent = true;
+        return this;
+      },
+      end(body?: string) {
+        fresh.body = body ?? "";
+        return this;
+      },
+      destroy() {
+        fresh.destroyed = true;
+        return this;
+      },
+    } as never,
+    new Error(secret),
+  );
+  assertEquals(fresh.status, 500);
+  assert(!fresh.body.includes("urban.db"), `must not leak the exception: ${fresh.body}`);
+
+  const committed = { destroyed: false, wrote: false };
+  sendInternalError(
+    {
+      headersSent: true,
+      writeHead() {
+        committed.wrote = true;
+        throw new Error("ERR_HTTP_HEADERS_SENT");
+      },
+      end() {
+        committed.wrote = true;
+        return this;
+      },
+      destroy() {
+        committed.destroyed = true;
+        return this;
+      },
+    } as never,
+    new Error(secret),
+  );
+  assert(committed.destroyed, "a committed response must be destroyed, not re-headed");
+  assert(!committed.wrote, "no second status line may be attempted");
 });

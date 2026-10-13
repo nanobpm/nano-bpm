@@ -22,7 +22,7 @@ Two further defects the framework fixes structurally:
   outcome.
 - One step **promised what the console knew it could not keep**: "hit Run to boot the
   engine" on a host with no JavaScript runtime, when the very `listProjects()`
-  response that feeds the tour carries `denoAvailable` / `nodeAvailable`. Steps now
+  response that feeds the tour carries `nodeAvailable`. Steps now
   declare preconditions, and a `repair` step replaces the promise with an install
   hint.
 

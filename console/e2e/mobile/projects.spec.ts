@@ -24,8 +24,8 @@ test.describe("mobile Studio project cards", () => {
     const noCrash = assertNoPageCrash(page);
     await stubConsoleApi(page, {
       projects: [
-        { name: "alpha", lang: "deno", running: false },
-        { name: "bravo", lang: "deno", running: true },
+        { name: "alpha", lang: "node", running: false },
+        { name: "bravo", lang: "node", running: true },
       ],
     });
     await resetTourState(page);

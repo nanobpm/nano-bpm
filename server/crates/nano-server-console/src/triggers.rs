@@ -21,10 +21,10 @@
 //! still `pending`); this is why the contract is honestly *at-least-once*, not
 //! exactly-once, and why makers should design idempotent processes.
 //!
-//! ## Runtime portability (ADR 0038)
+//! ## Runtime portability (ADR 0065)
 //! The inbox is reached through [`super::projects::run_data_op`], which is
-//! Node-first (Deno optional). The dispatcher itself is pure in-process Rust; it
-//! carries no Deno dependency.
+//! Node-only (ADR 0065). The dispatcher itself is pure in-process Rust; it
+//! carries no JS-runtime dependency.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -116,7 +116,7 @@ const CREATE_INBOX_SQL: &str = "CREATE TABLE IF NOT EXISTS trigger_inbox (\
 /// Create the inbox table on the App's default datasource if absent.
 ///
 /// Idempotent **and memoised**: the `CREATE TABLE IF NOT EXISTS` is cheap on
-/// SQLite, but every call is a fresh `urban data` process spawn (ADR 0038), so
+/// SQLite, but every call is a fresh `urban data` process spawn (ADR 0065), so
 /// re-running it on every drain round (#1340) burns a core on small hosts. Once
 /// the table has been created for a project we skip the spawn entirely; a
 /// failed attempt is *not* memoised, so a project whose datasource isn't ready
@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     fn runtime_available() -> bool {
-        workers::usable_node().is_some() || workers::find_deno().is_some()
+        workers::usable_node().is_some()
     }
 
     /// Grace period a withheld-pack test waits before concluding no child
@@ -1899,11 +1899,11 @@ mod tests {
 
     // --- pack-source driver auto-launch (ADR 0025 phase 4) -----------------
 
-    /// A dependency-free, cross-runtime (Node/Deno) trigger driver: it reads the
-    /// env contract, POSTs two distinct events to the ingress, then stays alive
-    /// (so the supervisor doesn't treat its exit as a crash and respawn it).
+    /// A dependency-free Node trigger driver: it reads the env contract, POSTs
+    /// two distinct events to the ingress, then stays alive (so the supervisor
+    /// doesn't treat its exit as a crash and respawn it).
     const TEST_DRIVER_MJS: &str = r#"
-const env = globalThis.Deno ? Deno.env.toObject() : process.env;
+const env = process.env;
 const url = env.NANOBPMN_HOOK_URL;
 const token = env.NANOBPMN_WEBHOOK_TOKEN;
 const cfg = JSON.parse(env.NANOBPMN_TRIGGER_CONFIG || "{}");
@@ -2095,7 +2095,7 @@ await new Promise((r) => setTimeout(r, 60000));
     /// gateway (`NANOBPMN_BASE_URL`). We don't need a real job stream — a single
     /// TCP connection to the test server is proof the child launched.
     const TEST_WORKER_MJS: &str = r#"
-const env = globalThis.Deno ? Deno.env.toObject() : process.env;
+const env = process.env;
 const base = env.NANOBPMN_BASE_URL;
 for (let i = 0; i < 100; i++) {
   try { await fetch(`${base}/hit`); } catch (_) {}

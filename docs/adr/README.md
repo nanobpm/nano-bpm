@@ -48,9 +48,9 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0033](0033-urban-element-templates-first-class-components.md) | Element templates as first-class Urban components (the Delphi palette for the process canvas) | Proposed | 2026-07-22 |
 | [0034](0034-console-build-profiles.md) | Console build profiles: a lean "observe" surface vs the full "studio" IDE | Accepted | 2026-07-23 |
 | [0035](0035-observability-config-and-standalone-console.md) | Full-fidelity Prometheus, a standalone console, and runtime observability config | Accepted | 2026-07-23 |
-| [0036](0036-dual-runtime-workers-deno-node-fallback.md) | Dual-runtime workers: Deno-preferred, Node fallback (32-bit ARM support) | Accepted | 2026-07-24 |
+| [0036](0036-dual-runtime-workers-deno-node-fallback.md) | Dual-runtime workers: Deno-preferred, Node fallback (32-bit ARM support) | Superseded by [0065](0065-deno-removal.md) | 2026-07-24 |
 | [0037](0037-execution-and-task-listeners.md) | Execution listeners (and task listeners): BPMN lifecycle-hook parity | Proposed | 2026-07-23 |
-| [0038](0038-node-first-runtime.md) | Node-first runtime: Deno optional, only for `deno compile` | Accepted | 2026-07-24 |
+| [0038](0038-node-first-runtime.md) | Node-first runtime: Deno optional, only for `deno compile` | Superseded by [0065](0065-deno-removal.md) | 2026-07-24 |
 | [0039](0039-falcon-client-cluster-channel-split.md) | Splitting Falcon: a public client channel vs an authenticated cluster channel | Proposed | 2026-07-24 |
 | [0040](0040-fused-domain-model.md) | The Fused Domain Model: the registry is derived, not authored (three sources → one fuse) | Proposed | 2026-07-27 |
 | [0041](0041-urban-app-import-registry.md) | Importing an Urban App by reference: external project pointers + headless run | Proposed | 2026-07-27 |
@@ -74,6 +74,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0062](0062-durable-agent-session-resume.md) | Durable agent-session resume: authoritative session log, mind/world checkpoint, and the ACP/stream-json harness seam | Proposed | 2026-08-19 |
 | [0063](0063-nano-controlled-embedded-harness.md) | Nano-controlled embedded coding-agent harness: an adopted wasm agent whose capability-nil boundary is the mind/world split | Proposed | 2026-08-21 |
 | [0064](0064-server-crate-decomposition.md) | Server crate decomposition (compile-time-driven workspace split) | Proposed | 2026-08-29 |
+| [0065](0065-deno-removal.md) | Deno removal: Node (≥ 22.6) is the sole JS/TS runtime | Accepted | 2026-10-13 |
 
 ## Reading paths
 

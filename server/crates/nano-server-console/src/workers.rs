@@ -1,14 +1,15 @@
 //! Worker supervisor for the console.
 //!
-//! Runs each enabled worker as a sandboxed **Deno** subprocess (one process per
-//! worker), independent of any browser. The worker code (`workers/<name>/worker.ts`)
+//! Runs each enabled worker as a **Node** subprocess (one process per worker),
+//! independent of any browser. The worker code (`workers/<name>/worker.ts`)
 //! imports the embedded SDK (`nano-generated/worker-sdk.ts`), which speaks the
 //! falcon protocol and prints structured metric/status lines that this
 //! supervisor parses. Everything here is feature-gated behind `console`; the
-//! base gateway build never spawns Deno and does not require it on PATH.
+//! base gateway build never spawns Node and does not require it on PATH.
 //!
-//! Deno is **optional**: if it is not installed, the Workers tab still authors
-//! code but `start` reports the runtime as unavailable.
+//! Node (>= 22.6) is the sole JS/TS runtime (ADR 0065 removed Deno). If it is
+//! too old or absent, the Workers tab still authors code but `start` reports the
+//! runtime as unavailable.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -27,11 +28,10 @@ use super::workspace;
 /// worker code can import it. Kept in sync with the binary on every supervisor
 /// init (overwritten), so upgrading the server upgrades the SDK.
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
-/// Node fallback runtime loader + bootstrap (ADR 0036), materialised beside the
-/// SDK so `deno.json` import maps resolve under Node when no Deno build exists.
+/// Node runtime loader + bootstrap, materialised beside the SDK so the
+/// project's import-map manifest resolves under Node.
 const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
 const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
-const NODE_DENO_SHIM_MJS: &str = include_str!("node_deno_shim.mjs");
 
 /// Control-line prefixes emitted by the SDK on stdout (see `worker_sdk.ts`).
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
@@ -194,16 +194,15 @@ fn ensure_sdk_written() -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(dir.join("node-register.mjs"), NODE_REGISTER_MJS)?;
-    std::fs::write(dir.join("node-deno-shim.mjs"), NODE_DENO_SHIM_MJS)?;
     std::fs::write(workspace::sdk_path(), WORKER_SDK_TS)
 }
 
-/// Backfills the `@lib/` import-map alias into a worker's `deno.json` so workers
+/// Backfills the `@lib/` import-map alias into a worker's `node.json` so workers
 /// scaffolded before shared-library support can still `import "@lib/…"`. Only
 /// adds the missing alias; never disturbs other user-defined imports. Best
-/// effort — a malformed or missing `deno.json` is left untouched.
+/// effort — a malformed or missing `node.json` is left untouched.
 fn ensure_lib_alias(dir: &std::path::Path) {
-    let path = dir.join("deno.json");
+    let path = dir.join("node.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return;
     };
@@ -225,66 +224,86 @@ fn ensure_lib_alias(dir: &std::path::Path) {
     }
 }
 
-/// Locates the Deno binary: `NANOBPMN_DENO_BIN`, then `PATH`, then `~/.deno/bin`.
-pub(crate) fn find_deno() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NANOBPMN_DENO_BIN")
-        && !p.is_empty()
-    {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Some(pb);
-        }
-    }
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
-            let cand = dir.join("deno");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let cand = PathBuf::from(home).join(".deno").join("bin").join("deno");
-        if cand.is_file() {
-            return Some(cand);
-        }
-    }
-    None
-}
-
 /// Minimum Node that can run workers: `--experimental-strip-types` (TS erasure)
-/// landed in 22.6; `node:sqlite` (22.5) and a global `WebSocket` (22.4) are
-/// older still, so 22.6 is the effective floor. See ADR 0036.
+/// landed in 22.6. `node:sqlite` (22.5) and a global `WebSocket` (22.4) are older
+/// still — and `node:sqlite` stays behind `--experimental-sqlite` until 22.13, so
+/// the launch command passes that flag ([`super::projects::node_fallback_command`])
+/// rather than raising this floor and stranding 22.6–22.12 installs.
 const NODE_MIN: (u32, u32) = (22, 6);
 
-/// Locates a Node binary for the worker fallback runtime: `NANOBPMN_NODE_BIN`
-/// (exported by the npm launcher — its own `process.execPath`), then `PATH`,
-/// then `~/.local/bin`. Presence only; see [`usable_node`] for the version gate.
-pub(crate) fn find_node() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NANOBPMN_NODE_BIN")
+/// One Node candidate to consider, with the one-line `--version` output it
+/// produced (`None` when it did not spawn or exited non-zero).
+type NodeProbe = (PathBuf, Option<String>);
+
+/// Every Node binary worth trying, in resolution order: `NANOBPMN_NODE_BIN`
+/// (exported by the npm launcher — its own `process.execPath`), then `node` on
+/// `PATH`, then `~/.local/bin/node`.
+///
+/// A **list**, not first-match: a stale `NANOBPMN_NODE_BIN` must not mask a
+/// supported Node further down. This is the single source of the candidate order
+/// — [`find_node`] (presence) and [`usable_node`] (version-gated) both derive
+/// from it, so they can never disagree, and ProcessOS's `select_node` applies the
+/// same first-supported policy in its own crate.
+///
+/// The environment is read once, here, and handed to the pure
+/// [`node_candidates_from`] — so the selection logic itself is testable without
+/// mutating the process-global environment (which `cargo test` runs in parallel).
+fn node_candidates() -> Vec<PathBuf> {
+    let override_bin = std::env::var("NANOBPMN_NODE_BIN").ok();
+    let path = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME");
+    node_candidates_from(NodeEnv {
+        override_bin: override_bin.as_deref(),
+        path: path.as_deref(),
+        home: home.as_deref(),
+    })
+}
+
+/// The parts of the environment candidate resolution depends on, injected so the
+/// ordering is pure and testable.
+struct NodeEnv<'a> {
+    /// `NANOBPMN_NODE_BIN`, if set and non-empty.
+    override_bin: Option<&'a str>,
+    /// `PATH`.
+    path: Option<&'a std::ffi::OsStr>,
+    /// `HOME`, for the `~/.local/bin/node` fallback.
+    home: Option<&'a std::ffi::OsStr>,
+}
+
+/// Pure candidate resolution: override, then every `node` on `PATH`, then
+/// `~/.local/bin/node` — keeping only paths that exist. No environment access.
+fn node_candidates_from(env: NodeEnv<'_>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(p) = env.override_bin
         && !p.is_empty()
     {
         let pb = PathBuf::from(p);
         if pb.is_file() {
-            return Some(pb);
+            out.push(pb);
         }
     }
     let exe = if cfg!(windows) { "node.exe" } else { "node" };
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
+    if let Some(path) = env.path {
+        for dir in std::env::split_paths(path) {
             let cand = dir.join(exe);
             if cand.is_file() {
-                return Some(cand);
+                out.push(cand);
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
+    if let Some(home) = env.home {
         let cand = PathBuf::from(home).join(".local").join("bin").join(exe);
         if cand.is_file() {
-            return Some(cand);
+            out.push(cand);
         }
     }
-    None
+    out
+}
+
+/// Locates a Node binary for the worker fallback runtime, by **presence** only
+/// (the first existing candidate). See [`usable_node`] for the version gate.
+pub(crate) fn find_node() -> Option<PathBuf> {
+    node_candidates().into_iter().next()
 }
 
 /// Parses a `node --version` string (`"v24.15.0\n"`) into `(major, minor)`.
@@ -296,30 +315,62 @@ fn parse_node_version(s: &str) -> Option<(u32, u32)> {
     Some((major, minor))
 }
 
+/// The first candidate whose `--version` parses as **>= [`NODE_MIN`]**, skipping
+/// anything older, unparseable, or that fails to spawn — so an outdated
+/// `NANOBPMN_NODE_BIN` cannot make workers unavailable when a supported Node is
+/// later on `PATH`.
+///
+/// `None` when *nothing* clears the floor: an older Node must be reported as
+/// unavailable, not launched with flags it does not support. This matches
+/// ProcessOS's `select_node`, which rejects the same host.
+fn first_supported_probe(probed: &[NodeProbe]) -> Option<&NodeProbe> {
+    probed.iter().find(|(_, raw)| {
+        raw.as_ref()
+            .and_then(|r| parse_node_version(r))
+            .is_some_and(|v| v >= NODE_MIN)
+    })
+}
+
+/// The binary of [`first_supported_probe`] — the path the workers launch.
+fn first_supported(probed: &[NodeProbe]) -> Option<PathBuf> {
+    first_supported_probe(probed).map(|(bin, _)| bin.clone())
+}
+
 /// The Node binary iff present **and** new enough ([`NODE_MIN`]) to run workers.
-/// Probes `node --version`; returns `None` on any older/unparseable/erroring Node.
+/// Probes each candidate's `--version` and takes the first that clears the floor;
+/// `None` when no candidate does.
 pub(crate) fn usable_node() -> Option<PathBuf> {
-    let bin = find_node()?;
-    let out = std::process::Command::new(&bin)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let ver = parse_node_version(&String::from_utf8_lossy(&out.stdout))?;
-    (ver >= NODE_MIN).then_some(bin)
+    first_supported(&probe_candidates(&node_candidates()))
+}
+
+/// The selected usable Node together with the `--version` line it reported —
+/// the single source for both the launch path ([`usable_node`]) and the IDE's
+/// runtime report (`config::check_node`), so the reported binary/version can
+/// never disagree with `present: true`.
+pub(crate) fn selected_node() -> Option<NodeProbe> {
+    first_supported_probe(&probe_candidates(&node_candidates())).cloned()
+}
+
+/// Runs `--version` on every candidate in order. Kept separate from the pure
+/// [`first_supported`] policy so the selection is unit-testable without spawning.
+fn probe_candidates(candidates: &[PathBuf]) -> Vec<NodeProbe> {
+    candidates
+        .iter()
+        .map(|bin| {
+            let raw = std::process::Command::new(bin)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            (bin.clone(), raw)
+        })
+        .collect()
 }
 
 impl WorkerSupervisor {
-    /// Whether a Deno runtime is available. Node-first (ADR 0038): Deno is
-    /// needed only for `deno compile`; workers run on Node.
-    pub fn deno_available(&self) -> bool {
-        find_deno().is_some()
-    }
-
-    /// Whether a usable Node (>= 22.6) runtime is available — the primary
-    /// runtime for running workers. See ADR 0038.
+    /// Whether a usable Node (>= 22.6) runtime is available — the sole runtime
+    /// for running workers (ADR 0065 removed Deno).
     pub fn node_available(&self) -> bool {
         usable_node().is_some()
     }
@@ -356,21 +407,11 @@ impl WorkerSupervisor {
         if !dir.is_dir() {
             return Err("no such worker".into());
         }
-        // Node-first: Node (>= 22.6) is the runtime the npm launcher always
-        // provides, so it is the primary path. Deno is preferred only when a
-        // project needs `deno compile`; for Run it is an equal alternative and
-        // no longer required. See ADR 0038 (Node-first) / 0036.
-        enum WorkerRuntime {
-            Deno(PathBuf),
-            Node(PathBuf),
-        }
-        let runtime = if let Some(n) = usable_node() {
-            WorkerRuntime::Node(n)
-        } else if let Some(d) = find_deno() {
-            WorkerRuntime::Deno(d)
-        } else {
+        // Node (>= 22.6) is the sole runtime — the npm launcher always provides
+        // one (ADR 0065 removed Deno).
+        let Some(node) = usable_node() else {
             return Err("No JavaScript runtime found to run workers. Install Node \
-                 >= 22.6 (the npm launcher provides one), or Deno (https://deno.com)."
+                 >= 22.6 (the npm launcher provides one)."
                 .to_string());
         };
 
@@ -393,41 +434,18 @@ impl WorkerSupervisor {
         if !entrypoint.is_file() {
             return Err("worker has no worker.ts entrypoint".into());
         }
-        let cache = workspace::deno_cache_dir();
-        let _ = std::fs::create_dir_all(&cache);
-        let ws_root = workspace::workspace_dir();
         let port = self.gateway_port.load(Ordering::Relaxed);
         let base_url = format!("http://127.0.0.1:{port}");
 
-        let mut cmd;
-        let runtime_label;
-        match &runtime {
-            WorkerRuntime::Deno(deno) => {
-                runtime_label = "deno";
-                cmd = Command::new(deno);
-                cmd.current_dir(&dir)
-                    .arg("run")
-                    .arg("--no-prompt")
-                    .arg("--allow-net")
-                    .arg(format!("--allow-read={}", ws_root.display()))
-                    .arg(format!("--allow-write={}", cache.display()))
-                    .arg("--allow-env")
-                    .arg("worker.ts")
-                    .env("DENO_DIR", &cache);
-            }
-            WorkerRuntime::Node(node) => {
-                // Node fallback: strip TS types + register the import-map loader
-                // (materialised beside the SDK). `node:sqlite`/WebSocket are built in.
-                runtime_label = "node";
-                cmd = Command::new(node);
-                cmd.current_dir(&dir);
-                super::projects::node_fallback_command(
-                    &mut cmd,
-                    &workspace::sdk_dir().join("node-register.mjs"),
-                );
-                cmd.arg("worker.ts");
-            }
-        }
+        // Strip TS types + register the import-map loader (materialised beside the
+        // SDK). `node:sqlite`/WebSocket are built in.
+        let mut cmd = Command::new(node);
+        cmd.current_dir(&dir);
+        super::projects::node_fallback_command(
+            &mut cmd,
+            &workspace::sdk_dir().join("node-register.mjs"),
+        );
+        cmd.arg("worker.ts");
         cmd.env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
             .env("NANOBPMN_WORKER_NAME", name)
@@ -438,7 +456,7 @@ impl WorkerSupervisor {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn {runtime_label}: {e}"))?;
+            .map_err(|e| format!("failed to spawn node: {e}"))?;
 
         let pid = child.id().unwrap_or(0);
         inner.pid.store(pid, Ordering::Relaxed);
@@ -488,10 +506,10 @@ impl WorkerSupervisor {
                 }
             });
         }
-        // stderr reader: log lines. Deno writes informational progress
-        // (`Download`, `Check`, ...) to stderr too, so these are surfaced as
-        // logs but NOT recorded as `last_error`; genuine errors come from the
-        // SDK's status/metric lines and the process exit code.
+        // stderr reader: log lines. Node writes informational warnings to
+        // stderr too, so these are surfaced as logs but NOT recorded as
+        // `last_error`; genuine errors come from the SDK's status/metric lines
+        // and the process exit code.
         if let Some(stderr) = child.stderr.take() {
             let inner = inner.clone();
             tokio::spawn(async move {
@@ -579,7 +597,11 @@ struct StatusLine {
 
 #[cfg(test)]
 mod node_runtime_tests {
-    use super::{NODE_MIN, find_node, parse_node_version};
+    use super::{NODE_MIN, NodeEnv, first_supported, node_candidates_from, parse_node_version};
+
+    fn p(s: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(s)
+    }
 
     #[test]
     fn parse_node_version_reads_major_minor() {
@@ -603,23 +625,108 @@ mod node_runtime_tests {
         assert!(parse_node_version("v22.6.0").unwrap() >= NODE_MIN);
     }
 
+    /// The candidate order is pure over an injected environment, so this needs no
+    /// process-global mutation (which `cargo test` runs in parallel and which is
+    /// exactly why `set_var`/`remove_var` are `unsafe`).
     #[test]
-    fn find_node_honors_explicit_bin_env() {
-        // A non-existent path is ignored; a real file is returned.
-        let dir = std::env::temp_dir().join(format!("nbpm-node-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let fake = dir.join(if cfg!(windows) { "node.exe" } else { "node" });
-        std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
-        // SAFETY: single-threaded test; scoped env mutation.
-        unsafe { std::env::set_var("NANOBPMN_NODE_BIN", &fake) };
-        assert_eq!(find_node(), Some(fake));
-        unsafe { std::env::set_var("NANOBPMN_NODE_BIN", "/nonexistent/definitely/not/node") };
-        // Falls through to PATH/HOME; just assert it doesn't return the bogus path.
-        assert_ne!(
-            find_node(),
-            Some(std::path::PathBuf::from("/nonexistent/definitely/not/node"))
+    fn node_candidates_from_orders_override_then_path_then_local_bin() {
+        let tmp = std::env::temp_dir().join(format!("nbpm-env-{}", std::process::id()));
+        let override_dir = tmp.join("override");
+        let path_dir = tmp.join("pathdir");
+        let home_dir = tmp.join("home");
+        for d in [&override_dir, &path_dir] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let exe = if cfg!(windows) { "node.exe" } else { "node" };
+        let override_bin = override_dir.join(exe);
+        std::fs::write(&override_bin, b"#!/bin/sh\n").unwrap();
+        let path_bin = path_dir.join(exe);
+        std::fs::write(&path_bin, b"#!/bin/sh\n").unwrap();
+        let local_bin = home_dir.join(".local").join("bin").join(exe);
+        std::fs::create_dir_all(local_bin.parent().unwrap()).unwrap();
+        std::fs::write(&local_bin, b"#!/bin/sh\n").unwrap();
+
+        let override_str = override_bin.to_string_lossy().into_owned();
+        let got = node_candidates_from(NodeEnv {
+            override_bin: Some(&override_str),
+            path: Some(path_dir.as_os_str()),
+            home: Some(home_dir.as_os_str()),
+        });
+        assert_eq!(got, vec![override_bin.clone(), path_bin, local_bin]);
+
+        // A non-existent override (and empty string) is ignored, never returned.
+        let missing = tmp.join("missing").join(exe);
+        let missing_str = missing.to_string_lossy().into_owned();
+        let got = node_candidates_from(NodeEnv {
+            override_bin: Some(&missing_str),
+            path: None,
+            home: None,
+        });
+        assert!(
+            got.is_empty(),
+            "a missing override must not be listed: {got:?}"
         );
-        unsafe { std::env::remove_var("NANOBPMN_NODE_BIN") };
-        std::fs::remove_dir_all(&dir).ok();
+        let got = node_candidates_from(NodeEnv {
+            override_bin: Some(""),
+            path: None,
+            home: None,
+        });
+        assert!(got.is_empty());
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn first_supported_skips_a_stale_override_for_a_newer_path_node() {
+        // The defect class: a first-match resolver (the old `find_node` + probe)
+        // binds an outdated `NANOBPMN_NODE_BIN` and reports the host as having no
+        // runtime, even though a supported Node sits later on PATH — while
+        // ProcessOS selects by version and reports the host ready. One policy:
+        // first candidate that *clears the floor* wins.
+        let probed = vec![
+            (p("/usr/local/bin/node"), Some("v18.20.0\n".to_string())),
+            (p("/opt/node/bin/node"), Some("v22.6.0\n".to_string())),
+        ];
+        assert_eq!(first_supported(&probed), Some(p("/opt/node/bin/node")));
+    }
+
+    #[test]
+    fn first_supported_prefers_the_newest_eligible_in_order() {
+        let probed = vec![
+            (p("a"), None), // did not spawn — skipped, not selected
+            (p("b"), Some("v22.6.1".to_string())),
+            (p("c"), Some("v24.15.0".to_string())),
+        ];
+        assert_eq!(first_supported(&probed), Some(p("b")));
+    }
+
+    #[test]
+    fn first_supported_rejects_a_host_that_only_has_an_older_node() {
+        // Nothing clears the floor: report unavailable rather than launching a
+        // Node that cannot strip types / load `node:sqlite`. ProcessOS
+        // (`select_node`) rejects the same host, so the two resolvers agree.
+        assert_eq!(
+            first_supported(&[(p("old"), Some("v20.11.0".to_string()))]),
+            None
+        );
+        assert_eq!(
+            first_supported(&[(p("almost"), Some("v22.5.0".to_string()))]),
+            None
+        );
+    }
+
+    #[test]
+    fn first_supported_is_none_without_any_node() {
+        assert_eq!(first_supported(&[]), None);
+        assert_eq!(first_supported(&[(p("x"), None)]), None);
+    }
+
+    #[test]
+    fn first_supported_ignores_unparseable_versions() {
+        let probed = vec![
+            (p("weird"), Some("not-a-version".to_string())),
+            (p("ok"), Some("v23.1.0".to_string())),
+        ];
+        assert_eq!(first_supported(&probed), Some(p("ok")));
     }
 }

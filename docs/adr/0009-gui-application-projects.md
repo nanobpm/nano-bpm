@@ -1,6 +1,6 @@
 # ADR 0009 — GUI application projects (served-UI binaries)
 
-Status: **Accepted — implemented (extension manifest, builtin deno/rust/deno-gui packs, lang+app project axes, toolchain run/compile, marketplace UI).**
+Status: **Accepted — implemented (extension manifest, builtin node/rust/node-gui packs, lang+app project axes, toolchain run/compile, marketplace UI).** The built-in pack ids were renamed `deno`→`node` and `deno-gui`→`node-gui` when Deno was removed ([ADR 0065](0065-deno-removal.md)); the legacy ids still resolve as aliases.
 Date: 2026-06-29.
 Relates to: ADR 0007 (`0007-rad-extension-system.md`, the pack contract), ADR 0005
 (`0005-embedded-u-nano.md`, embed-Nano binary direction), `server/src/console/projects.rs`

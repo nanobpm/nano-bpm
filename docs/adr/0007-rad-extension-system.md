@@ -1,6 +1,6 @@
 # ADR 0007 — RAD extension system (npm-installable IDE packs)
 
-Status: **Accepted — implemented (extension manifest, builtin deno/rust/deno-gui packs, lang+app project axes, toolchain run/compile, marketplace UI).**
+Status: **Accepted — implemented (extension manifest, builtin node/rust/node-gui packs, lang+app project axes, toolchain run/compile, marketplace UI).** The built-in pack ids were renamed `deno`→`node` and `deno-gui`→`node-gui` when Deno was removed ([ADR 0065](0065-deno-removal.md)); the legacy ids still resolve as aliases.
 Date: 2026-06-29.
 Relates to: ADR 0005 (`docs/adr/0005-embedded-u-nano.md`, the application-binary direction),
 `server/src/console/projects.rs` (`TEMPLATES`, scaffolder, run/compile supervisor),

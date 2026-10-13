@@ -3,7 +3,7 @@
 // Journeys import from here rather than each defining their own gates, so
 // "would Run actually work?" has exactly one answer across the console. The
 // alternative — three journey files each hand-rolling a runtime check — is how
-// the tour ends up telling one user to install Deno and promising another that
+// the tour ends up telling one user to install Node and promising another that
 // Run works on the same machine.
 //
 // Pure: no runtime imports, so these are unit-testable without the Vite globals.
@@ -21,7 +21,7 @@ import type { Precondition } from "./types";
  */
 export const hasJsRuntime: Precondition = {
   id: "has-js-runtime",
-  test: (ctx) => (ctx.denoAvailable || ctx.nodeAvailable ? "ok" : "repair"),
+  test: (ctx) => (ctx.nodeAvailable ? "ok" : "repair"),
 };
 
 /** At least one project exists. `skip`: nothing to point at, and that is fine. */

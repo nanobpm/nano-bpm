@@ -240,7 +240,7 @@ pub fn router(server: ConsoleServerRef) -> Router {
         .route("/console/api/workers/{name}/logs", get(worker_logs))
         // The vendored `@nanobpm/urban` type surface for the Studio editor's
         // Monaco IntelliSense. Hand-wired (not in the OpenAPI spec) like the
-        // embedded worker SDK / Deno types it sits beside: a static text asset
+        // embedded worker SDK / Node types it sits beside: a static text asset
         // baked into the binary, served verbatim.
         .route("/console/api/urban-types", get(urban_types))
         // GET on this path returns text OR a binary descriptor via `X-File-*`
@@ -3439,17 +3439,17 @@ pub fn model_delete(name: &str) -> ApiResult {
 }
 
 // ---------------------------------------------------------------------------
-// Workers API — workspace-backed worker code + a Deno subprocess supervisor
+// Workers API — workspace-backed worker code + a Node subprocess supervisor
 // ---------------------------------------------------------------------------
 //
 // A worker is a directory of source files under `workers/<name>/` (an entry
-// `worker.ts` plus optional helpers and a `deno.json`). The supervisor (see
-// `workers`) runs each enabled worker as a sandboxed Deno subprocess that speaks
+// `worker.ts` plus optional helpers and a `node.json`). The supervisor (see
+// `workers`) runs each enabled worker as a Node subprocess that speaks
 // the Falcon protocol. This API is workspace file CRUD plus start/stop and a live
 // log/metrics view; it never touches the engine data dir.
 
 /// Default `worker.ts` scaffold for a new worker. Imports the embedded SDK via
-/// the import map in `deno.json` and echoes the job's input back as output.
+/// the import map in `node.json` and echoes the job's input back as output.
 fn worker_scaffold_ts(job_type: &str) -> String {
     format!(
         r#"import {{ defineWorker }} from "@nanobpm/worker";
@@ -3470,13 +3470,22 @@ defineWorker({{
     )
 }
 
-/// `deno.json` mapping the `@nanobpm/worker` specifier to the embedded SDK and
+/// `node.json` mapping the `@nanobpm/worker` specifier to the embedded SDK and
 /// the `@lib/` alias to the shared workspace library, so a worker can both
 /// `import { defineWorker } from "@nanobpm/worker"` and reuse shared logic with
 /// `import { fmt } from "@lib/money.ts"`.
-const WORKER_DENO_JSON: &str = r#"{
+///
+/// The target is `<gen>/worker-sdk.ts` — the file the standalone supervisor
+/// materialises (`workers::ensure_sdk_written`). A standalone worker directory is
+/// `<workspace>/workers/<name>/`, so the relative specifier climbs to the
+/// workspace root and back down. **Do not** point this at `workers.ts`: that
+/// typed re-export exists only inside a RAD project (magic `{GEN}` dir next to
+/// the worker), so a standalone worker would fail module resolution before it
+/// ever connects. `worker-sdk.ts` is self-contained (no imports of its own), so
+/// it is a complete replacement for `workers.ts`'s `export *`.
+const WORKER_NODE_JSON: &str = r#"{
   "imports": {
-    "@nanobpm/worker": "../../nano-generated/workers.ts",
+    "@nanobpm/worker": "../../nano-generated/worker-sdk.ts",
     "@lib/": "../../lib/"
   }
 }
@@ -3535,7 +3544,6 @@ pub async fn workers_list() -> ApiResult {
     }
     Ok(serde_json::json!({
         "workers": out,
-        "denoAvailable": workers::supervisor().deno_available(),
         "nodeAvailable": workers::supervisor().node_available(),
     }))
 }
@@ -3564,7 +3572,7 @@ pub async fn worker_create(name: String, job_type: Option<String>) -> ApiResult 
             format!("could not write worker.ts: {e}"),
         ));
     }
-    let _ = std::fs::write(dir.join("deno.json"), WORKER_DENO_JSON);
+    let _ = std::fs::write(dir.join("node.json"), WORKER_NODE_JSON);
     match worker_summary(&name).await {
         Some(s) => Ok(serde_json::to_value(s).unwrap()),
         None => Err((
@@ -3577,11 +3585,6 @@ pub async fn worker_create(name: String, job_type: Option<String>) -> ApiResult 
 /// `GET /console/api/worker-sdk` — the embedded worker SDK TypeScript source.
 pub fn worker_sdk_source() -> String {
     worker_export::worker_sdk_source().to_string()
-}
-
-/// `GET /console/api/deno-types` — the embedded Deno namespace ambient types.
-pub fn deno_types_source() -> String {
-    worker_export::deno_namespace_types().to_string()
 }
 
 /// `GET /console/api/urban-types` — the vendored `@nanobpm/urban` type surface,
@@ -3609,7 +3612,7 @@ struct ExportWorkersBody {
 }
 
 /// `POST /console/api/export-workers-app` — bundle the selected workers into a
-/// standalone, runnable Deno application, returned as a downloadable `.zip`
+/// standalone, runnable Node application, returned as a downloadable `.zip`
 /// (see [`worker_export`]).
 async fn workers_export(Json(body): Json<ExportWorkersBody>) -> Response {
     match worker_export::build_app(&body.workers) {
@@ -3894,9 +3897,16 @@ async fn recv_live(
 
 // ---------------------------------------------------------------------------
 // Projects API — the RAD environment. A project is a self-contained directory
-// (resources/, workers/, lib/, main.ts, deno.json, nanobpm.project.json) that
-// is itself a runnable Deno app. See `projects`.
+// (resources/, workers/, lib/, main.ts, node.json, nanobpm.project.json) that
+// is itself a runnable Node app. See `projects`.
 // ---------------------------------------------------------------------------
+
+/// Public wrapper over [`urban::urban_available`] for the server crate's
+/// hand-written-to-generated response adapter (`console_api.rs`), which must
+/// supply the required `urbanAvailable` field on its error fallback.
+pub fn urban_available() -> bool {
+    urban::urban_available()
+}
 
 /// `GET /console/api/projects` — list projects (tiles) with resource counts and
 /// live run status.
@@ -3921,7 +3931,6 @@ pub async fn projects_list() -> ApiResult {
     }
     Ok(serde_json::json!({
         "projects": out,
-        "denoAvailable": sup.deno_available(),
         "nodeAvailable": sup.node_available(),
         "urbanAvailable": urban::urban_available(),
         "platforms": projects::PLATFORMS,
@@ -4167,12 +4176,11 @@ pub async fn project_detail(name: &str) -> ApiResult {
     };
     let tree = projects::file_tree(name).unwrap_or_default();
     let sup = projects::supervisor();
-    // Run/Compile readiness is language-aware: Deno projects need the Deno
-    // runtime *or* the Node fallback (>= 22.6) on hosts with no Deno build,
-    // e.g. 32-bit ARM (ADR 0036); a polyglot lang pack (e.g. Rust) needs its
-    // own toolchain (cargo).
-    let runnable = if cfg.lang == "deno" {
-        sup.deno_available() || sup.node_available()
+    // Run/Compile readiness is language-aware: a JS/TS project runs on Node
+    // (>= 22.6) — the sole JS/TS runtime (ADR 0065); a polyglot lang pack
+    // (e.g. Rust) needs its own toolchain (cargo).
+    let runnable = if is_node_lang(&cfg.lang) {
+        sup.node_available()
     } else {
         extensions::lang_pack(&cfg.lang)
             .map(|p| extensions::toolchain_available(&p))
@@ -4198,7 +4206,6 @@ pub async fn project_detail(name: &str) -> ApiResult {
         "files": tree,
         "runState": sup.run_state(name).await,
         "appUi": app_ui,
-        "denoAvailable": sup.deno_available(),
         "nodeAvailable": sup.node_available(),
         // Presence of the `@nanobpm/urban` CLI (epic #514 host dry-out). The
         // Studio gates urban-app affordances on this; the binary is delivered
@@ -4217,16 +4224,23 @@ pub async fn project_detail(name: &str) -> ApiResult {
 /// `None` when the project is runnable. Pure: given `lang` + `runnable` it only
 /// reads the (already-probed) lang pack manifest, so it's unit-testable without
 /// a supervisor or an on-disk project.
+/// Whether a lang pack id denotes the built-in JS/TS runtime. Node is the sole
+/// JS/TS runtime (ADR 0065); the legacy `deno` id is kept as an alias so a
+/// project config scaffolded before Deno removal still recognises its runtime.
+fn is_node_lang(lang: &str) -> bool {
+    lang == "node" || lang == "deno"
+}
+
 fn missing_toolchain_json(lang: &str, runnable: bool) -> Option<serde_json::Value> {
     if runnable {
         return None;
     }
-    if lang == "deno" {
+    if is_node_lang(lang) {
         return Some(serde_json::json!({
-            "displayName": "Deno / Node",
-            "probes": ["deno", "node"],
-            "installHint": "Install the Deno runtime, or Node \u{2265} 22.6 (used as a fallback where Deno has no build, e.g. 32-bit ARM).",
-            "installUrl": "https://deno.com/",
+            "displayName": "Node",
+            "probes": ["node"],
+            "installHint": "Install the Node runtime \u{2265} 22.6 (https://nodejs.org).",
+            "installUrl": "https://nodejs.org/",
         }));
     }
     extensions::lang_pack(lang).map(|p| {
@@ -4251,21 +4265,25 @@ mod missing_toolchain_tests {
 
     #[test]
     fn runnable_project_reports_no_missing_toolchain() {
-        assert!(missing_toolchain_json("deno", true).is_none());
+        assert!(missing_toolchain_json("node", true).is_none());
         assert!(missing_toolchain_json("rust", true).is_none());
     }
 
     #[test]
-    fn missing_deno_names_both_runtimes() {
-        let v = missing_toolchain_json("deno", false).expect("deno payload");
-        let probes: Vec<_> = v["probes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|p| p.as_str().unwrap())
-            .collect();
-        assert_eq!(probes, ["deno", "node"]);
-        assert!(v["installUrl"].as_str().unwrap().contains("deno.com"));
+    fn missing_node_names_the_node_runtime() {
+        // Both the canonical id and the legacy `deno` alias name Node, since
+        // Node is the sole JS/TS runtime (ADR 0065).
+        for lang in ["node", "deno"] {
+            let v = missing_toolchain_json(lang, false).expect("node payload");
+            let probes: Vec<_> = v["probes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.as_str().unwrap())
+                .collect();
+            assert_eq!(probes, ["node"]);
+            assert!(v["installUrl"].as_str().unwrap().contains("nodejs.org"));
+        }
     }
 
     #[test]
@@ -5420,7 +5438,7 @@ fn data_error(e: projects::DataError) -> (StatusCode, String) {
         NoRuntime => (
             StatusCode::SERVICE_UNAVAILABLE,
             "No JavaScript runtime found for the Data panel. Install Node >= 22.6 \
-             (the npm launcher provides one), or Deno (https://deno.com)."
+             (the npm launcher provides one), or from https://nodejs.org."
                 .to_string(),
         ),
         // A bad SQL statement / unknown source / missing manifest is the
@@ -5581,7 +5599,7 @@ pub fn is_model_resource(rel: &str) -> bool {
 /// save re-derives the typed SDK; here the workflow *code* is the source of truth
 /// and a save re-generates the `resources/processes/*.bpmn` the SDK derives from.
 /// Matched precisely (a `.ts` in `workflows/`, not nested, not the project root)
-/// so an unrelated `.ts` save never triggers a Deno round-trip.
+/// so an unrelated `.ts` save never triggers a workflow-codegen round-trip.
 pub fn is_workflow_source(rel: &str) -> bool {
     let path = std::path::Path::new(rel.trim_start_matches('/'));
     path.extension()
@@ -5731,7 +5749,7 @@ pub async fn project_data_domaintypes(name: &str, source: &str) -> ApiResult {
     // the branch runs `urban gen` (persist) and then reads back through
     // `urban data` introspection. An `urban` that has `gen` but predates `data`
     // would otherwise persist via `urban gen` yet fall back to the *embedded*
-    // introspection inside `run_data_op` — re-introducing a Node/Deno dependency
+    // introspection inside `run_data_op` — re-introducing a Node dependency
     // and contradicting this doc comment. Gating the whole branch on
     // `urban_supports_data` keeps it atomic (all-urban or all-embedded), mirroring
     // the capability gate in `run_data_op`.
@@ -6289,7 +6307,7 @@ mod asset_encoding_tests {
         assert!(is_workflow_source("workflows/pr-review.ts"));
         assert!(is_workflow_source("workflows/order.TS")); // case-insensitive
         assert!(is_workflow_source("/workflows/pr-review.ts")); // leading-slash tolerated
-        // Anything outside `workflows/*.ts` must not trigger a Deno round-trip.
+        // Anything outside `workflows/*.ts` must not trigger a workflow-codegen round-trip.
         assert!(!is_workflow_source("pr-review.ts")); // project root
         assert!(!is_workflow_source("workflows/sub/pr-review.ts")); // nested
         assert!(!is_workflow_source("scripts/approve.ts"));
@@ -6416,6 +6434,70 @@ mod asset_encoding_tests {
                 .get(header::CONTENT_ENCODING)
                 .and_then(|v| v.to_str().ok()),
             Some("gzip")
+        );
+    }
+}
+
+#[cfg(test)]
+mod standalone_worker_scaffold_tests {
+    //! A standalone (Workers-tab) worker is scaffolded **outside** any RAD
+    //! project: its directory is `<workspace>/workers/<name>/`, and the only SDK
+    //! the supervisor materialises is `<workspace>/nano-generated/worker-sdk.ts`.
+    //! The scaffold's `node.json` import map therefore has to resolve
+    //! `@nanobpm/worker` to *that* file — pointing it at a RAD-project-only
+    //! `workers.ts` leaves the freshly created worker unresolvable, so it dies at
+    //! module load before it can connect (the "it scaffolded but never ran"
+    //! failure mode).
+    use std::path::{Component, Path, PathBuf};
+
+    use super::{WORKER_NODE_JSON, worker_scaffold_ts};
+
+    /// Lexical `..`/`.` collapse (the dirs need not exist), mirroring how Node
+    /// resolves a relative import specifier.
+    fn normalize(p: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                Component::ParentDir => {
+                    out.pop();
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn worker_scaffold_import_map_resolves_against_a_real_standalone_worker_dir() {
+        let sdk = "worker-sdk.ts";
+        let root = Path::new("/tmp/nanobpm-workspace");
+        let worker = root.join("workers").join("echo");
+        let import_map: serde_json::Value = serde_json::from_str(WORKER_NODE_JSON)
+            .expect("the scaffolded node.json must be valid JSON");
+        let target = import_map["imports"]["@nanobpm/worker"]
+            .as_str()
+            .expect("@nanobpm/worker alias");
+        // Resolve the relative specifier the way Node does: from the worker dir.
+        let resolved = normalize(&worker.join(target));
+        assert_eq!(
+            resolved,
+            root.join("nano-generated").join(sdk),
+            "@nanobpm/worker must resolve to the SDK the supervisor actually writes"
+        );
+        assert!(
+            !target.ends_with("workers.ts"),
+            "workers.ts is written only inside a RAD project; a standalone worker \
+             would fail module resolution (got {target})"
+        );
+    }
+
+    #[test]
+    fn worker_scaffold_imports_the_worker_sdk_specifier_it_maps() {
+        let ts = worker_scaffold_ts("my-job");
+        assert!(
+            ts.contains(r#"from "@nanobpm/worker""#),
+            "the scaffold must import the bare specifier the import map defines"
         );
     }
 }

@@ -161,11 +161,11 @@ export interface WorkerLogLine {
 
 // --- Standalone worker app export (zip) ------------------------------------
 
-/// Bundles the named workers into a standalone, runnable Deno application and
+/// Bundles the named workers into a standalone, runnable Node application and
 /// triggers a browser download of the returned `.zip`. The zip ships every
 /// worker's source, the embedded worker SDK, a `main.ts` that deploys all
 /// `resources/*.bpmn` models on startup before running the workers, a
-/// `deno.json` start task, and a README. Throws with the server's error text on
+/// `node.json` start task, and a README. Throws with the server's error text on
 /// failure (e.g. no workers selected).
 export async function exportWorkersApp(workers: string[]): Promise<void> {
   const res = await fetch("/console/api/export-workers-app", {
@@ -459,7 +459,7 @@ export interface DerivedModel {
 
 /// Derives the executable BPMN for a code-first workflow project. The server
 /// runs the project's `workflows/*.ts` through `@nanobpm/workflow`'s `toBpmn`
-/// (read-only). Throws with the server's detail on failure (e.g. Deno missing).
+/// (read-only). Throws with the server's detail on failure (e.g. Node missing).
 export async function projectDerivedModels(
   name: string,
 ): Promise<DerivedModel[]> {

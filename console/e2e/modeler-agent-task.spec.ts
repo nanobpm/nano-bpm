@@ -225,7 +225,6 @@ async function stubProjectFiles(
         appUi: { enabled: true },
         runnable: true,
         missingToolchain: null,
-        denoAvailable: true,
         nodeAvailable: true,
         urbanAvailable: false,
         platforms: [],

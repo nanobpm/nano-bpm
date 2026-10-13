@@ -34,7 +34,7 @@ export function ensureBundledJsonSchemas(): void {
   // Mark registered only after the call succeeds, so a transient failure (e.g.
   // Monaco JSON defaults not yet initialized) doesn't permanently prevent a
   // later retry from registering the schemas for the session.
-  monaco.languages.json.jsonDefaults.setDiagnosticsOptions({
+  monaco.json.jsonDefaults.setDiagnosticsOptions({
     validate: true,
     enableSchemaRequest: false,
     schemas: [

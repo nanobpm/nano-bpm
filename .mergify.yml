@@ -115,6 +115,16 @@ merge_protections:
       - or:
           - check-success=processos (clippy + test)
           - check-skipped=processos (clippy + test)
+      # The server console's embedded TypeScript (`server/crates/nano-server-console/
+      # src/*.ts`) is type-checked and unit-tested by this lane. It was previously
+      # gated by `deno test`; after everything moved to Node (ADR 0065) it is the
+      # only gate on that TS surface — the `console (typecheck + test)` job covers
+      # only `console/tsconfig*.json` + `console/src`, so without this a type error
+      # in the embedded gateway TS lands on `main` red. Change-gated on the `code`
+      # OR `console` filter, so accept skipped too.
+      - or:
+          - check-success=console-ts (server TS typecheck + test)
+          - check-skipped=console-ts (server TS typecheck + test)
       # The TLA+ model checks (formal/README.md), including the known-defect
       # ratchets and the Zeebe parity coverage guard (formal/parity). Change-gated
       # on the `formal` filter, so accept skipped too.

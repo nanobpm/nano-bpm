@@ -64,7 +64,7 @@ export const ELEMENT_TEMPLATE_FILE_MATCH = [
  */
 export function elementTemplateSchemaEntries(
   schema: Record<string, unknown>,
-): NonNullable<monaco.languages.json.DiagnosticsOptions["schemas"]> {
+): NonNullable<monaco.json.DiagnosticsOptions["schemas"]> {
   return ELEMENT_TEMPLATE_SCHEMA_URIS.map((uri) => ({
     uri,
     fileMatch: [...ELEMENT_TEMPLATE_FILE_MATCH],

@@ -6,9 +6,8 @@
 //! Layout under the workspace root:
 //! ```text
 //! <workspace>/models/<name>.bpmn
-//! <workspace>/workers/<name>/{worker.ts, deno.json, ...}
-//! <workspace>/nano-generated/worker-sdk.ts   (the embedded Deno worker SDK)
-//! <workspace>/.deno-cache/             (DENO_DIR for worker dependency caching)
+//! <workspace>/workers/<name>/{worker.ts, node.json, ...}
+//! <workspace>/nano-generated/worker-sdk.ts   (the embedded Node worker SDK)
 //! ```
 //! The root defaults to `./nanobpm-workspace` (relative to the server's cwd) and
 //! is overridden by `NANOBPMN_WORKSPACE_DIR`. Unlike the engine data dir — which
@@ -115,8 +114,7 @@ pub fn worker_dir(name: &str) -> Option<PathBuf> {
 }
 
 /// Whether `file` is a safe, flat filename within a worker directory: no path
-/// separators or `..`, and a tidy name. Workers are flat dirs in v1 (the only
-/// nested content is the hidden Deno dependency cache, which is not exposed).
+/// separators or `..`, and a tidy name. Workers are flat dirs in v1.
 pub fn is_safe_worker_file(file: &str) -> bool {
     is_safe_name(file)
 }
@@ -175,7 +173,7 @@ pub fn list_worker_files(name: &str) -> std::io::Result<Vec<String>> {
     Ok(files)
 }
 
-/// The generated directory holding the embedded Deno worker SDK.
+/// The generated directory holding the embedded Node worker SDK.
 pub fn sdk_dir() -> PathBuf {
     workspace_dir().join(super::projects::GEN_DIR)
 }
@@ -187,7 +185,7 @@ pub fn sdk_path() -> PathBuf {
 
 // ---------------------------------------------------------------------------
 // Shared library — reusable TS/JS files under `lib/`, importable from every
-// worker via the `@lib/` import-map alias (`workers/<name>/deno.json`).
+// worker via the `@lib/` import-map alias (`workers/<name>/node.json`).
 // ---------------------------------------------------------------------------
 
 /// Directory holding shared library source files (`<workspace>/lib/`). Workers
@@ -231,11 +229,6 @@ pub fn list_lib_files() -> std::io::Result<Vec<String>> {
     Ok(files)
 }
 
-/// The Deno dependency cache directory (`DENO_DIR`) for sandboxed workers.
-pub fn deno_cache_dir() -> PathBuf {
-    workspace_dir().join(".deno-cache")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,7 +260,7 @@ mod tests {
         assert!(worker_dir("order-worker").is_some());
         // A file within a worker must be a safe flat filename.
         assert!(worker_file_path("w", "worker.ts").is_some());
-        assert!(worker_file_path("w", "deno.json").is_some());
+        assert!(worker_file_path("w", "node.json").is_some());
         assert!(worker_file_path("w", "../../etc/passwd").is_none());
         assert!(worker_file_path("w", "sub/dir.ts").is_none());
         assert!(worker_file_path("../w", "worker.ts").is_none());

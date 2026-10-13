@@ -45,7 +45,7 @@ export const APP_MANIFEST_FILE_MATCH = ["*.nano.app.json", "nano.app.json"];
  */
 export function manifestSchemaEntries(
   schema: Record<string, unknown>,
-): NonNullable<monaco.languages.json.DiagnosticsOptions["schemas"]> {
+): NonNullable<monaco.json.DiagnosticsOptions["schemas"]> {
   return APP_SCHEMA_URIS.map((uri) => ({
     uri,
     fileMatch: [...APP_MANIFEST_FILE_MATCH],
@@ -61,7 +61,7 @@ export function manifestSchemaEntries(
  */
 export function buildManifestSchemaOptions(
   schema: Record<string, unknown>,
-): monaco.languages.json.DiagnosticsOptions {
+): monaco.json.DiagnosticsOptions {
   return {
     validate: true,
     enableSchemaRequest: false,

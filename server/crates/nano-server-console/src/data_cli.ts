@@ -1,5 +1,5 @@
-// nanobpmn datasource CLI (Deno-preferred, Node-capable) — ADR 0024 phase-2
-// (DB Manager gateway); dual-runtime per ADR 0036/0038.
+// nanobpmn datasource CLI (Node runtime) — ADR 0024 phase-2
+// (DB Manager gateway); Node-only per ADR 0065.
 //
 // Materialised verbatim to <project>/nano-generated/data-cli.ts next to data-sdk.ts.
 // The Rust console server invokes it as a one-shot subprocess to serve the
@@ -124,12 +124,11 @@ export function overlayDerivedWorkerIo(
   return [...byType.values()];
 }
 
-// Runtime adapter (ADR 0036/0038): the host calls that differ between Deno
-// (`Deno.*`) and Node (`process` / `node:fs`). The DB Manager gateway runs under
-// whichever runtime the console picked — Deno preferred, Node >= 22.6 fallback
-// (32-bit ARM ships no Deno build). `data-sdk.ts` already carries the same shim
-// for SQLite/`node:sqlite`; this closes the gateway's own host calls (stdin,
-// readDir, readTextFile, exit) so the Data panel works with no Deno present.
+// Runtime adapter: the host calls the CLI needs (stdin, readDir, file IO, exit).
+// Deno support was removed in ADR 0065 — Node's `process` / `node:fs` is the
+// only runtime. `data-sdk.ts` carries the same Node-only shim for
+// SQLite/`node:sqlite`; this closes the gateway's own host calls so the Data
+// panel works on Node.
 interface DirEntry {
   name: string;
   isFile: boolean;
@@ -156,43 +155,7 @@ function concatDecode(chunks: Uint8Array[]): string {
 }
 
 const RT: CliRuntime = ((): CliRuntime => {
-  const g = globalThis as unknown as {
-    Deno?: {
-      stdin: { readable: ReadableStream<Uint8Array> };
-      readDir(dir: string): AsyncIterable<{ name: string; isFile: boolean }>;
-      readTextFile(p: string): Promise<string>;
-      exit(code: number): never;
-    };
-    process?: { stdin: AsyncIterable<Uint8Array>; exit(code: number): never };
-  };
-  if (g.Deno) {
-    const d = g.Deno as typeof g.Deno & {
-      mkdir(p: string, o: { recursive: boolean }): Promise<void>;
-      writeTextFile(p: string, data: string): Promise<void>;
-    };
-    return {
-      readStdin: async () => {
-        const chunks: Uint8Array[] = [];
-        const reader = d.stdin.readable.getReader();
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) chunks.push(value);
-        }
-        return concatDecode(chunks);
-      },
-      readDir: async (dir) => {
-        const out: DirEntry[] = [];
-        for await (const e of d.readDir(dir)) out.push({ name: e.name, isFile: e.isFile });
-        return out;
-      },
-      readTextFile: (p) => d.readTextFile(p),
-      mkdir: (p) => d.mkdir(p, { recursive: true }),
-      writeTextFile: (p, data) => d.writeTextFile(p, data),
-      exit: (c) => d.exit(c),
-    };
-  }
-  const p = g.process!;
+  const p = (globalThis as unknown as { process: NonNullable<NodeJS.Process> }).process;
   return {
     readStdin: async () => {
       const chunks: Uint8Array[] = [];

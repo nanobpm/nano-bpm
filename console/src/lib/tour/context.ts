@@ -2,9 +2,9 @@
 // read.
 //
 // The base comes from ONE `listProjects()` call — which already returns the
-// projects, `denoAvailable`, `nodeAvailable`, the template menu and the installed
-// extensions — plus the current route. Everything else is contributed by
-// whichever slice needs it, through `registerContextSource`.
+// projects, `nodeAvailable`, the template menu and the installed extensions —
+// plus the current route. Everything else is contributed by whichever slice
+// needs it, through `registerContextSource`.
 //
 // That extension point is what keeps the journey slices independent: the
 // topology slice can add `nodeCount`, the agentic journey `runState`, and #404's
@@ -48,7 +48,6 @@ export function clearContextSources(): void {
 /** The subset of `listProjects()`'s response the base context needs. */
 export interface ProjectsSnapshot {
   projects?: TourContext["projects"];
-  denoAvailable?: boolean;
   nodeAvailable?: boolean;
   templates?: TourContext["templates"];
   extensions?: { extensions?: TourContext["extensions"] };
@@ -75,7 +74,6 @@ export function baseContext(input: BaseContextInput): TourContext {
     profile: input.profile,
     route: input.route,
     projects: s?.projects ?? [],
-    denoAvailable: s?.denoAvailable ?? false,
     nodeAvailable: s?.nodeAvailable ?? false,
     templates: s?.templates ?? [],
     extensions: s?.extensions?.extensions ?? [],

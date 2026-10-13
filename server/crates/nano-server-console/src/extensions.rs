@@ -10,9 +10,12 @@
 //! * the project scaffolder (which starter templates exist, see [`super::projects`]);
 //! * the run/compile supervisor (which on-machine toolchain runs/compiles a project).
 //!
-//! First-party packs (`deno`, `rust`, `deno-gui`) ship **built in** so the
-//! console works offline with zero installs and existing Deno projects are
-//! unchanged. Third-party packs install into `<workspace>/extensions/<pkg>/`.
+//! First-party packs (`node`, `rust`, `node-gui`) ship **built in** so the
+//! console works offline with zero installs and existing Node projects are
+//! unchanged. (The Deno runtime was removed in ADR 0065; the legacy `deno` /
+//! `deno-gui` ids are still resolved to these built-ins so a project config
+//! scaffolded before the removal keeps loading.) Third-party packs install into
+//! `<workspace>/extensions/<pkg>/`.
 //!
 //! Toolchain commands run on the user's machine, so the default is allowlist +
 //! consent ([`TrustStore`]): per-extension *approve always* plus a global
@@ -69,7 +72,7 @@ pub struct TriggerSourceSpec {
     /// Config fields the console renders for a trigger of this kind.
     #[serde(default)]
     pub config_fields: Vec<ConfigField>,
-    /// Pack-relative path to the out-of-process driver entrypoint (a Node/Deno
+    /// Pack-relative path to the out-of-process driver entrypoint (a Node
     /// `.ts`/`.js`/`.mjs` file). When present, the runtime **auto-launches and
     /// supervises** the driver while an App with a trigger of this `kind` runs
     /// (ADR 0025 phase 4): one child process per such trigger, restarted with
@@ -111,7 +114,7 @@ pub struct WorkerSpec {
     /// as `type` (a Rust keyword, hence the rename).
     #[serde(rename = "type")]
     pub worker_type: String,
-    /// Pack-relative entrypoint (a Node/Deno `.ts`/`.js`/`.mjs`) calling
+    /// Pack-relative entrypoint (a Node `.ts`/`.js`/`.mjs`) calling
     /// `@nanobpm/worker`'s `defineWorker`. When present, the runtime launches +
     /// supervises it while an App that enables this worker runs; absent = a
     /// declaration-only worker run out-of-band. Mirrors [`TriggerSourceSpec::driver`].
@@ -280,16 +283,17 @@ pub struct RunConfig {
 #[serde(rename_all = "camelCase")]
 pub struct Toolchain {
     /// Probe argv proving the toolchain is installed (e.g. `cargo --version`).
-    /// Empty for the built-in Deno pack (handled internally).
+    /// Empty for the built-in Node pack (handled internally).
     #[serde(default)]
     pub detect: Vec<String>,
     /// Shell-style argv to run the project (cwd = project dir). Empty => use the
-    /// built-in Deno runner. Serves as a fallback when the active run config's
+    /// built-in Node runner. Serves as a fallback when the active run config's
     /// `run` argv is empty (per [`RunConfig`] semantics).
     #[serde(default)]
     pub run: Vec<String>,
-    /// Shell-style argv to compile the project. Empty => Deno compile. Serves
-    /// as a fallback when the active run config's `compile` argv is empty.
+    /// Shell-style argv to compile the project. Empty => the built-in Node
+    /// runner (Node has no compile step, ADR 0065). Serves as a fallback when
+    /// the active run config's `compile` argv is empty.
     #[serde(default)]
     pub compile: Vec<String>,
     /// Cross-compile target triples this toolchain offers.
@@ -301,7 +305,7 @@ pub struct Toolchain {
     #[serde(default)]
     pub run_configs: Vec<RunConfig>,
     /// Official, OS-aware install instructions for this toolchain, surfaced in the
-    /// IDE config panel when the `detect` probe fails. Empty for the built-in Deno
+    /// IDE config panel when the `detect` probe fails. Empty for the built-in Node
     /// pack (whose runtime is reported separately as a first-class dependency).
     #[serde(default)]
     pub install_url: Option<String>,
@@ -345,7 +349,7 @@ pub struct TemplateSpec {
     pub description: Option<String>,
     /// Language pack id this template's project uses, when it differs from
     /// what the pack implies (lang packs → the pack id; app/example packs →
-    /// `requires[0]`, else "deno"). Drives the card's language icon AND the
+    /// `requires[0]`, else "node"). Drives the card's language icon AND the
     /// scaffolded project's `lang`.
     #[serde(default)]
     pub lang: Option<String>,
@@ -368,7 +372,7 @@ pub struct TemplateSpec {
 // names — a drift surface in place of a style nit.
 #[allow(clippy::enum_variant_names)]
 pub enum TourGate {
-    /// Node or Deno is present, so Run can actually start something.
+    /// Node is present, so Run can actually start something.
     HasJsRuntime,
     /// At least one project exists.
     HasProject,
@@ -623,17 +627,18 @@ pub struct ExtManifest {
 /// A colored tile stays legible on both the light and dark console themes (an
 /// `<img>`-loaded SVG can't inherit `currentColor`). Published packs may ship
 /// their own richer SVG via `nano-ide.ext.json`'s `icon`.
-const ICON_DENO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#3178C6"/><text x="12" y="16.5" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="700" fill="#fff" text-anchor="middle">TS</text></svg>"##;
+const ICON_NODE_TS: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#3178C6"/><text x="12" y="16.5" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="700" fill="#fff" text-anchor="middle">TS</text></svg>"##;
 
 /// The built-in first-party packs — always available, offline, unremovable.
-/// Deno is the legacy lang+app runtime (empty toolchain => internal Deno path).
+/// Node is the sole JS/TS lang+app runtime (ADR 0065; empty toolchain => the
+/// internal Node path).
 pub fn builtin_extensions() -> Vec<ExtManifest> {
     vec![
         ExtManifest {
-            id: "deno".into(),
+            id: "node".into(),
             kind: ExtKind::Lang,
-            display_name: "Deno (TypeScript)".into(),
-            icon: Some(ICON_DENO.into()),
+            display_name: "Node (TypeScript)".into(),
+            icon: Some(ICON_NODE_TS.into()),
             file_types: vec![
                 FileType {
                     ext: ".ts".into(),
@@ -651,13 +656,13 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             summary: None,
             builtin: true,
             config_fields: vec![ConfigField {
-                key: "denoBin".into(),
-                label: "Deno binary".into(),
+                key: "nodeBin".into(),
+                label: "Node binary".into(),
                 description: Some(
-                    "Path to the Deno runtime, used only to compile a project to a standalone binary (`deno compile`). Auto-resolved from PATH / ~/.deno/bin when unset.".into(),
+                    "Path to the Node runtime used to run a project (`node --experimental-strip-types`). Auto-resolved from NANOBPMN_NODE_BIN, then PATH, then ~/.local/bin when unset.".into(),
                 ),
-                env: Some("NANOBPMN_DENO_BIN".into()),
-                default: Some("deno (on PATH)".into()),
+                env: Some("NANOBPMN_NODE_BIN".into()),
+                default: Some("node (on PATH)".into()),
             }],
             themes: vec![],
             intellisense: vec![],
@@ -668,15 +673,15 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             install_deps: false,
         },
         ExtManifest {
-            id: "deno-gui".into(),
+            id: "node-gui".into(),
             kind: ExtKind::App,
-            display_name: "Deno GUI app".into(),
+            display_name: "Node GUI app".into(),
             icon: None,
             file_types: vec![],
             templates: vec![TemplateSpec {
                 id: "gui-starter".into(),
                 label: "GUI app".into(),
-                description: Some("Served UI binary (Deno.serve)".into()),
+                description: Some("Served-UI app (Node HTTP server)".into()),
                 lang: None,
             }],
             toolchain: Toolchain::default(),
@@ -757,11 +762,19 @@ pub fn all_extensions() -> Vec<ExtManifest> {
     out
 }
 
-/// Resolve the lang pack for a project's `lang` id (default "deno").
+/// Resolve the lang pack for a project's `lang` id (default "node").
+///
+/// The legacy Deno ids map onto the built-in Node packs so a project config
+/// scaffolded before Deno removal (ADR 0065) — `lang: "deno"`, or an app pack
+/// `deno-gui` — keeps resolving to a working language pack.
 pub fn lang_pack(id: &str) -> Option<ExtManifest> {
+    let canonical = match id {
+        "deno" => "node",
+        other => other,
+    };
     all_extensions()
         .into_iter()
-        .find(|e| e.kind == ExtKind::Lang && e.id == id)
+        .find(|e| e.kind == ExtKind::Lang && e.id == canonical)
 }
 
 /// Every trigger source **kind** any installed pack contributes (ADR 0025 §6) —
@@ -1231,7 +1244,7 @@ pub fn template_source(template_id: &str) -> Option<(ExtManifest, PathBuf)> {
         // anything without a readable manifest instead of aborting the scan:
         // a `?` here let the FIRST such entry hide every installed template
         // (the picker still offered them via the tolerant all_extensions(),
-        // but creation silently fell back to the built-in Deno starter).
+        // but creation silently fell back to the built-in Node starter).
         let txt = match std::fs::read_to_string(base.join(manifest_name())) {
             Ok(t) => t,
             Err(_) => continue,
@@ -1345,7 +1358,7 @@ fn builtin_ids() -> BTreeSet<String> {
 /// testable without a live trust file. Unlike [`is_trusted`], it deliberately
 /// omits the built-in-id shortcut: a pack fetched from npm is by definition
 /// **not** one of the bundled built-ins, so honouring a self-declared built-in
-/// id here would let any third-party pack spoof a built-in id (e.g. `deno`) in
+/// id here would let any third-party pack spoof a built-in id (e.g. `node`) in
 /// its manifest and gain implicit trust to execute arbitrary install scripts.
 /// Trust therefore comes only from explicit user consent — the global `yolo`
 /// bypass or a prior approve-always of this exact pack id.
@@ -1480,7 +1493,7 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
             // Trust is decided by [`install_scripts_trusted`], NOT [`is_trusted`]:
             // `m.id` is self-declared by the just-downloaded manifest, and
             // `is_trusted` treats any built-in id as trusted — so a third-party pack
-            // could spoof a built-in id (e.g. `deno`) to gain implicit trust and run
+            // could spoof a built-in id (e.g. `node`) to gain implicit trust and run
             // arbitrary npm lifecycle scripts. A pack fetched from npm is by
             // definition never a bundled built-in, so that shortcut must not apply
             // here; only explicit consent (yolo / a prior approve of this id) counts.
@@ -2694,7 +2707,7 @@ fn changelog_delta(md: &str, installed: &str) -> Option<String> {
 }
 
 /// Find a program on PATH (plus the usual per-user tool bin dirs). Mirrors
-/// [`super::workers::find_deno`]'s resolution order.
+/// [`super::workers::usable_node`]'s resolution order.
 ///
 /// A detached server (e.g. spawned by systemd / at boot) often inherits a
 /// minimal PATH like `/usr/local/sbin:…:/bin` that omits the per-user bin dirs
@@ -2704,7 +2717,7 @@ fn changelog_delta(md: &str, installed: &str) -> Option<String> {
 /// execution without the operator having to symlink or patch PATH.
 ///
 /// On Windows the tools we resolve are batch shims, not bare executables:
-/// `npm` ships as `npm.cmd`, `deno`/`tar` as `.exe`. A literal `dir\npm`
+/// `npm` ships as `npm.cmd`, `tar` as `.exe`. A literal `dir\npm`
 /// probe therefore matches nothing (or, worse, the non-runnable POSIX shell
 /// shim npm also drops next to `npm.cmd`), which is why the console showed an
 /// empty extension marketplace on Windows: `find_program("npm")` returned
@@ -2800,11 +2813,17 @@ mod tests {
     use super::*;
 
     /// Tests that mutate `NANOBPMN_EXTENSIONS_DIR` (a process-global env var)
-    /// must serialize on this mutex — cargo test runs them in parallel by
+    /// must serialize on the **crate-wide** guard
+    /// ([`crate::projects::env_lock`]) — cargo test runs them in parallel by
     /// default, so two concurrent tests would race on the env var and read
-    /// each other's temp dirs. Use `let _guard = ENV_LOCK.lock().unwrap();`
-    /// at the top of any such test.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// each other's temp dirs. A mutex local to this module would NOT
+    /// serialize against the suites in `connectors.rs` / `projects.rs` /
+    /// `triggers.rs` / `lib.rs` that mutate the same variable, so this must be
+    /// the shared lock, not a private one. Use `let _guard = env_lock();` at
+    /// the top of any such test.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::projects::env_lock()
+    }
 
     #[test]
     fn install_deps_defaults_false_and_round_trips() {
@@ -2855,9 +2874,9 @@ mod tests {
         // scoped pack name maps through `safe_pkg_dir` (`@scope/name →
         // scope__name`) to `<extensions>/nanobpm__nano-ide-app-urban`, so
         // pack_install_dir(URBAN_PACK_PKG) must end in that exact dir name.
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-urbanpkg-{}", std::process::id()));
-        // SAFETY: test-local env set, serialized on ENV_LOCK.
+        // SAFETY: test-local env set, serialized on the crate-wide env lock.
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
         let dir = pack_install_dir(URBAN_PACK_PKG).expect("valid pack name");
         assert_eq!(
@@ -2872,11 +2891,13 @@ mod tests {
     }
 
     #[test]
-    fn builtins_cover_deno_and_gui() {
+    fn builtins_cover_node_and_gui() {
         // Rust (and Java) are pack-provided, not built-in — installing the
-        // nano-ide lang pack is what adds them. Only the Deno runtime ships in-box.
+        // nano-ide lang pack is what adds them. Only the Node runtime ships
+        // in-box (Deno was removed, ADR 0065).
         let ids: BTreeSet<_> = builtin_extensions().into_iter().map(|e| e.id).collect();
-        assert!(ids.contains("deno") && ids.contains("deno-gui"));
+        assert!(ids.contains("node") && ids.contains("node-gui"));
+        assert!(!ids.contains("deno") && !ids.contains("deno-gui"));
         assert!(
             !ids.contains("rust"),
             "rust is now pack-provided, not built-in"
@@ -2885,21 +2906,21 @@ mod tests {
 
     #[test]
     fn builtins_are_always_trusted() {
-        assert!(is_trusted("deno"));
-        assert!(is_trusted("deno-gui"));
+        assert!(is_trusted("node"));
+        assert!(is_trusted("node-gui"));
     }
 
     #[test]
     fn install_scripts_trust_ignores_builtin_id_spoof() {
         // A pack fetched from npm is never a bundled built-in, so a self-declared
         // built-in id must NOT grant implicit trust to run lifecycle scripts —
-        // otherwise a third-party pack could ship `"id": "deno"` and, with
+        // otherwise a third-party pack could ship `"id": "node"` and, with
         // `installDeps: true`, execute arbitrary npm install scripts. Contrast
         // `is_trusted`, which DOES honour the built-in shortcut (unchanged).
         let none = TrustStore::default();
-        assert!(is_trusted("deno"), "built-in id trusted via is_trusted");
+        assert!(is_trusted("node"), "built-in id trusted via is_trusted");
         assert!(
-            !install_scripts_trusted(&none, "deno"),
+            !install_scripts_trusted(&none, "node"),
             "a downloaded pack spoofing a built-in id must not be install-trusted"
         );
 
@@ -2908,7 +2929,7 @@ mod tests {
             yolo: true,
             approved: BTreeSet::new(),
         };
-        assert!(install_scripts_trusted(&yolo, "deno"));
+        assert!(install_scripts_trusted(&yolo, "node"));
 
         // An explicit approve-always of this exact pack id trusts it; a
         // different id (including a built-in one) stays untrusted.
@@ -2917,14 +2938,17 @@ mod tests {
             approved: ["evil-pack".to_string()].into_iter().collect(),
         };
         assert!(install_scripts_trusted(&approved, "evil-pack"));
-        assert!(!install_scripts_trusted(&approved, "deno"));
+        assert!(!install_scripts_trusted(&approved, "node"));
     }
 
     #[test]
     fn lang_lookup() {
-        // Deno is the only built-in lang pack; rust/java come from installed packs.
-        assert_eq!(lang_pack("deno").unwrap().display_name, "Deno (TypeScript)");
+        // Node is the only built-in lang pack; rust/java come from installed packs.
+        assert_eq!(lang_pack("node").unwrap().display_name, "Node (TypeScript)");
         assert!(lang_pack("rust").is_none());
+        // The legacy Deno id resolves to the built-in Node pack so a project
+        // config from before Deno removal keeps loading (ADR 0065).
+        assert_eq!(lang_pack("deno").unwrap().display_name, "Node (TypeScript)");
     }
 
     #[test]
@@ -3043,10 +3067,10 @@ mod tests {
     #[test]
     fn concurrent_marketplace_requests_single_flight_and_cap_view_fanout() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-mkt-sf-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        // SAFETY: test-local env set; serialized on ENV_LOCK.
+        // SAFETY: test-local env set; serialized on the crate-wide env lock.
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
 
         // Six installed packs — more than the cap — so an uncapped fan-out would
@@ -3507,10 +3531,10 @@ mod tests {
     /// never go stale.
     #[test]
     fn overlay_install_state_reflects_mutations_within_the_cache_ttl() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-mkt-ovl-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        // SAFETY: test-local env set; serialized on ENV_LOCK.
+        // SAFETY: test-local env set; serialized on the crate-wide env lock.
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
 
         let entry = |name: &str, version: &str| MarketEntry {
@@ -3699,7 +3723,7 @@ mod tests {
 
     #[test]
     fn pack_component_templates_reads_declared_files() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-comp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let pack = root.join("nanobpm__nano-ide-components-hvac");
@@ -3742,7 +3766,7 @@ mod tests {
         )
         .unwrap();
 
-        // SAFETY: test-local env set, serialized on ENV_LOCK; no other test in
+        // SAFETY: test-local env set, serialized on the crate-wide env lock; no other test in
         // this module depends on the extensions-root value.
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
         let comps = pack_component_templates("components-hvac");
@@ -3763,12 +3787,12 @@ mod tests {
                 .collect()
         );
         // Built-in packs (no on-disk dir) contribute nothing.
-        assert!(pack_component_templates("deno").is_empty());
+        assert!(pack_component_templates("node").is_empty());
     }
 
     #[test]
     fn worker_driver_resolves_declared_entry_first_pack_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-work-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // Pack A: a connector declaring a worker with a real entry, plus a
@@ -3807,7 +3831,7 @@ mod tests {
         .unwrap();
         std::fs::write(pack_b.join("worker.ts"), "// worker B").unwrap();
 
-        // SAFETY: test-local env set, serialized on ENV_LOCK.
+        // SAFETY: test-local env set, serialized on the crate-wide env lock.
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
         let resolved = worker_driver("slack:send-message");
         let escape = worker_driver("slack:escape");
@@ -3828,7 +3852,7 @@ mod tests {
 
     #[test]
     fn find_program_falls_back_to_local_bin() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let home = std::env::temp_dir().join(format!("nano-fp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         // A tool an installer dropped in ~/.local/bin, absent from PATH — mirrors
@@ -3838,7 +3862,7 @@ mod tests {
         let tool = format!("nano-fake-uv-{}", std::process::id());
         std::fs::write(local_bin.join(&tool), b"#!/bin/sh\n").unwrap();
 
-        // SAFETY: test-local env, serialized on ENV_LOCK; restored below.
+        // SAFETY: test-local env, serialized on the crate-wide env lock; restored below.
         let saved_home = std::env::var_os("HOME");
         let saved_path = std::env::var_os("PATH");
         unsafe {
@@ -3867,7 +3891,7 @@ mod tests {
     /// just the bare name. Exercised from POSIX via the pure candidate builder.
     #[test]
     fn windows_program_candidates_apply_pathext() {
-        // Windows: npm.cmd / deno.exe must be probed, and executable
+        // Windows: npm.cmd must be probed, and executable
         // extensions come BEFORE the bare name (npm ships a non-runnable POSIX
         // shim named exactly `npm` next to `npm.cmd`).
         let npm = program_file_candidates("npm", true, Some(".COM;.EXE;.BAT;.CMD".to_string()));
@@ -3928,16 +3952,16 @@ mod tests {
     #[test]
     fn manifest_round_trips() {
         let m = &builtin_extensions()[0];
-        assert_eq!(m.id, "deno");
+        assert_eq!(m.id, "node");
         let s = serde_json::to_string(m).unwrap();
         let back: ExtManifest = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.id, "deno");
-        assert_eq!(back.display_name, "Deno (TypeScript)");
+        assert_eq!(back.id, "node");
+        assert_eq!(back.display_name, "Node (TypeScript)");
     }
 
     #[test]
     fn installed_version_reads_package_json() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         // Point the extensions root at a unique temp dir and drop a pack with a
         // package.json, then confirm installed_version reads its version.
         let root = std::env::temp_dir().join(format!("nano-ext-ver-{}", std::process::id()));
@@ -4075,7 +4099,7 @@ mod tests {
     /// ever observable as packs.
     #[test]
     fn pack_dirs_ignores_dot_prefixed_scratch_dirs() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-scratch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
@@ -4117,7 +4141,7 @@ mod tests {
 
     #[test]
     fn pack_readme_reads_installed_readme() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         // An installed pack's bundled README.md is returned verbatim, flagged
         // as installed (so the UI shows it without a network round-trip).
         let root = std::env::temp_dir().join(format!("nano-ext-readme-{}", std::process::id()));
@@ -4218,7 +4242,7 @@ mod tests {
 
     #[test]
     fn pack_changelog_reads_installed_and_scopes_delta() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-changelog-{}", std::process::id()));
         let pkg = "@nanobpm/nano-workforce";
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
@@ -4398,7 +4422,7 @@ mod tests {
 
     #[test]
     fn changelog_available_false_without_bundled_changelog() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root =
             std::env::temp_dir().join(format!("nano-ext-nochangelog-{}", std::process::id()));
         let pkg = "@nanobpm/nano-ide-trigger-mqtt";
@@ -4415,7 +4439,7 @@ mod tests {
 
     #[test]
     fn remove_resolves_manifest_id_when_npm_name_missing() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         // Console UI has only the manifest id (e.g. "throughput-jvm") from the
         // overview payload, so remove() must accept it and reverse-lookup the
         // pack dir via its bundled nano-ide.ext.json — otherwise the button
@@ -4513,11 +4537,11 @@ mod tests {
     /// the console never executes it. Trusted packs keep theirs.
     #[test]
     fn visible_tours_strips_handoff_steps_from_untrusted_packs() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root = std::env::temp_dir().join(format!("nano-ext-tours-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        // SAFETY: test-local env set, serialized on ENV_LOCK.
+        // SAFETY: test-local env set, serialized on the crate-wide env lock.
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
 
         let m: ExtManifest = serde_json::from_str(

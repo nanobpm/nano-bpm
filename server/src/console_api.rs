@@ -49,6 +49,26 @@ fn from_val<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
     serde_json::from_value(v).expect("generated model matches value shape")
 }
 
+/// The empty-project-listing body served when [`nano_server_console::projects_list`]
+/// fails. Kept as its own function so it can be held to the generated model's
+/// shape: `projects_list` answers `200` only, and the adapter round-trips the body
+/// through [`from_val`], which `expect`s a match — so a missing **required** field
+/// (`urbanAvailable` on the spec's list response) would panic the handler instead
+/// of serving the intended empty list. Returning the typed model's body here makes
+/// that drift a compile error rather than a runtime panic.
+fn list_projects_fallback() -> serde_json::Value {
+    let empty = nanobpm_console_api::models::ProjectsResponse::new(
+        Vec::new(),
+        false,
+        nano_server_console::urban_available(),
+        nano_server_console::projects::PLATFORMS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    serde_json::to_value(empty).expect("fallback response serializes")
+}
+
 /// Remap the project run `status` `crashed` → `error` on every `RunState`
 /// object (identified by the `compiling` discriminator key) nested in `v`.
 fn fix_run_status(v: &mut serde_json::Value) {
@@ -888,19 +908,6 @@ impl apis::workers::Workers for ServerImpl {
         }
     }
 
-    async fn get_deno_types(
-        &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-    ) -> Result<apis::workers::GetDenoTypesResponse, ()> {
-        Ok(
-            apis::workers::GetDenoTypesResponse::Status200_DenoTypeDeclarations(
-                nano_server_console::deno_types_source(),
-            ),
-        )
-    }
-
     async fn get_worker(
         &self,
         _method: &Method,
@@ -959,7 +966,7 @@ impl apis::workers::Workers for ServerImpl {
         // Only 200 is declared; on a workspace error fall back to empty.
         let v = nano_server_console::workers_list()
             .await
-            .unwrap_or_else(|_| serde_json::json!({ "workers": [], "denoAvailable": false }));
+            .unwrap_or_else(|_| serde_json::json!({ "workers": [], "nodeAvailable": false }));
         Ok(
             apis::workers::ListWorkersResponse::Status200_WorkersPlusRuntimeAvailability(from_val(
                 v,
@@ -1055,10 +1062,10 @@ impl apis::projects::Projects for ServerImpl {
                 // Code-first projects (ADR 0048): generate the initial laid-out
                 // `resources/processes/*.bpmn` from the scaffolded `workflows/*.ts`
                 // so a brand-new project opens with a rendered model. It needs a
-                // Deno round-trip (npm fetch); both paths below are best-effort and
+                // Node round-trip (npm fetch); both paths below are best-effort and
                 // only log on failure — they never fail the create. How they run
                 // differs per template: the `workflow-starter` path is fire-and-
-                // forget (spawned, so the create response isn't blocked on the Deno
+                // forget (spawned, so the create response isn't blocked on the Node
                 // round-trip), while the pack-template path awaits (see below).
                 //
                 // Both post-create refresh paths key off the created config's
@@ -1259,13 +1266,7 @@ impl apis::projects::Projects for ServerImpl {
         // Only 200 is declared; on error fall back to empty.
         let mut v = nano_server_console::projects_list()
             .await
-            .unwrap_or_else(|_| {
-                serde_json::json!({
-                    "projects": [],
-                    "denoAvailable": false,
-                    "platforms": nano_server_console::projects::PLATFORMS,
-                })
-            });
+            .unwrap_or_else(|_| list_projects_fallback());
         fix_run_status(&mut v);
         Ok(
             apis::projects::ListProjectsResponse::Status200_ProjectsPlusRuntimeAvailability(
@@ -1424,7 +1425,7 @@ impl apis::projects::Projects for ServerImpl {
                     // Code-first inverse (ADR 0048): a `workflows/*.ts` save
                     // (re)generates the laid-out `resources/processes/*.bpmn` the
                     // SDK derives, then refreshes the types from them. Fire-and-
-                    // forget — it needs a Deno round-trip (npm fetch + auto-layout)
+                    // forget — it needs a Node round-trip (npm fetch + auto-layout)
                     // we must not block the save response on; best-effort.
                     let project = path_params.name.clone();
                     tokio::spawn(async move {
@@ -1484,7 +1485,7 @@ impl apis::projects::Projects for ServerImpl {
 
 /// Map a datasource `ApiResult` error to a data response's collapsed status set
 /// (only 400/404 exist on these operations): `NOT_FOUND` → 404, everything else
-/// (bad SQL/unknown source → 400; no-Deno → 503; gateway → 500) → 400.
+/// (bad SQL/unknown source → 400; no-runtime → 503; gateway → 500) → 400.
 macro_rules! data_ok_or {
     ($res:expr, $ok:path, $bad:path, $nf:path) => {
         match $res {
@@ -1904,5 +1905,40 @@ impl nano_server_console::ConsoleServer for ServerImpl {
                 m
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression for the error path of `GET /console/api/projects`: the response
+    /// model marks `urbanAvailable` **required**, and the adapter deserializes the
+    /// body with [`from_val`] (which `expect`s a match). Before this test the
+    /// fallback omitted that field, so a project-listing error *panicked* the
+    /// handler instead of returning the intended empty 200.
+    #[test]
+    fn list_projects_fallback_satisfies_the_required_response_shape() {
+        let body = list_projects_fallback();
+        assert_eq!(body["projects"], serde_json::json!([]));
+        // Every required field is present with the right type — the property the
+        // generated `expect` relies on.
+        assert!(body["nodeAvailable"].is_boolean());
+        assert!(body["urbanAvailable"].is_boolean());
+        assert!(body["platforms"].is_array());
+    }
+
+    /// The fallback round-trips through the exact conversion the handler performs,
+    /// so a missing field fails here (loudly) rather than at request time.
+    #[test]
+    fn list_projects_fallback_deserializes_into_the_generated_model() {
+        let model: nanobpm_console_api::models::ProjectsResponse =
+            from_val(list_projects_fallback());
+        assert!(model.projects.is_empty());
+        assert!(!model.node_available);
+        assert_eq!(
+            model.platforms.len(),
+            nano_server_console::projects::PLATFORMS.len()
+        );
     }
 }

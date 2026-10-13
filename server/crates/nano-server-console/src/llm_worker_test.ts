@@ -1,17 +1,18 @@
-// Deno unit tests for the Urban LLM-as-job-worker runtime (ADR 0022 §E role 1).
+// Node unit tests for the Urban LLM-as-job-worker runtime (ADR 0022 §E role 1).
 //
-// Run in CI by the `console-deno` job, and locally with:
-//   deno test --allow-read --allow-env server/src/console/llm_worker_test.ts
+// Run in CI by the `console-ts` job, and locally with:
+//   node --experimental-strip-types --test server/crates/nano-server-console/src/llm_worker_test.ts
 //
 // They cover provider resolution, prompt construction, the chat-completions call
 // (mocked), the DMN-decision "rails", and manifest-driven worker registration —
 // all without a live model or engine (fetch + the worker registrar are injected).
 
+import { test } from "node:test";
 import {
   assertEquals,
   assertRejects,
   assertStringIncludes,
-} from "jsr:@std/assert@1";
+} from "./test_support.ts";
 import {
   type AppManifest,
   buildMessages,
@@ -50,7 +51,7 @@ function fakeFetch(handler: (url: string, init: RequestInit) => unknown) {
   return { fn, calls };
 }
 
-Deno.test("resolveProvider reads env + templates the model", () => {
+test("resolveProvider reads env + templates the model", () => {
   const env = (k: string) =>
     ({
       NANO_APP_LLM_BASE_URL: "http://host:1234/v1/",
@@ -77,7 +78,7 @@ Deno.test("resolveProvider reads env + templates the model", () => {
   assertEquals(p2.apiKey, undefined);
 });
 
-Deno.test("resolveProvider throws when no model resolves", () => {
+test("resolveProvider throws when no model resolves", () => {
   let threw = false;
   try {
     resolveProvider({ provider: "env", model: "${MISSING}" }, () => undefined);
@@ -88,7 +89,7 @@ Deno.test("resolveProvider throws when no model resolves", () => {
   assertEquals(threw, true);
 });
 
-Deno.test("buildMessages: prompt, system, and explicit messages", () => {
+test("buildMessages: prompt, system, and explicit messages", () => {
   assertEquals(buildMessages(job({ prompt: "hi" })), [{
     role: "user",
     content: "hi",
@@ -110,7 +111,7 @@ Deno.test("buildMessages: prompt, system, and explicit messages", () => {
   assertEquals(buildMessages(job({ messages: msgs })), msgs);
 });
 
-Deno.test("buildMessages rejects a job with neither prompt nor messages", () => {
+test("buildMessages rejects a job with neither prompt nor messages", () => {
   let threw = false;
   try {
     buildMessages(job({}));
@@ -121,7 +122,7 @@ Deno.test("buildMessages rejects a job with neither prompt nor messages", () => 
   assertEquals(threw, true);
 });
 
-Deno.test("callLlm posts an OpenAI-compatible request + returns content", async () => {
+test("callLlm posts an OpenAI-compatible request + returns content", async () => {
   const { fn, calls } = fakeFetch(() => ({
     choices: [{ message: { content: "pong" } }],
   }));
@@ -143,7 +144,7 @@ Deno.test("callLlm posts an OpenAI-compatible request + returns content", async 
   );
 });
 
-Deno.test("callLlm throws on a non-200 response", async () => {
+test("callLlm throws on a non-200 response", async () => {
   const fn = (() =>
     Promise.resolve(
       new Response("nope", { status: 500 }),
@@ -159,7 +160,7 @@ Deno.test("callLlm throws on a non-200 response", async () => {
   );
 });
 
-Deno.test("evaluateDecision posts to the engine + returns output", async () => {
+test("evaluateDecision posts to the engine + returns output", async () => {
   const { fn, calls } = fakeFetch(() => ({ output: { risk: "high" } }));
   const out = await evaluateDecision("http://engine:8080/v2", "risk", {
     score: 9,
@@ -173,7 +174,7 @@ Deno.test("evaluateDecision posts to the engine + returns output", async () => {
   assertEquals(body, { decisionDefinitionId: "risk", variables: { score: 9 } });
 });
 
-Deno.test("runLlmJob: no output binding returns { text }", async () => {
+test("runLlmJob: no output binding returns { text }", async () => {
   const { fn } = fakeFetch(() => ({
     choices: [{ message: { content: "hello" } }],
   }));
@@ -187,7 +188,7 @@ Deno.test("runLlmJob: no output binding returns { text }", async () => {
   assertEquals(out, { text: "hello" });
 });
 
-Deno.test("runLlmJob: output binding parses JSON", async () => {
+test("runLlmJob: output binding parses JSON", async () => {
   const { fn } = fakeFetch(() => ({
     choices: [{ message: { content: '{"label":"spam","score":0.9}' } }],
   }));
@@ -199,7 +200,7 @@ Deno.test("runLlmJob: output binding parses JSON", async () => {
   assertEquals(out, { label: "spam", score: 0.9 });
 });
 
-Deno.test("runLlmJob: output.decision feeds the JSON through the DMN rails", async () => {
+test("runLlmJob: output.decision feeds the JSON through the DMN rails", async () => {
   const { fn, calls } = fakeFetch((url) =>
     url.includes("/chat/completions")
       ? { choices: [{ message: { content: '{"score":9}' } }] }
@@ -220,7 +221,7 @@ Deno.test("runLlmJob: output.decision feeds the JSON through the DMN rails", asy
   });
 });
 
-Deno.test("runLlmJob: a scalar decision output is wrapped as { result }", async () => {
+test("runLlmJob: a scalar decision output is wrapped as { result }", async () => {
   const { fn } = fakeFetch((url) =>
     url.includes("/chat/completions")
       ? { choices: [{ message: { content: "{}" } }] }
@@ -234,7 +235,7 @@ Deno.test("runLlmJob: a scalar decision output is wrapped as { result }", async 
   assertEquals(out, { result: 42 });
 });
 
-Deno.test("startLlmWorkers registers only llm workers, resolving their bindings", async () => {
+test("startLlmWorkers registers only llm workers, resolving their bindings", async () => {
   const registered: LlmWorkerOptions[] = [];
   const define: DefineWorkerFn = (opts) => registered.push(opts);
   const manifest: AppManifest = {
@@ -257,7 +258,7 @@ Deno.test("startLlmWorkers registers only llm workers, resolving their bindings"
   assertEquals(registered.map((r) => r.type), ["classify", "summarize"]);
 });
 
-Deno.test("startLlmWorkers throws on an unknown binding reference", async () => {
+test("startLlmWorkers throws on an unknown binding reference", async () => {
   const manifest: AppManifest = {
     workers: [{ taskType: "x", llm: "ghost" }],
     llm: {},
@@ -269,7 +270,7 @@ Deno.test("startLlmWorkers throws on an unknown binding reference", async () => 
   );
 });
 
-Deno.test("defineLlmWorker wires taskType → a handler that runs the model", async () => {
+test("defineLlmWorker wires taskType → a handler that runs the model", async () => {
   const registered: LlmWorkerOptions[] = [];
   const { fn } = fakeFetch(() => ({
     choices: [{ message: { content: "ok" } }],

@@ -15,9 +15,11 @@
 // browser sized to a phone can.
 //
 // The suite never talks to a real gateway. Every test stubs the console API, so a
-// run is deterministic and needs no engine, no Deno, and no scaffolded project —
-// which is what keeps it honest under this repo's no-intermittent-failures,
-// no-retries rule.
+// run is deterministic and needs no engine and no scaffolded project. (Playwright
+// itself still runs on Node — that is the test *runner*; what these tests stub is
+// the **gateway-side** runtime, so no Node is required on the machine the gateway
+// would be simulating.) That is what keeps it honest under this repo's
+// no-intermittent-failures, no-retries rule.
 
 import { defineConfig, devices } from "@playwright/test";
 

@@ -1,14 +1,13 @@
-// nanobpmn embedded worker SDK (Deno-preferred, Node-capable).
+// nanobpmn embedded worker SDK (Node runtime).
 //
 // This file is written verbatim into <workspace>/nano-generated/worker-sdk.ts by the
 // console worker supervisor and imported by each worker's `worker.ts`. It speaks
 // the nanobpmn Falcon protocol directly over the platform's native WebSocket
 // (no `ws`, no node:events) so a worker is a single self-contained process.
 //
-// It runs under **Deno** (preferred) or, on hosts with no Deno build (e.g.
-// 32-bit ARM), under **Node** (>= 22.6, launched with type stripping + the
-// import-map loader). The only host calls that differ between the two runtimes
-// are isolated behind the `RT` adapter below; see ADR 0036.
+// It runs under **Node** (>= 22.6, launched with type stripping). Deno support
+// was removed in ADR 0065; the host calls the worker needs (env, stdout, signal,
+// exit) are isolated behind the `RT` adapter below.
 //
 // A worker file looks like:
 //
@@ -134,9 +133,8 @@ export interface WorkerOptions<
 const METRIC = "@@NBPM_METRIC@@";
 const STATUS = "@@NBPM_STATUS@@";
 
-// Runtime adapter: the handful of host calls that differ between Deno (native
-// `Deno.*`) and Node (`process`). Everything else the worker uses — WebSocket,
-// fetch, timers, TextEncoder — is standard on both. Detected once at load.
+// Runtime adapter: the host calls a worker needs (env, stdout, signal, exit).
+// Deno support was removed in ADR 0065 — Node's `process` is the only runtime.
 interface Runtime {
   env(key: string): string | undefined;
   write(line: string): void;
@@ -144,31 +142,7 @@ interface Runtime {
   exit(code: number): void;
 }
 const RT: Runtime = ((): Runtime => {
-  const g = globalThis as unknown as {
-    Deno?: {
-      env: { get(k: string): string | undefined };
-      stdout: { writeSync(b: Uint8Array): number };
-      addSignalListener(sig: string, h: () => void): void;
-      exit(code: number): void;
-    };
-    process?: {
-      env: Record<string, string | undefined>;
-      stdout: { write(s: string): boolean };
-      on(sig: string, h: () => void): void;
-      exit(code: number): void;
-    };
-  };
-  if (g.Deno) {
-    const d = g.Deno;
-    const enc = new TextEncoder();
-    return {
-      env: (k) => d.env.get(k),
-      write: (line) => void d.stdout.writeSync(enc.encode(line)),
-      onSigterm: (h) => d.addSignalListener("SIGTERM", h),
-      exit: (c) => d.exit(c),
-    };
-  }
-  const p = g.process!;
+  const p = (globalThis as unknown as { process: NonNullable<NodeJS.Process> }).process;
   return {
     env: (k) => p.env[k],
     write: (line) => void p.stdout.write(line),
@@ -277,7 +251,7 @@ export class MalformedJobError extends Error {
   // Plain field declarations (not TS parameter properties): the Node worker
   // fallback loads this SDK with `--experimental-strip-types`, whose strip-only
   // parser rejects `constructor(readonly x)` shorthand. Assign in the body so
-  // the type stays erasable on both Deno and Node.
+  // the type stays erasable under Node's strip-only mode.
   readonly detail: string;
   readonly raw: unknown;
   constructor(detail: string, raw: unknown) {
@@ -407,10 +381,14 @@ export function defineWorker<
 
   // The App runtime handed to handlers. `ctx.data()` lazily loads the sibling
   // datasource SDK (materialised next to this file as ./data-sdk.ts) so a worker
-  // that never touches data pays nothing and needs no import-map entry.
+  // that never touches data pays nothing and needs no import-map entry. The
+  // specifier is a variable, not a literal: `./data-sdk.ts` is written into a
+  // rendered project next to this file, so it does not exist in-tree and a
+  // literal would make `tsc` (the console-ts CI gate) report a missing module.
+  const DATA_SDK_SPECIFIER = "./data-sdk.ts";
   const ctx: WorkerContext = {
     data: (name?: string) =>
-      import("./data-sdk.ts").then((m) =>
+      import(DATA_SDK_SPECIFIER).then((m) =>
         (m as { openDataSource(n?: string): Promise<WorkerDataSource> }).openDataSource(name)
       ),
   };

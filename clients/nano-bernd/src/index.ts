@@ -271,7 +271,7 @@ export class EmbeddedEngine {
    * Fire due timers as of `nowEpochMs`. The engine is clock-free; the host
    * decides cadence. Returns the number of timers fired.
    *
-   * EmbeddedEngine wrappers (JVM, Deno) call this from a scheduled ticker;
+   * EmbeddedEngine wrappers (JVM, Node) call this from a scheduled ticker;
    * direct callers can call it on demand from tests with fake time.
    */
   triggerTimers(nowEpochMs: number): bigint {

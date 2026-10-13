@@ -1,7 +1,9 @@
 # ADR 0036 — Dual-runtime workers: Deno-preferred, Node fallback
 
-Status: **Accepted** (preference inverted by ADR 0038 — the dual-runtime mechanism stands, but the
-default is now **Node-first**, with Deno required only for `deno compile`).
+Status: **Superseded by [ADR 0065](0065-deno-removal.md)** — Deno is removed entirely; Node (≥ 22.6) is
+the sole JS/TS runtime. (Historically: **Accepted**, with the preference inverted by ADR 0038 — the
+dual-runtime mechanism stood, but the default became **Node-first**, Deno required only for `deno
+compile`.)
 Date: 2026-07-24.
 Relates to:
 ADR 0022 (`0022-nano-rad-application.md`, **Urban** — §E's embedded job workers are the runtime this
