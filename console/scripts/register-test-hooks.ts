@@ -12,6 +12,13 @@
 // console's own `src/lib` code already use explicit `.ts` extensions, so this
 // only ever kicks in for the generated code (and any future bundler-style
 // import a test pulls in).
+//
+// The `load` hook additionally teaches node to read `.tsx` modules: component
+// unit tests (e.g. ConfigModal.test.tsx, the configuration-save-gate
+// regression) render real components with react-dom/server, and
+// `--experimental-strip-types` refuses the `.tsx` extension outright. esbuild
+// (already a transitive devDependency via Vite — the app's bundler) transpiles
+// the module to ESM with the automatic JSX runtime, mirroring the app's build.
 import { existsSync, statSync } from "node:fs";
 import { register } from "node:module";
 import { dirname, join } from "node:path";
@@ -41,6 +48,29 @@ export async function resolve(specifier, context, nextResolve) {
     }
     throw err;
   }
+}
+
+export async function load(url, context, nextLoad) {
+  if (url.endsWith(".tsx")) {
+    const { readFile } = await import("node:fs/promises");
+    const { createRequire } = await import("node:module");
+    // Bare "esbuild" must resolve against the console's node_modules, not the
+    // hooks worker's data:-URL context (which has no resolution base).
+    const require = createRequire(pathToFileURL(process.cwd() + "/"));
+    const esbuildUrl = pathToFileURL(require.resolve("esbuild")).href;
+    const { transform } = await import(esbuildUrl);
+    const source = await readFile(fileURLToPath(url), "utf8");
+    const { code } = await transform(source, {
+      loader: "tsx",
+      jsx: "automatic",
+      format: "esm",
+      target: "es2022",
+      sourcemap: "inline",
+      sourcefile: fileURLToPath(url),
+    });
+    return { format: "module", source: code, shortCircuit: true };
+  }
+  return nextLoad(url, context);
 }
 `;
 
