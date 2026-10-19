@@ -11,7 +11,7 @@
     "dev": "vite",
     "gen:api": "openapi-ts",
     "typecheck": "npm run gen:api && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "test": "node --experimental-strip-types --test",
+    "test": "node --experimental-strip-types --import ./scripts/register-test-hooks.ts --test",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
     "build:assets": "npm run gen:api && node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && node scripts/build-changelog.mjs && tsc",

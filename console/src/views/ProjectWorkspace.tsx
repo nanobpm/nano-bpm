@@ -28,6 +28,7 @@ import { SCALAR_KEYWORDS } from "../lib/shapeComposer";
 import AppManifestEditor, {
   isAppManifestPath,
 } from "../components/AppManifestEditor";
+import { ConfigModal } from "../components/ConfigModal";
 import {
   compileProject,
   createProjectPath,
@@ -60,7 +61,7 @@ import {
   type ProjectLogLine,
   type ProjectFile,
 } from "../lib/api";
-import { Button, inputClass } from "../components/ui";
+import { Button, inputClass, Modal } from "../components/ui";
 import { useTemplateUpdate } from "../components/TemplateUpdate";
 import { toUpdateTarget } from "../lib/templateUpdate";
 import { appIsRunning } from "../lib/appRunning";
@@ -760,13 +761,22 @@ export default function ProjectWorkspace() {
 
       {showConfig && (
         <ConfigModal
-          name={name}
           config={detail.config}
+          appRunning={running}
           onClose={() => setShowConfig(false)}
           onSaved={(cfg) => {
             setDetail((d) => (d ? { ...d, config: cfg } : d));
             setShowConfig(false);
           }}
+          onSave={async (body) =>
+            (
+              await saveProjectConfig({
+                path: { name },
+                body,
+                throwOnError: true,
+              })
+            ).data
+          }
         />
       )}
     </div>
@@ -2856,166 +2866,6 @@ function DebugRow({ entry }: { entry: DebugEntry }) {
   );
 }
 
-// --- Configure modal -------------------------------------------------------
-
-function ConfigModal({
-  name,
-  config,
-  onClose,
-  onSaved,
-}: {
-  name: string;
-  config: ProjectConfig;
-  onClose: () => void;
-  onSaved: (cfg: ProjectConfig) => void;
-}) {
-  const [deployTarget, setDeployTarget] = useState(config.deployTarget);
-  const [main, setMain] = useState(config.main);
-  const [desc, setDesc] = useState(config.description);
-  // Env editor state: array of {key,value} rows, kept ordered so that adding
-  // a fresh empty row doesn't reshuffle the user's typing. We serialise back
-  // to an object on save, dropping rows with an empty key.
-  const [envRows, setEnvRows] = useState<Array<{ key: string; value: string }>>(
-    () =>
-      Object.entries(config.env ?? {})
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([key, value]) => ({ key, value })),
-  );
-  const [busy, setBusy] = useState(false);
-
-  const addEnvRow = () =>
-    setEnvRows((rows) => [...rows, { key: "", value: "" }]);
-  const removeEnvRow = (idx: number) =>
-    setEnvRows((rows) => rows.filter((_, i) => i !== idx));
-  const setEnvRow = (
-    idx: number,
-    patch: Partial<{ key: string; value: string }>,
-  ) =>
-    setEnvRows((rows) =>
-      rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)),
-    );
-
-  const save = async () => {
-    setBusy(true);
-    try {
-      const env: Record<string, string> = {};
-      for (const { key, value } of envRows) {
-        const k = key.trim();
-        if (k) env[k] = value;
-      }
-      const cfg = (
-        await saveProjectConfig({
-          path: { name },
-          body: {
-            ...config,
-            description: desc,
-            deployTarget,
-            main,
-            env,
-          },
-          throwOnError: true,
-        })
-      ).data;
-      onSaved(cfg);
-    } catch (e) {
-      alert(e instanceof Error ? e.message : String(e));
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Modal title="Configure project" onClose={onClose}>
-      <label className="block text-xs uppercase tracking-wider text-fg-faint">
-        Description
-      </label>
-      <input
-        value={desc}
-        onChange={(e) => setDesc(e.target.value)}
-        className={inputCls}
-      />
-      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
-        Deploy target
-      </label>
-      <input
-        value={deployTarget}
-        onChange={(e) => setDeployTarget(e.target.value)}
-        className={inputCls}
-        placeholder="http://localhost:8080"
-      />
-      <p className="mt-1 text-[11px] text-fg-faint">
-        REST API at &lt;target&gt;/v2; the Falcon protocol is dialled here too.
-      </p>
-      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
-        Entry point
-      </label>
-      <input
-        value={main}
-        onChange={(e) => setMain(e.target.value)}
-        className={inputCls}
-        placeholder="main.ts"
-      />
-      <div className="mt-3 flex items-center justify-between">
-        <label className="block text-xs uppercase tracking-wider text-fg-faint">
-          Environment variables
-        </label>
-        <button
-          type="button"
-          onClick={addEnvRow}
-          className="text-[11px] text-accent hover:underline"
-        >
-          + Add
-        </button>
-      </div>
-      <p className="mt-1 text-[11px] text-fg-faint">
-        Passed to every Run/Compile spawn. Run-config env overrides these.
-        Example:{" "}
-        <span className="font-mono">
-          CAMUNDA_REST_ADDRESS=http://localhost:8081
-        </span>
-        .
-      </p>
-      {envRows.length === 0 ? (
-        <p className="mt-2 text-[11px] text-fg-faint italic">
-          No env vars set.
-        </p>
-      ) : (
-        <div className="mt-2 space-y-1">
-          {envRows.map((row, i) => (
-            <div key={i} className="flex gap-2">
-              <input
-                value={row.key}
-                onChange={(e) => setEnvRow(i, { key: e.target.value })}
-                placeholder="KEY"
-                className={`${inputClass} font-mono w-2/5`}
-              />
-              <input
-                value={row.value}
-                onChange={(e) => setEnvRow(i, { value: e.target.value })}
-                placeholder="value"
-                className={`${inputClass} font-mono min-w-0 flex-1`}
-              />
-              <button
-                type="button"
-                onClick={() => removeEnvRow(i)}
-                aria-label="Remove"
-                className="px-2 text-fg-faint hover:text-fg"
-              >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
-      <div className="mt-5 flex justify-end gap-2">
-        <Button onClick={onClose}>Cancel</Button>
-        <Button variant="primary" onClick={() => void save()} disabled={busy}>
-          {busy ? "Saving…" : "Save"}
-        </Button>
-      </div>
-    </Modal>
-  );
-}
-
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 /// Field-authoring surface for a transient domain type (an "envelope"): the maker
@@ -3235,31 +3085,6 @@ function EnvelopeEditorModal({
         </div>
       </div>
     </Modal>
-  );
-}
-
-function Modal({
-  title,
-  children,
-  onClose,
-}: {
-  title: string;
-  children: React.ReactNode;
-  onClose: () => void;
-}) {
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-lg rounded-lg border border-edge bg-raised p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="mb-4 text-lg font-semibold text-fg">{title}</h2>
-        {children}
-      </div>
-    </div>
   );
 }
 
