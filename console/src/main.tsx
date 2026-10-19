@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { ThemeProvider } from "./theme/ThemeProvider";
 import { installChunkReloadBackstop } from "./lib/lazyWithReload";
+import { installApiErrorInterceptors } from "./lib/apiClients";
 // Self-hosted JetBrains Mono (variable) — bundled so the code editor uses it
 // offline, without relying on the font being installed on the user's machine.
 import "@fontsource-variable/jetbrains-mono";
@@ -20,6 +21,11 @@ const queryClient = new QueryClient({
 // that 404s to the SPA index.html (text/html) triggers a one-shot reload to
 // fetch the fresh module graph. See lib/chunkReload.ts / lib/lazyWithReload.ts.
 installChunkReloadBackstop();
+
+// Every failed generated-client request rejects with an `ApiError` carrying the
+// server's message, so no catch site can render "[object Object]" (issue #1350).
+// Must run before the first request, i.e. before render.
+installApiErrorInterceptors();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

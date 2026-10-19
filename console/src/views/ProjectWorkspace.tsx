@@ -762,6 +762,7 @@ export default function ProjectWorkspace() {
         <ConfigModal
           name={name}
           config={detail.config}
+          appRunning={running}
           onClose={() => setShowConfig(false)}
           onSaved={(cfg) => {
             setDetail((d) => (d ? { ...d, config: cfg } : d));
@@ -2861,11 +2862,15 @@ function DebugRow({ entry }: { entry: DebugEntry }) {
 function ConfigModal({
   name,
   config,
+  appRunning,
   onClose,
   onSaved,
 }: {
   name: string;
   config: ProjectConfig;
+  /** Mirrors the server's 409 `app_running` guard: config is read-only while
+   * the app runs (issue #1350, same gate as the file editor's Save). */
+  appRunning: boolean;
   onClose: () => void;
   onSaved: (cfg: ProjectConfig) => void;
 }) {
@@ -2896,6 +2901,7 @@ function ConfigModal({
     );
 
   const save = async () => {
+    if (appRunning) return;
     setBusy(true);
     try {
       const env: Record<string, string> = {};
@@ -3006,9 +3012,20 @@ function ConfigModal({
           ))}
         </div>
       )}
+      {appRunning && (
+        <p className="mt-4 text-xs text-fg-faint" role="status">
+          Stop the app before changing its configuration. The app reads its
+          environment when it starts.
+        </p>
+      )}
       <div className="mt-5 flex justify-end gap-2">
         <Button onClick={onClose}>Cancel</Button>
-        <Button variant="primary" onClick={() => void save()} disabled={busy}>
+        <Button
+          variant="primary"
+          onClick={() => void save()}
+          disabled={busy || appRunning}
+          title={appRunning ? "Stop the app before saving changes" : undefined}
+        >
           {busy ? "Saving…" : "Save"}
         </Button>
       </div>
