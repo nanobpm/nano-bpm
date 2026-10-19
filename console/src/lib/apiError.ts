@@ -79,14 +79,18 @@ type ResponseLike = { status: number; statusText?: string };
 /**
  * Normalise anything a generated client threw into an `Error`.
  *
- * - An `Error` not tied to an HTTP response (network failure, abort, a bug) is
- *   returned unchanged, so its type and stack survive.
+ * - An `Error` is returned unchanged, so its type and stack survive — even
+ *   when a response exists: the hey-api client passes the populated `response`
+ *   to error interceptors when reading the body fails after headers arrive,
+ *   and wrapping that abort/connection error in an `ApiError` would lose its
+ *   identity (and could even report status 200). Parsed HTTP error bodies
+ *   (plain objects / strings) are still normalised below.
  * - A failed HTTP response becomes an `ApiError` carrying the body's message,
  *   with `status`/`code`/`body` for callers that branch on them.
  */
 export function toApiError(error: unknown, response?: ResponseLike): Error {
   if (error instanceof ApiError) return error;
-  if (error instanceof Error && !response) return error;
+  if (error instanceof Error) return error;
   const status = response?.status;
   let code: string | undefined;
   if (isRecord(error)) {

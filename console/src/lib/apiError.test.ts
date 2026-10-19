@@ -91,6 +91,17 @@ test("no thrown shape stringifies to [object Object] (defect-class sweep)", () =
   }
 });
 
+test("an Error is preserved even when a response exists (body-read failure)", () => {
+  // The generated clients pass the populated `response` to error interceptors
+  // when reading the body fails after headers arrive. That abort/connection
+  // error must keep its identity, type, and stack — wrapping it in an
+  // ApiError would even report status 200 for a failed read on a 200.
+  const boom = new Error("unexpected end of JSON input");
+  assert.equal(toApiError(boom, { status: 200, statusText: "OK" }), boom);
+  const aborted = new DOMException("The operation was aborted.", "AbortError");
+  assert.equal(toApiError(aborted, { status: 409 }), aborted);
+});
+
 test("installApiErrorInterceptor drives the generated client's error chain and is idempotent", async () => {
   // Mirror of the hey-api fetch client's error path (src/gen/client/client.gen.ts):
   // run every error interceptor over the thrown body, then throw the result.
@@ -155,6 +166,95 @@ test("guard: every generated client is registered in apiClients.ts", () => {
           "m",
         ).test(registry),
       `src/${dir}/client.gen.ts is not registered in GENERATED_CLIENTS (lib/apiClients.ts)`,
+    );
+  }
+});
+
+test("the production installer normalises real requests through every registered client", async () => {
+  // End-to-end over the REAL generated clients: install via the production
+  // `installApiErrorInterceptors()` and drive an actual request through each
+  // client's fetch pipeline with a stubbed 409. If the installer becomes a
+  // no-op (or a client drops out of GENERATED_CLIENTS), the raw parsed body
+  // rejects instead of an ApiError and this fails — the original defect.
+  const { GENERATED_CLIENTS, installApiErrorInterceptors } =
+    await import("./apiClients.ts");
+  installApiErrorInterceptors();
+
+  const body = {
+    error: "app_running",
+    message: "Stop the app before updating it.",
+  };
+  const conflict = () =>
+    new Response(JSON.stringify(body), {
+      status: 409,
+      statusText: "Conflict",
+      headers: { "Content-Type": "application/json" },
+    });
+
+  for (const [name, client] of Object.entries(GENERATED_CLIENTS)) {
+    assert.equal(
+      hasApiErrorInterceptor(client),
+      true,
+      `${name}: production installer did not register an interceptor`,
+    );
+    await assert.rejects(
+      client.get({
+        url: "/__api_error_probe__",
+        baseUrl: "http://nano-test.invalid",
+        fetch: (async () => conflict()) as typeof fetch,
+        throwOnError: true,
+      }),
+      (err: unknown) => {
+        assert.ok(
+          err instanceof ApiError,
+          `${name}: rejected with ${String(err)}, not an ApiError`,
+        );
+        assert.equal(display(err), "Stop the app before updating it.");
+        assert.equal(err.status, 409);
+        assert.equal(err.code, "app_running");
+        assert.deepEqual(err.body, body);
+        return true;
+      },
+    );
+  }
+});
+
+test("a body-read failure after headers arrive keeps the original Error end-to-end", async () => {
+  // Headers arrive (status 200) but reading the body throws. The client passes
+  // the populated response to error interceptors; the rejection must still be
+  // the original read error, not an ApiError — and definitely not status 200.
+  const { GENERATED_CLIENTS, installApiErrorInterceptors } =
+    await import("./apiClients.ts");
+  installApiErrorInterceptors();
+
+  const readFailure = new Error("unexpected end of JSON input");
+  const truncated = () =>
+    new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"partial":'));
+          controller.error(readFailure);
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+
+  for (const [name, client] of Object.entries(GENERATED_CLIENTS)) {
+    await assert.rejects(
+      client.get({
+        url: "/__api_error_probe__",
+        baseUrl: "http://nano-test.invalid",
+        fetch: (async () => truncated()) as typeof fetch,
+        throwOnError: true,
+      }),
+      (err: unknown) => {
+        assert.equal(
+          err,
+          readFailure,
+          `${name}: body-read failure lost its original identity`,
+        );
+        return true;
+      },
     );
   }
 });
