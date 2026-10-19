@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ProjectConfig } from "../gen";
-import { Button, inputClass } from "./ui";
+import { Button, inputClass, Modal } from "./ui";
 
 const inputCls = `mt-1 w-full ${inputClass}`;
 
@@ -175,30 +175,5 @@ export function ConfigModal({
         </Button>
       </div>
     </Modal>
-  );
-}
-
-function Modal({
-  title,
-  children,
-  onClose,
-}: {
-  title: string;
-  children: React.ReactNode;
-  onClose: () => void;
-}) {
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-lg rounded-lg border border-edge bg-raised p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="mb-4 text-lg font-semibold text-fg">{title}</h2>
-        {children}
-      </div>
-    </div>
   );
 }

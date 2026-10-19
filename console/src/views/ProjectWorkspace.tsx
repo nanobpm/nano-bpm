@@ -61,7 +61,7 @@ import {
   type ProjectLogLine,
   type ProjectFile,
 } from "../lib/api";
-import { Button, inputClass } from "../components/ui";
+import { Button, inputClass, Modal } from "../components/ui";
 import { useTemplateUpdate } from "../components/TemplateUpdate";
 import { toUpdateTarget } from "../lib/templateUpdate";
 import { appIsRunning } from "../lib/appRunning";
@@ -3085,31 +3085,6 @@ function EnvelopeEditorModal({
         </div>
       </div>
     </Modal>
-  );
-}
-
-function Modal({
-  title,
-  children,
-  onClose,
-}: {
-  title: string;
-  children: React.ReactNode;
-  onClose: () => void;
-}) {
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
-      onClick={onClose}
-    >
-      <div
-        className="w-full max-w-lg rounded-lg border border-edge bg-raised p-5 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="mb-4 text-lg font-semibold text-fg">{title}</h2>
-        {children}
-      </div>
-    </div>
   );
 }
 

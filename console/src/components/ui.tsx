@@ -379,6 +379,37 @@ export function Badge({
   );
 }
 
+/** The console's shared centered dialog: a backdrop that closes on click, a
+ * raised panel that stops propagation, and a title over caller-supplied
+ * content (including any footer buttons). Every simple confirmation/edit
+ * dialog composes this so the markup has one implementation — the panels'
+ * richer dialogs (header close button, scrollable body, fixed footer) are a
+ * different shape and keep their own shells. */
+export function Modal({
+  title,
+  children,
+  onClose,
+}: {
+  title: string;
+  children: ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg rounded-lg border border-edge bg-raised p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 className="mb-4 text-lg font-semibold text-fg">{title}</h2>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 /** Shared text-input styling (also exported as a class string for selects /
  * textareas that can't use the component). */
 export const inputClass =
