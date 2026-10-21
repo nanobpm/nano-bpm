@@ -1394,7 +1394,7 @@ function nanoCoderPostBody() {
   up. Small workers plus a durable orchestrator is the whole design.</p>
 
   <h2>Try it</h2>
-  <pre><code>${esc(F.install)}</code></pre>
+  <figure class="code"><pre><code>${esc(F.install)}</code></pre></figure>
   <p>Prebuilt binaries ship for ${F.platforms}; or <code>cargo install nano-coder</code>. Source and
   docs are on <a href="${F.repo}">GitHub</a>.</p>`;
 }
