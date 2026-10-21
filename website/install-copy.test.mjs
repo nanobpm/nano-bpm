@@ -97,19 +97,32 @@ test("a pending copy cannot be raced by repeated clicks", async () => {
   assert.equal(item.status.textContent, "Copied!");
 });
 
-function assertInstallControls(html) {
+const CURL = "curl -fsSL https://nanobpm.io/install.sh | sh";
+const NPM = "npm install -g @nanobpm/nano-coder";
+
+// `commands` lists, in page order, the install command each control must carry.
+function assertInstallControls(html, commands = [CURL, NPM, CURL]) {
   const controls = [...html.matchAll(/<div class="install-copy" data-install-copy>\s*<div class="install install-command" role="group" aria-label="([^"]+)"[^>]*>([\s\S]*?)<\/div>\s*<p[^>]*role="status"[^>]*><\/p>\s*<\/div>/g)];
-  assert.equal(controls.length, 2);
-  assert.equal(new Set(controls.map(([, label]) => label)).size, 2);
-  for (const [, , content] of controls) {
+  assert.equal(controls.length, commands.length);
+  assert.equal(new Set(controls.map(([, label]) => label)).size, commands.length);
+  for (const [i, [, , content]] of controls.entries()) {
     assert.doesNotMatch(content, /<\/?div\b/, "the match must not cross a container boundary");
-    assert.match(content, /<code>curl -fsSL https:\/\/nanobpm\.io\/install\.sh \| sh<\/code>/);
+    assert.ok(content.includes(`<code>${commands[i].replaceAll("&", "&amp;")}</code>`), `control ${i} carries ${commands[i]}`);
     assert.match(content, /<button type="button"[^>]*aria-label="Copy install command"[^>]*hidden>/);
     assert.match(content, /<svg[^>]*aria-hidden="true"/);
   }
 }
 
-test("the published homepage wires both install controls to the shipped handler", () => {
+test("the nano-coder page wires its npm install control to the shipped handler", () => {
+  execFileSync(process.execPath, [fileURLToPath(new URL("./build.mjs", import.meta.url))], {
+    stdio: "pipe",
+  });
+  const html = readFileSync(new URL("./_site/nano-coder/index.html", import.meta.url), "utf8");
+  assertInstallControls(html, [NPM]);
+  assert.match(html, /bindInstallCopy\(document, navigator\.clipboard\)/);
+});
+
+test("the published homepage wires every install control to the shipped handler", () => {
   execFileSync(process.execPath, [fileURLToPath(new URL("./build.mjs", import.meta.url))], {
     stdio: "pipe",
   });

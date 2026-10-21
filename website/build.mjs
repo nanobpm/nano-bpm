@@ -146,6 +146,7 @@ write(join(outDir, "index.html"), homeHtml());
 copyFileSync(join(here, "install-copy.mjs"), join(outDir, "install-copy.mjs"));
 write(join(outDir, "architecture", "index.html"), architectureHtml());
 write(join(outDir, "blog", "index.html"), blogIndexHtml());
+write(join(outDir, "nano-coder", "index.html"), nanoCoderHtml());
 for (const post of blogPosts()) {
   write(join(outDir, "blog", post.slug, "index.html"), blogPostHtml(post));
 }
@@ -312,10 +313,18 @@ function readSnippetRegion(relPath, region) {
   return out.join("\n");
 }
 
-function installCommand(label) {
+// Wires every installCommand() copy button on a page to the shipped handler.
+function installCopyScript() {
+  return `<script type="module">
+import { bindInstallCopy } from "/install-copy.mjs";
+bindInstallCopy(document, navigator.clipboard);
+</script>`;
+}
+
+function installCommand(label, cmd = "curl -fsSL https://nanobpm.io/install.sh | sh") {
   return `<div class="install-copy" data-install-copy>
     <div class="install install-command" role="group" aria-label="${esc(label)}">
-      <code>curl -fsSL https://nanobpm.io/install.sh | sh</code>
+      <code>${esc(cmd)}</code>
       <button type="button" class="install-copy-button" aria-label="Copy install command" title="Copy install command" hidden>
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true" focusable="false">
           <rect x="8" y="8" width="12" height="12" rx="2"/>
@@ -431,11 +440,7 @@ function homeHtml() {
     <p>Blend frontier models with local LLMs — on one workstation or across many. Route the expensive
     steps to a frontier model and keep the rest private and free. Bring the coding harness you already use:</p>
     <div class="provs" aria-label="Supported agent harnesses">
-      <span>GitHub Copilot</span>
-      <span>Claude Code</span>
-      <span>Pi</span>
-      <span>Open Coder</span>
-      <span>Little Coder</span>
+${agentHarnesses().map((h) => `      <span>${esc(h)}</span>`).join("\n")}
       <span class="more">and more</span>
     </div>
   </div>
@@ -473,6 +478,19 @@ ${langChips()}
 </section>
 
 ${compareHtml()}
+
+<section class="band problem" id="nano-coder">
+  <div class="wrap">
+    <p class="eyebrow"><code>@nanobpm/nano-coder</code></p>
+    <h2>Your fleet's workers, at ${esc(nanoCoderFacts().rss)} each.</h2>
+    <p>nano-coder is a Rust coding agent built to be the worker your graphs fan out. Node-based agent
+    CLIs take ${esc(nanoCoderFacts().nodeRss)} apiece; nano-coder takes about ${esc(nanoCoderFacts().rss)}, so a
+    laptop runs a fleet instead of a handful. Interactive in your terminal, or headless over ACP
+    under Nano Workforce.</p>
+    ${installCommand("Install nano-coder", nanoCoderFacts().install)}
+    <p><a href="/nano-coder/">Meet nano-coder →</a> · <a href="/blog/a-6mb-coding-agent/">Why the worker's size matters →</a></p>
+  </div>
+</section>
 
 <section class="band backbone">
   <div class="wrap">
@@ -529,10 +547,7 @@ ${compareHtml()}
   });
 })();
 </script>
-<script type="module">
-import { bindInstallCopy } from "/install-copy.mjs";
-bindInstallCopy(document, navigator.clipboard);
-</script>`;
+${installCopyScript()}`;
 
   return homePage("nanobpm.io — Agent Graph Orchestration for the Developer Workstation", body);
 }
@@ -870,6 +885,7 @@ function siteNav() {
   <nav>
     <a href="/architecture/">Architecture</a>
     <a href="/architecture/#landscape">Compare</a>
+    <a href="/nano-coder/">nano-coder</a>
     <a href="/blog/">Blog</a>
     <a href="/demo/">Demo</a>
     ${whitepaperPresent ? '<a href="/whitepaper/">Whitepaper</a>' : ""}
@@ -898,6 +914,22 @@ function architectureHtml() {
         "review, test, merge, QA, and run retrospectives — as durable graphs that resume " +
         "across crashes and reboots.",
       tags: ["Agent orchestration", "SDLC", "Durable runs"],
+      rung: "hires workers like",
+    },
+    {
+      name: "Agent workers",
+      role: "Agent worker · bring your own",
+      tagline: "nano-coder, or the harness you already use",
+      desc:
+        "The coding agents Workforce dispatches work to. nano-coder is optional: Workforce " +
+        "hires any supported harness — " +
+        agentHarnesses().filter((h) => h !== "nano-coder").join(", ") +
+        " and more — and you can mix them in one fleet. nano-coder is the purpose-built option: " +
+        `a Rust agent at ${nanoCoderFacts().rss} resident memory, so a laptop can host a dense fleet, ` +
+        "running interactively or headless over ACP.",
+      descLink: { text: "nano-coder", href: "/nano-coder/" },
+      tags: agentHarnesses(),
+      rung: "driven by graphs built on",
     },
     {
       name: "Urban",
@@ -940,17 +972,17 @@ function architectureHtml() {
       .join("");
     const connector =
       i < ARCH_LAYERS.length - 1
-        ? '\n  <div class="rung" aria-hidden="true"><span>runs on</span></div>'
+        ? `\n  <div class="rung" aria-hidden="true"><span>${esc(l.rung ?? "runs on")}</span></div>`
         : "";
     return `<article class="layer${l.foundation ? " foundation" : ""}">
     <div class="layer-head">
       <span class="depth" aria-hidden="true">${i + 1}</span>
       <div>
         <p class="role">${esc(l.role)}</p>
-        <h3>${esc(l.name)} <span class="tagline">— ${esc(l.tagline)}</span></h3>
+        <h3>${l.href ? `<a href="${l.href}">${esc(l.name)}</a>` : esc(l.name)} <span class="tagline">— ${esc(l.tagline)}</span></h3>
       </div>
     </div>
-    <p>${esc(l.desc)}</p>
+    <p>${l.descLink ? esc(l.desc).replace(esc(l.descLink.text), `<a href="${l.descLink.href}">${esc(l.descLink.text)}</a>`) : esc(l.desc)}</p>
     <div class="tags">${tags}</div>
   </article>${connector}`;
   }).join("\n");
@@ -1019,7 +1051,7 @@ function architectureHtml() {
 
 <section class="arch-hero">
   <p class="eyebrow"><span class="arp">Architecture</span></p>
-  <h1>One stack, <span class="grad">four layers.</span></h1>
+  <h1>One stack, <span class="grad">${["zero", "one", "two", "three", "four", "five", "six", "seven"][ARCH_LAYERS.length]} layers.</span></h1>
   <p class="lede">From the agent-powered application at the top to the durable Rust engine at
   the foundation — each layer builds on the one below it.</p>
 </section>
@@ -1159,6 +1191,16 @@ function tok(cls, text) {
 function blogPosts() {
   return [
     {
+      slug: "a-6mb-coding-agent",
+      title: "A 6MB coding agent, and why fleets need one",
+      subtitle: "Introducing @nanobpm/nano-coder — the worker at the bottom of the Nano stack",
+      date: "2026-10-21",
+      dek:
+        "When a graph fans out ten coding agents, the agent's footprint becomes the fleet's " +
+        "ceiling. nano-coder is a Rust coding agent that runs in about 6MB, so the ceiling moves.",
+      body: nanoCoderPostBody,
+    },
+    {
       slug: "the-bottleneck-moved-from-code-to-coordination",
       title: "The bottleneck moved from code to coordination",
       subtitle:
@@ -1223,6 +1265,66 @@ function blogStyle() {
 </style>`;
 }
 
+// The coding-agent harnesses Workforce can hire, in display order. Single source
+// for the home page's harness chips and the architecture page's worker layer,
+// so "bring your own harness" can't drift between them.
+function agentHarnesses() {
+  return ["nano-coder", "GitHub Copilot", "Claude Code", "Pi", "Open Coder", "Little Coder"];
+}
+
+// Single source of truth for the nano-coder claims repeated across the site
+// (product page, home band, architecture layer, launch post). Hoisted function so
+// it is callable during the top-level emit. Platforms mirror the npm package's
+// optionalDependencies (@nanobpm/nano-coder-{darwin,linux}-{x64,arm64}).
+function nanoCoderFacts() {
+  return {
+    install: "npm install -g @nanobpm/nano-coder",
+    platforms: "macOS and Linux (x64, arm64)",
+    rss: "~6MB",
+    nodeRss: "150–660MB",
+    repo: "https://github.com/nanobpm/nano-coder",
+  };
+}
+
+// The @nanobpm/nano-coder product page: the coding agent that Nano Workforce
+// orchestrates as a headless ACP worker. Facts mirror the nanobpm/nano-coder README.
+function nanoCoderHtml() {
+  const F = nanoCoderFacts();
+  const FEATURES = [
+    [`${F.rss} resident memory`, `Written in Rust. Node-based agent CLIs take ${F.nodeRss}; nano-coder lets you run a dense fleet of workers on one laptop.`],
+    ["Interactive or headless", "A streaming terminal REPL with steering and queued prompts — or headless over ACP (JSON-RPC 2.0 on stdio) as a Nano Workforce worker."],
+    ["Bring your own model", "OpenAI-compatible and Anthropic endpoints, remote or local, selected per model as <code>provider/model</code>."],
+    ["Survives long tasks", "Task plans live outside the conversation, so work survives compaction, resume and a change of worker. Sessions are append-only JSONL."],
+    ["Guardrails built in", "Destructive-command guards, allow/deny rules, and an optional OS sandbox (Seatbelt on macOS, Landlock on Linux)."],
+    ["Speaks your repo", "Reads <code>AGENTS.md</code> / <code>CLAUDE.md</code>, loads <code>SKILL.md</code> skills on demand, and runs Claude Code–compatible hooks."],
+  ];
+  const cards = FEATURES.map(([h, p]) => `  <div class="post-card"><h2>${esc(h)}</h2><p>${p}</p></div>`).join("\n");
+  const body = `${siteNav()}
+${blogStyle()}
+<section class="blog-index">
+  <p class="eyebrow"><code>@nanobpm/nano-coder</code></p>
+  <h1>A 6MB coding agent.<br><span class="grad">Run a fleet on your laptop.</span></h1>
+  <p class="lede">nano-coder is the worker at the bottom of the Nano stack: a terminal coding agent
+  small enough that Nano Workforce graphs can fan out dozens of them on one machine — durable,
+  resumable, and supervised by the engine.</p>
+  ${installCommand("Install nano-coder", F.install)}
+  <p class="install-note">Prebuilt binaries for ${esc(F.platforms)}. Or <code>cargo install nano-coder</code>.</p>
+${cards}
+  <p class="lede">Why the worker's size matters: <a href="/blog/a-6mb-coding-agent/">A 6MB coding agent, and why fleets need one →</a></p>
+  <div class="cta">
+    <a class="btn primary" href="${F.repo}" rel="noopener noreferrer" target="_blank">nano-coder on GitHub →</a>
+    <a class="btn ghost" href="https://www.npmjs.com/package/@nanobpm/nano-coder" rel="noopener noreferrer" target="_blank">npm package →</a>
+  </div>
+</section>
+
+<footer class="site-foot wrap">
+  <p><a href="/">Home</a> · <a href="/architecture/">Architecture</a> · <a href="/demo/">Browser demo</a> · <a href="/schemas/">Published schemas</a></p>
+  <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
+</footer>
+${installCopyScript()}`;
+  return homePage("nanobpm.io — nano-coder", body);
+}
+
 function blogIndexHtml() {
   const cards = blogPosts()
     .map(
@@ -1267,6 +1369,34 @@ ${post.body()}
   <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
 </footer>`;
   return homePage(`${post.title} — nanobpm.io`, body);
+}
+
+// The article body for the nano-coder launch post.
+function nanoCoderPostBody() {
+  const F = nanoCoderFacts();
+  return `  <p>Nano Workforce turns software delivery into durable graphs: plan, implement, review,
+  test, merge. The interesting graphs fan out — ten slices of an epic, each with its own coding
+  agent, each looping through review until it converges. At that point the question stops being
+  <em>how good is one agent</em> and becomes <em>how many can this machine hold?</em></p>
+
+  <h2>The footprint is the ceiling</h2>
+  <p>Node-based agent CLIs sit at ${F.nodeRss} of resident memory each. Multiply by a fleet and
+  the laptop is full before the work is. Most of that memory does nothing: an agent spends its
+  life waiting on a model or a test run.</p>
+
+  <h2>nano-coder</h2>
+  <p><a href="/nano-coder/">nano-coder</a> is a coding agent written in Rust that runs in about
+  ${F.rss}. It is a complete terminal agent — streaming REPL, tool calling, task plans that survive
+  compaction, OS sandboxing, <code>AGENTS.md</code> and skills — and it also runs headless over ACP
+  (JSON-RPC 2.0 on stdio), which is how Workforce drives it as a durable job worker.</p>
+  <p>Because the engine owns durability, the worker doesn't have to: if a nano-coder process dies,
+  the Nano instance that dispatched it is still at the same step, and the next worker picks the job
+  up. Small workers plus a durable orchestrator is the whole design.</p>
+
+  <h2>Try it</h2>
+  <figure class="code"><pre><code>${esc(F.install)}</code></pre></figure>
+  <p>Prebuilt binaries ship for ${F.platforms}; or <code>cargo install nano-coder</code>. Source and
+  docs are on <a href="${F.repo}">GitHub</a>.</p>`;
 }
 
 // The article body for the "code to coordination" post.
