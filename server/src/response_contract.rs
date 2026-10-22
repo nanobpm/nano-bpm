@@ -151,6 +151,12 @@ fn contract() -> &'static Contract {
     STORE.get_or_init(load_contract)
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: CONTRACT_JSON is a compile-time \
+include_str! of a generated artifact validated at codegen time; invalid JSON is a \
+build-time regeneration bug, not a runtime-recoverable condition"
+)]
 fn load_contract() -> Contract {
     let root: Value = serde_json::from_str(CONTRACT_JSON).expect(
         "response_contract_schema.json is not valid JSON (regenerate with `make generate`)",

@@ -91,16 +91,16 @@ fn current_snapshot(now: u64) -> Snapshot {
 pub fn tick() {
     let now = now_ms();
     let cur = current_snapshot(now);
-    let mut prev = PREV.lock().expect("provisioning prev poisoned");
+    let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
     let (cur, advice) = compute(&prev, cur);
     *prev = cur;
-    *LATEST.lock().expect("provisioning latest poisoned") = advice;
+    *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = advice;
 }
 
 /// The latest per-job-type provisioning advice for the console endpoint. Clones
 /// the small stored [`Advice`] so the lock is held only for the copy.
 pub fn latest() -> Advice {
-    LATEST.lock().expect("provisioning latest poisoned").clone()
+    LATEST.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 #[cfg(test)]
@@ -190,5 +190,44 @@ mod tests {
         let r = find(&a, jt);
         assert_eq!(r.class, Class::ServerBound);
         assert_eq!(r.suggest_worker_delta, 0);
+    }
+
+    /// Lock-poison recovery (epic #1357): a panic while holding the `LATEST`
+    /// mutex poisons it. The console endpoint reads the advice via [`latest`],
+    /// which must keep serving the stored advice rather than cascading the panic
+    /// into every subsequent request. Before the unwrap/expect-deny conversion,
+    /// `latest()` used `.expect("provisioning latest poisoned")` and this
+    /// panicked; now it recovers the inner guard.
+    ///
+    /// `nextest` runs each test in its own process, so poisoning the process-
+    /// global `LATEST` here does not leak into sibling tests.
+    #[test]
+    fn latest_recovers_from_poisoned_lock() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("intentionally poison LATEST");
+        });
+        assert!(poisoned.is_err(), "the panicking closure must unwind");
+        assert!(LATEST.is_poisoned(), "LATEST must now be poisoned");
+
+        // The real assertion: this returns instead of panicking.
+        let advice = latest();
+        // Touch the recovered value so the read is not optimized away.
+        let _ = advice.recommendations.len();
+    }
+
+    /// Companion guard for the writer path: `tick()` locks both `PREV` and
+    /// `LATEST`. A poisoned `PREV` must not panic the ~1 Hz monitor tick.
+    #[test]
+    fn tick_recovers_from_poisoned_prev() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = PREV.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("intentionally poison PREV");
+        });
+        assert!(poisoned.is_err(), "the panicking closure must unwind");
+        assert!(PREV.is_poisoned(), "PREV must now be poisoned");
+
+        // The real assertion: the tick completes instead of panicking.
+        tick();
     }
 }

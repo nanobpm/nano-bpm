@@ -189,7 +189,7 @@ impl BatchOperationStore {
     /// transitions (`ACTIVE → SUSPENDED → ACTIVE`; any `→ CANCELED`) are valid.
     fn create(&self, op_type: models::BatchOperationTypeEnum, item_keys: Vec<u64>) -> u64 {
         let now = now_millis();
-        let mut inner = self.inner.lock().expect("batch-operation store poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.seq == 0 {
             inner.seq = now;
         }
@@ -223,7 +223,7 @@ impl BatchOperationStore {
     fn get(&self, key: u64) -> Option<BatchOperationRecord> {
         self.inner
             .lock()
-            .expect("batch-operation store poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .ops
             .get(&key)
             .cloned()
@@ -233,7 +233,7 @@ impl BatchOperationStore {
     fn all(&self) -> Vec<BatchOperationRecord> {
         self.inner
             .lock()
-            .expect("batch-operation store poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .ops
             .values()
             .cloned()
@@ -251,7 +251,7 @@ impl BatchOperationStore {
     /// unknown key is `NotFound`.
     fn transition(&self, key: u64, to: models::BatchOperationStateEnum) -> BatchLifecycleOutcome {
         use models::BatchOperationStateEnum as S;
-        let mut inner = self.inner.lock().expect("batch-operation store poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match inner.ops.get_mut(&key) {
             None => BatchLifecycleOutcome::NotFound,
             Some(rec) => {
@@ -372,62 +372,66 @@ impl ClusterVariableStore {
             .cloned()
     }
 
-    /// Creates a new variable. Returns `false` (creating nothing) when one
-    /// already exists for `(tenant, name)` — the caller maps that to 409.
+    /// Creates a new variable, returning a snapshot of the stored record taken
+    /// while the write lock is still held. Returns `None` (creating nothing)
+    /// when one already exists for `(tenant, name)` — the caller maps that to
+    /// 409. Returning the snapshot (rather than a separate post-mutation `get`)
+    /// is race-free: a concurrent DELETE cannot make the caller's response
+    /// construction observe a missing record.
     fn create(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         metadata: ClusterVariableMetadata,
-    ) -> bool {
+    ) -> Option<StoredClusterVariable> {
         let key = (tenant.map(str::to_string), name.to_string());
-        {
+        let stored = {
             let mut e = self.write();
             if e.by_key.contains_key(&key) {
-                return false;
+                return None;
             }
             e.next_id += 1;
             let id = e.next_id;
-            e.by_key.insert(
-                key,
-                StoredClusterVariable {
-                    id,
-                    name: name.to_string(),
-                    tenant_id: tenant.map(str::to_string),
-                    value,
-                    metadata,
-                },
-            );
-        }
+            let stored = StoredClusterVariable {
+                id,
+                name: name.to_string(),
+                tenant_id: tenant.map(str::to_string),
+                value,
+                metadata,
+            };
+            e.by_key.insert(key, stored.clone());
+            stored
+        };
         self.sync_runtime();
-        true
+        Some(stored)
     }
 
     /// Updates an existing variable's value and metadata in place, preserving
-    /// its id. The metadata bag is REPLACED, not merged (Camunda: an update that
-    /// omits it clears it). Returns `false` when none exists for `(tenant, name)`
-    /// — the caller maps that to 404.
+    /// its id, and returns a snapshot of the updated record taken while the
+    /// write lock is still held. The metadata bag is REPLACED, not merged
+    /// (Camunda: an update that omits it clears it). Returns `None` when none
+    /// exists for `(tenant, name)` — the caller maps that to 404. Returning the
+    /// snapshot (rather than a separate post-mutation `get`) is race-free: a
+    /// concurrent DELETE cannot make the caller's response construction observe
+    /// a missing record.
     fn update(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         metadata: ClusterVariableMetadata,
-    ) -> bool {
+    ) -> Option<StoredClusterVariable> {
         let key = (tenant.map(str::to_string), name.to_string());
-        {
+        let stored = {
             let mut e = self.write();
-            match e.by_key.get_mut(&key) {
-                Some(entry) => {
-                    entry.value = value;
-                    entry.metadata = metadata;
-                }
-                None => return false,
-            }
-        }
+            let entry = e.by_key.get_mut(&key)?;
+            entry.value = value;
+            entry.metadata = metadata;
+            entry.clone()
+        };
         self.sync_runtime();
-        true
+        Some(stored)
     }
 
     /// Deletes a variable. Returns `false` when none exists — the caller maps
@@ -585,14 +589,10 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if self
+        if let Some(stored) = self
             .cluster_variables
             .create(None, &body.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(None, &body.name)
-                .expect("just created");
             Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
             ))
@@ -628,14 +628,10 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if self
-            .cluster_variables
-            .create(Some(tenant), &body.name, value, metadata)
+        if let Some(stored) =
+            self.cluster_variables
+                .create(Some(tenant), &body.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(Some(tenant), &body.name)
-                .expect("just created");
             Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
             ))
@@ -668,14 +664,10 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if self
-            .cluster_variables
-            .update(None, &path_params.name, value, metadata)
+        if let Some(stored) =
+            self.cluster_variables
+                .update(None, &path_params.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(None, &path_params.name)
-                .expect("just updated");
             Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
             ))
@@ -703,14 +695,10 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if self
-            .cluster_variables
-            .update(Some(tenant), &path_params.name, value, metadata)
+        if let Some(stored) =
+            self.cluster_variables
+                .update(Some(tenant), &path_params.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(Some(tenant), &path_params.name)
-                .expect("just updated");
             Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
             ))
@@ -904,19 +892,25 @@ mod cluster_variable_tests {
     #[test]
     fn create_rejects_a_duplicate_scope_and_name() {
         let s = store();
-        assert!(s.create(
-            None,
-            "region",
-            val(json!("EMEA")),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
         // Same (scope, name) again -> false, which the handler maps to 409.
-        assert!(!s.create(
-            None,
-            "region",
-            val(json!("APAC")),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "region",
+                val(json!("APAC")),
+                ClusterVariableMetadata::new()
+            )
+            .is_none()
+        );
         // The rejected create left the stored value untouched.
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -925,20 +919,77 @@ mod cluster_variable_tests {
     }
 
     #[test]
+    fn create_and_update_return_a_race_free_snapshot() {
+        // Regression: the create/update handlers used to re-`get` the record
+        // after releasing the mutation lock, so a concurrent DELETE between the
+        // mutation and the lookup made `expect("just created"/"just updated")`
+        // panic. `create`/`update` now return the stored snapshot taken while
+        // the write lock is still held, so the response never depends on a
+        // second lookup that a delete could lose.
+        let s = store();
+
+        let created = s
+            .create(
+                Some("acme"),
+                "region",
+                val(json!("EMEA")),
+                ClusterVariableMetadata::new(),
+            )
+            .expect("create of a fresh (scope, name) returns the stored snapshot");
+        assert_eq!(created.name, "region");
+        assert_eq!(created.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
+
+        // A delete landing right after the mutation cannot invalidate the
+        // snapshot already returned to the handler.
+        assert!(s.delete(Some("acme"), "region"));
+        assert!(s.get(Some("acme"), "region").is_none());
+        assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
+
+        // Update returns its own post-mutation snapshot the same way.
+        assert!(
+            s.create(
+                None,
+                "flag",
+                val(json!(false)),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
+        let updated = s
+            .update(
+                None,
+                "flag",
+                val(json!(true)),
+                ClusterVariableMetadata::new(),
+            )
+            .expect("update of an existing (scope, name) returns the stored snapshot");
+        assert_eq!(cluster_variable_value_string(&updated.value), "true");
+        assert!(s.delete(None, "flag"));
+        assert_eq!(cluster_variable_value_string(&updated.value), "true");
+    }
+
+    #[test]
     fn global_and_tenant_scopes_are_isolated() {
         let s = store();
-        assert!(s.create(
-            None,
-            "region",
-            val(json!("global")),
-            ClusterVariableMetadata::new()
-        ));
-        assert!(s.create(
-            Some("acme"),
-            "region",
-            val(json!("acme")),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "region",
+                val(json!("global")),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
+        assert!(
+            s.create(
+                Some("acme"),
+                "region",
+                val(json!("acme")),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
         assert_eq!(s.all().len(), 2);
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -956,9 +1007,18 @@ mod cluster_variable_tests {
     fn update_requires_an_existing_entry() {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
-        assert!(!s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
-        assert!(s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
-        assert!(s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new()));
+        assert!(
+            s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+                .is_none()
+        );
+        assert!(
+            s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+                .is_some()
+        );
+        assert!(
+            s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+                .is_some()
+        );
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
             "2"
@@ -969,12 +1029,15 @@ mod cluster_variable_tests {
     fn delete_reports_absence() {
         let s = store();
         assert!(!s.delete(None, "nope"));
-        assert!(s.create(
-            None,
-            "nope",
-            val(json!(true)),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "nope",
+                val(json!(true)),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
         assert!(s.delete(None, "nope"));
         assert!(s.get(None, "nope").is_none());
     }
@@ -982,7 +1045,10 @@ mod cluster_variable_tests {
     #[test]
     fn empty_object_value_round_trips() {
         let s = store();
-        assert!(s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new()));
+        assert!(
+            s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new())
+                .is_some()
+        );
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
             "{}"
@@ -1490,6 +1556,198 @@ mod cluster_variable_tests {
         )
         .await;
         assert_eq!(names(&page2_again), names(&page2));
+    }
+}
+
+#[cfg(test)]
+mod converted_lock_poison_tests {
+    //! Epic #1357 lock-poison recovery regression guards. The unwrap/expect-deny
+    //! conversion rewrote every `.lock().expect(...)` in the gateway binary to
+    //! `.lock().unwrap_or_else(|e| e.into_inner())`, so a panic while one of these
+    //! mutexes is held can no longer cascade a crash into every path that later
+    //! touches the same state. The consumers/provisioning guards lock *different*
+    //! mutexes, so they would still pass if any of these accessors reverted to
+    //! `.expect(...)`. These tests poison each converted lock on a locally-owned
+    //! store/server fixture and assert the real accessor recovers, returning the
+    //! preserved state instead of panicking.
+    use super::*;
+
+    /// Poison a mutex by panicking while holding its guard, on a detached thread
+    /// so the panic does not unwind the test itself. A recovered guard does NOT
+    /// clear the poison flag, so every later `.lock()` still returns `Err` and
+    /// must be recovered — which is exactly what the accessors under test do.
+    fn poison<T: Send + 'static>(lock: Arc<std::sync::Mutex<T>>) {
+        assert!(
+            std::thread::spawn(move || {
+                let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("intentionally poison the lock");
+            })
+            .join()
+            .is_err(),
+            "the closure must panic while holding the lock to poison it"
+        );
+    }
+
+    /// Batch-store: a panic while holding `BatchOperationStore::inner` must not
+    /// cascade into every later batch get/search/transition.
+    #[test]
+    fn batch_operation_store_recovers_from_a_poisoned_lock() {
+        let store = BatchOperationStore::default();
+        let key = store.create(
+            models::BatchOperationTypeEnum::CancelProcessInstance,
+            vec![1, 2],
+        );
+
+        poison(store.inner.clone());
+        assert!(store.inner.is_poisoned(), "inner lock must be poisoned");
+
+        // Reads recover and preserve the pre-poison record.
+        let got = store.get(key).expect("get recovers the poisoned lock");
+        assert_eq!(got.key, key);
+        assert_eq!(store.all().len(), 1, "all() recovers and sees the record");
+
+        // Writes recover: a fresh create and a lifecycle transition still apply.
+        let key2 = store.create(
+            models::BatchOperationTypeEnum::CancelProcessInstance,
+            vec![3],
+        );
+        assert_ne!(key2, key, "create recovers and mints a distinct key");
+        assert!(
+            matches!(
+                store.transition(key, models::BatchOperationStateEnum::Suspended),
+                BatchLifecycleOutcome::Ok
+            ),
+            "transition recovers the poisoned lock and applies"
+        );
+        assert_eq!(
+            store
+                .get(key)
+                .expect("still present after the recovered transition")
+                .state,
+            models::BatchOperationStateEnum::Suspended,
+            "the recovered write preserved and advanced the state"
+        );
+    }
+
+    /// The `ServerImpl` cluster-coordination maps converted in this file
+    /// (promotion/handoff, replica, lease, retirement, definition-index) must all
+    /// recover their poisoned locks through their real accessors.
+    #[tokio::test]
+    async fn server_converted_mutexes_recover_from_poisoned_locks() {
+        let server = ServerImpl {
+            tier2_enabled: true,
+            lease_digest: true,
+            ..Default::default()
+        };
+        let me = server.engine.topology().node_id as u64;
+
+        // --- promotion epoch (promotion/handoff state) ---
+        server
+            .promotion_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, (5, me));
+        poison(server.promotion_epoch.clone());
+        assert!(server.promotion_epoch.is_poisoned());
+        assert_eq!(
+            server.current_app_epoch(0),
+            5,
+            "current_app_epoch recovers the poisoned promotion_epoch read"
+        );
+        assert!(
+            server.next_promotion_epoch(0) >= 5,
+            "next_promotion_epoch recovers the poisoned promotion_epoch write"
+        );
+
+        // --- handoff gating (promotion/handoff state) ---
+        server
+            .handoff_gated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, std::time::Instant::now());
+        poison(server.handoff_gated.clone());
+        assert!(server.handoff_gated.is_poisoned());
+        assert!(
+            server.handoff_write_gated(0),
+            "handoff_write_gated recovers the poisoned read and sees the gate"
+        );
+        server.release_handoff_lease(0);
+        assert!(
+            !server.handoff_write_gated(0),
+            "release_handoff_lease recovers the poisoned write and lifts the gate"
+        );
+
+        // --- raft replicas ---
+        let replica_handle = server
+            .engine
+            .local_for_partition(0)
+            .expect("single-node fixture owns partition 0")
+            .clone();
+        server
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, replica_handle);
+        poison(server.raft_replicas.clone());
+        assert!(server.raft_replicas.is_poisoned());
+        // replica_engine_for reads the raft_replicas map first; the recovered read
+        // must return the pre-seeded replica handle rather than panicking (and
+        // without falling through to build a fresh actor).
+        let _ = server.replica_engine_for(0).await;
+        assert!(
+            server
+                .raft_replicas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&0),
+            "replica_engine_for recovers the poisoned raft_replicas read"
+        );
+
+        // --- lease digests ---
+        poison(server.lease_digests.clone());
+        assert!(server.lease_digests.is_poisoned());
+        server.record_lease_digest(0, vec![(1, 2)], 0);
+        assert!(
+            server
+                .lease_digests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&0),
+            "record_lease_digest recovers the poisoned write and records the digest"
+        );
+
+        // --- pending retirements ---
+        server
+            .pending_retirements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, vec![7]);
+        poison(server.pending_retirements.clone());
+        assert!(server.pending_retirements.is_poisoned());
+        // The retirement digest drains the map under the recovered lock; on a
+        // single-node (rf=1) fixture it has no followers to send to, so it just
+        // recovers and clears without panicking.
+        server.run_retirement_digest().await;
+        assert!(
+            server
+                .pending_retirements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "run_retirement_digest recovers the poisoned lock and drains the buffer"
+        );
+
+        // --- definition-index (def_key_to_process_id) ---
+        server
+            .def_key_to_process_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("def-key".to_string(), "proc-id".to_string());
+        poison(server.def_key_to_process_id.clone());
+        assert!(server.def_key_to_process_id.is_poisoned());
+        // tier2_should_shed resolves a create-by-key through the definition index;
+        // the recovered read must not panic (shed decision itself may be None).
+        let _ = server.tier2_should_shed(None, Some("def-key"));
     }
 }
 
@@ -2271,6 +2529,10 @@ impl ServerImpl {
     /// partitions so any of them can instantiate it. Each journal's exporter must
     /// already be wired to the shared read store so the seed deployment is
     /// projected.
+    #[allow(
+        clippy::expect_used,
+        reason = "startup-only: the demo process is a fixed compile-time builder input seeding a fresh journal; a failure is a build-time bug, not a runtime condition"
+    )]
     pub fn new(
         mut journals: Vec<Journal>,
         store: Arc<ReadModel>,
@@ -3047,6 +3309,10 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
 /// `ProcessDeployed` is partition-agnostic and its key belongs to the deployment
 /// partition (0), which a clustered peer may not own, so it is replayed into
 /// EVERY owned shard; other events route to `partition_of(key)`'s shard.
+#[allow(
+    clippy::expect_used,
+    reason = "startup-only: one-time legacy read-model rebuild during boot; a shard reset/export failure aborts boot deliberately"
+)]
 fn rebuild_read_model_legacy(
     shards: &[(u64, Arc<ReadStore>)],
     events: &[Event],
@@ -3451,6 +3717,10 @@ fn retry_until_ok<T, E>(
 /// dropped). Events arrive as `Arc<Vec<Event>>` shared with the command thread, so
 /// projecting them costs no deep copy of the payloads.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::expect_used,
+    reason = "startup-only: OS thread spawn at boot; inability to spawn the supporting thread is an unrecoverable boot failure"
+)]
 fn spawn_exporter(
     rx: mpsc::Receiver<ExportBatch>,
     store: Arc<dyn ProjectionSink>,
@@ -3597,7 +3867,7 @@ fn spawn_exporter(
                     // `Active` shells. Grouped by minting partition (a batch may span
                     // the shard's owned partitions); the ~500 ms tick drains + sends.
                     if let Some(buf) = &retirements {
-                        let mut buf = buf.lock().unwrap();
+                        let mut buf = buf.lock().unwrap_or_else(|e| e.into_inner());
                         for &key in &completed {
                             buf.entry(nanobpmn_engine_core::partition_of(key))
                                 .or_default()
@@ -3704,6 +3974,10 @@ fn spawn_exporter(
 /// its own timer; its small delete transactions interleave with the exporter's
 /// inserts at SQLite's write-lock granularity, giving eviction a fair share of
 /// the writer regardless of the export backlog. Exits when the store is dropped.
+#[allow(
+    clippy::expect_used,
+    reason = "startup-only: OS thread spawn at boot; inability to spawn the supporting thread is an unrecoverable boot failure"
+)]
 fn spawn_adaptive_pruner(store: Arc<ReadStore>, high_bytes: u64) {
     // Hold live data between `low_bytes` and `high_bytes` (7/8 hysteresis, matching
     // the former keep-target). Small per-batch/per-wake bounds keep each write-lock
@@ -5579,6 +5853,10 @@ struct CreatedInstanceDirect {
 /// under Raft they take the replicated `create_via_raft` propose path and never
 /// apply directly. `fallback_process_id` names the version when the just-created
 /// instance's definition is no longer resolvable (pre-retention). #1308.
+#[allow(
+    clippy::expect_used,
+    reason = "invariant by construction: a freshly created instance always journals an instance key"
+)]
 fn apply_create_instance_direct(
     journal: &mut Journal,
     command: Command,
@@ -8277,6 +8555,10 @@ impl ServerImpl {
     /// every node (each node correlates its own local subset), so the union still
     /// covers both owners. With a single partition the target set is `{0}` — one
     /// round-trip, identical to the pre-partitioning path.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: correlation only fails on a business id, already validated earlier on this path"
+    )]
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -8341,8 +8623,11 @@ impl ServerImpl {
 
     /// Correlates a message across this node's owned partitions and returns the
     /// minted message key and the first instance it correlated to (an existing
-    /// subscription or a message-start-created instance), if any. The local
-    /// building block for both the gateway fan-out and the peer-side
+    /// subscription or a message-start-created instance), if any. The message
+    /// key is `None` when this node owns neither the correlation-key hash
+    /// partition nor partition 0 (no local `CorrelateMessage` was applied, so no
+    /// key was minted); the cluster fan-out then sources it from an owning peer.
+    /// The local building block for both the gateway fan-out and the peer-side
     /// `PublishMessage` handler.
     pub(crate) async fn correlate_message_local(
         &self,
@@ -8350,7 +8635,7 @@ impl ServerImpl {
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
-    ) -> Result<(u64, Option<u64>), EngineError> {
+    ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let events = self
             .correlate_message_everywhere(name, correlation_key, variables, business_id)
             .await?;
@@ -8371,18 +8656,22 @@ impl ServerImpl {
     /// partitions plus every peer (each correlates against its own partitions).
     /// An open subscription's instance can live on any node, and the message-start
     /// subscriptions live solely on the partition-0 owner, so a published message
-    /// must reach every node. Returns the (locally minted) message key and the
-    /// first correlated instance found across the cluster — local matches first,
-    /// then peers. A peer that is unreachable is logged and skipped (best-effort,
-    /// matching the no-buffer correlate-and-drop model). A single-node cluster
-    /// fans only locally — byte-identical to the pre-cluster path.
+    /// must reach every node. Returns the message key and the first correlated
+    /// instance found across the cluster — local matches first, then peers. The
+    /// key is minted locally when this node owns a target partition, otherwise
+    /// it is taken from the first owning peer's response (the node that actually
+    /// minted it); it is `None` only when this node owns no target partition and
+    /// every owning peer was unreachable, which the gateway surfaces as 503. A
+    /// peer that is unreachable is logged and skipped (best-effort, matching the
+    /// no-buffer correlate-and-drop model). A single-node cluster fans only
+    /// locally — byte-identical to the pre-cluster path.
     async fn correlate_message_cluster(
         &self,
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
-    ) -> Result<(u64, Option<u64>), EngineError> {
+    ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let engine_vars: std::collections::HashMap<String, Value> = variables
             .as_ref()
             .map(|m| {
@@ -8391,7 +8680,7 @@ impl ServerImpl {
                     .collect()
             })
             .unwrap_or_default();
-        let (message_key, mut instance) = self
+        let (mut message_key, mut instance) = self
             .correlate_message_local(
                 name.clone(),
                 correlation_key.clone(),
@@ -8429,10 +8718,18 @@ impl ServerImpl {
                         .await
                     {
                         Ok(res) if res.status == 200 => {
+                            let body = res.body.as_ref();
+                            // When this node owns no target partition it minted
+                            // no key; take the one the owning peer minted so the
+                            // client still gets a message key.
+                            if message_key.is_none() {
+                                message_key = body
+                                    .and_then(|b| b.get("messageKey"))
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<u64>().ok());
+                            }
                             if instance.is_none() {
-                                instance = res
-                                    .body
-                                    .as_ref()
+                                instance = body
                                     .and_then(|b| b.get("correlatedInstanceKey"))
                                     .and_then(|v| v.as_str())
                                     .and_then(|s| s.parse::<u64>().ok());
@@ -8500,6 +8797,10 @@ impl ServerImpl {
     /// **peer**, the source event is forwarded over the Falcon protocol and the
     /// owning node drives its own pump (so the recursion continues there). A
     /// no-op single-partition.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: a routed subscription command cannot fail"
+    )]
     async fn drive_subscription_routing(&self, events: Vec<Event>) {
         let num_partitions = self.engine.topology().num_partitions;
         if num_partitions <= 1 {
@@ -10189,6 +10490,18 @@ impl ServerImpl {
             }
         };
 
+        // No key means this node owns no target partition and every owning peer
+        // was unreachable, so the publish reached nowhere: report 503 rather
+        // than fabricating a key for a publication that did not happen.
+        let Some(message_key) = message_key else {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "UNAVAILABLE",
+                503,
+                "could not reach a node owning a target partition for the message; retry"
+                    .to_string(),
+            )));
+        };
+
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
         self.signal_jobs_available();
@@ -10231,6 +10544,17 @@ impl ServerImpl {
                     e.to_string(),
                 )));
             }
+        };
+        // No key means this node owns no target partition and every owning peer
+        // was unreachable, so the correlation reached nowhere: report 503 rather
+        // than a 404 (which would wrongly claim nothing matched).
+        let Some(message_key) = message_key else {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "UNAVAILABLE",
+                503,
+                "could not reach a node owning a target partition for the message; retry"
+                    .to_string(),
+            )));
         };
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
@@ -14186,6 +14510,10 @@ impl ServerImpl {
     /// projects decision-instance rows. It runs on a local partition chosen like
     /// a create (the decision registry is replicated onto every owned
     /// partition), so no cross-node forwarding is needed.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: a successful EvaluateDecision journals exactly one DecisionEvaluated that identifies its evaluation"
+    )]
     async fn evaluate_decision_impl(
         &self,
         body: &models::DecisionEvaluationInstruction,
@@ -14721,6 +15049,10 @@ impl ServerImpl {
     /// Runs a forwarded deploy on the partition-0 owner: parses, deploys locally,
     /// broadcasts to peers, and returns the deployment JSON. Invoked by the
     /// `Deploy` falcon frame handler. `Err` is `(status, detail)`.
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible by construction: the deployment result is a serde-derived struct that always serializes to Value"
+    )]
     pub async fn deploy_centralized(
         &self,
         resources: Vec<(String, String)>,
@@ -15296,7 +15628,10 @@ impl ServerImpl {
             tokio::time::sleep(HANDOFF_PROBE_POLL).await;
             // Owned partitions whose adopted epoch names a peer (not us).
             let candidates: Vec<(u64, u32)> = {
-                let map = self.promotion_epoch.lock().unwrap();
+                let map = self
+                    .promotion_epoch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 owned
                     .iter()
                     .filter_map(|&p| match map.get(&p) {
@@ -15703,7 +16038,7 @@ impl ServerImpl {
                     _ => self
                         .promotion_epoch
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get(&p)
                         .map(|&(_, l)| l)
                         .filter(|&l| l != me)
@@ -15774,7 +16109,10 @@ impl ServerImpl {
                 state.misses.remove(&p);
                 // No reachable incumbent remained, so any stale hand-off request
                 // for `p` is moot — clear it so a later rejoin starts clean.
-                self.handoff_pending.lock().unwrap().remove(&p);
+                self.handoff_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&p);
                 // Hold the partition down for a settle window so a lagging metrics
                 // view cannot trigger an immediate re-promote at the next epoch.
                 state
@@ -15813,7 +16151,10 @@ impl ServerImpl {
     /// records this node as the leader at that epoch. Monotonic per partition.
     fn next_promotion_epoch(&self, p: u64) -> u64 {
         let me = self.engine.topology().node_id as u64;
-        let mut map = self.promotion_epoch.lock().unwrap();
+        let mut map = self
+            .promotion_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
         // Idempotent for the incumbent-self: only step strictly PAST a *different*
         // leader's epoch (the fence overtake). If WE already hold `p` at
@@ -16023,7 +16364,10 @@ impl ServerImpl {
             return;
         }
         let led: Vec<(u64, u64)> = {
-            let map = self.promotion_epoch.lock().unwrap();
+            let map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             map.iter()
                 .filter(|(_, (_, leader))| *leader == me)
                 .map(|(p, (epoch, _))| (*p, *epoch))
@@ -16201,7 +16545,10 @@ impl ServerImpl {
         // Promote/SolicitPromotions naming us can't re-adopt and undo the transfer.
         let new_epoch = incumbent_epoch + 1;
         {
-            let mut map = self.promotion_epoch.lock().unwrap();
+            let mut map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
             if new_epoch >= cur {
                 map.insert(partition, (new_epoch, requester_node));
@@ -16224,7 +16571,10 @@ impl ServerImpl {
     ) {
         tracing::debug!(partition, incumbent_epoch, accepted, "hand-off ack");
         if !accepted {
-            self.handoff_pending.lock().unwrap().remove(&partition);
+            self.handoff_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&partition);
             return;
         }
         // Rebuild as a receiver ONLY when we don't already have a receiver in
@@ -16247,7 +16597,7 @@ impl ServerImpl {
             let incumbent = self
                 .promotion_epoch
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&partition)
                 .map(|(_, leader)| *leader)
                 .unwrap_or(u64::MAX);
@@ -16265,13 +16615,19 @@ impl ServerImpl {
         new_leader: u64,
     ) {
         {
-            let mut map = self.promotion_epoch.lock().unwrap();
+            let mut map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
             if epoch >= cur {
                 map.insert(partition, (epoch, new_leader));
             }
         }
-        self.handoff_pending.lock().unwrap().remove(&partition);
+        self.handoff_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&partition);
         tracing::info!(
             partition,
             epoch,
@@ -16291,7 +16647,10 @@ impl ServerImpl {
         reason: String,
     ) {
         tracing::warn!(partition, joint_suspected, %reason, "hand-off failed");
-        let mut pending = self.handoff_pending.lock().unwrap();
+        let mut pending = self
+            .handoff_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if joint_suspected {
             if let Some(hp) = pending.get_mut(&partition) {
                 hp.joint_suspected = true;
@@ -16308,7 +16667,7 @@ impl ServerImpl {
         let me = self.engine.topology().node_id as u64;
         self.promotion_epoch
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&partition)
             .filter(|(_, leader)| *leader == me)
             .map(|(e, _)| *e)
@@ -16334,7 +16693,7 @@ impl ServerImpl {
             configured.max(self.handoff_catchup_ceiling())
         };
         let deadline = std::time::Instant::now() + pause;
-        let mut gated = self.handoff_gated.lock().unwrap();
+        let mut gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         if gated.contains_key(&partition) {
             return false;
         }
@@ -16350,7 +16709,7 @@ impl ServerImpl {
     /// hand-off that extends its catch-up would outlive its write-pause, the head
     /// would move mid-install, and the learner would re-snapshot forever.
     fn extend_handoff_pause(&self, partition: u64, until: std::time::Instant) {
-        let mut gated = self.handoff_gated.lock().unwrap();
+        let mut gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(deadline) = gated.get_mut(&partition)
             && until > *deadline
         {
@@ -16387,13 +16746,16 @@ impl ServerImpl {
     /// Release the incumbent hand-off lease and lift the write-gate/pause for
     /// `partition`.
     fn release_handoff_lease(&self, partition: u64) {
-        self.handoff_gated.lock().unwrap().remove(&partition);
+        self.handoff_gated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&partition);
     }
 
     /// Whether `partition` is currently create-write-gated by an in-flight
     /// incumbent hand-off (new creates are steered off it so its log quiesces).
     fn handoff_write_gated(&self, partition: u64) -> bool {
-        let gated = self.handoff_gated.lock().unwrap();
+        let gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         !gated.is_empty() && gated.contains_key(&partition)
     }
 
@@ -16402,7 +16764,7 @@ impl ServerImpl {
     /// bounded pause window (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`) is open. Rejected
     /// writes are retryable; the pause lets the catch-up learner reach zero lag.
     fn handoff_completion_paused(&self, partition: u64) -> bool {
-        let gated = self.handoff_gated.lock().unwrap();
+        let gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         if gated.is_empty() {
             return false;
         }
@@ -16455,11 +16817,17 @@ impl ServerImpl {
     async fn request_handoff_or_wait(&self, partition: u64, incumbent: u32) {
         // Fast path: the transfer already landed and we now lead — clear and stop.
         if self.i_lead_raft(partition) {
-            self.handoff_pending.lock().unwrap().remove(&partition);
+            self.handoff_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&partition);
             return;
         }
         let resend = {
-            let mut pending = self.handoff_pending.lock().unwrap();
+            let mut pending = self
+                .handoff_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             match pending.get_mut(&partition) {
                 None => {
                     pending.insert(
@@ -16606,7 +16974,10 @@ impl ServerImpl {
         // same epoch with a lower node id. `cur_leader` defaults to u64::MAX so any
         // real promotion at epoch >= 1 beats the implicit (0, _) incumbent state.
         let (adopt, i_lead_here) = {
-            let mut map = self.promotion_epoch.lock().unwrap();
+            let mut map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let (cur_epoch, cur_leader) =
                 map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
             let wins = crate::fence::wins(cur_epoch, cur_leader, epoch, leader_node);
@@ -16742,7 +17113,12 @@ impl ServerImpl {
     /// of already-deployed processes; later deploys fan in via
     /// [`Self::install_into_raft_replicas`].
     async fn replica_engine_for(&self, p: u64) -> DeepthiHandle {
-        if let Some(h) = self.raft_replicas.lock().unwrap().get(&p) {
+        if let Some(h) = self
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+        {
             return h.clone();
         }
         let mut journal = Journal::in_memory_partition(p);
@@ -16765,7 +17141,7 @@ impl ServerImpl {
         let handle = DeepthiHandle::spawn(journal, p, None);
         self.raft_replicas
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(p)
             .or_insert(handle)
             .clone()
@@ -16798,7 +17174,11 @@ impl ServerImpl {
         if let Some(h) = self.engine.local_for_partition(p) {
             return Some(h.clone());
         }
-        self.raft_replicas.lock().unwrap().get(&p).cloned()
+        self.raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+            .cloned()
     }
 
     /// One read-model reconciliation sweep. Rebuilds the engine's authoritative
@@ -16857,7 +17237,7 @@ impl ServerImpl {
         }
         self.lease_digests
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(partition, ReceivedDigest { leases });
     }
 
@@ -16886,7 +17266,12 @@ impl ServerImpl {
                 None => continue,
             };
             // 1. Recover a received digest (only present just after a promotion).
-            let stored = self.lease_digests.lock().unwrap().get(&p).cloned();
+            let stored = self
+                .lease_digests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&p)
+                .cloned();
             if let Some(digest) = stored {
                 let leases = digest.leases.clone();
                 let recover_handle = handle.clone();
@@ -16901,7 +17286,10 @@ impl ServerImpl {
                 // nothing left to recover and we must not pin stale state.
                 let max_deadline = digest.leases.iter().map(|(_, d)| *d).max().unwrap_or(0);
                 if max_deadline <= now {
-                    self.lease_digests.lock().unwrap().remove(&p);
+                    self.lease_digests
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&p);
                 }
             }
             // 2. Broadcast our current leases to this partition's followers.
@@ -16944,7 +17332,10 @@ impl ServerImpl {
         // exporter accumulated between ticks (a large drain is chunked across frames).
         const MAX_KEYS_PER_FRAME: usize = 8192;
         let drained: std::collections::HashMap<u64, Vec<Key>> = {
-            let mut buf = self.pending_retirements.lock().unwrap();
+            let mut buf = self
+                .pending_retirements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *buf)
         };
         let node_id = self.engine.topology().node_id;
@@ -17027,7 +17418,12 @@ impl ServerImpl {
         if self.engine.local_for_partition(p).is_some() {
             return;
         }
-        let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
+        let handle = self
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+            .cloned();
         if let Some(handle) = handle {
             handle.spawn_job(move |journal| {
                 journal.retire_instances_owned(keys);
@@ -17059,7 +17455,12 @@ impl ServerImpl {
         if self.engine.local_for_partition(p).is_some() {
             return;
         }
-        let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
+        let handle = self
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+            .cloned();
         if let Some(handle) = handle {
             handle.spawn_job(move |journal| {
                 journal.retire_below(low_water, max_remove);
@@ -17073,7 +17474,7 @@ impl ServerImpl {
     /// actors, i.e. single-node, RF=1, or Raft disabled.
     async fn install_into_raft_replicas(&self, events: &Arc<Vec<Event>>) {
         let handles: Vec<DeepthiHandle> = {
-            let map = self.raft_replicas.lock().unwrap();
+            let map = self.raft_replicas.lock().unwrap_or_else(|e| e.into_inner());
             if map.is_empty() {
                 return;
             }
@@ -19215,7 +19616,7 @@ impl ServerImpl {
                 let key = by_key?;
                 self.def_key_to_process_id
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(key)
                     .cloned()?
             }
@@ -20129,6 +20530,10 @@ fn now_millis() -> u64 {
 /// A placeholder timestamp. The clock-free engine does not record wall-clock
 /// times for process instances, so their read projections report the Unix
 /// epoch. (Incidents do carry a real `created_at` fed in at command time.)
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: from_timestamp(0, 0) is the Unix epoch, always a valid DateTime"
+)]
 fn epoch() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch is valid")
 }
@@ -21031,6 +21436,10 @@ fn agent_message_content(
 /// Maps a REST message-content block to the engine content shape. The structured
 /// `object` payload is serialised back to the opaque JSON string the engine core
 /// stores (it stays free of a `serde_json::Value` dependency).
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: the document reference is a serde-derived DTO that always serializes to a String"
+)]
 fn agent_content_from(c: &models::AgentInstanceMessageContent) -> agent_model::AgentHistoryContent {
     use agent_model::AgentHistoryContentType as CT;
     let (content_type, text, document_reference, object) = match c {
@@ -22688,15 +23097,16 @@ fn dmn_value_to_string(value: &Value) -> String {
 pub(crate) use nanobpmn_read_model::dmn_decision_type_name;
 
 /// The minted message key from a `CorrelateMessage`'s events: the heading
-/// [`Event::MessagePublished`] always carries it.
-fn message_key_of(events: &[Event]) -> u64 {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::MessagePublished { message_key, .. } => Some(*message_key),
-            _ => None,
-        })
-        .expect("CorrelateMessage always emits MessagePublished")
+/// [`Event::MessagePublished`] carries it. `None` when this node applied no
+/// local `CorrelateMessage` — it owns neither the correlation-key hash
+/// partition nor partition 0, so `correlate_message_everywhere` produced no
+/// events. Callers that fan out to the cluster then take the key from an owning
+/// peer's response rather than treating the local miss as infallible.
+fn message_key_of(events: &[Event]) -> Option<u64> {
+    events.iter().find_map(|e| match e {
+        Event::MessagePublished { message_key, .. } => Some(*message_key),
+        _ => None,
+    })
 }
 
 /// Maps the stub `Err(())` returned by every operation to `501 Not Implemented`.
@@ -22753,6 +23163,10 @@ const REST_LOG_BODY_PREVIEW: usize = 4096;
 ///   - leader `last_log` flat            → propose/append stall (nothing enters the log)
 ///   - follower `last_log` lags leader's → replication stall (followers not appending)
 ///   - `applied` lags `last_log`         → state-machine/apply (engine-actor) stall
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
     use std::fmt::Write as _;
     let mut body = String::new();
@@ -22791,6 +23205,10 @@ fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
 /// reading?": each row is `peer=<node> load=<idx> age_ms=<ms> expired=<bool>
 /// weight=<placement_weight>`. A peer with `expired=true` is treated as full
 /// headroom by placement; a fresh `load=SHED` (weight 0) peer is steered away.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 fn peers_debug_body(server: &ServerImpl) -> Response {
     use std::fmt::Write as _;
     let me = server.engine.topology().node_id;
@@ -22828,6 +23246,10 @@ fn peers_debug_body(server: &ServerImpl) -> Response {
 /// (instances, jobs), the activated/activatable index sizes, active incidents,
 /// and a sample of `Active` instances with their parked element ids and each
 /// owning job's state / activation / lease-due flag. Read-only.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 async fn instances_debug_body(server: &ServerImpl) -> Response {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
@@ -23091,6 +23513,10 @@ fn metrics_body(server: &ServerImpl) -> String {
     body
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 async fn metrics_handler(server: ServerImpl) -> Response {
     let body = metrics_body(&server);
     Response::builder()
@@ -23107,6 +23533,10 @@ async fn metrics_handler(server: ServerImpl) -> Response {
 /// jemalloc accounts it (the most meaningful figure: `ps`/RSS under-reports on
 /// macOS). Used by the Throughput Explorer demo to report peak memory; cheap to
 /// poll. Returns `{ residentBytes }` (omitted/null if jemalloc isn't available).
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 async fn system_memory_handler() -> Response {
     let bytes = memory::resident_bytes();
     let body = serde_json::json!({ "residentBytes": bytes }).to_string();
@@ -23960,11 +24390,19 @@ async fn main() {
                     if pos > events.len() {
                         // The store is ahead of the log (truncated/corrupt journal):
                         // rebuild from scratch.
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "startup/boot recovery: resets the read store during a truncated/corrupt-journal rebuild; failure aborts boot deliberately"
+                        )]
                         shard.reset().expect("reset read store");
                         pos = 0;
                     }
                     if pos < events.len() {
                         let refs: Vec<&Event> = events[pos..].iter().collect();
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "startup/boot recovery: catches the read model up from the journal during boot; failure aborts boot deliberately"
+                        )]
                         shard
                             .export(&refs)
                             .expect("catch up read model from journal");
@@ -24923,6 +25361,10 @@ async fn main() {
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             let (fired, _commit) = journal.trigger_timers(now);
+                            #[allow(
+                                clippy::expect_used,
+                                reason = "invariant by construction: ExpireJobsByDurability is an internal timer-driven command that cannot be rejected"
+                            )]
                             let (leased_expired, _lease_commit) = journal
                                 .apply_command_at(
                                     Command::ExpireJobsByDurability { now, durable: true },
@@ -25266,7 +25708,10 @@ async fn main() {
                         }
                     }
                     if !key_index.is_empty() {
-                        *monitor_server.def_key_to_process_id.lock().unwrap() = key_index;
+                        *monitor_server
+                            .def_key_to_process_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = key_index;
                     }
                     let now = std::time::Instant::now();
                     let dt_s = now.duration_since(prev_tier2_instant).as_secs_f64();
@@ -25678,6 +26123,10 @@ async fn main() {
             .unwrap_or_else(|_| internal_addr.to_string());
         tracing::info!("intra-cluster /cluster channel on dedicated internal listener {bound}");
         tokio::spawn(async move {
+            #[allow(
+                clippy::expect_used,
+                reason = "startup-only: the internal cluster listener is bound at boot; a serve error on it is an unrecoverable supervisor failure"
+            )]
             axum::serve(NoDelayListener(internal_listener), internal_cluster_router)
                 .await
                 .expect("internal cluster server error");
@@ -25713,6 +26162,10 @@ async fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "startup-only: the main gateway server runs for the process lifetime; a serve error is an unrecoverable top-level failure"
+    )]
     axum::serve(
         NoDelayListener(listener),
         app.into_make_service_with_connect_info::<PeerAddr>(),
@@ -26949,6 +27402,107 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(stamped, types::Nullable::Present("order-7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn publish_from_a_node_owning_no_target_partition_sources_the_key_from_a_peer() {
+        // Regression: when the gateway node owns NEITHER the correlation-key hash
+        // partition NOR partition 0, its local correlate applies no command and
+        // produces no `MessagePublished`, so the old `message_key_of(...).expect()`
+        // panicked. The publish must instead fan out and take the minted key from
+        // the owning peer's response. With 2 partitions and 3 nodes, node 2 owns
+        // no partition at all (owner_of(p) = p % 3 ∈ {0,1}), so it is the
+        // no-local-target gateway.
+        let proc = ProcessBuilder::new("order-flow")
+            .message_start_event("start", "order-placed")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("order-flow".to_string(), "order.bpmn".to_string());
+
+        // Node 0 owns partition 0, where every message-start subscription lives.
+        let node0_topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["unused".into(), "unused".into(), "unused".into()],
+            num_partitions: 3,
+            replication_factor: 1,
+        };
+        let node0 = build_server_in_memory(
+            node0_topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect(),
+            node0_topology,
+        );
+        node0
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy message-start process on the partition-0 owner");
+        let node0_url = serve_node(&node0).await;
+
+        // The gateway the client hits must own SOME partition (so it has a read
+        // model shard) but NEITHER of the two publish targets: partition 0 (the
+        // message-start home) nor the empty correlation key's hash partition. With
+        // 3 nodes / 3 partitions (owner_of(p) = p % 3), partition 0 is node 0 and
+        // the hash partition is node `hp`; the remaining node owns only its own
+        // partition and is the no-local-target gateway.
+        let hp = nanobpmn_engine_core::subscription_partition("", 3);
+        let gateway: u32 = if hp == 1 { 2 } else { 1 };
+        let mut peers = vec![
+            "http://unused".to_string(),
+            "http://unused".to_string(),
+            "http://unused".to_string(),
+        ];
+        peers[0] = node0_url;
+        let topology = cluster::Topology {
+            node_id: gateway,
+            peers,
+            num_partitions: 3,
+            replication_factor: 1,
+        };
+        assert_eq!(
+            topology.local_partitions(),
+            vec![gateway as u64],
+            "the gateway owns only its own partition"
+        );
+        assert!(
+            !topology.local_partitions().contains(&0)
+                && !topology.local_partitions().contains(&(hp as u64)),
+            "the gateway must own neither publish-target partition for this regression"
+        );
+        let node2 = build_server_in_memory(
+            topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect(),
+            topology,
+        );
+
+        let (message_key, instance) = node2
+            .correlate_message_cluster("order-placed".into(), String::new(), None, None)
+            .await
+            .expect("correlation with a valid business id never panics on a no-local-target node");
+        assert!(
+            message_key.is_some(),
+            "the message key is sourced from the owning peer, not minted locally"
+        );
+        let instance =
+            instance.expect("the owner's message-start subscription creates an instance");
+        assert_eq!(
+            nanobpmn_engine_core::partition_of(instance),
+            0,
+            "the message-start instance lives on the owner's partition 0"
+        );
     }
 
     #[tokio::test]

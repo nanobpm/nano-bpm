@@ -209,7 +209,7 @@ impl Registry {
         crate::metrics::stream_connection_inc();
         self.conns
             .lock()
-            .expect("registry poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(conn.id, conn);
     }
 
@@ -220,13 +220,17 @@ impl Registry {
     /// connection; without the guard the `nanobpm_stream_connections_active`
     /// gauge would double-decrement and drift negative.
     fn unregister(&self, id: ConnId) -> bool {
-        let removed = self.conns.lock().expect("registry poisoned").remove(&id);
+        let removed = self
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         let Some(conn) = removed else {
             return false;
         };
         conn.closed.store(true, Ordering::Relaxed);
         crate::metrics::stream_connection_dec();
-        let mut by_type = self.by_type.lock().expect("registry poisoned");
+        let mut by_type = self.by_type.lock().unwrap_or_else(|e| e.into_inner());
         for ids in by_type.values_mut() {
             ids.retain(|&other| other != id);
         }
@@ -243,7 +247,7 @@ impl Registry {
         // so without this a repeated subscribe/disconnect cycle would retain one
         // `String` per historical type indefinitely. Lock order `by_type` → `rr`
         // matches `dispatch_plan`, so there is no lock-ordering inversion.
-        let mut rr = self.rr.lock().expect("registry poisoned");
+        let mut rr = self.rr.lock().unwrap_or_else(|e| e.into_inner());
         rr.retain(|job_type, _| by_type.contains_key(job_type));
         true
     }
@@ -262,7 +266,7 @@ impl Registry {
     /// wins and the index sees the id absent and bails. Lock order `conns → by_type`
     /// matches `dispatch_plan`, so there is no lock-ordering inversion.
     fn index(&self, job_type: &str, id: ConnId) {
-        let conns = self.conns.lock().expect("registry poisoned");
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
         match conns.get(&id) {
             // Still registered and not yet reaped: safe to index.
             Some(conn) if !conn.closed.load(Ordering::Relaxed) => {}
@@ -270,7 +274,7 @@ impl Registry {
             // the index so it cannot resurrect a phantom roster entry.
             _ => return,
         }
-        let mut by_type = self.by_type.lock().expect("registry poisoned");
+        let mut by_type = self.by_type.lock().unwrap_or_else(|e| e.into_inner());
         let ids = by_type.entry(job_type.to_string()).or_default();
         if !ids.contains(&id) {
             ids.push(id);
@@ -284,7 +288,7 @@ impl Registry {
     pub fn workers_per_type(&self) -> HashMap<String, usize> {
         self.by_type
             .lock()
-            .expect("registry poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|(job_type, ids)| (job_type.clone(), ids.len()))
             .collect()
@@ -312,9 +316,9 @@ impl Registry {
     /// are untouched here: they redeliver on lock expiry, preserving at-least-once —
     /// no job is lost, only delayed.)
     fn dispatch_plan(&self, per_type_cap: usize) -> Vec<(String, Vec<DispatchTarget>)> {
-        let conns = self.conns.lock().expect("registry poisoned");
-        let by_type = self.by_type.lock().expect("registry poisoned");
-        let mut rr = self.rr.lock().expect("registry poisoned");
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        let by_type = self.by_type.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rr = self.rr.lock().unwrap_or_else(|e| e.into_inner());
         let mut plan = Vec::new();
         for (job_type, ids) in by_type.iter() {
             if ids.is_empty() {
@@ -347,7 +351,7 @@ impl Registry {
                 let sub = conn
                     .subs
                     .lock()
-                    .expect("registry poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(job_type)
                     .cloned();
                 if let Some(sub) = sub {
@@ -372,7 +376,7 @@ impl Registry {
     fn all_connections(&self) -> Vec<Arc<Connection>> {
         self.conns
             .lock()
-            .expect("registry poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .cloned()
             .collect()
@@ -397,7 +401,7 @@ impl Registry {
         let mut out = Vec::new();
         for conn in self.all_connections() {
             let last_seen_ms = conn.last_seen_ms.load(Ordering::Relaxed);
-            let subs = conn.subs.lock().expect("registry poisoned");
+            let subs = conn.subs.lock().unwrap_or_else(|e| e.into_inner());
             for (job_type, sub) in subs.iter() {
                 out.push(FalconConsumer {
                     job_type: job_type.clone(),
@@ -866,14 +870,19 @@ async fn handle_client_frame(
             });
             conn.subs
                 .lock()
-                .expect("registry poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(job_type.clone(), sub);
             registry.index(&job_type, conn.id);
             // A new subscription may have a backlog waiting: wake the dispatcher.
             server.dispatch_wake_handle().notify_one();
         }
         ClientFrame::JobCredits { job_type, n } => {
-            if let Some(sub) = conn.subs.lock().expect("registry poisoned").get(&job_type) {
+            if let Some(sub) = conn
+                .subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&job_type)
+            {
                 sub.credits.fetch_add(n, Ordering::Relaxed);
             }
             server.dispatch_wake_handle().notify_one();
@@ -931,9 +940,9 @@ async fn handle_client_frame(
             // Raft Batcher. `awaitCompletion` creates stay on the inline path below
             // (the completion wait must read this node's read store). The non-Raft
             // single-node fast path is likewise unchanged.
-            if should_spawn_fire_and_forget(awaiting, raft_active, create_permit.is_some()) {
-                let permit =
-                    create_permit.expect("permit is Some whenever the spawn decision is true");
+            if let Some(permit) =
+                create_permit.filter(|_| should_spawn_fire_and_forget(awaiting, raft_active, true))
+            {
                 let server = server.clone();
                 let conn = conn.clone();
                 tokio::spawn(async move {
@@ -1423,7 +1432,10 @@ async fn handle_client_frame(
                 corr,
                 status: 200,
                 body: Some(serde_json::json!({
-                    "messageKey": message_key.to_string(),
+                    // `None` only when this peer owns no target partition, which
+                    // the fan-out never targets; serialised as JSON null so the
+                    // caller falls back rather than reading a bogus key.
+                    "messageKey": message_key.map(|k| k.to_string()),
                     "correlatedInstanceKey": instance.map(|k| k.to_string()),
                 })),
             });
@@ -2666,7 +2678,7 @@ fn peer_backlog_cache() -> &'static Mutex<HashMap<u32, (i64, Instant)>> {
 pub(crate) fn record_peer_backlog(node: u32, backlog: i64) {
     peer_backlog_cache()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(node, (backlog.max(0), Instant::now()));
 }
 
@@ -2716,7 +2728,7 @@ fn read_peer_backlog(node: u32) -> Option<i64> {
 fn read_peer_backlog_within(node: u32, window: Duration) -> Option<i64> {
     peer_backlog_cache()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&node)
         .filter(|(_, at)| at.elapsed() < window)
         .map(|(b, _)| *b)
@@ -3447,6 +3459,102 @@ mod registry_tests {
             "both live subscribers are reachable under rotation: {seen:?}"
         );
     }
+
+    #[test]
+    fn registry_accessors_recover_from_poisoned_locks() {
+        // Epic #1357: a panic while holding any registry lock (`conns`,
+        // `by_type`, `rr`, or a connection's `subs`) poisons it. Every accessor
+        // now recovers the inner guard instead of `.expect("registry poisoned")`,
+        // so one unlucky panic cannot cascade a crash into dispatch, the
+        // worker-count snapshot, the consumer listing, or teardown. The registry
+        // and its connections are locally-owned fixtures, so poisoning them here
+        // never touches a process-global or a sibling test.
+        fn poison_in_thread<F>(f: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            assert!(
+                std::thread::spawn(f).join().is_err(),
+                "the closure must panic while holding the lock to poison it"
+            );
+        }
+
+        let registry = Registry::new();
+        let conn = test_connection(7);
+        registry.register(conn.clone());
+        registry.index("pay", 7);
+        // A credited subscription so the recovered dispatch plan yields a target.
+        conn.subs.lock().unwrap().insert(
+            "pay".to_string(),
+            Arc::new(Subscription {
+                worker: "w".to_string(),
+                with_lease: false,
+                timeout: 0,
+                fetch_variable: None,
+                credits: AtomicI64::new(5),
+            }),
+        );
+
+        // Poison every lock the accessors touch.
+        {
+            let r = Arc::clone(&registry);
+            poison_in_thread(move || {
+                let _g = r.conns.lock().unwrap();
+                panic!("poison conns");
+            });
+        }
+        {
+            let r = Arc::clone(&registry);
+            poison_in_thread(move || {
+                let _g = r.by_type.lock().unwrap();
+                panic!("poison by_type");
+            });
+        }
+        {
+            let r = Arc::clone(&registry);
+            poison_in_thread(move || {
+                let _g = r.rr.lock().unwrap();
+                panic!("poison rr");
+            });
+        }
+        {
+            let c = Arc::clone(&conn);
+            poison_in_thread(move || {
+                let _g = c.subs.lock().unwrap();
+                panic!("poison subs");
+            });
+        }
+        assert!(registry.conns.is_poisoned(), "conns is poisoned");
+        assert!(registry.by_type.is_poisoned(), "by_type is poisoned");
+        assert!(registry.rr.is_poisoned(), "rr is poisoned");
+        assert!(conn.subs.is_poisoned(), "subs is poisoned");
+
+        // Every accessor recovers rather than panicking on the poison.
+        assert_eq!(
+            registry.workers_per_type().get("pay"),
+            Some(&1),
+            "workers_per_type recovers the poisoned by_type lock"
+        );
+        assert_eq!(
+            registry.all_connections().len(),
+            1,
+            "all_connections recovers the poisoned conns lock"
+        );
+        let plan = registry.dispatch_plan(0);
+        assert!(
+            plan.iter()
+                .any(|(jt, targets)| jt == "pay" && !targets.is_empty()),
+            "dispatch_plan recovers conns/by_type/rr/subs and still yields a target"
+        );
+        assert!(
+            registry.unregister(7),
+            "unregister recovers conns/by_type/rr and still removes the connection"
+        );
+        assert!(
+            registry.all_connections().is_empty(),
+            "the connection is gone after the recovered unregister"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3602,6 +3710,63 @@ mod peer_backlog_freshness_tests {
         );
         // housekeeping so the process-global cache doesn't leak across tests.
         peer_backlog_cache().lock().unwrap().remove(&node);
+    }
+
+    /// Lock-poison recovery (epic #1357): a panic while holding the
+    /// `peer_backlog_cache` mutex poisons it. `record_peer_backlog` /
+    /// `read_peer_backlog_within` now recover the inner guard instead of
+    /// `.expect(...)`, so one unlucky panic cannot cascade into every Stage-2
+    /// weighting decision that samples a peer's backlog.
+    ///
+    /// Like `REST_POLLS`, `peer_backlog_cache` is a process-global static and
+    /// `cargo test --workspace` runs this binary's tests on many threads in ONE
+    /// process, where the sibling freshness tests above lock it with `.unwrap()`.
+    /// Poisoning it in-process would flake them during the poison window, so the
+    /// poison scenario runs in a freshly re-exec'd CHILD process whose poisoned
+    /// static dies with it.
+    #[test]
+    fn peer_backlog_cache_recovers_from_a_poisoned_lock() {
+        const CHILD_ENV: &str = "NANO_PEER_BACKLOG_POISON_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // CHILD: poison the real static, then prove the real accessors recover
+            // instead of panicking. Isolated to this process.
+            let poisoned = std::panic::catch_unwind(|| {
+                let _guard = peer_backlog_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                panic!("intentionally poison peer_backlog_cache");
+            });
+            assert!(poisoned.is_err(), "the panicking closure must unwind");
+            assert!(
+                peer_backlog_cache().is_poisoned(),
+                "peer_backlog_cache must now be poisoned"
+            );
+            // The real assertions: both accessors return instead of panicking.
+            record_peer_backlog(91_001, 777);
+            assert_eq!(
+                read_peer_backlog_within(91_001, Duration::from_secs(3600)),
+                Some(777),
+                "record/read recover the poisoned peer-backlog lock"
+            );
+            return;
+        }
+
+        // PARENT: re-exec just this test in a child process with the gate set.
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "falcon::peer_backlog_freshness_tests::peer_backlog_cache_recovers_from_a_poisoned_lock",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn peer-backlog poison-recovery child test process");
+        assert!(
+            status.success(),
+            "the isolated child must exercise poison recovery without panicking"
+        );
     }
 }
 

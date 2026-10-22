@@ -30,7 +30,7 @@ use axum::routing::{get, post};
 use serde_json::Value;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -60,11 +60,12 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
-        .unwrap_or_else(|e| panic!("nano-exporter: bind {bind} failed: {e}"));
+        .map_err(|e| format!("nano-exporter: bind {bind} failed: {e}"))?;
     tracing::info!("nano-exporter: listening on {bind}");
     axum::serve(listener, app)
         .await
-        .expect("nano-exporter: server error");
+        .map_err(|e| format!("nano-exporter: server error: {e}"))?;
+    Ok(())
 }
 
 /// Selects the downstream target from the environment: Elasticsearch when
