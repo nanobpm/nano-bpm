@@ -563,6 +563,50 @@ mod landing_page_tests {
         assert!(page.contains("<h2 id=\"videos-title\">Videos</h2>"));
     }
 
+    /// Regression (PR #1356 review): the landing page used to lock the viewport
+    /// (`overflow: hidden` on `html, body` + a fixed `height: 100%` centered
+    /// `.wrap`), so in short or zoomed windows the Videos section (and any
+    /// growing content) was clipped with no way to scroll to it. Guard the
+    /// whole class: the page must scroll vertically, the wrapper must be able
+    /// to grow past the viewport, and centering must not push content off-top.
+    #[test]
+    fn landing_layout_never_clips_overflowing_content() {
+        let css = LANDING_HTML.split("</style>").next().expect("inline style");
+        let rule = |sel: &str| -> String {
+            let start = css
+                .find(&format!("{sel} {{"))
+                .unwrap_or_else(|| panic!("{sel} rule"));
+            let body = &css[start..];
+            body[..body.find('}').unwrap()].to_string()
+        };
+        let root = rule("body");
+        assert!(
+            !root.contains("overflow: hidden"),
+            "html/body must not hide overflow: {root}"
+        );
+        assert!(
+            root.contains("overflow-y: auto"),
+            "html/body must scroll vertically: {root}"
+        );
+        let wrap = rule(".wrap");
+        assert!(
+            !wrap.contains("\n        height: 100%"),
+            ".wrap must not be capped at viewport height: {wrap}"
+        );
+        assert!(
+            wrap.contains("min-height: 100%"),
+            ".wrap must fill at least the viewport: {wrap}"
+        );
+        assert!(
+            wrap.contains("justify-content: safe center"),
+            ".wrap centering must be overflow-safe: {wrap}"
+        );
+        assert!(
+            wrap.contains("padding-bottom"),
+            ".wrap must clear the fixed footer: {wrap}"
+        );
+    }
+
     #[test]
     #[should_panic(expected = "missing the <!--VIDEOS_SECTION--> marker")]
     fn splice_panics_on_missing_marker() {

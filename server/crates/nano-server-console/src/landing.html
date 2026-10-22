@@ -18,7 +18,8 @@
       body {
         margin: 0;
         height: 100%;
-        overflow: hidden;
+        overflow-x: hidden;
+        overflow-y: auto;
         background: #08080a;
         color: var(--ink);
         font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
@@ -43,13 +44,15 @@
       .wrap {
         position: relative;
         z-index: 2;
-        height: 100%;
+        min-height: 100%;
         display: flex;
         flex-direction: column;
         align-items: center;
-        justify-content: center;
+        justify-content: safe center;
         text-align: center;
         padding: 2rem;
+        /* Keep the last section clear of the fixed footer when scrolled. */
+        padding-bottom: 3.5rem;
       }
       .mark {
         display: flex;
