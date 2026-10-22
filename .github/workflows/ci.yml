@@ -553,15 +553,20 @@ jobs:
         # schema domain, or if a published $id/uri no longer resolves to
         # nanobpm.io. This is the same build pages.yml deploys on merge, so a
         # green PR here guarantees the site publishes cleanly. The integration
-        # test runs that build once before checking the published controls.
-        run: node --test website/install-copy.test.mjs
-      - name: Fail if the console landscape artifact is stale
+        # tests each build into a private temp dir (website/test-build.mjs), so
+        # parallel test files never race on the shared, wiped-first _site; the
+        # shared console *.gen.html artifacts are published atomically
+        # (website/atomic-write.mjs) so concurrent builds never expose a partial file.
+        run: node --test website/install-copy.test.mjs website/videos.test.mjs website/atomic-write.test.mjs
+      - name: Fail if the console landscape/videos artifacts are stale
         # website/build.mjs also renders the shared landscape table into
         # server/crates/nano-server-console/src/landscape.gen.html (single source of truth for both
         # /architecture#landscape and the console /stack page). Fail if the
         # committed artifact doesn't match a fresh render (the maker edited
         # website/data/landscape.json but forgot `node website/build.mjs`).
-        run: git diff --exit-code -- server/crates/nano-server-console/src/landscape.gen.html
+        # Same for the shared Videos section (website/data/videos.json ->
+        # videos.gen.html, spliced into the console landing page).
+        run: git diff --exit-code -- server/crates/nano-server-console/src/landscape.gen.html server/crates/nano-server-console/src/videos.gen.html
 
   website-snippet:
     name: website snippet (typecheck)

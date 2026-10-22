@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+
+import { buildSite } from "./test-build.mjs";
 import { bindInstallCopy } from "./install-copy.mjs";
 
 function control(command) {
@@ -114,19 +114,15 @@ function assertInstallControls(html, commands = [CURL, NPM, CURL]) {
 }
 
 test("the nano-coder page wires its npm install control to the shipped handler", () => {
-  execFileSync(process.execPath, [fileURLToPath(new URL("./build.mjs", import.meta.url))], {
-    stdio: "pipe",
-  });
-  const html = readFileSync(new URL("./_site/nano-coder/index.html", import.meta.url), "utf8");
+  const site = buildSite();
+  const html = site("nano-coder/index.html");
   assertInstallControls(html, [NPM]);
   assert.match(html, /bindInstallCopy\(document, navigator\.clipboard\)/);
 });
 
 test("the published homepage wires every install control to the shipped handler", () => {
-  execFileSync(process.execPath, [fileURLToPath(new URL("./build.mjs", import.meta.url))], {
-    stdio: "pipe",
-  });
-  const html = readFileSync(new URL("./_site/index.html", import.meta.url), "utf8");
+  const site = buildSite();
+  const html = site("index.html");
   assertInstallControls(html);
   const misplacedStatus = html.replaceAll(
     /(<p class="install-copy-status" role="status"><\/p>)(\s*<\/div>)/g,
@@ -137,7 +133,7 @@ test("the published homepage wires every install control to the shipped handler"
   assert.match(html, /import \{ bindInstallCopy \} from "\/install-copy\.mjs"/);
   assert.match(html, /bindInstallCopy\(document, navigator\.clipboard\)/);
   assert.equal(
-    readFileSync(new URL("./_site/install-copy.mjs", import.meta.url), "utf8"),
+    site("install-copy.mjs"),
     readFileSync(new URL("./install-copy.mjs", import.meta.url), "utf8"),
   );
 });
