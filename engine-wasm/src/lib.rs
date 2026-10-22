@@ -5189,12 +5189,16 @@ mod tests {
 /// where the read model links the platform SQLite; the same code path is the one
 /// compiled to `wasm32` with the in-memory MemoryVFS backend.
 #[cfg(all(test, feature = "read-model"))]
-// The `allow-unwrap-in-tests`/`allow-expect-in-tests` clippy.toml exemptions key
-// on a plain `#[cfg(test)]` and do not recognise this module's
-// `#[cfg(all(test, feature = "read-model"))]` gate, so the test-only unwraps
-// below carry an explicit module-level allow (still test-only code — the whole
-// module compiles only under `cargo test --features read-model`).
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test-only module: the allow-unwrap-in-tests/allow-expect-in-tests \
+              clippy.toml exemptions key on a plain #[cfg(test)] and do not \
+              recognise this module's #[cfg(all(test, feature = read-model))] \
+              gate, so the test-only unwraps below carry an explicit \
+              module-level allow (the whole module compiles only under \
+              cargo test --features read-model)"
+)]
 mod read_channel_tests {
     use nanobpmn_engine_core::{Command, Event, FormResource};
     use serde_json::Value as J;
