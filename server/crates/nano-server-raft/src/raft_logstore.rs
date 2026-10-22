@@ -762,18 +762,35 @@ impl RaftLogStore {
         self.bytes.clone()
     }
 
-    /// Test-only: append `entries` through the same write path the openraft
-    /// `append` callback uses (serialize, roll, write, fsync per durability mode,
-    /// index, account, demote), minus the `pub(crate)` `LogFlushed` callback the
-    /// raft core supplies. Lets tests populate a store through the durable
-    /// mutation path instead of hand-writing segment files.
-    #[cfg(test)]
-    fn append_for_test(&mut self, entries: &[Entry<RaftConfig>]) -> io::Result<()> {
+    /// Core append path shared by the openraft [`RaftLogStorage::append`] trait
+    /// method and the `#[cfg(test)]` [`Self::append_for_test`] adapter: acquire
+    /// the (poison-recovering) `inner` lock, then serialize, roll, write, fsync
+    /// per durability mode, index, account and demote each entry. The `LogFlushed`
+    /// acknowledgement stays in the trait method (the raft core owns that
+    /// callback), so this is deliberately callback-free. Keeping it the single
+    /// source of truth means both callers — production replication and the poison
+    /// regression — exercise the identical durable mutation, fsync barrier,
+    /// metric accounting and lock-recovery logic; there is no second copy to drift.
+    fn append_entries<I>(&mut self, entries: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = Entry<RaftConfig>>,
+    {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut added = 0i64;
+        let mut new_bytes = 0usize;
+        let mut new_ram = 0usize;
         for entry in entries {
             let mut json = Vec::new();
-            serde_json::to_writer(&mut json, entry)?;
+            serde_json::to_writer(&mut json, &entry)?;
+            // Uncompressed in-RAM footprint (plaintext `JSON + '\n'`), captured before
+            // the compress branch may reframe/extend `json`. This — not the possibly
+            // compressed on-disk `len` — is what the resident `entry` copy actually
+            // costs, so it drives the RAM budget/metric.
             let ram_len = json.len() + 1;
+            // Compress large entries into a self-describing frame when enabled; small
+            // entries (and the disabled path) stay verbatim as `json + '\n'`. `len` is
+            // the physical on-disk record length either way, so the offset/roll/demote
+            // bookkeeping below is codec-agnostic.
             let line = if inner.compress {
                 frame_entry(&json).unwrap_or_else(|| {
                     json.push(b'\n');
@@ -786,11 +803,19 @@ impl RaftLogStore {
             let len = line.len();
             let index = entry.log_id.index;
             let log_id = entry.log_id;
+
+            // Roll to a fresh segment once the active one is full (and non-empty, so
+            // a single oversized entry still lands somewhere). The outgoing segment
+            // is fsynced before the switch so a sealed segment is always durable
+            // regardless of durability mode.
             if inner.active_bytes > 0 && inner.active_bytes + len > inner.seg_max_bytes {
                 timed_log_sync(&inner.active_file)?;
                 inner.unsynced_bytes = 0;
                 inner.roll_active(index)?;
             }
+
+            // Record where this entry's line lands (post-roll) so it can later be
+            // demoted to descriptor-only and read back from the segment file.
             let seg_start = inner.segments.last().map(|s| s.start).unwrap_or(index);
             let offset = inner.active_bytes;
             inner.active_file.write_all(&line)?;
@@ -806,20 +831,56 @@ impl RaftLogStore {
                     ram_len,
                     seg_start,
                     offset,
-                    entry: Some(entry.clone()),
+                    entry: Some(entry),
                 },
             );
             inner.log_bytes += len;
             inner.ram_bytes += ram_len;
             inner.unsynced_bytes += len;
+            new_bytes += len;
+            new_ram += ram_len;
+            added += 1;
+            crate::metrics::raft_log_entry_appended(len);
         }
-        if !inner.async_durability() {
-            timed_log_sync(&inner.active_file)?;
-            inner.unsynced_bytes = 0;
+        match inner.async_durability() {
+            // Sync: fsync before acknowledging — a flushed entry is power-loss
+            // durable. The media barrier (an `F_FULLFSYNC` on macOS) is on the
+            // critical path of every replication round.
+            false => {
+                timed_log_sync(&inner.active_file)?;
+                inner.unsynced_bytes = 0;
+            }
+            // Async (base mode, or a sync store inside the recovery fsync-relief
+            // window): the bytes are in the page cache (process-crash durable);
+            // acknowledge now and let the background flusher amortise the fsync.
+            // A byte-bounded inline flush caps the unfsynced window under a flood,
+            // when the periodic tick alone could fall behind.
+            true => {
+                if inner.unsynced_bytes >= inner.flush.max_bytes {
+                    timed_log_sync(&inner.active_file)?;
+                    inner.unsynced_bytes = 0;
+                }
+            }
         }
+        crate::metrics::raft_log_delta(added, new_bytes as i64);
+        crate::metrics::raft_log_ram_delta(new_ram as i64);
+        // Demote the cold tail back under the RAM budget (O(1) in-memory drops; the
+        // bytes are already durably on disk). Off the fsync path above.
         inner.enforce_ram_budget();
         self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Test-only: populate a store through the exact production durable mutation
+    /// path by delegating to [`Self::append_entries`] (the same lock acquisition,
+    /// write, fsync, indexing and accounting the openraft `append` trait method
+    /// drives), minus only the `pub(crate)` `LogFlushed` callback the raft core
+    /// supplies. Because it shares `append_entries`, the poison regression that
+    /// drives it genuinely covers the production append lock — reverting that lock
+    /// to `.unwrap()` makes the regression fail.
+    #[cfg(test)]
+    fn append_for_test(&mut self, entries: &[Entry<RaftConfig>]) -> io::Result<()> {
+        self.append_entries(entries.iter().cloned())
     }
 
     /// Test-only: whether an append would DEFER its `fsync` (coalesce onto the
@@ -1272,100 +1333,12 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         I: IntoIterator<Item = Entry<RaftConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut added = 0i64;
-        let mut new_bytes = 0usize;
-        let mut new_ram = 0usize;
-        for entry in entries {
-            let mut json = Vec::new();
-            serde_json::to_writer(&mut json, &entry).map_err(io_err)?;
-            // Uncompressed in-RAM footprint (plaintext `JSON + '\n'`), captured before
-            // the compress branch may reframe/extend `json`. This — not the possibly
-            // compressed on-disk `len` — is what the resident `entry` copy actually
-            // costs, so it drives the RAM budget/metric.
-            let ram_len = json.len() + 1;
-            // Compress large entries into a self-describing frame when enabled; small
-            // entries (and the disabled path) stay verbatim as `json + '\n'`. `len` is
-            // the physical on-disk record length either way, so the offset/roll/demote
-            // bookkeeping below is codec-agnostic.
-            let line = if inner.compress {
-                frame_entry(&json).unwrap_or_else(|| {
-                    json.push(b'\n');
-                    json
-                })
-            } else {
-                json.push(b'\n');
-                json
-            };
-            let len = line.len();
-            let index = entry.log_id.index;
-            let log_id = entry.log_id;
-
-            // Roll to a fresh segment once the active one is full (and non-empty, so
-            // a single oversized entry still lands somewhere). The outgoing segment
-            // is fsynced before the switch so a sealed segment is always durable
-            // regardless of durability mode.
-            if inner.active_bytes > 0 && inner.active_bytes + len > inner.seg_max_bytes {
-                timed_log_sync(&inner.active_file).map_err(io_err)?;
-                inner.unsynced_bytes = 0;
-                inner.roll_active(index).map_err(io_err)?;
-            }
-
-            // Record where this entry's line lands (post-roll) so it can later be
-            // demoted to descriptor-only and read back from the segment file.
-            let seg_start = inner.segments.last().map(|s| s.start).unwrap_or(index);
-            let offset = inner.active_bytes;
-            inner.active_file.write_all(&line).map_err(io_err)?;
-            inner.active_bytes += len;
-            if let Some(seg) = inner.segments.last_mut() {
-                seg.last = Some(index);
-            }
-            inner.log.insert(
-                index,
-                Stored {
-                    log_id,
-                    len,
-                    ram_len,
-                    seg_start,
-                    offset,
-                    entry: Some(entry),
-                },
-            );
-            inner.log_bytes += len;
-            inner.ram_bytes += ram_len;
-            inner.unsynced_bytes += len;
-            new_bytes += len;
-            new_ram += ram_len;
-            added += 1;
-            crate::metrics::raft_log_entry_appended(len);
-        }
-        match inner.async_durability() {
-            // Sync: fsync before acknowledging — a flushed entry is power-loss
-            // durable. The media barrier (an `F_FULLFSYNC` on macOS) is on the
-            // critical path of every replication round.
-            false => {
-                timed_log_sync(&inner.active_file).map_err(io_err)?;
-                inner.unsynced_bytes = 0;
-            }
-            // Async (base mode, or a sync store inside the recovery fsync-relief
-            // window): the bytes are in the page cache (process-crash durable);
-            // acknowledge now and let the background flusher amortise the fsync.
-            // A byte-bounded inline flush caps the unfsynced window under a flood,
-            // when the periodic tick alone could fall behind.
-            true => {
-                if inner.unsynced_bytes >= inner.flush.max_bytes {
-                    timed_log_sync(&inner.active_file).map_err(io_err)?;
-                    inner.unsynced_bytes = 0;
-                }
-            }
-        }
-        crate::metrics::raft_log_delta(added, new_bytes as i64);
-        crate::metrics::raft_log_ram_delta(new_ram as i64);
-        // Demote the cold tail back under the RAM budget (O(1) in-memory drops; the
-        // bytes are already durably on disk). Off the fsync path above.
-        inner.enforce_ram_budget();
-        self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
-        drop(inner);
+        // The durable write (lock, serialize, roll, write, fsync, index, account,
+        // demote) is `append_entries` — the single source of truth both this trait
+        // method and the `#[cfg(test)]` adapter drive. The `LogFlushed`
+        // acknowledgement is the raft core's and stays here, so `append_entries`
+        // is callback-free.
+        self.append_entries(entries).map_err(io_err)?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
