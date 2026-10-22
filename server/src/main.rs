@@ -3300,7 +3300,12 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
             .iter()
             .find(|(p, _)| p == pid)
             .map(|(_, e)| e.state());
-        seglog::catch_up_shard(shard, base_p, &p_events, reseed_state);
+        // Boot-fatal: a read model that cannot catch up (typed error from the
+        // store) means the projection is not durable/consistent — abort boot
+        // loudly rather than serve a stale read model.
+        if let Err(e) = seglog::catch_up_shard(shard, base_p, &p_events, reseed_state) {
+            panic!("failed to catch up read-model shard {pid} from the segmented journal: {e}");
+        }
     }
 }
 
@@ -24374,12 +24379,19 @@ async fn main() {
                     // journal) is refused rather than silently resumed — see
                     // issue #600.
                     let surviving: Vec<&Event> = recovery.events.iter().collect();
-                    seglog::catch_up_shard(
+                    // Boot-fatal, mirroring the sibling catch-up site above: a read
+                    // model that cannot catch up is not durable/consistent — abort
+                    // boot loudly rather than serve a stale read model. Written as
+                    // `if let Err .. panic!` (not `.expect`) to satisfy the
+                    // workspace `expect_used = "deny"` lint.
+                    if let Err(e) = seglog::catch_up_shard(
                         &shard,
                         recovery.first_index,
                         &surviving,
                         Some(journal.engine_state()),
-                    );
+                    ) {
+                        panic!("failed to catch up the read model from the segmented journal: {e}");
+                    }
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 } else {
