@@ -166,8 +166,13 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
                 break; // torn header tail — nothing durable past here
             }
             let codec = raw[i + 1];
-            let raw_len = u32::from_le_bytes(raw[i + 2..i + 6].try_into().unwrap()) as usize;
-            let comp_len = u32::from_le_bytes(raw[i + 6..i + 10].try_into().unwrap()) as usize;
+            // Total: the `i + FRAME_HEADER_LEN <= raw.len()` guard above
+            // guarantees both 4-byte windows are in bounds, and a `[u8; 4]`
+            // conversion from a 4-byte slice cannot fail.
+            let raw_len =
+                u32::from_le_bytes([raw[i + 2], raw[i + 3], raw[i + 4], raw[i + 5]]) as usize;
+            let comp_len =
+                u32::from_le_bytes([raw[i + 6], raw[i + 7], raw[i + 8], raw[i + 9]]) as usize;
             let start = i + FRAME_HEADER_LEN;
             let Some(end) = start.checked_add(comp_len).filter(|e| *e <= raw.len()) else {
                 break; // torn frame body
@@ -519,7 +524,7 @@ impl ActiveSegment {
         self.shared
             .sealed
             .lock()
-            .expect("sealed lock")
+            .unwrap_or_else(|e| e.into_inner())
             .push(SealedSeg {
                 start,
                 end,
@@ -1252,7 +1257,7 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
 /// longer need it. The active segment is never touched. Returns the number of
 /// segments removed.
 pub fn compact(shared: &SegShared, watermark: u64) -> usize {
-    let mut sealed = shared.sealed.lock().expect("sealed lock");
+    let mut sealed = shared.sealed.lock().unwrap_or_else(|e| e.into_inner());
     let mut removed = 0usize;
     // Sealed segments are kept ascending; remove the covered prefix — but ARCHIVE
     // each covered segment into the bounded cold store first, so a later snapshot
@@ -2210,7 +2215,7 @@ pub fn recover_multi(
 ///
 /// Removes each segment's per-partition sidecar with it. Returns the count removed.
 pub fn compact_multi(shared: &SegShared, covered: &[u64], exported: &[u64]) -> usize {
-    let mut sealed = shared.sealed.lock().expect("sealed lock");
+    let mut sealed = shared.sealed.lock().unwrap_or_else(|e| e.into_inner());
     let mut removed = 0usize;
     while let Some(seg) = sealed.first() {
         let export_ok = seg
@@ -2319,7 +2324,7 @@ pub fn catch_up_shard(
     floor: u64,
     surviving: &[&Event],
     reseed_state: Option<&nanobpmn_engine_core::State>,
-) {
+) -> rusqlite::Result<()> {
     let exported = shard.exported_position() as u64;
     match plan_catch_up(exported, floor, surviving.len() as u64) {
         CatchUpPlan::Resume { skip } => {
@@ -2328,9 +2333,7 @@ pub fn catch_up_shard(
             // snapshot BEFORE replaying the tail it already reflects (a replayed
             // `*Created` is then a no-op and a replayed settle deletes the row).
             if let Some(state) = reseed_state
-                && shard
-                    .backfill_pending_event_waits(state)
-                    .expect("backfill event waits from engine snapshot")
+                && shard.backfill_pending_event_waits(state)?
             {
                 tracing::info!(
                     "backfilled open timer/signal/conditional waits from the engine snapshot \
@@ -2338,9 +2341,7 @@ pub fn catch_up_shard(
                 );
             }
             if skip < surviving.len() {
-                shard
-                    .export(&surviving[skip..])
-                    .expect("catch up read model from segmented journal");
+                shard.export(&surviving[skip..])?;
             }
         }
         CatchUpPlan::RebuildFromSurviving => {
@@ -2349,7 +2350,7 @@ pub fn catch_up_shard(
                 floor,
                 surviving,
                 "rebuild read model from surviving journal tail",
-            );
+            )?;
         }
         CatchUpPlan::CompactedGap { missing } => {
             if let Some(state) = reseed_state {
@@ -2369,7 +2370,7 @@ pub fn catch_up_shard(
                      available (issue #831); any history never written to the archive (e.g. \
                      completed before the archive existed) is NOT restored."
                 );
-                reseed_from_engine_state(shard, total, state);
+                reseed_from_engine_state(shard, total, state)?;
             } else if read_model_lossy_rebuild_enabled() {
                 tracing::error!(
                     exported,
@@ -2387,7 +2388,7 @@ pub fn catch_up_shard(
                     floor,
                     surviving,
                     "lossy rebuild read model from surviving journal tail",
-                );
+                )?;
             } else {
                 panic!(
                     "read model at exported_position={exported} is below the journal compaction \
@@ -2405,6 +2406,7 @@ pub fn catch_up_shard(
             }
         }
     }
+    Ok(())
 }
 
 /// Resets a shard and reprojects it from the authoritative boot engine `state`,
@@ -2417,11 +2419,9 @@ fn reseed_from_engine_state(
     shard: &crate::readstore::ReadStore,
     total: u64,
     state: &nanobpmn_engine_core::State,
-) {
-    shard.reset().expect("reset read store");
-    shard
-        .seed_from_engine_state(state)
-        .expect("reproject read model from engine snapshot");
+) -> rusqlite::Result<()> {
+    shard.reset()?;
+    shard.seed_from_engine_state(state)?;
     // Replay the durable terminal-audit archive on top of the live snapshot
     // (issue #831): the snapshot only carries live instances, so completed/
     // terminal history — which lived only in the read model — is restored here
@@ -2441,10 +2441,9 @@ fn reseed_from_engine_state(
         ),
     }
     if total > 0 {
-        shard
-            .advance_exported(total as usize)
-            .expect("advance exported_position to the recovered event count");
+        shard.advance_exported(total as usize)?;
     }
+    Ok(())
 }
 
 /// Resets a shard and rebuilds it from just the surviving tail. Because
@@ -2459,16 +2458,20 @@ fn rebuild_from_surviving_tail(
     floor: u64,
     surviving: &[&Event],
     export_ctx: &str,
-) {
-    shard.reset().expect("reset read store");
+) -> rusqlite::Result<()> {
+    shard.reset()?;
     if floor > 0 {
-        shard
-            .advance_exported(floor as usize)
-            .expect("advance exported_position to the compaction floor");
+        shard.advance_exported(floor as usize)?;
     }
     if !surviving.is_empty() {
-        shard.export(surviving).expect(export_ctx);
+        shard.export(surviving).map_err(|e| {
+            // Keep the operator-facing context the `expect` message carried,
+            // attached to the typed error rather than a panic payload.
+            tracing::error!(error = %e, "{export_ctx}");
+            e
+        })?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3724,7 +3727,7 @@ mod tests {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            catch_up_shard(&store, recovery.first_index, &surviving, None);
+            let _ = catch_up_shard(&store, recovery.first_index, &surviving, None);
         }));
         std::panic::set_hook(prev);
         assert!(
@@ -3741,7 +3744,7 @@ mod tests {
         // Safe from cross-test env races: this is the only test touching this var.
         unsafe { std::env::set_var("NANOBPMN_READ_MODEL_LOSSY_REBUILD", "1") };
         let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            catch_up_shard(&store, recovery.first_index, &surviving, None);
+            let _ = catch_up_shard(&store, recovery.first_index, &surviving, None);
         }));
         unsafe { std::env::remove_var("NANOBPMN_READ_MODEL_LOSSY_REBUILD") };
         assert!(rebuilt.is_ok(), "the escape hatch must rebuild, not abort");
@@ -3829,7 +3832,8 @@ mod tests {
             recovery.first_index,
             &surviving,
             Some(engine.engine_state()),
-        );
+        )
+        .expect("reprojection catch-up succeeds");
 
         assert_eq!(
             store.exported_position() as u64,
@@ -3912,7 +3916,8 @@ mod tests {
         assert!(engine.engine_state().instances.is_empty());
 
         // Drive the public reprojection entrypoint with a non-zero floor.
-        catch_up_shard(&store, 100, &[], Some(engine.engine_state()));
+        catch_up_shard(&store, 100, &[], Some(engine.engine_state()))
+            .expect("reprojection catch-up succeeds");
 
         assert_eq!(
             store.process_instance(999).map(|r| r.state),
@@ -5335,5 +5340,81 @@ mod tests {
             );
             let _ = fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Epic #1357 failure-injection guard: a poisoned `sealed` mutex must be
+    /// RECOVERED (the guard is taken from the poison) on the compaction paths —
+    /// never a panic. The list is only mutated under the lock, so a poisoned
+    /// guard still observes a consistent list.
+    #[test]
+    fn poisoned_sealed_lock_is_recovered_not_panicked() {
+        let dir = temp_dir("sealed-poison");
+        let shared = SegShared::legacy(dir.join(ACTIVE_NAME));
+
+        // Poison the mutex: panic while holding the guard.
+        let sealed = &shared.sealed;
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sealed.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            shared.sealed.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // Both compaction entry points must still work (empty list → no-op).
+        assert_eq!(compact(&shared, u64::MAX), 0);
+        assert_eq!(compact_multi(&shared, &[u64::MAX], &[u64::MAX]), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Epic #1357 failure-injection guard: a failing read-model export during
+    /// catch-up must surface as a typed `Err` (rusqlite), never a panic — the
+    /// replay-migrator path (#1071) changes error handling only, never silently
+    /// drops or rewinds. The failure is injected deterministically by dropping
+    /// the `process_instances` table (via a second connection to the same
+    /// file-backed store) that the projection writes, so `export` fails with a
+    /// typed SQLite error.
+    #[test]
+    fn catch_up_shard_propagates_export_failure_as_typed_error() {
+        use crate::readstore::ReadStore;
+
+        let dir = temp_dir("catchup-err");
+        fs::create_dir_all(&dir).unwrap();
+        let store_path = dir.join("read-model.sqlite");
+        let store = ReadStore::open(Some(&store_path)).expect("open file-backed read store");
+
+        let event = Event::ProcessInstanceCreated {
+            instance_key: 1,
+            process_id: "p".into(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        let surviving: Vec<&Event> = vec![&event];
+
+        // Break the projection's target table via a second connection to the same
+        // file, so the export's INSERT fails with a typed rusqlite error.
+        {
+            let conn = rusqlite::Connection::open(&store_path).expect("second connection");
+            conn.execute_batch("DROP TABLE process_instances;")
+                .expect("drop the projection target table");
+        }
+
+        let result = catch_up_shard(&store, 0, &surviving, None);
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            result.is_err(),
+            "a failing export must surface as a typed error, not a panic"
+        );
     }
 }

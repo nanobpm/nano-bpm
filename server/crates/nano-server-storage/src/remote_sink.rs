@@ -107,7 +107,7 @@ impl InflightIndex {
     /// Applies a log-ordered batch, returning the exact net in-flight delta and
     /// the keys that made a genuine Active->terminal transition in this batch.
     pub fn apply(&self, events: &[&Event]) -> ExportOutcome {
-        let mut active = self.active.lock().expect("in-flight index poisoned");
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         let mut inflight_delta: i64 = 0;
         let mut terminal_keys = Vec::new();
         for &event in events {
@@ -135,7 +135,7 @@ impl InflightIndex {
 
     /// Number of instances currently tracked as Active.
     pub fn active_count(&self) -> usize {
-        self.active.lock().expect("in-flight index poisoned").len()
+        self.active.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -219,6 +219,13 @@ impl HttpBatchTransport {
     /// (e.g. `http://exporter-host:9700/ingest`); `capacity` bounds the in-RAM
     /// queue of undelivered batches (backpressure threshold); `concurrency`
     /// bounds the number of POSTs kept in flight at once (pipeline depth).
+    // expect_used: spawning the exporter thread fails only on OS resource
+    // exhaustion; a transport with no sender thread would silently drop every
+    // batch, so construction aborts loudly instead.
+    #[allow(
+        clippy::expect_used,
+        reason = "thread spawn failure is a fatal OS resource error at transport construction"
+    )]
     pub fn new(endpoint: String, capacity: usize, concurrency: usize) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<HttpBatch>(capacity.max(1));
         let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -490,6 +497,34 @@ mod tests {
         assert_eq!(o.inflight_delta, 1); // +2 creates, -1 completion
         assert_eq!(o.terminal_keys, vec![1]);
         assert_eq!(idx.active_count(), 1); // key 2 still active
+    }
+
+    /// Epic #1357 failure-injection guard: a poisoned in-flight-index mutex must
+    /// be RECOVERED, not panicked — the exporter path must keep projecting even
+    /// if some thread panicked while holding the index lock.
+    #[test]
+    fn poisoned_inflight_lock_is_recovered_not_panicked() {
+        let idx = InflightIndex::new();
+        outcome_of(&idx, &[created(1)]);
+
+        let active = &idx.active;
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = active.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            idx.active.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // Both locked paths still work.
+        let o = outcome_of(&idx, &[created(2), completed(1)]);
+        assert_eq!(o.inflight_delta, 0);
+        assert_eq!(idx.active_count(), 1);
     }
 
     #[test]

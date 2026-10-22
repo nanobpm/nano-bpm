@@ -167,6 +167,12 @@ impl ReadModel {
 
     /// A single in-memory shard for partition 0 — the trivial (single-partition /
     /// test) case.
+    // expect_used: opening an in-memory SQLite read store cannot fail in practice
+    // (no file I/O); a failure here is a broken SQLite build, surfaced loudly.
+    #[allow(
+        clippy::expect_used,
+        reason = "in-memory SQLite open is infallible in practice"
+    )]
     pub fn single_in_memory() -> Self {
         Self::from_shards(vec![(
             0,
@@ -175,6 +181,12 @@ impl ReadModel {
     }
 
     /// In-memory shards, one per partition in `owned`.
+    // expect_used: opening an in-memory SQLite read store cannot fail in practice
+    // (no file I/O); a failure here is a broken SQLite build, surfaced loudly.
+    #[allow(
+        clippy::expect_used,
+        reason = "in-memory SQLite open is infallible in practice"
+    )]
     pub fn in_memory_partitions(owned: &[u64]) -> Self {
         let shards = owned
             .iter()
@@ -439,6 +451,12 @@ impl ReadModel {
     /// so cross-shard ordering has a single home; the shared read store is the
     /// source of the rows.
     /// Panics on query failure; request handlers use [`Self::try_agent_instances`].
+    // expect_used: documented panic-on-query-failure convenience wrapper over the
+    // typed `try_agent_instances`; request handlers use the typed variant.
+    #[allow(
+        clippy::expect_used,
+        reason = "documented panicking wrapper over try_agent_instances"
+    )]
     pub fn agent_instances(&self) -> Vec<AgentInstanceRow> {
         self.try_agent_instances().expect("query agent_instances")
     }
@@ -454,6 +472,12 @@ impl ReadModel {
     /// A single agent instance by its dedicated key, returning the first shard's
     /// match (keys are unique across shards, so at most one shard answers).
     /// Panics on query failure; request handlers use [`Self::try_agent_instance`].
+    // expect_used: documented panic-on-query-failure convenience wrapper over the
+    // typed `try_agent_instance`; request handlers use the typed variant.
+    #[allow(
+        clippy::expect_used,
+        reason = "documented panicking wrapper over try_agent_instance"
+    )]
     pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
         self.try_agent_instance(key).expect("query agent_instance")
     }
@@ -472,6 +496,12 @@ impl ReadModel {
     /// [`AgentHistoryFilter`], so passing the filter through preserves it as the
     /// single source of truth; the REST handler sorts and paginates the result.
     /// Panics on query failure; request handlers use [`Self::try_agent_history`].
+    // expect_used: documented panic-on-query-failure convenience wrapper over the
+    // typed `try_agent_history`; request handlers use the typed variant.
+    #[allow(
+        clippy::expect_used,
+        reason = "documented panicking wrapper over try_agent_history"
+    )]
     pub fn agent_history(&self, filter: &AgentHistoryFilter) -> Vec<AgentHistoryRow> {
         self.try_agent_history(filter).expect("query agent_history")
     }

@@ -318,6 +318,13 @@ impl VarSpillStore {
     /// store has been quiet for `idle_ms` and the freelist exceeds `threshold_bytes`,
     /// it reclaims in [`RECLAIM_CHUNK_PAGES`]-sized passes, re-checking for resumed
     /// activity between passes so live load preempts the drain.
+    // expect_used: spawning the reclaim thread fails only on OS resource
+    // exhaustion (thread spawn); there is no recoverable fallback for a missing
+    // maintenance thread at open, so abort startup loudly.
+    #[allow(
+        clippy::expect_used,
+        reason = "thread spawn failure is a fatal OS resource error at store open"
+    )]
     fn spawn_reclaim_worker(
         conn: Arc<Mutex<Connection>>,
         activity: Arc<AtomicU64>,
@@ -375,6 +382,16 @@ impl VarSpillStore {
     /// Starts the background forget worker: receives batches of keys and deletes
     /// their spill/cold rows off the engine actor, in [`FORGET_CHUNK`]-sized
     /// transactions so each commit holds the connection lock only briefly.
+    // expect_used: (1) thread spawn failure is a fatal OS resource error at store
+    // open; (2) inside the worker, a poisoned connection lock or a failed
+    // checkpoint means the connection is in an unknown state — the worker aborts
+    // loudly (matching `delete_keys`) rather than silently letting the WAL grow
+    // without bound under sustained retirement, the failure this backstop exists
+    // to prevent.
+    #[allow(
+        clippy::expect_used,
+        reason = "thread spawn is fatal at open; a poisoned lock or failed checkpoint aborts the worker loudly rather than leaking unbounded WAL growth"
+    )]
     fn spawn_forget_worker(conn: Arc<Mutex<Connection>>, activity: Arc<AtomicU64>) -> ForgetWorker {
         let (tx, rx) = sync_channel::<ForgetMsg>(forget_queue_cap());
         let handle = std::thread::Builder::new()
@@ -438,13 +455,21 @@ impl VarSpillStore {
     /// engine actor's own spill/rehydrate access). Bumps `activity` once per chunk
     /// so the reclaim worker sees the store as busy for the entire (potentially
     /// long) sweep, not just at its start.
+    // expect_used: any SQLite failure mid-batch would drop deletes and
+    // reintroduce the orphan cold rows (and unbounded file growth) this path
+    // exists to prevent — surfaced loudly (abort) rather than silently skipping
+    // deletes. (The connection lock itself recovers from poison; see below.)
+    #[allow(
+        clippy::expect_used,
+        reason = "a SQLite failure mid-forget aborts loudly; silently skipping deletes would leak orphan cold rows"
+    )]
     fn delete_keys(conn: &Mutex<Connection>, activity: &AtomicU64, keys: &[Key]) {
         for chunk in keys.chunks(FORGET_CHUNK) {
             activity.fetch_add(1, Ordering::Relaxed);
-            // A poisoned lock means another thread panicked mid-mutation, leaving the
-            // connection in an unknown state; treat it as fatal (matching `put`/`take`)
-            // rather than silently skipping deletes and leaking orphan cold rows.
-            let mut guard = conn.lock().expect("spill store poisoned");
+            // A poisoned lock means another thread panicked mid-mutation; the
+            // connection itself is still usable (every op is atomic under the
+            // lock), so recover the guard rather than abort the forget path.
+            let mut guard = conn.lock().unwrap_or_else(|e| e.into_inner());
             // Surface any SQLite failure loudly, for the same reason the poisoned
             // lock is fatal above: silently swallowing a transaction/prepare/execute/
             // commit error would drop deletes mid-batch and reintroduce the orphan
@@ -474,8 +499,9 @@ impl VarSpillStore {
 
     /// Persists `vars` under `key`, replacing any prior payload.
     pub fn put(&self, key: Key, vars: &HashMap<String, Value>) -> rusqlite::Result<()> {
-        let json = serde_json::to_string(vars).expect("variables serialize to JSON");
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = serde_json::to_string(vars)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO spill (key, vars) VALUES (?1, ?2)",
             params![key as i64, json],
@@ -489,7 +515,7 @@ impl VarSpillStore {
     /// Used to fold spilled payloads into a self-contained snapshot (#1331): the
     /// live instance stays spilled, so its row must survive the read.
     pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         drop(conn);
         serde_json::from_str(&json).ok()
@@ -499,7 +525,7 @@ impl VarSpillStore {
     /// instance is rehydrated exactly once (on activation), so taking the row on
     /// read keeps the store bounded to the still-cold backlog.
     pub fn take(&self, key: Key) -> Option<HashMap<String, Value>> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM spill WHERE key = ?1", params![key as i64]);
         drop(conn);
@@ -519,8 +545,9 @@ impl VarSpillStore {
     /// variable spill above, so the two tiers live in one file and one durability
     /// story — the reason cold spill reuses this store rather than a second DB.
     pub fn put_cold(&self, key: Key, snapshot: &InstanceSnapshot) -> rusqlite::Result<()> {
-        let json = serde_json::to_string(snapshot).expect("snapshot serializes to JSON");
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = serde_json::to_string(snapshot)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO cold (key, snapshot) VALUES (?1, ?2)",
             params![key as i64, json],
@@ -534,7 +561,7 @@ impl VarSpillStore {
     /// absent. Used to fold a still-cold instance into a self-contained snapshot
     /// (#1331) while it stays off-heap.
     pub fn get_cold(&self, key: Key) -> Option<InstanceSnapshot> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         drop(conn);
         serde_json::from_str(&json).ok()
@@ -545,7 +572,7 @@ impl VarSpillStore {
     /// instance takes its snapshot back out, so the cold table holds only the
     /// still-dormant backlog.
     pub fn take_cold(&self, key: Key) -> Option<InstanceSnapshot> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
         drop(conn);
@@ -619,21 +646,24 @@ impl VarSpillStore {
     /// Blocks until every batch queued on the background forget worker before this
     /// call has been applied. A no-op for in-memory stores (forgets run inline).
     /// Used by tests and graceful shutdown to make the async deletes observable.
-    pub fn flush_forgets(&self) {
+    ///
+    /// Returns `false` when the worker is gone (channel disconnected) instead of
+    /// panicking: a false "flushed" signal would mask lost or still-pending
+    /// deletes, so callers observe the failure explicitly.
+    pub fn flush_forgets(&self) -> bool {
         let Some(tx) = self.forget.as_ref().and_then(|w| w.tx.as_ref()) else {
-            return;
+            return true;
         };
         let (ack_tx, ack_rx) = channel();
         // A live store keeps its worker running until `ForgetWorker::drop` closes
         // the channel, so a failed send or ack-recv here means the worker has
-        // panicked/exited. Surface that loudly rather than returning a false
+        // panicked/exited. Surface that (as `false`) rather than returning a false
         // "flushed" signal to tests / graceful shutdown (which would mask lost or
         // still-pending deletes — the orphan-row leak this path guards against).
-        tx.send(ForgetMsg::Flush(ack_tx))
-            .expect("varspill forget worker gone before flush");
-        ack_rx
-            .recv()
-            .expect("varspill forget worker dropped flush ack");
+        if tx.send(ForgetMsg::Flush(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv().is_ok()
     }
 
     /// The store's on-disk size as `(file_bytes, live_bytes)` (see
@@ -642,7 +672,7 @@ impl VarSpillStore {
     /// incremental auto-vacuum + background reclaim, `file_bytes` settles toward the
     /// live cold backlog once a spike drains, rather than plateauing at the peak.
     pub fn db_page_stats(&self) -> (u64, u64) {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         page_stats(&conn)
     }
 }
@@ -663,6 +693,48 @@ mod tests {
         store.put(7, &vars("hello")).unwrap();
         let got = store.take(7).expect("payload present");
         assert_eq!(got.get("data"), Some(&Value::Str("hello".to_string())));
+    }
+
+    /// Epic #1357 failure-injection guard: a poisoned connection mutex must be
+    /// RECOVERED (the guard is taken from the poison) on every public path —
+    /// never a panic. Poisoning means some thread panicked mid-mutation; the
+    /// store stays available because every operation here is atomic under the
+    /// lock (a panic between operations leaves the connection usable).
+    #[test]
+    fn poisoned_connection_lock_is_recovered_not_panicked() {
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(1, &vars("before-poison")).unwrap();
+
+        // Poison the mutex: panic while holding the guard.
+        let conn = Arc::clone(&store.conn);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = conn.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            store.conn.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // Every public path must still work — no panics.
+        store.put(2, &vars("after-poison")).unwrap();
+        assert_eq!(store.get(1), Some(vars("before-poison")));
+        assert_eq!(store.take(2), Some(vars("after-poison")));
+        let snapshot = cold_snapshot(3, "cold");
+        store.put_cold(3, &snapshot).unwrap();
+        assert_eq!(store.get_cold(3), Some(snapshot.clone()));
+        assert_eq!(store.take_cold(3), Some(snapshot));
+        let (file_bytes, live_bytes) = store.db_page_stats();
+        assert!(
+            live_bytes > 0,
+            "stats still read: ({file_bytes}, {live_bytes})"
+        );
+        store.forget(&[1]);
+        assert!(store.get(1).is_none(), "forget still deletes");
     }
 
     // #1331: the store's rows must survive a process restart (re-open), because
@@ -915,7 +987,7 @@ mod tests {
         // Enqueue the forget; the actual DELETEs run on the worker thread.
         store.forget_async(&[1, 2]);
         // A flush barrier acks only after every batch queued before it is applied.
-        store.flush_forgets();
+        assert!(store.flush_forgets(), "forget worker flushed");
 
         assert!(
             store.take(1).is_none(),
@@ -929,7 +1001,7 @@ mod tests {
 
         // Empty slice is a cheap no-op (no message queued).
         store.forget_async(&[]);
-        store.flush_forgets();
+        assert!(store.flush_forgets(), "forget worker flushed");
 
         drop(store);
         let _ = std::fs::remove_file(&path);
@@ -947,6 +1019,6 @@ mod tests {
             "in-memory forget_async is synchronous"
         );
         // flush is a no-op when there is no worker.
-        store.flush_forgets();
+        assert!(store.flush_forgets(), "forget worker flushed");
     }
 }

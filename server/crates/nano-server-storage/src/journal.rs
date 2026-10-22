@@ -386,7 +386,11 @@ fn forward_shared_export(
         debug_assert!(false, "shared write with no exporter cell wired");
         return;
     };
-    if let Some((tx, queued)) = cell.lock().unwrap().get(&partition) {
+    if let Some((tx, queued)) = cell
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&partition)
+    {
         // Account the queued bytes BEFORE the send so the create-admission gauge
         // never lags behind a queue the exporter has not yet drained; the
         // exporter subtracts the same amount once the batch is projected.
@@ -866,7 +870,7 @@ impl SharedWriter {
         let shared = SegShared::legacy(path.as_ref().to_path_buf());
         let seg = ActiveSegment::open(shared)?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        spawn_writer(seg, rx, None).expect("spawn shared journal writer thread");
+        spawn_writer(seg, rx, None)?;
         Ok(Self {
             tx,
             seg: None,
@@ -892,8 +896,7 @@ impl SharedWriter {
         let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
         let exporter: ExporterCell = Arc::new(Mutex::new(HashMap::new()));
-        spawn_writer(seg_active, rx, Some(Arc::clone(&exporter)))
-            .expect("spawn shared journal writer thread");
+        spawn_writer(seg_active, rx, Some(Arc::clone(&exporter)))?;
         Ok((
             Self {
                 tx,
@@ -1077,8 +1080,7 @@ impl Journal {
         let shared = SegShared::legacy(path.to_path_buf());
         let seg_active = ActiveSegment::open(shared)?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        let writer_thread =
-            spawn_writer(seg_active, rx, None).expect("spawn journal writer thread");
+        let writer_thread = spawn_writer(seg_active, rx, None)?;
 
         Ok(Self {
             engine,
@@ -1109,8 +1111,7 @@ impl Journal {
         let shared = Arc::clone(&recovery.shared);
         let seg_active = ActiveSegment::open(Arc::clone(&shared))?;
         let (tx, rx) = mpsc::channel::<WriterMsg>();
-        let writer_thread =
-            spawn_writer(seg_active, rx, None).expect("spawn journal writer thread");
+        let writer_thread = spawn_writer(seg_active, rx, None)?;
 
         let journal = Self {
             engine,
@@ -1498,13 +1499,21 @@ impl Journal {
         // resident falls under `low_water` (the OOM guard's reclaim target).
         let threshold = if shedding { low } else { high };
         if resident < threshold {
-            if shedding {
-                self.cold.as_mut().expect("cold set").shedding = false;
+            if shedding && let Some(cold) = self.cold.as_mut() {
+                cold.shedding = false;
             }
             return;
         }
-        self.cold.as_mut().expect("cold set").shedding = true;
-        let store = Arc::clone(&self.cold.as_ref().expect("cold set").store);
+        // Total: the match above returned unless `self.cold` is `Some`, so the
+        // spill state is present here by construction.
+        // expect_used: invariant by construction — see the match guard above.
+        #[allow(
+            clippy::expect_used,
+            reason = "self.cold is Some by the match guard at function entry"
+        )]
+        let cold = self.cold.as_mut().expect("cold set");
+        cold.shedding = true;
+        let store = Arc::clone(&cold.store);
         // Evict dormant instances under a bounded per-tick wall-clock budget
         // ([`SPILL_TICK_BUDGET`]), then purge ONCE — same rationale as the variable
         // sweep: holding the single writer through a `shrink()` + `purge()` per
@@ -1524,11 +1533,11 @@ impl Journal {
                     continue;
                 };
                 if store.put_cold(key, &snapshot).is_ok() {
-                    self.cold
-                        .as_mut()
-                        .expect("cold set")
-                        .index
-                        .insert(&snapshot);
+                    // Total: `self.cold` is `Some` for the whole sweep (bound
+                    // above and never cleared here).
+                    if let Some(cold) = self.cold.as_mut() {
+                        cold.index.insert(&snapshot);
+                    }
                     spilled_in_batch += 1;
                 } else {
                     // Store write failed: keep the instance resident rather than
@@ -1543,9 +1552,9 @@ impl Journal {
         }
         if spilled > 0 {
             let _ = crate::memory::purge();
+            let cold_len = self.cold.as_ref().map_or(0, |cold| cold.index.len());
             tracing::info!(
-                "cold spill: shed {spilled} dormant instance(s) to disk ({} now cold, budgeted)",
-                self.cold.as_ref().expect("cold set").index.len(),
+                "cold spill: shed {spilled} dormant instance(s) to disk ({cold_len} now cold, budgeted)",
             );
             // Clear the latch once this sweep has dropped resident under the
             // low-water target. Cold spill removes *whole* instances (unlike a
@@ -1553,7 +1562,9 @@ impl Journal {
             // compact them ONCE here, at the end of the shedding episode, rather
             // than `shrink_to_fit`-ing all ten maps on every firing tick.
             if crate::memory::resident_bytes().is_some_and(|now| (now as u64) < low) {
-                self.cold.as_mut().expect("cold set").shedding = false;
+                if let Some(cold) = self.cold.as_mut() {
+                    cold.shedding = false;
+                }
                 self.engine.shrink();
             }
         }
@@ -1591,11 +1602,11 @@ impl Journal {
                     continue;
                 };
                 if store.put_cold(key, &snapshot).is_ok() {
-                    self.cold
-                        .as_mut()
-                        .expect("cold set")
-                        .index
-                        .insert(&snapshot);
+                    // Total: `self.cold` is `Some` for the whole sweep (bound
+                    // above and never cleared here).
+                    if let Some(cold) = self.cold.as_mut() {
+                        cold.index.insert(&snapshot);
+                    }
                     spilled_in_batch += 1;
                 } else {
                     self.engine.rehydrate_instance(snapshot);
@@ -1626,7 +1637,7 @@ impl Journal {
     pub fn set_exporter(&mut self, exporter: Sender<ExportBatch>, queued: Arc<AtomicU64>) {
         if let Some(cell) = self.shared_exporter.as_ref() {
             cell.lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(self.partition_id, (exporter, queued));
         } else {
             self.exporter = Some(exporter);
@@ -1802,6 +1813,14 @@ impl Journal {
                 bytes.extend_from_slice(self.partition_id.to_string().as_bytes());
                 bytes.push(b'\t');
             }
+            // expect_used: `Event`'s serde derive is total (every field is a
+            // serializable value type), so serialization cannot fail; `persist`
+            // returns a `Commit` (no error channel), so there is no typed path
+            // to propagate through here.
+            #[allow(
+                clippy::expect_used,
+                reason = "Event serialization is total (serde derive over value types); Commit carries no error channel"
+            )]
             let line = serde_json::to_string(event).expect("event serializes");
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');
@@ -1951,8 +1970,13 @@ impl Journal {
             if let Some(vars) = self.engine.spill_variables(key) {
                 let ok = if let Some(vstore) = varstore.as_ref() {
                     vstore.put_current(key, &vars).is_ok()
+                } else if let Some(spill) = spill_store.as_ref() {
+                    // Total: the early return above guarantees at least one of
+                    // varstore / spill_store is `Some`; with varstore `None`
+                    // here, the spill store is present by construction.
+                    spill.put(key, &vars).is_ok()
                 } else {
-                    spill_store.as_ref().unwrap().put(key, &vars).is_ok()
+                    false
                 };
                 if ok {
                     shed += 1;
@@ -2147,13 +2171,8 @@ impl Journal {
         // Rehydrate up to `max_jobs` cold instances holding an activatable job of
         // this type, so a worker poll can reach a parked-then-cold backlog. Only
         // pays a SQLite read when something of this type is actually cold.
-        if self.cold.is_some() {
-            let candidates = self
-                .cold
-                .as_ref()
-                .expect("cold set")
-                .index
-                .instances_for_job_type(job_type, max_jobs);
+        if let Some(cold) = self.cold.as_ref() {
+            let candidates = cold.index.instances_for_job_type(job_type, max_jobs);
             for key in candidates {
                 self.rehydrate_cold(key);
             }
@@ -2224,13 +2243,8 @@ impl Journal {
     pub fn trigger_timers(&mut self, now: u64) -> (Arc<Vec<Event>>, Commit) {
         // Rehydrate any cold instance whose armed timer is now due, so the tick
         // can fire it. No-op when nothing cold is due.
-        if self.cold.is_some() {
-            let due = self
-                .cold
-                .as_ref()
-                .expect("cold set")
-                .index
-                .instances_due(now);
+        if let Some(cold) = self.cold.as_ref() {
+            let due = cold.index.instances_due(now);
             for key in due {
                 self.rehydrate_cold(key);
             }
@@ -2618,6 +2632,37 @@ mod tests {
             .connect("work", "end")
             .build()
             .expect("valid demo process")
+    }
+
+    /// Epic #1357 failure-injection guard: a poisoned shared-exporter-cell
+    /// mutex must be RECOVERED (the guard is taken from the poison), never a
+    /// panic — a poisoned cell must not take down the journal write path.
+    #[test]
+    fn poisoned_exporter_cell_lock_is_recovered_not_panicked() {
+        let cell: ExporterCell =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        // Poison the mutex: panic while holding the guard.
+        let poison_target = std::sync::Arc::clone(&cell);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_target.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            cell.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // Both locked paths (write-side forward + set_exporter insert) recover.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        forward_shared_export(&Some(cell.clone()), 0, None, 0);
+        let mut journal = Journal::in_memory();
+        journal.shared_exporter = Some(cell);
+        journal.set_exporter(tx, std::sync::Arc::new(AtomicU64::new(0)));
     }
 
     #[test]

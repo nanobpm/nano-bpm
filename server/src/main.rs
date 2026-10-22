@@ -3038,7 +3038,12 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
             .iter()
             .find(|(p, _)| p == pid)
             .map(|(_, e)| e.state());
-        seglog::catch_up_shard(shard, base_p, &p_events, reseed_state);
+        // Boot-fatal: a read model that cannot catch up (typed error from the
+        // store) means the projection is not durable/consistent — abort boot
+        // loudly rather than serve a stale read model.
+        if let Err(e) = seglog::catch_up_shard(shard, base_p, &p_events, reseed_state) {
+            panic!("failed to catch up read-model shard {pid} from the segmented journal: {e}");
+        }
     }
 }
 
@@ -23949,7 +23954,8 @@ async fn main() {
                         recovery.first_index,
                         &surviving,
                         Some(journal.engine_state()),
-                    );
+                    )
+                    .expect("failed to catch up the read model from the segmented journal");
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 } else {
