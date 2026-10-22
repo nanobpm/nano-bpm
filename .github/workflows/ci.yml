@@ -305,8 +305,12 @@ jobs:
           # Cache-key rider so this job doesn't fight the engine-core job's cache
           # (they build the same crate for different targets).
           key: wasm32
-      - name: Install binaryen (wasm-opt)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Install binaryen (wasm-opt) + mold linker
+        # binaryen: wasm-opt for the dist build. mold: the host Clippy step
+        # below links host build scripts / proc-macros, and the repo's
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu —
+        # without it that step fails at the link before linting.
+        run: sudo apt-get update && sudo apt-get install -y binaryen mold
       - name: Build + verify + emit dist
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
