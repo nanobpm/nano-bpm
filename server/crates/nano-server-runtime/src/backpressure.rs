@@ -876,8 +876,8 @@ impl ProcessGovernors {
         if dt_s <= 0.0 {
             return;
         }
-        let mut st = self.state.lock().unwrap();
-        let mut pubm = self.published.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pubm = self.published.lock().unwrap_or_else(|e| e.into_inner());
         for (pid, inflight, created) in backlog {
             let e = st.entry(pid.clone()).or_insert_with(|| DefGov {
                 prev_inflight: *inflight,
@@ -932,7 +932,7 @@ impl ProcessGovernors {
     /// per-definition accumulator (no RNG, deterministic). Zero-pressure (the
     /// common case) is a cheap map lookup with no shed.
     pub fn should_shed(&self, pid: &str) -> bool {
-        let mut pubm = self.published.lock().unwrap();
+        let mut pubm = self.published.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = pubm.get_mut(pid) {
             if slot.permille == 0 {
                 return false;
@@ -951,7 +951,7 @@ impl ProcessGovernors {
     pub fn pressures(&self) -> Vec<(String, u32)> {
         self.published
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|(_, s)| s.permille > 0)
             .map(|(k, s)| (k.clone(), s.permille))
@@ -1193,7 +1193,7 @@ impl GlobalGuard {
         // backpressure is unconfigured).
         let exporter_permille = Self::exporter_permille(self.cfg.exporter_knee, exporter_fill);
 
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
 
         if !self.cfg.enabled || !active {
             st.pressure = 0.0;
@@ -1348,7 +1348,10 @@ impl GlobalGuard {
     }
 
     fn publish(&self, permille: u32) {
-        self.published.lock().unwrap().permille = permille;
+        self.published
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .permille = permille;
     }
 
     /// Admission hook: return `true` if this `createProcessInstance` should be shed
@@ -1356,7 +1359,7 @@ impl GlobalGuard {
     /// *all* creates, spread evenly by an accumulator (no RNG, deterministic).
     /// Zero-pressure (the common case) is a single cheap lock with no shed.
     pub fn should_shed(&self) -> bool {
-        let mut pubm = self.published.lock().unwrap();
+        let mut pubm = self.published.lock().unwrap_or_else(|e| e.into_inner());
         if pubm.permille == 0 {
             return false;
         }
@@ -2326,5 +2329,48 @@ mod tests {
             w_target_s: 1.0,
             deadband_frac: 0.1,
         }
+    }
+
+    /// Poison both `ProcessGovernors` mutexes (a panic while holding each
+    /// guard), then confirm the public API still works: lock poisoning on this
+    /// recoverable observability path must never abort the process.
+    #[test]
+    fn process_governors_survive_poisoned_locks() {
+        let gov = ProcessGovernors::new(ProcGovConfig::default());
+        let state_ref: &std::sync::Mutex<std::collections::HashMap<String, DefGov>> = &gov.state;
+        let pub_ref: &std::sync::Mutex<std::collections::HashMap<String, PubPressure>> =
+            &gov.published;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = state_ref.lock();
+            panic!("poison state");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = pub_ref.lock();
+            panic!("poison published");
+        }));
+
+        // Every entry point recovers the poisoned guard instead of panicking.
+        gov.step(1.0, &[("p".to_string(), 10, 100)]);
+        let _ = gov.should_shed("p");
+        let _ = gov.pressures();
+    }
+
+    /// Same guard for the Tier-1 `GlobalGuard` mutexes.
+    #[test]
+    fn global_guard_survives_poisoned_locks() {
+        let g = GlobalGuard::new(Tier1Config::default());
+        let state_ref: &std::sync::Mutex<GuardState> = &g.state;
+        let pub_ref: &std::sync::Mutex<PubPressure> = &g.published;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = state_ref.lock();
+            panic!("poison state");
+        }));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = pub_ref.lock();
+            panic!("poison published");
+        }));
+
+        let _ = g.step(1000.0, true, false, 0.0, false);
+        let _ = g.should_shed();
     }
 }

@@ -32,3 +32,9 @@ console = []
 # Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
 # warning (unused code, deprecations, future-incompat lints, etc.).
 warnings = "deny"
+
+[lints.clippy]
+# Epic #1357: no panicking unwrap/expect in production code — fallible paths
+# propagate typed errors, infallible invariants carry a scoped `#[allow]`.
+unwrap_used = "deny"
+expect_used = "deny"

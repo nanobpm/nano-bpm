@@ -479,7 +479,7 @@ impl RaftLogReader<RaftConfig> for MemLogStore {
         let Some(bounds) = clamp_log_range(&range) else {
             return Ok(Vec::new());
         };
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Ok(inner.log.range(bounds).map(|(_, e)| e.clone()).collect())
     }
 }
@@ -488,7 +488,7 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<RaftConfig>, StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let last_log_id = inner
             .log
             .values()
@@ -506,12 +506,12 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().unwrap().vote = Some(*vote);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().vote)
+        Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote)
     }
 
     async fn append<I>(
@@ -524,7 +524,7 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
         I::IntoIter: OptionalSend,
     {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             for entry in entries {
                 inner.log.insert(entry.log_id.index, entry);
             }
@@ -536,14 +536,14 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Remove everything from `log_id.index` onward (inclusive).
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let _removed = inner.log.split_off(&log_id.index);
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Drop everything up to and including `log_id.index`, keep the rest.
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.last_purged = Some(log_id);
         inner.log = inner.log.split_off(&(log_id.index + 1));
         Ok(())
@@ -553,12 +553,19 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().unwrap().committed = committed;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed = committed;
         Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().committed)
+        Ok(self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed)
     }
 }
 
@@ -924,7 +931,10 @@ impl PartitionStateMachine {
     /// original recovery path).
     async fn restore_from_current_snapshot(&self) -> anyhow::Result<()> {
         let path = {
-            let guard = self.current_snapshot.lock().unwrap();
+            let guard = self
+                .current_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(s) => s.path.clone(),
                 None => return Ok(()),
@@ -1130,7 +1140,12 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
         // Publish as the current snapshot and unlink the file it replaces.
-        let previous = self.sm.current_snapshot.lock().unwrap().replace(stored);
+        let previous = self
+            .sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(stored);
         if let Some(previous) = previous.filter(|p| p.path != path) {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -1155,7 +1170,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         &mut self,
     ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
     {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Ok((inner.last_applied, inner.last_membership.clone()))
     }
 
@@ -1177,7 +1192,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             let log_id = entry.log_id;
             match entry.payload {
                 EntryPayload::Blank => {
-                    self.inner.lock().unwrap().last_applied = Some(log_id);
+                    self.inner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .last_applied = Some(log_id);
                     responses.push(ReplicatedResponse::default());
                 }
                 EntryPayload::Normal(batch) => {
@@ -1258,11 +1276,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             journal.evict_instances(&terminal);
                         });
                     }
-                    self.inner.lock().unwrap().last_applied = Some(log_id);
+                    self.inner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .last_applied = Some(log_id);
                     responses.push(ReplicatedResponse { items });
                 }
                 EntryPayload::Membership(mem) => {
-                    let mut inner = self.inner.lock().unwrap();
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.last_applied = Some(log_id);
                     inner.last_membership = StoredMembership::new(Some(log_id), mem);
                     responses.push(ReplicatedResponse::default());
@@ -1288,7 +1309,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .with(|journal| journal.try_engine_snapshot())
             .await;
         let (last_applied, last_membership) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             (inner.last_applied, inner.last_membership.clone())
         };
         PartitionSnapshotBuilder {
@@ -1375,7 +1396,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .await;
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.last_applied = meta.last_log_id;
             inner.last_membership = meta.last_membership.clone();
         }
@@ -1401,7 +1422,11 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         };
         write_snapshot_ptr(&self.snapshot_dir, &stored)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let previous = self.current_snapshot.lock().unwrap().replace(stored);
+        let previous = self
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(stored);
         if let Some(previous) = previous {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -1414,7 +1439,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // Copy the small (meta, path) pair out from under the lock so the file
         // open can `.await` without holding the std mutex.
         let entry = {
-            let guard = self.current_snapshot.lock().unwrap();
+            let guard = self
+                .current_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|s| (s.meta.clone(), s.path.clone()))
         };
         match entry {
@@ -2281,25 +2309,37 @@ impl RaftRegistry {
     pub fn insert(&self, part: Arc<RaftPartition>) {
         self.partitions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(part.partition_id, part);
     }
 
     /// The hosted group for `partition`, if this node replicates it.
     pub fn get(&self, partition: u64) -> Option<Arc<RaftPartition>> {
-        self.partitions.lock().unwrap().get(&partition).cloned()
+        self.partitions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&partition)
+            .cloned()
     }
 
     /// Whether this node hosts no Raft groups (the non-Raft default).
     pub fn is_empty(&self) -> bool {
-        self.partitions.lock().unwrap().is_empty()
+        self.partitions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// A snapshot of every hosted partition, ordered by partition id. Used by the
     /// `/debug/raft` diagnostic endpoint to dump per-partition replication indices.
     pub fn all(&self) -> Vec<Arc<RaftPartition>> {
-        let mut parts: Vec<Arc<RaftPartition>> =
-            self.partitions.lock().unwrap().values().cloned().collect();
+        let mut parts: Vec<Arc<RaftPartition>> = self
+            .partitions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         parts.sort_by_key(|p| p.partition_id);
         parts
     }
@@ -3042,7 +3082,11 @@ mod tests {
                 )
                 .expect("state machine"),
             );
-            src_sm.inner.lock().unwrap().last_applied = Some(applied);
+            src_sm
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_applied = Some(applied);
             let mut builder = src_sm.get_snapshot_builder().await;
             let _ = builder.build_snapshot().await.expect("build snapshot");
         }

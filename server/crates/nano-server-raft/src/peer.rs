@@ -292,6 +292,10 @@ impl PeerLink {
         }
         let corr = self.next_corr.fetch_add(1, Ordering::Relaxed);
         let frame = build(corr);
+        #[allow(
+            clippy::expect_used,
+            reason = "ClientFrame is a derived-Serialize wire type with no fallible fields; serialization cannot fail"
+        )]
         let txt = serde_json::to_string(&frame).expect("ClientFrame serializes");
 
         let (tx, rx) = oneshot::channel();
@@ -321,6 +325,10 @@ impl PeerLink {
         if !self.is_connected() {
             return Err(PeerError::Closed);
         }
+        #[allow(
+            clippy::expect_used,
+            reason = "ClientFrame is a derived-Serialize wire type with no fallible fields; serialization cannot fail"
+        )]
         let txt = serde_json::to_string(&frame).expect("ClientFrame serializes");
         self.out_app
             .send(Message::Text(txt.into()))

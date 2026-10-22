@@ -768,34 +768,49 @@ impl RaftLogStore {
     /// predicate the `append`/`save_committed` fsync paths branch on.
     #[cfg(test)]
     fn would_defer_fsync(&self) -> bool {
-        self.inner.lock().unwrap().async_durability()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .async_durability()
     }
 
     /// Test-only: force `coalesce_capable` on/off without touching the process
     /// environment (which would race other parallel tests that `open()` a store).
     #[cfg(test)]
     fn force_coalesce_capable(&self, on: bool) {
-        self.inner.lock().unwrap().coalesce_capable = on;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .coalesce_capable = on;
     }
 
     /// Test-only: force the sync-mode committed-marker deferral on/off without
     /// touching the process environment.
     #[cfg(test)]
     fn force_defer_committed(&self, on: bool) {
-        self.inner.lock().unwrap().defer_committed = on;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .defer_committed = on;
     }
 
     /// Test-only: whether the committed/purge markers are dirty in memory (awaiting
     /// a background-flusher persist to `state.json`).
     #[cfg(test)]
     fn is_state_dirty(&self) -> bool {
-        self.inner.lock().unwrap().state_dirty
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state_dirty
     }
 
     /// Test-only: run one background-flusher pass synchronously.
     #[cfg(test)]
     fn flush_now(&self) -> io::Result<()> {
-        self.inner.lock().unwrap().flush_async()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush_async()
     }
 
     /// Opens (creating if absent) a durable log store rooted at `dir`, replaying
@@ -914,7 +929,11 @@ impl RaftLogStore {
         crate::metrics::raft_log_ram_delta(ram_total as i64);
         // A recovered tail loads fully resident; demote its cold prefix so a
         // restart under a large-payload workload does not re-balloon RAM.
-        store.inner.lock().unwrap().enforce_ram_budget();
+        store
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enforce_ram_budget();
 
         // The async flusher bounds the unfsynced window when the partition goes
         // quiet (an idle follower would otherwise hold an unflushed tail
@@ -942,7 +961,7 @@ impl RaftLogStore {
     fn spawn_flusher(&self) {
         let weak: Weak<Mutex<Inner>> = Arc::downgrade(&self.inner);
         let interval = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.flush.interval
         };
         std::thread::Builder::new()
@@ -953,7 +972,7 @@ impl RaftLogStore {
                     let Some(inner) = weak.upgrade() else {
                         break; // store dropped — stop ticking
                     };
-                    let mut inner = inner.lock().unwrap();
+                    let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = inner.flush_async() {
                         tracing::error!(
                             "raft log flusher fsync failed: {e}; aborting to avoid \
@@ -1006,7 +1025,14 @@ impl RaftLogStore {
         // byte offsets, so we truncate the file to the end of the last survivor
         // rather than re-serializing — which also avoids rehydrating any demoted
         // (descriptor-only) entries and keeps every `Stored.offset` valid.
-        let active = kept.last().unwrap();
+        let Some(active) = kept.last() else {
+            // Unreachable: the empty case returned above with a fresh segment.
+            // Guard anyway so a refactor can never turn this into a panic.
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "rewrite_after_truncate: no surviving segment",
+            )));
+        };
         let active_start = active.start;
         let path = seg_path(&inner.dir, active_start);
         let mut cut = 0usize;
@@ -1100,7 +1126,7 @@ impl RaftLogReader<RaftConfig> for RaftLogStore {
             },
         }
         let planned: Vec<Resolved> = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             // Guard against a degenerate (inverted/empty) range before touching
             // the BTreeMap, which would otherwise panic and take the node down.
             // See `crate::raft::clamp_log_range`.
@@ -1120,7 +1146,13 @@ impl RaftLogReader<RaftConfig> for RaftLogStore {
                 })
                 .collect()
         };
-        let dir = { self.inner.lock().unwrap().dir.clone() };
+        let dir = {
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .dir
+                .clone()
+        };
         let mut out = Vec::with_capacity(planned.len());
         for r in planned {
             match r {
@@ -1140,7 +1172,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<RaftConfig>, StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let last_log_id = inner
             .log
             .values()
@@ -1158,17 +1190,17 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // The vote must hit disk before openraft acts on it.
         let bytes = serde_json::to_vec(vote).map_err(io_err)?;
         atomic_write(&inner.dir, &vote_path(&inner.dir), &bytes).map_err(io_err)?;
         drop(inner);
-        self.inner.lock().unwrap().vote = Some(*vote);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().vote)
+        Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote)
     }
 
     async fn append<I>(
@@ -1180,7 +1212,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         I: IntoIterator<Item = Entry<RaftConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut added = 0i64;
         let mut new_bytes = 0usize;
         let mut new_ram = 0usize;
@@ -1281,7 +1313,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Remove everything from `log_id.index` onward (inclusive), then rewrite at
         // most the single straddled segment (log conflicts are rare and bounded).
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before_entries = inner.log.len() as i64;
         let before_bytes = inner.log_bytes as i64;
         let removed = inner.log.split_off(&log_id.index);
@@ -1311,7 +1343,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         // unbounded work — the durable record of the purge is the `state.json`
         // marker; physical segment deletion is best-effort and reconciled on
         // restart, so a failed unlink or a crash mid-purge never resurrects entries.
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before_entries = inner.log.len() as i64;
         let before_bytes = inner.log_bytes as i64;
         inner.last_purged = Some(log_id);
@@ -1358,7 +1390,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.committed = committed;
         // Defer the committed marker to the background flusher when either the store
         // is behaving as `async` (base async mode or the recovery fsync-relief
@@ -1379,7 +1411,11 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().committed)
+        Ok(self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed)
     }
 }
 
@@ -1576,7 +1612,7 @@ mod tests {
         let mut store = RaftLogStore::open(&dir).unwrap();
 
         {
-            let mut inner = store.inner.lock().unwrap();
+            let mut inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.ram_budget = 1;
             inner.demote_scan_from = 0;
             inner.enforce_ram_budget();
@@ -1620,7 +1656,7 @@ mod tests {
         write_segment(&dir, 0, &[0, 1, 2, 3, 4, 5]);
         let mut store = RaftLogStore::open(&dir).unwrap();
         {
-            let mut inner = store.inner.lock().unwrap();
+            let mut inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.ram_budget = 1;
             inner.demote_scan_from = 0;
             inner.enforce_ram_budget();
@@ -1645,7 +1681,7 @@ mod tests {
         write_segment(&dir, 3, &[3, 4, 5]);
         let mut store = RaftLogStore::open(&dir).unwrap();
         let ram_after_demote = {
-            let mut inner = store.inner.lock().unwrap();
+            let mut inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.ram_budget = 1;
             inner.demote_scan_from = 0;
             inner.enforce_ram_budget();
@@ -1656,7 +1692,14 @@ mod tests {
         assert_eq!(indices_in(&mut store).await, vec![3, 4, 5]);
         // The purged entries were demoted (descriptor-only), so resident bytes are
         // unchanged by the purge.
-        assert_eq!(store.inner.lock().unwrap().ram_bytes, ram_after_demote);
+        assert_eq!(
+            store
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ram_bytes,
+            ram_after_demote
+        );
 
         let mut reopened = RaftLogStore::open(&dir).unwrap();
         assert_eq!(indices_in(&mut reopened).await, vec![3, 4, 5]);
@@ -1853,7 +1896,7 @@ mod tests {
         std::fs::write(seg_path(&dir, 0), &file).unwrap();
 
         let store = RaftLogStore::open(&dir).unwrap();
-        let inner = store.inner.lock().unwrap();
+        let inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
         let on_disk = r0.len() + r1.len();
         let uncompressed = (j0.len() + 1) + (j1.len() + 1);
         assert_eq!(

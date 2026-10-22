@@ -180,14 +180,18 @@ pub struct SnapshotSendProgress {
 impl SnapshotSendProgress {
     /// Add an acknowledged chunk's byte count to `target`'s running total.
     fn record(&self, target: NodeId, chunk_len: usize) {
-        let mut m = self.bytes.lock().unwrap();
+        let mut m = self.bytes.lock().unwrap_or_else(|e| e.into_inner());
         *m.entry(target).or_insert(0) += chunk_len as u64;
     }
 
     /// Cumulative bytes streamed to `target` so far, or `None` if no snapshot
     /// chunk has ever been sent to it (no install in progress).
     pub fn bytes_sent(&self, target: NodeId) -> Option<u64> {
-        self.bytes.lock().unwrap().get(&target).copied()
+        self.bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&target)
+            .copied()
     }
 }
 
@@ -358,7 +362,10 @@ impl LocalCluster {
     /// Publishes a node's Raft handle so peers can reach it. Call once per member
     /// after `Raft::new` and before driving the group.
     pub fn register(&self, partition: u64, node: NodeId, raft: openraft::Raft<RaftConfig>) {
-        self.nodes.lock().unwrap().insert((partition, node), raft);
+        self.nodes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((partition, node), raft);
     }
 }
 
@@ -372,7 +379,7 @@ impl RaftTransport for LocalCluster {
         let raft = self
             .nodes
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&(partition, target))
             .cloned();
         Box::pin(async move {
@@ -477,5 +484,22 @@ mod codec_tests {
     #[test]
     fn decode_rejects_corrupt_compressed_payload() {
         assert!(decode_rpc_payload("not-valid-base64!!!", true).is_err());
+    }
+
+    /// A poisoned progress mutex (a panic while the guard is held mid-record)
+    /// must not wedge snapshot progress tracking: `record`/`bytes_sent` recover
+    /// the guard instead of panicking on the consensus hot path.
+    #[test]
+    fn snapshot_send_progress_survives_poisoned_lock() {
+        let progress = SnapshotSendProgress::default();
+        {
+            let bytes: &Mutex<HashMap<NodeId, u64>> = &progress.bytes;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = bytes.lock();
+                panic!("poison progress");
+            }));
+        }
+        progress.record(1, 512);
+        assert_eq!(progress.bytes_sent(1), Some(512));
     }
 }
