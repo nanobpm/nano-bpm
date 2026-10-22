@@ -67,3 +67,11 @@ wasm-opt = ['-Oz', '--enable-bulk-memory', '--enable-nontrapping-float-to-int', 
 # warning (unused code, deprecations, future-incompat lints, linker_messages,
 # etc.). See .cargo/config.toml for the macOS `__eh_frame` linker-warning fix.
 warnings = "deny"
+
+[lints.clippy]
+# Epic #1357: production code must not panic via `.unwrap()`/`.expect()`.
+# Runtime-fallible sites propagate a typed error; genuinely infallible ones
+# carry a narrow `#[allow(..., reason = "…")]`. Test code is exempt via
+# `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
+unwrap_used = "deny"
+expect_used = "deny"

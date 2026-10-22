@@ -36,6 +36,16 @@
 //! `engine-wasm` cdylib), which is exactly where both `-lsqlite3` and `-lwsqlite3`
 //! are resolved.
 
+// Epic #1357: a build script reports unrecoverable configuration failures by
+// panicking — that is the idiomatic, Cargo-sanctioned error path (it aborts the
+// build with the message). None of these sites are runtime-fallible production
+// code, so the crate-wide `unwrap_used`/`expect_used` deny is relaxed here.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "build-script failures abort the build; panic is the idiomatic error path"
+)]
+
 use std::path::{Path, PathBuf};
 
 fn main() {

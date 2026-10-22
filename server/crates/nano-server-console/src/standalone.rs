@@ -435,7 +435,14 @@ pub async fn run(peers: Vec<String>) {
     println!();
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
-    axum::serve(listener, app).await.expect("server error");
+    #[allow(
+        clippy::expect_used,
+        reason = "standalone-console entry point: serving the bound listener is the \
+                  process's terminal task, so an unexpected serve error is fatal"
+    )]
+    {
+        axum::serve(listener, app).await.expect("server error");
+    }
 }
 
 #[cfg(test)]

@@ -186,8 +186,15 @@ impl TraceSink {
         let dropped_w = dropped.clone();
         let handle = std::thread::Builder::new()
             .name("trace-ndjson".to_string())
-            .spawn(move || writer_loop(cfg, rx, queued_w, written_w, errors_w, dropped_w))
-            .expect("spawn trace-ndjson writer thread");
+            .spawn(move || writer_loop(cfg, rx, queued_w, written_w, errors_w, dropped_w));
+        #[allow(
+            clippy::expect_used,
+            reason = "the writer thread is spawned once when the trace sink is \
+                      constructed at startup; a thread-creation failure is \
+                      unrecoverable process-resource exhaustion, not a runtime \
+                      condition"
+        )]
+        let handle = handle.expect("spawn trace-ndjson writer thread");
         Self {
             tx,
             queued_bytes,

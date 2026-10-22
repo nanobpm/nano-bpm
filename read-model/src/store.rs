@@ -549,9 +549,9 @@ fn reconcile_to_schema(conn: &Connection) -> rusqlite::Result<()> {
                         let value = if col.notnull {
                             format!(
                                 "COALESCE({cast}, {})",
-                                col.dflt
-                                    .as_deref()
-                                    .expect("non-null lease column has a schema default")
+                                col.dflt.as_deref().unwrap_or_else(|| {
+                                    panic!("non-null lease column has a schema default")
+                                })
                             )
                         } else {
                             cast
@@ -1933,13 +1933,13 @@ impl ReadStore {
     /// opens a write transaction and creates the rollback journal, exercising
     /// both file and directory permissions.
     fn check_writable(&self) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute("UPDATE meta SET v = v WHERE k = 'schema_fingerprint'", [])?;
         Ok(())
     }
 
     fn ensure_schema(&self) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         Self::ensure_schema_on(&conn)
     }
 
@@ -2063,7 +2063,7 @@ impl ReadStore {
     /// How many journal events have already been durably projected. A boot
     /// catch-up replays only events at or after this offset.
     pub fn exported_position(&self) -> usize {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let v: i64 = conn
             .query_row(
                 "SELECT v FROM meta WHERE k = 'exported_position'",
@@ -2091,11 +2091,8 @@ impl ReadStore {
         if n == 0 {
             return Ok(());
         }
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
-        let conn = self.conn.lock().expect("read store poisoned");
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE meta SET v = v + ?1 WHERE k = 'exported_position'",
             params![n as i64],
@@ -2120,11 +2117,8 @@ impl ReadStore {
         // performs destructive DDL, so running it concurrently with a pruning /
         // export / replay WAL writer would race SQLite's lock and trip
         // `database is locked`.
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
-        let conn = self.conn.lock().expect("read store poisoned");
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         drop_all_user_tables(&conn)?;
         create_fresh_schema(&conn)?;
         Ok(())
@@ -2141,11 +2135,8 @@ impl ReadStore {
         // (see `write_lock`) so the two WAL writers never race SQLite's lock and
         // trip `database is locked`; this is a cheap uncontended lock on the
         // common path (pruner idle) and a short wait when the pruner is active.
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
-        let mut conn = self.conn.lock().expect("read store poisoned");
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         let mut terminal_keys = Vec::new();
         let mut inflight_delta: i64 = 0;
@@ -2202,7 +2193,7 @@ impl ReadStore {
         let Some(archive) = &self.archive_path else {
             return;
         };
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let done: i64 = conn
             .query_row(
                 "SELECT v FROM meta WHERE k = 'terminal_archive_backfilled'",
@@ -2273,11 +2264,8 @@ impl ReadStore {
         if !archive.exists() {
             return Ok(0);
         }
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
-        let conn = self.conn.lock().expect("read store poisoned");
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         attach_archive(&conn, archive)?;
         let restored = (|| -> rusqlite::Result<usize> {
             let pi_cols =
@@ -2315,11 +2303,8 @@ impl ReadStore {
         &self,
         state: &nanobpmn_engine_core::State,
     ) -> rusqlite::Result<bool> {
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
-        let mut conn = self.conn.lock().expect("read store poisoned");
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         let pending = tx
             .query_row(
@@ -2353,11 +2338,8 @@ impl ReadStore {
         &self,
         state: &nanobpmn_engine_core::State,
     ) -> rusqlite::Result<()> {
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
-        let mut conn = self.conn.lock().expect("read store poisoned");
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         project_engine_state(&tx, state, now_ms())?;
         tx.commit()?;
@@ -2403,7 +2385,7 @@ impl ReadStore {
         if max_keep == 0 {
             return Ok(0);
         }
-        let mut conn = self.conn.lock().expect("read store poisoned");
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         // Materialize the keys to evict: of the terminal instances beyond the most
         // recent `max_keep` (inner `LIMIT -1 OFFSET max_keep` = "all but the newest
@@ -2476,7 +2458,7 @@ impl ReadStore {
     /// plateaus rather than growing without bound.
     #[cfg(feature = "native")]
     pub fn db_page_stats(&self) -> (u64, u64) {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         page_stats(&conn)
     }
 
@@ -2532,10 +2514,7 @@ impl ReadStore {
             // does (no `database is locked`); the lock is released between chunks
             // so the exporter interleaves and is never starved for a whole wake.
             let evicted = {
-                let _write = self
-                    .write_lock
-                    .lock()
-                    .expect("read store write lock poisoned");
+                let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
                 prune_oldest_terminal(conn, want)?
             };
             if evicted == 0 {
@@ -2592,10 +2571,7 @@ impl ReadStore {
         if self.wal_len_bytes() < threshold {
             return false;
         }
-        let _write = self
-            .write_lock
-            .lock()
-            .expect("read store write lock poisoned");
+        let _write = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         true
     }
@@ -2608,7 +2584,7 @@ impl ReadStore {
     /// `ProcessInstanceCreated` events over-counts the deduplicated rows and
     /// inflates the keep target until pruning silently evicts nothing.
     pub fn instance_count(&self) -> usize {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row("SELECT COUNT(*) FROM process_instances", [], |r| {
             r.get::<_, i64>(0)
         })
@@ -2620,7 +2596,7 @@ impl ReadStore {
     /// read model. Used once at startup to seed the in-flight backpressure gauge
     /// after a journal replay, so the watermark reflects recovered work.
     pub fn active_instance_count(&self) -> usize {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT COUNT(*) FROM process_instances WHERE state = 0",
             [],
@@ -2652,7 +2628,7 @@ impl ReadStore {
     /// exactly once. Returns the number of rows reconciled — the amount by which
     /// the in-flight gauge was over-counting.
     pub fn reconcile_orphaned_active(&self, live: &std::collections::HashSet<Key>) -> usize {
-        let mut conn = self.conn.lock().expect("read store poisoned");
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let active: Vec<i64> = {
             let mut stmt = match conn.prepare("SELECT key FROM process_instances WHERE state = 0") {
                 Ok(s) => s,
@@ -2701,16 +2677,16 @@ impl ReadStore {
     }
 
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT key, process_id, process_definition_id, process_definition_key, \
                  version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances",
             )
-            .expect("prepare process_instances");
+            .or_corrupt("prepare process_instances");
         let rows = stmt
             .query_map([], map_instance)
-            .expect("query process_instances");
+            .or_corrupt("query process_instances");
         rows.filter_map(Result::ok).collect()
     }
 
@@ -2720,7 +2696,7 @@ impl ReadStore {
     /// predicate the page query uses, so the pager total tracks the filtered set
     /// (never a desynced unfiltered count).
     pub fn process_instance_count(&self, filter: &InstanceFilter) -> i64 {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT COUNT(*) FROM process_instances{}",
             filter.where_clause()
@@ -2741,7 +2717,7 @@ impl ReadStore {
         offset: i64,
         filter: &InstanceFilter,
     ) -> Vec<ProcessInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT key, process_id, process_definition_id, process_definition_key, \
                  version, state, start_date_ms, has_incident, tags, business_id, \
@@ -2749,15 +2725,28 @@ impl ReadStore {
                  FROM process_instances{} ORDER BY key DESC LIMIT ?1 OFFSET ?2",
             filter.where_clause()
         );
-        let mut stmt = conn.prepare(&sql).expect("prepare process_instances_page");
+        let mut stmt = conn
+            .prepare(&sql)
+            .or_corrupt("prepare process_instances_page");
         let rows = stmt
             .query_map(params![limit, offset], map_instance)
-            .expect("query process_instances_page");
+            .or_corrupt("query process_instances_page");
         rows.filter_map(Result::ok).collect()
     }
 
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        self.try_process_instance(key)
+            .or_corrupt("query process_instance")
+    }
+
+    /// Look up a process instance, distinguishing absence from a failed read.
+    ///
+    /// Static SQL and an ensured schema make a *prepare*/decode failure a
+    /// corruption signal, but a file-backed page read can still fail at runtime
+    /// with `SQLITE_IOERR` — this fallible path lets a caller propagate that
+    /// instead of taking the infallible wrapper's fail-fast panic (#1357).
+    pub fn try_process_instance(&self, key: Key) -> rusqlite::Result<Option<ProcessInstanceRow>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT key, process_id, process_definition_id, process_definition_key, \
              version, state, start_date_ms, has_incident, tags, business_id, parent_process_instance_key, parent_element_instance_key, suspended_date_ms FROM process_instances WHERE key = ?1",
@@ -2765,7 +2754,6 @@ impl ReadStore {
             map_instance,
         )
         .optional()
-        .expect("query process_instance")
     }
 
     /// Resolves `key`'s `rootProcessInstanceKey` (issue #977) by walking the
@@ -2782,7 +2770,7 @@ impl ReadStore {
     }
 
     pub fn jobs(&self) -> Vec<JobRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
@@ -2791,46 +2779,50 @@ impl ReadStore {
                  business_id, error_message, error_code, has_failed_with_retries_left, \
                  last_update_ms, end_ms, last_event_identity_ms FROM jobs",
             )
-            .expect("prepare jobs");
-        let rows = stmt.query_map([], map_job).expect("query jobs");
+            .or_corrupt("prepare jobs");
+        let rows = stmt.query_map([], map_job).or_corrupt("query jobs");
         rows.filter_map(Result::ok).collect()
     }
 
     pub fn user_tasks(&self) -> Vec<UserTaskRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!("SELECT {USER_TASK_COLS} FROM user_tasks"))
-            .expect("prepare user_tasks");
-        let rows = stmt.query_map([], map_user_task).expect("query user_tasks");
+            .or_corrupt("prepare user_tasks");
+        let rows = stmt
+            .query_map([], map_user_task)
+            .or_corrupt("query user_tasks");
         rows.filter_map(Result::ok).collect()
     }
 
     pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!("SELECT {USER_TASK_COLS} FROM user_tasks WHERE key = ?1"),
             params![key as i64],
             map_user_task,
         )
         .optional()
-        .expect("query user_task")
+        .or_corrupt("query user_task")
     }
 
     pub fn incidents(&self) -> Vec<IncidentRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, kind, state, \
                  reason, job_key, created_at_ms, process_definition_id, process_definition_key \
                  FROM incidents",
             )
-            .expect("prepare incidents");
-        let rows = stmt.query_map([], map_incident).expect("query incidents");
+            .or_corrupt("prepare incidents");
+        let rows = stmt
+            .query_map([], map_incident)
+            .or_corrupt("query incidents");
         rows.filter_map(Result::ok).collect()
     }
 
     pub fn incident(&self, key: Key) -> Option<IncidentRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT key, instance_key, element_instance_key, element_id, kind, state, \
              reason, job_key, created_at_ms, process_definition_id, process_definition_key \
@@ -2839,26 +2831,26 @@ impl ReadStore {
             map_incident,
         )
         .optional()
-        .expect("query incident")
+        .or_corrupt("query incident")
     }
 
     /// All element-instance rows in this shard.
     pub fn element_instances(&self) -> Vec<ElementInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {ELEMENT_INSTANCE_COLS} FROM element_instances"
             ))
-            .expect("prepare element_instances");
+            .or_corrupt("prepare element_instances");
         let rows = stmt
             .query_map([], map_element_instance)
-            .expect("query element_instances");
+            .or_corrupt("query element_instances");
         rows.filter_map(Result::ok).collect()
     }
 
     /// A single element instance by its key.
     pub fn element_instance(&self, key: Key) -> Option<ElementInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!(
                 "SELECT {ELEMENT_INSTANCE_COLS} FROM element_instances WHERE element_instance_key = ?1"
@@ -2867,7 +2859,7 @@ impl ReadStore {
             map_element_instance,
         )
         .optional()
-        .expect("query element_instance")
+        .or_corrupt("query element_instance")
     }
 
     /// The `Active` element instances for one process instance (its live token
@@ -2875,13 +2867,13 @@ impl ReadStore {
     /// and filters to the `Active` state code in SQL, so this stays O(rows for
     /// this instance) rather than scanning every element instance in the shard.
     pub fn active_element_instances(&self, instance_key: Key) -> Vec<ElementInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {ELEMENT_INSTANCE_COLS} FROM element_instances \
                  WHERE instance_key = ?1 AND state = ?2"
             ))
-            .expect("prepare active_element_instances");
+            .or_corrupt("prepare active_element_instances");
         let rows = stmt
             .query_map(
                 params![
@@ -2890,33 +2882,33 @@ impl ReadStore {
                 ],
                 map_element_instance,
             )
-            .expect("query active_element_instances");
+            .or_corrupt("query active_element_instances");
         rows.filter_map(Result::ok).collect()
     }
 
     /// All open message subscriptions in this shard (MESSAGE wait states).
     pub fn message_subscriptions(&self) -> Vec<MessageSubscriptionRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {MESSAGE_SUBSCRIPTION_COLS} FROM message_subscriptions"
             ))
-            .expect("prepare message_subscriptions");
+            .or_corrupt("prepare message_subscriptions");
         let rows = stmt
             .query_map([], map_message_subscription)
-            .expect("query message_subscriptions");
+            .or_corrupt("query message_subscriptions");
         rows.filter_map(Result::ok).collect()
     }
 
     /// All open timer / signal / conditional waits in this shard.
     pub fn event_waits(&self) -> Vec<EventWaitRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT wait_key, wait_type, instance_key, element_instance_key, element_id, \
                  detail, due_at_ms FROM event_waits",
             )
-            .expect("prepare event_waits");
+            .or_corrupt("prepare event_waits");
         let rows = stmt
             .query_map([], |r| {
                 let code: String = r.get(1)?;
@@ -2933,44 +2925,44 @@ impl ReadStore {
                     due_at_ms: r.get::<_, Option<i64>>(6)?.map(|v| v.max(0) as u64),
                 }))
             })
-            .expect("query event_waits");
+            .or_corrupt("query event_waits");
         rows.filter_map(|r| r.ok().flatten()).collect()
     }
 
     /// All correlated (historical) message subscriptions in this shard.
     pub fn correlated_message_subscriptions(&self) -> Vec<CorrelatedMessageSubscriptionRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {CORRELATED_MESSAGE_SUBSCRIPTION_COLS} FROM correlated_message_subscriptions"
             ))
-            .expect("prepare correlated_message_subscriptions");
+            .or_corrupt("prepare correlated_message_subscriptions");
         let rows = stmt
             .query_map([], map_correlated_message_subscription)
-            .expect("query correlated_message_subscriptions");
+            .or_corrupt("query correlated_message_subscriptions");
         rows.filter_map(Result::ok).collect()
     }
 
     /// All decision-instance rows in this shard.
     pub fn decision_instances(&self) -> Vec<DecisionInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!("SELECT {DECISION_INSTANCE_COLS} FROM decision_instances");
-        let mut stmt = conn.prepare(&sql).expect("prepare decision_instances");
+        let mut stmt = conn.prepare(&sql).or_corrupt("prepare decision_instances");
         let rows = stmt
             .query_map([], map_decision_instance)
-            .expect("query decision_instances");
+            .or_corrupt("query decision_instances");
         rows.filter_map(Result::ok).collect()
     }
 
     /// A single decision-instance by its `<decisionEvaluationKey>-<index>` id.
     pub fn decision_instance(&self, eval_instance_key: &str) -> Option<DecisionInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT {DECISION_INSTANCE_COLS} FROM decision_instances WHERE eval_instance_key = ?1"
         );
         conn.query_row(&sql, params![eval_instance_key], map_decision_instance)
             .optional()
-            .expect("query decision_instance")
+            .or_corrupt("query decision_instance")
     }
 
     /// Every decision-instance row sharing a `decision_evaluation_key` (one per
@@ -2981,25 +2973,25 @@ impl ReadStore {
         &self,
         decision_evaluation_key: Key,
     ) -> Vec<DecisionInstanceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let sql = format!(
             "SELECT {DECISION_INSTANCE_COLS} FROM decision_instances \
              WHERE decision_evaluation_key = ?1 ORDER BY idx"
         );
         let mut stmt = conn
             .prepare(&sql)
-            .expect("prepare decision_instances_by_evaluation_key");
+            .or_corrupt("prepare decision_instances_by_evaluation_key");
         let rows = stmt
             .query_map(
                 params![decision_evaluation_key as i64],
                 map_decision_instance,
             )
-            .expect("query decision_instances_by_evaluation_key");
+            .or_corrupt("query decision_instances_by_evaluation_key");
         rows.filter_map(Result::ok).collect()
     }
 
     pub fn process_definitions(&self) -> Vec<ProcessDefinitionRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         // Return EVERY deployed version (Camunda/Zeebe parity: each version is a
         // distinct, searchable process definition, e.g. so `version` filters and
         // by-key lookups resolve superseded versions). `is_latest` marks the
@@ -3010,7 +3002,7 @@ impl ReadStore {
                  (version = MAX(version) OVER (PARTITION BY process_id)) AS is_latest \
                  FROM process_definitions",
             )
-            .expect("prepare process_definitions");
+            .or_corrupt("prepare process_definitions");
         let rows = stmt
             .query_map([], |r| {
                 Ok(ProcessDefinitionRow {
@@ -3021,7 +3013,7 @@ impl ReadStore {
                     is_latest: r.get::<_, i64>(4)? != 0,
                 })
             })
-            .expect("query process_definitions");
+            .or_corrupt("query process_definitions");
         rows.filter_map(Result::ok).collect()
     }
 
@@ -3029,7 +3021,7 @@ impl ReadStore {
     /// resolving any version (not just the latest), or `None` if no such key was
     /// ever deployed. Backs the get-by-key endpoint.
     pub fn process_definition_by_key(&self, key: Key) -> Option<ProcessDefinitionRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT key, process_id, version, name, \
@@ -3037,7 +3029,7 @@ impl ReadStore {
                              WHERE process_id = pd.process_id)) AS is_latest \
                  FROM process_definitions pd WHERE key = ?1",
             )
-            .expect("prepare process_definition_by_key");
+            .or_corrupt("prepare process_definition_by_key");
         stmt.query_row([key as i64], |r| {
             Ok(ProcessDefinitionRow {
                 key: r.get::<_, i64>(0)? as Key,
@@ -3048,25 +3040,25 @@ impl ReadStore {
             })
         })
         .optional()
-        .expect("query process_definition_by_key")
+        .or_corrupt("query process_definition_by_key")
     }
 
     pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {DECISION_REQUIREMENTS_COLS} FROM decision_requirements"
             ))
-            .expect("prepare decision_requirements");
+            .or_corrupt("prepare decision_requirements");
         let rows = stmt
             .query_map([], map_decision_requirements)
-            .expect("query decision_requirements");
+            .or_corrupt("query decision_requirements");
         rows.filter_map(Result::ok).collect()
     }
 
     /// A single decision-requirements graph by its numeric key.
     pub fn decision_requirements_by_key(&self, key: Key) -> Option<DecisionRequirementsRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!(
                 "SELECT {DECISION_REQUIREMENTS_COLS} FROM decision_requirements WHERE drg_key = ?1"
@@ -3075,52 +3067,52 @@ impl ReadStore {
             map_decision_requirements,
         )
         .optional()
-        .expect("query decision_requirements_by_key")
+        .or_corrupt("query decision_requirements_by_key")
     }
 
     /// The verbatim DMN XML for the DRG with `key`, or `None` when no such graph
     /// is projected. Empty-string XML (a graph built programmatically rather than
     /// parsed) is returned as `Some("")`.
     pub fn decision_requirements_xml(&self, key: Key) -> Option<String> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT xml FROM decision_requirements WHERE drg_key = ?1",
             params![key as i64],
             |r| r.get::<_, String>(0),
         )
         .optional()
-        .expect("query decision_requirements_xml")
+        .or_corrupt("query decision_requirements_xml")
     }
 
     pub fn decision_definitions(&self) -> Vec<DecisionDefinitionRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {DECISION_DEFINITION_COLS} FROM decision_definitions"
             ))
-            .expect("prepare decision_definitions");
+            .or_corrupt("prepare decision_definitions");
         let rows = stmt
             .query_map([], map_decision_definition)
-            .expect("query decision_definitions");
+            .or_corrupt("query decision_definitions");
         rows.filter_map(Result::ok).collect()
     }
 
     /// A single decision definition by its numeric key.
     pub fn decision_definition_by_key(&self, key: Key) -> Option<DecisionDefinitionRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!("SELECT {DECISION_DEFINITION_COLS} FROM decision_definitions WHERE decision_key = ?1"),
             params![key as i64],
             map_decision_definition,
         )
         .optional()
-        .expect("query decision_definition_by_key")
+        .or_corrupt("query decision_definition_by_key")
     }
 
     /// The DMN XML of the DRG owning the decision definition with `key`, or `None`
     /// when no such decision is projected.
     pub fn decision_definition_xml(&self, key: Key) -> Option<String> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT r.xml FROM decision_definitions d \
              JOIN decision_requirements r ON r.drg_key = d.decision_requirements_key \
@@ -3129,7 +3121,7 @@ impl ReadStore {
             |r| r.get::<_, String>(0),
         )
         .optional()
-        .expect("query decision_definition_xml")
+        .or_corrupt("query decision_definition_xml")
     }
 
     /// A single deployed form by its per-version numeric key. Each deployed form
@@ -3137,21 +3129,21 @@ impl ReadStore {
     /// new key never invalidates an earlier one. `None` when no such form is
     /// projected.
     pub fn form_by_key(&self, key: Key) -> Option<FormRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!("SELECT {FORM_COLS} FROM forms WHERE form_key = ?1"),
             params![key as i64],
             map_form,
         )
         .optional()
-        .expect("query form_by_key")
+        .or_corrupt("query form_by_key")
     }
 
     /// The latest deployed form for a given form id (highest version), used to
     /// resolve a process start form (`GetStartProcessForm`) by its declared
     /// `formId`. `None` when no form with that id is projected.
     pub fn form_by_id(&self, form_id: &str) -> Option<FormRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!(
                 "SELECT {FORM_COLS} FROM forms WHERE form_id = ?1 \
@@ -3161,7 +3153,7 @@ impl ReadStore {
             map_form,
         )
         .optional()
-        .expect("query form_by_id")
+        .or_corrupt("query form_by_id")
     }
 
     /// A single deployed generic resource by its per-version numeric key. Each
@@ -3169,27 +3161,27 @@ impl ReadStore {
     /// that mints a new key never invalidates an earlier one. `None` when no such
     /// resource is projected.
     pub fn resource_by_key(&self, key: Key) -> Option<ResourceRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!("SELECT {RESOURCE_COLS} FROM resources WHERE resource_key = ?1"),
             params![key as i64],
             map_resource,
         )
         .optional()
-        .expect("query resource_by_key")
+        .or_corrupt("query resource_by_key")
     }
 
     /// Metadata (no `content`) for a single generic resource by key, for the
     /// by-key metadata endpoint (`getResource`), which returns no content.
     pub fn resource_by_key_meta(&self, key: Key) -> Option<ResourceMetaRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!("SELECT {RESOURCE_META_COLS} FROM resources WHERE resource_key = ?1"),
             params![key as i64],
             map_resource_meta,
         )
         .optional()
-        .expect("query resource_by_key_meta")
+        .or_corrupt("query resource_by_key_meta")
     }
 
     /// Metadata (no `content`) for every projected generic-resource row, for the
@@ -3197,14 +3189,14 @@ impl ReadStore {
     /// resources does not read every version's full body. Callers apply search
     /// filters / sort / pagination in the gateway.
     pub fn resources_meta(&self) -> Vec<ResourceMetaRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {RESOURCE_META_COLS} FROM resources ORDER BY resource_key"
             ))
-            .expect("prepare resources_meta");
+            .or_corrupt("prepare resources_meta");
         stmt.query_map([], map_resource_meta)
-            .expect("query resources_meta")
+            .or_corrupt("query resources_meta")
             .filter_map(Result::ok)
             .collect()
     }
@@ -3213,14 +3205,14 @@ impl ReadStore {
     /// id is retained, mirroring the engine). Empty-string XML (a definition
     /// built programmatically rather than parsed) is returned as `Some("")`.
     pub fn process_definition_xml(&self, key: Key) -> Option<String> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT xml FROM process_definitions WHERE key = ?1",
             params![key as i64],
             |r| r.get::<_, String>(0),
         )
         .optional()
-        .expect("query process_definition_xml")
+        .or_corrupt("query process_definition_xml")
     }
 
     /// The `zeebe:formDefinition formId` declared on a process definition's start
@@ -3228,30 +3220,32 @@ impl ReadStore {
     /// `None` when no such definition is projected; the inner is `None` when the
     /// definition exists but declares no start form.
     pub fn process_definition_start_form_id(&self, key: Key) -> Option<Option<String>> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT start_form_id FROM process_definitions WHERE key = ?1",
             params![key as i64],
             |r| r.get::<_, Option<String>>(0),
         )
         .optional()
-        .expect("query process_definition_start_form_id")
+        .or_corrupt("query process_definition_start_form_id")
     }
 
     pub fn variables(&self) -> Vec<VariableRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT key, instance_key, scope_key, name, value, \
                  process_definition_id, process_definition_key FROM variables",
             )
-            .expect("prepare variables");
-        let rows = stmt.query_map([], map_variable).expect("query variables");
+            .or_corrupt("prepare variables");
+        let rows = stmt
+            .query_map([], map_variable)
+            .or_corrupt("query variables");
         rows.filter_map(Result::ok).collect()
     }
 
     pub fn variable(&self, key: Key) -> Option<VariableRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT key, instance_key, scope_key, name, value, \
              process_definition_id, process_definition_key FROM variables WHERE key = ?1",
@@ -3259,24 +3253,24 @@ impl ReadStore {
             map_variable,
         )
         .optional()
-        .expect("query variable")
+        .or_corrupt("query variable")
     }
 
     /// Returns every variable belonging to a process instance, ordered by name
     /// for deterministic results. Used to assemble the variable payload returned
     /// by an `awaitCompletion` create request.
     pub fn instance_variables(&self, instance_key: Key) -> Vec<VariableRow> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn
             .prepare(
                 "SELECT key, instance_key, scope_key, name, value, \
                  process_definition_id, process_definition_key FROM variables \
                  WHERE instance_key = ?1 ORDER BY name",
             )
-            .expect("prepare instance variables");
+            .or_corrupt("prepare instance variables");
         let rows = stmt
             .query_map(params![instance_key as i64], map_variable)
-            .expect("query instance variables");
+            .or_corrupt("query instance variables");
         rows.filter_map(Result::ok).collect()
     }
 }
@@ -3710,6 +3704,38 @@ impl CachedSql for rusqlite::Connection {
         F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     {
         self.prepare_cached(sql)?.query_row(params, f)
+    }
+}
+
+/// Collapses an infallible-by-construction read-model query `Result` to its
+/// value, panicking with context on the error path.
+///
+/// The read model is a projection whose SQL is **static** and runs against a
+/// schema **ensured at open** ([`ReadStore::ensure_schema`]), so a `prepare`/
+/// `query`/column-decode error here is not a runtime-recoverable condition the
+/// store's (deliberately infallible) read API could surface — it signals
+/// unrecoverable database corruption or a programming bug. Epic #1357 bans a
+/// bare `.unwrap()`/`.expect()` in production; routing these sites through a
+/// single `.unwrap_or_else(|e| panic!(..))` helper keeps the identical
+/// fail-fast behaviour while (a) carrying a uniform, greppable diagnostic and
+/// (b) leaving the crate-wide `unwrap_used`/`expect_used` deny free to catch any
+/// *new* naked panic the next author introduces.
+trait OrCorrupt<T> {
+    /// Unwrap `self`, panicking with `ctx` (and the underlying error) on `Err`.
+    fn or_corrupt(self, ctx: &str) -> T;
+}
+
+impl<T, E: std::fmt::Display> OrCorrupt<T> for Result<T, E> {
+    #[track_caller]
+    fn or_corrupt(self, ctx: &str) -> T {
+        self.unwrap_or_else(|e| {
+            panic!(
+                "read-model invariant violated at `{ctx}`: {e}. The read model's \
+                 SQL is static and runs against a schema ensured at open, so this \
+                 indicates unrecoverable database corruption or a programming bug, \
+                 not a runtime-recoverable condition."
+            )
+        })
     }
 }
 
@@ -5930,7 +5956,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // canonically (see `Event::decision_evaluation_key`).
             let evaluation_key = event
                 .decision_evaluation_key()
-                .expect("DecisionEvaluated always identifies its evaluation");
+                .unwrap_or_else(|| panic!("DecisionEvaluated always identifies its evaluation"));
             let last = evaluated_decisions.len();
             // The owning process definition key (join within this shard; the
             // businessRuleTask instance is projected here). Empty when absent.
@@ -6550,8 +6576,13 @@ fn project_agent_history_record(
             i64::from(r.is_duplicate),
             r.commit_status.as_str(),
             r.job_lease,
-            r.limits.as_ref().map(serde_json::to_string).transpose().unwrap(),
-            serde_json::to_string(&r.metrics).unwrap(),
+            r.limits
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
+            serde_json::to_string(&r.metrics)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
             r.system_prompt.as_ref().map(serde_json::to_string).transpose()
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
         ],
@@ -7089,7 +7120,7 @@ impl ReadStore {
         sort: Option<(AgentInstanceSortField, SortOrder)>,
     ) -> Vec<AgentInstanceRow> {
         self.try_agent_instances(filter, sort)
-            .expect("query agent_instances")
+            .or_corrupt("query agent_instances")
     }
 
     /// Search agents without hiding malformed persisted projections.
@@ -7098,7 +7129,7 @@ impl ReadStore {
         filter: &AgentInstanceFilter,
         sort: Option<(AgentInstanceSortField, SortOrder)>,
     ) -> rusqlite::Result<Vec<AgentInstanceRow>> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let (where_sql, values) = filter.where_clause();
         let (col, dir) = match sort {
             Some((field, order)) => (field.column(), order.keyword()),
@@ -7115,12 +7146,13 @@ impl ReadStore {
 
     /// A single AgentInstance by its dedicated key.
     pub fn agent_instance(&self, key: Key) -> Option<AgentInstanceRow> {
-        self.try_agent_instance(key).expect("query agent_instance")
+        self.try_agent_instance(key)
+            .or_corrupt("query agent_instance")
     }
 
     /// Look up an agent, distinguishing absence from corrupt persisted data.
     pub fn try_agent_instance(&self, key: Key) -> rusqlite::Result<Option<AgentInstanceRow>> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             &format!(
                 "SELECT {AGENT_INSTANCE_COLS} FROM agent_instances WHERE agent_instance_key = ?1"
@@ -7141,7 +7173,7 @@ impl ReadStore {
         sort: Option<(AgentHistorySortField, SortOrder)>,
     ) -> Vec<AgentHistoryRow> {
         self.try_agent_history(filter, sort)
-            .expect("query agent_history")
+            .or_corrupt("query agent_history")
     }
 
     /// Search history without silently dropping malformed rows.
@@ -7150,7 +7182,7 @@ impl ReadStore {
         filter: &AgentHistoryFilter,
         sort: Option<(AgentHistorySortField, SortOrder)>,
     ) -> rusqlite::Result<Vec<AgentHistoryRow>> {
-        let conn = self.conn.lock().expect("read store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let (where_sql, values) = filter.where_clause();
         let order_sql = match sort {
             Some((field, order)) => {
@@ -14112,5 +14144,52 @@ mod agent_projection_tests {
             row.completion_date_ms.is_some(),
             "a completed instance carries its completion date"
         );
+    }
+}
+
+#[cfg(test)]
+mod try_query_tests {
+    use super::{Event, Key, ReadStore};
+
+    fn created_event(instance_key: Key) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    #[test]
+    fn try_process_instance_distinguishes_absence_from_corrupt_rows() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&created_event(1)]).unwrap();
+
+        // A healthy row reads back; an absent key is `Ok(None)`, not an error.
+        assert_eq!(store.try_process_instance(1).unwrap().unwrap().key, 1);
+        assert!(store.try_process_instance(999).unwrap().is_none());
+
+        // A malformed persisted projection (here: TEXT stored in the INTEGER
+        // state column — SQLite's dynamic typing admits it past the column
+        // constraints, but decoding it as i64 fails) is a typed decode error on
+        // the fallible path — never a silent absence and never the infallible
+        // wrapper's panic (#1357).
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE process_instances SET state = 'not-an-int' WHERE key = 1",
+                [],
+            )
+            .unwrap();
+        assert!(store.try_process_instance(1).is_err());
+        assert!(store.try_process_instance(999).unwrap().is_none());
     }
 }
