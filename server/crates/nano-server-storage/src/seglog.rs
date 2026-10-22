@@ -2464,11 +2464,10 @@ fn rebuild_from_surviving_tail(
         shard.advance_exported(floor as usize)?;
     }
     if !surviving.is_empty() {
-        shard.export(surviving).map_err(|e| {
+        shard.export(surviving).inspect_err(|e| {
             // Keep the operator-facing context the `expect` message carried,
             // attached to the typed error rather than a panic payload.
             tracing::error!(error = %e, "{export_ctx}");
-            e
         })?;
     }
     Ok(())
