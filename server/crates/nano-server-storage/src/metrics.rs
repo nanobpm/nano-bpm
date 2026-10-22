@@ -372,6 +372,15 @@ struct Metrics {
     engine_cardinality: prometheus::IntGaugeVec,
 }
 
+// expect_used: every metric is built from a static, valid spec (fixed names,
+// help strings, and monotonically increasing bucket lists) and registered once
+// into a fresh `Registry`, so construction/registration cannot fail in
+// practice; a failure would be a broken prometheus invariant, surfaced loudly
+// at first metric touch (process init). Startup-only, infallible in practice.
+#[allow(
+    clippy::expect_used,
+    reason = "static metric registration with valid fixed opts is infallible in practice"
+)]
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let registry = Registry::new();
 
@@ -1541,6 +1550,12 @@ pub fn record_writer_cycle(idle: Duration, busy: Duration) {
 }
 
 /// Renders the registry in the Prometheus text exposition format.
+// expect_used: encoding the gathered families into a `String` is infallible in
+// practice (the text encoder writes to an in-memory buffer; there is no I/O).
+#[allow(
+    clippy::expect_used,
+    reason = "text-encoding gathered metrics into an in-memory String is infallible"
+)]
 pub fn gather() -> String {
     let mut buf = String::new();
     let families = METRICS.registry.gather();

@@ -54,6 +54,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::mpsc::Receiver;
 use std::sync::mpsc::{Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -152,6 +154,9 @@ struct ForgetWorker {
     /// slow consumer applies backpressure instead of growing memory unbounded.
     /// The worker drains and deletes in [`FORGET_CHUNK`]s.
     tx: Option<SyncSender<ForgetMsg>>,
+    /// `Some` while the worker is running; taken by
+    /// [`VarSpillStore::await_forget_worker`] (graceful shutdown / tests) to
+    /// observe worker completion, or by [`Drop`] to join the thread.
     handle: Option<JoinHandle<()>>,
 }
 
@@ -167,6 +172,7 @@ impl Drop for ForgetWorker {
     fn drop(&mut self) {
         // Closing the channel lets the worker drain any queued batches (so no
         // forget is lost on shutdown) and then exit its `recv` loop; join it.
+        // If `await_forget_worker` already closed + joined, both are `None`.
         drop(self.tx.take());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
@@ -189,6 +195,177 @@ impl Drop for ReclaimWorker {
     }
 }
 
+/// Observable record of a fatal forget/delete failure (#1366). Set exactly once
+/// (the first error wins — later faults are almost always the same condition) by
+/// the background forget worker or by the synchronous [`VarSpillStore::forget`]
+/// fallback, and never cleared: a store that has lost deletes stays faulted for
+/// its lifetime so the failure can never be silently forgotten.
+///
+/// `record()` also **closes producer admission** (sets `closed` under the
+/// `admission` mutex). `forget_async*` performs its closed-check **and** the
+/// `try_send` under that same mutex, and the worker's failure path closes
+/// admission under it *before* draining the queue — so a producer either
+/// completes its enqueue before the close (and is retained by that drain) or
+/// observes the closed flag and takes the synchronous fallback. The check and
+/// the send are one atomic step under the lock, so a batch can never be accepted
+/// into a queue the faulting worker's drain has already passed, and no batch
+/// enqueued after the close is left stranded. The worker then stops on the fault
+/// (rather than dropping or retrying the batch), so a `Some` error here also
+/// means the worker is gone and every batch still queued at that point was
+/// drained into [`Self::retained_keys`] — no pending delete is ever dropped
+/// silently. Once faulted, later `forget_async*` calls fall back to synchronous
+/// deletes, which either succeed (disk healthy again) or latch the same fault
+/// and retain their batch here.
+#[derive(Debug, Default)]
+pub struct ForgetFaults {
+    /// The first fatal error (delete or checkpoint), as a display string.
+    error: Mutex<Option<String>>,
+    /// Keys whose deletes were not applied: the failed batch, every batch
+    /// drained from the queue on the worker's way out, and every batch whose
+    /// synchronous fallback delete failed afterwards.
+    retained_keys: Mutex<Vec<Key>>,
+    /// Producer admission state. `forget_async*` holds this mutex across its
+    /// closed-check **and** the `try_send`, and the worker's failure path holds
+    /// it to set the flag before draining — serializing the admission check with
+    /// the enqueue against the worker's close transition (a bare atomic would
+    /// let a producer pass the check, then enqueue after the drain closed).
+    admission: Mutex<bool>,
+}
+
+impl ForgetFaults {
+    /// Latches `err` (first fault wins), closes producer admission, and appends
+    /// `retained` to the retained key set. Lock poisons are recovered: a
+    /// poisoned latch must never mask the fault it records.
+    ///
+    /// The close runs under the `admission` mutex (see [`close_admission`])
+    /// *before* the retained keys are appended, so a producer that observes the
+    /// closed flag and falls back to a failing synchronous delete appends its own
+    /// batch after the worker's drain — never into a gap the drain already passed.
+    fn record(&self, err: &rusqlite::Error, retained: Vec<Key>) {
+        self.close_admission();
+        let mut slot = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(err.to_string());
+        }
+        drop(slot);
+        self.retain(retained);
+    }
+
+    /// Closes producer admission under the `admission` mutex. `forget_async*`
+    /// holds that mutex across its closed-check + `try_send`, so once this
+    /// returns, no producer is mid-enqueue and every later producer sees the
+    /// closed flag — the worker's failure path calls this *before* draining the
+    /// queue, which is what makes "enqueued before the close ⇒ retained by the
+    /// drain" hold.
+    fn close_admission(&self) {
+        *self.admission.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    }
+
+    /// Appends `retained` keys whose deletes were not applied (a drained queue
+    /// batch, or a synchronous-fallback batch whose delete failed). Separate
+    /// from [`record`](Self::record) so the worker can close admission and latch
+    /// the error first, then append the drained keys.
+    fn retain(&self, retained: Vec<Key>) {
+        if !retained.is_empty() {
+            self.retained_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(retained);
+        }
+    }
+
+    /// The first latched fault, if any.
+    pub fn error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Keys whose deletes were retained (not applied): the failed batch, the
+    /// drained queue, and any later synchronous-fallback failures.
+    pub fn retained_keys(&self) -> Vec<Key> {
+        self.retained_keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+}
+
+/// Test-only fault-injection seam (#1366): lets a unit test force the forget
+/// worker's next delete batch or WAL-truncate checkpoint to fail with a real
+/// [`rusqlite::Error`], so the fault-latch path is covered deterministically
+/// without the process-global env knobs (which race parallel tests). Compiled
+/// out of production builds entirely.
+///
+/// `gate` additionally lets a test hold the worker at a deterministic point —
+/// after it has received a batch, just before the delete runs — so the test can
+/// queue the rest of the scenario (more batches, a flush barrier) *before* the
+/// failure is allowed to happen, instead of relying on thread scheduling.
+#[cfg(test)]
+#[derive(Default)]
+struct ForgetFaultInjection {
+    fail_next_delete: AtomicBool,
+    fail_next_checkpoint: AtomicBool,
+    /// Gate state: the worker signals `parked_tx` (cloned out at the gate) and
+    /// then blocks on `release_rx` until the test lets it proceed.
+    gate_parked: Mutex<Option<Sender<()>>>,
+    gate_release: Mutex<Option<Receiver<()>>>,
+}
+
+#[cfg(test)]
+impl ForgetFaultInjection {
+    /// The injected delete error for this batch, if armed (disarms on take).
+    fn take_delete_error(&self) -> Option<rusqlite::Error> {
+        if self.fail_next_delete.swap(false, Ordering::Relaxed) {
+            Some(rusqlite::Error::InvalidQuery)
+        } else {
+            None
+        }
+    }
+
+    /// The injected checkpoint error, if armed (disarms on take).
+    fn take_checkpoint_error(&self) -> Option<rusqlite::Error> {
+        if self.fail_next_checkpoint.swap(false, Ordering::Relaxed) {
+            Some(rusqlite::Error::InvalidQuery)
+        } else {
+            None
+        }
+    }
+
+    /// Arms the worker to fail its next delete, but only after blocking at a
+    /// gate until the returned releaser is signalled. The returned receiver
+    /// fires once the worker is parked at the gate, so the test can queue the
+    /// remaining batches and the flush barrier while the failure is held —
+    /// making the queued-work retention assertions deterministic.
+    fn arm_gated_delete_failure(&self) -> (Receiver<()>, Sender<()>) {
+        let (parked_tx, parked_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        *self.gate_parked.lock().unwrap_or_else(|e| e.into_inner()) = Some(parked_tx);
+        *self.gate_release.lock().unwrap_or_else(|e| e.into_inner()) = Some(release_rx);
+        self.fail_next_delete.store(true, Ordering::Relaxed);
+        (parked_rx, release_tx)
+    }
+
+    /// If a gate is armed, parks the worker (signalling `parked`) until the
+    /// test releases it. Runs just before the delete, after the batch is
+    /// received, so everything the test queued while the worker was parked is
+    /// behind the failed batch in the channel.
+    fn wait_at_gate(&self) {
+        let parked = self
+            .gate_parked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let release = self
+            .gate_release
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let (Some(parked_tx), Some(release_rx)) = (parked, release) {
+            let _ = parked_tx.send(());
+            let _ = release_rx.recv();
+        }
+    }
+}
+
 /// A SQLite-backed key → variables map for spilled instance payloads.
 pub struct VarSpillStore {
     conn: Arc<Mutex<Connection>>,
@@ -206,6 +383,12 @@ pub struct VarSpillStore {
     /// for in-memory stores (tests), where `forget_async` runs inline so assertions
     /// observe the delete synchronously.
     forget: Option<ForgetWorker>,
+    /// Latched forget/delete failure state, shared with the forget worker (see
+    /// [`ForgetFaults`]). Always present; empty until the first fatal fault.
+    faults: Arc<ForgetFaults>,
+    /// Test-only fault-injection seam shared with the forget worker.
+    #[cfg(test)]
+    fault_injection: Arc<ForgetFaultInjection>,
 }
 
 impl VarSpillStore {
@@ -281,6 +464,9 @@ impl VarSpillStore {
         enable_incremental_auto_vacuum(&conn)?;
         let conn = Arc::new(Mutex::new(conn));
         let activity = Arc::new(AtomicU64::new(0));
+        let faults = Arc::new(ForgetFaults::default());
+        #[cfg(test)]
+        let fault_injection = Arc::new(ForgetFaultInjection::default());
 
         // Spawn the background reclaim thread only when it can do useful work: an
         // in-memory store has no file to shrink, and a zero gate disables reclaim.
@@ -302,6 +488,9 @@ impl VarSpillStore {
             Some(Self::spawn_forget_worker(
                 Arc::clone(&conn),
                 Arc::clone(&activity),
+                Arc::clone(&faults),
+                #[cfg(test)]
+                Arc::clone(&fault_injection),
             ))
         } else {
             None
@@ -311,6 +500,9 @@ impl VarSpillStore {
             activity,
             reclaim,
             forget,
+            faults,
+            #[cfg(test)]
+            fault_injection,
         })
     }
 
@@ -318,6 +510,13 @@ impl VarSpillStore {
     /// store has been quiet for `idle_ms` and the freelist exceeds `threshold_bytes`,
     /// it reclaims in [`RECLAIM_CHUNK_PAGES`]-sized passes, re-checking for resumed
     /// activity between passes so live load preempts the drain.
+    // expect_used: spawning the reclaim thread fails only on OS resource
+    // exhaustion (thread spawn); there is no recoverable fallback for a missing
+    // maintenance thread at open, so abort startup loudly.
+    #[allow(
+        clippy::expect_used,
+        reason = "thread spawn failure is a fatal OS resource error at store open"
+    )]
     fn spawn_reclaim_worker(
         conn: Arc<Mutex<Connection>>,
         activity: Arc<AtomicU64>,
@@ -351,7 +550,13 @@ impl VarSpillStore {
                         // Quiescent: drain one bounded pass. Skip cheaply if there is
                         // nothing worth a copy-back. Any activity during/after the
                         // pass resets the idle counter above on the next tick.
-                        let Ok(conn) = conn.lock() else { return };
+                        // Recover a poisoned lock (another thread panicked
+                        // mid-mutation; the connection is still usable because every
+                        // op is atomic under the lock) rather than exiting the
+                        // worker — matching `delete_keys` and the forget worker. A
+                        // silent exit here would stop freelist reclaim while
+                        // foreground writes continue (#1366).
+                        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
                         if freelist_bytes(&conn) >= threshold_bytes {
                             let _ = reclaim_freelist_step(&conn, RECLAIM_CHUNK_PAGES);
                         }
@@ -375,7 +580,32 @@ impl VarSpillStore {
     /// Starts the background forget worker: receives batches of keys and deletes
     /// their spill/cold rows off the engine actor, in [`FORGET_CHUNK`]-sized
     /// transactions so each commit holds the connection lock only briefly.
-    fn spawn_forget_worker(conn: Arc<Mutex<Connection>>, activity: Arc<AtomicU64>) -> ForgetWorker {
+    ///
+    /// A genuine SQLite delete/checkpoint failure is **not** panicked on (#1366):
+    /// under the server's unwind profile a panic would silently kill only this
+    /// thread, dropping every queued batch and the WAL-growth backstop while
+    /// foreground writes continued. Instead the worker latches the error into
+    /// `faults` (observable via [`VarSpillStore::forget_faults`]), retains the
+    /// failed batch plus every still-queued batch in the latch (no pending delete
+    /// is dropped silently), acks any pending flush barrier so a concurrent
+    /// `flush_forgets` cannot hang, and exits — which disconnects the channel, so
+    /// later `forget_async*` calls fall back to synchronous deletes and
+    /// `flush_forgets` reports `false`. A poisoned connection lock is NOT fatal:
+    /// every op is atomic under the lock, so the guard is recovered (matching
+    /// `delete_keys` and the reclaim worker) — a poison must never silently stop
+    /// a maintenance worker while foreground writes continue.
+    // expect_used: thread spawn failure is a fatal OS resource error at store
+    // open; there is no recoverable fallback for a missing maintenance thread.
+    #[allow(
+        clippy::expect_used,
+        reason = "thread spawn failure is a fatal OS resource error at store open"
+    )]
+    fn spawn_forget_worker(
+        conn: Arc<Mutex<Connection>>,
+        activity: Arc<AtomicU64>,
+        faults: Arc<ForgetFaults>,
+        #[cfg(test)] injection: Arc<ForgetFaultInjection>,
+    ) -> ForgetWorker {
         let (tx, rx) = sync_channel::<ForgetMsg>(forget_queue_cap());
         let handle = std::thread::Builder::new()
             .name("varspill-forget".into())
@@ -392,15 +622,29 @@ impl VarSpillStore {
                 let mut since_ckpt: u64 = 0;
                 // Exits when the channel closes (every sender dropped), after
                 // draining any batches still queued — so no forget is lost.
-                while let Ok(msg) = rx.recv() {
+                'drain: while let Ok(msg) = rx.recv() {
                     match msg {
                         ForgetMsg::Keys(keys) => {
                             let n = keys.len() as u64;
+                            // Test-only seam: force this batch's delete to fail.
+                            #[cfg(test)]
+                            let delete_result = {
+                                injection.wait_at_gate();
+                                match injection.take_delete_error() {
+                                    Some(err) => Err(err),
+                                    None => Self::delete_keys(&conn, &activity, &keys),
+                                }
+                            };
+                            #[cfg(not(test))]
+                            let delete_result = Self::delete_keys(&conn, &activity, &keys);
                             // delete_keys bumps `activity` per chunk, so even a long
                             // multi-chunk batch keeps the store non-idle for its whole
                             // duration and the reclaim worker won't start a pass while
                             // deletes are in-flight.
-                            Self::delete_keys(&conn, &activity, &keys);
+                            if let Err(err) = delete_result {
+                                Self::fail_worker(&faults, &rx, &err, keys);
+                                break 'drain;
+                            }
                             since_ckpt = since_ckpt.saturating_add(n);
                             if since_ckpt >= ckpt_keys {
                                 since_ckpt = 0;
@@ -409,15 +653,38 @@ impl VarSpillStore {
                                 // worker won't classify the store as idle and start a
                                 // vacuum pass during/around this maintenance I/O.
                                 activity.fetch_add(1, Ordering::Relaxed);
-                                // Surface a poisoned lock or checkpoint failure
-                                // loudly (matching `delete_keys`): silently
-                                // swallowing them here would let the WAL grow
-                                // without bound under sustained retirement — the
-                                // very failure this backstop exists to prevent.
-                                let guard = conn.lock().expect("spill store poisoned");
-                                guard
-                                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
-                                    .expect("spill store: wal_checkpoint(TRUNCATE)");
+                                // A poisoned lock means another thread panicked
+                                // mid-mutation; the connection is still usable
+                                // (every op is atomic under the lock), so recover
+                                // the guard rather than kill the worker — matching
+                                // `delete_keys` and the reclaim worker, so a poison
+                                // never silently stops a maintenance worker while
+                                // foreground writes continue (#1366). A genuine
+                                // checkpoint I/O failure takes the same observable
+                                // fault-latch path as a delete failure (see the
+                                // fn-level docs): silently swallowing it would let
+                                // the WAL grow without bound under sustained
+                                // retirement — the failure this backstop prevents.
+                                let checkpoint_result = {
+                                    let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+                                    guard.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| {
+                                        Ok(())
+                                    })
+                                };
+                                #[cfg(test)]
+                                let checkpoint_result = checkpoint_result.and_then(|()| {
+                                    match injection.take_checkpoint_error() {
+                                        Some(err) => Err(err),
+                                        None => Ok(()),
+                                    }
+                                });
+                                if let Err(err) = checkpoint_result {
+                                    // Nothing failed to delete here — the batch was
+                                    // already applied — so there are no keys to
+                                    // retain beyond what is still queued.
+                                    Self::fail_worker(&faults, &rx, &err, Vec::new());
+                                    break 'drain;
+                                }
                             }
                         }
                         ForgetMsg::Flush(ack) => {
@@ -433,49 +700,91 @@ impl VarSpillStore {
         }
     }
 
+    /// The worker's fatal-failure path (#1366): record the fault (which **closes
+    /// producer admission** under the `admission` mutex — see
+    /// [`ForgetFaults::record`]) *before* draining, so a `forget_async*` racing
+    /// this shutdown either completed its enqueue before the close (and is
+    /// retained by the drain below) or observes the closed flag and takes the
+    /// synchronous fallback — no batch is ever accepted into the queue after the
+    /// drain has passed it, and none is left stranded. Then drain every
+    /// still-queued batch into the latch's retained set (acking any flush barrier
+    /// so a concurrent `flush_forgets` never hangs) and return so the thread
+    /// exits.
+    ///
+    /// Exiting drops `rx`, disconnecting the channel — which makes
+    /// `flush_forgets` report `false`. Because `record` runs before the drain, an
+    /// observer that sees the latched error knows admission is already closed and
+    /// the queue already drained.
+    fn fail_worker(
+        faults: &ForgetFaults,
+        rx: &std::sync::mpsc::Receiver<ForgetMsg>,
+        err: &rusqlite::Error,
+        failed: Vec<Key>,
+    ) {
+        // Close producer admission FIRST (under the admission mutex): after this,
+        // `forget_async*` stops enqueueing and falls back to synchronous deletes,
+        // so the drain below observes a quiescing queue.
+        faults.record(err, failed);
+        let mut retained = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ForgetMsg::Keys(keys) => retained.extend(keys),
+                ForgetMsg::Flush(ack) => {
+                    let _ = ack.send(());
+                }
+            }
+        }
+        faults.retain(retained);
+    }
+
     /// Deletes the spill and cold rows for `keys`, chunked into short transactions
     /// so a large batch never holds the connection lock for long (blocking the
     /// engine actor's own spill/rehydrate access). Bumps `activity` once per chunk
     /// so the reclaim worker sees the store as busy for the entire (potentially
     /// long) sweep, not just at its start.
-    fn delete_keys(conn: &Mutex<Connection>, activity: &AtomicU64, keys: &[Key]) {
+    ///
+    /// Returns the typed [`rusqlite::Error`] on any SQLite failure (#1366): a
+    /// panicking `expect` here would, under the server's unwind profile, silently
+    /// kill only the calling (worker) thread and drop the deletes this path exists
+    /// to apply. Each chunk is one atomic transaction, so an `Err` leaves that
+    /// chunk (and all later chunks) unapplied and every earlier chunk durably
+    /// deleted — the caller decides how to surface and retain the unapplied keys
+    /// (the forget worker latches them; the synchronous [`forget`](Self::forget)
+    /// path returns the error to its caller).
+    fn delete_keys(
+        conn: &Mutex<Connection>,
+        activity: &AtomicU64,
+        keys: &[Key],
+    ) -> rusqlite::Result<()> {
         for chunk in keys.chunks(FORGET_CHUNK) {
             activity.fetch_add(1, Ordering::Relaxed);
-            // A poisoned lock means another thread panicked mid-mutation, leaving the
-            // connection in an unknown state; treat it as fatal (matching `put`/`take`)
-            // rather than silently skipping deletes and leaking orphan cold rows.
-            let mut guard = conn.lock().expect("spill store poisoned");
-            // Surface any SQLite failure loudly, for the same reason the poisoned
-            // lock is fatal above: silently swallowing a transaction/prepare/execute/
-            // commit error would drop deletes mid-batch and reintroduce the orphan
-            // cold rows (and unbounded file growth) this path exists to prevent.
-            let tx = guard
-                .transaction()
-                .expect("spill store: begin forget transaction");
+            // A poisoned lock means another thread panicked mid-mutation; the
+            // connection itself is still usable (every op is atomic under the
+            // lock), so recover the guard rather than abort the forget path.
+            let mut guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+            // Propagate any SQLite failure to the caller (see the fn-level docs):
+            // silently swallowing a transaction/prepare/execute/commit error would
+            // drop deletes mid-batch and reintroduce the orphan cold rows (and
+            // unbounded file growth) this path exists to prevent.
+            let tx = guard.transaction()?;
             {
-                let mut del_spill = tx
-                    .prepare_cached("DELETE FROM spill WHERE key = ?1")
-                    .expect("spill store: prepare spill delete");
-                let mut del_cold = tx
-                    .prepare_cached("DELETE FROM cold WHERE key = ?1")
-                    .expect("spill store: prepare cold delete");
+                let mut del_spill = tx.prepare_cached("DELETE FROM spill WHERE key = ?1")?;
+                let mut del_cold = tx.prepare_cached("DELETE FROM cold WHERE key = ?1")?;
                 for &key in chunk {
-                    del_spill
-                        .execute(params![key as i64])
-                        .expect("spill store: delete spill row");
-                    del_cold
-                        .execute(params![key as i64])
-                        .expect("spill store: delete cold row");
+                    del_spill.execute(params![key as i64])?;
+                    del_cold.execute(params![key as i64])?;
                 }
             }
-            tx.commit().expect("spill store: commit forget transaction");
+            tx.commit()?;
         }
+        Ok(())
     }
 
     /// Persists `vars` under `key`, replacing any prior payload.
     pub fn put(&self, key: Key, vars: &HashMap<String, Value>) -> rusqlite::Result<()> {
-        let json = serde_json::to_string(vars).expect("variables serialize to JSON");
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = serde_json::to_string(vars)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO spill (key, vars) VALUES (?1, ?2)",
             params![key as i64, json],
@@ -489,7 +798,7 @@ impl VarSpillStore {
     /// Used to fold spilled payloads into a self-contained snapshot (#1331): the
     /// live instance stays spilled, so its row must survive the read.
     pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         drop(conn);
         serde_json::from_str(&json).ok()
@@ -499,7 +808,7 @@ impl VarSpillStore {
     /// instance is rehydrated exactly once (on activation), so taking the row on
     /// read keeps the store bounded to the still-cold backlog.
     pub fn take(&self, key: Key) -> Option<HashMap<String, Value>> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM spill WHERE key = ?1", params![key as i64]);
         drop(conn);
@@ -519,8 +828,9 @@ impl VarSpillStore {
     /// variable spill above, so the two tiers live in one file and one durability
     /// story — the reason cold spill reuses this store rather than a second DB.
     pub fn put_cold(&self, key: Key, snapshot: &InstanceSnapshot) -> rusqlite::Result<()> {
-        let json = serde_json::to_string(snapshot).expect("snapshot serializes to JSON");
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let json = serde_json::to_string(snapshot)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO cold (key, snapshot) VALUES (?1, ?2)",
             params![key as i64, json],
@@ -534,7 +844,7 @@ impl VarSpillStore {
     /// absent. Used to fold a still-cold instance into a self-contained snapshot
     /// (#1331) while it stays off-heap.
     pub fn get_cold(&self, key: Key) -> Option<InstanceSnapshot> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         drop(conn);
         serde_json::from_str(&json).ok()
@@ -545,7 +855,7 @@ impl VarSpillStore {
     /// instance takes its snapshot back out, so the cold table holds only the
     /// still-dormant backlog.
     pub fn take_cold(&self, key: Key) -> Option<InstanceSnapshot> {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
         drop(conn);
@@ -564,12 +874,26 @@ impl VarSpillStore {
     /// background reclaim thread, which drains only while the store is quiescent — so
     /// this eviction path stays free of the fsync-heavy vacuum/checkpoint that would
     /// otherwise contend with the engine's raft-log fsync under load.
-    pub fn forget(&self, keys: &[Key]) {
+    ///
+    /// On a SQLite failure the error is latched into [`Self::forget_faults`] (so the
+    /// loss is observable and never silent), the unapplied `keys` are retained in
+    /// the same latch (so the pending-delete record survives the failure and no
+    /// orphan rows are silently dropped), **and** the typed error is returned to
+    /// the caller (#1366) — never panicked: this path runs on the replica actor
+    /// thread, where under the server's unwind profile a panic would take the
+    /// whole actor down.
+    pub fn forget(&self, keys: &[Key]) -> rusqlite::Result<()> {
         if keys.is_empty() {
-            return;
+            return Ok(());
         }
         // delete_keys bumps activity per chunk, so no separate note_activity is needed.
-        Self::delete_keys(&self.conn, &self.activity, keys);
+        Self::delete_keys(&self.conn, &self.activity, keys).inspect_err(|err| {
+            // Retain the unapplied keys alongside the fault: the caller owns the
+            // batch but (on the fire-and-forget retirement/eviction paths) drops
+            // it on error, so recording only the error text would lose the
+            // pending-delete record and leave orphan rows (#1366).
+            self.faults.record(err, keys.to_vec());
+        })
     }
 
     /// Like [`forget`](Self::forget), but hands the deletes to the background
@@ -597,43 +921,122 @@ impl VarSpillStore {
         if keys.is_empty() {
             return;
         }
-        // Non-blocking handoff. If the bounded queue is full (slow consumer) or the
-        // worker has gone away, recover the batch and delete synchronously so a
-        // producer > consumer imbalance applies backpressure here instead of growing
-        // the queue's memory without bound.
-        match self.forget.as_ref().and_then(|w| w.tx.as_ref()) {
+        // Producer admission is serialized with the worker's fault transition
+        // (#1366): the closed-check AND the `try_send` run together under the
+        // `admission` mutex, and the worker's failure path closes admission under
+        // that same mutex *before* draining the queue. So a batch either
+        // completes its enqueue before the close (and is retained by the worker's
+        // drain) or observes the closed flag and takes the synchronous fallback —
+        // never accepted into a queue the exiting worker's drain already passed,
+        // and never stranded. The lock is held only across the non-blocking
+        // `try_send`; the (potentially slow) synchronous fallback runs *after* it
+        // is released, so a failing disk never blocks other producers on the
+        // admission lock.
+        //
+        // Non-blocking handoff. If the bounded queue is full (slow consumer) or
+        // the worker has gone away (faulted — see `forget_faults`), recover the
+        // batch and delete synchronously so a producer > consumer imbalance
+        // applies backpressure here instead of growing the queue's memory
+        // without bound. A synchronous fallback failure is latched + retained
+        // by `forget`; this fire-and-forget retirement path surfaces it through
+        // `forget_faults`.
+        let tx = self.forget.as_ref().and_then(|w| w.tx.as_ref());
+        let fallback = match tx {
             Some(tx) => {
-                // Only `Keys` is ever sent on this path, so a Full/Disconnected error
-                // always hands the same batch back for the synchronous fallback.
-                if let Err(TrySendError::Full(ForgetMsg::Keys(k)))
-                | Err(TrySendError::Disconnected(ForgetMsg::Keys(k))) =
-                    tx.try_send(ForgetMsg::Keys(keys))
-                {
-                    self.forget(&k);
+                // Hold the admission lock across the check + send so the pair is
+                // atomic with respect to the worker's close transition.
+                let admission = self
+                    .faults
+                    .admission
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if *admission {
+                    Some(keys)
+                } else {
+                    // Only `Keys` is ever sent on this path, so a
+                    // Full/Disconnected error always hands the same batch back
+                    // for the synchronous fallback.
+                    match tx.try_send(ForgetMsg::Keys(keys)) {
+                        Ok(()) => None,
+                        Err(TrySendError::Full(ForgetMsg::Keys(k)))
+                        | Err(TrySendError::Disconnected(ForgetMsg::Keys(k))) => Some(k),
+                        // `try_send` returns the msg on error and it is always
+                        // `Keys` here; the arms above are exhaustive for this
+                        // path, but cover a `Flush` defensively (unreachable).
+                        Err(TrySendError::Full(ForgetMsg::Flush(_)))
+                        | Err(TrySendError::Disconnected(ForgetMsg::Flush(_))) => None,
+                    }
                 }
+                // `admission` (the guard) drops here, before the fallback.
             }
-            None => self.forget(&keys),
+            None => Some(keys),
+        };
+        if let Some(k) = fallback {
+            let _ = self.forget(&k);
         }
     }
 
     /// Blocks until every batch queued on the background forget worker before this
     /// call has been applied. A no-op for in-memory stores (forgets run inline).
     /// Used by tests and graceful shutdown to make the async deletes observable.
-    pub fn flush_forgets(&self) {
+    ///
+    /// Returns `false` when the worker is gone (channel disconnected) instead of
+    /// panicking: a false "flushed" signal would mask lost or still-pending
+    /// deletes, so callers observe the failure explicitly. A worker that stopped
+    /// on a fatal SQLite error (#1366) acks any already-queued barrier before
+    /// exiting (so this never hangs), then disconnects the channel — the `false`
+    /// comes from the failed send, and [`Self::forget_faults`] carries the error
+    /// and the retained (unapplied) keys.
+    pub fn flush_forgets(&self) -> bool {
         let Some(tx) = self.forget.as_ref().and_then(|w| w.tx.as_ref()) else {
-            return;
+            return true;
         };
         let (ack_tx, ack_rx) = channel();
         // A live store keeps its worker running until `ForgetWorker::drop` closes
         // the channel, so a failed send or ack-recv here means the worker has
-        // panicked/exited. Surface that loudly rather than returning a false
-        // "flushed" signal to tests / graceful shutdown (which would mask lost or
-        // still-pending deletes — the orphan-row leak this path guards against).
-        tx.send(ForgetMsg::Flush(ack_tx))
-            .expect("varspill forget worker gone before flush");
-        ack_rx
-            .recv()
-            .expect("varspill forget worker dropped flush ack");
+        // exited (faulted). Surface that (as `false`) rather than returning a
+        // false "flushed" signal to tests / graceful shutdown (which would mask
+        // lost or still-pending deletes — the orphan-row leak this path guards
+        // against).
+        if tx.send(ForgetMsg::Flush(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv().is_ok()
+    }
+
+    /// Waits for the background forget worker to finish: closes the channel (so
+    /// the worker drains any queued batches and exits its `recv` loop) and joins
+    /// the thread, returning its result. `true` when the worker exited cleanly
+    /// (including a faulted exit — the fault is latched in
+    /// [`Self::forget_faults`], not a panic); `false` when the worker **panicked**
+    /// (the join returns the panic payload). A no-op (`true`) for in-memory
+    /// stores (no worker) or when the worker was already awaited / dropped.
+    ///
+    /// This is a worker-**completion** barrier, unlike [`flush_forgets`] (a
+    /// queued-work barrier) and unlike polling [`ForgetFaults::error`] (which
+    /// fires *before* the worker's drain + exit). Tests and graceful shutdown use
+    /// it to observe that the faulted worker has actually exited — and every
+    /// still-queued batch has been drained into `retained_keys` — before
+    /// asserting the final fault state.
+    pub fn await_forget_worker(&mut self) -> bool {
+        let Some(worker) = self.forget.as_mut() else {
+            return true;
+        };
+        // Close the channel so the worker drains and exits its recv loop.
+        drop(worker.tx.take());
+        match worker.handle.take() {
+            Some(h) => h.join().is_ok(),
+            None => true,
+        }
+    }
+
+    /// The latched forget/delete failure state (#1366): `Some` once the
+    /// background forget worker (or a synchronous [`forget`](Self::forget)) hit a
+    /// fatal SQLite error, carrying the first error and the keys whose deletes
+    /// were retained (not applied) when the worker stopped. Empty while the store
+    /// is healthy.
+    pub fn forget_faults(&self) -> &ForgetFaults {
+        &self.faults
     }
 
     /// The store's on-disk size as `(file_bytes, live_bytes)` (see
@@ -642,7 +1045,7 @@ impl VarSpillStore {
     /// incremental auto-vacuum + background reclaim, `file_bytes` settles toward the
     /// live cold backlog once a spike drains, rather than plateauing at the peak.
     pub fn db_page_stats(&self) -> (u64, u64) {
-        let conn = self.conn.lock().expect("spill store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         page_stats(&conn)
     }
 }
@@ -663,6 +1066,421 @@ mod tests {
         store.put(7, &vars("hello")).unwrap();
         let got = store.take(7).expect("payload present");
         assert_eq!(got.get("data"), Some(&Value::Str("hello".to_string())));
+    }
+
+    /// Epic #1357 failure-injection guard: a poisoned connection mutex must be
+    /// RECOVERED (the guard is taken from the poison) on every public path —
+    /// never a panic. Poisoning means some thread panicked mid-mutation; the
+    /// store stays available because every operation here is atomic under the
+    /// lock (a panic between operations leaves the connection usable).
+    #[test]
+    fn poisoned_connection_lock_is_recovered_not_panicked() {
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(1, &vars("before-poison")).unwrap();
+
+        // Poison the mutex: panic while holding the guard.
+        let conn = Arc::clone(&store.conn);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = conn.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            store.conn.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // Every public path must still work — no panics.
+        store.put(2, &vars("after-poison")).unwrap();
+        assert_eq!(store.get(1), Some(vars("before-poison")));
+        assert_eq!(store.take(2), Some(vars("after-poison")));
+        let snapshot = cold_snapshot(3, "cold");
+        store.put_cold(3, &snapshot).unwrap();
+        assert_eq!(store.get_cold(3), Some(snapshot.clone()));
+        assert_eq!(store.take_cold(3), Some(snapshot));
+        let (file_bytes, live_bytes) = store.db_page_stats();
+        assert!(
+            live_bytes > 0,
+            "stats still read: ({file_bytes}, {live_bytes})"
+        );
+        store.forget(&[1]).unwrap();
+        assert!(store.get(1).is_none(), "forget still deletes");
+    }
+
+    /// Epic #1357 / #1366 failure-injection guard: on a **file-backed** store the
+    /// background forget worker holds the connection lock too, and it must RECOVER
+    /// a poisoned lock (take the guard from the poison) rather than panic or exit
+    /// silently. Under `panic = "unwind"` a worker panic only kills the worker
+    /// thread, so a poison that stopped the worker would silently drop queued
+    /// retirement deletes (and the WAL-growth checkpoint backstop) while foreground
+    /// writes kept running — the failure mode this test guards against. In-memory
+    /// stores forget inline and spawn no worker, so this needs a real file.
+    #[test]
+    fn poisoned_connection_lock_is_recovered_in_file_backed_forget_worker() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-poison-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let store = VarSpillStore::open(Some(&path)).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        store.put(2, &vars("b")).unwrap();
+
+        // Poison the shared connection mutex: panic while holding the guard.
+        let conn = Arc::clone(&store.conn);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = conn.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            store.conn.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // The background forget worker must recover the poison and still apply the
+        // delete — not exit silently or panic. `flush_forgets` returns `false` iff
+        // the worker has gone away, so a `true` here proves it survived the poison
+        // and drained the queued batch.
+        store.forget_async(&[1]);
+        assert!(
+            store.flush_forgets(),
+            "forget worker survived the poison and drained its queue"
+        );
+        assert!(
+            store.get(1).is_none(),
+            "the async forget still deleted key 1 through the recovered lock"
+        );
+
+        // Foreground writes keep working through the recovered (still-poisoned)
+        // lock, so the store stays available end to end.
+        store.put(3, &vars("c")).unwrap();
+        assert_eq!(store.get(2), Some(vars("b")));
+        assert_eq!(store.get(3), Some(vars("c")));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1366 failure-injection guard (delete path): a genuine SQLite error in the
+    /// forget worker's delete must NOT panic the worker (under `panic = "unwind"`
+    /// that would silently kill only the worker thread, dropping every queued
+    /// batch). The worker latches the error into `forget_faults`, retains the
+    /// failed batch plus every still-queued batch, acks a queued flush barrier,
+    /// and exits — disconnecting the channel so `flush_forgets` reports `false`
+    /// and later `forget_async*` calls fall back to synchronous deletes.
+    ///
+    /// Deterministic: the failure is gated (see
+    /// [`ForgetFaultInjection::arm_gated_delete_failure`]) so the second batch and
+    /// the flush barrier are queued *while the worker is parked at the failure
+    /// point*, not by racing the scheduler.
+    #[test]
+    fn forget_worker_delete_error_latches_fault_and_retains_pending_keys() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-delerr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let mut store = VarSpillStore::open(Some(&path)).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        store.put(2, &vars("b")).unwrap();
+        store.put(3, &vars("c")).unwrap();
+
+        // Break deletes: dropping the `spill` table makes the worker's
+        // `DELETE FROM spill` fail with a real SQLite error on the next batch.
+        {
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute("DROP TABLE spill", []).unwrap();
+        }
+
+        // Arm the gated failure, then queue the first batch. The worker receives
+        // it and parks at the gate just before the (injected) failing delete.
+        let (parked, release) = store.fault_injection.arm_gated_delete_failure();
+        store.forget_async(&[1]);
+        parked
+            .recv()
+            .expect("the worker parks at the gate before its failing delete");
+
+        // While the worker is parked at the failure point, queue the second
+        // batch and the flush barrier behind it — deterministically, with no
+        // scheduling race. Then release the worker into the failure.
+        store.forget_async(&[2]);
+        let (ack_tx, ack_rx) = channel();
+        {
+            let tx = store.forget.as_ref().and_then(|w| w.tx.as_ref());
+            tx.expect("worker alive")
+                .send(ForgetMsg::Flush(ack_tx))
+                .expect("barrier enqueued while the worker is parked");
+        }
+        release.send(()).expect("release the gated worker");
+
+        // The worker fails batch [1], closes admission, retains [1]+[2], acks
+        // the already-queued barrier (so this recv cannot hang), and exits.
+        ack_rx
+            .recv()
+            .expect("the barrier queued behind the batches is acked by the failing worker");
+        // Wait for ACTUAL worker completion (not just the latched error, which
+        // `record` sets before the drain): close + join the worker. After this,
+        // the worker has exited, the queue is drained into `retained_keys`, and
+        // the channel is disconnected — so the retained set is final. `true`
+        // (not a panic): the fault is latched in `forget_faults`, not propagated
+        // as a panic. (A post-join `flush_forgets` would be vacuous — the channel
+        // is already closed — so worker exit is proven by the join itself.)
+        assert!(
+            store.await_forget_worker(),
+            "the forget worker exited cleanly (fault latched, not panicked)"
+        );
+        assert!(
+            store.forget_faults().error().is_some(),
+            "the delete failure is latched observably"
+        );
+        let mut retained = store.forget_faults().retained_keys();
+        retained.sort_unstable();
+        assert_eq!(
+            retained,
+            vec![1, 2],
+            "the failed batch and the still-queued batch are both retained, not dropped"
+        );
+
+        // No silent loss: with the table restored, the synchronous fallback path
+        // (the worker is gone, so forget_async falls back) still applies deletes.
+        // Reinsert key 3 first — `DROP TABLE spill` already removed it, so
+        // without a reinsert the `get(3).is_none()` assertion below would pass
+        // vacuously even if the fallback did nothing.
+        {
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS spill (key INTEGER PRIMARY KEY, vars TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        store.put(3, &vars("c")).unwrap();
+        assert_eq!(store.get(3), Some(vars("c")), "key 3 reinserted");
+        store.forget_async(&[3]);
+        assert!(
+            store.get(3).is_none(),
+            "post-fault forget_async falls back to a synchronous delete"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1366 failure-injection guard (checkpoint path): a failing
+    /// `wal_checkpoint(TRUNCATE)` takes the same observable fault-latch path as a
+    /// delete error — the worker latches the fault and stops rather than
+    /// panicking (silently killing the thread under unwind) or swallowing the
+    /// error (letting the WAL grow without bound). Uses the cfg(test) injection
+    /// seam: a real checkpoint error cannot be forced deterministically on a
+    /// healthy connection, and the env knob is process-global (races parallel
+    /// tests).
+    #[test]
+    fn forget_worker_checkpoint_error_latches_fault_and_stops() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-ckpterr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let mut store = VarSpillStore::open(Some(&path)).unwrap();
+
+        // Arm the seam: the worker's next checkpoint fails after the batch's
+        // deletes have been applied (so there is nothing to retain from it).
+        store
+            .fault_injection
+            .fail_next_checkpoint
+            .store(true, Ordering::Relaxed);
+        // Queue at least WAL_CKPT_KEYS keys so the checkpoint fires on this batch.
+        let n = wal_checkpoint_keys();
+        store.forget_async_owned((0..n).collect());
+
+        // Wait for ACTUAL worker completion (not just the latched error, which
+        // `record` sets before the drain + exit): close + join the worker. After
+        // this the worker has exited and the channel is disconnected — no
+        // scheduling race between "worker exiting" and observing the exit. `true`
+        // (not a panic): the checkpoint fault is latched, not propagated as a
+        // panic. (A post-join `flush_forgets` would be vacuous — the channel is
+        // already closed — so worker exit is proven by the join itself.)
+        assert!(
+            store.await_forget_worker(),
+            "the forget worker exited cleanly (checkpoint fault latched, not panicked)"
+        );
+        assert!(
+            store.forget_faults().error().is_some(),
+            "the checkpoint failure is latched observably"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1366: the synchronous `forget` path (replica actor thread) returns the
+    /// typed error and latches the same fault — it must never panic, because
+    /// under `panic = "unwind"` a panic there would take the whole actor down.
+    /// The unapplied keys are retained in the latch so the pending-delete record
+    /// survives the failure (no orphan rows dropped silently).
+    #[test]
+    fn sync_forget_returns_typed_error_and_latches_fault() {
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        {
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute("DROP TABLE spill", []).unwrap();
+        }
+
+        let err = store
+            .forget(&[1])
+            .expect_err("a broken delete surfaces as a typed error, not a panic");
+        assert!(
+            err.to_string().contains("spill"),
+            "the typed error names the failed statement's table: {err}"
+        );
+        assert!(
+            store.forget_faults().error().is_some(),
+            "the synchronous failure is latched into the same observable fault"
+        );
+        assert_eq!(
+            store.forget_faults().retained_keys(),
+            vec![1],
+            "the unapplied keys are retained, not dropped"
+        );
+    }
+
+    /// #1366 regression guard: a failing **synchronous fallback** in
+    /// `forget_async_owned` (queue full or worker gone) must retain the batch in
+    /// `forget_faults` — the fire-and-forget retirement path drops the owned
+    /// batch on error, so without retention the pending-delete record is lost
+    /// and the rows orphan silently.
+    #[test]
+    fn failing_sync_fallback_retains_the_batch() {
+        // In-memory store: no forget worker, so `forget_async` always runs the
+        // synchronous fallback inline.
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(7, &vars("x")).unwrap();
+        {
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute("DROP TABLE spill", []).unwrap();
+        }
+
+        store.forget_async(&[7]);
+        assert!(
+            store.forget_faults().error().is_some(),
+            "the fallback failure is latched observably"
+        );
+        assert_eq!(
+            store.forget_faults().retained_keys(),
+            vec![7],
+            "the fallback's failed batch is retained, not dropped"
+        );
+    }
+
+    /// #1366 regression guard for the fault-transition shutdown window: a batch
+    /// enqueued concurrently with the worker's failure handling must NEVER be
+    /// accepted into the queue after the worker's drain has already passed it
+    /// (which would leave it neither retained nor deleted). The admission
+    /// closed-check and the `try_send` run together under the `admission` mutex,
+    /// and the worker closes admission under that same mutex *before* draining —
+    /// so a racing producer either completes its enqueue before the close (and is
+    /// retained by the drain) or observes the closed flag and takes the
+    /// synchronous fallback. Either way the key is accounted for: deleted, or
+    /// present in `retained_keys`.
+    #[test]
+    fn forget_async_during_fault_transition_is_never_lost() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let mut store = VarSpillStore::open(Some(&path)).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        store.put(9, &vars("z")).unwrap();
+
+        // Break deletes so the worker's next delete fails.
+        {
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute("DROP TABLE spill", []).unwrap();
+        }
+
+        // Arm the gated failure and queue the failing batch; the worker parks at
+        // the gate just before the delete.
+        let (parked, release) = store.fault_injection.arm_gated_delete_failure();
+        store.forget_async(&[1]);
+        parked.recv().expect("worker parked at the gate");
+
+        // While the worker is parked, hammer `forget_async` from another thread
+        // so some sends race the fault transition (the close + drain + exit).
+        // `std::thread::scope` joins the racer before returning. Use DISTINCT
+        // keys (100..150) so the accounting below can verify EVERY submitted
+        // batch is retained — a repeated-key `contains` assertion would pass
+        // even if some batches were lost in the shutdown window.
+        const RACERS: u64 = 50;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                for k in 0..RACERS {
+                    store.forget_async(&[100 + k]);
+                }
+            });
+            // Release the worker into the failure while the racer is mid-stream.
+            release.send(()).expect("release the gated worker");
+        });
+
+        // Wait for ACTUAL worker completion (not just the producer join, which
+        // can finish while the worker is still mid-drain): close + join the
+        // worker. After this, every racing batch has been fully accounted for —
+        // either applied (impossible here, deletes are broken) or retained by
+        // the worker's drain / the synchronous fallback — and the retained set
+        // is final. `true` (not a panic): the fault is latched, not panicked.
+        assert!(
+            store.await_forget_worker(),
+            "the forget worker exited cleanly (fault latched, not panicked)"
+        );
+
+        // No silent loss: because deletes are broken, EVERY submitted key — the
+        // failed batch [1] and all 50 racing batches [100..150) — must be
+        // retained. None may be dropped in the shutdown window. This exact
+        // accounting (not a `contains` on one repeated key) is what proves no
+        // batch was lost.
+        assert!(
+            store.forget_faults().error().is_some(),
+            "the fault is latched"
+        );
+        let mut retained = store.forget_faults().retained_keys();
+        retained.sort_unstable();
+        let mut expected: Vec<Key> = vec![1];
+        expected.extend((0..RACERS).map(|k| 100 + k));
+        assert_eq!(
+            retained, expected,
+            "every submitted batch (the failed one + all racers) is retained, none lost"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // #1331: the store's rows must survive a process restart (re-open), because
@@ -809,7 +1627,7 @@ mod tests {
 
         // Forgetting terminal instances drops their rows; an absent key (99) is a
         // no-op, and an untouched key (3) survives.
-        store.forget(&[1, 2, 99]);
+        store.forget(&[1, 2, 99]).unwrap();
 
         assert!(store.take(1).is_none(), "forgotten spill row gone");
         assert!(store.take(2).is_none(), "forgotten spill row gone");
@@ -817,11 +1635,11 @@ mod tests {
 
         // forget also clears the cold tier for the same key.
         store.put(4, &vars("d")).unwrap();
-        store.forget(&[4]);
+        store.forget(&[4]).unwrap();
         assert!(store.take(4).is_none(), "forget clears spill tier for key");
 
         // Empty slice is a cheap no-op.
-        store.forget(&[]);
+        store.forget(&[]).unwrap();
     }
 
     #[test]
@@ -846,7 +1664,7 @@ mod tests {
 
         // Terminal eviction frees the rows onto the freelist but does NOT reclaim
         // inline any more — the file still holds the high-water right after forget.
-        store.forget(&keys);
+        store.forget(&keys).unwrap();
         let (file_right_after, live_after) = store.db_page_stats();
         assert!(
             live_after < live_peak / 4,
@@ -915,7 +1733,7 @@ mod tests {
         // Enqueue the forget; the actual DELETEs run on the worker thread.
         store.forget_async(&[1, 2]);
         // A flush barrier acks only after every batch queued before it is applied.
-        store.flush_forgets();
+        assert!(store.flush_forgets(), "forget worker flushed");
 
         assert!(
             store.take(1).is_none(),
@@ -929,7 +1747,7 @@ mod tests {
 
         // Empty slice is a cheap no-op (no message queued).
         store.forget_async(&[]);
-        store.flush_forgets();
+        assert!(store.flush_forgets(), "forget worker flushed");
 
         drop(store);
         let _ = std::fs::remove_file(&path);
@@ -947,6 +1765,6 @@ mod tests {
             "in-memory forget_async is synchronous"
         );
         // flush is a no-op when there is no worker.
-        store.flush_forgets();
+        assert!(store.flush_forgets(), "forget worker flushed");
     }
 }

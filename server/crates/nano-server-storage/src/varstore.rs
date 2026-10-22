@@ -148,13 +148,14 @@ impl VarStore {
         upserts: &[(Key, &HashMap<String, Value>)],
         forgets: &[Key],
     ) -> rusqlite::Result<()> {
-        let mut conn = self.conn.lock().expect("var store poisoned");
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction()?;
         {
             let mut put =
                 tx.prepare_cached("INSERT OR REPLACE INTO vars (key, vars) VALUES (?1, ?2)")?;
             for (key, vars) in upserts {
-                let json = serde_json::to_string(vars).expect("variables serialize to JSON");
+                let json = serde_json::to_string(vars)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 put.execute(params![*key as i64, json])?;
             }
             let mut del = tx.prepare_cached("DELETE FROM vars WHERE key = ?1")?;
@@ -175,8 +176,9 @@ impl VarStore {
     /// be ahead of the last checkpoint, which recovery tolerates (the journal
     /// tail past the checkpoint re-applies any newer change).
     pub fn put_current(&self, key: Key, vars: &HashMap<String, Value>) -> rusqlite::Result<()> {
-        let json = serde_json::to_string(vars).expect("variables serialize to JSON");
-        let conn = self.conn.lock().expect("var store poisoned");
+        let json = serde_json::to_string(vars)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "INSERT OR REPLACE INTO vars (key, vars) VALUES (?1, ?2)",
             params![key as i64, json],
@@ -189,7 +191,7 @@ impl VarStore {
     /// instance on job activation must leave the durable row in place for the next
     /// recovery. `None` if the instance is absent.
     pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
-        let conn = self.conn.lock().expect("var store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json: Option<String> = conn
             .query_row(
                 "SELECT vars FROM vars WHERE key = ?1",
@@ -205,7 +207,7 @@ impl VarStore {
     /// checkpointed). Compaction gates on this so no segment needed to replay the
     /// journal tail past it is deleted.
     pub fn position(&self, partition: u64) -> u64 {
-        let conn = self.conn.lock().expect("var store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT pos FROM position WHERE partition = ?1",
             params![partition as i64],
@@ -222,7 +224,7 @@ impl VarStore {
     /// Rows that fail to deserialize are skipped (the journal tail can still
     /// re-create them), keeping a partially-corrupt store non-fatal.
     pub fn load_all(&self) -> HashMap<Key, HashMap<String, Value>> {
-        let conn = self.conn.lock().expect("var store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = match conn.prepare("SELECT key, vars FROM vars") {
             Ok(s) => s,
             Err(_) => return HashMap::new(),
@@ -260,13 +262,13 @@ impl VarStore {
     /// A `SQLITE_BUSY` from a concurrent reader is not fatal — the WAL is simply
     /// truncated on a later tick — so callers should log-and-continue on error.
     pub fn checkpoint_wal(&self) -> rusqlite::Result<()> {
-        let conn = self.conn.lock().expect("var store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
     }
 
     /// Number of instances currently held. Test/observability helper.
     pub fn len(&self) -> usize {
-        let conn = self.conn.lock().expect("var store poisoned");
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row("SELECT COUNT(*) FROM vars", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0) as usize
     }
@@ -305,6 +307,43 @@ mod tests {
             Some(&Value::Str("beta".into()))
         );
         assert_eq!(store.position(0), 10);
+    }
+
+    /// Epic #1357 failure-injection guard: a poisoned connection mutex must be
+    /// RECOVERED on every public path — never a panic. The store is the durable
+    /// variable tier on the recovery path, so availability beats fail-fast here.
+    #[test]
+    fn poisoned_connection_lock_is_recovered_not_panicked() {
+        let store = VarStore::open(None).unwrap();
+        store
+            .checkpoint(0, 1, &[(1, &vars("before"))], &[])
+            .unwrap();
+
+        // Poison the mutex: panic while holding the guard.
+        let conn = &store.conn;
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = conn.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            store.conn.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // Every public path must still work — no panics.
+        store.put_current(2, &vars("after")).unwrap();
+        assert_eq!(store.get(2), Some(vars("after")));
+        store.checkpoint(0, 2, &[(3, &vars("c"))], &[1]).unwrap();
+        assert_eq!(store.position(0), 2);
+        let all = store.load_all();
+        assert!(all.contains_key(&3) && !all.contains_key(&1));
+        store.checkpoint_wal().unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(!store.is_empty());
     }
 
     #[test]
