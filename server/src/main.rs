@@ -23949,13 +23949,19 @@ async fn main() {
                     // journal) is refused rather than silently resumed — see
                     // issue #600.
                     let surviving: Vec<&Event> = recovery.events.iter().collect();
-                    seglog::catch_up_shard(
+                    // Boot-fatal, mirroring the sibling catch-up site above: a read
+                    // model that cannot catch up is not durable/consistent — abort
+                    // boot loudly rather than serve a stale read model. Written as
+                    // `if let Err .. panic!` (not `.expect`) to satisfy the
+                    // workspace `expect_used = "deny"` lint.
+                    if let Err(e) = seglog::catch_up_shard(
                         &shard,
                         recovery.first_index,
                         &surviving,
                         Some(journal.engine_state()),
-                    )
-                    .expect("failed to catch up the read model from the segmented journal");
+                    ) {
+                        panic!("failed to catch up the read model from the segmented journal: {e}");
+                    }
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 } else {
