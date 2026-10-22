@@ -2735,6 +2735,17 @@ impl ReadStore {
     }
 
     pub fn process_instance(&self, key: Key) -> Option<ProcessInstanceRow> {
+        self.try_process_instance(key)
+            .or_corrupt("query process_instance")
+    }
+
+    /// Look up a process instance, distinguishing absence from a failed read.
+    ///
+    /// Static SQL and an ensured schema make a *prepare*/decode failure a
+    /// corruption signal, but a file-backed page read can still fail at runtime
+    /// with `SQLITE_IOERR` — this fallible path lets a caller propagate that
+    /// instead of taking the infallible wrapper's fail-fast panic (#1357).
+    pub fn try_process_instance(&self, key: Key) -> rusqlite::Result<Option<ProcessInstanceRow>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.query_row(
             "SELECT key, process_id, process_definition_id, process_definition_key, \
@@ -2743,7 +2754,6 @@ impl ReadStore {
             map_instance,
         )
         .optional()
-        .or_corrupt("query process_instance")
     }
 
     /// Resolves `key`'s `rootProcessInstanceKey` (issue #977) by walking the
@@ -14134,5 +14144,52 @@ mod agent_projection_tests {
             row.completion_date_ms.is_some(),
             "a completed instance carries its completion date"
         );
+    }
+}
+
+#[cfg(test)]
+mod try_query_tests {
+    use super::{Event, Key, ReadStore};
+
+    fn created_event(instance_key: Key) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: "p".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        }
+    }
+
+    #[test]
+    fn try_process_instance_distinguishes_absence_from_corrupt_rows() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&created_event(1)]).unwrap();
+
+        // A healthy row reads back; an absent key is `Ok(None)`, not an error.
+        assert_eq!(store.try_process_instance(1).unwrap().unwrap().key, 1);
+        assert!(store.try_process_instance(999).unwrap().is_none());
+
+        // A malformed persisted projection (here: TEXT stored in the INTEGER
+        // state column — SQLite's dynamic typing admits it past the column
+        // constraints, but decoding it as i64 fails) is a typed decode error on
+        // the fallible path — never a silent absence and never the infallible
+        // wrapper's panic (#1357).
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE process_instances SET state = 'not-an-int' WHERE key = 1",
+                [],
+            )
+            .unwrap();
+        assert!(store.try_process_instance(1).is_err());
+        assert!(store.try_process_instance(999).unwrap().is_none());
     }
 }

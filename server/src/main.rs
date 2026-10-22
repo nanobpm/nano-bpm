@@ -8077,7 +8077,7 @@ impl ServerImpl {
             }
         };
 
-        let result = self.store.process_instance(key);
+        let result = self.store.try_process_instance(key).map_err(|_| ())?;
         if result.is_none()
             && let Some(node) = self.read_route(key)
         {

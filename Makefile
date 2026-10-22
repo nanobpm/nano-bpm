@@ -384,9 +384,17 @@ engine-wasm-agent-instance-e2e: ## Run the AgentInstance/AgentHistory end-to-end
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
 	cd $(WASM_DIR) && cargo check --target wasm32-unknown-unknown
 
+.PHONY: engine-wasm-clippy
+engine-wasm-clippy: ## Clippy-gate engine-wasm's #1357 unwrap/expect denies for wasm32 (needs the wasm32 target AND the clippy component). `cargo check` (engine-wasm-check) never runs lints, so without this a new production unwrap() in engine-wasm would pass CI.
+	cd $(WASM_DIR) && cargo clippy --all-targets --target wasm32-unknown-unknown -- -D warnings
+
 .PHONY: engine-wasm-check-read-model
 engine-wasm-check-read-model: ## Type-check engine-wasm with the off-by-default `read-model` feature for wasm32. Compiles a trimmed SQLite C amalgamation, so it needs the wasm32 target AND an LLVM clang with a wasm backend (Apple/GCC clang have none): point CC_wasm32_unknown_unknown/AR_wasm32_unknown_unknown at llvm clang/llvm-ar (e.g. Homebrew LLVM on macOS, the distro `llvm`/`clang` on CI).
 	cd $(WASM_DIR) && $(WASM_READ_MODEL_ENV) cargo check --features read-model --target wasm32-unknown-unknown
+
+.PHONY: engine-wasm-clippy-read-model
+engine-wasm-clippy-read-model: ## Clippy-gate engine-wasm + the read-model crate (a path dependency, so this lints both) with the `read-model` feature, on the host (needs the clippy component; no wasm toolchain — the wasm32 variant above covers the target-specific cfgs).
+	cd $(WASM_DIR) && cargo clippy --all-targets --features read-model -- -D warnings
 
 .PHONY: release-tags
 release-tags: ## Cut release tags for every train whose version is bumped but untagged (dry run; PUSH=1 to tag origin/main HEAD and push). One tag per push + confirms each release workflow started — see RELEASE.md.

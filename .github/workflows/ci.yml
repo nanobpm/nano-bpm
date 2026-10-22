@@ -298,6 +298,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-core
@@ -310,6 +311,11 @@ jobs:
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
         run: make engine-wasm-check
+      - name: Clippy engine-wasm (wasm32, default features)
+        # Enforces the crate's #1357 `unwrap_used`/`expect_used` denies:
+        # `cargo check` (engine-wasm-check) never runs lints, so without this a
+        # new production unwrap() in engine-wasm would pass CI.
+        run: make engine-wasm-clippy
       - name: Bundle-split test (each subpath emits only its own _bg.wasm)
         # Guards the dual-publish acceptance criterion (#825): bundles the lean
         # (`.`) and `/readmodel` entrypoints of the committed engine-wasm/pkg and
@@ -364,6 +370,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-wasm
@@ -398,6 +405,13 @@ jobs:
           echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
       - name: Type-check engine-wasm --features read-model (wasm32)
         run: make engine-wasm-check-read-model
+      - name: Clippy engine-wasm --features read-model (host)
+        # Enforces the #1357 `unwrap_used`/`expect_used` denies on the
+        # feature-ON surface. engine-wasm path-depends on the read-model crate,
+        # so this lints read-model's denies in the same pass (read-model is in
+        # no other clippy job's workspace). Host target: the read model links
+        # the bundled native SQLite there, so no wasm C toolchain is involved.
+        run: make engine-wasm-clippy-read-model
       - name: Test engine-wasm on the host (--features read-model)
         # The facade's Rust tests (incl. the read channel and the spec-required
         # DTO guard, #1291) were compiled for wasm32 above but never *run*.
