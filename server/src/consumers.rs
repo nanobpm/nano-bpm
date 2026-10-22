@@ -208,7 +208,7 @@ pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) -> bool
     }
     let now = now_ms();
     let key = (job_type.to_string(), worker.to_string());
-    let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    let mut polls = REST_POLLS.lock().unwrap_or_else(|e| e.into_inner());
     let prior = polls.get(&key);
     let in_flight = prior.map(|p| p.in_flight).unwrap_or(0);
     // Overlapping polls share one entry keyed by `(job_type, worker)`, so the
@@ -261,7 +261,7 @@ pub fn record_rest_poll(job_type: &str, worker: &str, long_poll_ms: u64) -> bool
 /// was never recorded because `max_jobs_to_activate <= 0`).
 pub fn complete_rest_poll(job_type: &str, worker: &str) {
     let now = now_ms();
-    let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    let mut polls = REST_POLLS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(p) = polls.get_mut(&(job_type.to_string(), worker.to_string())) {
         p.in_flight = p.in_flight.saturating_sub(1);
         if p.in_flight == 0 {
@@ -429,7 +429,7 @@ pub fn rest_workers_per_type() -> HashMap<String, usize> {
     let now = now_ms();
     let stale = rest_stale_ms();
     let evict = rest_evict_ms();
-    let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+    let mut polls = REST_POLLS.lock().unwrap_or_else(|e| e.into_inner());
     // Drop entries past the eviction window before folding, mirroring
     // `snapshot()`'s prune. `rest_retained` keeps every armed/in-flight
     // registration (`in_flight > 0`) and every entry still within its eviction
@@ -464,7 +464,7 @@ pub fn snapshot(registry: &Registry) -> ConsumersResponse {
     // A consumer is live while its long-poll window is open (the request is
     // legitimately in flight) or it re-polled within the stale grace.
     {
-        let mut polls = REST_POLLS.lock().expect("consumer rest-polls poisoned");
+        let mut polls = REST_POLLS.lock().unwrap_or_else(|e| e.into_inner());
         polls.retain(|_, p| rest_retained(p, now, evict));
         for ((job_type, worker), p) in polls.iter() {
             let age = now.saturating_sub(p.last_seen_ms);
@@ -1359,5 +1359,33 @@ mod tests {
             );
         }
         clear("t-inflight:");
+    }
+
+    /// Lock-poison recovery (epic #1357): a panic while holding the `REST_POLLS`
+    /// mutex poisons it. The REST poll-registry accessors feed the always-on
+    /// `nanobpm_job_type_workers` gauge, so a poisoned lock must not cascade a
+    /// panic into every consumer request. Before the unwrap/expect-deny
+    /// conversion `complete_rest_poll` called `.expect("consumer rest-polls
+    /// poisoned")` and panicked; now it recovers the inner guard.
+    ///
+    /// The poison is cleared again at the end so sibling tests sharing the
+    /// process-global static are unaffected (nextest also isolates per-process).
+    #[test]
+    fn complete_rest_poll_recovers_from_poisoned_lock() {
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = REST_POLLS.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("intentionally poison REST_POLLS");
+        });
+        assert!(poisoned.is_err(), "the panicking closure must unwind");
+        assert!(REST_POLLS.is_poisoned(), "REST_POLLS must now be poisoned");
+
+        // The real assertion: this returns instead of panicking on the poison.
+        complete_rest_poll("t-poison-recovery:absent", "nobody");
+
+        REST_POLLS.clear_poison();
+        assert!(
+            !REST_POLLS.is_poisoned(),
+            "poison restored for sibling tests"
+        );
     }
 }

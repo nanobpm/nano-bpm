@@ -209,7 +209,7 @@ impl Registry {
         crate::metrics::stream_connection_inc();
         self.conns
             .lock()
-            .expect("registry poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(conn.id, conn);
     }
 
@@ -220,13 +220,17 @@ impl Registry {
     /// connection; without the guard the `nanobpm_stream_connections_active`
     /// gauge would double-decrement and drift negative.
     fn unregister(&self, id: ConnId) -> bool {
-        let removed = self.conns.lock().expect("registry poisoned").remove(&id);
+        let removed = self
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
         let Some(conn) = removed else {
             return false;
         };
         conn.closed.store(true, Ordering::Relaxed);
         crate::metrics::stream_connection_dec();
-        let mut by_type = self.by_type.lock().expect("registry poisoned");
+        let mut by_type = self.by_type.lock().unwrap_or_else(|e| e.into_inner());
         for ids in by_type.values_mut() {
             ids.retain(|&other| other != id);
         }
@@ -243,7 +247,7 @@ impl Registry {
         // so without this a repeated subscribe/disconnect cycle would retain one
         // `String` per historical type indefinitely. Lock order `by_type` → `rr`
         // matches `dispatch_plan`, so there is no lock-ordering inversion.
-        let mut rr = self.rr.lock().expect("registry poisoned");
+        let mut rr = self.rr.lock().unwrap_or_else(|e| e.into_inner());
         rr.retain(|job_type, _| by_type.contains_key(job_type));
         true
     }
@@ -262,7 +266,7 @@ impl Registry {
     /// wins and the index sees the id absent and bails. Lock order `conns → by_type`
     /// matches `dispatch_plan`, so there is no lock-ordering inversion.
     fn index(&self, job_type: &str, id: ConnId) {
-        let conns = self.conns.lock().expect("registry poisoned");
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
         match conns.get(&id) {
             // Still registered and not yet reaped: safe to index.
             Some(conn) if !conn.closed.load(Ordering::Relaxed) => {}
@@ -270,7 +274,7 @@ impl Registry {
             // the index so it cannot resurrect a phantom roster entry.
             _ => return,
         }
-        let mut by_type = self.by_type.lock().expect("registry poisoned");
+        let mut by_type = self.by_type.lock().unwrap_or_else(|e| e.into_inner());
         let ids = by_type.entry(job_type.to_string()).or_default();
         if !ids.contains(&id) {
             ids.push(id);
@@ -284,7 +288,7 @@ impl Registry {
     pub fn workers_per_type(&self) -> HashMap<String, usize> {
         self.by_type
             .lock()
-            .expect("registry poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|(job_type, ids)| (job_type.clone(), ids.len()))
             .collect()
@@ -312,9 +316,9 @@ impl Registry {
     /// are untouched here: they redeliver on lock expiry, preserving at-least-once —
     /// no job is lost, only delayed.)
     fn dispatch_plan(&self, per_type_cap: usize) -> Vec<(String, Vec<DispatchTarget>)> {
-        let conns = self.conns.lock().expect("registry poisoned");
-        let by_type = self.by_type.lock().expect("registry poisoned");
-        let mut rr = self.rr.lock().expect("registry poisoned");
+        let conns = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        let by_type = self.by_type.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rr = self.rr.lock().unwrap_or_else(|e| e.into_inner());
         let mut plan = Vec::new();
         for (job_type, ids) in by_type.iter() {
             if ids.is_empty() {
@@ -347,7 +351,7 @@ impl Registry {
                 let sub = conn
                     .subs
                     .lock()
-                    .expect("registry poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(job_type)
                     .cloned();
                 if let Some(sub) = sub {
@@ -372,7 +376,7 @@ impl Registry {
     fn all_connections(&self) -> Vec<Arc<Connection>> {
         self.conns
             .lock()
-            .expect("registry poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .values()
             .cloned()
             .collect()
@@ -397,7 +401,7 @@ impl Registry {
         let mut out = Vec::new();
         for conn in self.all_connections() {
             let last_seen_ms = conn.last_seen_ms.load(Ordering::Relaxed);
-            let subs = conn.subs.lock().expect("registry poisoned");
+            let subs = conn.subs.lock().unwrap_or_else(|e| e.into_inner());
             for (job_type, sub) in subs.iter() {
                 out.push(FalconConsumer {
                     job_type: job_type.clone(),
@@ -866,14 +870,19 @@ async fn handle_client_frame(
             });
             conn.subs
                 .lock()
-                .expect("registry poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .insert(job_type.clone(), sub);
             registry.index(&job_type, conn.id);
             // A new subscription may have a backlog waiting: wake the dispatcher.
             server.dispatch_wake_handle().notify_one();
         }
         ClientFrame::JobCredits { job_type, n } => {
-            if let Some(sub) = conn.subs.lock().expect("registry poisoned").get(&job_type) {
+            if let Some(sub) = conn
+                .subs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&job_type)
+            {
                 sub.credits.fetch_add(n, Ordering::Relaxed);
             }
             server.dispatch_wake_handle().notify_one();
@@ -931,9 +940,9 @@ async fn handle_client_frame(
             // Raft Batcher. `awaitCompletion` creates stay on the inline path below
             // (the completion wait must read this node's read store). The non-Raft
             // single-node fast path is likewise unchanged.
-            if should_spawn_fire_and_forget(awaiting, raft_active, create_permit.is_some()) {
-                let permit =
-                    create_permit.expect("permit is Some whenever the spawn decision is true");
+            if let Some(permit) =
+                create_permit.filter(|_| should_spawn_fire_and_forget(awaiting, raft_active, true))
+            {
                 let server = server.clone();
                 let conn = conn.clone();
                 tokio::spawn(async move {
@@ -2666,7 +2675,7 @@ fn peer_backlog_cache() -> &'static Mutex<HashMap<u32, (i64, Instant)>> {
 pub(crate) fn record_peer_backlog(node: u32, backlog: i64) {
     peer_backlog_cache()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .insert(node, (backlog.max(0), Instant::now()));
 }
 
@@ -2716,7 +2725,7 @@ fn read_peer_backlog(node: u32) -> Option<i64> {
 fn read_peer_backlog_within(node: u32, window: Duration) -> Option<i64> {
     peer_backlog_cache()
         .lock()
-        .unwrap()
+        .unwrap_or_else(|e| e.into_inner())
         .get(&node)
         .filter(|(_, at)| at.elapsed() < window)
         .map(|(b, _)| *b)

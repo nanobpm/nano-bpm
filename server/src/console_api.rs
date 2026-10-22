@@ -34,6 +34,12 @@ use crate::ServerImpl;
 
 /// Serialize a hand-written DTO and deserialize it into the generated model.
 /// Safe because the spec's JSON property names/shapes match the DTOs.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: a concrete DTO serializes to Value and \
+the generated model mirrors the DTO shape (compile-time spec parity); a mismatch \
+is a codegen bug to surface loudly, not a runtime-recoverable condition"
+)]
 fn from_dto<T, D>(dto: D) -> T
 where
     D: serde::Serialize,
@@ -45,6 +51,11 @@ where
 
 /// Deserialize a `serde_json::Value` (already the response body shape) into the
 /// generated model.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: the value already has the generated \
+model's shape; a mismatch is a codegen/spec-drift bug to surface loudly"
+)]
 fn from_val<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
     serde_json::from_value(v).expect("generated model matches value shape")
 }
@@ -56,6 +67,11 @@ fn from_val<T: serde::de::DeserializeOwned>(v: serde_json::Value) -> T {
 /// (`urbanAvailable` on the spec's list response) would panic the handler instead
 /// of serving the intended empty list. Returning the typed model's body here makes
 /// that drift a compile error rather than a runtime panic.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: a freshly built generated-model value \
+serializes to Value; failure would be a codegen bug, not a runtime condition"
+)]
 fn list_projects_fallback() -> serde_json::Value {
     let empty = nanobpm_console_api::models::ProjectsResponse::new(
         Vec::new(),
@@ -1345,6 +1361,11 @@ impl apis::projects::Projects for ServerImpl {
                     plan.post_update =
                         Some(nano_server_console::projects::finalize_after_update(&name).await);
                 }
+                #[allow(
+                    clippy::expect_used,
+                    reason = "infallible by construction: the overlay plan is a \
+serde-derived struct that always serializes to Value"
+                )]
                 let v = serde_json::to_value(plan).expect("update plan serializes");
                 Ok(R::Status200_TheOverlayPlan(from_val(v)))
             }
@@ -1387,6 +1408,11 @@ impl apis::projects::Projects for ServerImpl {
         path_params: &models::SaveProjectConfigPathParams,
         body: &models::ProjectConfig,
     ) -> Result<apis::projects::SaveProjectConfigResponse, ()> {
+        #[allow(
+            clippy::expect_used,
+            reason = "infallible by construction: the request body is a \
+serde-derived struct that always serializes to Value"
+        )]
         let cfg: nano_server_console::projects::ProjectConfig =
             from_val(serde_json::to_value(body).expect("config serializes"));
         match nano_server_console::project_config_put(&path_params.name, cfg) {

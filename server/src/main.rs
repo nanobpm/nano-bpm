@@ -189,7 +189,7 @@ impl BatchOperationStore {
     /// transitions (`ACTIVE → SUSPENDED → ACTIVE`; any `→ CANCELED`) are valid.
     fn create(&self, op_type: models::BatchOperationTypeEnum, item_keys: Vec<u64>) -> u64 {
         let now = now_millis();
-        let mut inner = self.inner.lock().expect("batch-operation store poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.seq == 0 {
             inner.seq = now;
         }
@@ -223,7 +223,7 @@ impl BatchOperationStore {
     fn get(&self, key: u64) -> Option<BatchOperationRecord> {
         self.inner
             .lock()
-            .expect("batch-operation store poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .ops
             .get(&key)
             .cloned()
@@ -233,7 +233,7 @@ impl BatchOperationStore {
     fn all(&self) -> Vec<BatchOperationRecord> {
         self.inner
             .lock()
-            .expect("batch-operation store poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .ops
             .values()
             .cloned()
@@ -251,7 +251,7 @@ impl BatchOperationStore {
     /// unknown key is `NotFound`.
     fn transition(&self, key: u64, to: models::BatchOperationStateEnum) -> BatchLifecycleOutcome {
         use models::BatchOperationStateEnum as S;
-        let mut inner = self.inner.lock().expect("batch-operation store poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match inner.ops.get_mut(&key) {
             None => BatchLifecycleOutcome::NotFound,
             Some(rec) => {
@@ -572,6 +572,10 @@ fn reject_unsupported_cluster_variable_kind(
 impl ServerImpl {
     /// POST /v2/cluster-variables/global — create a global-scoped cluster
     /// variable. 200 with the created resource, or 409 when one already exists.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: the cluster variable was just created in this handler above, so the store lookup is Some"
+    )]
     async fn create_global_cluster_variable_impl(
         &self,
         body: &models::CreateClusterVariableRequest,
@@ -613,6 +617,10 @@ impl ServerImpl {
     /// POST /v2/cluster-variables/tenants/{tenantId} — create a tenant-scoped
     /// cluster variable. 200 with the created resource, or 409 when one already
     /// exists for that tenant.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: the cluster variable was just created in this handler above, so the store lookup is Some"
+    )]
     async fn create_tenant_cluster_variable_impl(
         &self,
         path_params: &models::CreateTenantClusterVariablePathParams,
@@ -657,6 +665,10 @@ impl ServerImpl {
 
     /// PUT /v2/cluster-variables/global/{name} — update a global-scoped cluster
     /// variable's value. 200 with the updated resource, or 404 when absent.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: the cluster variable was just updated in this handler above, so the store lookup is Some"
+    )]
     async fn update_global_cluster_variable_impl(
         &self,
         path_params: &models::UpdateGlobalClusterVariablePathParams,
@@ -691,6 +703,10 @@ impl ServerImpl {
     /// PUT /v2/cluster-variables/tenants/{tenantId}/{name} — update a
     /// tenant-scoped cluster variable's value. 200 with the updated resource, or
     /// 404 when absent for that tenant.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: the cluster variable was just updated in this handler above, so the store lookup is Some"
+    )]
     async fn update_tenant_cluster_variable_impl(
         &self,
         path_params: &models::UpdateTenantClusterVariablePathParams,
@@ -2271,6 +2287,10 @@ impl ServerImpl {
     /// partitions so any of them can instantiate it. Each journal's exporter must
     /// already be wired to the shared read store so the seed deployment is
     /// projected.
+    #[allow(
+        clippy::expect_used,
+        reason = "startup-only: the demo process is a fixed compile-time builder input seeding a fresh journal; a failure is a build-time bug, not a runtime condition"
+    )]
     pub fn new(
         mut journals: Vec<Journal>,
         store: Arc<ReadModel>,
@@ -3047,6 +3067,10 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
 /// `ProcessDeployed` is partition-agnostic and its key belongs to the deployment
 /// partition (0), which a clustered peer may not own, so it is replayed into
 /// EVERY owned shard; other events route to `partition_of(key)`'s shard.
+#[allow(
+    clippy::expect_used,
+    reason = "startup-only: one-time legacy read-model rebuild during boot; a shard reset/export failure aborts boot deliberately"
+)]
 fn rebuild_read_model_legacy(
     shards: &[(u64, Arc<ReadStore>)],
     events: &[Event],
@@ -3451,6 +3475,10 @@ fn retry_until_ok<T, E>(
 /// dropped). Events arrive as `Arc<Vec<Event>>` shared with the command thread, so
 /// projecting them costs no deep copy of the payloads.
 #[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::expect_used,
+    reason = "startup-only: OS thread spawn at boot; inability to spawn the supporting thread is an unrecoverable boot failure"
+)]
 fn spawn_exporter(
     rx: mpsc::Receiver<ExportBatch>,
     store: Arc<dyn ProjectionSink>,
@@ -3597,7 +3625,7 @@ fn spawn_exporter(
                     // `Active` shells. Grouped by minting partition (a batch may span
                     // the shard's owned partitions); the ~500 ms tick drains + sends.
                     if let Some(buf) = &retirements {
-                        let mut buf = buf.lock().unwrap();
+                        let mut buf = buf.lock().unwrap_or_else(|e| e.into_inner());
                         for &key in &completed {
                             buf.entry(nanobpmn_engine_core::partition_of(key))
                                 .or_default()
@@ -3704,6 +3732,10 @@ fn spawn_exporter(
 /// its own timer; its small delete transactions interleave with the exporter's
 /// inserts at SQLite's write-lock granularity, giving eviction a fair share of
 /// the writer regardless of the export backlog. Exits when the store is dropped.
+#[allow(
+    clippy::expect_used,
+    reason = "startup-only: OS thread spawn at boot; inability to spawn the supporting thread is an unrecoverable boot failure"
+)]
 fn spawn_adaptive_pruner(store: Arc<ReadStore>, high_bytes: u64) {
     // Hold live data between `low_bytes` and `high_bytes` (7/8 hysteresis, matching
     // the former keep-target). Small per-batch/per-wake bounds keep each write-lock
@@ -5579,6 +5611,10 @@ struct CreatedInstanceDirect {
 /// under Raft they take the replicated `create_via_raft` propose path and never
 /// apply directly. `fallback_process_id` names the version when the just-created
 /// instance's definition is no longer resolvable (pre-retention). #1308.
+#[allow(
+    clippy::expect_used,
+    reason = "invariant by construction: a freshly created instance always journals an instance key"
+)]
 fn apply_create_instance_direct(
     journal: &mut Journal,
     command: Command,
@@ -8277,6 +8313,10 @@ impl ServerImpl {
     /// every node (each node correlates its own local subset), so the union still
     /// covers both owners. With a single partition the target set is `{0}` — one
     /// round-trip, identical to the pre-partitioning path.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: correlation only fails on a business id, already validated earlier on this path"
+    )]
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -8500,6 +8540,10 @@ impl ServerImpl {
     /// **peer**, the source event is forwarded over the Falcon protocol and the
     /// owning node drives its own pump (so the recursion continues there). A
     /// no-op single-partition.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: a routed subscription command cannot fail"
+    )]
     async fn drive_subscription_routing(&self, events: Vec<Event>) {
         let num_partitions = self.engine.topology().num_partitions;
         if num_partitions <= 1 {
@@ -14186,6 +14230,10 @@ impl ServerImpl {
     /// projects decision-instance rows. It runs on a local partition chosen like
     /// a create (the decision registry is replicated onto every owned
     /// partition), so no cross-node forwarding is needed.
+    #[allow(
+        clippy::expect_used,
+        reason = "invariant by construction: a successful EvaluateDecision journals exactly one DecisionEvaluated that identifies its evaluation"
+    )]
     async fn evaluate_decision_impl(
         &self,
         body: &models::DecisionEvaluationInstruction,
@@ -14721,6 +14769,10 @@ impl ServerImpl {
     /// Runs a forwarded deploy on the partition-0 owner: parses, deploys locally,
     /// broadcasts to peers, and returns the deployment JSON. Invoked by the
     /// `Deploy` falcon frame handler. `Err` is `(status, detail)`.
+    #[allow(
+        clippy::expect_used,
+        reason = "infallible by construction: the deployment result is a serde-derived struct that always serializes to Value"
+    )]
     pub async fn deploy_centralized(
         &self,
         resources: Vec<(String, String)>,
@@ -15296,7 +15348,10 @@ impl ServerImpl {
             tokio::time::sleep(HANDOFF_PROBE_POLL).await;
             // Owned partitions whose adopted epoch names a peer (not us).
             let candidates: Vec<(u64, u32)> = {
-                let map = self.promotion_epoch.lock().unwrap();
+                let map = self
+                    .promotion_epoch
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 owned
                     .iter()
                     .filter_map(|&p| match map.get(&p) {
@@ -15703,7 +15758,7 @@ impl ServerImpl {
                     _ => self
                         .promotion_epoch
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .get(&p)
                         .map(|&(_, l)| l)
                         .filter(|&l| l != me)
@@ -15774,7 +15829,10 @@ impl ServerImpl {
                 state.misses.remove(&p);
                 // No reachable incumbent remained, so any stale hand-off request
                 // for `p` is moot — clear it so a later rejoin starts clean.
-                self.handoff_pending.lock().unwrap().remove(&p);
+                self.handoff_pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&p);
                 // Hold the partition down for a settle window so a lagging metrics
                 // view cannot trigger an immediate re-promote at the next epoch.
                 state
@@ -15813,7 +15871,10 @@ impl ServerImpl {
     /// records this node as the leader at that epoch. Monotonic per partition.
     fn next_promotion_epoch(&self, p: u64) -> u64 {
         let me = self.engine.topology().node_id as u64;
-        let mut map = self.promotion_epoch.lock().unwrap();
+        let mut map = self
+            .promotion_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
         // Idempotent for the incumbent-self: only step strictly PAST a *different*
         // leader's epoch (the fence overtake). If WE already hold `p` at
@@ -16023,7 +16084,10 @@ impl ServerImpl {
             return;
         }
         let led: Vec<(u64, u64)> = {
-            let map = self.promotion_epoch.lock().unwrap();
+            let map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             map.iter()
                 .filter(|(_, (_, leader))| *leader == me)
                 .map(|(p, (epoch, _))| (*p, *epoch))
@@ -16201,7 +16265,10 @@ impl ServerImpl {
         // Promote/SolicitPromotions naming us can't re-adopt and undo the transfer.
         let new_epoch = incumbent_epoch + 1;
         {
-            let mut map = self.promotion_epoch.lock().unwrap();
+            let mut map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
             if new_epoch >= cur {
                 map.insert(partition, (new_epoch, requester_node));
@@ -16224,7 +16291,10 @@ impl ServerImpl {
     ) {
         tracing::debug!(partition, incumbent_epoch, accepted, "hand-off ack");
         if !accepted {
-            self.handoff_pending.lock().unwrap().remove(&partition);
+            self.handoff_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&partition);
             return;
         }
         // Rebuild as a receiver ONLY when we don't already have a receiver in
@@ -16247,7 +16317,7 @@ impl ServerImpl {
             let incumbent = self
                 .promotion_epoch
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .get(&partition)
                 .map(|(_, leader)| *leader)
                 .unwrap_or(u64::MAX);
@@ -16265,13 +16335,19 @@ impl ServerImpl {
         new_leader: u64,
     ) {
         {
-            let mut map = self.promotion_epoch.lock().unwrap();
+            let mut map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
             if epoch >= cur {
                 map.insert(partition, (epoch, new_leader));
             }
         }
-        self.handoff_pending.lock().unwrap().remove(&partition);
+        self.handoff_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&partition);
         tracing::info!(
             partition,
             epoch,
@@ -16291,7 +16367,10 @@ impl ServerImpl {
         reason: String,
     ) {
         tracing::warn!(partition, joint_suspected, %reason, "hand-off failed");
-        let mut pending = self.handoff_pending.lock().unwrap();
+        let mut pending = self
+            .handoff_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if joint_suspected {
             if let Some(hp) = pending.get_mut(&partition) {
                 hp.joint_suspected = true;
@@ -16308,7 +16387,7 @@ impl ServerImpl {
         let me = self.engine.topology().node_id as u64;
         self.promotion_epoch
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&partition)
             .filter(|(_, leader)| *leader == me)
             .map(|(e, _)| *e)
@@ -16334,7 +16413,7 @@ impl ServerImpl {
             configured.max(self.handoff_catchup_ceiling())
         };
         let deadline = std::time::Instant::now() + pause;
-        let mut gated = self.handoff_gated.lock().unwrap();
+        let mut gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         if gated.contains_key(&partition) {
             return false;
         }
@@ -16350,7 +16429,7 @@ impl ServerImpl {
     /// hand-off that extends its catch-up would outlive its write-pause, the head
     /// would move mid-install, and the learner would re-snapshot forever.
     fn extend_handoff_pause(&self, partition: u64, until: std::time::Instant) {
-        let mut gated = self.handoff_gated.lock().unwrap();
+        let mut gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(deadline) = gated.get_mut(&partition)
             && until > *deadline
         {
@@ -16387,13 +16466,16 @@ impl ServerImpl {
     /// Release the incumbent hand-off lease and lift the write-gate/pause for
     /// `partition`.
     fn release_handoff_lease(&self, partition: u64) {
-        self.handoff_gated.lock().unwrap().remove(&partition);
+        self.handoff_gated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&partition);
     }
 
     /// Whether `partition` is currently create-write-gated by an in-flight
     /// incumbent hand-off (new creates are steered off it so its log quiesces).
     fn handoff_write_gated(&self, partition: u64) -> bool {
-        let gated = self.handoff_gated.lock().unwrap();
+        let gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         !gated.is_empty() && gated.contains_key(&partition)
     }
 
@@ -16402,7 +16484,7 @@ impl ServerImpl {
     /// bounded pause window (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`) is open. Rejected
     /// writes are retryable; the pause lets the catch-up learner reach zero lag.
     fn handoff_completion_paused(&self, partition: u64) -> bool {
-        let gated = self.handoff_gated.lock().unwrap();
+        let gated = self.handoff_gated.lock().unwrap_or_else(|e| e.into_inner());
         if gated.is_empty() {
             return false;
         }
@@ -16455,11 +16537,17 @@ impl ServerImpl {
     async fn request_handoff_or_wait(&self, partition: u64, incumbent: u32) {
         // Fast path: the transfer already landed and we now lead — clear and stop.
         if self.i_lead_raft(partition) {
-            self.handoff_pending.lock().unwrap().remove(&partition);
+            self.handoff_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&partition);
             return;
         }
         let resend = {
-            let mut pending = self.handoff_pending.lock().unwrap();
+            let mut pending = self
+                .handoff_pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             match pending.get_mut(&partition) {
                 None => {
                     pending.insert(
@@ -16606,7 +16694,10 @@ impl ServerImpl {
         // same epoch with a lower node id. `cur_leader` defaults to u64::MAX so any
         // real promotion at epoch >= 1 beats the implicit (0, _) incumbent state.
         let (adopt, i_lead_here) = {
-            let mut map = self.promotion_epoch.lock().unwrap();
+            let mut map = self
+                .promotion_epoch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let (cur_epoch, cur_leader) =
                 map.get(&p).copied().unwrap_or((0, crate::fence::NO_LEADER));
             let wins = crate::fence::wins(cur_epoch, cur_leader, epoch, leader_node);
@@ -16742,7 +16833,12 @@ impl ServerImpl {
     /// of already-deployed processes; later deploys fan in via
     /// [`Self::install_into_raft_replicas`].
     async fn replica_engine_for(&self, p: u64) -> DeepthiHandle {
-        if let Some(h) = self.raft_replicas.lock().unwrap().get(&p) {
+        if let Some(h) = self
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+        {
             return h.clone();
         }
         let mut journal = Journal::in_memory_partition(p);
@@ -16765,7 +16861,7 @@ impl ServerImpl {
         let handle = DeepthiHandle::spawn(journal, p, None);
         self.raft_replicas
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(p)
             .or_insert(handle)
             .clone()
@@ -16798,7 +16894,11 @@ impl ServerImpl {
         if let Some(h) = self.engine.local_for_partition(p) {
             return Some(h.clone());
         }
-        self.raft_replicas.lock().unwrap().get(&p).cloned()
+        self.raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+            .cloned()
     }
 
     /// One read-model reconciliation sweep. Rebuilds the engine's authoritative
@@ -16857,7 +16957,7 @@ impl ServerImpl {
         }
         self.lease_digests
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(partition, ReceivedDigest { leases });
     }
 
@@ -16886,7 +16986,12 @@ impl ServerImpl {
                 None => continue,
             };
             // 1. Recover a received digest (only present just after a promotion).
-            let stored = self.lease_digests.lock().unwrap().get(&p).cloned();
+            let stored = self
+                .lease_digests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&p)
+                .cloned();
             if let Some(digest) = stored {
                 let leases = digest.leases.clone();
                 let recover_handle = handle.clone();
@@ -16901,7 +17006,10 @@ impl ServerImpl {
                 // nothing left to recover and we must not pin stale state.
                 let max_deadline = digest.leases.iter().map(|(_, d)| *d).max().unwrap_or(0);
                 if max_deadline <= now {
-                    self.lease_digests.lock().unwrap().remove(&p);
+                    self.lease_digests
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&p);
                 }
             }
             // 2. Broadcast our current leases to this partition's followers.
@@ -16944,7 +17052,10 @@ impl ServerImpl {
         // exporter accumulated between ticks (a large drain is chunked across frames).
         const MAX_KEYS_PER_FRAME: usize = 8192;
         let drained: std::collections::HashMap<u64, Vec<Key>> = {
-            let mut buf = self.pending_retirements.lock().unwrap();
+            let mut buf = self
+                .pending_retirements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             std::mem::take(&mut *buf)
         };
         let node_id = self.engine.topology().node_id;
@@ -17027,7 +17138,12 @@ impl ServerImpl {
         if self.engine.local_for_partition(p).is_some() {
             return;
         }
-        let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
+        let handle = self
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+            .cloned();
         if let Some(handle) = handle {
             handle.spawn_job(move |journal| {
                 journal.retire_instances_owned(keys);
@@ -17059,7 +17175,12 @@ impl ServerImpl {
         if self.engine.local_for_partition(p).is_some() {
             return;
         }
-        let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
+        let handle = self
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&p)
+            .cloned();
         if let Some(handle) = handle {
             handle.spawn_job(move |journal| {
                 journal.retire_below(low_water, max_remove);
@@ -17073,7 +17194,7 @@ impl ServerImpl {
     /// actors, i.e. single-node, RF=1, or Raft disabled.
     async fn install_into_raft_replicas(&self, events: &Arc<Vec<Event>>) {
         let handles: Vec<DeepthiHandle> = {
-            let map = self.raft_replicas.lock().unwrap();
+            let map = self.raft_replicas.lock().unwrap_or_else(|e| e.into_inner());
             if map.is_empty() {
                 return;
             }
@@ -19215,7 +19336,7 @@ impl ServerImpl {
                 let key = by_key?;
                 self.def_key_to_process_id
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .get(key)
                     .cloned()?
             }
@@ -20129,6 +20250,10 @@ fn now_millis() -> u64 {
 /// A placeholder timestamp. The clock-free engine does not record wall-clock
 /// times for process instances, so their read projections report the Unix
 /// epoch. (Incidents do carry a real `created_at` fed in at command time.)
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: from_timestamp(0, 0) is the Unix epoch, always a valid DateTime"
+)]
 fn epoch() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).expect("epoch is valid")
 }
@@ -21031,6 +21156,10 @@ fn agent_message_content(
 /// Maps a REST message-content block to the engine content shape. The structured
 /// `object` payload is serialised back to the opaque JSON string the engine core
 /// stores (it stays free of a `serde_json::Value` dependency).
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: the document reference is a serde-derived DTO that always serializes to a String"
+)]
 fn agent_content_from(c: &models::AgentInstanceMessageContent) -> agent_model::AgentHistoryContent {
     use agent_model::AgentHistoryContentType as CT;
     let (content_type, text, document_reference, object) = match c {
@@ -22689,6 +22818,10 @@ pub(crate) use nanobpmn_read_model::dmn_decision_type_name;
 
 /// The minted message key from a `CorrelateMessage`'s events: the heading
 /// [`Event::MessagePublished`] always carries it.
+#[allow(
+    clippy::expect_used,
+    reason = "invariant by construction: CorrelateMessage always emits a MessagePublished carrying the message key"
+)]
 fn message_key_of(events: &[Event]) -> u64 {
     events
         .iter()
@@ -22753,6 +22886,10 @@ const REST_LOG_BODY_PREVIEW: usize = 4096;
 ///   - leader `last_log` flat            → propose/append stall (nothing enters the log)
 ///   - follower `last_log` lags leader's → replication stall (followers not appending)
 ///   - `applied` lags `last_log`         → state-machine/apply (engine-actor) stall
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
     use std::fmt::Write as _;
     let mut body = String::new();
@@ -22791,6 +22928,10 @@ fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
 /// reading?": each row is `peer=<node> load=<idx> age_ms=<ms> expired=<bool>
 /// weight=<placement_weight>`. A peer with `expired=true` is treated as full
 /// headroom by placement; a fresh `load=SHED` (weight 0) peer is steered away.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 fn peers_debug_body(server: &ServerImpl) -> Response {
     use std::fmt::Write as _;
     let me = server.engine.topology().node_id;
@@ -22828,6 +22969,10 @@ fn peers_debug_body(server: &ServerImpl) -> Response {
 /// (instances, jobs), the activated/activatable index sizes, active incidents,
 /// and a sample of `Active` instances with their parked element ids and each
 /// owning job's state / activation / lease-due flag. Read-only.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 async fn instances_debug_body(server: &ServerImpl) -> Response {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
@@ -23091,6 +23236,10 @@ fn metrics_body(server: &ServerImpl) -> String {
     body
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 async fn metrics_handler(server: ServerImpl) -> Response {
     let body = metrics_body(&server);
     Response::builder()
@@ -23107,6 +23256,10 @@ async fn metrics_handler(server: ServerImpl) -> Response {
 /// jemalloc accounts it (the most meaningful figure: `ps`/RSS under-reports on
 /// macOS). Used by the Throughput Explorer demo to report peak memory; cheap to
 /// poll. Returns `{ residentBytes }` (omitted/null if jemalloc isn't available).
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
 async fn system_memory_handler() -> Response {
     let bytes = memory::resident_bytes();
     let body = serde_json::json!({ "residentBytes": bytes }).to_string();
@@ -23960,11 +24113,19 @@ async fn main() {
                     if pos > events.len() {
                         // The store is ahead of the log (truncated/corrupt journal):
                         // rebuild from scratch.
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "startup/boot recovery: resets the read store during a truncated/corrupt-journal rebuild; failure aborts boot deliberately"
+                        )]
                         shard.reset().expect("reset read store");
                         pos = 0;
                     }
                     if pos < events.len() {
                         let refs: Vec<&Event> = events[pos..].iter().collect();
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "startup/boot recovery: catches the read model up from the journal during boot; failure aborts boot deliberately"
+                        )]
                         shard
                             .export(&refs)
                             .expect("catch up read model from journal");
@@ -24923,6 +25084,10 @@ async fn main() {
                     futures_util::future::join_all(engine.all().iter().map(|handle| {
                         handle.with(move |journal| {
                             let (fired, _commit) = journal.trigger_timers(now);
+                            #[allow(
+                                clippy::expect_used,
+                                reason = "invariant by construction: ExpireJobsByDurability is an internal timer-driven command that cannot be rejected"
+                            )]
                             let (leased_expired, _lease_commit) = journal
                                 .apply_command_at(
                                     Command::ExpireJobsByDurability { now, durable: true },
@@ -25266,7 +25431,10 @@ async fn main() {
                         }
                     }
                     if !key_index.is_empty() {
-                        *monitor_server.def_key_to_process_id.lock().unwrap() = key_index;
+                        *monitor_server
+                            .def_key_to_process_id
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = key_index;
                     }
                     let now = std::time::Instant::now();
                     let dt_s = now.duration_since(prev_tier2_instant).as_secs_f64();
@@ -25678,6 +25846,10 @@ async fn main() {
             .unwrap_or_else(|_| internal_addr.to_string());
         tracing::info!("intra-cluster /cluster channel on dedicated internal listener {bound}");
         tokio::spawn(async move {
+            #[allow(
+                clippy::expect_used,
+                reason = "startup-only: the internal cluster listener is bound at boot; a serve error on it is an unrecoverable supervisor failure"
+            )]
             axum::serve(NoDelayListener(internal_listener), internal_cluster_router)
                 .await
                 .expect("internal cluster server error");
@@ -25713,6 +25885,10 @@ async fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "startup-only: the main gateway server runs for the process lifetime; a serve error is an unrecoverable top-level failure"
+    )]
     axum::serve(
         NoDelayListener(listener),
         app.into_make_service_with_connect_info::<PeerAddr>(),

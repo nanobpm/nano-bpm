@@ -211,6 +211,16 @@ warnings = "deny"
 # x86_64-linux binary never emits, so we allow just this lint.
 linker_messages = "allow"
 
+# Epic #1357: production code must not panic via unwrap/expect. These are
+# package-scoped to the `nanobpm-gateway-rest-server` binary crate (there is no
+# `[workspace.lints]`), so they do NOT propagate to the `crates/*` members, which
+# each enable the gate in their own slice. `server/clippy.toml`
+# (`allow-unwrap-in-tests` / `allow-expect-in-tests`) exempts `#[cfg(test)]` and
+# `#[test]` code.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
 [build-dependencies]
 # Shared version-stamp derivation (ADR 0064), also used by nano-server-console.
 nano-version-stamp = { path = "crates/nano-version-stamp" }

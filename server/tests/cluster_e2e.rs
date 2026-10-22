@@ -17,6 +17,13 @@
 //! know each other's URLs *before* binding — they cannot use the `PORT=0`
 //! print-back trick the single-node harnesses rely on.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test target: unwrap/expect are acceptable in test setup/assertions; \
+clippy.toml allow-unwrap-in-tests does not cover non-#[test] helper fns in tests/*.rs"
+)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
