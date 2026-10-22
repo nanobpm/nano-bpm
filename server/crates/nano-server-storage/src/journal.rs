@@ -2657,12 +2657,33 @@ mod tests {
             "the mutex is now poisoned (test precondition)"
         );
 
-        // Both locked paths (write-side forward + set_exporter insert) recover.
-        let (tx, _rx) = std::sync::mpsc::channel();
-        forward_shared_export(&Some(cell.clone()), 0, None, 0);
+        // Exercise BOTH poisoned-lock acquisitions, not just `set_exporter`:
+        // register partition 0 (insert-side recovery), then forward a NONEMPTY
+        // batch (write-side recovery) and assert the batch is delivered and the
+        // queued-byte gauge is updated. Passing `None`/an empty batch would make
+        // `forward_shared_export` return before it ever acquires the poisoned
+        // mutex, so the write-side recovery would go untested and a regression to
+        // `.unwrap()` there would still pass (#1366).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let queued = std::sync::Arc::new(AtomicU64::new(0));
         let mut journal = Journal::in_memory();
-        journal.shared_exporter = Some(cell);
-        journal.set_exporter(tx, std::sync::Arc::new(AtomicU64::new(0)));
+        journal.shared_exporter = Some(cell.clone());
+        journal.set_exporter(tx, std::sync::Arc::clone(&queued));
+
+        let events = std::sync::Arc::new(vec![Event::ProcessInstanceCompleted { instance_key: 7 }]);
+        let bytes: u32 = 42;
+        forward_shared_export(&Some(cell), 0, Some(std::sync::Arc::clone(&events)), bytes);
+
+        let batch = rx
+            .try_recv()
+            .expect("batch delivered through the recovered (poisoned) cell");
+        assert_eq!(batch.bytes, bytes, "forwarded byte count");
+        assert_eq!(batch.events.len(), events.len(), "forwarded events");
+        assert_eq!(
+            queued.load(Ordering::Relaxed),
+            bytes as u64,
+            "queued-byte gauge accounts the forwarded batch",
+        );
     }
 
     #[test]

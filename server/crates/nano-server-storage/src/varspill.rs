@@ -358,7 +358,13 @@ impl VarSpillStore {
                         // Quiescent: drain one bounded pass. Skip cheaply if there is
                         // nothing worth a copy-back. Any activity during/after the
                         // pass resets the idle counter above on the next tick.
-                        let Ok(conn) = conn.lock() else { return };
+                        // Recover a poisoned lock (another thread panicked
+                        // mid-mutation; the connection is still usable because every
+                        // op is atomic under the lock) rather than exiting the
+                        // worker — matching `delete_keys` and the forget worker. A
+                        // silent exit here would stop freelist reclaim while
+                        // foreground writes continue (#1366).
+                        let conn = conn.lock().unwrap_or_else(|e| e.into_inner());
                         if freelist_bytes(&conn) >= threshold_bytes {
                             let _ = reclaim_freelist_step(&conn, RECLAIM_CHUNK_PAGES);
                         }
@@ -383,14 +389,16 @@ impl VarSpillStore {
     /// their spill/cold rows off the engine actor, in [`FORGET_CHUNK`]-sized
     /// transactions so each commit holds the connection lock only briefly.
     // expect_used: (1) thread spawn failure is a fatal OS resource error at store
-    // open; (2) inside the worker, a poisoned connection lock or a failed
-    // checkpoint means the connection is in an unknown state — the worker aborts
-    // loudly (matching `delete_keys`) rather than silently letting the WAL grow
-    // without bound under sustained retirement, the failure this backstop exists
-    // to prevent.
+    // open; (2) inside the worker, a failed `wal_checkpoint(TRUNCATE)` means the
+    // connection is in an unknown state — the worker surfaces it loudly (matching
+    // `delete_keys`) rather than silently letting the WAL grow without bound under
+    // sustained retirement, the failure this backstop exists to prevent. A poisoned
+    // connection lock is NOT fatal: every op is atomic under the lock, so the guard
+    // is recovered (matching `delete_keys` and the reclaim worker) — a poison must
+    // never silently stop a maintenance worker while foreground writes continue.
     #[allow(
         clippy::expect_used,
-        reason = "thread spawn is fatal at open; a poisoned lock or failed checkpoint aborts the worker loudly rather than leaking unbounded WAL growth"
+        reason = "thread spawn is fatal at open; a failed checkpoint surfaces loudly; a poisoned lock is recovered, not fatal"
     )]
     fn spawn_forget_worker(conn: Arc<Mutex<Connection>>, activity: Arc<AtomicU64>) -> ForgetWorker {
         let (tx, rx) = sync_channel::<ForgetMsg>(forget_queue_cap());
@@ -426,12 +434,18 @@ impl VarSpillStore {
                                 // worker won't classify the store as idle and start a
                                 // vacuum pass during/around this maintenance I/O.
                                 activity.fetch_add(1, Ordering::Relaxed);
-                                // Surface a poisoned lock or checkpoint failure
-                                // loudly (matching `delete_keys`): silently
-                                // swallowing them here would let the WAL grow
+                                // A poisoned lock means another thread panicked
+                                // mid-mutation; the connection is still usable
+                                // (every op is atomic under the lock), so recover
+                                // the guard rather than kill the worker — matching
+                                // `delete_keys` and the reclaim worker, so a poison
+                                // never silently stops a maintenance worker while
+                                // foreground writes continue (#1366). A genuine
+                                // checkpoint I/O failure is still surfaced loudly:
+                                // silently swallowing it would let the WAL grow
                                 // without bound under sustained retirement — the
                                 // very failure this backstop exists to prevent.
-                                let guard = conn.lock().expect("spill store poisoned");
+                                let guard = conn.lock().unwrap_or_else(|e| e.into_inner());
                                 guard
                                     .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
                                     .expect("spill store: wal_checkpoint(TRUNCATE)");
@@ -735,6 +749,69 @@ mod tests {
         );
         store.forget(&[1]);
         assert!(store.get(1).is_none(), "forget still deletes");
+    }
+
+    /// Epic #1357 / #1366 failure-injection guard: on a **file-backed** store the
+    /// background forget worker holds the connection lock too, and it must RECOVER
+    /// a poisoned lock (take the guard from the poison) rather than panic or exit
+    /// silently. Under `panic = "unwind"` a worker panic only kills the worker
+    /// thread, so a poison that stopped the worker would silently drop queued
+    /// retirement deletes (and the WAL-growth checkpoint backstop) while foreground
+    /// writes kept running — the failure mode this test guards against. In-memory
+    /// stores forget inline and spawn no worker, so this needs a real file.
+    #[test]
+    fn poisoned_connection_lock_is_recovered_in_file_backed_forget_worker() {
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-varspill-poison-worker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("var-spill.sqlite");
+        let store = VarSpillStore::open(Some(&path)).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        store.put(2, &vars("b")).unwrap();
+
+        // Poison the shared connection mutex: panic while holding the guard.
+        let conn = Arc::clone(&store.conn);
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = conn.lock().unwrap();
+            panic!("deliberate poison for the recovery test");
+        }));
+        std::panic::set_hook(prev);
+        assert!(poisoned.is_err(), "the poisoning panic must propagate");
+        assert!(
+            store.conn.lock().is_err(),
+            "the mutex is now poisoned (test precondition)"
+        );
+
+        // The background forget worker must recover the poison and still apply the
+        // delete — not exit silently or panic. `flush_forgets` returns `false` iff
+        // the worker has gone away, so a `true` here proves it survived the poison
+        // and drained the queued batch.
+        store.forget_async(&[1]);
+        assert!(
+            store.flush_forgets(),
+            "forget worker survived the poison and drained its queue"
+        );
+        assert!(
+            store.get(1).is_none(),
+            "the async forget still deleted key 1 through the recovered lock"
+        );
+
+        // Foreground writes keep working through the recovered (still-poisoned)
+        // lock, so the store stays available end to end.
+        store.put(3, &vars("c")).unwrap();
+        assert_eq!(store.get(2), Some(vars("b")));
+        assert_eq!(store.get(3), Some(vars("c")));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // #1331: the store's rows must survive a process restart (re-open), because
