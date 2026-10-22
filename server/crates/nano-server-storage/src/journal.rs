@@ -1652,7 +1652,11 @@ impl Journal {
     /// orphan payloads for every completed or cancelled instance.
     pub fn evict_instances(&mut self, keys: &[Key]) -> usize {
         if let Some(store) = self.spill_store() {
-            store.forget(keys);
+            // A spill-delete failure is latched into the store's observable
+            // `forget_faults` (#1366); the eviction itself is hot-state only and
+            // must still proceed, so the typed error is surfaced there rather
+            // than aborting the eviction pass.
+            let _ = store.forget(keys);
         }
         self.engine.evict_instances(keys)
     }
@@ -3707,7 +3711,7 @@ mod tests {
         // while the live engine still flags it spilled. The fold now cannot
         // resolve that instance's variables.
         let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
-        store.forget(&[keys[0]]);
+        store.forget(&[keys[0]]).unwrap();
 
         assert!(
             journal.try_engine_snapshot().is_none(),
@@ -3744,7 +3748,8 @@ mod tests {
             .as_ref()
             .expect("cold spill configured")
             .store
-            .forget(&[key]);
+            .forget(&[key])
+            .unwrap();
 
         assert!(
             journal.try_engine_snapshot().is_none(),
