@@ -397,6 +397,10 @@ engine-wasm-clippy-read-model: ## Clippy-gate engine-wasm's `read-model` feature
 	cd $(WASM_DIR) && cargo clippy --all-targets --features read-model -- -D warnings
 	cd $(READ_MODEL_DIR) && cargo clippy --all-targets -- -D warnings
 
+.PHONY: read-model-clippy-wasm
+read-model-clippy-wasm: ## Clippy-gate the read-model crate's `wasm` backend for wasm32 (needs the wasm32 target AND an LLVM clang with a wasm backend — the build compiles a trimmed SQLite C amalgamation via `cc`; Apple/GCC clang have no wasm backend, so point CC_wasm32_unknown_unknown/AR_wasm32_unknown_unknown at llvm clang/llvm-ar). The host `engine-wasm-clippy-read-model` run selects read-model's default `native` feature, which excludes `src/backend/wasm.rs` (gated `all(feature = "wasm", not(feature = "native"))`) and every wasm32-only path (e.g. `store.rs::now_ms`); the wasm32 engine-wasm Clippy selects engine-wasm WITHOUT its `read-model` feature. So only this run lints the wasm read-model surface — `--no-default-features --features wasm` flips the backend to wasm and `--target wasm32-unknown-unknown` exposes the wasm32-only code.
+	cd $(READ_MODEL_DIR) && $(WASM_READ_MODEL_ENV) cargo clippy --all-targets --no-default-features --features wasm --target wasm32-unknown-unknown -- -D warnings
+
 .PHONY: release-tags
 release-tags: ## Cut release tags for every train whose version is bumped but untagged (dry run; PUSH=1 to tag origin/main HEAD and push). One tag per push + confirms each release workflow started — see RELEASE.md.
 	@case "$(PUSH)" in ""|1) ;; *) echo "PUSH must be 1 (push) or unset (dry run), got '$(PUSH)'" >&2; exit 1;; esac
