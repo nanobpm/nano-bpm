@@ -762,6 +762,66 @@ impl RaftLogStore {
         self.bytes.clone()
     }
 
+    /// Test-only: append `entries` through the same write path the openraft
+    /// `append` callback uses (serialize, roll, write, fsync per durability mode,
+    /// index, account, demote), minus the `pub(crate)` `LogFlushed` callback the
+    /// raft core supplies. Lets tests populate a store through the durable
+    /// mutation path instead of hand-writing segment files.
+    #[cfg(test)]
+    fn append_for_test(&mut self, entries: &[Entry<RaftConfig>]) -> io::Result<()> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in entries {
+            let mut json = Vec::new();
+            serde_json::to_writer(&mut json, entry)?;
+            let ram_len = json.len() + 1;
+            let line = if inner.compress {
+                frame_entry(&json).unwrap_or_else(|| {
+                    json.push(b'\n');
+                    json
+                })
+            } else {
+                json.push(b'\n');
+                json
+            };
+            let len = line.len();
+            let index = entry.log_id.index;
+            let log_id = entry.log_id;
+            if inner.active_bytes > 0 && inner.active_bytes + len > inner.seg_max_bytes {
+                timed_log_sync(&inner.active_file)?;
+                inner.unsynced_bytes = 0;
+                inner.roll_active(index)?;
+            }
+            let seg_start = inner.segments.last().map(|s| s.start).unwrap_or(index);
+            let offset = inner.active_bytes;
+            inner.active_file.write_all(&line)?;
+            inner.active_bytes += len;
+            if let Some(seg) = inner.segments.last_mut() {
+                seg.last = Some(index);
+            }
+            inner.log.insert(
+                index,
+                Stored {
+                    log_id,
+                    len,
+                    ram_len,
+                    seg_start,
+                    offset,
+                    entry: Some(entry.clone()),
+                },
+            );
+            inner.log_bytes += len;
+            inner.ram_bytes += ram_len;
+            inner.unsynced_bytes += len;
+        }
+        if !inner.async_durability() {
+            timed_log_sync(&inner.active_file)?;
+            inner.unsynced_bytes = 0;
+        }
+        inner.enforce_ram_budget();
+        self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Test-only: whether an append would DEFER its `fsync` (coalesce onto the
     /// async cadence) rather than fsync inline right now, given the store's mode,
     /// `coalesce_capable`, and the live recovery-relief flag. Mirrors the exact
@@ -2016,5 +2076,92 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&off_dir);
         let _ = std::fs::remove_dir_all(&on_dir);
+    }
+
+    /// Red/green regression (#1357) for `RaftLogStore::inner` poison recovery: a
+    /// panic while the store mutex is held mid-operation must not wedge the
+    /// durable log — every acquisition recovers the guard
+    /// (`unwrap_or_else(|e| e.into_inner())`) instead of panicking on the
+    /// replication hot path. Poison a populated store, assert the poisoning
+    /// actually took, then exercise reads, durable mutations (vote, append,
+    /// committed marker, truncate, purge) and marker flushing, and finally
+    /// reopen the store to verify the surviving entries and persisted markers.
+    /// With the previous panicking acquisitions each exercise below would fail
+    /// with a `PoisonError`; with the recovery behaviour they pass.
+    #[tokio::test]
+    async fn store_survives_poisoned_inner_lock() {
+        use openraft::storage::RaftLogStorage;
+
+        let dir = tmp_dir("poisoned-inner");
+        let mut store = RaftLogStore::open(&dir).unwrap();
+
+        // Populate the store through the durable mutation path (a real append
+        // with fsync), so the poison lands on a non-empty log.
+        store
+            .append_for_test(&[entry(0), entry(1), entry(2), entry(3), entry(4)])
+            .unwrap();
+
+        // Poison `inner` (a panic while the guard is held) and prove it took.
+        {
+            let inner: &Arc<Mutex<Inner>> = &store.inner;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _g = inner.lock();
+                    panic!("poison raft log store");
+                }))
+                .is_err(),
+                "the injected panic must fire while the store guard is held"
+            );
+            assert!(
+                inner.lock().is_err(),
+                "the store mutex must be poisoned by the injected panic"
+            );
+        }
+
+        // Reads recover the poisoned guard and serve the populated log.
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4]);
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id, Some(log_id(4)));
+
+        // Durable mutations recover the guard too: the vote (fsynced inline) and
+        // a further append.
+        let vote = Vote::new(1, 0);
+        store.save_vote(&vote).await.unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(vote));
+        store.append_for_test(&[entry(5), entry(6)]).unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4, 5, 6]);
+
+        // Marker flushing: the deferred committed marker is held dirty in memory,
+        // then the flusher pass (itself a guard acquisition) persists it.
+        store.force_defer_committed(true);
+        store.save_committed(Some(log_id(6))).await.unwrap();
+        assert!(
+            store.is_state_dirty(),
+            "the committed marker must be held dirty for the flusher"
+        );
+        store.flush_now().unwrap();
+        assert!(!store.is_state_dirty(), "the flusher persists the marker");
+        let flushed: PersistedState = read_json(&state_path(&dir)).unwrap().unwrap();
+        assert_eq!(flushed.committed, Some(log_id(6)));
+
+        // Truncate + purge (the compaction mutations) recover the guard as well.
+        store.truncate(log_id(6)).await.unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4, 5]);
+        store.purge(log_id(2)).await.unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![3, 4, 5]);
+        store.save_committed(Some(log_id(5))).await.unwrap();
+        store.flush_now().unwrap();
+
+        // Reopen: the surviving entries and the persisted markers are exactly
+        // what the recovered mutations left behind.
+        let mut reopened = RaftLogStore::open(&dir).unwrap();
+        assert_eq!(indices_in(&mut reopened).await, vec![3, 4, 5]);
+        let state = reopened.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(2)));
+        assert_eq!(state.last_log_id, Some(log_id(5)));
+        assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id(5)));
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(vote));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

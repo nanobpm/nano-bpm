@@ -2425,6 +2425,8 @@ pub fn spawn_compaction_governor(registry: Arc<RaftRegistry>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use nanobpmn_engine_core::ProcessBuilder;
 
     use super::*;
@@ -3526,6 +3528,135 @@ mod tests {
         );
         // Exclusive end of 0 is empty, not an underflow panic.
         assert_eq!(clamp_log_range(&(0u64..0)), None);
+    }
+
+    /// Failure-injection regression (#1357): a poisoned `PartitionStateMachine`
+    /// mutex — a panic while the `inner` / `current_snapshot` guard is held
+    /// mid-mutation — must not wedge the partition. Every acquisition recovers the
+    /// guard (`unwrap_or_else(|e| e.into_inner())`) instead of panicking on the
+    /// consensus hot path. Poison each mutex separately, assert the poisoning
+    /// actually took, then drive the applied-state read and snapshot
+    /// publication/retrieval paths across both recovered mutexes, verifying the
+    /// applied log id and membership match the snapshot metadata — including
+    /// after a fresh state machine restores from the durable pointer on disk.
+    /// With the previous panicking acquisitions each exercise below would fail
+    /// with a `PoisonError`; with the recovery behaviour they pass.
+    #[tokio::test]
+    async fn state_machine_survives_poisoned_inner_and_snapshot_locks() {
+        use openraft::CommittedLeaderId;
+
+        let lid = |index: u64| LogId::new(CommittedLeaderId::new(1, 0), index);
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+            })
+            .await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let snap_dir = sm.snapshot_dir.clone();
+
+        // Seed a membership so the applied-state tuple covers both fields.
+        let membership = StoredMembership::new(
+            Some(lid(2)),
+            openraft::Membership::new(vec![BTreeSet::from([0u64])], None),
+        );
+        sm.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_membership = membership.clone();
+
+        // Poison `inner` (a panic while the guard is held) and prove it took.
+        {
+            let inner: &Mutex<SmMeta> = &sm.inner;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _g = inner.lock();
+                    panic!("poison state-machine meta");
+                }))
+                .is_err(),
+                "the injected panic must fire while the meta guard is held"
+            );
+            assert!(
+                inner.lock().is_err(),
+                "the meta mutex must be poisoned by the injected panic"
+            );
+        }
+
+        // Applied-state reads recover the poisoned guard and serve the metadata.
+        let (last_applied, last_membership) =
+            sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(last_applied, None);
+        assert_eq!(last_membership, membership);
+
+        // Poison `current_snapshot` too, and prove it took.
+        {
+            let current: &Mutex<Option<StoredSnapshot>> = &sm.current_snapshot;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _g = current.lock();
+                    panic!("poison current snapshot");
+                }))
+                .is_err(),
+                "the injected panic must fire while the snapshot guard is held"
+            );
+            assert!(
+                current.lock().is_err(),
+                "the snapshot mutex must be poisoned by the injected panic"
+            );
+        }
+
+        // Snapshot publication writes through BOTH recovered mutexes: the build
+        // captures `inner` (applied metadata) and publishes into
+        // `current_snapshot`.
+        let applied = lid(42);
+        sm.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_applied = Some(applied);
+        let mut builder = sm.clone().get_snapshot_builder().await;
+        let snap = builder
+            .build_snapshot()
+            .await
+            .expect("snapshot build recovers the poisoned snapshot mutex");
+        assert_eq!(snap.meta.last_log_id, Some(applied));
+        assert_eq!(snap.meta.last_membership, membership);
+
+        // Snapshot retrieval recovers the same poisoned mutex and serves the
+        // publication, with metadata matching the applied state.
+        let current = sm
+            .clone()
+            .get_current_snapshot()
+            .await
+            .expect("get_current_snapshot")
+            .expect("a snapshot was published");
+        assert_eq!(current.meta, snap.meta);
+        let (last_applied, last_membership) =
+            sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(last_applied, Some(applied));
+        assert_eq!(last_membership, snap.meta.last_membership);
+
+        // After restoration from disk (a fresh state machine over the same
+        // snapshot dir, i.e. the reboot path), the applied log id and membership
+        // still match the snapshot metadata.
+        let restored: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                engine,
+                0,
+                snap_dir,
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("reopen state machine"),
+        );
+        let (restored_applied, restored_membership) = restored
+            .clone()
+            .applied_state()
+            .await
+            .expect("applied_state");
+        assert_eq!(restored_applied, Some(applied));
+        assert_eq!(restored_membership, snap.meta.last_membership);
     }
 
     #[tokio::test]
