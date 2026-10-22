@@ -1300,6 +1300,53 @@ fn should_dispatch_jobs_to_a_callback_worker() {
 }
 
 #[test]
+fn poll_jobs_does_not_panic_when_a_batch_entry_cancels_a_sibling() {
+    // A parallel split forks two branches that park on the SAME job type, so a
+    // single `poll_jobs` batch activates both. One branch reaches a terminate end
+    // whose completion kills the sibling token and CANCELS its still-activated
+    // job. The callback worker must not panic when it then tries to complete the
+    // now-cancelled sibling — completion is runtime-fallible within a batch, not
+    // an infallible invariant.
+    let def = ProcessBuilder::new("term-poll")
+        .start_event("s")
+        .parallel_gateway("split")
+        .service_task("trigger", "jt")
+        .terminate_end_event("stop")
+        .service_task("work", "jt")
+        .end_event("work-end")
+        .connect("s", "split")
+        .connect("split", "trigger")
+        .connect("split", "work")
+        .connect("trigger", "stop")
+        .connect("work", "work-end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let instance_key = engine
+        .apply_command(Command::create_instance("term-poll"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Both branches are parked on "jt" jobs.
+    assert_eq!(engine.pending_jobs().len(), 2);
+
+    // A single batch poll activates both jobs, then completes each in turn.
+    // Completing the trigger entry terminates the instance and cancels the work
+    // entry, so the work entry is no longer completable when its turn comes.
+    let handled = engine.poll_jobs("jt", "cb", 10, 60_000, 0, |_job| Some(HashMap::new()));
+
+    // No panic; the instance completed (terminate end, Zeebe parity), and at
+    // least the trigger job was completed. The cancelled sibling is simply not
+    // counted — never a panic.
+    assert!(handled >= 1, "at least the trigger job should complete");
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
 fn job_index_tracks_create_activate_complete_expire_and_evict() {
     let mut engine = Engine::new();
     engine

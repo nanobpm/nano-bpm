@@ -535,10 +535,13 @@ impl Engine {
     /// returns complete the job (by key); returning `None` leaves the job locked.
     /// Returns the number of jobs the handler completed. Runs entirely on the
     /// single-writer thread, so there is no concurrency to reason about.
-    #[allow(
-        clippy::expect_used,
-        reason = "completing a just-activated job cannot fail"
-    )]
+    ///
+    /// Completing one batch entry can still cancel a later one — a terminate end
+    /// or a parallel multi-instance completion condition kills sibling tokens and
+    /// cancels their jobs — so an activated entry is **not** guaranteed to remain
+    /// completable. Each entry is re-validated before dispatch and its completion
+    /// is handled (not asserted): a no-longer-active entry is skipped, never
+    /// panicked on, and is not counted as completed.
     pub fn poll_jobs<F>(
         &mut self,
         job_type: impl Into<String>,
@@ -554,10 +557,24 @@ impl Engine {
         let jobs = self.activate_jobs(job_type, worker, max_jobs, timeout, now);
         let mut completed = 0;
         for job in jobs {
+            // A prior completion in this same batch may have cancelled this entry
+            // (terminate end / MI completion condition), so re-check it is still
+            // activated before dispatching the handler.
+            if !self
+                .job(job.key)
+                .is_some_and(|j| j.state == state::JobState::Activated)
+            {
+                continue;
+            }
             if let Some(variables) = handler(&job) {
-                self.apply_command(Command::complete_job_with(job.key, variables))
-                    .expect("activated job can be completed");
-                completed += 1;
+                // Completion is runtime-fallible within a batch; skip (don't
+                // count, don't panic) an entry that is no longer completable.
+                if self
+                    .apply_command(Command::complete_job_with(job.key, variables))
+                    .is_ok()
+                {
+                    completed += 1;
+                }
             }
         }
         completed
