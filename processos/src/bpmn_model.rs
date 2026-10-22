@@ -590,7 +590,8 @@ fn loop_components(
     }
     impl Tarjan {
         fn strong(&mut self, v: usize, neighbours: &[Vec<usize>]) {
-            self.indices[v] = Some(self.idx);
+            let v_index = self.idx;
+            self.indices[v] = Some(v_index);
             self.low[v] = self.idx;
             self.idx += 1;
             self.stack.push(v);
@@ -600,10 +601,12 @@ fn loop_components(
                     self.strong(w, neighbours);
                     self.low[v] = self.low[v].min(self.low[w]);
                 } else if self.on_stack[w] {
-                    self.low[v] = self.low[v].min(self.indices[w].unwrap());
+                    if let Some(iw) = self.indices[w] {
+                        self.low[v] = self.low[v].min(iw);
+                    }
                 }
             }
-            if self.low[v] == self.indices[v].unwrap() {
+            if self.low[v] == v_index {
                 let mut comp = Vec::new();
                 while let Some(w) = self.stack.pop() {
                     self.on_stack[w] = false;
@@ -812,18 +815,19 @@ fn node_view(def: &ProcessDefinition) -> (BTreeMap<&'static str, usize>, Vec<Val
             "outgoing": outgoing,
             "reachable": reachable.contains(*id),
         });
-        let obj = node.as_object_mut().unwrap();
-        if is_gateway(&el.kind) {
-            let role = match (incoming > 1, el.outgoing.len() > 1) {
-                (true, true) => "join+split",
-                (true, false) => "join",
-                (false, true) => "split",
-                (false, false) => "pass",
-            };
-            obj.insert("gatewayRole".into(), json!(role));
-        }
-        for (k, v) in kind_extras(&el.kind) {
-            obj.insert(k, v);
+        if let Some(obj) = node.as_object_mut() {
+            if is_gateway(&el.kind) {
+                let role = match (incoming > 1, el.outgoing.len() > 1) {
+                    (true, true) => "join+split",
+                    (true, false) => "join",
+                    (false, true) => "split",
+                    (false, false) => "pass",
+                };
+                obj.insert("gatewayRole".into(), json!(role));
+            }
+            for (k, v) in kind_extras(&el.kind) {
+                obj.insert(k, v);
+            }
         }
         nodes.push(node);
     }
@@ -3472,7 +3476,7 @@ fn route_avoiding(
                 return c.clone();
             }
         }
-        return candidates.into_iter().last().unwrap();
+        return candidates.into_iter().next_back().unwrap_or_default();
     }
 
     let sx = s.x + s.w;
@@ -3539,7 +3543,7 @@ fn route_avoiding(
             return c.clone();
         }
     }
-    candidates.pop().unwrap()
+    candidates.pop().unwrap_or_default()
 }
 
 /// Append a generated, left-to-right `<bpmndi:BPMNDiagram>` for `def` so the model renders and

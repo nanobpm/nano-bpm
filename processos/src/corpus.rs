@@ -290,6 +290,16 @@ pub fn load_pack(pack_path: &Path) -> Result<(Pack, ProcessDefinition), String> 
         std::fs::read(pack_path).map_err(|e| format!("read {}: {e}", pack_path.display()))?;
     let pack: Pack = serde_json::from_slice(&bytes).map_err(|e| format!("parse pack: {e}"))?;
 
+    // A pack with no inputs cannot drive the generator (the weighted input
+    // sampler has nothing to pick), so reject it here with a typed error rather
+    // than letting it surface as a panic deep inside generation.
+    if pack.inputs.is_empty() {
+        return Err(format!(
+            "parse pack {}: a pack must declare at least one input",
+            pack_path.display()
+        ));
+    }
+
     let pack_dir = pack_path.parent().unwrap_or_else(|| Path::new("."));
     let resolve = |raw: &str| -> std::path::PathBuf {
         let p = Path::new(raw);
@@ -748,6 +758,15 @@ fn pick_input(inputs: &[InputCase], total_weight: f64, seed: u64, idx: u64) -> &
             return c;
         }
     }
+    // The weighted walk above returns on the first input whose cumulative weight
+    // covers `r`; this final line only runs when floating-point residue leaves
+    // `r` fractionally positive past the last input. `inputs` is non-empty by
+    // construction — `load_pack` rejects an empty-input pack with a typed error,
+    // and every in-repo `Pack` literal declares at least one input.
+    #[allow(
+        clippy::expect_used,
+        reason = "inputs is non-empty by construction: load_pack rejects an empty-input pack with a typed error before any pick_input call"
+    )]
     inputs.last().expect("pack has at least one input")
 }
 
@@ -1206,6 +1225,36 @@ pub(crate) mod tests {
         assert!(path.completed);
         let jobs: Vec<&str> = path.steps.iter().map(|s| s.job_type.as_str()).collect();
         assert_eq!(jobs, vec!["credit-check", "reject-application"]);
+    }
+
+    #[test]
+    fn load_pack_rejects_a_pack_with_no_inputs() {
+        // A malformed external pack that declares an empty `inputs` array must
+        // yield a typed parse error, never a panic deep inside generation (the
+        // weighted input sampler would otherwise have nothing to pick).
+        let tmp = std::env::temp_dir().join(format!("corpus-empty-inputs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create tmp dir");
+        std::fs::write(tmp.join("loan.bpmn"), LOAN_BPMN).expect("write bpmn");
+        let pack_json = r#"{
+            "processId": "loan-approval",
+            "bpmn": "loan.bpmn",
+            "domain": "loan-origination",
+            "peak": { "pattern": "weekday-morning", "multiplier": 8.0, "startHour": 9, "endHour": 12 },
+            "jobs": {},
+            "inputs": [],
+            "plantedFault": { "jobType": "credit-check", "kind": "under-provisioned", "window": "weekday-morning" }
+        }"#;
+        let pack_path = tmp.join("pack.json");
+        std::fs::write(&pack_path, pack_json).expect("write pack");
+
+        let err = load_pack(&pack_path).expect_err("empty-inputs pack must be rejected");
+        assert!(
+            err.contains("at least one input"),
+            "expected a typed empty-inputs error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

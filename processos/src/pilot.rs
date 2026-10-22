@@ -101,12 +101,16 @@ impl PilotStore {
 
     /// The XML the supervisor should deploy on boot.
     pub fn current_xml(&self) -> String {
-        self.state.lock().unwrap().xml.clone()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .xml
+            .clone()
     }
 
     /// A serializable snapshot of the current pilot.
     pub fn doc(&self) -> PilotDoc {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         doc_of(&s.xml, s.source)
     }
 
@@ -122,7 +126,7 @@ impl PilotStore {
         }
         std::fs::write(&self.path, xml)
             .map_err(|e| format!("write {}: {e}", self.path.display()))?;
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.xml = xml.to_string();
         s.source = Source::Forked;
         Ok(doc_of(&s.xml, s.source))
@@ -134,7 +138,7 @@ impl PilotStore {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&self.path, DEFAULT_PILOT_BPMN);
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.xml = DEFAULT_PILOT_BPMN.to_string();
         s.source = Source::Default;
         doc_of(&s.xml, s.source)

@@ -296,7 +296,11 @@ fn reroute_edges(xml: &str, geom: &Geom, delta: &HashMap<String, (f64, f64)>) ->
             cursor = close;
             continue;
         }
-        let e = edge.unwrap();
+        let Some(e) = edge else {
+            result.push_str(&xml[cursor..close]);
+            cursor = close;
+            continue;
+        };
         let Some(src) = geom.node(&e.source) else {
             result.push_str(&xml[cursor..close]);
             cursor = close;

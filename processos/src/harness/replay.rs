@@ -598,7 +598,9 @@ pub fn replay_instance_with_mocks(
                         .map(|s| (s.message_name.clone(), s.correlation_key.clone()))
                 };
                 if let Some((message_name, correlation_key)) = target {
-                    let input = msg_inputs.pop_front().unwrap();
+                    let Some(input) = msg_inputs.pop_front() else {
+                        continue;
+                    };
                     clock = clock.max(input.at);
                     last_consumed_at = input.at;
                     apply_and_fold(
@@ -633,7 +635,9 @@ pub fn replay_instance_with_mocks(
                         .map(|u| u.key)
                 };
                 if let Some(user_task_key) = target {
-                    let input = usertask_inputs.pop_front().unwrap();
+                    let Some(input) = usertask_inputs.pop_front() else {
+                        continue;
+                    };
                     clock = clock.max(input.at);
                     last_consumed_at = input.at;
                     apply_and_fold(
@@ -668,7 +672,9 @@ pub fn replay_instance_with_mocks(
                         .map(|s| s.signal_name.clone())
                 };
                 if let Some(signal_name) = target {
-                    let input = signal_inputs.pop_front().unwrap();
+                    let Some(input) = signal_inputs.pop_front() else {
+                        continue;
+                    };
                     clock = clock.max(input.at);
                     last_consumed_at = input.at;
                     apply_and_fold(

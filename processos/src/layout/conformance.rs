@@ -146,8 +146,9 @@ pub fn flow_direction(geom: &Geom) -> f64 {
     }
     let mut forward = 0usize;
     for e in &seq {
-        let a = e.waypoints.first().unwrap();
-        let b = e.waypoints.last().unwrap();
+        let (Some(a), Some(b)) = (e.waypoints.first(), e.waypoints.last()) else {
+            continue;
+        };
         if b.0 > a.0 - 1.0 {
             forward += 1;
         }
@@ -306,8 +307,9 @@ pub fn port_direction(geom: &Geom) -> f64 {
             good += 1;
             continue;
         };
-        let a = e.waypoints.first().unwrap();
-        let b = e.waypoints.last().unwrap();
+        let (Some(a), Some(b)) = (e.waypoints.first(), e.waypoints.last()) else {
+            continue;
+        };
         let leave_ok = (a.0 - (s.x + s.w)).abs() < 4.0 || (a.1 - (s.y + s.h)).abs() < 4.0;
         let enter_ok = (b.0 - t.x).abs() < 4.0 || (b.1 - t.y).abs() < 4.0;
         if leave_ok && enter_ok {
@@ -350,14 +352,13 @@ pub fn canonical_sizing(geom: &Geom) -> f64 {
     let relevant: Vec<_> = geom
         .nodes
         .iter()
-        .filter(|n| n.kind.canonical_size().is_some())
+        .filter_map(|n| n.kind.canonical_size().map(|sz| (n, sz)))
         .collect();
     if relevant.is_empty() {
         return 1.0;
     }
     let mut ok = 0usize;
-    for n in &relevant {
-        let (w, h) = n.kind.canonical_size().unwrap();
+    for (n, (w, h)) in &relevant {
         if (n.w - w).abs() <= 6.0 && (n.h - h).abs() <= 6.0 {
             ok += 1;
         }
