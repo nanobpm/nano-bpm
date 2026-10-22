@@ -298,18 +298,76 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: engine-core
           # Cache-key rider so this job doesn't fight the engine-core job's cache
           # (they build the same crate for different targets).
           key: wasm32
-      - name: Install binaryen (wasm-opt)
-        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Install binaryen (wasm-opt) + mold linker + LLVM clang (wasm backend)
+        # binaryen: wasm-opt for the dist build. mold: the host Clippy step
+        # below links host build scripts / proc-macros, and the repo's
+        # .cargo/config.toml sets `-fuse-ld=mold` for x86_64-unknown-linux-gnu —
+        # without it that step fails at the link before linting. llvm/clang: the
+        # read-model `wasm` backend compiles a trimmed SQLite C amalgamation (via
+        # the `cc` crate + read-model/build.rs) to wasm32, and GCC/Apple clang
+        # have no wasm backend — upstream LLVM clang does. The `cc` crate reads
+        # these per-target knobs to pick the compiler + archiver; export them for
+        # the wasm read-model Clippy step below.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y binaryen mold llvm clang
+          cc_bin=""
+          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
+            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
+          done
+          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
+          if [ -z "$cc_bin" ]; then
+            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
+          fi
+          if [ -z "$ar_bin" ]; then
+            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
+          fi
+          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
       - name: Build + verify + emit dist
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
         run: make engine-wasm-check
+      - name: Clippy engine-wasm (wasm32, default features)
+        # Enforces the crate's #1357 `unwrap_used`/`expect_used` denies:
+        # `cargo check` (engine-wasm-check) never runs lints, so without this a
+        # new production unwrap() in engine-wasm would pass CI.
+        run: make engine-wasm-clippy
+      - name: Clippy engine-wasm --features read-model + the read-model crate (host)
+        # Enforces the #1357 `unwrap_used`/`expect_used` denies on the
+        # feature-ON surface. Lives in THIS required job (not the
+        # `engine-wasm (read-model wasm32 type-check)` job, which is absent from
+        # the AGENTS.md / .mergify.yml required-check lists) so a new production
+        # unwrap() in read-model or engine-wasm's feature-enabled code actually
+        # blocks the merge gate. Two Clippy runs (see the Makefile target): the
+        # first lints engine-wasm's own `--features read-model` surface; the
+        # second lints the standalone read-model crate directly, because Clippy
+        # does NOT lint path dependencies outside the selected package — so
+        # compiling read-model through engine-wasm's feature does not enforce
+        # read-model's own denies (read-model is in no other clippy job's
+        # workspace). Host target: the read model links the bundled native
+        # SQLite there, so no wasm C toolchain is involved.
+        run: make engine-wasm-clippy-read-model
+      - name: Clippy the read-model crate's wasm backend (wasm32)
+        # Closes the last gap in the #1357 unwrap/expect gate: the host run above
+        # selects read-model's default `native` feature (excluding
+        # `src/backend/wasm.rs` and wasm32-only paths like `store.rs::now_ms`),
+        # and the wasm32 engine-wasm Clippy selects engine-wasm WITHOUT its
+        # `read-model` feature — so a production unwrap()/expect() in the wasm
+        # read-model backend would otherwise pass CI. This run lints read-model
+        # with `--no-default-features --features wasm --target
+        # wasm32-unknown-unknown`. Needs the LLVM clang/llvm-ar exported by the
+        # install step above (the build compiles a trimmed SQLite C amalgamation
+        # to wasm32). Lives in THIS required job so it actually gates the merge.
+        run: make read-model-clippy-wasm
       - name: Bundle-split test (each subpath emits only its own _bg.wasm)
         # Guards the dual-publish acceptance criterion (#825): bundles the lean
         # (`.`) and `/readmodel` entrypoints of the committed engine-wasm/pkg and

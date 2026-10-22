@@ -55,3 +55,11 @@ console-observe = []
 
 [build-dependencies]
 nano-version-stamp = { path = "../nano-version-stamp" }
+
+[lints.clippy]
+# Epic #1357: production code must not panic via `.unwrap()`/`.expect()`.
+# Runtime-fallible sites propagate a typed error; genuinely infallible ones
+# carry a narrow `#[allow(..., reason = "…")]`. Test code is exempt via
+# `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
+unwrap_used = "deny"
+expect_used = "deny"

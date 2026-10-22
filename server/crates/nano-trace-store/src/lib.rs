@@ -413,7 +413,7 @@ impl TraceStore {
     /// Folds one exporter batch into the trace store. `now` is the server's
     /// observation time for this batch (ms since the Unix epoch).
     pub fn ingest(&self, events: &[&Event], now: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for ev in events {
             inner.apply(ev, now);
         }
@@ -429,7 +429,7 @@ impl TraceStore {
         if acts.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         for &(instance_key, job_key) in acts {
             inner.record_activation(instance_key, job_key, worker, now);
         }
@@ -437,7 +437,7 @@ impl TraceStore {
 
     /// Recent instance summaries, most-recent first, capped at `limit`.
     pub fn list(&self, limit: usize) -> Vec<TraceSummaryDto> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .order
             .iter()
@@ -450,7 +450,7 @@ impl TraceStore {
 
     /// The full trace for one instance (design doc §3 shape).
     pub fn get(&self, instance_key: u64) -> Option<InstanceTraceDto> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.instances.get(&instance_key).map(InstanceTrace::dto)
     }
 
@@ -464,7 +464,7 @@ impl TraceStore {
     /// an operation failure that loses no trace — so the counter stays
     /// monotonic for alerting. Useful for a metric/log.
     pub fn sink_stats(&self) -> Option<(u64, u64, u64)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .sink
             .as_ref()
@@ -475,13 +475,13 @@ impl TraceStore {
     /// spans): one root span for the instance, a child span per element instance,
     /// and a grandchild span per job. Ingestible by an OpenTelemetry collector.
     pub fn otel(&self, instance_key: u64) -> Option<serde_json::Value> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.instances.get(&instance_key).map(InstanceTrace::otel)
     }
 
     /// The current capture configuration and in-memory ring state.
     pub fn config(&self) -> TraceConfigDto {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.config()
     }
 
@@ -492,7 +492,7 @@ impl TraceStore {
     /// resulting configuration. Node-local and not persisted — a restart resets
     /// capture to the `NANOBPMN_TRACE_*` env defaults.
     pub fn set_capture(&self, variables: Option<bool>, stimuli: Option<bool>) -> TraceConfigDto {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut vars = variables.unwrap_or(inner.capture_vars);
         let mut stim = stimuli.unwrap_or(inner.capture_stimuli);
         // Enabling the dependent (stimuli) implies the base (variables)...

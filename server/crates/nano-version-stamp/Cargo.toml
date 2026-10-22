@@ -12,3 +12,10 @@ publish = false
 # derivation lives in exactly one place and the two can never drift.
 
 [dependencies]
+
+[lints.clippy]
+# Epic #1357 ratchet: this crate has no production `.unwrap()`/`.expect()`
+# sites today; the deny gate keeps it that way. Test code is exempt via
+# `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
+unwrap_used = "deny"
+expect_used = "deny"

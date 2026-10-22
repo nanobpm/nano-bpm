@@ -1051,15 +1051,15 @@ impl TestEngine {
             .log
             .iter()
             .map(|e| {
-                let mut v = serde_json::to_value(&e.event).unwrap_or(serde_json::Value::Null);
+                let v = serde_json::to_value(&e.event).unwrap_or(serde_json::Value::Null);
                 // Event serializes as an externally-tagged object `{ "Type": {..} }`;
                 // flatten it to `{ "type": "Type", seq, now, ...fields }`.
                 let (ty, body) = match v {
-                    serde_json::Value::Object(ref mut m) if m.len() == 1 => {
-                        let k = m.keys().next().cloned().unwrap();
-                        let b = m.remove(&k).unwrap();
-                        (k, b)
-                    }
+                    serde_json::Value::Object(m) if m.len() == 1 => match m.into_iter().next() {
+                        Some((k, b)) => (k, b),
+                        // `m.len() == 1` guarantees exactly one entry.
+                        None => unreachable!("single-key object always yields one entry"),
+                    },
                     serde_json::Value::String(s) => (s, serde_json::Value::Null),
                     other => ("Unknown".to_string(), other),
                 };
@@ -1399,6 +1399,11 @@ impl TestEngine {
 /// environment bug and is surfaced as a panic.
 #[cfg(feature = "read-model")]
 fn open_read_model() -> ReadStore {
+    #[allow(
+        clippy::expect_used,
+        reason = "opening a pristine ephemeral in-memory SQLite cannot fail in \
+                  practice; a failure is an unrecoverable environment bug"
+    )]
     ReadStore::open(None).expect("open in-memory read model")
 }
 
@@ -2370,6 +2375,11 @@ impl TestEngine {
                 failure.failed_decision_id, failure.message
             ));
         }
+        #[allow(
+            clippy::expect_used,
+            reason = "a DecisionEvaluated event without a failure always carries \
+                      its evaluation key by construction"
+        )]
         let evaluation_key = evaluated
             .decision_evaluation_key()
             .expect("DecisionEvaluated identifies its evaluation");
@@ -2493,11 +2503,17 @@ impl TestEngine {
                 failure,
                 ..
             } => {
+                #[allow(
+                    clippy::expect_used,
+                    reason = "a DecisionEvaluated event always carries its evaluation \
+                              key by construction"
+                )]
+                let decision_evaluation_key = ev
+                    .decision_evaluation_key()
+                    .expect("DecisionEvaluated identifies its evaluation")
+                    .to_string();
                 self.history.decisions.push(DecisionInstanceDto {
-                    decision_evaluation_key: ev
-                        .decision_evaluation_key()
-                        .expect("DecisionEvaluated identifies its evaluation")
-                        .to_string(),
+                    decision_evaluation_key,
                     instance_key: instance_key.to_string(),
                     element_id: element_id.clone(),
                     decision_key: decision_key.to_string(),
@@ -5173,6 +5189,12 @@ mod tests {
 /// where the read model links the platform SQLite; the same code path is the one
 /// compiled to `wasm32` with the in-memory MemoryVFS backend.
 #[cfg(all(test, feature = "read-model"))]
+// The `allow-unwrap-in-tests`/`allow-expect-in-tests` clippy.toml exemptions key
+// on a plain `#[cfg(test)]` and do not recognise this module's
+// `#[cfg(all(test, feature = "read-model"))]` gate, so the test-only unwraps
+// below carry an explicit module-level allow (still test-only code — the whole
+// module compiles only under `cargo test --features read-model`).
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod read_channel_tests {
     use nanobpmn_engine_core::{Command, Event, FormResource};
     use serde_json::Value as J;

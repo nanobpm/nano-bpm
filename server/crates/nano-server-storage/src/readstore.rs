@@ -215,6 +215,17 @@ impl ReadModel {
         self.shard_for(key)?.process_instance(key)
     }
 
+    /// Fallible twin of [`Self::process_instance`]: routes to the key's owning
+    /// shard and propagates a query error (e.g. a runtime `SQLITE_IOERR` on a
+    /// file-backed read) instead of taking the infallible wrapper's fail-fast
+    /// panic. Request handlers that can surface a 500 use this (#1357).
+    pub fn try_process_instance(&self, key: Key) -> rusqlite::Result<Option<ProcessInstanceRow>> {
+        match self.shard_for(key) {
+            Some(shard) => shard.try_process_instance(key),
+            None => Ok(None),
+        }
+    }
+
     /// Resolves the `rootProcessInstanceKey` for `key` by walking the
     /// `parentProcessInstanceKey` chain to the top-level ancestor (C8 parity,
     /// issue #977).
@@ -669,6 +680,39 @@ mod tests {
             fail_loudly, [true; 3],
             "query failures must not resemble absent data"
         );
+    }
+
+    #[test]
+    fn try_process_instance_surfaces_a_broken_shard_as_an_error() {
+        // The fallible point lookup must distinguish a failed read from an
+        // absent row: a shard whose process_instances table was dropped answers
+        // `Err`, never `Ok(None)` (which would misreport a live instance as
+        // 404) and never the infallible wrapper's panic (#1357).
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "nano-try-process-instance-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("read.sqlite");
+        let broken = Arc::new(ReadStore::open(Some(&path)).unwrap());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP TABLE process_instances;")
+            .unwrap();
+        // A key minted by partition 1 routes to the broken shard.
+        let broken_key = nanobpmn_engine_core::compose_key(1, 1);
+        let model = ReadModel::from_shards(vec![(0, shard()), (1, broken)]);
+        assert!(model.try_process_instance(broken_key).is_err());
+        // A key routed to the healthy shard still reads as a genuine absence.
+        let healthy_key = nanobpmn_engine_core::compose_key(0, 1);
+        assert!(model.try_process_instance(healthy_key).unwrap().is_none());
+        drop(model);
+        drop(connection);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

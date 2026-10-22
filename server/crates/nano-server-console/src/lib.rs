@@ -167,6 +167,20 @@ fn splice_once(page: &str, name: &str, marker: &str, fragment: &str) -> String {
 /// variants.
 pub type ApiResult = Result<serde_json::Value, (StatusCode, String)>;
 
+/// Serializes a response body into [`ApiResult`], mapping a serialization
+/// failure to a `500`. The response DTOs are plain `Serialize` structs so this
+/// never fails in practice, but Epic #1357 bans a bare `.unwrap()`/`.expect()`
+/// in production — propagating a typed `(StatusCode, String)` keeps the handler
+/// total instead of panicking the request task.
+fn json_response<T: serde::Serialize>(value: T) -> ApiResult {
+    serde_json::to_value(value).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("serialize response: {e}"),
+        )
+    })
+}
+
 /// The console's view of the running gateway node (ADR 0064 Phase 3, Option B
 /// seam).
 ///
@@ -1770,21 +1784,28 @@ async fn app_view_icon(Path(name): Path<String>) -> Response {
 
     let mut out = Response::new(axum::body::Body::from(bytes));
     let h = out.headers_mut();
-    h.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    h.insert(
+        header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_str(content_type)
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream")),
+    );
     // Defence in depth for scripted SVGs: served for <img> (scripts don't run
     // there), but a direct navigation to this URL would otherwise execute an
     // embedded <script> in the console origin. `sandbox` (no allow-scripts)
     // neutralises that even on direct load; nosniff keeps the type honest.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        "sandbox; default-src 'none'; style-src 'unsafe-inline'"
-            .parse()
-            .unwrap(),
+        axum::http::HeaderValue::from_static(
+            "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+        ),
     );
-    h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
     h.insert(
         header::CACHE_CONTROL,
-        "private, max-age=60".parse().unwrap(),
+        axum::http::HeaderValue::from_static("private, max-age=60"),
     );
     out
 }
@@ -2492,10 +2513,7 @@ impl From<&nano_server_storage::readstore::ProcessInstanceRow> for InstanceDto {
                 i64::try_from(ms)
                     .ok()
                     .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
-                    .unwrap_or_else(|| {
-                        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
-                            .expect("epoch is valid")
-                    })
+                    .unwrap_or_default()
                     .to_rfc3339()
             }),
             parent_process_instance_key: r.parent_process_instance_key.map(|k| k.to_string()),
@@ -3455,7 +3473,7 @@ pub fn models(server: &dyn ConsoleServer) -> ApiResult {
             size,
         });
     }
-    Ok(serde_json::to_value(out).unwrap())
+    json_response(out)
 }
 
 /// `GET /console/api/models/{name}` — one model's XML and deploy status.
@@ -3466,7 +3484,7 @@ pub fn model_get(server: &dyn ConsoleServer, name: &str) -> ApiResult {
     let xml = std::fs::read_to_string(&path)
         .map_err(|_| (StatusCode::NOT_FOUND, "no such model".to_string()))?;
     let status = deploy_status_of(server, &xml);
-    Ok(serde_json::to_value(ModelDto {
+    json_response(ModelDto {
         name: name.to_string(),
         xml,
         process_ids: status.process_ids,
@@ -3474,7 +3492,6 @@ pub fn model_get(server: &dyn ConsoleServer, name: &str) -> ApiResult {
         deployed_version: status.deployed_version,
         deployed_key: status.deployed_key,
     })
-    .unwrap())
 }
 
 /// `PUT /console/api/models/{name}` — overwrite (save) a model's XML. The body
@@ -3496,7 +3513,7 @@ pub fn model_save(server: &dyn ConsoleServer, name: &str, xml: String) -> ApiRes
         ));
     }
     let status = deploy_status_of(server, &xml);
-    Ok(serde_json::to_value(ModelDto {
+    json_response(ModelDto {
         name: name.to_string(),
         xml,
         process_ids: status.process_ids,
@@ -3504,7 +3521,6 @@ pub fn model_save(server: &dyn ConsoleServer, name: &str, xml: String) -> ApiRes
         deployed_version: status.deployed_version,
         deployed_key: status.deployed_key,
     })
-    .unwrap())
 }
 
 /// `POST /console/api/models` — create a new model. 409 if a model with the
@@ -3532,7 +3548,7 @@ pub fn model_create(server: &dyn ConsoleServer, name: String, xml: String) -> Ap
         ));
     }
     let status = deploy_status_of(server, &xml);
-    Ok(serde_json::to_value(ModelDto {
+    json_response(ModelDto {
         name,
         xml,
         process_ids: status.process_ids,
@@ -3540,7 +3556,6 @@ pub fn model_create(server: &dyn ConsoleServer, name: String, xml: String) -> Ap
         deployed_version: status.deployed_version,
         deployed_key: status.deployed_key,
     })
-    .unwrap())
 }
 
 /// `DELETE /console/api/models/{name}` — remove a model from the workspace.
@@ -3697,7 +3712,7 @@ pub async fn worker_create(name: String, job_type: Option<String>) -> ApiResult 
     }
     let _ = std::fs::write(dir.join("node.json"), WORKER_NODE_JSON);
     match worker_summary(&name).await {
-        Some(s) => Ok(serde_json::to_value(s).unwrap()),
+        Some(s) => json_response(s),
         None => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "could not read worker".to_string(),
@@ -3759,7 +3774,7 @@ async fn workers_export(Json(body): Json<ExportWorkersBody>) -> Response {
 /// `GET /console/api/workers/{name}` — one worker's files and runtime status.
 pub async fn worker_get(name: &str) -> ApiResult {
     match worker_summary(name).await {
-        Some(s) => Ok(serde_json::to_value(s).unwrap()),
+        Some(s) => json_response(s),
         None => Err((StatusCode::NOT_FOUND, "no such worker".to_string())),
     }
 }
@@ -3863,7 +3878,7 @@ pub fn worker_file_delete(name: &str, rel: &str) -> ApiResult {
 pub async fn worker_start(name: &str) -> ApiResult {
     let sup = workers::supervisor();
     match sup.start(name).await {
-        Ok(()) => Ok(serde_json::to_value(sup.runtime(name).await).unwrap()),
+        Ok(()) => json_response(sup.runtime(name).await),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
@@ -3961,7 +3976,7 @@ pub fn lib_file_delete(rel: &str) -> ApiResult {
 pub async fn worker_stop(name: &str) -> ApiResult {
     let sup = workers::supervisor();
     match sup.stop(name).await {
-        Ok(()) => Ok(serde_json::to_value(sup.runtime(name).await).unwrap()),
+        Ok(()) => json_response(sup.runtime(name).await),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
@@ -4104,7 +4119,7 @@ pub fn project_create(
     options: &std::collections::HashMap<String, String>,
 ) -> ApiResult {
     match projects::create_project_with_options(name, description, template, options) {
-        Ok(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
+        Ok(cfg) => json_response(cfg),
         Err(e) if e.contains("already exists") => Err((StatusCode::CONFLICT, e)),
         Err(e) if e.contains("invalid") => Err((StatusCode::BAD_REQUEST, e)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
@@ -4459,7 +4474,7 @@ pub async fn project_rename(name: &str, new_name: &str) -> ApiResult {
             // `ensure_inbox` skip the `CREATE`, so enqueue/drain fail on the
             // missing `trigger_inbox` table.
             triggers::forget_inbox(name);
-            Ok(serde_json::to_value(cfg).unwrap())
+            json_response(cfg)
         }
         Err(e) if e.contains("already exists") => Err((StatusCode::CONFLICT, e)),
         Err(e) if e.contains("no such") => Err((StatusCode::NOT_FOUND, e)),
@@ -4471,7 +4486,7 @@ pub async fn project_rename(name: &str, new_name: &str) -> ApiResult {
 /// `GET /console/api/projects/{name}/config` — the project config.
 pub fn project_config_get(name: &str) -> ApiResult {
     match projects::read_config(name) {
-        Some(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
+        Some(cfg) => json_response(cfg),
         None => Err((StatusCode::NOT_FOUND, "no such project".to_string())),
     }
 }
@@ -4484,7 +4499,7 @@ pub fn project_config_put(name: &str, mut cfg: projects::ProjectConfig) -> ApiRe
     cfg.name = name.to_string();
     cfg.updated_ms = now_ms_proj();
     match projects::write_config(name, &cfg) {
-        Ok(()) => Ok(serde_json::to_value(cfg).unwrap()),
+        Ok(()) => json_response(cfg),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save config: {e}"),
@@ -4586,8 +4601,14 @@ async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuer
                     header::CONTENT_TYPE,
                     "text/plain; charset=utf-8".to_string(),
                 ),
-                ("x-file-binary".parse().unwrap(), "false".to_string()),
-                ("x-file-size".parse().unwrap(), size.to_string()),
+                (
+                    axum::http::HeaderName::from_static("x-file-binary"),
+                    "false".to_string(),
+                ),
+                (
+                    axum::http::HeaderName::from_static("x-file-size"),
+                    size.to_string(),
+                ),
             ],
             s,
         )
@@ -4602,8 +4623,14 @@ async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuer
                 StatusCode::OK,
                 [
                     (header::CONTENT_TYPE, "application/json".to_string()),
-                    ("x-file-binary".parse().unwrap(), "true".to_string()),
-                    ("x-file-size".parse().unwrap(), size.to_string()),
+                    (
+                        axum::http::HeaderName::from_static("x-file-binary"),
+                        "true".to_string(),
+                    ),
+                    (
+                        axum::http::HeaderName::from_static("x-file-size"),
+                        size.to_string(),
+                    ),
                 ],
                 body,
             )
@@ -6127,7 +6154,7 @@ pub fn project_path_delete(name: &str, rel: &str) -> ApiResult {
 pub async fn project_run(name: &str) -> ApiResult {
     let sup = projects::supervisor();
     match sup.run(name).await {
-        Ok(()) => Ok(serde_json::to_value(sup.run_state(name).await).unwrap()),
+        Ok(()) => json_response(sup.run_state(name).await),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
@@ -6136,7 +6163,7 @@ pub async fn project_run(name: &str) -> ApiResult {
 pub async fn project_stop(name: &str) -> ApiResult {
     let sup = projects::supervisor();
     match sup.stop(name).await {
-        Ok(()) => Ok(serde_json::to_value(sup.run_state(name).await).unwrap()),
+        Ok(()) => json_response(sup.run_state(name).await),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
