@@ -8,6 +8,13 @@
 //! client frames) so the test suite keeps the same no-extra-deps philosophy as
 //! the HTTP journal-replay e2e harness.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test target: unwrap/expect are acceptable in test setup/assertions; \
+clippy.toml allow-unwrap-in-tests does not cover non-#[test] helper fns in tests/*.rs"
+)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 #[cfg(unix)]

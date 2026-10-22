@@ -11,6 +11,13 @@
 //! freshly allocated port, so runs never collide with each other or leak state
 //! between them.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test target: unwrap/expect are acceptable in test setup/assertions; \
+clippy.toml allow-unwrap-in-tests does not cover non-#[test] helper fns in tests/*.rs"
+)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 #[cfg(unix)]
