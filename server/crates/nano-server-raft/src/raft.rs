@@ -479,7 +479,7 @@ impl RaftLogReader<RaftConfig> for MemLogStore {
         let Some(bounds) = clamp_log_range(&range) else {
             return Ok(Vec::new());
         };
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Ok(inner.log.range(bounds).map(|(_, e)| e.clone()).collect())
     }
 }
@@ -488,7 +488,7 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<RaftConfig>, StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let last_log_id = inner
             .log
             .values()
@@ -506,12 +506,12 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().unwrap().vote = Some(*vote);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().vote)
+        Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote)
     }
 
     async fn append<I>(
@@ -524,7 +524,7 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
         I::IntoIter: OptionalSend,
     {
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             for entry in entries {
                 inner.log.insert(entry.log_id.index, entry);
             }
@@ -536,14 +536,14 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Remove everything from `log_id.index` onward (inclusive).
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let _removed = inner.log.split_off(&log_id.index);
         Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Drop everything up to and including `log_id.index`, keep the rest.
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.last_purged = Some(log_id);
         inner.log = inner.log.split_off(&(log_id.index + 1));
         Ok(())
@@ -553,12 +553,19 @@ impl RaftLogStorage<RaftConfig> for MemLogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        self.inner.lock().unwrap().committed = committed;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed = committed;
         Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().committed)
+        Ok(self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed)
     }
 }
 
@@ -924,7 +931,10 @@ impl PartitionStateMachine {
     /// original recovery path).
     async fn restore_from_current_snapshot(&self) -> anyhow::Result<()> {
         let path = {
-            let guard = self.current_snapshot.lock().unwrap();
+            let guard = self
+                .current_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(s) => s.path.clone(),
                 None => return Ok(()),
@@ -1130,7 +1140,12 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
         // Publish as the current snapshot and unlink the file it replaces.
-        let previous = self.sm.current_snapshot.lock().unwrap().replace(stored);
+        let previous = self
+            .sm
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(stored);
         if let Some(previous) = previous.filter(|p| p.path != path) {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -1155,7 +1170,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         &mut self,
     ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>), StorageError<NodeId>>
     {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         Ok((inner.last_applied, inner.last_membership.clone()))
     }
 
@@ -1177,7 +1192,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             let log_id = entry.log_id;
             match entry.payload {
                 EntryPayload::Blank => {
-                    self.inner.lock().unwrap().last_applied = Some(log_id);
+                    self.inner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .last_applied = Some(log_id);
                     responses.push(ReplicatedResponse::default());
                 }
                 EntryPayload::Normal(batch) => {
@@ -1258,11 +1276,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                             journal.evict_instances(&terminal);
                         });
                     }
-                    self.inner.lock().unwrap().last_applied = Some(log_id);
+                    self.inner
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .last_applied = Some(log_id);
                     responses.push(ReplicatedResponse { items });
                 }
                 EntryPayload::Membership(mem) => {
-                    let mut inner = self.inner.lock().unwrap();
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.last_applied = Some(log_id);
                     inner.last_membership = StoredMembership::new(Some(log_id), mem);
                     responses.push(ReplicatedResponse::default());
@@ -1288,7 +1309,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .with(|journal| journal.try_engine_snapshot())
             .await;
         let (last_applied, last_membership) = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             (inner.last_applied, inner.last_membership.clone())
         };
         PartitionSnapshotBuilder {
@@ -1375,7 +1396,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .await;
 
         {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.last_applied = meta.last_log_id;
             inner.last_membership = meta.last_membership.clone();
         }
@@ -1401,7 +1422,11 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         };
         write_snapshot_ptr(&self.snapshot_dir, &stored)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let previous = self.current_snapshot.lock().unwrap().replace(stored);
+        let previous = self
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(stored);
         if let Some(previous) = previous {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -1414,7 +1439,10 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // Copy the small (meta, path) pair out from under the lock so the file
         // open can `.await` without holding the std mutex.
         let entry = {
-            let guard = self.current_snapshot.lock().unwrap();
+            let guard = self
+                .current_snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|s| (s.meta.clone(), s.path.clone()))
         };
         match entry {
@@ -2281,25 +2309,37 @@ impl RaftRegistry {
     pub fn insert(&self, part: Arc<RaftPartition>) {
         self.partitions
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(part.partition_id, part);
     }
 
     /// The hosted group for `partition`, if this node replicates it.
     pub fn get(&self, partition: u64) -> Option<Arc<RaftPartition>> {
-        self.partitions.lock().unwrap().get(&partition).cloned()
+        self.partitions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&partition)
+            .cloned()
     }
 
     /// Whether this node hosts no Raft groups (the non-Raft default).
     pub fn is_empty(&self) -> bool {
-        self.partitions.lock().unwrap().is_empty()
+        self.partitions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
     }
 
     /// A snapshot of every hosted partition, ordered by partition id. Used by the
     /// `/debug/raft` diagnostic endpoint to dump per-partition replication indices.
     pub fn all(&self) -> Vec<Arc<RaftPartition>> {
-        let mut parts: Vec<Arc<RaftPartition>> =
-            self.partitions.lock().unwrap().values().cloned().collect();
+        let mut parts: Vec<Arc<RaftPartition>> = self
+            .partitions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         parts.sort_by_key(|p| p.partition_id);
         parts
     }
@@ -2385,6 +2425,8 @@ pub fn spawn_compaction_governor(registry: Arc<RaftRegistry>) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use nanobpmn_engine_core::ProcessBuilder;
 
     use super::*;
@@ -3042,7 +3084,11 @@ mod tests {
                 )
                 .expect("state machine"),
             );
-            src_sm.inner.lock().unwrap().last_applied = Some(applied);
+            src_sm
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_applied = Some(applied);
             let mut builder = src_sm.get_snapshot_builder().await;
             let _ = builder.build_snapshot().await.expect("build snapshot");
         }
@@ -3482,6 +3528,135 @@ mod tests {
         );
         // Exclusive end of 0 is empty, not an underflow panic.
         assert_eq!(clamp_log_range(&(0u64..0)), None);
+    }
+
+    /// Failure-injection regression (#1357): a poisoned `PartitionStateMachine`
+    /// mutex — a panic while the `inner` / `current_snapshot` guard is held
+    /// mid-mutation — must not wedge the partition. Every acquisition recovers the
+    /// guard (`unwrap_or_else(|e| e.into_inner())`) instead of panicking on the
+    /// consensus hot path. Poison each mutex separately, assert the poisoning
+    /// actually took, then drive the applied-state read and snapshot
+    /// publication/retrieval paths across both recovered mutexes, verifying the
+    /// applied log id and membership match the snapshot metadata — including
+    /// after a fresh state machine restores from the durable pointer on disk.
+    /// With the previous panicking acquisitions each exercise below would fail
+    /// with a `PoisonError`; with the recovery behaviour they pass.
+    #[tokio::test]
+    async fn state_machine_survives_poisoned_inner_and_snapshot_locks() {
+        use openraft::CommittedLeaderId;
+
+        let lid = |index: u64| LogId::new(CommittedLeaderId::new(1, 0), index);
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with(|j| {
+                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+            })
+            .await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("snapshot dir"));
+        let snap_dir = sm.snapshot_dir.clone();
+
+        // Seed a membership so the applied-state tuple covers both fields.
+        let membership = StoredMembership::new(
+            Some(lid(2)),
+            openraft::Membership::new(vec![BTreeSet::from([0u64])], None),
+        );
+        sm.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_membership = membership.clone();
+
+        // Poison `inner` (a panic while the guard is held) and prove it took.
+        {
+            let inner: &Mutex<SmMeta> = &sm.inner;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _g = inner.lock();
+                    panic!("poison state-machine meta");
+                }))
+                .is_err(),
+                "the injected panic must fire while the meta guard is held"
+            );
+            assert!(
+                inner.lock().is_err(),
+                "the meta mutex must be poisoned by the injected panic"
+            );
+        }
+
+        // Applied-state reads recover the poisoned guard and serve the metadata.
+        let (last_applied, last_membership) =
+            sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(last_applied, None);
+        assert_eq!(last_membership, membership);
+
+        // Poison `current_snapshot` too, and prove it took.
+        {
+            let current: &Mutex<Option<StoredSnapshot>> = &sm.current_snapshot;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _g = current.lock();
+                    panic!("poison current snapshot");
+                }))
+                .is_err(),
+                "the injected panic must fire while the snapshot guard is held"
+            );
+            assert!(
+                current.lock().is_err(),
+                "the snapshot mutex must be poisoned by the injected panic"
+            );
+        }
+
+        // Snapshot publication writes through BOTH recovered mutexes: the build
+        // captures `inner` (applied metadata) and publishes into
+        // `current_snapshot`.
+        let applied = lid(42);
+        sm.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_applied = Some(applied);
+        let mut builder = sm.clone().get_snapshot_builder().await;
+        let snap = builder
+            .build_snapshot()
+            .await
+            .expect("snapshot build recovers the poisoned snapshot mutex");
+        assert_eq!(snap.meta.last_log_id, Some(applied));
+        assert_eq!(snap.meta.last_membership, membership);
+
+        // Snapshot retrieval recovers the same poisoned mutex and serves the
+        // publication, with metadata matching the applied state.
+        let current = sm
+            .clone()
+            .get_current_snapshot()
+            .await
+            .expect("get_current_snapshot")
+            .expect("a snapshot was published");
+        assert_eq!(current.meta, snap.meta);
+        let (last_applied, last_membership) =
+            sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(last_applied, Some(applied));
+        assert_eq!(last_membership, snap.meta.last_membership);
+
+        // After restoration from disk (a fresh state machine over the same
+        // snapshot dir, i.e. the reboot path), the applied log id and membership
+        // still match the snapshot metadata.
+        let restored: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                engine,
+                0,
+                snap_dir,
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("reopen state machine"),
+        );
+        let (restored_applied, restored_membership) = restored
+            .clone()
+            .applied_state()
+            .await
+            .expect("applied_state");
+        assert_eq!(restored_applied, Some(applied));
+        assert_eq!(restored_membership, snap.meta.last_membership);
     }
 
     #[tokio::test]

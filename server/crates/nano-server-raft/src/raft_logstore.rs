@@ -762,40 +762,176 @@ impl RaftLogStore {
         self.bytes.clone()
     }
 
+    /// Core append path shared by the openraft [`RaftLogStorage::append`] trait
+    /// method and the `#[cfg(test)]` [`Self::append_for_test`] adapter: acquire
+    /// the (poison-recovering) `inner` lock, then serialize, roll, write, fsync
+    /// per durability mode, index, account and demote each entry. The `LogFlushed`
+    /// acknowledgement stays in the trait method (the raft core owns that
+    /// callback), so this is deliberately callback-free. Keeping it the single
+    /// source of truth means both callers — production replication and the poison
+    /// regression — exercise the identical durable mutation, fsync barrier,
+    /// metric accounting and lock-recovery logic; there is no second copy to drift.
+    fn append_entries<I>(&mut self, entries: I) -> io::Result<()>
+    where
+        I: IntoIterator<Item = Entry<RaftConfig>>,
+    {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut added = 0i64;
+        let mut new_bytes = 0usize;
+        let mut new_ram = 0usize;
+        for entry in entries {
+            let mut json = Vec::new();
+            serde_json::to_writer(&mut json, &entry)?;
+            // Uncompressed in-RAM footprint (plaintext `JSON + '\n'`), captured before
+            // the compress branch may reframe/extend `json`. This — not the possibly
+            // compressed on-disk `len` — is what the resident `entry` copy actually
+            // costs, so it drives the RAM budget/metric.
+            let ram_len = json.len() + 1;
+            // Compress large entries into a self-describing frame when enabled; small
+            // entries (and the disabled path) stay verbatim as `json + '\n'`. `len` is
+            // the physical on-disk record length either way, so the offset/roll/demote
+            // bookkeeping below is codec-agnostic.
+            let line = if inner.compress {
+                frame_entry(&json).unwrap_or_else(|| {
+                    json.push(b'\n');
+                    json
+                })
+            } else {
+                json.push(b'\n');
+                json
+            };
+            let len = line.len();
+            let index = entry.log_id.index;
+            let log_id = entry.log_id;
+
+            // Roll to a fresh segment once the active one is full (and non-empty, so
+            // a single oversized entry still lands somewhere). The outgoing segment
+            // is fsynced before the switch so a sealed segment is always durable
+            // regardless of durability mode.
+            if inner.active_bytes > 0 && inner.active_bytes + len > inner.seg_max_bytes {
+                timed_log_sync(&inner.active_file)?;
+                inner.unsynced_bytes = 0;
+                inner.roll_active(index)?;
+            }
+
+            // Record where this entry's line lands (post-roll) so it can later be
+            // demoted to descriptor-only and read back from the segment file.
+            let seg_start = inner.segments.last().map(|s| s.start).unwrap_or(index);
+            let offset = inner.active_bytes;
+            inner.active_file.write_all(&line)?;
+            inner.active_bytes += len;
+            if let Some(seg) = inner.segments.last_mut() {
+                seg.last = Some(index);
+            }
+            inner.log.insert(
+                index,
+                Stored {
+                    log_id,
+                    len,
+                    ram_len,
+                    seg_start,
+                    offset,
+                    entry: Some(entry),
+                },
+            );
+            inner.log_bytes += len;
+            inner.ram_bytes += ram_len;
+            inner.unsynced_bytes += len;
+            new_bytes += len;
+            new_ram += ram_len;
+            added += 1;
+            crate::metrics::raft_log_entry_appended(len);
+        }
+        match inner.async_durability() {
+            // Sync: fsync before acknowledging — a flushed entry is power-loss
+            // durable. The media barrier (an `F_FULLFSYNC` on macOS) is on the
+            // critical path of every replication round.
+            false => {
+                timed_log_sync(&inner.active_file)?;
+                inner.unsynced_bytes = 0;
+            }
+            // Async (base mode, or a sync store inside the recovery fsync-relief
+            // window): the bytes are in the page cache (process-crash durable);
+            // acknowledge now and let the background flusher amortise the fsync.
+            // A byte-bounded inline flush caps the unfsynced window under a flood,
+            // when the periodic tick alone could fall behind.
+            true => {
+                if inner.unsynced_bytes >= inner.flush.max_bytes {
+                    timed_log_sync(&inner.active_file)?;
+                    inner.unsynced_bytes = 0;
+                }
+            }
+        }
+        crate::metrics::raft_log_delta(added, new_bytes as i64);
+        crate::metrics::raft_log_ram_delta(new_ram as i64);
+        // Demote the cold tail back under the RAM budget (O(1) in-memory drops; the
+        // bytes are already durably on disk). Off the fsync path above.
+        inner.enforce_ram_budget();
+        self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Test-only: populate a store through the exact production durable mutation
+    /// path by delegating to [`Self::append_entries`] (the same lock acquisition,
+    /// write, fsync, indexing and accounting the openraft `append` trait method
+    /// drives), minus only the `pub(crate)` `LogFlushed` callback the raft core
+    /// supplies. Because it shares `append_entries`, the poison regression that
+    /// drives it genuinely covers the production append lock — reverting that lock
+    /// to `.unwrap()` makes the regression fail.
+    #[cfg(test)]
+    fn append_for_test(&mut self, entries: &[Entry<RaftConfig>]) -> io::Result<()> {
+        self.append_entries(entries.iter().cloned())
+    }
+
     /// Test-only: whether an append would DEFER its `fsync` (coalesce onto the
     /// async cadence) rather than fsync inline right now, given the store's mode,
     /// `coalesce_capable`, and the live recovery-relief flag. Mirrors the exact
     /// predicate the `append`/`save_committed` fsync paths branch on.
     #[cfg(test)]
     fn would_defer_fsync(&self) -> bool {
-        self.inner.lock().unwrap().async_durability()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .async_durability()
     }
 
     /// Test-only: force `coalesce_capable` on/off without touching the process
     /// environment (which would race other parallel tests that `open()` a store).
     #[cfg(test)]
     fn force_coalesce_capable(&self, on: bool) {
-        self.inner.lock().unwrap().coalesce_capable = on;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .coalesce_capable = on;
     }
 
     /// Test-only: force the sync-mode committed-marker deferral on/off without
     /// touching the process environment.
     #[cfg(test)]
     fn force_defer_committed(&self, on: bool) {
-        self.inner.lock().unwrap().defer_committed = on;
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .defer_committed = on;
     }
 
     /// Test-only: whether the committed/purge markers are dirty in memory (awaiting
     /// a background-flusher persist to `state.json`).
     #[cfg(test)]
     fn is_state_dirty(&self) -> bool {
-        self.inner.lock().unwrap().state_dirty
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state_dirty
     }
 
     /// Test-only: run one background-flusher pass synchronously.
     #[cfg(test)]
     fn flush_now(&self) -> io::Result<()> {
-        self.inner.lock().unwrap().flush_async()
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flush_async()
     }
 
     /// Opens (creating if absent) a durable log store rooted at `dir`, replaying
@@ -914,7 +1050,11 @@ impl RaftLogStore {
         crate::metrics::raft_log_ram_delta(ram_total as i64);
         // A recovered tail loads fully resident; demote its cold prefix so a
         // restart under a large-payload workload does not re-balloon RAM.
-        store.inner.lock().unwrap().enforce_ram_budget();
+        store
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enforce_ram_budget();
 
         // The async flusher bounds the unfsynced window when the partition goes
         // quiet (an idle follower would otherwise hold an unflushed tail
@@ -942,7 +1082,7 @@ impl RaftLogStore {
     fn spawn_flusher(&self) {
         let weak: Weak<Mutex<Inner>> = Arc::downgrade(&self.inner);
         let interval = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.flush.interval
         };
         std::thread::Builder::new()
@@ -953,7 +1093,7 @@ impl RaftLogStore {
                     let Some(inner) = weak.upgrade() else {
                         break; // store dropped — stop ticking
                     };
-                    let mut inner = inner.lock().unwrap();
+                    let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
                     if let Err(e) = inner.flush_async() {
                         tracing::error!(
                             "raft log flusher fsync failed: {e}; aborting to avoid \
@@ -1006,7 +1146,14 @@ impl RaftLogStore {
         // byte offsets, so we truncate the file to the end of the last survivor
         // rather than re-serializing — which also avoids rehydrating any demoted
         // (descriptor-only) entries and keeps every `Stored.offset` valid.
-        let active = kept.last().unwrap();
+        let Some(active) = kept.last() else {
+            // Unreachable: the empty case returned above with a fresh segment.
+            // Guard anyway so a refactor can never turn this into a panic.
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "rewrite_after_truncate: no surviving segment",
+            )));
+        };
         let active_start = active.start;
         let path = seg_path(&inner.dir, active_start);
         let mut cut = 0usize;
@@ -1100,7 +1247,7 @@ impl RaftLogReader<RaftConfig> for RaftLogStore {
             },
         }
         let planned: Vec<Resolved> = {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             // Guard against a degenerate (inverted/empty) range before touching
             // the BTreeMap, which would otherwise panic and take the node down.
             // See `crate::raft::clamp_log_range`.
@@ -1120,7 +1267,13 @@ impl RaftLogReader<RaftConfig> for RaftLogStore {
                 })
                 .collect()
         };
-        let dir = { self.inner.lock().unwrap().dir.clone() };
+        let dir = {
+            self.inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .dir
+                .clone()
+        };
         let mut out = Vec::with_capacity(planned.len());
         for r in planned {
             match r {
@@ -1140,7 +1293,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     type LogReader = Self;
 
     async fn get_log_state(&mut self) -> Result<LogState<RaftConfig>, StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let last_log_id = inner
             .log
             .values()
@@ -1158,17 +1311,17 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // The vote must hit disk before openraft acts on it.
         let bytes = serde_json::to_vec(vote).map_err(io_err)?;
         atomic_write(&inner.dir, &vote_path(&inner.dir), &bytes).map_err(io_err)?;
         drop(inner);
-        self.inner.lock().unwrap().vote = Some(*vote);
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().vote)
+        Ok(self.inner.lock().unwrap_or_else(|e| e.into_inner()).vote)
     }
 
     async fn append<I>(
@@ -1180,100 +1333,12 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         I: IntoIterator<Item = Entry<RaftConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
     {
-        let mut inner = self.inner.lock().unwrap();
-        let mut added = 0i64;
-        let mut new_bytes = 0usize;
-        let mut new_ram = 0usize;
-        for entry in entries {
-            let mut json = Vec::new();
-            serde_json::to_writer(&mut json, &entry).map_err(io_err)?;
-            // Uncompressed in-RAM footprint (plaintext `JSON + '\n'`), captured before
-            // the compress branch may reframe/extend `json`. This — not the possibly
-            // compressed on-disk `len` — is what the resident `entry` copy actually
-            // costs, so it drives the RAM budget/metric.
-            let ram_len = json.len() + 1;
-            // Compress large entries into a self-describing frame when enabled; small
-            // entries (and the disabled path) stay verbatim as `json + '\n'`. `len` is
-            // the physical on-disk record length either way, so the offset/roll/demote
-            // bookkeeping below is codec-agnostic.
-            let line = if inner.compress {
-                frame_entry(&json).unwrap_or_else(|| {
-                    json.push(b'\n');
-                    json
-                })
-            } else {
-                json.push(b'\n');
-                json
-            };
-            let len = line.len();
-            let index = entry.log_id.index;
-            let log_id = entry.log_id;
-
-            // Roll to a fresh segment once the active one is full (and non-empty, so
-            // a single oversized entry still lands somewhere). The outgoing segment
-            // is fsynced before the switch so a sealed segment is always durable
-            // regardless of durability mode.
-            if inner.active_bytes > 0 && inner.active_bytes + len > inner.seg_max_bytes {
-                timed_log_sync(&inner.active_file).map_err(io_err)?;
-                inner.unsynced_bytes = 0;
-                inner.roll_active(index).map_err(io_err)?;
-            }
-
-            // Record where this entry's line lands (post-roll) so it can later be
-            // demoted to descriptor-only and read back from the segment file.
-            let seg_start = inner.segments.last().map(|s| s.start).unwrap_or(index);
-            let offset = inner.active_bytes;
-            inner.active_file.write_all(&line).map_err(io_err)?;
-            inner.active_bytes += len;
-            if let Some(seg) = inner.segments.last_mut() {
-                seg.last = Some(index);
-            }
-            inner.log.insert(
-                index,
-                Stored {
-                    log_id,
-                    len,
-                    ram_len,
-                    seg_start,
-                    offset,
-                    entry: Some(entry),
-                },
-            );
-            inner.log_bytes += len;
-            inner.ram_bytes += ram_len;
-            inner.unsynced_bytes += len;
-            new_bytes += len;
-            new_ram += ram_len;
-            added += 1;
-            crate::metrics::raft_log_entry_appended(len);
-        }
-        match inner.async_durability() {
-            // Sync: fsync before acknowledging — a flushed entry is power-loss
-            // durable. The media barrier (an `F_FULLFSYNC` on macOS) is on the
-            // critical path of every replication round.
-            false => {
-                timed_log_sync(&inner.active_file).map_err(io_err)?;
-                inner.unsynced_bytes = 0;
-            }
-            // Async (base mode, or a sync store inside the recovery fsync-relief
-            // window): the bytes are in the page cache (process-crash durable);
-            // acknowledge now and let the background flusher amortise the fsync.
-            // A byte-bounded inline flush caps the unfsynced window under a flood,
-            // when the periodic tick alone could fall behind.
-            true => {
-                if inner.unsynced_bytes >= inner.flush.max_bytes {
-                    timed_log_sync(&inner.active_file).map_err(io_err)?;
-                    inner.unsynced_bytes = 0;
-                }
-            }
-        }
-        crate::metrics::raft_log_delta(added, new_bytes as i64);
-        crate::metrics::raft_log_ram_delta(new_ram as i64);
-        // Demote the cold tail back under the RAM budget (O(1) in-memory drops; the
-        // bytes are already durably on disk). Off the fsync path above.
-        inner.enforce_ram_budget();
-        self.bytes.store(inner.log_bytes as i64, Ordering::Relaxed);
-        drop(inner);
+        // The durable write (lock, serialize, roll, write, fsync, index, account,
+        // demote) is `append_entries` — the single source of truth both this trait
+        // method and the `#[cfg(test)]` adapter drive. The `LogFlushed`
+        // acknowledgement is the raft core's and stays here, so `append_entries`
+        // is callback-free.
+        self.append_entries(entries).map_err(io_err)?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
@@ -1281,7 +1346,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         // Remove everything from `log_id.index` onward (inclusive), then rewrite at
         // most the single straddled segment (log conflicts are rare and bounded).
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before_entries = inner.log.len() as i64;
         let before_bytes = inner.log_bytes as i64;
         let removed = inner.log.split_off(&log_id.index);
@@ -1311,7 +1376,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         // unbounded work — the durable record of the purge is the `state.json`
         // marker; physical segment deletion is best-effort and reconciled on
         // restart, so a failed unlink or a crash mid-purge never resurrects entries.
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let before_entries = inner.log.len() as i64;
         let before_bytes = inner.log_bytes as i64;
         inner.last_purged = Some(log_id);
@@ -1358,7 +1423,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         &mut self,
         committed: Option<LogId<NodeId>>,
     ) -> Result<(), StorageError<NodeId>> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.committed = committed;
         // Defer the committed marker to the background flusher when either the store
         // is behaving as `async` (base async mode or the recovery fsync-relief
@@ -1379,7 +1444,11 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        Ok(self.inner.lock().unwrap().committed)
+        Ok(self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .committed)
     }
 }
 
@@ -1576,7 +1645,7 @@ mod tests {
         let mut store = RaftLogStore::open(&dir).unwrap();
 
         {
-            let mut inner = store.inner.lock().unwrap();
+            let mut inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.ram_budget = 1;
             inner.demote_scan_from = 0;
             inner.enforce_ram_budget();
@@ -1620,7 +1689,7 @@ mod tests {
         write_segment(&dir, 0, &[0, 1, 2, 3, 4, 5]);
         let mut store = RaftLogStore::open(&dir).unwrap();
         {
-            let mut inner = store.inner.lock().unwrap();
+            let mut inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.ram_budget = 1;
             inner.demote_scan_from = 0;
             inner.enforce_ram_budget();
@@ -1645,7 +1714,7 @@ mod tests {
         write_segment(&dir, 3, &[3, 4, 5]);
         let mut store = RaftLogStore::open(&dir).unwrap();
         let ram_after_demote = {
-            let mut inner = store.inner.lock().unwrap();
+            let mut inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.ram_budget = 1;
             inner.demote_scan_from = 0;
             inner.enforce_ram_budget();
@@ -1656,7 +1725,14 @@ mod tests {
         assert_eq!(indices_in(&mut store).await, vec![3, 4, 5]);
         // The purged entries were demoted (descriptor-only), so resident bytes are
         // unchanged by the purge.
-        assert_eq!(store.inner.lock().unwrap().ram_bytes, ram_after_demote);
+        assert_eq!(
+            store
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .ram_bytes,
+            ram_after_demote
+        );
 
         let mut reopened = RaftLogStore::open(&dir).unwrap();
         assert_eq!(indices_in(&mut reopened).await, vec![3, 4, 5]);
@@ -1853,7 +1929,7 @@ mod tests {
         std::fs::write(seg_path(&dir, 0), &file).unwrap();
 
         let store = RaftLogStore::open(&dir).unwrap();
-        let inner = store.inner.lock().unwrap();
+        let inner = store.inner.lock().unwrap_or_else(|e| e.into_inner());
         let on_disk = r0.len() + r1.len();
         let uncompressed = (j0.len() + 1) + (j1.len() + 1);
         assert_eq!(
@@ -1973,5 +2049,92 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&off_dir);
         let _ = std::fs::remove_dir_all(&on_dir);
+    }
+
+    /// Red/green regression (#1357) for `RaftLogStore::inner` poison recovery: a
+    /// panic while the store mutex is held mid-operation must not wedge the
+    /// durable log — every acquisition recovers the guard
+    /// (`unwrap_or_else(|e| e.into_inner())`) instead of panicking on the
+    /// replication hot path. Poison a populated store, assert the poisoning
+    /// actually took, then exercise reads, durable mutations (vote, append,
+    /// committed marker, truncate, purge) and marker flushing, and finally
+    /// reopen the store to verify the surviving entries and persisted markers.
+    /// With the previous panicking acquisitions each exercise below would fail
+    /// with a `PoisonError`; with the recovery behaviour they pass.
+    #[tokio::test]
+    async fn store_survives_poisoned_inner_lock() {
+        use openraft::storage::RaftLogStorage;
+
+        let dir = tmp_dir("poisoned-inner");
+        let mut store = RaftLogStore::open(&dir).unwrap();
+
+        // Populate the store through the durable mutation path (a real append
+        // with fsync), so the poison lands on a non-empty log.
+        store
+            .append_for_test(&[entry(0), entry(1), entry(2), entry(3), entry(4)])
+            .unwrap();
+
+        // Poison `inner` (a panic while the guard is held) and prove it took.
+        {
+            let inner: &Arc<Mutex<Inner>> = &store.inner;
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _g = inner.lock();
+                    panic!("poison raft log store");
+                }))
+                .is_err(),
+                "the injected panic must fire while the store guard is held"
+            );
+            assert!(
+                inner.lock().is_err(),
+                "the store mutex must be poisoned by the injected panic"
+            );
+        }
+
+        // Reads recover the poisoned guard and serve the populated log.
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4]);
+        let state = store.get_log_state().await.unwrap();
+        assert_eq!(state.last_log_id, Some(log_id(4)));
+
+        // Durable mutations recover the guard too: the vote (fsynced inline) and
+        // a further append.
+        let vote = Vote::new(1, 0);
+        store.save_vote(&vote).await.unwrap();
+        assert_eq!(store.read_vote().await.unwrap(), Some(vote));
+        store.append_for_test(&[entry(5), entry(6)]).unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4, 5, 6]);
+
+        // Marker flushing: the deferred committed marker is held dirty in memory,
+        // then the flusher pass (itself a guard acquisition) persists it.
+        store.force_defer_committed(true);
+        store.save_committed(Some(log_id(6))).await.unwrap();
+        assert!(
+            store.is_state_dirty(),
+            "the committed marker must be held dirty for the flusher"
+        );
+        store.flush_now().unwrap();
+        assert!(!store.is_state_dirty(), "the flusher persists the marker");
+        let flushed: PersistedState = read_json(&state_path(&dir)).unwrap().unwrap();
+        assert_eq!(flushed.committed, Some(log_id(6)));
+
+        // Truncate + purge (the compaction mutations) recover the guard as well.
+        store.truncate(log_id(6)).await.unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![0, 1, 2, 3, 4, 5]);
+        store.purge(log_id(2)).await.unwrap();
+        assert_eq!(indices_in(&mut store).await, vec![3, 4, 5]);
+        store.save_committed(Some(log_id(5))).await.unwrap();
+        store.flush_now().unwrap();
+
+        // Reopen: the surviving entries and the persisted markers are exactly
+        // what the recovered mutations left behind.
+        let mut reopened = RaftLogStore::open(&dir).unwrap();
+        assert_eq!(indices_in(&mut reopened).await, vec![3, 4, 5]);
+        let state = reopened.get_log_state().await.unwrap();
+        assert_eq!(state.last_purged_log_id, Some(log_id(2)));
+        assert_eq!(state.last_log_id, Some(log_id(5)));
+        assert_eq!(reopened.read_committed().await.unwrap(), Some(log_id(5)));
+        assert_eq!(reopened.read_vote().await.unwrap(), Some(vote));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

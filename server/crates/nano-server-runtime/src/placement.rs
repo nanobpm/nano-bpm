@@ -142,7 +142,11 @@ pub fn swrr_pick(weights: &[u128], current: &mut [i128]) -> Option<usize> {
     let mut best: Option<usize> = None;
     for i in 0..weights.len() {
         current[i] += weights[i] as i128;
-        if weights[i] > 0 && (best.is_none() || current[i] > current[best.unwrap()]) {
+        let dominated = match best {
+            Some(b) => current[i] <= current[b],
+            None => false,
+        };
+        if weights[i] > 0 && !dominated {
             best = Some(i);
         }
     }

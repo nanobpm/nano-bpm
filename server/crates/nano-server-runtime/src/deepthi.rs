@@ -177,7 +177,7 @@ impl Mailbox {
     }
 
     fn push(&self, priority: Priority, job: Job) {
-        let mut g = self.inner.lock().expect("engine mailbox poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match priority {
             Priority::High => {
                 g.hi.push_back(job);
@@ -198,7 +198,7 @@ impl Mailbox {
     /// creates vs completions). Returns `None` once every producer handle is gone
     /// and both queues are empty (clean shutdown).
     fn pop(&self) -> Option<(Job, Priority)> {
-        let mut g = self.inner.lock().expect("engine mailbox poisoned");
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(job) = g.hi.pop_front() {
                 self.stats.hi_depth.store(g.hi.len(), Ordering::Relaxed);
@@ -211,7 +211,7 @@ impl Mailbox {
             if g.producers == 0 {
                 return None;
             }
-            g = self.signal.wait(g).expect("engine mailbox poisoned");
+            g = self.signal.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -228,7 +228,7 @@ impl Clone for DeepthiHandle {
         self.mb
             .inner
             .lock()
-            .expect("engine mailbox poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .producers += 1;
         Self {
             mb: Arc::clone(&self.mb),
@@ -238,7 +238,7 @@ impl Clone for DeepthiHandle {
 
 impl Drop for DeepthiHandle {
     fn drop(&mut self) {
-        let mut g = self.mb.inner.lock().expect("engine mailbox poisoned");
+        let mut g = self.mb.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.producers -= 1;
         if g.producers == 0 {
             drop(g);
@@ -292,6 +292,14 @@ impl DeepthiHandle {
         let mb = Mailbox::new(partition);
         let consumer = Arc::clone(&mb);
         let profile = std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some();
+        // Startup-only (partition boot / lazy replica engine): a thread-spawn
+        // failure is OS resource exhaustion at boot, which is unrecoverable —
+        // the partition can never serve writes — so we fail fast rather than
+        // surface a half-initialized node.
+        #[allow(
+            clippy::expect_used,
+            reason = "startup-only: OS thread-spawn failure at partition boot is unrecoverable resource exhaustion"
+        )]
         thread::Builder::new()
             .name("nanobpmn-engine".into())
             .spawn(move || {
@@ -440,6 +448,16 @@ impl DeepthiHandle {
             let _ = reply_tx.send(f(journal));
         });
         self.mb.push(priority, job);
+        // A `None` here means the engine thread unwound mid-command (its
+        // `AliveGuard` already cleared `ActorStats::alive` and logged the panic,
+        // and the process-wide panic hook captured the cause). The single writer
+        // is dead, so no reply can ever arrive — there is no typed error to
+        // propagate through the `R`-returning API, and failing fast keeps a
+        // wedged partition from hanging every caller forever.
+        #[allow(
+            clippy::expect_used,
+            reason = "a dead engine thread can never answer; AliveGuard + the panic hook already surfaced the fatal unwind"
+        )]
         reply_rx.await.expect("engine thread answered")
     }
 
@@ -533,5 +551,25 @@ mod tests {
         // though the consumer is gone.
         h.spawn_job(|_journal| {});
         assert!(h.stats().hi_depth.load(Ordering::Relaxed) >= 1);
+    }
+
+    /// A poisoned mailbox mutex (a panic while the guard is held) must not
+    /// wedge the actor: push/pop recover the guard and keep the queue
+    /// serviceable.
+    #[test]
+    fn mailbox_survives_poisoned_lock() {
+        let mb = Mailbox::new(0);
+        {
+            let inner: &Mutex<MailboxInner> = &mb.inner;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _g = inner.lock();
+                panic!("poison mailbox");
+            }));
+        }
+        // Producers and the consumer both recover the poisoned guard.
+        mb.push(Priority::High, Box::new(|_journal| {}));
+        let (job, prio) = mb.pop().expect("job enqueued before poison is served");
+        assert_eq!(prio, Priority::High);
+        drop(job);
     }
 }

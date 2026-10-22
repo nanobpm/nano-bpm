@@ -66,6 +66,10 @@ pub fn next_epoch(cur_epoch: u64, cur_leader: u64, me: u64) -> u64 {
         // corrupt the fence. The space is unreachable in practice (it takes
         // 2^64 overtakes to exhaust), so this is a defence-in-depth assertion,
         // not a live failure mode.
+        #[allow(
+            clippy::expect_used,
+            reason = "defence-in-depth: exhausting the u64 fence-epoch space is unreachable; wrapping would silently regress the fence"
+        )]
         cur_epoch.checked_add(1).expect(
             "fence epoch space exhausted at u64::MAX; refusing to wrap and regress the fence",
         )

@@ -348,6 +348,13 @@ impl Partitions {
     /// topology); use [`try_for_create`](Self::try_for_create) where a
     /// recoverable error is wanted instead.
     pub fn for_create(&self) -> &DeepthiHandle {
+        // Startup rejects a zero-local-partition topology before traffic flows,
+        // so by the time this hot path runs the invariant holds; the recoverable
+        // surface is `try_for_create`.
+        #[allow(
+            clippy::expect_used,
+            reason = "startup rejects a node hosting no local partition; try_for_create is the recoverable API"
+        )]
         self.try_for_create()
             .expect("for_create requires at least one local partition")
     }
