@@ -80,3 +80,7 @@ lto = true
 # warning (unused code, deprecations, future-incompat lints, linker_messages,
 # etc.). See .cargo/config.toml for the macOS `__eh_frame` linker-warning fix.
 warnings = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

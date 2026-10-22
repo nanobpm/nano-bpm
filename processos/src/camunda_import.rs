@@ -234,11 +234,12 @@ struct InstAcc {
 
 impl InstAcc {
     fn elem_mut(&mut self, key: i64, element_id: &str, bpmn_type: &str, ts: u64) -> &mut ElemAcc {
-        if !self.elems.contains_key(&key) {
-            self.elem_order.push(key);
-            self.elems.insert(
-                key,
-                ElemAcc {
+        use std::collections::hash_map::Entry;
+        match self.elems.entry(key) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                self.elem_order.push(key);
+                e.insert(ElemAcc {
                     element_id: element_id.to_string(),
                     bpmn_type: bpmn_type.to_string(),
                     first_seen: ts,
@@ -246,10 +247,9 @@ impl InstAcc {
                     completed_at: None,
                     incidents: 0,
                     job_key: None,
-                },
-            );
+                })
+            }
         }
-        self.elems.get_mut(&key).unwrap()
     }
 
     /// Append one recorded external input to the Tier-2 log, assigning the next
@@ -321,6 +321,20 @@ fn is_routing_element(bpmn_type: &str) -> bool {
 /// JOB CREATED is always folded before its JOB_BATCH ACTIVATED / JOB COMPLETED,
 /// regardless of input ordering.
 pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
+    /// Get or create the accumulator for `pik`, recording first-seen order.
+    /// Returns the live `&mut InstAcc`, so callers never need a follow-up
+    /// `get_mut().unwrap()` — the key is present by construction.
+    fn touch<'a>(
+        insts: &'a mut HashMap<i64, InstAcc>,
+        inst_order: &mut Vec<i64>,
+        pik: i64,
+    ) -> &'a mut InstAcc {
+        insts.entry(pik).or_insert_with(|| {
+            inst_order.push(pik);
+            InstAcc::default()
+        })
+    }
+
     let mut order: Vec<usize> = (0..records.len()).collect();
     order.sort_by_key(|&i| (records[i].timestamp, records[i].position));
 
@@ -333,13 +347,6 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
     // correlation (which is keyed by its catch-event instance, not the process
     // instance) can route back to the instance that consumed the signal.
     let mut eik_to_inst: HashMap<i64, i64> = HashMap::new();
-
-    let touch = |insts: &mut HashMap<i64, InstAcc>, inst_order: &mut Vec<i64>, pik: i64| {
-        insts.entry(pik).or_insert_with(|| {
-            inst_order.push(pik);
-            InstAcc::default()
-        });
-    };
 
     for &i in &order {
         let r = &records[i];
@@ -357,13 +364,12 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = vi64(v, "processInstanceKey") else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
                 // Map this element instance to its process instance (the record
                 // key is the element-instance key) for later signal routing.
                 if r.key != 0 {
                     eik_to_inst.insert(r.key, pik);
                 }
-                let inst = insts.get_mut(&pik).unwrap();
+                let inst = touch(&mut insts, &mut inst_order, pik);
                 let element_id = vstr(v, "elementId").unwrap_or("").to_string();
                 let bpmn_type = vstr(v, "bpmnElementType").unwrap_or("").to_string();
                 if let Some(pid) = vstr(v, "bpmnProcessId") {
@@ -421,8 +427,7 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = vi64(v, "processInstanceKey") else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
-                let inst = insts.get_mut(&pik).unwrap();
+                let inst = touch(&mut insts, &mut inst_order, pik);
                 if let Some(pid) = vstr(v, "bpmnProcessId") {
                     if inst.process_id.is_empty() {
                         inst.process_id = pid.to_string();
@@ -439,12 +444,11 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = vi64(v, "processInstanceKey") else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
                 let job_key = r.key;
                 let job_type = vstr(v, "type").unwrap_or("").to_string();
                 let eik = vi64(v, "elementInstanceKey").unwrap_or(0);
                 job_to_inst.insert(job_key, pik);
-                let inst = insts.get_mut(&pik).unwrap();
+                let inst = touch(&mut insts, &mut inst_order, pik);
                 let job = inst.jobs.entry(job_key).or_insert_with(|| JobAcc {
                     job_type: job_type.clone(),
                     element_instance_key: eik,
@@ -465,33 +469,27 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                         el.job_key = Some(job_key);
                     }
                 }
+                // `job_key` was just inserted above, so the lookups below hit by
+                // construction; `if let` keeps the access total regardless.
                 match intent {
                     "CREATED" => {
-                        insts
-                            .get_mut(&pik)
-                            .unwrap()
-                            .jobs
-                            .get_mut(&job_key)
-                            .unwrap()
-                            .created_at
-                            .get_or_insert(ts);
+                        if let Some(job) = inst.jobs.get_mut(&job_key) {
+                            job.created_at.get_or_insert(ts);
+                        }
                     }
                     "COMPLETED" => {
-                        let inst = insts.get_mut(&pik).unwrap();
-                        inst.jobs.get_mut(&job_key).unwrap().completed_at = Some(ts);
+                        if let Some(job) = inst.jobs.get_mut(&job_key) {
+                            job.completed_at = Some(ts);
+                        }
                         if tier2 {
                             let vars = variables_of(v);
                             inst.push_stimulus(ts, "jobCompleted", Some(job_type.clone()), vars);
                         }
                     }
                     "FAILED" | "ERROR_THROWN" => {
-                        insts
-                            .get_mut(&pik)
-                            .unwrap()
-                            .jobs
-                            .get_mut(&job_key)
-                            .unwrap()
-                            .failures += 1;
+                        if let Some(job) = inst.jobs.get_mut(&job_key) {
+                            job.failures += 1;
+                        }
                     }
                     _ => {}
                 }
@@ -525,8 +523,7 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = vi64(v, "processInstanceKey") else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
-                let inst = insts.get_mut(&pik).unwrap();
+                let inst = touch(&mut insts, &mut inst_order, pik);
                 let element_id = vstr(v, "elementId").unwrap_or("").to_string();
                 inst.incidents.push(IncidentOut {
                     element_id: element_id.clone(),
@@ -546,10 +543,9 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = vi64(v, "processInstanceKey") else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
                 let element_id = vstr(v, "elementId").map(|s| s.to_string());
                 let vars = variables_of(v);
-                insts.get_mut(&pik).unwrap().push_stimulus(
+                touch(&mut insts, &mut inst_order, pik).push_stimulus(
                     ts,
                     "userTaskCompleted",
                     element_id,
@@ -564,12 +560,9 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = vi64(v, "processInstanceKey") else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
                 let element_id = vstr(v, "elementId").map(|s| s.to_string());
                 let vars = variables_of(v);
-                insts
-                    .get_mut(&pik)
-                    .unwrap()
+                touch(&mut insts, &mut inst_order, pik)
                     .push_stimulus(ts, "message", element_id, vars);
             }
 
@@ -580,13 +573,10 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = vi64(v, "processInstanceKey") else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
                 let element_id = vstr(v, "targetElementId")
                     .or_else(|| vstr(v, "elementId"))
                     .map(|s| s.to_string());
-                insts
-                    .get_mut(&pik)
-                    .unwrap()
+                touch(&mut insts, &mut inst_order, pik)
                     .push_stimulus(ts, "timer", element_id, None);
             }
 
@@ -602,14 +592,11 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
                 let Some(pik) = pik else {
                     continue;
                 };
-                touch(&mut insts, &mut inst_order, pik);
                 let element_id = vstr(v, "catchEventId")
                     .or_else(|| vstr(v, "elementId"))
                     .map(|s| s.to_string());
                 let vars = variables_of(v);
-                insts
-                    .get_mut(&pik)
-                    .unwrap()
+                touch(&mut insts, &mut inst_order, pik)
                     .push_stimulus(ts, "signal", element_id, vars);
             }
 
@@ -620,7 +607,9 @@ pub fn transform(records: &[RawRecord], tier2: bool) -> Vec<TraceOut> {
     // Emit in first-seen instance order for stable output.
     let mut out: Vec<TraceOut> = Vec::with_capacity(inst_order.len());
     for pik in inst_order {
-        let inst = insts.remove(&pik).unwrap();
+        let Some(inst) = insts.remove(&pik) else {
+            continue;
+        };
         out.push(finish(pik, inst, tier2));
     }
     out
@@ -643,7 +632,9 @@ fn finish(pik: i64, mut inst: InstAcc, tier2: bool) -> TraceOut {
 
     let mut elements: Vec<ElementOut> = Vec::new();
     for k in keys {
-        let el = inst.elems.remove(&k).unwrap();
+        let Some(el) = inst.elems.remove(&k) else {
+            continue;
+        };
         if is_process_element(&el.bpmn_type) || is_routing_element(&el.bpmn_type) {
             continue;
         }
