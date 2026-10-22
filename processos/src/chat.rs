@@ -156,24 +156,23 @@ impl ChatStore {
         let mut metas: Vec<SessionMeta> = self
             .mem
             .read()
-            .ok()
-            .and_then(|m| {
-                m.get(key).map(|sessions| {
-                    sessions
-                        .iter()
-                        .map(|s| SessionMeta {
-                            id: s.id.clone(),
-                            name: s.name.clone(),
-                            created: s.created,
-                            updated: s.updated,
-                            turns: render_view(&s.messages).len(),
-                            persona: s.persona.clone(),
-                            models: s.models.clone(),
-                            origin: s.origin.clone(),
-                            imported_from: s.imported_from.clone(),
-                        })
-                        .collect()
-                })
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .map(|sessions| {
+                sessions
+                    .iter()
+                    .map(|s| SessionMeta {
+                        id: s.id.clone(),
+                        name: s.name.clone(),
+                        created: s.created,
+                        updated: s.updated,
+                        turns: render_view(&s.messages).len(),
+                        persona: s.persona.clone(),
+                        models: s.models.clone(),
+                        origin: s.origin.clone(),
+                        imported_from: s.imported_from.clone(),
+                    })
+                    .collect()
             })
             .unwrap_or_default();
         metas.sort_by_key(|b| std::cmp::Reverse(b.updated));
@@ -256,10 +255,11 @@ impl ChatStore {
     /// Load a session by id (its full transcript + stamps).
     pub fn get(&self, key: &str, session_id: &str) -> Option<ChatSession> {
         self.ensure_loaded(key);
-        self.mem.read().ok().and_then(|m| {
-            m.get(key)
-                .and_then(|s| s.iter().find(|s| s.id == session_id).cloned())
-        })
+        self.mem
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
+            .and_then(|s| s.iter().find(|s| s.id == session_id).cloned())
     }
 
     /// Replace a session's transcript + stamps, bumping `updated`. Creates the session if
@@ -431,25 +431,32 @@ impl ChatStore {
 
     /// Clear every session under a key (used by the legacy "reset" path).
     pub fn clear(&self, key: &str) {
-        if let Ok(mut mem) = self.mem.write() {
-            mem.insert(key.to_string(), Vec::new());
-        }
+        self.mem
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.to_string(), Vec::new());
         let _ = fs::remove_file(self.path_for(key));
     }
 
     fn ensure_loaded(&self, key: &str) {
+        // Recover a poisoned lock rather than skipping the load: the in-memory
+        // sessions are plain data (no invariant a panic can violate), and
+        // skipping here would let a later `create`/`save` start from an empty
+        // vector and overwrite the persisted file, losing saved history.
         if self
             .mem
             .read()
-            .map(|m| m.contains_key(key))
-            .unwrap_or(false)
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(key)
         {
             return;
         }
         let loaded = self.load_from_disk(key).unwrap_or_default();
-        if let Ok(mut mem) = self.mem.write() {
-            mem.entry(key.to_string()).or_insert(loaded);
-        }
+        self.mem
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(key.to_string())
+            .or_insert(loaded);
     }
 
     /// Load a key's sessions from disk, migrating the legacy single-conversation shape.
@@ -550,33 +557,39 @@ impl DebugStore {
     /// Replace the stored request payloads for a session (`cancel_key` = `key::session_id`),
     /// writing through to disk so they outlive a restart.
     pub fn save(&self, cancel_key: &str, requests: Vec<serde_json::Value>) {
-        if let Ok(mut m) = self.mem.write() {
-            m.insert(cancel_key.to_string(), requests.clone());
-        }
+        self.mem
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(cancel_key.to_string(), requests.clone());
         self.persist(cancel_key, &requests);
     }
 
     /// Load a session's request payloads: the in-memory copy if present, else the persisted
     /// file (cached back into memory). Empty when nothing has been captured for the session.
     pub fn load(&self, cancel_key: &str) -> Vec<serde_json::Value> {
-        if let Ok(m) = self.mem.read() {
-            if let Some(v) = m.get(cancel_key) {
-                return v.clone();
-            }
+        if let Some(v) = self
+            .mem
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(cancel_key)
+        {
+            return v.clone();
         }
         let loaded = self.load_from_disk(cancel_key).unwrap_or_default();
-        if let Ok(mut m) = self.mem.write() {
-            m.entry(cancel_key.to_string())
-                .or_insert_with(|| loaded.clone());
-        }
+        self.mem
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(cancel_key.to_string())
+            .or_insert_with(|| loaded.clone());
         loaded
     }
 
     /// Drop a session's payloads from memory and disk (called when the session is deleted).
     pub fn remove(&self, cancel_key: &str) {
-        if let Ok(mut m) = self.mem.write() {
-            m.remove(cancel_key);
-        }
+        self.mem
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(cancel_key);
         let path = self.path_for(cancel_key);
         if path.exists() {
             if let Err(e) = fs::remove_file(&path) {
@@ -1191,6 +1204,59 @@ mod tests {
     }
 
     #[test]
+    fn poisoned_lock_recovers_without_losing_persisted_sessions() {
+        // Regression for the poison-recovery hole: a panic while holding the
+        // store's lock poisons it. `ensure_loaded`/`list`/`get`/`clear` must
+        // recover the guard (like the write paths) instead of skipping — a
+        // skip would leave a persisted-but-uncached key out of the in-memory
+        // map, so a following `create` would start from an empty vector and
+        // overwrite the file with only the new session, losing saved history.
+        let dir = tmp();
+        let key = session_key("acme", "loan");
+        let old_id;
+        {
+            let store = ChatStore::open(&dir);
+            old_id = store.create(&key, Some("old".into())).id;
+        }
+
+        // Reopen so the key is persisted but NOT cached in memory.
+        let store = ChatStore::open(&dir);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = store.mem.write().unwrap_or_else(|e| e.into_inner());
+            panic!("poison the chat store lock");
+        }));
+        assert!(store.mem.is_poisoned(), "lock should now be poisoned");
+
+        // Creating a session for the uncached persisted key must load the
+        // existing history first, not overwrite it.
+        let new_session = store.create(&key, Some("new".into()));
+        let metas = store.list(&key);
+        assert_eq!(metas.len(), 2, "old and new sessions must both survive");
+        let old = store
+            .get(&key, &old_id)
+            .expect("persisted session must stay readable after poison");
+        assert_eq!(old.name, "old");
+
+        // Both sessions must be persisted: a fresh store recovers them from disk.
+        let store = ChatStore::open(&dir);
+        let metas = store.list(&key);
+        assert_eq!(metas.len(), 2, "both sessions must persist to disk");
+        assert!(store.get(&key, &old_id).is_some());
+        assert!(store.get(&key, &new_session.id).is_some());
+
+        // `clear` must also work against the poisoned lock.
+        let store = ChatStore::open(&dir);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = store.mem.write().unwrap_or_else(|e| e.into_inner());
+            panic!("poison the chat store lock");
+        }));
+        store.clear(&key);
+        assert!(store.list(&key).is_empty());
+        assert!(store.get(&key, &old_id).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn debug_store_persists_across_reopen_and_removes() {
         let dir = tmp();
         let key = session_key("acme", "loan");
@@ -1224,6 +1290,29 @@ mod tests {
         assert!(!dir
             .join(format!("debug-{}.json", "acme__loan__s123-0"))
             .exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debug_store_recovers_poisoned_lock() {
+        // Same poison-recovery class as the ChatStore: a panic while holding the
+        // lock must not wedge the debug store. `save`/`load`/`remove` recover the
+        // guard instead of silently skipping the in-memory cache.
+        let dir = tmp();
+        let key = session_key("acme", "loan");
+        let cancel_key = format!("{key}::s123-0");
+        let store = DebugStore::open(&dir);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = store.mem.write().unwrap_or_else(|e| e.into_inner());
+            panic!("poison the debug store lock");
+        }));
+        assert!(store.mem.is_poisoned(), "lock should now be poisoned");
+
+        let requests = vec![serde_json::json!({ "round": 1, "body": "x" })];
+        store.save(&cancel_key, requests.clone());
+        assert_eq!(store.load(&cancel_key), requests);
+        store.remove(&cancel_key);
+        assert!(store.load(&cancel_key).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 
