@@ -144,7 +144,9 @@ pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
     // fingerprint is computed before the lock (it does filesystem IO).
     let fingerprint = projects::datasource_fingerprint(project);
     let generation = {
-        let memo = ensure_inbox_memo().lock().unwrap();
+        let memo = ensure_inbox_memo()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if memo.hits(project, fingerprint) {
             return Ok(());
         }
@@ -155,7 +157,9 @@ pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
     // no `forget_inbox` (delete / rename / datasource reconfig) landed while
     // the `CREATE` was in flight. A bumped generation means the table we just
     // created may belong to a torn-down datasource, so we must not memo it.
-    let mut memo = ensure_inbox_memo().lock().unwrap();
+    let mut memo = ensure_inbox_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     memo.record_ensured(project, fingerprint, generation);
     Ok(())
 }
@@ -197,7 +201,9 @@ async fn run_inbox_op(project: &str, body: Json) -> Result<Json, TriggerError> {
 /// and bumps the project's generation so any in-flight [`ensure_inbox`] for the
 /// old datasource cannot resurrect a stale marker.
 pub(crate) fn forget_inbox(project: &str) {
-    let mut memo = ensure_inbox_memo().lock().unwrap();
+    let mut memo = ensure_inbox_memo()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     memo.ensured.remove(project);
     // Bump the generation so an `ensure_inbox` currently awaiting its `CREATE`
     // for the pre-teardown datasource skips its memo insert.

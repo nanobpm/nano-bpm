@@ -2027,7 +2027,7 @@ impl MarketplaceCache {
         // Phase 1: either return a fresh/shared result, or become the leader
         // and take ownership of a fresh `Flight`.
         let flight = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if !force
                 && let Some((at, v)) = &st.value
                 && at.elapsed() < self.ttl
@@ -2053,13 +2053,16 @@ impl MarketplaceCache {
                 // outcome — while a later leader completes a *second* flight.
                 #[cfg(test)]
                 self.note_waiter_wait();
-                let mut outcome = flight.outcome.lock().unwrap();
+                let mut outcome = flight.outcome.lock().unwrap_or_else(|e| e.into_inner());
                 while outcome.is_none() {
-                    outcome = flight.ready.wait(outcome).unwrap();
+                    outcome = flight
+                        .ready
+                        .wait(outcome)
+                        .unwrap_or_else(|e| e.into_inner());
                 }
                 return outcome
                     .as_ref()
-                    .expect("a settled flight always carries an outcome")
+                    .unwrap_or_else(|| panic!("a settled flight always carries an outcome"))
                     .clone();
             }
             // Become the leader for this recompute: install a fresh flight
@@ -2083,7 +2086,7 @@ impl MarketplaceCache {
         // evict a still-usable listing) and retire this flight from `in_flight`
         // so the next request starts a new one.
         let shared: ComputeResult = {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let shared = match result {
                 Ok(entries) => {
                     let arc = std::sync::Arc::new(entries);
@@ -2098,7 +2101,7 @@ impl MarketplaceCache {
 
         // Publish to *this* flight's waiters (success and failure alike): each
         // clones the shared outcome rather than starting its own `npm` fan-out.
-        let mut outcome = flight.outcome.lock().unwrap();
+        let mut outcome = flight.outcome.lock().unwrap_or_else(|e| e.into_inner());
         *outcome = Some(shared.clone());
         flight.ready.notify_all();
         shared
@@ -2378,7 +2381,9 @@ fn refresh_installed_latest(runner: &dyn NpmRunner, entries: &mut [MarketEntry],
             let updates = Arc::clone(&updates);
             scope.spawn(move || {
                 loop {
-                    let Some((idx, name)) = queue.lock().unwrap().pop_front() else {
+                    let Some((idx, name)) =
+                        queue.lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+                    else {
                         break;
                     };
                     let out =
@@ -2388,14 +2393,17 @@ fn refresh_installed_latest(runner: &dyn NpmRunner, entries: &mut [MarketEntry],
                     {
                         let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
                         if !v.is_empty() {
-                            updates.lock().unwrap().push((idx, v));
+                            updates
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push((idx, v));
                         }
                     }
                 }
             });
         }
     });
-    for (idx, latest) in updates.lock().unwrap().drain(..) {
+    for (idx, latest) in updates.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
         let e = &mut entries[idx];
         e.version = latest;
         // Re-derive the install state against the fresh `version` so

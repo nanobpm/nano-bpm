@@ -10,3 +10,10 @@ description = "Low-level serve/listener primitives shared by the nanobpm gateway
 axum = { version = "0.8" }
 # The wrapped `TcpListener`/`TcpStream` the listener accepts on.
 tokio = { version = "1", features = ["net", "time"] }
+
+[lints.clippy]
+# Epic #1357 ratchet: this crate has no production `.unwrap()`/`.expect()`
+# sites today; the deny gate keeps it that way. Test code is exempt via
+# `clippy.toml` (`allow-unwrap-in-tests` / `allow-expect-in-tests`).
+unwrap_used = "deny"
+expect_used = "deny"
