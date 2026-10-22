@@ -336,6 +336,33 @@ PR — by then the duplicate work already happened.
   `nanobpm/nano-bpm` issue, and the resulting PRs link back to it — one place
   to look, whatever repo the diff ends up in.
 
+## Creating a Worktree: `scripts/new-worktree.sh`
+
+Create agent worktrees with the script, not a bare `git worktree add`:
+
+```
+scripts/new-worktree.sh <name> [<branch>] [<base, default origin/main>]
+```
+
+It puts the worktree in `~/workspace/nanobpmn-worktrees/<name>`, runs the code
+generation the build needs (`generated/`, `generated-console/`, `stub_impls.rs`,
+the response contract), stubs `console/dist` as CI does, and seeds
+`server/target/debug` with a copy-on-write clone of the main checkout's, so
+crates.io dependencies arrive already compiled and only our path crates build.
+
+What it saves is **CPU**, not wall time or disk. A first `cargo test --workspace
+--no-run` costs ~280 CPU-seconds, setup included, against ~400 for a plain
+worktree: about 30% less, which is what matters when a dozen agents build at
+once and compete for cores. Wall time on an idle machine is about the same
+(~2.3 min); the clone adds ~20s to setup and the build saves about as much. Disk
+is barely smaller either: the clone itself is free, but our own crates' output,
+mostly their ~4.5 GB incremental cache, is written fresh in every worktree.
+
+The seed is only as warm as the main checkout. After pulling `main`, run
+`cargo test --workspace --no-run` in its `server/` so new worktrees inherit
+current dependencies. Never copy `generated/` between worktrees: copied files get
+fresh mtimes, so Make would skip regenerating them on a branch whose spec differs.
+
 ## Merging PRs
 
 This repository does **not** auto-merge pull requests. Opening a PR is *not* the
