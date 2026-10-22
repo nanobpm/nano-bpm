@@ -14,6 +14,11 @@
 //! binding lives in `token_flow`. Sibling specs (#1227, #1240) reuse `harness`
 //! with their own `TraceMapping`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 #[path = "trace_validation/harness.rs"]
 mod harness;
 #[path = "trace_validation/token_flow.rs"]

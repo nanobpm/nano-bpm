@@ -40,6 +40,11 @@
 //! interleaving-invariant milestone multiset, so the JobLease descriptor
 //! declares no `SPEC_TRACE_MODELS` and this test carries its own behaviours.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 #[path = "trace_validation/harness.rs"]
 mod harness;
 

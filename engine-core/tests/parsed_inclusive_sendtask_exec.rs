@@ -5,6 +5,11 @@
 //! executed behaviour is broken (the gap flagged at `bpmn.rs:705` / `bpmn.rs:678`
 //! and `model.rs:544`).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{bpmn::parse_bpmn, Command, Engine, Event, Value};

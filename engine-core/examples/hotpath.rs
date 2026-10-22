@@ -8,6 +8,11 @@
 //! process-instance lifecycle, so we can tell how much of the per-op critical
 //! section is engine work vs variable copying.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use std::collections::HashMap;
 use std::time::Instant;
 

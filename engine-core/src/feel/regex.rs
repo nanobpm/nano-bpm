@@ -213,6 +213,12 @@ impl Regex {
         while pos <= chars.len() {
             match self.find(&chars, pos) {
                 Some(caps) => {
+                    // Capture group 0 (the whole match) is always present
+                    // when `find` returns `Some`.
+                    #[allow(
+                        clippy::unwrap_used,
+                        reason = "group 0 is the whole match, always Some on a hit"
+                    )]
                     let (s, e) = caps[0].unwrap();
                     out.extend(&chars[pos..s]);
                     expand(replacement, &caps, &chars, &mut out);
@@ -244,6 +250,12 @@ impl Regex {
         while pos <= chars.len() {
             match self.find(&chars, pos) {
                 Some(caps) => {
+                    // Capture group 0 (the whole match) is always present
+                    // when `find` returns `Some`.
+                    #[allow(
+                        clippy::unwrap_used,
+                        reason = "group 0 is the whole match, always Some on a hit"
+                    )]
                     let (s, e) = caps[0].unwrap();
                     if e == s {
                         pos = s + 1;
@@ -269,6 +281,12 @@ impl Regex {
         while pos <= chars.len() {
             match self.find(&chars, pos) {
                 Some(caps) => {
+                    // Capture group 0 (the whole match) is always present
+                    // when `find` returns `Some`.
+                    #[allow(
+                        clippy::unwrap_used,
+                        reason = "group 0 is the whole match, always Some on a hit"
+                    )]
                     let (s, e) = caps[0].unwrap();
                     out.push(chars[s..e].iter().collect());
                     // Advance past the match; step one char on a zero-width hit.
@@ -439,7 +457,7 @@ impl Parser {
             branches.push(self.parse_concat()?);
         }
         if branches.len() == 1 {
-            Some(branches.pop().unwrap())
+            branches.pop()
         } else {
             Some(Ast::Alt(branches))
         }
@@ -456,7 +474,7 @@ impl Parser {
         if items.is_empty() {
             Some(Ast::Empty)
         } else if items.len() == 1 {
-            Some(items.pop().unwrap())
+            items.pop()
         } else {
             Some(Ast::Concat(items))
         }

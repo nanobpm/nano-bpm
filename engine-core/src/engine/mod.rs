@@ -3951,6 +3951,7 @@ impl Engine {
                 //        that kind rather than in `active`.
                 //    Zeebe rejects several of these as "not supported yet";
                 //    reproducing the rejection is parity.
+                #[allow(clippy::expect_used, reason = "instance existence checked above")]
                 let instance = self
                     .state
                     .instances
@@ -4120,6 +4121,7 @@ impl Engine {
                 //     is the only such element today. Only *open* joins are
                 //     guarded: a join with no arrivals yet has no durable count to
                 //     re-interpret, so it may safely adopt the target's arity.
+                #[allow(clippy::expect_used, reason = "instance existence checked above")]
                 let instance = self
                     .state
                     .instances
@@ -4135,6 +4137,10 @@ impl Engine {
                     if !is_parallel_join && !is_inclusive_join {
                         continue;
                     }
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "step 5 guarantees an open join is mapped"
+                    )]
                     let tgt = mapped
                         .get(&src)
                         .expect("an open join is active, so step 5 guarantees it is mapped");
@@ -5834,6 +5840,10 @@ impl Engine {
                     .map(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask)
                     .unwrap_or(false);
                 if declarative_adhoc {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "declarative_adhoc implies adhoc_def is Some"
+                    )]
                     let def = adhoc_def
                         .as_ref()
                         .expect("declarative_adhoc implies adhoc_def is Some");
@@ -6788,6 +6798,10 @@ impl Engine {
                     .map(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask)
                     .unwrap_or(false);
                 if declarative_adhoc {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "declarative_adhoc implies adhoc_def is Some"
+                    )]
                     let def = adhoc_def
                         .as_ref()
                         .expect("declarative_adhoc implies adhoc_def is Some");
@@ -11298,6 +11312,10 @@ impl Engine {
         index: usize,
         scope: Key,
     ) -> (Vec<Event>, Step) {
+        #[allow(
+            clippy::expect_used,
+            reason = "a taken flow is an outgoing flow of `from`"
+        )]
         let (to, flow) = self
             .process_of_instance(instance_key)
             .and_then(|p| p.incoming_flow(from, index))

@@ -218,8 +218,11 @@ pub fn unescape(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'&' {
-            // Copy the current UTF-8 character wholesale.
-            let ch = s[i..].chars().next().unwrap();
+            // Copy the current UTF-8 character wholesale. `i` is always on a
+            // char boundary (we advance by `len_utf8`), so there is a next char.
+            let Some(ch) = s[i..].chars().next() else {
+                break;
+            };
             out.push(ch);
             i += ch.len_utf8();
             continue;
@@ -372,6 +375,12 @@ pub fn parse_tree(xml: &str) -> Result<Element, XmlError> {
                     text: String::new(),
                 };
                 if self_closing {
+                    // The sentinel root (pushed before the loop) is never popped,
+                    // so the stack always has at least one element here.
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "sentinel root keeps the stack non-empty"
+                    )]
                     stack
                         .last_mut()
                         .expect("stack never empties")
@@ -388,9 +397,19 @@ pub fn parse_tree(xml: &str) -> Result<Element, XmlError> {
                 if stack.is_empty() {
                     return Err(XmlError("unbalanced end tag".into()));
                 }
+                // The `is_empty` guard above proves there is a parent to push into.
+                #[allow(
+                    clippy::unwrap_used,
+                    reason = "the is_empty guard above proves the stack is non-empty"
+                )]
                 stack.last_mut().unwrap().children.push(finished);
             }
             Token::Text(t) => {
+                // The sentinel root keeps the stack non-empty for stray text too.
+                #[allow(
+                    clippy::unwrap_used,
+                    reason = "sentinel root keeps the stack non-empty"
+                )]
                 stack.last_mut().unwrap().text.push_str(&t);
             }
         }
@@ -402,7 +421,10 @@ pub fn parse_tree(xml: &str) -> Result<Element, XmlError> {
         return Err(XmlError("unbalanced start tag".into()));
     }
     match root.children.len() {
-        1 => Ok(root.children.pop().unwrap()),
+        1 => match root.children.pop() {
+            Some(child) => Ok(child),
+            None => Err(XmlError("no root element".into())),
+        },
         0 => Err(XmlError("no root element".into())),
         _ => Err(XmlError("multiple root elements".into())),
     }

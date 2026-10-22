@@ -76,7 +76,8 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
         Node::Neg(inner) => {
             let v = eval_node(inner, ctx)?;
             match v {
-                FeelVal::Int(_) | FeelVal::Double(_) => Ok(FeelVal::num(-v.as_f64().unwrap())),
+                FeelVal::Int(i) => Ok(FeelVal::num(-(i as f64))),
+                FeelVal::Double(d) => Ok(FeelVal::num(-d)),
                 FeelVal::YmDur(d) => Ok(FeelVal::YmDur(YmDuration::new(-d.months))),
                 FeelVal::DtDur(d) => Ok(FeelVal::DtDur(DtDuration::from_nanos(-d.nanos))),
                 other => Err(FeelError(format!("cannot negate {}", other.type_name()))),
@@ -104,7 +105,9 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
             for (key, value_node) in entries {
                 let v = eval_node(value_node, ctx)?;
                 map.insert(key.clone(), v.clone());
-                ctx.scopes.last_mut().unwrap().insert(key.clone(), v);
+                if let Some(scope) = ctx.scopes.last_mut() {
+                    scope.insert(key.clone(), v);
+                }
             }
             ctx.pop();
             Ok(FeelVal::Context(map))
@@ -524,10 +527,10 @@ const NANOS_PER_SEC: i128 = 1_000_000_000;
 
 fn add(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
     use FeelVal::*;
+    if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
+        return Ok(FeelVal::num(a + b));
+    }
     match (l, r) {
-        (a, b) if a.is_number() && b.is_number() => {
-            Ok(FeelVal::num(a.as_f64().unwrap() + b.as_f64().unwrap()))
-        }
         (Str(a), Str(b)) => Ok(Str(format!("{a}{b}"))),
         // date/datetime + durations (commutative)
         (Date(d), YmDur(y)) | (YmDur(y), Date(d)) => Ok(FeelVal::Date(d.add_months(y.months))),
@@ -557,10 +560,10 @@ fn add(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
 
 fn sub(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
     use FeelVal::*;
+    if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
+        return Ok(FeelVal::num(a - b));
+    }
     match (l, r) {
-        (a, b) if a.is_number() && b.is_number() => {
-            Ok(FeelVal::num(a.as_f64().unwrap() - b.as_f64().unwrap()))
-        }
         (Date(a), Date(b)) => Ok(FeelVal::DtDur(DtDuration::from_seconds(
             (a.epoch_day() - b.epoch_day()) * 86_400,
         ))),
@@ -599,31 +602,36 @@ fn sub(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
 
 fn mul(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
     use FeelVal::*;
+    if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
+        return Ok(FeelVal::num(a * b));
+    }
     match (l, r) {
-        (a, b) if a.is_number() && b.is_number() => {
-            Ok(FeelVal::num(a.as_f64().unwrap() * b.as_f64().unwrap()))
-        }
-        (YmDur(d), n) | (n, YmDur(d)) if n.is_number() => Ok(FeelVal::YmDur(YmDuration::new(
-            (d.months as f64 * n.as_f64().unwrap()).round() as i64,
-        ))),
-        (DtDur(d), n) | (n, DtDur(d)) if n.is_number() => Ok(FeelVal::DtDur(
-            DtDuration::from_nanos((d.nanos as f64 * n.as_f64().unwrap()).round() as i128),
-        )),
+        (YmDur(d), other) | (other, YmDur(d)) => match other.as_f64() {
+            Some(n) => Ok(FeelVal::YmDur(YmDuration::new(
+                (d.months as f64 * n).round() as i64,
+            ))),
+            None => Err(type_err("*", l, r)),
+        },
+        (DtDur(d), other) | (other, DtDur(d)) => match other.as_f64() {
+            Some(n) => Ok(FeelVal::DtDur(DtDuration::from_nanos(
+                (d.nanos as f64 * n).round() as i128,
+            ))),
+            None => Err(type_err("*", l, r)),
+        },
         _ => Err(type_err("*", l, r)),
     }
 }
 
 fn div(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
     use FeelVal::*;
+    if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
+        return if b == 0.0 {
+            Ok(FeelVal::Null)
+        } else {
+            Ok(FeelVal::num(a / b))
+        };
+    }
     match (l, r) {
-        (a, b) if a.is_number() && b.is_number() => {
-            let d = b.as_f64().unwrap();
-            if d == 0.0 {
-                Ok(FeelVal::Null)
-            } else {
-                Ok(FeelVal::num(a.as_f64().unwrap() / d))
-            }
-        }
         (YmDur(a), YmDur(b)) => {
             if b.months == 0 {
                 Ok(FeelVal::Null)
@@ -638,26 +646,20 @@ fn div(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
                 Ok(FeelVal::num(a.nanos as f64 / b.nanos as f64))
             }
         }
-        (YmDur(d), n) if n.is_number() => {
-            let x = n.as_f64().unwrap();
-            if x == 0.0 {
-                Ok(FeelVal::Null)
-            } else {
-                Ok(FeelVal::YmDur(YmDuration::new(
-                    (d.months as f64 / x).round() as i64,
-                )))
-            }
-        }
-        (DtDur(d), n) if n.is_number() => {
-            let x = n.as_f64().unwrap();
-            if x == 0.0 {
-                Ok(FeelVal::Null)
-            } else {
-                Ok(FeelVal::DtDur(DtDuration::from_nanos(
-                    (d.nanos as f64 / x).round() as i128,
-                )))
-            }
-        }
+        (YmDur(d), other) => match other.as_f64() {
+            Some(x) if x != 0.0 => Ok(FeelVal::YmDur(YmDuration::new(
+                (d.months as f64 / x).round() as i64,
+            ))),
+            Some(_) => Ok(FeelVal::Null),
+            None => Err(type_err("/", l, r)),
+        },
+        (DtDur(d), other) => match other.as_f64() {
+            Some(x) if x != 0.0 => Ok(FeelVal::DtDur(DtDuration::from_nanos(
+                (d.nanos as f64 / x).round() as i128,
+            ))),
+            Some(_) => Ok(FeelVal::Null),
+            None => Err(type_err("/", l, r)),
+        },
         _ => Err(type_err("/", l, r)),
     }
 }
@@ -700,10 +702,10 @@ pub fn feel_eq(l: &FeelVal, r: &FeelVal) -> bool {
 
 pub fn compare(l: &FeelVal, r: &FeelVal) -> Option<Ordering> {
     use FeelVal::*;
+    if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
+        return a.partial_cmp(&b);
+    }
     match (l, r) {
-        (a, b) if a.is_number() && b.is_number() => {
-            a.as_f64().unwrap().partial_cmp(&b.as_f64().unwrap())
-        }
         (Str(a), Str(b)) => Some(a.cmp(b)),
         (Date(a), Date(b)) => Some(a.cmp(b)),
         (Time(a), Time(b)) => Some(a.cmp(b)),

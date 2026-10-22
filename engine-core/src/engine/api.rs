@@ -202,6 +202,10 @@ impl Engine {
     }
 
     /// Activate any job kind with explicit worker leasing options.
+    #[allow(
+        clippy::expect_used,
+        reason = "ActivateJobs is an internal command that cannot fail"
+    )]
     pub fn activate_jobs_with_options(
         &mut self,
         job_type: impl Into<String>,
@@ -379,12 +383,20 @@ impl Engine {
     /// drives this periodically; the engine never reads a clock. Returns the
     /// [`Event::JobLockExpired`] events produced (empty when nothing was due), so
     /// the host can wake job dispatch immediately rather than waiting for a tick.
+    #[allow(
+        clippy::expect_used,
+        reason = "ExpireJobs is an internal command that cannot fail"
+    )]
     pub fn expire_jobs(&mut self, now: u64) -> Vec<Event> {
         self.apply_command_at(Command::ExpireJobs { now }, now)
             .expect("ExpireJobs never fails")
     }
 
     /// Expire only durable activations, or only leader-local soft locks.
+    #[allow(
+        clippy::expect_used,
+        reason = "ExpireJobsByDurability is an internal command that cannot fail"
+    )]
     pub fn expire_jobs_by_durability(&mut self, now: u64, durable: bool) -> Vec<Event> {
         self.apply_command_at(Command::ExpireJobsByDurability { now, durable }, now)
             .expect("ExpireJobsByDurability never fails")
@@ -426,6 +438,10 @@ impl Engine {
     /// the token parked on each. Like [`Engine::expire_jobs`], the host drives
     /// this periodically; the engine never reads a clock. Returns the events the
     /// tick produced (empty when nothing was due).
+    #[allow(
+        clippy::expect_used,
+        reason = "TriggerTimers is an internal command that cannot fail"
+    )]
     pub fn trigger_timers(&mut self, now: u64) -> Vec<Event> {
         self.apply_command_at(Command::TriggerTimers { now }, now)
             .expect("TriggerTimers never fails")
@@ -444,6 +460,10 @@ impl Engine {
     /// heading [`Event::MessagePublished`] (always) plus an
     /// [`Event::MessageCorrelated`] per correlated subscription. Mirrors applying
     /// a [`Command::CorrelateMessage`].
+    #[allow(
+        clippy::expect_used,
+        reason = "CorrelateMessage is an internal command that cannot fail"
+    )]
     pub fn correlate_message(
         &mut self,
         message_name: impl Into<String>,
@@ -464,6 +484,10 @@ impl Engine {
     /// [`Event::SignalBroadcast`] (always) plus an [`Event::SignalCorrelated`]
     /// per correlated subscription. Mirrors applying a
     /// [`Command::BroadcastSignal`].
+    #[allow(
+        clippy::expect_used,
+        reason = "BroadcastSignal is an internal command that cannot fail"
+    )]
     pub fn broadcast_signal(
         &mut self,
         signal_name: impl Into<String>,
@@ -511,6 +535,13 @@ impl Engine {
     /// returns complete the job (by key); returning `None` leaves the job locked.
     /// Returns the number of jobs the handler completed. Runs entirely on the
     /// single-writer thread, so there is no concurrency to reason about.
+    ///
+    /// Completing one batch entry can still cancel a later one — a terminate end
+    /// or a parallel multi-instance completion condition kills sibling tokens and
+    /// cancels their jobs — so an activated entry is **not** guaranteed to remain
+    /// completable. Each entry is re-validated before dispatch and its completion
+    /// is handled (not asserted): a no-longer-active entry is skipped, never
+    /// panicked on, and is not counted as completed.
     pub fn poll_jobs<F>(
         &mut self,
         job_type: impl Into<String>,
@@ -526,10 +557,24 @@ impl Engine {
         let jobs = self.activate_jobs(job_type, worker, max_jobs, timeout, now);
         let mut completed = 0;
         for job in jobs {
+            // A prior completion in this same batch may have cancelled this entry
+            // (terminate end / MI completion condition), so re-check it is still
+            // activated before dispatching the handler.
+            if !self
+                .job(job.key)
+                .is_some_and(|j| j.state == state::JobState::Activated)
+            {
+                continue;
+            }
             if let Some(variables) = handler(&job) {
-                self.apply_command(Command::complete_job_with(job.key, variables))
-                    .expect("activated job can be completed");
-                completed += 1;
+                // Completion is runtime-fallible within a batch; skip (don't
+                // count, don't panic) an entry that is no longer completable.
+                if self
+                    .apply_command(Command::complete_job_with(job.key, variables))
+                    .is_ok()
+                {
+                    completed += 1;
+                }
             }
         }
         completed
