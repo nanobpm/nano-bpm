@@ -20,6 +20,11 @@
 //! verdicts were captured from Zeebe, and the Nano↔Zeebe reject-category mapping
 //! table (whose single source of truth is [`NANO_ZEEBE_MAPPING`] below).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

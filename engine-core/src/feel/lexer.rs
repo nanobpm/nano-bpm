@@ -138,12 +138,15 @@ pub fn tokenize(src: &str) -> Result<Vec<Tok>, FeelError> {
             }
             '@' => {
                 let q = chars.get(i + 1).copied();
-                if q == Some('"') || q == Some('\'') {
-                    let (s, next) = lex_string(&chars, i + 1, q.unwrap())?;
-                    tokens.push(Tok::At(s));
-                    i = next;
-                } else {
-                    return Err(FeelError("expected a string after '@'".to_string()));
+                match q {
+                    Some(qc @ ('"' | '\'')) => {
+                        let (s, next) = lex_string(&chars, i + 1, qc)?;
+                        tokens.push(Tok::At(s));
+                        i = next;
+                    }
+                    _ => {
+                        return Err(FeelError("expected a string after '@'".to_string()));
+                    }
                 }
             }
             '"' | '\'' => {

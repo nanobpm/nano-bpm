@@ -202,6 +202,10 @@ impl Engine {
     }
 
     /// Activate any job kind with explicit worker leasing options.
+    #[allow(
+        clippy::expect_used,
+        reason = "ActivateJobs is an internal command that cannot fail"
+    )]
     pub fn activate_jobs_with_options(
         &mut self,
         job_type: impl Into<String>,
@@ -379,12 +383,20 @@ impl Engine {
     /// drives this periodically; the engine never reads a clock. Returns the
     /// [`Event::JobLockExpired`] events produced (empty when nothing was due), so
     /// the host can wake job dispatch immediately rather than waiting for a tick.
+    #[allow(
+        clippy::expect_used,
+        reason = "ExpireJobs is an internal command that cannot fail"
+    )]
     pub fn expire_jobs(&mut self, now: u64) -> Vec<Event> {
         self.apply_command_at(Command::ExpireJobs { now }, now)
             .expect("ExpireJobs never fails")
     }
 
     /// Expire only durable activations, or only leader-local soft locks.
+    #[allow(
+        clippy::expect_used,
+        reason = "ExpireJobsByDurability is an internal command that cannot fail"
+    )]
     pub fn expire_jobs_by_durability(&mut self, now: u64, durable: bool) -> Vec<Event> {
         self.apply_command_at(Command::ExpireJobsByDurability { now, durable }, now)
             .expect("ExpireJobsByDurability never fails")
@@ -426,6 +438,10 @@ impl Engine {
     /// the token parked on each. Like [`Engine::expire_jobs`], the host drives
     /// this periodically; the engine never reads a clock. Returns the events the
     /// tick produced (empty when nothing was due).
+    #[allow(
+        clippy::expect_used,
+        reason = "TriggerTimers is an internal command that cannot fail"
+    )]
     pub fn trigger_timers(&mut self, now: u64) -> Vec<Event> {
         self.apply_command_at(Command::TriggerTimers { now }, now)
             .expect("TriggerTimers never fails")
@@ -444,6 +460,10 @@ impl Engine {
     /// heading [`Event::MessagePublished`] (always) plus an
     /// [`Event::MessageCorrelated`] per correlated subscription. Mirrors applying
     /// a [`Command::CorrelateMessage`].
+    #[allow(
+        clippy::expect_used,
+        reason = "CorrelateMessage is an internal command that cannot fail"
+    )]
     pub fn correlate_message(
         &mut self,
         message_name: impl Into<String>,
@@ -464,6 +484,10 @@ impl Engine {
     /// [`Event::SignalBroadcast`] (always) plus an [`Event::SignalCorrelated`]
     /// per correlated subscription. Mirrors applying a
     /// [`Command::BroadcastSignal`].
+    #[allow(
+        clippy::expect_used,
+        reason = "BroadcastSignal is an internal command that cannot fail"
+    )]
     pub fn broadcast_signal(
         &mut self,
         signal_name: impl Into<String>,
@@ -511,6 +535,10 @@ impl Engine {
     /// returns complete the job (by key); returning `None` leaves the job locked.
     /// Returns the number of jobs the handler completed. Runs entirely on the
     /// single-writer thread, so there is no concurrency to reason about.
+    #[allow(
+        clippy::expect_used,
+        reason = "completing a just-activated job cannot fail"
+    )]
     pub fn poll_jobs<F>(
         &mut self,
         job_type: impl Into<String>,

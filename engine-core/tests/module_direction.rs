@@ -52,6 +52,11 @@
 //! a newly added module can never be an unlisted first segment that silently
 //! escapes the guard before its layer is assigned.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

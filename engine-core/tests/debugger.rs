@@ -7,6 +7,11 @@
 //! rather than a divergent copy — the whole point of driving the same `run_with`
 //! loop with a different `StepDriver`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use nanobpmn_engine_core::{BreakCondition, Command, Engine, Event, ProcessBuilder};
 
 /// A two-service-task process: start -> reserve(inventory) -> ship(logistics) -> end.
