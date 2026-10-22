@@ -1432,7 +1432,10 @@ async fn handle_client_frame(
                 corr,
                 status: 200,
                 body: Some(serde_json::json!({
-                    "messageKey": message_key.to_string(),
+                    // `None` only when this peer owns no target partition, which
+                    // the fan-out never targets; serialised as JSON null so the
+                    // caller falls back rather than reading a bogus key.
+                    "messageKey": message_key.map(|k| k.to_string()),
                     "correlatedInstanceKey": instance.map(|k| k.to_string()),
                 })),
             });
@@ -3456,6 +3459,102 @@ mod registry_tests {
             "both live subscribers are reachable under rotation: {seen:?}"
         );
     }
+
+    #[test]
+    fn registry_accessors_recover_from_poisoned_locks() {
+        // Epic #1357: a panic while holding any registry lock (`conns`,
+        // `by_type`, `rr`, or a connection's `subs`) poisons it. Every accessor
+        // now recovers the inner guard instead of `.expect("registry poisoned")`,
+        // so one unlucky panic cannot cascade a crash into dispatch, the
+        // worker-count snapshot, the consumer listing, or teardown. The registry
+        // and its connections are locally-owned fixtures, so poisoning them here
+        // never touches a process-global or a sibling test.
+        fn poison_in_thread<F>(f: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            assert!(
+                std::thread::spawn(f).join().is_err(),
+                "the closure must panic while holding the lock to poison it"
+            );
+        }
+
+        let registry = Registry::new();
+        let conn = test_connection(7);
+        registry.register(conn.clone());
+        registry.index("pay", 7);
+        // A credited subscription so the recovered dispatch plan yields a target.
+        conn.subs.lock().unwrap().insert(
+            "pay".to_string(),
+            Arc::new(Subscription {
+                worker: "w".to_string(),
+                with_lease: false,
+                timeout: 0,
+                fetch_variable: None,
+                credits: AtomicI64::new(5),
+            }),
+        );
+
+        // Poison every lock the accessors touch.
+        {
+            let r = Arc::clone(&registry);
+            poison_in_thread(move || {
+                let _g = r.conns.lock().unwrap();
+                panic!("poison conns");
+            });
+        }
+        {
+            let r = Arc::clone(&registry);
+            poison_in_thread(move || {
+                let _g = r.by_type.lock().unwrap();
+                panic!("poison by_type");
+            });
+        }
+        {
+            let r = Arc::clone(&registry);
+            poison_in_thread(move || {
+                let _g = r.rr.lock().unwrap();
+                panic!("poison rr");
+            });
+        }
+        {
+            let c = Arc::clone(&conn);
+            poison_in_thread(move || {
+                let _g = c.subs.lock().unwrap();
+                panic!("poison subs");
+            });
+        }
+        assert!(registry.conns.is_poisoned(), "conns is poisoned");
+        assert!(registry.by_type.is_poisoned(), "by_type is poisoned");
+        assert!(registry.rr.is_poisoned(), "rr is poisoned");
+        assert!(conn.subs.is_poisoned(), "subs is poisoned");
+
+        // Every accessor recovers rather than panicking on the poison.
+        assert_eq!(
+            registry.workers_per_type().get("pay"),
+            Some(&1),
+            "workers_per_type recovers the poisoned by_type lock"
+        );
+        assert_eq!(
+            registry.all_connections().len(),
+            1,
+            "all_connections recovers the poisoned conns lock"
+        );
+        let plan = registry.dispatch_plan(0);
+        assert!(
+            plan.iter()
+                .any(|(jt, targets)| jt == "pay" && !targets.is_empty()),
+            "dispatch_plan recovers conns/by_type/rr/subs and still yields a target"
+        );
+        assert!(
+            registry.unregister(7),
+            "unregister recovers conns/by_type/rr and still removes the connection"
+        );
+        assert!(
+            registry.all_connections().is_empty(),
+            "the connection is gone after the recovered unregister"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3611,6 +3710,63 @@ mod peer_backlog_freshness_tests {
         );
         // housekeeping so the process-global cache doesn't leak across tests.
         peer_backlog_cache().lock().unwrap().remove(&node);
+    }
+
+    /// Lock-poison recovery (epic #1357): a panic while holding the
+    /// `peer_backlog_cache` mutex poisons it. `record_peer_backlog` /
+    /// `read_peer_backlog_within` now recover the inner guard instead of
+    /// `.expect(...)`, so one unlucky panic cannot cascade into every Stage-2
+    /// weighting decision that samples a peer's backlog.
+    ///
+    /// Like `REST_POLLS`, `peer_backlog_cache` is a process-global static and
+    /// `cargo test --workspace` runs this binary's tests on many threads in ONE
+    /// process, where the sibling freshness tests above lock it with `.unwrap()`.
+    /// Poisoning it in-process would flake them during the poison window, so the
+    /// poison scenario runs in a freshly re-exec'd CHILD process whose poisoned
+    /// static dies with it.
+    #[test]
+    fn peer_backlog_cache_recovers_from_a_poisoned_lock() {
+        const CHILD_ENV: &str = "NANO_PEER_BACKLOG_POISON_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // CHILD: poison the real static, then prove the real accessors recover
+            // instead of panicking. Isolated to this process.
+            let poisoned = std::panic::catch_unwind(|| {
+                let _guard = peer_backlog_cache()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                panic!("intentionally poison peer_backlog_cache");
+            });
+            assert!(poisoned.is_err(), "the panicking closure must unwind");
+            assert!(
+                peer_backlog_cache().is_poisoned(),
+                "peer_backlog_cache must now be poisoned"
+            );
+            // The real assertions: both accessors return instead of panicking.
+            record_peer_backlog(91_001, 777);
+            assert_eq!(
+                read_peer_backlog_within(91_001, Duration::from_secs(3600)),
+                Some(777),
+                "record/read recover the poisoned peer-backlog lock"
+            );
+            return;
+        }
+
+        // PARENT: re-exec just this test in a child process with the gate set.
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "falcon::peer_backlog_freshness_tests::peer_backlog_cache_recovers_from_a_poisoned_lock",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn peer-backlog poison-recovery child test process");
+        assert!(
+            status.success(),
+            "the isolated child must exercise poison recovery without panicking"
+        );
     }
 }
 

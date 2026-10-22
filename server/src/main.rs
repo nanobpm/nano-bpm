@@ -372,62 +372,66 @@ impl ClusterVariableStore {
             .cloned()
     }
 
-    /// Creates a new variable. Returns `false` (creating nothing) when one
-    /// already exists for `(tenant, name)` — the caller maps that to 409.
+    /// Creates a new variable, returning a snapshot of the stored record taken
+    /// while the write lock is still held. Returns `None` (creating nothing)
+    /// when one already exists for `(tenant, name)` — the caller maps that to
+    /// 409. Returning the snapshot (rather than a separate post-mutation `get`)
+    /// is race-free: a concurrent DELETE cannot make the caller's response
+    /// construction observe a missing record.
     fn create(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         metadata: ClusterVariableMetadata,
-    ) -> bool {
+    ) -> Option<StoredClusterVariable> {
         let key = (tenant.map(str::to_string), name.to_string());
-        {
+        let stored = {
             let mut e = self.write();
             if e.by_key.contains_key(&key) {
-                return false;
+                return None;
             }
             e.next_id += 1;
             let id = e.next_id;
-            e.by_key.insert(
-                key,
-                StoredClusterVariable {
-                    id,
-                    name: name.to_string(),
-                    tenant_id: tenant.map(str::to_string),
-                    value,
-                    metadata,
-                },
-            );
-        }
+            let stored = StoredClusterVariable {
+                id,
+                name: name.to_string(),
+                tenant_id: tenant.map(str::to_string),
+                value,
+                metadata,
+            };
+            e.by_key.insert(key, stored.clone());
+            stored
+        };
         self.sync_runtime();
-        true
+        Some(stored)
     }
 
     /// Updates an existing variable's value and metadata in place, preserving
-    /// its id. The metadata bag is REPLACED, not merged (Camunda: an update that
-    /// omits it clears it). Returns `false` when none exists for `(tenant, name)`
-    /// — the caller maps that to 404.
+    /// its id, and returns a snapshot of the updated record taken while the
+    /// write lock is still held. The metadata bag is REPLACED, not merged
+    /// (Camunda: an update that omits it clears it). Returns `None` when none
+    /// exists for `(tenant, name)` — the caller maps that to 404. Returning the
+    /// snapshot (rather than a separate post-mutation `get`) is race-free: a
+    /// concurrent DELETE cannot make the caller's response construction observe
+    /// a missing record.
     fn update(
         &self,
         tenant: Option<&str>,
         name: &str,
         value: Value,
         metadata: ClusterVariableMetadata,
-    ) -> bool {
+    ) -> Option<StoredClusterVariable> {
         let key = (tenant.map(str::to_string), name.to_string());
-        {
+        let stored = {
             let mut e = self.write();
-            match e.by_key.get_mut(&key) {
-                Some(entry) => {
-                    entry.value = value;
-                    entry.metadata = metadata;
-                }
-                None => return false,
-            }
-        }
+            let entry = e.by_key.get_mut(&key)?;
+            entry.value = value;
+            entry.metadata = metadata;
+            entry.clone()
+        };
         self.sync_runtime();
-        true
+        Some(stored)
     }
 
     /// Deletes a variable. Returns `false` when none exists — the caller maps
@@ -572,10 +576,6 @@ fn reject_unsupported_cluster_variable_kind(
 impl ServerImpl {
     /// POST /v2/cluster-variables/global — create a global-scoped cluster
     /// variable. 200 with the created resource, or 409 when one already exists.
-    #[allow(
-        clippy::expect_used,
-        reason = "invariant by construction: the cluster variable was just created in this handler above, so the store lookup is Some"
-    )]
     async fn create_global_cluster_variable_impl(
         &self,
         body: &models::CreateClusterVariableRequest,
@@ -589,14 +589,10 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if self
+        if let Some(stored) = self
             .cluster_variables
             .create(None, &body.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(None, &body.name)
-                .expect("just created");
             Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
             ))
@@ -617,10 +613,6 @@ impl ServerImpl {
     /// POST /v2/cluster-variables/tenants/{tenantId} — create a tenant-scoped
     /// cluster variable. 200 with the created resource, or 409 when one already
     /// exists for that tenant.
-    #[allow(
-        clippy::expect_used,
-        reason = "invariant by construction: the cluster variable was just created in this handler above, so the store lookup is Some"
-    )]
     async fn create_tenant_cluster_variable_impl(
         &self,
         path_params: &models::CreateTenantClusterVariablePathParams,
@@ -636,14 +628,10 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if self
-            .cluster_variables
-            .create(Some(tenant), &body.name, value, metadata)
+        if let Some(stored) =
+            self.cluster_variables
+                .create(Some(tenant), &body.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(Some(tenant), &body.name)
-                .expect("just created");
             Ok(Resp::Status200_ClusterVariableCreated(
                 cluster_variable_result(&stored),
             ))
@@ -665,10 +653,6 @@ impl ServerImpl {
 
     /// PUT /v2/cluster-variables/global/{name} — update a global-scoped cluster
     /// variable's value. 200 with the updated resource, or 404 when absent.
-    #[allow(
-        clippy::expect_used,
-        reason = "invariant by construction: the cluster variable was just updated in this handler above, so the store lookup is Some"
-    )]
     async fn update_global_cluster_variable_impl(
         &self,
         path_params: &models::UpdateGlobalClusterVariablePathParams,
@@ -680,14 +664,10 @@ impl ServerImpl {
             Err(p) => return Ok(Resp::Status400_TheProvidedDataIsNotValid(p)),
         };
         let value = json_to_value(&body.value.0);
-        if self
-            .cluster_variables
-            .update(None, &path_params.name, value, metadata)
+        if let Some(stored) =
+            self.cluster_variables
+                .update(None, &path_params.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(None, &path_params.name)
-                .expect("just updated");
             Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
             ))
@@ -703,10 +683,6 @@ impl ServerImpl {
     /// PUT /v2/cluster-variables/tenants/{tenantId}/{name} — update a
     /// tenant-scoped cluster variable's value. 200 with the updated resource, or
     /// 404 when absent for that tenant.
-    #[allow(
-        clippy::expect_used,
-        reason = "invariant by construction: the cluster variable was just updated in this handler above, so the store lookup is Some"
-    )]
     async fn update_tenant_cluster_variable_impl(
         &self,
         path_params: &models::UpdateTenantClusterVariablePathParams,
@@ -719,14 +695,10 @@ impl ServerImpl {
         };
         let tenant = path_params.tenant_id.as_str();
         let value = json_to_value(&body.value.0);
-        if self
-            .cluster_variables
-            .update(Some(tenant), &path_params.name, value, metadata)
+        if let Some(stored) =
+            self.cluster_variables
+                .update(Some(tenant), &path_params.name, value, metadata)
         {
-            let stored = self
-                .cluster_variables
-                .get(Some(tenant), &path_params.name)
-                .expect("just updated");
             Ok(Resp::Status200_ClusterVariableUpdatedSuccessfully(
                 cluster_variable_result(&stored),
             ))
@@ -920,19 +892,25 @@ mod cluster_variable_tests {
     #[test]
     fn create_rejects_a_duplicate_scope_and_name() {
         let s = store();
-        assert!(s.create(
-            None,
-            "region",
-            val(json!("EMEA")),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "region",
+                val(json!("EMEA")),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
         // Same (scope, name) again -> false, which the handler maps to 409.
-        assert!(!s.create(
-            None,
-            "region",
-            val(json!("APAC")),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "region",
+                val(json!("APAC")),
+                ClusterVariableMetadata::new()
+            )
+            .is_none()
+        );
         // The rejected create left the stored value untouched.
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -941,20 +919,77 @@ mod cluster_variable_tests {
     }
 
     #[test]
+    fn create_and_update_return_a_race_free_snapshot() {
+        // Regression: the create/update handlers used to re-`get` the record
+        // after releasing the mutation lock, so a concurrent DELETE between the
+        // mutation and the lookup made `expect("just created"/"just updated")`
+        // panic. `create`/`update` now return the stored snapshot taken while
+        // the write lock is still held, so the response never depends on a
+        // second lookup that a delete could lose.
+        let s = store();
+
+        let created = s
+            .create(
+                Some("acme"),
+                "region",
+                val(json!("EMEA")),
+                ClusterVariableMetadata::new(),
+            )
+            .expect("create of a fresh (scope, name) returns the stored snapshot");
+        assert_eq!(created.name, "region");
+        assert_eq!(created.tenant_id.as_deref(), Some("acme"));
+        assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
+
+        // A delete landing right after the mutation cannot invalidate the
+        // snapshot already returned to the handler.
+        assert!(s.delete(Some("acme"), "region"));
+        assert!(s.get(Some("acme"), "region").is_none());
+        assert_eq!(cluster_variable_value_string(&created.value), "\"EMEA\"");
+
+        // Update returns its own post-mutation snapshot the same way.
+        assert!(
+            s.create(
+                None,
+                "flag",
+                val(json!(false)),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
+        let updated = s
+            .update(
+                None,
+                "flag",
+                val(json!(true)),
+                ClusterVariableMetadata::new(),
+            )
+            .expect("update of an existing (scope, name) returns the stored snapshot");
+        assert_eq!(cluster_variable_value_string(&updated.value), "true");
+        assert!(s.delete(None, "flag"));
+        assert_eq!(cluster_variable_value_string(&updated.value), "true");
+    }
+
+    #[test]
     fn global_and_tenant_scopes_are_isolated() {
         let s = store();
-        assert!(s.create(
-            None,
-            "region",
-            val(json!("global")),
-            ClusterVariableMetadata::new()
-        ));
-        assert!(s.create(
-            Some("acme"),
-            "region",
-            val(json!("acme")),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "region",
+                val(json!("global")),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
+        assert!(
+            s.create(
+                Some("acme"),
+                "region",
+                val(json!("acme")),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
         assert_eq!(s.all().len(), 2);
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "region").unwrap().value),
@@ -972,9 +1007,18 @@ mod cluster_variable_tests {
     fn update_requires_an_existing_entry() {
         let s = store();
         // Update of a missing var -> false, which the handler maps to 404.
-        assert!(!s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
-        assert!(s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new()));
-        assert!(s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new()));
+        assert!(
+            s.update(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+                .is_none()
+        );
+        assert!(
+            s.create(None, "ghost", val(json!(1)), ClusterVariableMetadata::new())
+                .is_some()
+        );
+        assert!(
+            s.update(None, "ghost", val(json!(2)), ClusterVariableMetadata::new())
+                .is_some()
+        );
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "ghost").unwrap().value),
             "2"
@@ -985,12 +1029,15 @@ mod cluster_variable_tests {
     fn delete_reports_absence() {
         let s = store();
         assert!(!s.delete(None, "nope"));
-        assert!(s.create(
-            None,
-            "nope",
-            val(json!(true)),
-            ClusterVariableMetadata::new()
-        ));
+        assert!(
+            s.create(
+                None,
+                "nope",
+                val(json!(true)),
+                ClusterVariableMetadata::new()
+            )
+            .is_some()
+        );
         assert!(s.delete(None, "nope"));
         assert!(s.get(None, "nope").is_none());
     }
@@ -998,7 +1045,10 @@ mod cluster_variable_tests {
     #[test]
     fn empty_object_value_round_trips() {
         let s = store();
-        assert!(s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new()));
+        assert!(
+            s.create(None, "cfg", val(json!({})), ClusterVariableMetadata::new())
+                .is_some()
+        );
         assert_eq!(
             cluster_variable_value_string(&s.get(None, "cfg").unwrap().value),
             "{}"
@@ -1506,6 +1556,198 @@ mod cluster_variable_tests {
         )
         .await;
         assert_eq!(names(&page2_again), names(&page2));
+    }
+}
+
+#[cfg(test)]
+mod converted_lock_poison_tests {
+    //! Epic #1357 lock-poison recovery regression guards. The unwrap/expect-deny
+    //! conversion rewrote every `.lock().expect(...)` in the gateway binary to
+    //! `.lock().unwrap_or_else(|e| e.into_inner())`, so a panic while one of these
+    //! mutexes is held can no longer cascade a crash into every path that later
+    //! touches the same state. The consumers/provisioning guards lock *different*
+    //! mutexes, so they would still pass if any of these accessors reverted to
+    //! `.expect(...)`. These tests poison each converted lock on a locally-owned
+    //! store/server fixture and assert the real accessor recovers, returning the
+    //! preserved state instead of panicking.
+    use super::*;
+
+    /// Poison a mutex by panicking while holding its guard, on a detached thread
+    /// so the panic does not unwind the test itself. A recovered guard does NOT
+    /// clear the poison flag, so every later `.lock()` still returns `Err` and
+    /// must be recovered — which is exactly what the accessors under test do.
+    fn poison<T: Send + 'static>(lock: Arc<std::sync::Mutex<T>>) {
+        assert!(
+            std::thread::spawn(move || {
+                let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("intentionally poison the lock");
+            })
+            .join()
+            .is_err(),
+            "the closure must panic while holding the lock to poison it"
+        );
+    }
+
+    /// Batch-store: a panic while holding `BatchOperationStore::inner` must not
+    /// cascade into every later batch get/search/transition.
+    #[test]
+    fn batch_operation_store_recovers_from_a_poisoned_lock() {
+        let store = BatchOperationStore::default();
+        let key = store.create(
+            models::BatchOperationTypeEnum::CancelProcessInstance,
+            vec![1, 2],
+        );
+
+        poison(store.inner.clone());
+        assert!(store.inner.is_poisoned(), "inner lock must be poisoned");
+
+        // Reads recover and preserve the pre-poison record.
+        let got = store.get(key).expect("get recovers the poisoned lock");
+        assert_eq!(got.key, key);
+        assert_eq!(store.all().len(), 1, "all() recovers and sees the record");
+
+        // Writes recover: a fresh create and a lifecycle transition still apply.
+        let key2 = store.create(
+            models::BatchOperationTypeEnum::CancelProcessInstance,
+            vec![3],
+        );
+        assert_ne!(key2, key, "create recovers and mints a distinct key");
+        assert!(
+            matches!(
+                store.transition(key, models::BatchOperationStateEnum::Suspended),
+                BatchLifecycleOutcome::Ok
+            ),
+            "transition recovers the poisoned lock and applies"
+        );
+        assert_eq!(
+            store
+                .get(key)
+                .expect("still present after the recovered transition")
+                .state,
+            models::BatchOperationStateEnum::Suspended,
+            "the recovered write preserved and advanced the state"
+        );
+    }
+
+    /// The `ServerImpl` cluster-coordination maps converted in this file
+    /// (promotion/handoff, replica, lease, retirement, definition-index) must all
+    /// recover their poisoned locks through their real accessors.
+    #[tokio::test]
+    async fn server_converted_mutexes_recover_from_poisoned_locks() {
+        let server = ServerImpl {
+            tier2_enabled: true,
+            lease_digest: true,
+            ..Default::default()
+        };
+        let me = server.engine.topology().node_id as u64;
+
+        // --- promotion epoch (promotion/handoff state) ---
+        server
+            .promotion_epoch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, (5, me));
+        poison(server.promotion_epoch.clone());
+        assert!(server.promotion_epoch.is_poisoned());
+        assert_eq!(
+            server.current_app_epoch(0),
+            5,
+            "current_app_epoch recovers the poisoned promotion_epoch read"
+        );
+        assert!(
+            server.next_promotion_epoch(0) >= 5,
+            "next_promotion_epoch recovers the poisoned promotion_epoch write"
+        );
+
+        // --- handoff gating (promotion/handoff state) ---
+        server
+            .handoff_gated
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, std::time::Instant::now());
+        poison(server.handoff_gated.clone());
+        assert!(server.handoff_gated.is_poisoned());
+        assert!(
+            server.handoff_write_gated(0),
+            "handoff_write_gated recovers the poisoned read and sees the gate"
+        );
+        server.release_handoff_lease(0);
+        assert!(
+            !server.handoff_write_gated(0),
+            "release_handoff_lease recovers the poisoned write and lifts the gate"
+        );
+
+        // --- raft replicas ---
+        let replica_handle = server
+            .engine
+            .local_for_partition(0)
+            .expect("single-node fixture owns partition 0")
+            .clone();
+        server
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, replica_handle);
+        poison(server.raft_replicas.clone());
+        assert!(server.raft_replicas.is_poisoned());
+        // replica_engine_for reads the raft_replicas map first; the recovered read
+        // must return the pre-seeded replica handle rather than panicking (and
+        // without falling through to build a fresh actor).
+        let _ = server.replica_engine_for(0).await;
+        assert!(
+            server
+                .raft_replicas
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&0),
+            "replica_engine_for recovers the poisoned raft_replicas read"
+        );
+
+        // --- lease digests ---
+        poison(server.lease_digests.clone());
+        assert!(server.lease_digests.is_poisoned());
+        server.record_lease_digest(0, vec![(1, 2)], 0);
+        assert!(
+            server
+                .lease_digests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&0),
+            "record_lease_digest recovers the poisoned write and records the digest"
+        );
+
+        // --- pending retirements ---
+        server
+            .pending_retirements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(0, vec![7]);
+        poison(server.pending_retirements.clone());
+        assert!(server.pending_retirements.is_poisoned());
+        // The retirement digest drains the map under the recovered lock; on a
+        // single-node (rf=1) fixture it has no followers to send to, so it just
+        // recovers and clears without panicking.
+        server.run_retirement_digest().await;
+        assert!(
+            server
+                .pending_retirements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "run_retirement_digest recovers the poisoned lock and drains the buffer"
+        );
+
+        // --- definition-index (def_key_to_process_id) ---
+        server
+            .def_key_to_process_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert("def-key".to_string(), "proc-id".to_string());
+        poison(server.def_key_to_process_id.clone());
+        assert!(server.def_key_to_process_id.is_poisoned());
+        // tier2_should_shed resolves a create-by-key through the definition index;
+        // the recovered read must not panic (shed decision itself may be None).
+        let _ = server.tier2_should_shed(None, Some("def-key"));
     }
 }
 
@@ -8381,8 +8623,11 @@ impl ServerImpl {
 
     /// Correlates a message across this node's owned partitions and returns the
     /// minted message key and the first instance it correlated to (an existing
-    /// subscription or a message-start-created instance), if any. The local
-    /// building block for both the gateway fan-out and the peer-side
+    /// subscription or a message-start-created instance), if any. The message
+    /// key is `None` when this node owns neither the correlation-key hash
+    /// partition nor partition 0 (no local `CorrelateMessage` was applied, so no
+    /// key was minted); the cluster fan-out then sources it from an owning peer.
+    /// The local building block for both the gateway fan-out and the peer-side
     /// `PublishMessage` handler.
     pub(crate) async fn correlate_message_local(
         &self,
@@ -8390,7 +8635,7 @@ impl ServerImpl {
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
-    ) -> Result<(u64, Option<u64>), EngineError> {
+    ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let events = self
             .correlate_message_everywhere(name, correlation_key, variables, business_id)
             .await?;
@@ -8411,18 +8656,22 @@ impl ServerImpl {
     /// partitions plus every peer (each correlates against its own partitions).
     /// An open subscription's instance can live on any node, and the message-start
     /// subscriptions live solely on the partition-0 owner, so a published message
-    /// must reach every node. Returns the (locally minted) message key and the
-    /// first correlated instance found across the cluster — local matches first,
-    /// then peers. A peer that is unreachable is logged and skipped (best-effort,
-    /// matching the no-buffer correlate-and-drop model). A single-node cluster
-    /// fans only locally — byte-identical to the pre-cluster path.
+    /// must reach every node. Returns the message key and the first correlated
+    /// instance found across the cluster — local matches first, then peers. The
+    /// key is minted locally when this node owns a target partition, otherwise
+    /// it is taken from the first owning peer's response (the node that actually
+    /// minted it); it is `None` only when this node owns no target partition and
+    /// every owning peer was unreachable, which the gateway surfaces as 503. A
+    /// peer that is unreachable is logged and skipped (best-effort, matching the
+    /// no-buffer correlate-and-drop model). A single-node cluster fans only
+    /// locally — byte-identical to the pre-cluster path.
     async fn correlate_message_cluster(
         &self,
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         business_id: Option<String>,
-    ) -> Result<(u64, Option<u64>), EngineError> {
+    ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let engine_vars: std::collections::HashMap<String, Value> = variables
             .as_ref()
             .map(|m| {
@@ -8431,7 +8680,7 @@ impl ServerImpl {
                     .collect()
             })
             .unwrap_or_default();
-        let (message_key, mut instance) = self
+        let (mut message_key, mut instance) = self
             .correlate_message_local(
                 name.clone(),
                 correlation_key.clone(),
@@ -8469,10 +8718,18 @@ impl ServerImpl {
                         .await
                     {
                         Ok(res) if res.status == 200 => {
+                            let body = res.body.as_ref();
+                            // When this node owns no target partition it minted
+                            // no key; take the one the owning peer minted so the
+                            // client still gets a message key.
+                            if message_key.is_none() {
+                                message_key = body
+                                    .and_then(|b| b.get("messageKey"))
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| s.parse::<u64>().ok());
+                            }
                             if instance.is_none() {
-                                instance = res
-                                    .body
-                                    .as_ref()
+                                instance = body
                                     .and_then(|b| b.get("correlatedInstanceKey"))
                                     .and_then(|v| v.as_str())
                                     .and_then(|s| s.parse::<u64>().ok());
@@ -10233,6 +10490,18 @@ impl ServerImpl {
             }
         };
 
+        // No key means this node owns no target partition and every owning peer
+        // was unreachable, so the publish reached nowhere: report 503 rather
+        // than fabricating a key for a publication that did not happen.
+        let Some(message_key) = message_key else {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "UNAVAILABLE",
+                503,
+                "could not reach a node owning a target partition for the message; retry"
+                    .to_string(),
+            )));
+        };
+
         // Correlation may have advanced a token onto a service task, creating a
         // new activatable job: wake any long-pollers.
         self.signal_jobs_available();
@@ -10275,6 +10544,17 @@ impl ServerImpl {
                     e.to_string(),
                 )));
             }
+        };
+        // No key means this node owns no target partition and every owning peer
+        // was unreachable, so the correlation reached nowhere: report 503 rather
+        // than a 404 (which would wrongly claim nothing matched).
+        let Some(message_key) = message_key else {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "UNAVAILABLE",
+                503,
+                "could not reach a node owning a target partition for the message; retry"
+                    .to_string(),
+            )));
         };
         // A message correlates either to an existing instance's open subscription
         // (MessageCorrelated) or, via a message start event, by creating a new
@@ -22817,19 +23097,16 @@ fn dmn_value_to_string(value: &Value) -> String {
 pub(crate) use nanobpmn_read_model::dmn_decision_type_name;
 
 /// The minted message key from a `CorrelateMessage`'s events: the heading
-/// [`Event::MessagePublished`] always carries it.
-#[allow(
-    clippy::expect_used,
-    reason = "invariant by construction: CorrelateMessage always emits a MessagePublished carrying the message key"
-)]
-fn message_key_of(events: &[Event]) -> u64 {
-    events
-        .iter()
-        .find_map(|e| match e {
-            Event::MessagePublished { message_key, .. } => Some(*message_key),
-            _ => None,
-        })
-        .expect("CorrelateMessage always emits MessagePublished")
+/// [`Event::MessagePublished`] carries it. `None` when this node applied no
+/// local `CorrelateMessage` — it owns neither the correlation-key hash
+/// partition nor partition 0, so `correlate_message_everywhere` produced no
+/// events. Callers that fan out to the cluster then take the key from an owning
+/// peer's response rather than treating the local miss as infallible.
+fn message_key_of(events: &[Event]) -> Option<u64> {
+    events.iter().find_map(|e| match e {
+        Event::MessagePublished { message_key, .. } => Some(*message_key),
+        _ => None,
+    })
 }
 
 /// Maps the stub `Err(())` returned by every operation to `501 Not Implemented`.
@@ -27125,6 +27402,107 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(stamped, types::Nullable::Present("order-7".to_string()));
+    }
+
+    #[tokio::test]
+    async fn publish_from_a_node_owning_no_target_partition_sources_the_key_from_a_peer() {
+        // Regression: when the gateway node owns NEITHER the correlation-key hash
+        // partition NOR partition 0, its local correlate applies no command and
+        // produces no `MessagePublished`, so the old `message_key_of(...).expect()`
+        // panicked. The publish must instead fan out and take the minted key from
+        // the owning peer's response. With 2 partitions and 3 nodes, node 2 owns
+        // no partition at all (owner_of(p) = p % 3 ∈ {0,1}), so it is the
+        // no-local-target gateway.
+        let proc = ProcessBuilder::new("order-flow")
+            .message_start_event("start", "order-placed")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("order-flow".to_string(), "order.bpmn".to_string());
+
+        // Node 0 owns partition 0, where every message-start subscription lives.
+        let node0_topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["unused".into(), "unused".into(), "unused".into()],
+            num_partitions: 3,
+            replication_factor: 1,
+        };
+        let node0 = build_server_in_memory(
+            node0_topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect(),
+            node0_topology,
+        );
+        node0
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy message-start process on the partition-0 owner");
+        let node0_url = serve_node(&node0).await;
+
+        // The gateway the client hits must own SOME partition (so it has a read
+        // model shard) but NEITHER of the two publish targets: partition 0 (the
+        // message-start home) nor the empty correlation key's hash partition. With
+        // 3 nodes / 3 partitions (owner_of(p) = p % 3), partition 0 is node 0 and
+        // the hash partition is node `hp`; the remaining node owns only its own
+        // partition and is the no-local-target gateway.
+        let hp = nanobpmn_engine_core::subscription_partition("", 3);
+        let gateway: u32 = if hp == 1 { 2 } else { 1 };
+        let mut peers = vec![
+            "http://unused".to_string(),
+            "http://unused".to_string(),
+            "http://unused".to_string(),
+        ];
+        peers[0] = node0_url;
+        let topology = cluster::Topology {
+            node_id: gateway,
+            peers,
+            num_partitions: 3,
+            replication_factor: 1,
+        };
+        assert_eq!(
+            topology.local_partitions(),
+            vec![gateway as u64],
+            "the gateway owns only its own partition"
+        );
+        assert!(
+            !topology.local_partitions().contains(&0)
+                && !topology.local_partitions().contains(&(hp as u64)),
+            "the gateway must own neither publish-target partition for this regression"
+        );
+        let node2 = build_server_in_memory(
+            topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect(),
+            topology,
+        );
+
+        let (message_key, instance) = node2
+            .correlate_message_cluster("order-placed".into(), String::new(), None, None)
+            .await
+            .expect("correlation with a valid business id never panics on a no-local-target node");
+        assert!(
+            message_key.is_some(),
+            "the message key is sourced from the owning peer, not minted locally"
+        );
+        let instance =
+            instance.expect("the owner's message-start subscription creates an instance");
+        assert_eq!(
+            nanobpmn_engine_core::partition_of(instance),
+            0,
+            "the message-start instance lives on the owner's partition 0"
+        );
     }
 
     #[tokio::test]

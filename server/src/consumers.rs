@@ -1368,24 +1368,47 @@ mod tests {
     /// conversion `complete_rest_poll` called `.expect("consumer rest-polls
     /// poisoned")` and panicked; now it recovers the inner guard.
     ///
-    /// The poison is cleared again at the end so sibling tests sharing the
-    /// process-global static are unaffected (nextest also isolates per-process).
+    /// `REST_POLLS` is a process-global static and `cargo test --workspace`
+    /// (what `make server-test{,-release}` run) executes this binary's tests on
+    /// many threads in ONE process, where sibling tests lock it with `.unwrap()`
+    /// (see `clear`/`insert_poll`). Poisoning it in-process would therefore flake
+    /// those siblings during the poison window. So the poison scenario runs in a
+    /// freshly re-exec'd CHILD process, whose poisoned static dies with it and
+    /// never touches this process's shared state.
     #[test]
     fn complete_rest_poll_recovers_from_poisoned_lock() {
-        let poisoned = std::panic::catch_unwind(|| {
-            let _guard = REST_POLLS.lock().unwrap_or_else(|e| e.into_inner());
-            panic!("intentionally poison REST_POLLS");
-        });
-        assert!(poisoned.is_err(), "the panicking closure must unwind");
-        assert!(REST_POLLS.is_poisoned(), "REST_POLLS must now be poisoned");
+        const CHILD_ENV: &str = "NANO_REST_POLLS_POISON_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // CHILD: poison the real static, then prove the real accessor recovers
+            // instead of panicking. Isolated to this process, so no sibling sees
+            // the poison.
+            let poisoned = std::panic::catch_unwind(|| {
+                let _guard = REST_POLLS.lock().unwrap_or_else(|e| e.into_inner());
+                panic!("intentionally poison REST_POLLS");
+            });
+            assert!(poisoned.is_err(), "the panicking closure must unwind");
+            assert!(REST_POLLS.is_poisoned(), "REST_POLLS must now be poisoned");
+            // The real assertion: this returns instead of panicking on the poison.
+            complete_rest_poll("t-poison-recovery:absent", "nobody");
+            return;
+        }
 
-        // The real assertion: this returns instead of panicking on the poison.
-        complete_rest_poll("t-poison-recovery:absent", "nobody");
-
-        REST_POLLS.clear_poison();
+        // PARENT: re-exec just this test in a child process with the gate set, so
+        // the poison is contained there.
+        let exe = std::env::current_exe().expect("test binary path");
+        let status = std::process::Command::new(exe)
+            .args([
+                "consumers::tests::complete_rest_poll_recovers_from_poisoned_lock",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn poison-recovery child test process");
         assert!(
-            !REST_POLLS.is_poisoned(),
-            "poison restored for sibling tests"
+            status.success(),
+            "the isolated child must exercise poison recovery without panicking"
         );
     }
 }
