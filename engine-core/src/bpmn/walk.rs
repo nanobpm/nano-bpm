@@ -232,6 +232,11 @@ pub(crate) fn parse_with_captures(
                         }
                     }
                     tag if current.is_some() => {
+                        // The `current.is_some()` guard proves this is `Some`.
+                        #[allow(
+                            clippy::expect_used,
+                            reason = "the `current.is_some()` match guard proves this is Some"
+                        )]
                         let acc = current.as_mut().expect("current process set");
                         match tag {
                             "startEvent" => {
@@ -1193,10 +1198,22 @@ pub(crate) fn parse_with_captures(
                                     // non-empty, so unwrap the invariant rather
                                     // than falling back to "" (a dead branch that
                                     // would only mask a future validation bug).
+                                    #[allow(
+                                        clippy::expect_used,
+                                        reason = "required-attribute loop above validated these non-empty"
+                                    )]
                                     let resource_id = nonempty("resourceId")
                                         .expect("resourceId validated non-empty above");
+                                    #[allow(
+                                        clippy::expect_used,
+                                        reason = "required-attribute loop above validated these non-empty"
+                                    )]
                                     let resource_type = nonempty("resourceType")
                                         .expect("resourceType validated non-empty above");
+                                    #[allow(
+                                        clippy::expect_used,
+                                        reason = "required-attribute loop above validated these non-empty"
+                                    )]
                                     let binding_type = match nonempty("bindingType")
                                         .expect("bindingType validated non-empty above")
                                     {

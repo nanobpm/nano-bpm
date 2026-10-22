@@ -564,7 +564,10 @@ pub fn call(
         })),
         "last day of month" => Ok(with_date(&arg(&args, 0), |d| {
             let last = days_in(d.year, d.month);
-            Date(super::temporal::Date::new(d.year, d.month, last).unwrap())
+            match super::temporal::Date::new(d.year, d.month, last) {
+                Some(date) => Date(date),
+                None => Null,
+            }
         })),
 
         // --- misc ---
@@ -720,7 +723,7 @@ fn mode(items: &[FeelVal]) -> Result<FeelVal, FeelError> {
             counts.push((x, 1));
         }
     }
-    let max = counts.iter().map(|(_, c)| *c).max().unwrap();
+    let max = counts.iter().map(|(_, c)| *c).max().unwrap_or(0);
     let mut modes: Vec<f64> = counts
         .into_iter()
         .filter(|(_, c)| *c == max)

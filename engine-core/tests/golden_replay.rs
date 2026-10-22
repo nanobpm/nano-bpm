@@ -40,7 +40,11 @@
 //! already passes it; this task reuses that job and does not re-add the flag).
 
 #![cfg(feature = "serde")]
-
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{

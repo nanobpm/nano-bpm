@@ -10,6 +10,11 @@
 //!
 //! Usage: `feel_diff <corpus-file>` (or `-` / stdin).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use std::collections::HashMap;
 use std::io::{self, Read};
 

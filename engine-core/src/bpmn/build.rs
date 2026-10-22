@@ -1222,6 +1222,12 @@ impl ProcessAcc {
             };
             // Keep a single none/signal start as the process-entry `StartEvent`
             // (prefer a none start); any additional *signal* start is surplus.
+            // `proc_starts.len() > 1` above guarantees the fallback min_by sees a
+            // non-empty iterator.
+            #[allow(
+                clippy::expect_used,
+                reason = "guarded by `proc_starts.len() > 1` above, so the iterator is non-empty"
+            )]
             let designated = proc_starts
                 .iter()
                 .copied()

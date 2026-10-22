@@ -1,5 +1,9 @@
 #![cfg(feature = "serde")]
-
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use nanobpmn_engine_core::{
     AgentType, Command, Engine, Event, JobActivationOptions, ProcessBuilder,
 };

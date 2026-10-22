@@ -54,7 +54,11 @@
 //! then review the diff and commit it. Never edit the JSON by hand.
 
 #![cfg(feature = "serde")]
-
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
