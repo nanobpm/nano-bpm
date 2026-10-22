@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { buildSite } from "./test-build.mjs";
 
 import { loadVideos, validateVideos, videosSectionHtml } from "./videos.mjs";
 
@@ -41,9 +42,9 @@ test("invalid data is rejected", () => {
 });
 
 test("the built homepage and console artifact both carry the shared Videos section", () => {
-  execFileSync(process.execPath, [fileURLToPath(new URL("./build.mjs", import.meta.url))], { stdio: "pipe" });
+  const site = buildSite();
   const section = videosSectionHtml(loadVideos(DATA));
-  const home = readFileSync(new URL("./_site/index.html", import.meta.url), "utf8");
+  const home = site("index.html");
   assert.ok(home.includes(section), "homepage embeds the shared section");
   assert.match(home, /id="videos"[\s\S]*?Coming soon/);
   assert.match(home, /<header class="nav">[\s\S]*?<a href="\/#videos">Videos<\/a>[\s\S]*?<\/header>/);

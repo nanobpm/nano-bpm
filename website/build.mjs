@@ -26,7 +26,7 @@ import {
   rmSync,
   readFileSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { loadVideos, videosSectionHtml } from "./videos.mjs";
 
@@ -35,7 +35,9 @@ const ORIGIN = `https://${DOMAIN}`;
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..");
-const outDir = join(here, "_site");
+// `SITE_OUT_DIR` lets tests build into a private directory: the default
+// `_site` is wiped first (rmSync below), so concurrent builds sharing it race.
+const outDir = process.env.SITE_OUT_DIR ? resolve(process.env.SITE_OUT_DIR) : join(here, "_site");
 
 /** Resolve a declared identity URI to its on-disk output path under `_site`. */
 function outFor(uri, { indexHtml = false } = {}) {

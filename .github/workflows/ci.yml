@@ -553,7 +553,8 @@ jobs:
         # schema domain, or if a published $id/uri no longer resolves to
         # nanobpm.io. This is the same build pages.yml deploys on merge, so a
         # green PR here guarantees the site publishes cleanly. The integration
-        # test runs that build once before checking the published controls.
+        # tests each build into a private temp dir (website/test-build.mjs), so
+        # parallel test files never race on the shared, wiped-first _site.
         run: node --test website/install-copy.test.mjs website/videos.test.mjs
       - name: Fail if the console landscape/videos artifacts are stale
         # website/build.mjs also renders the shared landscape table into
