@@ -393,8 +393,9 @@ engine-wasm-check-read-model: ## Type-check engine-wasm with the off-by-default 
 	cd $(WASM_DIR) && $(WASM_READ_MODEL_ENV) cargo check --features read-model --target wasm32-unknown-unknown
 
 .PHONY: engine-wasm-clippy-read-model
-engine-wasm-clippy-read-model: ## Clippy-gate engine-wasm + the read-model crate (a path dependency, so this lints both) with the `read-model` feature, on the host (needs the clippy component; no wasm toolchain — the wasm32 variant above covers the target-specific cfgs).
+engine-wasm-clippy-read-model: ## Clippy-gate engine-wasm's `read-model` feature-ON surface AND the standalone read-model crate, on the host (needs the clippy component; no wasm toolchain — the wasm32 variant above covers the target-specific cfgs). Two invocations: Clippy does NOT lint path dependencies outside the selected package, so compiling read-model via engine-wasm's `--features read-model` enforces engine-wasm's denies but leaves read-model's own #1357 unwrap/expect gate unchecked — the second `cd $(READ_MODEL_DIR)` run lints read-model directly (default `native` feature, the server's backend).
 	cd $(WASM_DIR) && cargo clippy --all-targets --features read-model -- -D warnings
+	cd $(READ_MODEL_DIR) && cargo clippy --all-targets -- -D warnings
 
 .PHONY: release-tags
 release-tags: ## Cut release tags for every train whose version is bumped but untagged (dry run; PUSH=1 to tag origin/main HEAD and push). One tag per push + confirms each release workflow started — see RELEASE.md.

@@ -407,10 +407,14 @@ jobs:
         run: make engine-wasm-check-read-model
       - name: Clippy engine-wasm --features read-model (host)
         # Enforces the #1357 `unwrap_used`/`expect_used` denies on the
-        # feature-ON surface. engine-wasm path-depends on the read-model crate,
-        # so this lints read-model's denies in the same pass (read-model is in
-        # no other clippy job's workspace). Host target: the read model links
-        # the bundled native SQLite there, so no wasm C toolchain is involved.
+        # feature-ON surface. Two Clippy runs (see the Makefile target): the
+        # first lints engine-wasm's own `--features read-model` surface; the
+        # second lints the standalone read-model crate directly, because Clippy
+        # does NOT lint path dependencies outside the selected package — so
+        # compiling read-model through engine-wasm's feature does not enforce
+        # read-model's own denies (read-model is in no other clippy job's
+        # workspace). Host target: the read model links the bundled native
+        # SQLite there, so no wasm C toolchain is involved.
         run: make engine-wasm-clippy-read-model
       - name: Test engine-wasm on the host (--features read-model)
         # The facade's Rust tests (incl. the read channel and the spec-required
