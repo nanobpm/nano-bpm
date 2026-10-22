@@ -312,7 +312,7 @@ struct LogInner {
 
 impl LogBuffer {
     fn push(&self, line: String) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.lines.push_back(line);
         while g.lines.len() > LOG_CAPACITY {
             g.lines.pop_front();
@@ -321,7 +321,7 @@ impl LogBuffer {
     }
 
     fn clear(&self) {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let end = g.base + g.lines.len() as u64;
         g.lines.clear();
         g.base = end;
@@ -329,7 +329,7 @@ impl LogBuffer {
 
     /// Lines with offset >= `since`, plus the next offset to poll from.
     fn since(&self, since: u64) -> (Vec<String>, u64) {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let end = g.base + g.lines.len() as u64;
         let from = since.max(g.base);
         let start = (from - g.base) as usize;
@@ -437,7 +437,7 @@ impl LlamaManager {
     fn log_buf(&self, profile_id: &str) -> LogBuffer {
         self.logs
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(profile_id.to_string())
             .or_default()
             .clone()
@@ -458,7 +458,7 @@ impl LlamaManager {
     ) -> Result<LlamaStatus, String> {
         self.reap();
         let excluded: Vec<u16> = {
-            let g = self.inner.lock().unwrap();
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if g.running.iter().any(|r| r.profile_id == profile.id) {
                 return Err(format!("sidecar '{}' is already running", profile.id));
             }
@@ -481,7 +481,7 @@ impl LlamaManager {
     pub fn start(&self, plan: LaunchPlan) -> Result<LlamaStatus, String> {
         self.reap();
         {
-            let g = self.inner.lock().unwrap();
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if g.running.iter().any(|r| r.profile_id == plan.profile_id) {
                 return Err(format!("sidecar '{}' is already running", plan.profile_id));
             }
@@ -522,7 +522,7 @@ impl LlamaManager {
             draft_model: plan.draft_model.clone(),
         };
         let status = running_status(&running, None);
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.last_error = None;
         g.running.push(running);
         Ok(status)
@@ -592,7 +592,7 @@ impl LlamaManager {
             return Err(format!("model for '{}' is already downloaded", profile.id));
         }
         let mut excluded: Vec<u16> = {
-            let g = self.inner.lock().unwrap();
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if g.running.iter().any(|r| r.profile_id == profile.id) {
                 return Err(format!(
                     "profile '{}' is already running as a sidecar",
@@ -602,7 +602,7 @@ impl LlamaManager {
             g.running.iter().map(|r| r.port).collect()
         };
         {
-            let d = self.downloads.lock().unwrap();
+            let d = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
             if d.iter().any(|h| h.profile_id == profile.id) {
                 return Err(format!("profile '{}' is already downloading", profile.id));
             }
@@ -622,14 +622,17 @@ impl LlamaManager {
         let cancel = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicBool::new(false));
         let started_at = now_iso();
-        self.downloads.lock().unwrap().push(DownloadHandle {
-            profile_id: profile.id.clone(),
-            model: plan.model.clone(),
-            port,
-            started_at: started_at.clone(),
-            cancel: cancel.clone(),
-            finished: finished.clone(),
-        });
+        self.downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(DownloadHandle {
+                profile_id: profile.id.clone(),
+                model: plan.model.clone(),
+                port,
+                started_at: started_at.clone(),
+                cancel: cancel.clone(),
+                finished: finished.clone(),
+            });
         let state = DownloadState {
             profile_id: profile.id.clone(),
             model: plan.model.clone(),
@@ -689,7 +692,7 @@ impl LlamaManager {
     /// poll). Returns true if a matching active download was found.
     pub fn cancel_download(&self, profile_id: &str) -> bool {
         self.reap_downloads();
-        let d = self.downloads.lock().unwrap();
+        let d = self.downloads.lock().unwrap_or_else(|e| e.into_inner());
         match d.iter().find(|h| h.profile_id == profile_id) {
             Some(h) => {
                 h.cancel.store(true, Ordering::Relaxed);
@@ -704,7 +707,7 @@ impl LlamaManager {
         self.reap_downloads();
         self.downloads
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .map(|h| DownloadState {
                 profile_id: h.profile_id.clone(),
@@ -720,7 +723,7 @@ impl LlamaManager {
         self.reap_downloads();
         self.downloads
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|h| h.profile_id == profile_id)
     }
@@ -729,7 +732,7 @@ impl LlamaManager {
     fn reap_downloads(&self) {
         self.downloads
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|h| !h.finished.load(Ordering::Relaxed));
     }
 
@@ -737,7 +740,7 @@ impl LlamaManager {
     /// Returns the resulting pool state.
     pub async fn stop(&self, profile_id: Option<&str>) -> StatusList {
         let to_kill: Vec<Running> = {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             match profile_id {
                 Some(id) => match g.running.iter().position(|r| r.profile_id == id) {
                     Some(pos) => vec![g.running.remove(pos)],
@@ -758,7 +761,7 @@ impl LlamaManager {
     pub fn reap(&self) {
         let mut exited_ids: Vec<String> = Vec::new();
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let mut i = 0;
             while i < g.running.len() {
                 let exited = matches!(g.running[i].child.try_wait(), Ok(Some(_)));
@@ -779,7 +782,7 @@ impl LlamaManager {
     /// The full pool state: every running sidecar plus capacity.
     pub fn statuses(&self) -> StatusList {
         self.reap();
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let sidecars: Vec<LlamaStatus> =
             g.running.iter().map(|r| running_status(r, None)).collect();
         StatusList {
@@ -794,7 +797,7 @@ impl LlamaManager {
     /// The status of a single profile's sidecar (running:false when it isn't up).
     pub fn status_of(&self, profile_id: &str) -> LlamaStatus {
         self.reap();
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match g.running.iter().find(|r| r.profile_id == profile_id) {
             Some(r) => running_status(r, g.last_error.clone()),
             None => empty_status(g.last_error.clone()),
@@ -808,7 +811,7 @@ impl LlamaManager {
         let serving = self
             .inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .running
             .iter()
             .any(|r| r.profile_id == profile_id);
@@ -829,7 +832,10 @@ impl LlamaManager {
     }
 
     fn set_error(&self, msg: &str) {
-        self.inner.lock().unwrap().last_error = Some(msg.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_error = Some(msg.to_string());
     }
 }
 
@@ -892,6 +898,31 @@ fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_buffer_recovers_from_a_poisoned_lock() {
+        // A panic while holding the buffer's mutex poisons it. The lock-recovery
+        // idiom (`.lock().unwrap_or_else(|e| e.into_inner())`) must keep the
+        // buffer usable instead of propagating the poison as a panic — a
+        // background trace-analysis plane should degrade, not crash, on poison.
+        let buf = LogBuffer::default();
+        buf.push("before".into());
+
+        let poisoned = buf.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = poisoned.inner.lock().unwrap_or_else(|e| e.into_inner());
+            panic!("poison the buffer lock");
+        }));
+        assert!(buf.inner.is_poisoned(), "lock should now be poisoned");
+
+        // Every accessor must still work against the poisoned lock.
+        buf.push("after".into());
+        let (lines, _) = buf.since(0);
+        assert_eq!(lines, vec!["before".to_string(), "after".to_string()]);
+        buf.clear();
+        let (lines, _) = buf.since(0);
+        assert!(lines.is_empty(), "clear should still work after poison");
+    }
 
     fn profile(model_file: &str, base_url: &str, args: Option<&str>) -> LlmProfile {
         LlmProfile {

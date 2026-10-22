@@ -85,7 +85,7 @@ impl NanoInstanceStore {
     /// Every configured instance plus the active id. Starred instances are returned first
     /// (stable within each group), so the Console card layout floats them to the top.
     pub fn list(&self) -> (Vec<NanoInstance>, Option<String>) {
-        let g = self.state.read().expect("nano-instances lock poisoned");
+        let g = self.state.read().unwrap_or_else(|e| e.into_inner());
         let mut instances = g.instances.clone();
         instances.sort_by_key(|i| !i.starred);
         (instances, g.active.clone())
@@ -93,7 +93,7 @@ impl NanoInstanceStore {
 
     /// The base URL of the active instance, if any is configured.
     pub fn active_base_url(&self) -> Option<String> {
-        let g = self.state.read().expect("nano-instances lock poisoned");
+        let g = self.state.read().unwrap_or_else(|e| e.into_inner());
         let active = g.active.as_ref()?;
         g.instances
             .iter()
@@ -114,7 +114,7 @@ impl NanoInstanceStore {
             starred: false,
         };
         {
-            let mut g = self.state.write().expect("nano-instances lock poisoned");
+            let mut g = self.state.write().unwrap_or_else(|e| e.into_inner());
             if g.active.is_none() {
                 g.active = Some(inst.id.clone());
             }
@@ -131,7 +131,7 @@ impl NanoInstanceStore {
             return Err("base URL must not be empty".to_string());
         }
         let out = {
-            let mut g = self.state.write().expect("nano-instances lock poisoned");
+            let mut g = self.state.write().unwrap_or_else(|e| e.into_inner());
             let inst = g
                 .instances
                 .iter_mut()
@@ -148,7 +148,7 @@ impl NanoInstanceStore {
     /// Remove an instance. If it was active, selection falls back to the first remaining.
     pub fn remove(&self, id: &str) -> Result<(), String> {
         {
-            let mut g = self.state.write().expect("nano-instances lock poisoned");
+            let mut g = self.state.write().unwrap_or_else(|e| e.into_inner());
             let before = g.instances.len();
             g.instances.retain(|i| i.id != id);
             if g.instances.len() == before {
@@ -165,7 +165,7 @@ impl NanoInstanceStore {
     /// Star or unstar an instance, so the Console floats it to the top of the card layout.
     pub fn set_star(&self, id: &str, starred: bool) -> Result<NanoInstance, String> {
         let out = {
-            let mut g = self.state.write().expect("nano-instances lock poisoned");
+            let mut g = self.state.write().unwrap_or_else(|e| e.into_inner());
             let inst = g
                 .instances
                 .iter_mut()
@@ -181,7 +181,7 @@ impl NanoInstanceStore {
     /// Make an instance the active analysis target.
     pub fn select(&self, id: &str) -> Result<(), String> {
         {
-            let mut g = self.state.write().expect("nano-instances lock poisoned");
+            let mut g = self.state.write().unwrap_or_else(|e| e.into_inner());
             if !g.instances.iter().any(|i| i.id == id) {
                 return Err(format!("no such instance: {id}"));
             }
@@ -193,13 +193,13 @@ impl NanoInstanceStore {
 
     /// Look up a single instance by id.
     pub fn get(&self, id: &str) -> Option<NanoInstance> {
-        let g = self.state.read().expect("nano-instances lock poisoned");
+        let g = self.state.read().unwrap_or_else(|e| e.into_inner());
         g.instances.iter().find(|i| i.id == id).cloned()
     }
 
     fn persist(&self) {
         let snapshot = {
-            let g = self.state.read().expect("nano-instances lock poisoned");
+            let g = self.state.read().unwrap_or_else(|e| e.into_inner());
             g.clone()
         };
         if let Some(parent) = self.path.parent() {

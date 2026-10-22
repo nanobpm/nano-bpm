@@ -700,6 +700,10 @@ async fn main() {
     );
     println!("PROCESSOS_PORT={}", cfg.port);
 
+    #[allow(
+        clippy::expect_used,
+        reason = "top-level server run: a serve error is fatal and unrecoverable — panicking aborts the process, which is the intended behaviour at the binary's entry point"
+    )]
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -1723,11 +1727,12 @@ fn serve_guide(slug: &str) -> axum::response::Response {
         None => {
             // Unknown section — fall back to the Overview so a stale link still lands
             // somewhere useful, with a 404 status for correctness.
-            let overview = USERGUIDE_PAGES
-                .iter()
-                .find(|p| p.slug == "index")
-                .expect("overview page");
-            (StatusCode::NOT_FOUND, Html(guide_shell(overview))).into_response()
+            match USERGUIDE_PAGES.iter().find(|p| p.slug == "index") {
+                Some(overview) => {
+                    (StatusCode::NOT_FOUND, Html(guide_shell(overview))).into_response()
+                }
+                None => (StatusCode::NOT_FOUND, Html(String::new())).into_response(),
+            }
         }
     }
 }
@@ -1792,7 +1797,7 @@ async fn advisor_advise(State(state): State<AppState>) -> impl IntoResponse {
     let cur = advisor::parse_snapshot(&text, chat_now_ms());
     // Diff against the previous scrape for this instance, then remember this one.
     let prev = {
-        let mut map = state.advisor_prev.lock().unwrap();
+        let mut map = state.advisor_prev.lock().unwrap_or_else(|e| e.into_inner());
         let prev = map.get(&key).cloned().unwrap_or_default();
         map.insert(key, cur.clone());
         prev
@@ -5947,7 +5952,12 @@ async fn harness_hypothesize(
     // library prompt; otherwise the built-in default.
     let system_prompt = match (&req.prompt, &req.prompt_id) {
         (Some(inline), _) => inline.clone(),
-        (None, Some(id)) => match state.prompts.read().unwrap().system_of(id) {
+        (None, Some(id)) => match state
+            .prompts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .system_of(id)
+        {
             Some(s) => s,
             None => {
                 return (
@@ -5960,7 +5970,7 @@ async fn harness_hypothesize(
         (None, None) => state
             .prompts
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .system_of(DEFAULT_PROMPT_ID)
             .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
     };
@@ -6382,7 +6392,12 @@ async fn harness_evolve(
     // Resolve the system prompt: inline override, else library prompt, else default.
     let system_prompt = match (&req.prompt, &req.prompt_id) {
         (Some(inline), _) => inline.clone(),
-        (None, Some(id)) => match state.prompts.read().unwrap().system_of(id) {
+        (None, Some(id)) => match state
+            .prompts
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .system_of(id)
+        {
             Some(s) => s,
             None => {
                 return (
@@ -6467,13 +6482,22 @@ async fn harness_evolve(
 }
 /// `GET /api/prompts` — list every prompt in the library (built-in + authored).
 async fn prompts_list(State(state): State<AppState>) -> impl IntoResponse {
-    let list = state.prompts.read().unwrap().list();
+    let list = state
+        .prompts
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .list();
     Json(list)
 }
 
 /// `GET /api/prompts/{id}` — one prompt, or 404.
 async fn prompts_get(State(state): State<AppState>, Path(id): Path<String>) -> impl IntoResponse {
-    match state.prompts.read().unwrap().get(&id) {
+    match state
+        .prompts
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+    {
         Some(p) => Json(p).into_response(),
         None => (
             StatusCode::NOT_FOUND,
@@ -6489,7 +6513,12 @@ async fn prompts_upsert(
     State(state): State<AppState>,
     Json(prompt): Json<Prompt>,
 ) -> impl IntoResponse {
-    match state.prompts.write().unwrap().upsert(prompt) {
+    match state
+        .prompts
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .upsert(prompt)
+    {
         Ok(stored) => (StatusCode::OK, Json(stored)).into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -6505,7 +6534,12 @@ async fn prompts_delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.prompts.write().unwrap().remove(&id) {
+    match state
+        .prompts
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&id)
+    {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,

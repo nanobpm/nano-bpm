@@ -65,6 +65,10 @@ fn resolve_version(manifest: &str) -> String {
     env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string())
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "build script: a missing cargo env var or an unreadable USERGUIDE.md is a fatal build misconfiguration — panicking fails the build loudly, which is the desired behaviour here"
+)]
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
 

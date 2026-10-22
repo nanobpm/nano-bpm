@@ -257,10 +257,16 @@ impl Settings {
         if !self.profiles.iter().any(|p| p.id == base) {
             return base;
         }
-        (2..)
-            .map(|n| format!("{base}-{n}"))
-            .find(|c| !self.profiles.iter().any(|p| &p.id == c))
-            .unwrap()
+        // `base-2`, `base-3`, … — the first id not already taken. Finite profile
+        // set over an unbounded counter, so this loop always terminates.
+        let mut n = 2u32;
+        loop {
+            let candidate = format!("{base}-{n}");
+            if !self.profiles.iter().any(|p| p.id == candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 }
 
@@ -578,17 +584,20 @@ impl SettingsStore {
 
     /// A snapshot of the current settings (cheap clone).
     pub fn snapshot(&self) -> Settings {
-        self.inner.read().expect("settings lock").clone()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The redacted view for the API/console.
     pub fn view(&self) -> SettingsView {
-        SettingsView::of(&self.inner.read().expect("settings lock"), &self.path)
+        SettingsView::of(
+            &self.inner.read().unwrap_or_else(|e| e.into_inner()),
+            &self.path,
+        )
     }
 
     /// Update the globals (active profile + python interpreter), persist, return the view.
     pub fn update_globals(&self, patch: GlobalsPatch) -> Result<SettingsView, String> {
-        let mut g = self.inner.write().expect("settings lock");
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(id) = patch.active_profile {
             let id = id.trim();
             if id.is_empty() {
@@ -615,7 +624,7 @@ impl SettingsStore {
     /// Create a new profile (optionally seeded from a patch); make it active if it is the
     /// first. Returns the new profile id plus the full view.
     pub fn add_profile(&self, patch: ProfilePatch) -> Result<(String, SettingsView), String> {
-        let mut g = self.inner.write().expect("settings lock");
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let name = patch
             .name
             .clone()
@@ -653,7 +662,7 @@ impl SettingsStore {
 
     /// Apply a patch to an existing profile, persist, return the view.
     pub fn update_profile(&self, id: &str, patch: ProfilePatch) -> Result<SettingsView, String> {
-        let mut g = self.inner.write().expect("settings lock");
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let p = g
             .profile_mut(id)
             .ok_or_else(|| format!("no such profile: {id}"))?;
@@ -664,7 +673,7 @@ impl SettingsStore {
 
     /// Delete a profile; if it was active, the active falls back to the first remaining.
     pub fn delete_profile(&self, id: &str) -> Result<SettingsView, String> {
-        let mut g = self.inner.write().expect("settings lock");
+        let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let before = g.profiles.len();
         g.profiles.retain(|p| p.id != id);
         if g.profiles.len() == before {
@@ -681,7 +690,7 @@ impl SettingsStore {
     /// the saved profile (if `profile_id` is given) so its stored key is used, then layer
     /// the inline overrides (so the console can probe an endpoint it is still editing).
     pub fn probe_config(&self, req: &ProbeRequest) -> Result<LlmConfig, String> {
-        let g = self.inner.read().expect("settings lock");
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let mut cfg = LlmConfig::from_env();
         if let Some(id) = req.profile_id.as_deref() {
             let p = g

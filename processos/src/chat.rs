@@ -184,7 +184,7 @@ impl ChatStore {
     pub fn create(&self, key: &str, name: Option<String>) -> ChatSession {
         self.ensure_loaded(key);
         let now = now_ms();
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let sessions = guard.entry(key.to_string()).or_default();
         let name = name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty());
         let session = ChatSession {
@@ -225,7 +225,7 @@ impl ChatStore {
     ) -> ChatSession {
         self.ensure_loaded(key);
         let now = now_ms();
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let sessions = guard.entry(key.to_string()).or_default();
         let name = name.trim();
         let name = if name.is_empty() {
@@ -267,7 +267,7 @@ impl ChatStore {
     pub fn save(&self, key: &str, session_id: &str, messages: Vec<Msg>, stamps: Vec<u64>) {
         self.ensure_loaded(key);
         let now = now_ms();
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let sessions = guard.entry(key.to_string()).or_default();
         if let Some(s) = sessions.iter_mut().find(|s| s.id == session_id) {
             s.messages = messages;
@@ -303,7 +303,7 @@ impl ChatStore {
         }
         self.ensure_loaded(key);
         let now = now_ms();
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let sessions = guard.entry(key.to_string()).or_default();
         match sessions.iter_mut().find(|s| s.id == session_id) {
             Some(s) => {
@@ -336,7 +336,7 @@ impl ChatStore {
     /// sites are untouched; callers compute it with [`extend_turn_models`] after saving.
     pub fn set_turn_models(&self, key: &str, session_id: &str, turn_models: Vec<String>) {
         self.ensure_loaded(key);
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let Some(sessions) = guard.get_mut(key) else {
             return;
         };
@@ -359,7 +359,7 @@ impl ChatStore {
         if name.is_empty() {
             return false;
         }
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let Some(sessions) = guard.get_mut(key) else {
             return false;
         };
@@ -383,7 +383,7 @@ impl ChatStore {
             return;
         }
         let now = now_ms();
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let sessions = guard.entry(key.to_string()).or_default();
         match sessions.iter_mut().find(|s| s.id == session_id) {
             Some(s) => {
@@ -414,7 +414,7 @@ impl ChatStore {
     /// Delete one session. Returns false when the id is unknown.
     pub fn delete(&self, key: &str, session_id: &str) -> bool {
         self.ensure_loaded(key);
-        let mut guard = self.mem.write().expect("chat mem poisoned");
+        let mut guard = self.mem.write().unwrap_or_else(|e| e.into_inner());
         let Some(sessions) = guard.get_mut(key) else {
             return false;
         };

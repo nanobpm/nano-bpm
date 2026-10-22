@@ -81,7 +81,7 @@ pub(crate) fn baseline_from_insights(
         None => processes
             .into_iter()
             .max_by_key(|p| p.instances)
-            .expect("non-empty checked above"),
+            .ok_or_else(|| "no sampled live traces to derive a baseline from".to_string())?,
     };
 
     let mut notes = vec![
