@@ -5,7 +5,12 @@
     "target_os": "linux",
     "target_family": "unix",
     "unix": true,
-    "windows": false
+    "windows": false,
+    "target_env": "gnu",
+    "target_vendor": "unknown",
+    "target_pointer_width": "64",
+    "target_endian": "little",
+    "panic": "unwind"
   },
   "targets": {
     "wasm32-unknown-unknown": {
@@ -13,7 +18,12 @@
       "target_os": "unknown",
       "target_family": "wasm",
       "unix": false,
-      "windows": false
+      "windows": false,
+      "target_env": "",
+      "target_vendor": "unknown",
+      "target_pointer_width": "32",
+      "target_endian": "little",
+      "panic": "abort"
     }
   },
   "entries": [
@@ -215,6 +225,20 @@
       "pred": "not(any(unix, windows))",
       "count": 1,
       "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-runtime/src/cmd_profile.rs",
+      "pred": "target_env = \"msvc\"",
+      "count": 1,
+      "reason": "Windows (MSVC)-only code: every required Clippy run is Linux x86_64 (gnu) or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-storage/src/memory.rs",
+      "pred": "target_env = \"msvc\"",
+      "count": 1,
+      "reason": "Windows (MSVC)-only code: every required Clippy run is Linux x86_64 (gnu) or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
       "trackedIn": "#1372"
     }
   ]

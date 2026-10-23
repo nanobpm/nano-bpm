@@ -22,6 +22,7 @@ import {
   requiredCheckNames,
 } from './clippy-matrix.mjs';
 
+const LIVE = loadMatrix();
 const workflow = readFileSync(join(ROOT, '.github', 'workflows', 'ci.yml'), 'utf8');
 
 test('the live matrix covers every production crate, feature and cfg, and ci.yml runs it', () => {
@@ -51,10 +52,9 @@ function fixture({ cargo, lib, entries, extra = {} }) {
   put(
     'scripts/clippy-matrix.json',
     JSON.stringify({
-      hostCfg: { target_arch: 'x86_64', target_os: 'linux', target_family: 'unix', unix: true, windows: false },
-      targets: {
-        'wasm32-unknown-unknown': { target_arch: 'wasm32', target_os: 'unknown', target_family: 'wasm', unix: false, windows: false },
-      },
+      // Derived from the live matrix (no second copy of the target model to drift).
+      hostCfg: LIVE.hostCfg,
+      targets: LIVE.targets,
       entries: entries.map((e, i) => ({ id: `e${i}`, job: 'j', dir: 'demo', target: 'host', scope: 'all-targets', features: [], ...e })),
       excludedCrates: {},
       ...extra,
@@ -98,6 +98,27 @@ test('RED: platform-only code (target_os / windows) the Linux runner never compi
   const out = gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n');
   assert.match(out, /target_os = "macos"/);
   assert.match(out, /cfg\(windows\)/);
+});
+
+test('RED: unmodelled cfg keys fail closed (target_env, target_vendor, custom --cfg)', () => {
+  const lib =
+    '#[cfg(target_env = "msvc")]\nfn a() {}\n#[cfg(target_vendor = "apple")]\nfn b() {}\n#[cfg(nano_custom)]\nfn c() {}\n';
+  const out = gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n');
+  assert.match(out, /target_env = "msvc"/);
+  assert.match(out, /target_vendor = "apple"/);
+  assert.match(out, /cfg\(nano_custom\)/);
+  // Genuinely free atoms stay reachable; modelled host keys evaluate.
+  const ok = '#[cfg(debug_assertions)]\nfn d() {}\n#[cfg(target_env = "gnu")]\nfn e() {}\n#[cfg(target_pointer_width = "64")]\nfn f() {}\n';
+  assert.deepEqual(gaps(fixture({ cargo: '', lib: ok, entries: [{}] })), []);
+});
+
+test('RED: cfg attributes not first on their line are still seen', () => {
+  const lib = '#[inline] #[cfg(windows)] fn f() {}\nstruct S { #[cfg(target_os = "macos")] x: u8 }\n';
+  const out = gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n');
+  assert.match(out, /cfg\(windows\)/);
+  assert.match(out, /target_os = "macos"/);
+  const ignored = 'const S: &str = "#[cfg(windows)]"; /* #[cfg(windows)] */ // #[cfg(windows)]\n';
+  assert.deepEqual(cfgPredicates(ignored), []);
 });
 
 test('unlintedCfg is an explicit, count-ratcheted allowlist (new sites and stale entries fail)', () => {

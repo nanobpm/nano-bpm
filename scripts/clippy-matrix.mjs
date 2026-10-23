@@ -217,11 +217,18 @@ export function entryConfigs(entry, crates, root = ROOT) {
 // --- #[cfg] predicate parsing + evaluation --------------------------------
 
 /** Every `#[cfg(P)]` / `#[cfg_attr(P, …)]` / `#![cfg(P)]` predicate P in `text`. */
-export function cfgPredicates(text) {
+export function cfgPredicates(source) {
   const out = [];
-  const re = /^[ \t]*#!?\[cfg(_attr)?\(/gm;
+  const text = stripComments(source);
+  // Attribute STARTS are located with strings blanked too, so `#[cfg(…)]`
+  // text inside a string literal (test fixtures, codegen) is not an attribute;
+  // the predicate is then read from `text`, which keeps its own `"…"` values.
+  const code = stripComments(source, { strings: true });
+  // Unanchored: attributes may follow other attributes or code on the same
+  // line (`#[inline] #[cfg(windows)] fn f() {}`, `struct S { #[cfg(x)] a: u8 }`).
+  const re = /#!?\[\s*cfg(_attr)?\s*\(/g;
   let m;
-  while ((m = re.exec(text))) {
+  while ((m = re.exec(code))) {
     let depth = 1;
     let i = m.index + m[0].length;
     const start = i;
@@ -234,6 +241,54 @@ export function cfgPredicates(text) {
     }
     if (depth !== 0) continue;
     out.push(text.slice(start, m[1] ? (end < 0 ? i - 1 : end) : i - 1).replace(/\s+/g, ' ').trim());
+  }
+  return out;
+}
+
+/**
+ * Blank out `//` and (nested) `/* … *\/` comments, preserving newlines, so
+ * cfg attributes in doc/plain comments are ignored. String and raw-string
+ * literals are skipped intact so `"//"` inside one does not start a comment
+ * (or, with `strings: true`, blanked too). Offsets are preserved.
+ */
+export function stripComments(src, { strings = false } = {}) {
+  let out = '';
+  let i = 0;
+  const n = src.length;
+  const blank = (s) => s.replace(/[^\n]/g, ' ');
+  while (i < n) {
+    const ch = src[i];
+    const raw = src.slice(i).match(/^b?r(#*)"/);
+    if (raw && !/[A-Za-z0-9_]/.test(src[i - 1] ?? '')) {
+      const close = `"${raw[1]}`;
+      const end = src.indexOf(close, i + raw[0].length);
+      const stop = end < 0 ? n : end + close.length;
+      out += strings ? blank(src.slice(i, stop)) : src.slice(i, stop);
+      i = stop;
+    } else if (ch === '"') {
+      let j = i + 1;
+      while (j < n && src[j] !== '"') j += src[j] === '\\' ? 2 : 1;
+      out += strings ? blank(src.slice(i, j + 1)) : src.slice(i, j + 1);
+      i = j + 1;
+    } else if (ch === '/' && src[i + 1] === '/') {
+      const end = src.indexOf('\n', i);
+      const stop = end < 0 ? n : end;
+      out += blank(src.slice(i, stop));
+      i = stop;
+    } else if (ch === '/' && src[i + 1] === '*') {
+      let depth = 1;
+      let j = i + 2;
+      while (j < n && depth > 0) {
+        if (src[j] === '/' && src[j + 1] === '*') (depth++, (j += 2));
+        else if (src[j] === '*' && src[j + 1] === '/') (depth--, (j += 2));
+        else j++;
+      }
+      out += blank(src.slice(i, j));
+      i = j;
+    } else {
+      out += ch;
+      i++;
+    }
   }
   return out;
 }
@@ -278,10 +333,16 @@ function parsePred(src) {
 }
 
 /**
- * Can predicate `pred` be TRUE under lint config `conf`? Atoms the config does
- * not decide (`test` on an all-targets run, `debug_assertions`, …) are free:
- * the predicate is reachable if SOME assignment of them makes it true.
+ * Can predicate `pred` be TRUE under lint config `conf`? Only the atoms in
+ * FREE_CFG_KEYS (plus `test` on an all-targets run) are free: the predicate is
+ * reachable if SOME assignment of them makes it true. Every OTHER key the
+ * target config does not define (an unmodelled target key, a custom
+ * `--cfg`) is FALSE — fail closed, so unknown cfgs surface as gaps instead of
+ * being silently counted as linted.
  */
+/** cfg atoms that genuinely vary across the lint runs' builds (debug vs release, rustdoc). */
+export const FREE_CFG_KEYS = new Set(['debug_assertions', 'doc']);
+
 export function reachable(pred, conf) {
   const ast = typeof pred === 'string' ? parsePred(pred) : pred;
   const free = new Set();
@@ -292,7 +353,8 @@ export function reachable(pred, conf) {
       const v = conf.cfg[a.key];
       return a.value === undefined ? Boolean(v) : v === a.value;
     }
-    return null;
+    if (FREE_CFG_KEYS.has(a.key) && a.value === undefined) return null;
+    return false;
   };
   const collect = (n) => {
     if (n.op) n.args.forEach(collect);
