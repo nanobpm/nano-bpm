@@ -400,3 +400,32 @@ test('RED→GREEN: weak forwarding (b?/x) counts only once the optional dep is a
   assert.doesNotMatch(mk(['fwd', 'on']), /feature = "x"/);
   assert.doesNotMatch(mk(['on', 'fwd']), /feature = "x"/);
 });
+
+test('RED→GREEN: features never forward through an inactive target-specific dependency', () => {
+  const cargo =
+    '[workspace]\nmembers = ["../b"]\n\n[target.\'cfg(windows)\'.dependencies]\nb = { path = "../b", optional = true }\n\n[features]\non = ["b/x"]\nweak = ["b?/x"]\n';
+  for (const feat of ['on', 'weak']) {
+    const root = fixture({ cargo, lib: '', entries: [{ workspace: true, features: [feat] }] });
+    mkdirSync(join(root, 'b/src'), { recursive: true });
+    writeFileSync(join(root, 'b/Cargo.toml'), `[package]\nname = "b"\n\n[features]\nx = []\n\n${LINTS}`);
+    writeFileSync(join(root, 'b/src/lib.rs'), '#[cfg(feature = "x")]\npub fn f() {}\n');
+    assert.match(gaps(root).join('\n'), /feature = "x"/, `${feat}: Linux build never compiles b/x`);
+  }
+});
+
+test('RED→GREEN: unmodelled cfg atoms fail closed even when negated', () => {
+  const conf = { features: new Set(), test: false, cfg: LIVE.hostCfg };
+  for (const p of [
+    'not(target_feature = "sse2")',
+    'not(nano_custom)',
+    'any(not(nano_other = "x"), windows)',
+    'all(unix, not(target_has_atomic = "64"))',
+  ]) {
+    assert.equal(reachable(p, conf), false, p);
+  }
+  // A modelled branch still makes a mixed predicate reachable; `test` stays free.
+  assert.equal(reachable('any(unix, not(nano_custom))', conf), true);
+  assert.equal(reachable('all(test, not(windows))', { ...conf, test: null }), true);
+  const lib = '#[cfg(not(target_feature = "sse2"))]\nfn f() {}\n';
+  assert.match(gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n'), /target_feature = "sse2"/);
+});

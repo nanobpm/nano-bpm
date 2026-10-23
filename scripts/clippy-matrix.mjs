@@ -279,12 +279,9 @@ export function entryConfigs(entry, crates, root = ROOT) {
     for (const f of pendingWeak.get(`${dir}\0${key}`) ?? []) forward(dir, key, f);
   };
   const forward = (dir, key, f) => {
+    // Only through a LIVE dependency edge: a feature definition never reaches a
+    // dependency inactive on this target (no package-name fallback — fail closed).
     for (const dep of liveDeps(dir).filter((x) => x.key === key)) enable(dep.dir, f);
-    // Not a (live) dependency of this crate: fall back to a linted package name.
-    if (!liveDeps(dir).some((x) => x.key === key)) {
-      const c = byName.get(key);
-      if (c) enable(c.dir, f);
-    }
   };
   const isLinked = (dir, key) =>
     liveDeps(dir).some((x) => x.key === key && !x.optional) || activated.get(dir).has(key);
@@ -687,7 +684,9 @@ function parsePred(src) {
  * `debug_assertions` true (every entry is a dev-profile build), `doc` false (no
  * entry runs rustdoc) — unless the target config overrides it; any key the
  * config does not define (an unmodelled target key, a custom `--cfg`) is
- * FALSE. Fail closed: release-only, rustdoc-only and unknown-cfg code
+ * UNKNOWN and universally quantified: the predicate counts as reachable only
+ * if it holds for EVERY value of the unknown atoms, so `not(unknown)` is not
+ * reachable either. Fail closed: release-only, rustdoc-only and unknown-cfg code
  * surfaces as a gap instead of being counted as linted.
  */
 export const DEFAULT_CFG = Object.freeze({ debug_assertions: true, doc: false });
@@ -703,25 +702,34 @@ export function reachable(pred, conf) {
       const v = cfg[a.key];
       return a.value === undefined ? Boolean(v) : v === a.value;
     }
-    return false;
+    return undefined; // unmodelled: unknown
   };
+  const unknown = new Set();
   const collect = (n) => {
     if (n.op) n.args.forEach(collect);
     else if (decide(n) === null) free.add(JSON.stringify(n));
+    else if (decide(n) === undefined) unknown.add(JSON.stringify(n));
   };
   collect(ast);
   const freeList = [...free];
+  const unknownList = [...unknown];
   const ev = (n, assign) => {
     if (n.op === 'all') return n.args.every((a) => ev(a, assign));
     if (n.op === 'any') return n.args.some((a) => ev(a, assign));
     if (n.op === 'not') return !ev(n.args[0], assign);
     if (n.op) throw new Error(`unknown cfg operator ${n.op}`);
     const d = decide(n);
-    return d === null ? assign.get(JSON.stringify(n)) : d;
+    return d === null || d === undefined ? assign.get(JSON.stringify(n)) : d;
   };
+  // EXISTS a value of the free atoms such that FOR ALL values of the unknown atoms it holds.
   for (let mask = 0; mask < 1 << freeList.length; mask++) {
     const assign = new Map(freeList.map((k, b) => [k, Boolean(mask & (1 << b))]));
-    if (ev(ast, assign)) return true;
+    let all = true;
+    for (let um = 0; all && um < 1 << unknownList.length; um++) {
+      unknownList.forEach((k, b) => assign.set(k, Boolean(um & (1 << b))));
+      all = ev(ast, assign);
+    }
+    if (all) return true;
   }
   return false;
 }
