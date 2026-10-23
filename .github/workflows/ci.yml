@@ -100,6 +100,9 @@ jobs:
               - 'rust-toolchain.toml'
               # The fail-open sccache wiring the processos job uses (#1325).
               - '.github/actions/sccache/**'
+              # The clippy matrix this job runs its Clippy step from (#1368).
+              - 'scripts/clippy-matrix.json'
+              - 'scripts/clippy-matrix.mjs'
               - '.github/workflows/ci.yml'
             console:
               - 'console/**'
@@ -239,8 +242,7 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: taiki-e/install-action@nextest
-      - name: Clippy
-        working-directory: engine-core
+      - name: Clippy (scripts/clippy-matrix.json, job engine-core)
         # `--features serde` is REQUIRED, not optional: the snapshot/event serde
         # derives (`cfg_attr(feature = "serde", ...)`) — and therefore the
         # `golden_serde_drift` CI drift guard (#1069) that fingerprints them — only
@@ -248,8 +250,10 @@ jobs:
         # and silently passes, letting an incompatible on-disk format ship
         # unnoticed (incident #1065). Linting `--all-targets --features serde` also
         # keeps the guard test itself under `-D warnings`. Downstream tasks
-        # (#1070/#1071) reuse this job; they do not re-add the flag.
-        run: cargo clippy --all-targets --features serde -- -D warnings
+        # (#1070/#1071) reuse this job; they do not re-add the flag. The exact
+        # permutations (serde + ffi) live in scripts/clippy-matrix.json, the
+        # single source of truth for every Clippy gate (#1368).
+        run: node scripts/clippy-matrix.mjs run --job engine-core
       - name: Test
         working-directory: engine-core
         # nextest for the unit/integration suite (process isolation,
@@ -319,55 +323,28 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y binaryen mold llvm clang
-          cc_bin=""
-          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
-            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
-          done
-          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
-          if [ -z "$cc_bin" ]; then
-            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
-          fi
-          if [ -z "$ar_bin" ]; then
-            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
-          fi
-          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
-          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
+          # The ONE definition of the wasm32 C toolchain env, shared with the
+          # Makefile's WASM_READ_MODEL_ENV and the clippy matrix (#1368).
+          scripts/wasm-cc-env.sh --github-env --require
       - name: Build + verify + emit dist
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
         run: make engine-wasm-check
-      - name: Clippy engine-wasm (wasm32, default features)
-        # Enforces the crate's #1357 `unwrap_used`/`expect_used` denies:
-        # `cargo check` (engine-wasm-check) never runs lints, so without this a
-        # new production unwrap() in engine-wasm would pass CI.
-        run: make engine-wasm-clippy
-      - name: Clippy engine-wasm --features read-model + the read-model crate (host)
-        # Enforces the #1357 `unwrap_used`/`expect_used` denies on the
-        # feature-ON surface. Lives in THIS required job (not the
-        # `engine-wasm (read-model wasm32 type-check)` job, which is absent from
-        # the AGENTS.md / .mergify.yml required-check lists) so a new production
-        # unwrap() in read-model or engine-wasm's feature-enabled code actually
-        # blocks the merge gate. Two Clippy runs (see the Makefile target): the
-        # first lints engine-wasm's own `--features read-model` surface; the
-        # second lints the standalone read-model crate directly, because Clippy
-        # does NOT lint path dependencies outside the selected package — so
-        # compiling read-model through engine-wasm's feature does not enforce
-        # read-model's own denies (read-model is in no other clippy job's
-        # workspace). Host target: the read model links the bundled native
-        # SQLite there, so no wasm C toolchain is involved.
-        run: make engine-wasm-clippy-read-model
-      - name: Clippy the read-model crate's wasm backend (wasm32)
-        # Closes the last gap in the #1357 unwrap/expect gate: the host run above
-        # selects read-model's default `native` feature (excluding
-        # `src/backend/wasm.rs` and wasm32-only paths like `store.rs::now_ms`),
-        # and the wasm32 engine-wasm Clippy selects engine-wasm WITHOUT its
-        # `read-model` feature — so a production unwrap()/expect() in the wasm
-        # read-model backend would otherwise pass CI. This run lints read-model
-        # with `--no-default-features --features wasm --target
-        # wasm32-unknown-unknown`. Needs the LLVM clang/llvm-ar exported by the
-        # install step above (the build compiles a trimmed SQLite C amalgamation
-        # to wasm32). Lives in THIS required job so it actually gates the merge.
-        run: make read-model-clippy-wasm
+      - name: Clippy gate matrix covers every crate / feature / cfg (#1368)
+        # scripts/clippy-matrix.json is the single source of truth for every
+        # Clippy -D warnings permutation (the #1357 unwrap/expect denies). This
+        # guard fails when a production crate, cargo feature or #[cfg]
+        # predicate (feature x target_arch x target_os, incl. not(...)) is
+        # compiled by no entry, when an entry's job is not a required check,
+        # or when ci.yml runs `cargo clippy` outside the matrix runner.
+        run: make clippy-matrix-guard
+      - name: Clippy (scripts/clippy-matrix.json, job engine-wasm-ffi-dist)
+        # engine-wasm (wasm32 default, wasm32 + host `read-model`) and the
+        # standalone read-model crate (host `native`, wasm32 `wasm`) — Clippy
+        # never lints path deps, so each crate needs its own run. Lives in THIS
+        # required job so it gates the merge; the wasm32 read-model entries use
+        # the CC/AR env exported by the install step above.
+        run: node scripts/clippy-matrix.mjs run --job engine-wasm-ffi-dist
       - name: Bundle-split test (each subpath emits only its own _bg.wasm)
         # Guards the dual-publish acceptance criterion (#825): bundles the lean
         # (`.`) and `/readmodel` entrypoints of the committed engine-wasm/pkg and
@@ -441,19 +418,8 @@ jobs:
           # (the wasm32 type-check escapes it only because `--target` keeps
           # target rustflags off host build scripts).
           sudo apt-get install -y llvm clang mold
-          cc_bin=""
-          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
-            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
-          done
-          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
-          if [ -z "$cc_bin" ]; then
-            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
-          fi
-          if [ -z "$ar_bin" ]; then
-            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
-          fi
-          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
-          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
+          # Same single definition as the dist/clippy builds (#1368).
+          scripts/wasm-cc-env.sh --github-env --require
       - name: Type-check engine-wasm --features read-model (wasm32)
         run: make engine-wasm-check-read-model
       - name: Test engine-wasm on the host (--features read-model)
@@ -800,9 +766,9 @@ jobs:
       - name: Re-materialise the prebuilt DuckDB lib (rust-cache prunes it)
         working-directory: processos
         run: rm -rf target/*/.fingerprint/libduckdb-sys-* target/*/build/libduckdb-sys-*
-      - name: Clippy
-        working-directory: processos
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - name: Clippy (scripts/clippy-matrix.json, job processos)
+        # `--no-default-features` (prebuilt DuckDB) — see the matrix entry.
+        run: node scripts/clippy-matrix.mjs run --job processos
       - name: Test
         working-directory: processos
         # processos is a binary crate (no lib target) => no doctests, so nextest
@@ -854,13 +820,18 @@ jobs:
         # The `console` feature embeds ../console/dist via rust-embed, but that
         # built frontend is gitignored. A stub satisfies the proc-macro so the
         # gate can clippy/test the console code without a full npm build.
-        run: mkdir -p console/dist && printf '<!doctype html>\n' > console/dist/index.html
-      - name: Clippy
-        working-directory: server
-        # `--workspace` covers the extracted member crates (ADR 0064: e.g.
-        # crates/nano-server-storage); `console` is a feature of the bin
-        # package, so with `--workspace` it must be package-scoped.
-        run: cargo clippy --workspace --all-targets --features nanobpm-gateway-rest-server/console -- -D warnings
+        # `console-observe` (linted by the clippy matrix) embeds
+        # ../console/dist-observe instead, so stub both.
+        run: |
+          for d in console/dist console/dist-observe; do
+            mkdir -p "$d" && printf '<!doctype html>\n' > "$d/index.html"
+          done
+      - name: Clippy (scripts/clippy-matrix.json, job server)
+        # Two `--workspace` permutations (covering the ADR 0064 member crates):
+        # every feature on (console, console-observe, heapprof, test-hooks) and
+        # the default headless build (the not(feature = "console") code). The
+        # list lives in scripts/clippy-matrix.json (#1368), not here.
+        run: node scripts/clippy-matrix.mjs run --job server
       - name: Test
         working-directory: server
         # Run with nextest so the heavy, timing-sensitive integration tests
