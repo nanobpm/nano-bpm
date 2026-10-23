@@ -501,7 +501,10 @@ export function fileGates(files) {
     // auto-discovered top-level tests/examples/benches target files.
     const modRs =
       /\/(mod|lib|main)\.rs$/.test(p) ||
-      /(^|\/)(src\/bin|tests|examples|benches)\/[^/]+\.rs$/.test(p);
+      /(^|\/)src\/bin\/[^/]+\.rs$/.test(p) ||
+      // tests/examples/benches are target roots only beside Cargo.toml — never
+      // a `tests/` module dir nested under `src/` (e.g. src/engine/tests/).
+      (/(^|\/)(tests|examples|benches)\/[^/]+\.rs$/.test(p) && !/(^|\/)src\//.test(p));
     const dir = modRs ? fileDir : base;
     for (const m of mods) {
       const sub = [dir, ...m.ns].join('/');

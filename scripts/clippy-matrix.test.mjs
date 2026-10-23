@@ -371,3 +371,15 @@ test('mod children of tests/examples/benches roots resolve beside the root and i
     assert.ok(g.get(`c/${kind}/child/mod.rs`), `${kind}: child inherits the rm gate`);
   }
 });
+
+test('tests/examples/benches dirs nested under src/ are ordinary modules, not target roots', () => {
+  for (const kind of ['tests', 'examples', 'benches']) {
+    const g = fileGates([
+      [`c/src/engine/${kind}/foo.rs`, '#[cfg(feature = "rm")]\nmod x;\n'],
+      [`c/src/engine/${kind}/foo/x.rs`, 'pub fn f() {}\n'],
+      [`c/src/engine/${kind}/x.rs`, 'pub fn f() {}\n'],
+    ]);
+    assert.ok(g.get(`c/src/engine/${kind}/foo/x.rs`).gate, `${kind}: nested child inherits the rm gate`);
+    assert.ok(!g.get(`c/src/engine/${kind}/x.rs`).gate, `${kind}: sibling file is not mistaken for the child`);
+  }
+});
