@@ -130,6 +130,24 @@
       "scope": "all-targets",
       "features": [],
       "why": "not(feature = \"console\") / not(feature = \"console-observe\") / not(feature = \"heapprof\") code — the headless gateway build."
+    },
+    {
+      "id": "server-runtime-isolated",
+      "job": "server",
+      "dir": "server/crates/nano-server-runtime",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [],
+      "why": "not(feature = \"console\") code in nano-server-runtime: in every workspace run nano-server-console's dependency forces `console` on (Cargo feature unification), so only an isolated package run compiles it off."
+    },
+    {
+      "id": "server-storage-isolated",
+      "job": "server",
+      "dir": "server/crates/nano-server-storage",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [],
+      "why": "not(feature = \"console\") code in nano-server-storage: in every workspace run nano-server-console's dependency forces `console` on (Cargo feature unification), so only an isolated package run compiles it off."
     }
   ],
   "excludedCrates": {

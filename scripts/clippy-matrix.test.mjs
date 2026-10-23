@@ -6,6 +6,7 @@
 // including not(...)) is compiled by no matrix entry — or when ci.yml drifts
 // from the matrix (raw `cargo clippy`, an entry whose job is not a required
 // check, or a job that never invokes its entries).
+import { execFileSync } from 'node:child_process';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
@@ -17,6 +18,7 @@ import {
   cfgPredicates,
   clippyArgs,
   coverageGaps,
+  entryEnv,
   loadMatrix,
   reachable,
   requiredCheckNames,
@@ -156,12 +158,69 @@ test('RED: stacked cfgs and enclosing gated modules are evaluated together', () 
   const root = fixture({ cargo, lib: '#[cfg(feature = "rm")]\nmod child;\n', entries });
   writeFileSync(join(root, 'demo/src/child.rs'), '#[cfg(target_arch = "wasm32")]\npub fn f() {}\n');
   assert.match(gaps(root).join('\n'), /child\.rs: #\[cfg\(target_arch = "wasm32"\)\]/);
+  // An UNGATED intermediate `mod grand;` keeps propagating the inherited gate.
+  const deep = fixture({ cargo, lib: '#[cfg(feature = "rm")]\nmod child;\n', entries });
+  writeFileSync(join(deep, 'demo/src/child.rs'), 'mod grand;\n');
+  mkdirSync(join(deep, 'demo/src/child'), { recursive: true });
+  writeFileSync(join(deep, 'demo/src/child/grand.rs'), '#[cfg(target_arch = "wasm32")]\npub fn f() {}\n');
+  assert.match(gaps(deep).join('\n'), /grand\.rs: #\[cfg\(target_arch = "wasm32"\)\]/);
   // Siblings that end before the gated item do not leak into it.
   const ok = '#[cfg(feature = "rm")]\nfn a(x: u8) {}\n#[cfg(target_arch = "wasm32")]\nfn b() {}\n';
   assert.deepEqual(gaps(fixture({ cargo, lib: ok, entries })), []);
   // A generic field's comma does not end the field; the next field's own gate still applies alone.
   const okFields = 'struct S {\n    #[cfg(feature = "rm")]\n    a: Foo<A, B>,\n    #[cfg(target_arch = "wasm32")]\n    b: u8,\n}\n';
   assert.deepEqual(gaps(fixture({ cargo, lib: okFields, entries })), []);
+});
+
+test('RED: a cfg introduced by (nested) cfg_attr gates the item', () => {
+  const cargo = '[features]\nrm = []\n';
+  const entries = [{ features: ['rm'] }, { target: 'wasm32-unknown-unknown' }];
+  const forms = {
+    direct: '#[cfg(feature = "rm")]\n#[cfg_attr(feature = "rm", cfg(target_arch = "wasm32"))]\nfn f() {}\n',
+    nested: '#[cfg(feature = "rm")]\n#[cfg_attr(feature = "rm", inline, cfg_attr(unix, cfg(target_arch = "wasm32")))]\nfn f() {}\n',
+    inner: 'mod m {\n    #![cfg(feature = "rm")]\n    #![cfg_attr(feature = "rm", cfg(target_arch = "wasm32"))]\n    #[cfg(unix)]\n    fn f() {}\n}\n',
+  };
+  for (const [name, lib] of Object.entries(forms)) {
+    assert.notDeepEqual(gaps(fixture({ cargo, lib, entries })), [], name);
+  }
+  // An attribute-only payload still gates nothing.
+  const ok = '#[cfg(feature = "rm")]\n#[cfg_attr(feature = "rm", allow(dead_code, unused))]\nfn f() {}\n';
+  assert.deepEqual(gaps(fixture({ cargo, lib: ok, entries })), []);
+});
+
+test('wasm-cc-env.sh values with spaces survive both the runner and a shell recipe', () => {
+  const env = { ...process.env, CC_wasm32_unknown_unknown: 'sccache clang', AR_wasm32_unknown_unknown: '/opt/my llvm/ar"x' };
+  const got = entryEnv({ wasmCc: true }, ROOT, env);
+  assert.equal(got.CC_wasm32_unknown_unknown, 'sccache clang');
+  assert.equal(got.AR_wasm32_unknown_unknown, '/opt/my llvm/ar"x');
+  // The Makefile splices the default output into a recipe via $(shell …) —
+  // exercise that exact path (WASM_READ_MODEL_ENV) through make itself.
+  const script = join(ROOT, 'scripts', 'wasm-cc-env.sh');
+  const mk = `E = $(shell "${script}")\nall:\n\t@$(E) sh -c 'printf "%s\\n" "$$CC_wasm32_unknown_unknown" "$$AR_wasm32_unknown_unknown"'\n`;
+  const out = execFileSync('make', ['-s', '-f', '-'], { env, input: mk, encoding: 'utf8' });
+  assert.equal(out, 'sccache clang\n/opt/my llvm/ar"x\n');
+});
+
+test('RED→GREEN: a dependency-forced feature is on in every run that links it', () => {
+  const root = fixture({ cargo: '', lib: '', entries: [] });
+  const put = (p, t) => {
+    mkdirSync(dirname(join(root, p)), { recursive: true });
+    writeFileSync(join(root, p), t);
+  };
+  put('demo/Cargo.toml', '[workspace]\nmembers = ["crates/*"]\n');
+  put('demo/crates/a/Cargo.toml', `[package]\nname = "a"\n\n[dependencies]\nb = { path = "../b", features = ["x"] }\n\n${LINTS}`);
+  put('demo/crates/a/src/lib.rs', '');
+  put('demo/crates/b/Cargo.toml', `[package]\nname = "b"\n\n[features]\nx = []\n\n${LINTS}`);
+  put('demo/crates/b/src/lib.rs', '#[cfg(not(feature = "x"))]\nfn off() {}\n');
+  const withEntries = (entries) => {
+    const m = JSON.parse(readFileSync(join(root, 'scripts/clippy-matrix.json'), 'utf8'));
+    writeFileSync(join(root, 'scripts/clippy-matrix.json'), JSON.stringify({ ...m, entries }));
+    return gaps(root).join('\n');
+  };
+  const ws = { id: 'ws', job: 'j', dir: 'demo', workspace: true, target: 'host', scope: 'all-targets', features: [] };
+  assert.match(withEntries([ws]), /crates\/b\/src\/lib\.rs: #\[cfg\(not\(feature = "x"\)\)\]/);
+  const isolated = { ...ws, id: 'b', dir: 'demo/crates/b', workspace: false };
+  assert.equal(withEntries([ws, isolated]), '');
 });
 
 test('unlintedCfg is an explicit, count-ratcheted allowlist (new sites and stale entries fail)', () => {

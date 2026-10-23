@@ -21,17 +21,25 @@
 # llvm-ar-18 / llvm-ar), taking the first clang that lists a wasm32 backend.
 #
 # Usage:
-#   scripts/wasm-cc-env.sh               print `CC_…=… AR_…=…` (nothing if absent)
+#   scripts/wasm-cc-env.sh               print shell-quoted `CC_…=… AR_…=…` assignments
+#                                        (nothing if absent) — safe to splice into a
+#                                        shell command line, e.g. a Make recipe, even
+#                                        when a value is `sccache clang` or a path
+#                                        containing spaces
+#   scripts/wasm-cc-env.sh --json        print `{"CC_…":"…","AR_…":"…"}` (lossless,
+#                                        for scripts/clippy-matrix.mjs; `{}` if absent)
 #   scripts/wasm-cc-env.sh --require     same, but exit 1 when no toolchain found
 #   scripts/wasm-cc-env.sh --github-env  also append both to "$GITHUB_ENV"
 set -euo pipefail
 
 require=0
 github_env=0
+json=0
 for arg in "$@"; do
   case "$arg" in
     --require) require=1 ;;
     --github-env) github_env=1 ;;
+    --json) json=1 ;;
     *) echo "wasm-cc-env.sh: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -63,8 +71,21 @@ if [ -z "$cc_bin" ] || [ -z "$ar_bin" ]; then
     echo "wasm-cc-env.sh: no LLVM clang with a wasm32 backend (cc='$cc_bin') and llvm-ar (ar='$ar_bin') found" >&2
     exit 1
   fi
+  if [ "$json" = 1 ]; then echo '{}'; fi
   exit 0
 fi
+
+# A newline cannot be carried by any output format ($GITHUB_ENV lines, Make's
+# $(shell)), so reject it rather than silently truncate the value.
+case "$cc_bin$ar_bin" in
+  *$'\n'*) echo "wasm-cc-env.sh: CC/AR value contains a newline" >&2; exit 1 ;;
+esac
+
+json_str() {
+  local v=${1//\\/\\\\}
+  v=${v//\"/\\\"}
+  printf '"%s"' "$v"
+}
 
 if [ "$github_env" = 1 ]; then
   : "${GITHUB_ENV:?--github-env needs GITHUB_ENV}"
@@ -73,4 +94,8 @@ if [ "$github_env" = 1 ]; then
     echo "AR_wasm32_unknown_unknown=$ar_bin"
   } >> "$GITHUB_ENV"
 fi
-echo "CC_wasm32_unknown_unknown=$cc_bin AR_wasm32_unknown_unknown=$ar_bin"
+if [ "$json" = 1 ]; then
+  printf '{"CC_wasm32_unknown_unknown":%s,"AR_wasm32_unknown_unknown":%s}\n' "$(json_str "$cc_bin")" "$(json_str "$ar_bin")"
+else
+  printf 'CC_wasm32_unknown_unknown=%q AR_wasm32_unknown_unknown=%q\n' "$cc_bin" "$ar_bin"
+fi

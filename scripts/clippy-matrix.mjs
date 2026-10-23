@@ -43,14 +43,13 @@ export function clippyArgs(entry) {
 export function entryEnv(entry, root = ROOT, baseEnv = process.env) {
   const env = { ...baseEnv, ...(entry.env ?? {}) };
   if (entry.wasmCc) {
-    const out = execFileSync(join(root, 'scripts', 'wasm-cc-env.sh'), ['--require'], {
+    // --json is lossless: a value such as `sccache clang` or a path with
+    // spaces survives intact (a whitespace split would truncate it).
+    const out = execFileSync(join(root, 'scripts', 'wasm-cc-env.sh'), ['--require', '--json'], {
       env: baseEnv,
       encoding: 'utf8',
-    }).trim();
-    for (const pair of out.split(/\s+/)) {
-      const i = pair.indexOf('=');
-      env[pair.slice(0, i)] = pair.slice(i + 1);
-    }
+    });
+    Object.assign(env, JSON.parse(out));
   }
   return env;
 }
@@ -118,6 +117,24 @@ export function readCrate(root, dir) {
   }
   const lints = tomlSection(text, 'lints.clippy');
   const workspace = tomlSection(text, 'workspace');
+  // Path dependencies' requested features: Cargo unifies them into every build
+  // that links both crates, so they are on in every run that lints the dep.
+  const deps = [];
+  for (const m of text.matchAll(/^\s*\[((?:target\.[^\]]*\.)?(dev-|build-)?dependencies)\]\s*$/gm)) {
+    for (const v of Object.values(tomlSection(text, m[1]))) {
+      const path = v.match(/\bpath\s*=\s*"([^"]+)"/);
+      if (!path || /\boptional\s*=\s*true/.test(v)) continue;
+      const fl = v.match(/\bfeatures\s*=\s*\[([^\]]*)\]/);
+      deps.push({
+        dir: join(dir, path[1]),
+        dev: m[2] === 'dev-',
+        features: [
+          ...(/\bdefault-features\s*=\s*false/.test(v) ? [] : ['default']),
+          ...(fl ? [...fl[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]) : []),
+        ],
+      });
+    }
+  }
   const members = workspace.members ? [...workspace.members.matchAll(/"([^"]+)"/g)].map((m) => m[1]) : [];
   return {
     dir,
@@ -125,6 +142,7 @@ export function readCrate(root, dir) {
     features,
     lints: Object.fromEntries(Object.entries(lints).map(([k, v]) => [k, v.replace(/"/g, '').trim()])),
     members,
+    deps,
     sources: walk(join(root, dir), (n) => n.endsWith('.rs'))
       .filter((p) => !relative(join(root, dir), p).startsWith('crates/'))
       .map((p) => relative(root, p)),
@@ -191,6 +209,15 @@ export function entryConfigs(entry, crates, root = ROOT) {
     if (!c) throw new Error(`clippy-matrix: entry ${entry.id}: unknown package in feature ${f}`);
     enable(c.dir, feat);
   }
+  // Feature unification: a linted crate's (non-optional) path dependency on
+  // another linted crate forces the requested features on (dev-dependencies
+  // only when test targets are built).
+  for (const d of linted) {
+    for (const dep of byDir.get(d)?.deps ?? []) {
+      if (dep.dev && entry.scope !== 'all-targets') continue;
+      for (const f of dep.features) enable(dep.dir, f);
+    }
+  }
   while (queue.length) {
     const [dir, feat] = queue.shift();
     const crate = byDir.get(dir);
@@ -221,6 +248,46 @@ export function cfgPredicates(source) {
   return cfgSites(source).sites.map((s) => s.pred);
 }
 
+/** Split `src` at top-level commas (outside `(…)`, `[…]` and `"…"`). */
+function splitTop(src) {
+  const out = [];
+  let d = 0;
+  let start = 0;
+  for (let i = 0; i < src.length; i++) {
+    const c = src[i];
+    if (c === '"') {
+      for (i++; i < src.length && src[i] !== '"'; i++) if (src[i] === '\\') i++;
+    } else if (c === '(' || c === '[') d++;
+    else if (c === ')' || c === ']') d--;
+    else if (c === ',' && d === 0) {
+      out.push(src.slice(start, i));
+      start = i + 1;
+    }
+  }
+  out.push(src.slice(start));
+  return out.map((x) => x.trim()).filter(Boolean);
+}
+
+/**
+ * The item-inclusion condition a `cfg_attr(P, attrs…)` argument list imposes:
+ * each `cfg(Q)` in `attrs` (also inside nested `cfg_attr`) excludes the item
+ * unless `Q` holds whenever `P` does, i.e. contributes `any(not(P), Q)`.
+ * `undefined` when the payload carries no `cfg`.
+ */
+export function cfgAttrGate(args) {
+  const [p, ...attrs] = splitTop(args);
+  const parts = [];
+  for (const a of attrs) {
+    const m = a.match(/^(cfg|cfg_attr)\s*\(([\s\S]*)\)$/);
+    if (!m) continue;
+    const q = m[1] === 'cfg' ? m[2].trim() : cfgAttrGate(m[2]);
+    if (q !== undefined) parts.push(`any(not(${p}), ${q})`);
+  }
+  return andPred(parts);
+}
+
+const MOD_DECL = /^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/;
+
 const andPred = (parts) => {
   const p = parts.filter((x) => x !== undefined);
   return p.length === 0 ? undefined : p.length === 1 ? p[0] : `all(${p.join(', ')})`;
@@ -234,8 +301,9 @@ const andPred = (parts) => {
  * `gate`, so `#[cfg(a)] #[cfg(b)]` on one item is `all(a, b)`, not two
  * independently-reachable atoms. `mods` lists out-of-line `mod name;`
  * declarations with their gate, so the caller can propagate it to the child
- * file. `#[cfg_attr(p, …)]` gates only the attribute, so it is checked but
- * never added to the item's gate.
+ * file. `#[cfg_attr(p, …)]` normally gates only the attribute, so its own
+ * predicate is never added to the item's gate — but a `cfg(q)` in its payload
+ * (directly or via nested `cfg_attr`) adds `any(not(p), q)` (see cfgAttrGate).
  */
 export function cfgSites(source) {
   const text = stripComments(source);
@@ -255,10 +323,10 @@ export function cfgSites(source) {
   const flush = (item) => {
     const own = andPred(pending.map((p) => p.pred));
     const gate = andPred([scopeGate(), own]);
-    for (const p of pending) p.site.gate = gate;
+    for (const p of pending) if (p.site) p.site.gate = gate;
     for (const s of pendingAttrOnly) s.gate = andPred([gate, s.pred]);
     if (item) {
-      const m = item.match(/^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/);
+      const m = item.match(MOD_DECL);
       if (m) mods.push({ name: m[1], gate });
     }
     pending = [];
@@ -295,15 +363,19 @@ export function cfgSites(source) {
           const pred = text.slice(from, cm[1] ? (comma < 0 ? k - 1 : comma) : k - 1).replace(/\s+/g, ' ').trim();
           const site = { pred, gate: undefined };
           sites.push(site);
+          // A `cfg_attr` whose payload is (or nests) a `cfg` gates the item too.
+          const attrGate = cm[1] ? cfgAttrGate(text.slice(from, k - 1)) : undefined;
           if (attr[1]) {
             // Inner attribute: gates the enclosing scope (or the whole file).
             const top = scopes[scopes.length - 1];
-            top.gate = andPred([top.gate, cm[1] ? undefined : pred]);
+            top.gate = andPred([top.gate, cm[1] ? attrGate : pred]);
             site.gate = andPred([scopeGate(), cm[1] ? pred : undefined]);
           } else {
             if (pending.length + pendingAttrOnly.length === 0) pendingDepth = scopes.length;
-            if (cm[1]) pendingAttrOnly.push(site);
-            else pending.push({ pred, site });
+            if (cm[1]) {
+              pendingAttrOnly.push(site);
+              if (attrGate !== undefined) pending.push({ pred: attrGate });
+            } else pending.push({ pred, site });
           }
         }
       }
@@ -338,6 +410,11 @@ export function cfgSites(source) {
       if (atItem && ends) {
         flush(code.slice(itemStart, i + 1));
         angle = 0;
+      } else if (!has && ch === ';') {
+        // An ungated `mod child;` still links child into the module tree, so
+        // the enclosing scope's gate (and the file's) propagates through it.
+        const m = code.slice(itemStart, i + 1).match(MOD_DECL);
+        if (m) mods.push({ name: m[1], gate: scopeGate() });
       }
       if (!(pending.length + pendingAttrOnly.length)) itemStart = i + 1;
     }
