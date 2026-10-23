@@ -15,7 +15,7 @@
 //   node scripts/clippy-matrix.mjs run --job <ci-job>   # entries of one CI job
 //   node scripts/clippy-matrix.mjs run --id <id> [--id <id>…]
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -251,6 +251,7 @@ export function entryConfigs(entry, crates, root = ROOT) {
     features: enabled.get(dir),
     cfg: targetCfg,
     test: entry.scope === 'all-targets' ? null : false, // null = both (lib + test builds)
+    libOnly: entry.scope !== 'all-targets', // `--lib` compiles only the src/lib.rs module tree
   }));
 }
 
@@ -330,6 +331,12 @@ export function cfgSites(source) {
   const scopes = [{ close: null, gate: undefined, list: false }];
   let angle = 0; // `<…>` generics depth at the current item's own level
   let pending = []; // { pred, site? } cfgs on the not-yet-started item
+  let pendingPath; // `#[path = "…"]` on the not-yet-started item
+  // Enclosing inline-module names: `mod outer { mod child; }` loads outer/child.rs.
+  const ns = () => scopes.filter((s) => s.mod).map((s) => s.mod);
+  const pushMod = (name, gate) => {
+    mods.push({ name, gate, ns: ns(), path: pendingPath });
+  };
   let pendingAttrOnly = []; // cfg_attr sites awaiting the item's gate
   let pendingDepth = 0;
   const scopeGate = () => andPred(scopes.map((s) => s.gate));
@@ -340,7 +347,7 @@ export function cfgSites(source) {
     for (const s of pendingAttrOnly) s.gate = andPred([gate, s.pred]);
     if (item) {
       const m = item.match(MOD_DECL);
-      if (m) mods.push({ name: m[1], gate });
+      if (m) pushMod(m[1], gate);
     }
     pending = [];
     pendingAttrOnly = [];
@@ -361,6 +368,10 @@ export function cfgSites(source) {
         else if (code[j] === ']') depth--;
       }
       const inner = code.slice(i + attr[0].length, j - 1);
+      if (!attr[1] && /^\s*path\s*=/.test(inner)) {
+        const pm = text.slice(i + attr[0].length, j - 1).match(/^\s*path\s*=\s*"([^"]*)"/);
+        pendingPath = pm ? pm[1] : '\0unparsed';
+      }
       const cm = inner.match(/^\s*cfg(_attr)?\s*\(/);
       if (cm) {
         const from = i + attr[0].length + cm[0].length;
@@ -407,7 +418,9 @@ export function cfgSites(source) {
       const list = ch !== '{' || /\b(?:struct|enum|union)\b/.test(code.slice(itemStart, i));
       const own = ch === '{' && atItem ? flush(code.slice(itemStart, i)) : undefined;
       if (ch === '{' && atItem) angle = 0;
-      scopes.push({ close: OPEN[ch], gate: own, list });
+      const inlineMod = ch === '{' ? code.slice(itemStart, i).match(/\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*$/) : null;
+      scopes.push({ close: OPEN[ch], gate: own, list, mod: inlineMod ? inlineMod[1] : undefined });
+      if (ch === '{') pendingPath = undefined;
       if (!has || ch === '{') itemStart = i + 1;
     } else if (ch === '}' || ch === ')' || ch === ']') {
       if (has && scopes.length <= pendingDepth) {
@@ -427,8 +440,9 @@ export function cfgSites(source) {
         // An ungated `mod child;` still links child into the module tree, so
         // the enclosing scope's gate (and the file's) propagates through it.
         const m = code.slice(itemStart, i + 1).match(MOD_DECL);
-        if (m) mods.push({ name: m[1], gate: scopeGate() });
+        if (m) pushMod(m[1], scopeGate());
       }
+      if (ch === ';') pendingPath = undefined;
       if (!(pending.length + pendingAttrOnly.length)) itemStart = i + 1;
     }
     i++;
@@ -448,13 +462,34 @@ export function fileGates(files) {
   const parent = new Map(); // child path -> { from, gate }
   for (const [p, { mods }] of byPath) {
     const base = p.replace(/\.rs$/, '');
-    const dir = /\/(mod|lib|main)\.rs$/.test(p) ? p.replace(/\/[^/]+$/, '') : base;
+    const fileDir = p.replace(/\/[^/]+$/, '');
+    const modRs = /\/(mod|lib|main)\.rs$/.test(p) || /\/src\/bin\/[^/]+\.rs$/.test(p);
+    const dir = modRs ? fileDir : base;
     for (const m of mods) {
-      for (const c of [`${dir}/${m.name}.rs`, `${dir}/${m.name}/mod.rs`]) {
+      const sub = [dir, ...m.ns].join('/');
+      let cands;
+      if (m.path !== undefined) {
+        // `#[path]`: relative to the file's dir (or, inside inline modules, the
+        // module-namespace dir) — normalise `..` / `.` segments.
+        const from = m.ns.length ? sub : fileDir;
+        const segs = [];
+        for (const s of `${from}/${m.path}`.split('/')) {
+          if (s === '..') segs.pop();
+          else if (s !== '.' && s !== '') segs.push(s);
+        }
+        cands = [segs.join('/')];
+      } else cands = [`${sub}/${m.name}.rs`, `${sub}/${m.name}/mod.rs`];
+      for (const c of cands) {
         if (byPath.has(c)) parent.set(c, { from: p, gate: m.gate });
       }
     }
   }
+  const rootOf = (p, seen = new Set()) => {
+    const up = parent.get(p);
+    if (!up || seen.has(p)) return p;
+    seen.add(p);
+    return rootOf(up.from, seen);
+  };
   const memo = new Map();
   const gateOf = (p, seen = new Set()) => {
     if (memo.has(p)) return memo.get(p);
@@ -467,7 +502,7 @@ export function fileGates(files) {
     memo.set(p, g);
     return g;
   };
-  return new Map([...byPath].map(([p, s]) => [p, { gate: gateOf(p), sites: s.sites }]));
+  return new Map([...byPath].map(([p, s]) => [p, { gate: gateOf(p), sites: s.sites, root: rootOf(p) }]));
 }
 
 /**
@@ -665,7 +700,11 @@ export function coverageGaps({ root = ROOT, matrix = loadMatrix(root), crates, w
       // covered only if EVERY one of its sites — under its combined gate
       // (sibling cfgs + enclosing scopes + the file's `mod` gate) — is.
       const counts = new Map();
-      const { gate: fileGate, sites } = gated.get(path);
+      const { gate: fileGate, sites, root: owner } = gated.get(path);
+      // A `--lib` entry compiles only files owned by the crate's src/lib.rs
+      // tree; bins / tests / examples / benches need an all-targets entry.
+      const inLib = owner === join(crate.dir, 'src', 'lib.rs');
+      const owners = mine.filter((c) => inLib || !c.libOnly);
       for (const s of sites) {
         const e = counts.get(s.pred) ?? { count: 0, gates: [] };
         e.count++;
@@ -676,7 +715,7 @@ export function coverageGaps({ root = ROOT, matrix = loadMatrix(root), crates, w
         const key = `${path}\0${pred}`;
         const allowed = unlinted.get(key);
         unlinted.delete(key);
-        if (gates.every((g) => mine.some((c) => reachable(g, c)))) {
+        if (gates.every((g) => owners.some((c) => reachable(g, c)))) {
           if (allowed) gaps.push(`${path}: unlintedCfg entry #[cfg(${pred})] is now covered — remove it (stale)`);
           continue;
         }
@@ -785,7 +824,18 @@ function main(argv) {
   return 0;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+/** True when this module is the launched script — compared on canonical paths,
+ * since Node resolves `import.meta.url` through symlinks but keeps argv[1] as given. */
+export function isMain(argv1, url = import.meta.url) {
+  if (!argv1) return false;
+  try {
+    return realpathSync(fileURLToPath(url)) === realpathSync(argv1);
+  } catch {
+    return false;
+  }
+}
+
+if (isMain(process.argv[1])) {
   try {
     process.exit(main(process.argv.slice(2)));
   } catch (err) {

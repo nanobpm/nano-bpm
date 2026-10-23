@@ -9,7 +9,7 @@
 import { execFileSync } from 'node:child_process';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -19,6 +19,7 @@ import {
   clippyArgs,
   coverageGaps,
   entryEnv,
+  isMain,
   loadMatrix,
   reachable,
   requiredCheckNames,
@@ -170,6 +171,43 @@ test('RED: stacked cfgs and enclosing gated modules are evaluated together', () 
   // A generic field's comma does not end the field; the next field's own gate still applies alone.
   const okFields = 'struct S {\n    #[cfg(feature = "rm")]\n    a: Foo<A, B>,\n    #[cfg(target_arch = "wasm32")]\n    b: u8,\n}\n';
   assert.deepEqual(gaps(fixture({ cargo, lib: okFields, entries })), []);
+});
+
+test('RED: inline-module namespaces and #[path] modules keep their inherited gate', () => {
+  const cargo = '[features]\nrm = []\n';
+  const entries = [{ features: ['rm'] }, { target: 'wasm32-unknown-unknown' }];
+  const child = '#[cfg(target_arch = "wasm32")]\npub fn f() {}\n';
+  const inline = fixture({ cargo, lib: '#[cfg(feature = "rm")]\nmod outer {\n    mod child;\n}\n', entries });
+  mkdirSync(join(inline, 'demo/src/outer'), { recursive: true });
+  writeFileSync(join(inline, 'demo/src/outer/child.rs'), child);
+  assert.match(gaps(inline).join('\n'), /outer\/child\.rs: #\[cfg\(target_arch = "wasm32"\)\]/);
+  const pathed = fixture({ cargo, lib: '#[cfg(feature = "rm")]\n#[path = "different.rs"]\nmod child;\n', entries });
+  writeFileSync(join(pathed, 'demo/src/different.rs'), child);
+  assert.match(gaps(pathed).join('\n'), /different\.rs: #\[cfg\(target_arch = "wasm32"\)\]/);
+});
+
+test('RED: a --lib entry cannot cover code owned by a binary target', () => {
+  const root = fixture({
+    cargo: '',
+    lib: 'pub fn ok() {}\n',
+    entries: [{}, { target: 'wasm32-unknown-unknown', scope: 'lib' }],
+  });
+  mkdirSync(join(root, 'demo/src/bin'), { recursive: true });
+  writeFileSync(join(root, 'demo/src/bin/tool.rs'), '#[cfg(target_arch = "wasm32")]\nfn f() {}\nfn main() {}\n');
+  assert.match(gaps(root).join('\n'), /bin\/tool\.rs: #\[cfg\(target_arch = "wasm32"\)\]/);
+  // The same site in the lib tree IS covered by the wasm32 --lib entry.
+  const libOk = fixture({ cargo: '', lib: '#[cfg(target_arch = "wasm32")]\nfn f() {}\n', entries: [{}, { target: 'wasm32-unknown-unknown', scope: 'lib' }] });
+  assert.deepEqual(gaps(libOk), []);
+});
+
+test('RED: a symlinked launch still runs main', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'clippy-matrix-link-'));
+  const link = join(dir, 'clippy-matrix.mjs');
+  symlinkSync(join(ROOT, 'scripts', 'clippy-matrix.mjs'), link);
+  assert.ok(isMain(link));
+  const out = execFileSync(process.execPath, [link, 'list'], { encoding: 'utf8' });
+  assert.equal(out.trim().split('\n').length, LIVE.entries.length);
+  assert.ok(!isMain(join(dir, 'missing.mjs')));
 });
 
 test('RED: a cfg introduced by (nested) cfg_attr gates the item', () => {
