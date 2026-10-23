@@ -321,3 +321,23 @@ test('cfg predicate extraction + reachability', () => {
   assert.equal(reachable('all(test, feature = "a")', { ...conf, test: false }), false);
   assert.equal(reachable('not(unix)', conf), false);
 });
+
+test('RED→GREEN: [[bin]] after [features] does not leak target keys into features', () => {
+  const cargo = '[features]\nextra = []\n\n[[bin]]\nname = "tool"\npath = "src/bin/tool.rs"\n';
+  const root = fixture({ cargo, lib: '', entries: [{ features: ['extra'] }] });
+  mkdirSync(join(root, 'demo/src/bin'), { recursive: true });
+  writeFileSync(join(root, 'demo/src/bin/tool.rs'), 'fn main() {}\n');
+  assert.deepEqual(gaps(root), []);
+});
+
+test('RED→GREEN: a target is covered only by an entry enabling ALL its required-features', () => {
+  const cargo = '[features]\na = []\nb = []\n\n[[bin]]\nname = "tool"\nrequired-features = ["a", "b"]\n';
+  const mk = (entries) => {
+    const root = fixture({ cargo, lib: '', entries });
+    mkdirSync(join(root, 'demo/src/bin'), { recursive: true });
+    writeFileSync(join(root, 'demo/src/bin/tool.rs'), '#[cfg(unix)]\nfn f() {}\nfn main() {}\n');
+    return root;
+  };
+  assert.match(gaps(mk([{ features: ['a'] }, { features: ['b'] }])).join('\n'), /bin\/tool\.rs: #\[cfg\(unix\)\]/);
+  assert.deepEqual(gaps(mk([{ features: ['a', 'b'] }])), []);
+});

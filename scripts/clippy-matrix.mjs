@@ -88,9 +88,11 @@ function tomlSection(text, section) {
   for (const raw of lines) {
     const line = raw.replace(/\s+#.*$/, '').trimEnd();
     if (/^\s*#/.test(raw)) continue;
-    const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    // `[[bin]]`-style array-of-table headers also end the current section
+    // (and never match a plain `[section]` name).
+    const header = line.match(/^\s*\[(\[)?([^\]]+)\](\])?\s*$/);
     if (header) {
-      inside = header[1].trim() === section;
+      inside = !header[1] && !header[3] && header[2].trim() === section;
       key = null;
       continue;
     }
@@ -104,6 +106,37 @@ function tomlSection(text, section) {
     }
   }
   return out;
+}
+
+/** Every `[[name]]` array-of-tables entry as a `key -> raw value` object. */
+function tomlTables(text, name) {
+  const out = [];
+  const parts = text.split(/^(?=\s*\[)/m);
+  for (const part of parts) {
+    const h = part.match(/^\s*\[\[([^\]]+)\]\]\s*$/m);
+    if (!h || h[1].trim() !== name) continue;
+    out.push(tomlSection(`[__t]\n${part.slice(h.index + h[0].length)}`, '__t'));
+  }
+  return out;
+}
+
+/**
+ * `required-features` per non-lib target root file (crate-relative path):
+ * Cargo silently skips such a target unless ALL of them are enabled.
+ */
+function targetRequirements(text) {
+  const req = new Map();
+  const defaults = { bin: (n) => [`src/bin/${n}.rs`, `src/bin/${n}/main.rs`, 'src/main.rs'], example: (n) => [`examples/${n}.rs`, `examples/${n}/main.rs`], test: (n) => [`tests/${n}.rs`, `tests/${n}/main.rs`], bench: (n) => [`benches/${n}.rs`, `benches/${n}/main.rs`] };
+  for (const [kind, paths] of Object.entries(defaults)) {
+    for (const t of tomlTables(text, kind)) {
+      const feats = t['required-features'] ? [...t['required-features'].matchAll(/"([^"]+)"/g)].map((m) => m[1]) : [];
+      if (!feats.length) continue;
+      const path = t.path?.match(/"([^"]+)"/)?.[1];
+      const name = t.name?.match(/"([^"]+)"/)?.[1];
+      for (const p of path ? [path] : name ? paths(name) : []) req.set(p.replace(/^\.\//, ''), feats);
+    }
+  }
+  return req;
 }
 
 /** Parse one crate's Cargo.toml into the facts the guard needs. */
@@ -148,6 +181,7 @@ export function readCrate(root, dir) {
     lints: Object.fromEntries(Object.entries(lints).map(([k, v]) => [k, v.replace(/"/g, '').trim()])),
     members,
     deps,
+    targetReqs: targetRequirements(text),
     sources: walk(join(root, dir), (n) => n.endsWith('.rs'))
       .filter((p) => !relative(join(root, dir), p).startsWith('crates/'))
       .map((p) => relative(root, p)),
@@ -704,7 +738,10 @@ export function coverageGaps({ root = ROOT, matrix = loadMatrix(root), crates, w
       // A `--lib` entry compiles only files owned by the crate's src/lib.rs
       // tree; bins / tests / examples / benches need an all-targets entry.
       const inLib = owner === join(crate.dir, 'src', 'lib.rs');
-      const owners = mine.filter((c) => inLib || !c.libOnly);
+      // A target with `required-features` is skipped by any run that does not
+      // enable every one of them.
+      const req = crate.targetReqs.get(relative(crate.dir, owner)) ?? [];
+      const owners = mine.filter((c) => (inLib || !c.libOnly) && req.every((f) => c.features.has(f)));
       for (const s of sites) {
         const e = counts.get(s.pred) ?? { count: 0, gates: [] };
         e.count++;
