@@ -121,6 +121,43 @@ test('RED: cfg attributes not first on their line are still seen', () => {
   assert.deepEqual(cfgPredicates(ignored), []);
 });
 
+test('RED: a char / byte-char literal holding a quote does not hide later cfgs', () => {
+  for (const lit of [`'"'`, `b'"'`, `'\\''`, `b'\\"'`]) {
+    const src = `const Q: char = ${lit};\n#[cfg(windows)]\nfn f<'a>(x: &'a str) {}\n`;
+    assert.deepEqual(cfgPredicates(src), ['windows'], lit);
+  }
+  const lib = `const Q: char = '"';\n#[cfg(windows)]\nfn f() {}\n`;
+  assert.match(gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n'), /cfg\(windows\)/);
+});
+
+test('RED: release-only and rustdoc-only code is not counted as linted', () => {
+  const lib = '#[cfg(not(debug_assertions))]\nfn a() {}\n#[cfg(doc)]\nfn b() {}\n';
+  const out = gaps(fixture({ cargo: '', lib, entries: [{}] })).join('\n');
+  assert.match(out, /not\(debug_assertions\)/);
+  assert.match(out, /cfg\(doc\)/);
+});
+
+test('RED: stacked cfgs and enclosing gated modules are evaluated together', () => {
+  const cargo = '[features]\nrm = []\n';
+  const entries = [{ features: ['rm'] }, { target: 'wasm32-unknown-unknown' }];
+  const forms = {
+    stacked: '#[cfg(feature = "rm")]\n#[cfg(target_arch = "wasm32")]\nfn f() {}\n',
+    inlineMod: '#[cfg(feature = "rm")]\nmod m {\n    #[cfg(target_arch = "wasm32")]\n    fn f(a: u8, b: [u8; 2]) {}\n}\n',
+    innerAttr: 'mod m {\n    #![cfg(feature = "rm")]\n    #[cfg(target_arch = "wasm32")]\n    fn f() {}\n}\n',
+    fnBody: '#[cfg(feature = "rm")]\nfn g(a: u8, b: u8) {\n    #[cfg(target_arch = "wasm32")]\n    let x = 1;\n}\n',
+  };
+  for (const [name, lib] of Object.entries(forms)) {
+    assert.match(gaps(fixture({ cargo, lib, entries })).join('\n'), /target_arch = "wasm32"/, name);
+  }
+  // External `#[cfg(..)] mod child;` gates the child file.
+  const root = fixture({ cargo, lib: '#[cfg(feature = "rm")]\nmod child;\n', entries });
+  writeFileSync(join(root, 'demo/src/child.rs'), '#[cfg(target_arch = "wasm32")]\npub fn f() {}\n');
+  assert.match(gaps(root).join('\n'), /child\.rs: #\[cfg\(target_arch = "wasm32"\)\]/);
+  // Siblings that end before the gated item do not leak into it.
+  const ok = '#[cfg(feature = "rm")]\nfn a(x: u8) {}\n#[cfg(target_arch = "wasm32")]\nfn b() {}\n';
+  assert.deepEqual(gaps(fixture({ cargo, lib: ok, entries })), []);
+});
+
 test('unlintedCfg is an explicit, count-ratcheted allowlist (new sites and stale entries fail)', () => {
   const lib = '#[cfg(windows)]\nfn a() {}\n';
   const allow = (count) => ({ unlintedCfg: [{ file: 'demo/src/lib.rs', pred: 'windows', count, reason: 'r' }] });

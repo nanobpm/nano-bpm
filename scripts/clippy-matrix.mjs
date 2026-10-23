@@ -218,31 +218,150 @@ export function entryConfigs(entry, crates, root = ROOT) {
 
 /** Every `#[cfg(P)]` / `#[cfg_attr(P, …)]` / `#![cfg(P)]` predicate P in `text`. */
 export function cfgPredicates(source) {
-  const out = [];
+  return cfgSites(source).sites.map((s) => s.pred);
+}
+
+const andPred = (parts) => {
+  const p = parts.filter((x) => x !== undefined);
+  return p.length === 0 ? undefined : p.length === 1 ? p[0] : `all(${p.join(', ')})`;
+};
+
+/**
+ * Every `#[cfg]` / `#[cfg_attr]` site in `source`, each with `gate`: the
+ * COMBINED condition under which that site is compiled — its own predicate
+ * AND every sibling `#[cfg]` stacked on the same item AND every enclosing
+ * gated scope (`#[cfg(x)] mod m { … }`, `#![cfg(x)]`). Coverage is decided on
+ * `gate`, so `#[cfg(a)] #[cfg(b)]` on one item is `all(a, b)`, not two
+ * independently-reachable atoms. `mods` lists out-of-line `mod name;`
+ * declarations with their gate, so the caller can propagate it to the child
+ * file. `#[cfg_attr(p, …)]` gates only the attribute, so it is checked but
+ * never added to the item's gate.
+ */
+export function cfgSites(source) {
   const text = stripComments(source);
-  // Attribute STARTS are located with strings blanked too, so `#[cfg(…)]`
-  // text inside a string literal (test fixtures, codegen) is not an attribute;
-  // the predicate is then read from `text`, which keeps its own `"…"` values.
+  // Attribute starts / item structure are scanned with strings + char
+  // literals blanked; predicates are read from `text`, which keeps `"…"`.
   const code = stripComments(source, { strings: true });
-  // Unanchored: attributes may follow other attributes or code on the same
-  // line (`#[inline] #[cfg(windows)] fn f() {}`, `struct S { #[cfg(x)] a: u8 }`).
-  const re = /#!?\[\s*cfg(_attr)?\s*\(/g;
-  let m;
-  while ((m = re.exec(code))) {
-    let depth = 1;
-    let i = m.index + m[0].length;
-    const start = i;
-    let end = -1;
-    for (; i < text.length && depth > 0; i++) {
-      const ch = text[i];
-      if (ch === '(') depth++;
-      else if (ch === ')') depth--;
-      else if (ch === ',' && depth === 1 && m[1] && end < 0) end = i;
+  const sites = [];
+  const mods = [];
+  const scopes = [{ close: null, gate: undefined }]; // brace/paren/bracket stack
+  let pending = []; // { pred, site? } cfgs on the not-yet-started item
+  let pendingAttrOnly = []; // cfg_attr sites awaiting the item's gate
+  let pendingDepth = 0;
+  const scopeGate = () => andPred(scopes.map((s) => s.gate));
+  const flush = (item) => {
+    const own = andPred(pending.map((p) => p.pred));
+    const gate = andPred([scopeGate(), own]);
+    for (const p of pending) p.site.gate = gate;
+    for (const s of pendingAttrOnly) s.gate = andPred([gate, s.pred]);
+    if (item) {
+      const m = item.match(/^\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/);
+      if (m) mods.push({ name: m[1], gate });
     }
-    if (depth !== 0) continue;
-    out.push(text.slice(start, m[1] ? (end < 0 ? i - 1 : end) : i - 1).replace(/\s+/g, ' ').trim());
+    pending = [];
+    pendingAttrOnly = [];
+    return own;
+  };
+  const OPEN = { '{': '}', '(': ')', '[': ']' };
+  let itemStart = 0;
+  let i = 0;
+  while (i < code.length) {
+    const rest = code.slice(i, i + 64);
+    const attr = rest.match(/^#(!?)\[/);
+    if (attr) {
+      // Find the attribute's closing bracket.
+      let depth = 1;
+      let j = i + attr[0].length;
+      for (; j < code.length && depth > 0; j++) {
+        if (code[j] === '[') depth++;
+        else if (code[j] === ']') depth--;
+      }
+      const inner = code.slice(i + attr[0].length, j - 1);
+      const cm = inner.match(/^\s*cfg(_attr)?\s*\(/);
+      if (cm) {
+        const from = i + attr[0].length + cm[0].length;
+        let d = 1;
+        let k = from;
+        let comma = -1;
+        for (; k < j && d > 0; k++) {
+          if (text[k] === '(') d++;
+          else if (text[k] === ')') d--;
+          else if (text[k] === ',' && d === 1 && cm[1] && comma < 0) comma = k;
+        }
+        if (d === 0) {
+          const pred = text.slice(from, cm[1] ? (comma < 0 ? k - 1 : comma) : k - 1).replace(/\s+/g, ' ').trim();
+          const site = { pred, gate: undefined };
+          sites.push(site);
+          if (attr[1]) {
+            // Inner attribute: gates the enclosing scope (or the whole file).
+            const top = scopes[scopes.length - 1];
+            top.gate = andPred([top.gate, cm[1] ? undefined : pred]);
+            site.gate = andPred([scopeGate(), cm[1] ? pred : undefined]);
+          } else {
+            if (pending.length + pendingAttrOnly.length === 0) pendingDepth = scopes.length;
+            if (cm[1]) pendingAttrOnly.push(site);
+            else pending.push({ pred, site });
+          }
+        }
+      }
+      i = j;
+      itemStart = i; // the item text (e.g. `mod name;`) starts after its attributes
+      continue;
+    }
+    const ch = code[i];
+    const has = pending.length + pendingAttrOnly.length > 0;
+    // Only punctuation at the item's own nesting level ends it: `fn f(a, b)`
+    // or `[u8; 4]` inside the item must not flush its pending gate.
+    const atItem = has && scopes.length === pendingDepth;
+    if (OPEN[ch]) {
+      const own = ch === '{' && atItem ? flush(code.slice(itemStart, i)) : undefined;
+      scopes.push({ close: OPEN[ch], gate: own });
+      if (!has || ch === '{') itemStart = i + 1;
+    } else if (ch === '}' || ch === ')' || ch === ']') {
+      if (has && scopes.length <= pendingDepth) flush(code.slice(itemStart, i));
+      if (scopes.length > 1 && scopes[scopes.length - 1].close === ch) scopes.pop();
+      if (!(pending.length + pendingAttrOnly.length)) itemStart = i + 1;
+    } else if (ch === ';' || ch === ',') {
+      if (atItem) flush(code.slice(itemStart, i + 1));
+      if (!(pending.length + pendingAttrOnly.length)) itemStart = i + 1;
+    }
+    i++;
   }
-  return out;
+  if (pending.length + pendingAttrOnly.length) flush(code.slice(itemStart));
+  for (const s of sites) if (s.gate === undefined) s.gate = s.pred;
+  return { sites, mods };
+}
+
+/**
+ * The cfg gate each source file inherits from the `#[cfg(x)] mod name;`
+ * declarations that include it (transitively), keyed by repo-relative path.
+ * Files no declaration reaches (crate roots, bins, tests) get no gate.
+ */
+export function fileGates(files) {
+  const byPath = new Map(files.map(([p, t]) => [p, cfgSites(t)]));
+  const parent = new Map(); // child path -> { from, gate }
+  for (const [p, { mods }] of byPath) {
+    const base = p.replace(/\.rs$/, '');
+    const dir = /\/(mod|lib|main)\.rs$/.test(p) ? p.replace(/\/[^/]+$/, '') : base;
+    for (const m of mods) {
+      for (const c of [`${dir}/${m.name}.rs`, `${dir}/${m.name}/mod.rs`]) {
+        if (byPath.has(c)) parent.set(c, { from: p, gate: m.gate });
+      }
+    }
+  }
+  const memo = new Map();
+  const gateOf = (p, seen = new Set()) => {
+    if (memo.has(p)) return memo.get(p);
+    const up = parent.get(p);
+    let g;
+    if (up && !seen.has(p)) {
+      seen.add(p);
+      g = andPred([gateOf(up.from, seen), up.gate]);
+    }
+    memo.set(p, g);
+    return g;
+  };
+  return new Map([...byPath].map(([p, s]) => [p, { gate: gateOf(p), sites: s.sites }]));
 }
 
 /**
@@ -265,6 +384,16 @@ export function stripComments(src, { strings = false } = {}) {
       const stop = end < 0 ? n : end + close.length;
       out += strings ? blank(src.slice(i, stop)) : src.slice(i, stop);
       i = stop;
+    } else if (
+      (ch === "'" || (ch === 'b' && src[i + 1] === "'" && !/[A-Za-z0-9_]/.test(src[i - 1] ?? ''))) &&
+      /^b?'(?:\\(?:u\{[0-9A-Fa-f_]{1,8}\}|x[0-9A-Fa-f]{2}|.)|[^\\'\n])'/.test(src.slice(i, i + 16))
+    ) {
+      // A char / byte-char literal (`'"'`, `b'\''`) — skipped whole so its
+      // quote never opens a phantom string. A lifetime (`'a`) has no closing
+      // quote, so it falls through as plain code.
+      const lit = src.slice(i, i + 16).match(/^b?'(?:\\(?:u\{[0-9A-Fa-f_]{1,8}\}|x[0-9A-Fa-f]{2}|.)|[^\\'\n])'/)[0];
+      out += strings ? blank(lit) : lit;
+      i += lit.length;
     } else if (ch === '"') {
       let j = i + 1;
       while (j < n && src[j] !== '"') j += src[j] === '\\' ? 2 : 1;
@@ -333,27 +462,29 @@ function parsePred(src) {
 }
 
 /**
- * Can predicate `pred` be TRUE under lint config `conf`? Only the atoms in
- * FREE_CFG_KEYS (plus `test` on an all-targets run) are free: the predicate is
- * reachable if SOME assignment of them makes it true. Every OTHER key the
- * target config does not define (an unmodelled target key, a custom
- * `--cfg`) is FALSE — fail closed, so unknown cfgs surface as gaps instead of
- * being silently counted as linted.
+ * Can predicate `pred` be TRUE under lint config `conf`? Only `test` on an
+ * all-targets run is free (clippy --all-targets compiles both the lib and its
+ * test harness): the predicate is reachable if SOME value of it makes it true.
+ * Every other key takes the value the matrix's actual builds give it —
+ * `debug_assertions` true (every entry is a dev-profile build), `doc` false (no
+ * entry runs rustdoc) — unless the target config overrides it; any key the
+ * config does not define (an unmodelled target key, a custom `--cfg`) is
+ * FALSE. Fail closed: release-only, rustdoc-only and unknown-cfg code
+ * surfaces as a gap instead of being counted as linted.
  */
-/** cfg atoms that genuinely vary across the lint runs' builds (debug vs release, rustdoc). */
-export const FREE_CFG_KEYS = new Set(['debug_assertions', 'doc']);
+export const DEFAULT_CFG = Object.freeze({ debug_assertions: true, doc: false });
 
 export function reachable(pred, conf) {
   const ast = typeof pred === 'string' ? parsePred(pred) : pred;
   const free = new Set();
   const decide = (a) => {
     if (a.key === 'feature') return conf.features.has(a.value);
-    if (a.key === 'test') return conf.test;
-    if (a.key in conf.cfg) {
-      const v = conf.cfg[a.key];
+    if (a.key === 'test') return a.value === undefined ? conf.test : false;
+    const cfg = { ...DEFAULT_CFG, ...conf.cfg };
+    if (a.key in cfg) {
+      const v = cfg[a.key];
       return a.value === undefined ? Boolean(v) : v === a.value;
     }
-    if (FREE_CFG_KEYS.has(a.key) && a.value === undefined) return null;
     return false;
   };
   const collect = (n) => {
@@ -413,6 +544,7 @@ export function coverageGaps({ root = ROOT, matrix = loadMatrix(root), crates, w
     }
     const exempt = matrix.exemptFeatures?.[crate.dir] ?? {};
     const texts = crate.sources.map((p) => [p, readFileSync(join(root, p), 'utf8')]);
+    const gated = fileGates(texts);
     for (const f of Object.keys(crate.features)) {
       if (f === 'default') continue;
       if (f in exempt) {
@@ -423,13 +555,22 @@ export function coverageGaps({ root = ROOT, matrix = loadMatrix(root), crates, w
       if (!mine.some((c) => c.features.has(f))) gaps.push(`crate ${crate.dir}: feature "${f}" is enabled by no clippy-matrix entry`);
     }
     for (const [path, text] of texts) {
+      // Keyed by the site's own predicate (the allowlist's unit); a pred is
+      // covered only if EVERY one of its sites — under its combined gate
+      // (sibling cfgs + enclosing scopes + the file's `mod` gate) — is.
       const counts = new Map();
-      for (const pred of cfgPredicates(text)) counts.set(pred, (counts.get(pred) ?? 0) + 1);
-      for (const [pred, count] of counts) {
+      const { gate: fileGate, sites } = gated.get(path);
+      for (const s of sites) {
+        const e = counts.get(s.pred) ?? { count: 0, gates: [] };
+        e.count++;
+        e.gates.push(andPred([fileGate, s.gate]));
+        counts.set(s.pred, e);
+      }
+      for (const [pred, { count, gates }] of counts) {
         const key = `${path}\0${pred}`;
         const allowed = unlinted.get(key);
         unlinted.delete(key);
-        if (mine.some((c) => reachable(pred, c))) {
+        if (gates.every((g) => mine.some((c) => reachable(g, c)))) {
           if (allowed) gaps.push(`${path}: unlintedCfg entry #[cfg(${pred})] is now covered — remove it (stale)`);
           continue;
         }
