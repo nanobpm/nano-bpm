@@ -341,3 +341,22 @@ test('RED→GREEN: a target is covered only by an entry enabling ALL its require
   assert.match(gaps(mk([{ features: ['a'] }, { features: ['b'] }])).join('\n'), /bin\/tool\.rs: #\[cfg\(unix\)\]/);
   assert.deepEqual(gaps(mk([{ features: ['a', 'b'] }])), []);
 });
+
+test('RED→GREEN: a target skipped by every entry is a gap even with no cfg sites', () => {
+  const cargo = '[features]\na = []\nb = []\n\n[[bin]]\nname = "tool"\nrequired-features = ["a", "b"]\n';
+  const mk = (entries) => {
+    const root = fixture({ cargo, lib: '', entries });
+    mkdirSync(join(root, 'demo/src/bin'), { recursive: true });
+    writeFileSync(join(root, 'demo/src/bin/tool.rs'), 'fn main() { None::<u8>.unwrap(); }\n');
+    return root;
+  };
+  assert.match(gaps(mk([{ features: ['a'] }, { features: ['b'] }])).join('\n'), /bin\/tool\.rs.*compiled by no clippy-matrix entry/);
+  assert.deepEqual(gaps(mk([{ features: ['a', 'b'] }])), []);
+});
+
+test('RED→GREEN: a non-lib target with only --lib entries is a gap even with no cfg sites', () => {
+  const root = fixture({ cargo: '', lib: '', entries: [{ scope: 'lib' }] });
+  mkdirSync(join(root, 'demo/src/bin'), { recursive: true });
+  writeFileSync(join(root, 'demo/src/bin/tool.rs'), 'fn main() {}\n');
+  assert.match(gaps(root).join('\n'), /bin\/tool\.rs.*compiled by no clippy-matrix entry/);
+});

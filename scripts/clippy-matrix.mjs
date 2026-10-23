@@ -720,6 +720,7 @@ export function coverageGaps({ root = ROOT, matrix = loadMatrix(root), crates, w
     const exempt = matrix.exemptFeatures?.[crate.dir] ?? {};
     const texts = crate.sources.map((p) => [p, readFileSync(join(root, p), 'utf8')]);
     const gated = fileGates(texts);
+    const uncovered = new Set();
     for (const f of Object.keys(crate.features)) {
       if (f === 'default') continue;
       if (f in exempt) {
@@ -742,6 +743,15 @@ export function coverageGaps({ root = ROOT, matrix = loadMatrix(root), crates, w
       // enable every one of them.
       const req = crate.targetReqs.get(relative(crate.dir, owner)) ?? [];
       const owners = mine.filter((c) => (inLib || !c.libOnly) && req.every((f) => c.features.has(f)));
+      // Coverage of the TARGET itself, independent of cfg sites: a file with
+      // no #[cfg] at all is still unlinted if every entry skips its target.
+      if (owners.length === 0) {
+        const t = relative(root, owner);
+        if (!uncovered.has(t)) {
+          uncovered.add(t);
+          gaps.push(`${t}: target is compiled by no clippy-matrix entry for ${crate.dir}` + (req.length ? ` (required-features ${req.join(', ')})` : ''));
+        }
+      }
       for (const s of sites) {
         const e = counts.get(s.pred) ?? { count: 0, gates: [] };
         e.count++;
