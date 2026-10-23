@@ -19,6 +19,7 @@ import {
   clippyArgs,
   coverageGaps,
   entryEnv,
+  fileGates,
   isMain,
   loadMatrix,
   reachable,
@@ -359,4 +360,14 @@ test('RED→GREEN: a non-lib target with only --lib entries is a gap even with n
   mkdirSync(join(root, 'demo/src/bin'), { recursive: true });
   writeFileSync(join(root, 'demo/src/bin/tool.rs'), 'fn main() {}\n');
   assert.match(gaps(root).join('\n'), /bin\/tool\.rs.*compiled by no clippy-matrix entry/);
+});
+
+test('mod children of tests/examples/benches roots resolve beside the root and inherit its gate', () => {
+  for (const kind of ['tests', 'examples', 'benches']) {
+    const g = fileGates([
+      [`c/${kind}/tool.rs`, '#[cfg(feature = "rm")]\nmod child;\n'],
+      [`c/${kind}/child/mod.rs`, 'pub fn f() {}\n'],
+    ]);
+    assert.ok(g.get(`c/${kind}/child/mod.rs`), `${kind}: child inherits the rm gate`);
+  }
 });

@@ -497,7 +497,11 @@ export function fileGates(files) {
   for (const [p, { mods }] of byPath) {
     const base = p.replace(/\.rs$/, '');
     const fileDir = p.replace(/\/[^/]+$/, '');
-    const modRs = /\/(mod|lib|main)\.rs$/.test(p) || /\/src\/bin\/[^/]+\.rs$/.test(p);
+    // Crate roots own their directory: lib/main/mod.rs, src/bin/*.rs, and the
+    // auto-discovered top-level tests/examples/benches target files.
+    const modRs =
+      /\/(mod|lib|main)\.rs$/.test(p) ||
+      /(^|\/)(src\/bin|tests|examples|benches)\/[^/]+\.rs$/.test(p);
     const dir = modRs ? fileDir : base;
     for (const m of mods) {
       const sub = [dir, ...m.ns].join('/');
