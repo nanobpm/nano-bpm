@@ -383,3 +383,20 @@ test('tests/examples/benches dirs nested under src/ are ordinary modules, not ta
     assert.ok(!g.get(`c/src/engine/${kind}/x.rs`).gate, `${kind}: sibling file is not mistaken for the child`);
   }
 });
+
+test('RED→GREEN: weak forwarding (b?/x) counts only once the optional dep is activated', () => {
+  const cargo =
+    '[workspace]\nmembers = ["../b"]\n\n[dependencies]\nb = { path = "../b", optional = true }\n\n[features]\nfwd = ["b?/x"]\non = ["dep:b"]\n';
+  const mk = (features) => {
+    const root = fixture({ cargo, lib: '', entries: [{ workspace: true, features }] });
+    mkdirSync(join(root, 'b/src'), { recursive: true });
+    writeFileSync(join(root, 'b/Cargo.toml'), `[package]\nname = "b"\n\n[features]\nx = []\n\n${LINTS}`);
+    writeFileSync(join(root, 'b/src/lib.rs'), '#[cfg(feature = "x")]\npub fn f() {}\n');
+    return gaps(root).join('\n');
+  };
+  // Inactive optional dep: `fwd` alone must NOT count b/x as linted.
+  assert.match(mk(['fwd']), /feature = "x"/);
+  // Activated (`dep:b`) in either order: the weak forward now applies.
+  assert.doesNotMatch(mk(['fwd', 'on']), /feature = "x"/);
+  assert.doesNotMatch(mk(['on', 'fwd']), /feature = "x"/);
+});

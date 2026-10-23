@@ -158,11 +158,15 @@ export function readCrate(root, dir) {
     // dependency only exists (and only unifies features) on matching targets.
     const t = m[2]?.trim().replace(/^['"]|['"]$/g, '');
     const target = t === undefined ? null : t.startsWith('cfg(') ? { cfg: t.slice(4, -1) } : { triple: t };
-    for (const v of Object.values(tomlSection(text, m[1]))) {
+    for (const [key, v] of Object.entries(tomlSection(text, m[1]))) {
       const path = v.match(/\bpath\s*=\s*"([^"]+)"/);
-      if (!path || /\boptional\s*=\s*true/.test(v)) continue;
+      if (!path) continue;
       const fl = v.match(/\bfeatures\s*=\s*\[([^\]]*)\]/);
       deps.push({
+        // Optional deps are linked only once activated (`dep:k`, `k/f`, or the
+        // implicit feature `k`); `key` is the name feature forwarding uses.
+        key: key.trim().replace(/^['"]|['"]$/g, ''),
+        optional: /\boptional\s*=\s*true/.test(v),
         dir: join(dir, path[1]),
         dev: m[3] === 'dev-',
         target,
@@ -258,25 +262,57 @@ export function entryConfigs(entry, crates, root = ROOT) {
     if (!c) throw new Error(`clippy-matrix: entry ${entry.id}: unknown package in feature ${f}`);
     enable(c.dir, feat);
   }
-  // Feature unification: a linted crate's (non-optional) path dependency on
-  // another linted crate forces the requested features on (dev-dependencies
-  // only when test targets are built).
+  // Feature unification: a linted crate's path dependency on another linted
+  // crate forces the requested features on (dev-dependencies only when test
+  // targets are built). Optional deps unify only once activated, and weak
+  // forwarding `k?/f` enables `f` only if `k` is activated by something else
+  // (fail closed: never counted as coverage on its own).
+  const liveDeps = (d) =>
+    (byDir.get(d)?.deps ?? []).filter((dep) => !(dep.dev && entry.scope !== 'all-targets') && depActive(dep.target));
+  const activated = new Map(linted.map((d) => [d, new Set()])); // crate dir -> activated optional dep keys
+  const pendingWeak = new Map(); // `${dir}\0${key}` -> [feat]
+  const activate = (dir, key) => {
+    const deps = liveDeps(dir).filter((dep) => dep.key === key && dep.optional);
+    if (!deps.length || activated.get(dir).has(key)) return;
+    activated.get(dir).add(key);
+    for (const dep of deps) for (const f of dep.features) enable(dep.dir, f);
+    for (const f of pendingWeak.get(`${dir}\0${key}`) ?? []) forward(dir, key, f);
+  };
+  const forward = (dir, key, f) => {
+    for (const dep of liveDeps(dir).filter((x) => x.key === key)) enable(dep.dir, f);
+    // Not a (live) dependency of this crate: fall back to a linted package name.
+    if (!liveDeps(dir).some((x) => x.key === key)) {
+      const c = byName.get(key);
+      if (c) enable(c.dir, f);
+    }
+  };
+  const isLinked = (dir, key) =>
+    liveDeps(dir).some((x) => x.key === key && !x.optional) || activated.get(dir).has(key);
   for (const d of linted) {
-    for (const dep of byDir.get(d)?.deps ?? []) {
-      if (dep.dev && entry.scope !== 'all-targets') continue;
-      if (!depActive(dep.target)) continue;
+    for (const dep of liveDeps(d)) {
+      if (dep.optional) continue;
       for (const f of dep.features) enable(dep.dir, f);
     }
   }
   while (queue.length) {
     const [dir, feat] = queue.shift();
     const crate = byDir.get(dir);
+    if (!crate?.features[feat]) activate(dir, feat); // implicit feature of an optional dep
     for (const imp of crate?.features[feat] ?? []) {
-      if (imp.startsWith('dep:')) continue;
-      if (imp.includes('/')) {
-        const [pkg, f] = imp.replace('?', '').split('/');
-        const c = byName.get(pkg);
-        if (c) enable(c.dir, f);
+      if (imp.startsWith('dep:')) activate(dir, imp.slice(4));
+      else if (imp.includes('/')) {
+        const [k, f] = imp.split('/');
+        if (k.endsWith('?')) {
+          const key = k.slice(0, -1);
+          if (isLinked(dir, key)) forward(dir, key, f);
+          else {
+            const id = `${dir}\0${key}`;
+            pendingWeak.set(id, [...(pendingWeak.get(id) ?? []), f]);
+          }
+        } else {
+          activate(dir, k);
+          forward(dir, k, f);
+        }
       } else enable(dir, imp);
     }
   }
