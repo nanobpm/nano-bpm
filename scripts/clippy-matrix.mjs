@@ -244,7 +244,10 @@ export function cfgSites(source) {
   const code = stripComments(source, { strings: true });
   const sites = [];
   const mods = [];
-  const scopes = [{ close: null, gate: undefined }]; // brace/paren/bracket stack
+  // brace/paren/bracket stack; `list` scopes (struct/enum/union bodies, `(…)`,
+  // `[…]`) are the only ones where a `,` separates items.
+  const scopes = [{ close: null, gate: undefined, list: false }];
+  let angle = 0; // `<…>` generics depth at the current item's own level
   let pending = []; // { pred, site? } cfgs on the not-yet-started item
   let pendingAttrOnly = []; // cfg_attr sites awaiting the item's gate
   let pendingDepth = 0;
@@ -313,16 +316,29 @@ export function cfgSites(source) {
     // Only punctuation at the item's own nesting level ends it: `fn f(a, b)`
     // or `[u8; 4]` inside the item must not flush its pending gate.
     const atItem = has && scopes.length === pendingDepth;
+    if (atItem && ch === '<') angle++;
+    else if (atItem && ch === '>' && code[i - 1] !== '-' && code[i - 1] !== '=' && angle > 0) angle--;
     if (OPEN[ch]) {
+      const list = ch !== '{' || /\b(?:struct|enum|union)\b/.test(code.slice(itemStart, i));
       const own = ch === '{' && atItem ? flush(code.slice(itemStart, i)) : undefined;
-      scopes.push({ close: OPEN[ch], gate: own });
+      if (ch === '{' && atItem) angle = 0;
+      scopes.push({ close: OPEN[ch], gate: own, list });
       if (!has || ch === '{') itemStart = i + 1;
     } else if (ch === '}' || ch === ')' || ch === ']') {
-      if (has && scopes.length <= pendingDepth) flush(code.slice(itemStart, i));
+      if (has && scopes.length <= pendingDepth) {
+        flush(code.slice(itemStart, i));
+        angle = 0;
+      }
       if (scopes.length > 1 && scopes[scopes.length - 1].close === ch) scopes.pop();
       if (!(pending.length + pendingAttrOnly.length)) itemStart = i + 1;
     } else if (ch === ';' || ch === ',') {
-      if (atItem) flush(code.slice(itemStart, i + 1));
+      // A `,` inside generics (`impl<A, B>`, `Foo<A, B>`) or a where-clause
+      // (outside a list scope) does not end the item.
+      const ends = ch === ';' || (scopes[scopes.length - 1].list && angle === 0);
+      if (atItem && ends) {
+        flush(code.slice(itemStart, i + 1));
+        angle = 0;
+      }
       if (!(pending.length + pendingAttrOnly.length)) itemStart = i + 1;
     }
     i++;

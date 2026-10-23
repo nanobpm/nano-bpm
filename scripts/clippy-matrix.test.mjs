@@ -144,6 +144,9 @@ test('RED: stacked cfgs and enclosing gated modules are evaluated together', () 
     stacked: '#[cfg(feature = "rm")]\n#[cfg(target_arch = "wasm32")]\nfn f() {}\n',
     inlineMod: '#[cfg(feature = "rm")]\nmod m {\n    #[cfg(target_arch = "wasm32")]\n    fn f(a: u8, b: [u8; 2]) {}\n}\n',
     innerAttr: 'mod m {\n    #![cfg(feature = "rm")]\n    #[cfg(target_arch = "wasm32")]\n    fn f() {}\n}\n',
+    genericImpl: '#[cfg(feature = "rm")]\nimpl<A, B> T for S<A, B> {\n    #[cfg(target_arch = "wasm32")]\n    fn f() {}\n}\n',
+    genericFn: '#[cfg(feature = "rm")]\nfn g<A, B>() -> Vec<(A, B)> {\n    #[cfg(target_arch = "wasm32")]\n    let x = 1;\n}\n',
+    whereClause: 'impl S {\n    #[cfg(feature = "rm")]\n    fn g<A>() where A: X, B: Y {\n        #[cfg(target_arch = "wasm32")]\n        let x = 1;\n    }\n}\n',
     fnBody: '#[cfg(feature = "rm")]\nfn g(a: u8, b: u8) {\n    #[cfg(target_arch = "wasm32")]\n    let x = 1;\n}\n',
   };
   for (const [name, lib] of Object.entries(forms)) {
@@ -156,6 +159,9 @@ test('RED: stacked cfgs and enclosing gated modules are evaluated together', () 
   // Siblings that end before the gated item do not leak into it.
   const ok = '#[cfg(feature = "rm")]\nfn a(x: u8) {}\n#[cfg(target_arch = "wasm32")]\nfn b() {}\n';
   assert.deepEqual(gaps(fixture({ cargo, lib: ok, entries })), []);
+  // A generic field's comma does not end the field; the next field's own gate still applies alone.
+  const okFields = 'struct S {\n    #[cfg(feature = "rm")]\n    a: Foo<A, B>,\n    #[cfg(target_arch = "wasm32")]\n    b: u8,\n}\n';
+  assert.deepEqual(gaps(fixture({ cargo, lib: okFields, entries })), []);
 });
 
 test('unlintedCfg is an explicit, count-ratcheted allowlist (new sites and stale entries fail)', () => {
