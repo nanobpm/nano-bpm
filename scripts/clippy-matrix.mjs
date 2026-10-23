@@ -120,14 +120,19 @@ export function readCrate(root, dir) {
   // Path dependencies' requested features: Cargo unifies them into every build
   // that links both crates, so they are on in every run that lints the dep.
   const deps = [];
-  for (const m of text.matchAll(/^\s*\[((?:target\.[^\]]*\.)?(dev-|build-)?dependencies)\]\s*$/gm)) {
+  for (const m of text.matchAll(/^\s*\[((?:target\.([^\]]*)\.)?(dev-|build-)?dependencies)\]\s*$/gm)) {
+    // `[target.'cfg(P)'.dependencies]` / `[target.TRIPLE.dependencies]`: the
+    // dependency only exists (and only unifies features) on matching targets.
+    const t = m[2]?.trim().replace(/^['"]|['"]$/g, '');
+    const target = t === undefined ? null : t.startsWith('cfg(') ? { cfg: t.slice(4, -1) } : { triple: t };
     for (const v of Object.values(tomlSection(text, m[1]))) {
       const path = v.match(/\bpath\s*=\s*"([^"]+)"/);
       if (!path || /\boptional\s*=\s*true/.test(v)) continue;
       const fl = v.match(/\bfeatures\s*=\s*\[([^\]]*)\]/);
       deps.push({
         dir: join(dir, path[1]),
-        dev: m[2] === 'dev-',
+        dev: m[3] === 'dev-',
+        target,
         features: [
           ...(/\bdefault-features\s*=\s*false/.test(v) ? [] : ['default']),
           ...(fl ? [...fl[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]) : []),
@@ -193,6 +198,16 @@ export function entryConfigs(entry, crates, root = ROOT) {
   const rootCrate = byDir.get(entry.dir) ?? readCrate(root, entry.dir);
   const linted = [rootCrate.dir];
   if (entry.workspace) linted.push(...workspaceMembers(root, rootCrate));
+  const matrix = loadMatrix(root);
+  const targetCfg = entry.target === 'host' ? matrix.hostCfg : matrix.targets[entry.target];
+  if (!targetCfg) throw new Error(`clippy-matrix: entry ${entry.id}: unknown target ${entry.target}`);
+  // Fail closed: a target-specific dependency counts only when its condition
+  // provably holds for this entry's target (an unknown triple never does).
+  const depActive = (t) =>
+    !t ||
+    (t.cfg !== undefined
+      ? reachable(t.cfg, { features: new Set(), test: false, cfg: targetCfg })
+      : t.triple === (entry.target === 'host' ? matrix.hostTriple : entry.target));
   const enabled = new Map(linted.map((d) => [d, new Set()]));
   const queue = [];
   const enable = (dir, feat) => {
@@ -215,6 +230,7 @@ export function entryConfigs(entry, crates, root = ROOT) {
   for (const d of linted) {
     for (const dep of byDir.get(d)?.deps ?? []) {
       if (dep.dev && entry.scope !== 'all-targets') continue;
+      if (!depActive(dep.target)) continue;
       for (const f of dep.features) enable(dep.dir, f);
     }
   }
@@ -230,9 +246,6 @@ export function entryConfigs(entry, crates, root = ROOT) {
       } else enable(dir, imp);
     }
   }
-  const matrix = loadMatrix(root);
-  const targetCfg = entry.target === 'host' ? matrix.hostCfg : matrix.targets[entry.target];
-  if (!targetCfg) throw new Error(`clippy-matrix: entry ${entry.id}: unknown target ${entry.target}`);
   return linted.map((dir) => ({
     dir,
     features: enabled.get(dir),
@@ -722,6 +735,7 @@ export function parseJobs(workflow) {
     }
     if (/^\S/.test(line)) break;
     if (!cur) continue;
+    if (/^\s*#/.test(line)) continue; // a commented-out step does not run
     const n = line.match(/^ {4}name:\s*['"]?(.*?)['"]?\s*$/);
     if (n) cur.name = n[1];
     cur.body += `${line}\n`;

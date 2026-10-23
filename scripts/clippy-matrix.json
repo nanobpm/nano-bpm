@@ -1,5 +1,6 @@
 {
   "$comment": "THE single source of truth for every Clippy (-D warnings) permutation that gates the #1357 unwrap_used/expect_used denies (#1368). Run locally with `make clippy-matrix` (or `node scripts/clippy-matrix.mjs run --job <job>|--id <id>`); ci.yml invokes the SAME runner per required job and contains no `cargo clippy` of its own. scripts/clippy-matrix.test.mjs (run in the required engine-wasm-ffi-dist job) fails when a production crate, a declared cargo feature, or a #[cfg]/#[cfg_attr] predicate (feature x target_arch x target_os, incl. not(...)) exists that no entry compiles, or when an entry's job is not a required check. `job` = the ci.yml job key; `target` = `host` (the ubuntu x86_64 CI runner) or a rustc triple; `scope` = `lib` (--lib) or `all-targets`; `wasmCc` = needs the LLVM wasm32 C toolchain env from scripts/wasm-cc-env.sh; `env` = extra env vars for the run. `unlintedCfg` is the explicit, count-ratcheted list of #[cfg] sites no permutation can compile (each with a reason / tracking issue); the guard fails on new sites, higher counts, or stale entries.",
+  "hostTriple": "x86_64-unknown-linux-gnu",
   "hostCfg": {
     "target_arch": "x86_64",
     "target_os": "linux",

@@ -223,6 +223,27 @@ test('RED→GREEN: a dependency-forced feature is on in every run that links it'
   assert.equal(withEntries([ws, isolated]), '');
 });
 
+test('RED: an inactive target-specific dependency cannot satisfy feature coverage', () => {
+  for (const tgt of ["'cfg(windows)'", 'x86_64-pc-windows-msvc']) {
+    const root = fixture({ cargo: '', lib: '', entries: [] });
+    const put = (p, t) => {
+      mkdirSync(dirname(join(root, p)), { recursive: true });
+      writeFileSync(join(root, p), t);
+    };
+    put('demo/Cargo.toml', '[workspace]\nmembers = ["crates/*"]\n');
+    put('demo/crates/a/Cargo.toml', `[package]\nname = "a"\n\n[target.${tgt}.dependencies]\nb = { path = "../b", features = ["x"] }\n\n${LINTS}`);
+    put('demo/crates/a/src/lib.rs', '');
+    put('demo/crates/b/Cargo.toml', `[package]\nname = "b"\n\n[features]\nx = []\n\n${LINTS}`);
+    put('demo/crates/b/src/lib.rs', '#[cfg(feature = "x")]\nfn on() {}\n');
+    const m = JSON.parse(readFileSync(join(root, 'scripts/clippy-matrix.json'), 'utf8'));
+    const ws = { id: 'ws', job: 'j', dir: 'demo', workspace: true, target: 'host', scope: 'all-targets', features: [] };
+    writeFileSync(join(root, 'scripts/clippy-matrix.json'), JSON.stringify({ ...m, entries: [ws] }));
+    const out = gaps(root).join('\n');
+    assert.match(out, /feature "x" is enabled by no clippy-matrix entry/, tgt);
+    assert.match(out, /crates\/b\/src\/lib\.rs: #\[cfg\(feature = "x"\)\]/, tgt);
+  }
+});
+
 test('unlintedCfg is an explicit, count-ratcheted allowlist (new sites and stale entries fail)', () => {
   const lib = '#[cfg(windows)]\nfn a() {}\n';
   const allow = (count) => ({ unlintedCfg: [{ file: 'demo/src/lib.rs', pred: 'windows', count, reason: 'r' }] });
@@ -245,6 +266,10 @@ test('RED: ci.yml drift — raw cargo clippy, unrequired job, job not invoking i
   const run = (w, req = required) => coverageGaps({ root, workflow: w, requiredJobNames: req }).join('\n');
   assert.match(run(wf('      - run: cargo clippy -- -D warnings\n')), /runs `cargo clippy` directly/);
   assert.match(run(wf('      - run: echo\n')), /does not run `node scripts\/clippy-matrix.mjs run --job j`/);
+  assert.match(
+    run(wf('      # - run: node scripts/clippy-matrix.mjs run --job j\n      - run: echo\n')),
+    /does not run `node scripts\/clippy-matrix.mjs run --job j`/,
+  );
   assert.match(run(wf('      - run: node scripts/clippy-matrix.mjs run --job j\n'), new Set()), /not a required check/);
   assert.equal(run(wf('      - run: node scripts/clippy-matrix.mjs run --job j\n')), '');
 });
