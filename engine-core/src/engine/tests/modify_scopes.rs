@@ -1030,3 +1030,241 @@ fn an_incident_parked_multi_instance_body_is_not_a_flow_scope() {
     );
     assert!(eiks(&engine, inst, "impl").is_empty());
 }
+
+// ---- Element-local variables at completion / on joins / on retries ---------
+
+fn seeded(element_id: &str, locals: &[(&str, Value)]) -> ActivateElementInstruction {
+    ActivateElementInstruction {
+        element_id: element_id.into(),
+        variable_instructions: vec![VariableInstruction {
+            variables: vars(locals),
+            scope_id: Some(element_id.into()),
+        }],
+        ..Default::default()
+    }
+}
+
+/// A script task's completion-time expression reads the element's own
+/// (seeded) scope: the element-local `x` shadows the root `x`.
+#[test]
+fn completion_time_script_reads_element_local_variables() {
+    let def = ProcessBuilder::new("seeded-script")
+        .start_event("s")
+        .service_task("a", "jobA")
+        .script_task("t", "=x + 1", "y")
+        .service_task("w", "jobW")
+        .connect("s", "a")
+        .connect("a", "t")
+        .connect("t", "w")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, vars(&[("x", Value::Int(1))]));
+    engine
+        .apply_command(modify(inst, vec![seeded("t", &[("x", Value::Int(41))])]))
+        .unwrap();
+    assert_eq!(
+        engine.instance(inst).unwrap().variables.get("y"),
+        Some(&Value::Int(42)),
+        "the script must evaluate against its element-local scope"
+    );
+}
+
+/// A gateway's flow selection reads the gateway's own (seeded) scope.
+#[test]
+fn gateway_selection_reads_element_local_variables() {
+    let def = ProcessBuilder::new("seeded-gw")
+        .start_event("s")
+        .service_task("a", "jobA")
+        .exclusive_gateway("g")
+        .service_task("yes", "jobYes")
+        .service_task("no", "jobNo")
+        .connect("s", "a")
+        .connect("a", "g")
+        .connect_when("g", "yes", "=x = 41")
+        .connect_default("g", "no")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, vars(&[("x", Value::Int(1))]));
+    engine
+        .apply_command(modify(inst, vec![seeded("g", &[("x", Value::Int(41))])]))
+        .unwrap();
+    assert_eq!(eiks(&engine, inst, "yes").len(), 1, "took the local branch");
+    assert!(eiks(&engine, inst, "no").is_empty());
+}
+
+/// `start -> fork -> {a(ja), b(jb)} -> join(parallel) -> done(jd)`.
+fn parallel_join() -> ProcessDefinition {
+    ProcessBuilder::new("pjoin")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .parallel_gateway("join")
+        .service_task("done", "jd")
+        .connect("start", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "done")
+        .build()
+        .unwrap()
+}
+
+/// A seeded join activation is queued behind the command's terminations like
+/// every other activation: terminating the waiting join and activating it with
+/// locals in one command must not fire it on the cancelled arrival.
+#[test]
+fn seeded_join_activation_runs_after_terminations() {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, parallel_join(), HashMap::new());
+    complete_all(&mut engine, "ja");
+    assert_eq!(eiks(&engine, inst, "join").len(), 1, "join is waiting");
+    let events = engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![seeded("join", &[("l", Value::Int(1))])],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec!["join".into()],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        activated(&events, "done"),
+        0,
+        "join fired on a cancelled arrival: {events:?}"
+    );
+    let join = eiks(&engine, inst, "join");
+    assert_eq!(join.len(), 1, "the activation waits on a fresh join");
+    assert_eq!(
+        engine.instance(inst).unwrap().scope_variables[&join[0]].get("l"),
+        Some(&Value::Int(1)),
+        "the waiting join keeps its locals"
+    );
+}
+
+/// `start -> fork -> {a(ja), b(jb)} -> join(inclusive) -> yes [=l = 1] | no`.
+fn inclusive_join() -> ProcessDefinition {
+    ProcessBuilder::new("ijoin")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .inclusive_gateway("join")
+        .service_task("yes", "jyes")
+        .service_task("no", "jno")
+        .connect("start", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect_when("join", "yes", "=l = 1")
+        .connect_default("join", "no")
+        .build()
+        .unwrap()
+}
+
+/// Reusing a waiting join (which emits no `ElementActivated`) still seeds it
+/// before it completes and routes.
+#[test]
+fn reused_waiting_join_routes_with_its_locals() {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, inclusive_join(), HashMap::new());
+    complete_all(&mut engine, "ja");
+    assert_eq!(eiks(&engine, inst, "join").len(), 1, "join is waiting");
+    engine
+        .apply_command(modify(inst, vec![seeded("join", &[("l", Value::Int(1))])]))
+        .unwrap();
+    assert_eq!(eiks(&engine, inst, "yes").len(), 1, "routed on the local");
+    assert!(eiks(&engine, inst, "no").is_empty());
+}
+
+/// A fresh join accepted on its first activation is seeded before it routes.
+#[test]
+fn fresh_join_routes_with_its_locals() {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, inclusive_join(), HashMap::new());
+    complete_all(&mut engine, "ja");
+    complete_all(&mut engine, "jb");
+    // Both branches arrived without the local: the default route was taken.
+    assert_eq!(eiks(&engine, inst, "no").len(), 1);
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![seeded("join", &[("l", Value::Int(1))])],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec!["no".into()],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    assert_eq!(eiks(&engine, inst, "yes").len(), 1, "routed on the local");
+}
+
+/// A call activity seeded with element-local variables keeps them on a spawn
+/// retry: the re-driven input mapping evaluates in the element's own view.
+#[test]
+fn call_activity_spawn_retry_keeps_element_locals() {
+    let child = ProcessBuilder::new("phase")
+        .start_event("pstart")
+        .service_task("work", "child-work")
+        .end_event("pend")
+        .connect("pstart", "work")
+        .connect("work", "pend")
+        .build()
+        .unwrap();
+    let parent = ProcessBuilder::new("orch")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .call_activity("c1", "phase")
+        .with_io(
+            "c1",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=local + missing".to_string(),
+                    target: "childOrder".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "a")
+        .connect("a", "c1")
+        .connect("c1", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(child)).unwrap();
+    let inst = start(&mut engine, parent, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![seeded("c1", &[("local", Value::Int(1))])],
+        ))
+        .unwrap();
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "input mapping parks on `missing`");
+    let incident_key = incidents[0].key;
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[("missing", Value::Int(41))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the retry must see the element-local `local`: {:?}",
+        engine.active_incidents()
+    );
+    let child = engine
+        .state()
+        .instances
+        .values()
+        .find(|i| i.process_id == "phase")
+        .expect("child spawned on retry");
+    assert_eq!(child.variables.get("childOrder"), Some(&Value::Int(42)));
+}

@@ -356,6 +356,19 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// A process-instance modification's activation of a join (parallel /
+    /// inclusive gateway with several incoming flows) carrying element-local
+    /// variables. Queued in instruction order — so it runs after the command's
+    /// terminations, like every other modification activation — and handled by
+    /// [`Engine::activate_seeded_join`], which seeds the join instance the
+    /// activation will take over BEFORE the guarded activation evaluates and
+    /// completes it.
+    ActivateSeededJoin {
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+        locals: Vec<HashMap<String, Value>>,
+    },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
     /// item and bindings are read from the body's runtime state.
@@ -4439,6 +4452,29 @@ impl Engine {
     ) -> Option<Paused> {
         loop {
             while let Some(step) = queue.pop_front() {
+                // A seeded join interleaves state-dependent writes with its
+                // guarded activation, so it emits directly into the log.
+                if let Step::ActivateSeededJoin {
+                    instance_key,
+                    element_id,
+                    scope,
+                    locals,
+                } = step
+                {
+                    let emitted_from = log.len();
+                    self.activate_seeded_join(
+                        log,
+                        &mut queue,
+                        instance_key,
+                        element_id,
+                        scope,
+                        locals,
+                    );
+                    if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                    continue;
+                }
                 let (events, followups) = self.process_step(step, &queue);
                 let emitted_from = log.len();
                 for event in events {
@@ -5112,6 +5148,11 @@ impl Engine {
                 instance_key,
                 scope,
                 ..
+            }
+            | Step::ActivateSeededJoin {
+                instance_key,
+                scope,
+                ..
             } => (*instance_key, Some(*scope), None, None),
             Step::Complete {
                 instance_key,
@@ -5433,6 +5474,17 @@ impl Engine {
                     scope,
                     element_instance_key,
                 )
+            }
+            // Handled in `run_with` (it needs the log between its writes); this
+            // arm is unreachable — degrade to the plain guarded activation.
+            Step::ActivateSeededJoin {
+                instance_key,
+                element_id,
+                scope,
+                ..
+            } => {
+                debug_assert!(false, "ActivateSeededJoin is dispatched by run_with");
+                self.activate(instance_key, element_id, scope, None, pending)
             }
             Step::ActivateMiChild {
                 instance_key,
@@ -9334,7 +9386,7 @@ impl Engine {
             result_variable,
         }) = self.element_kind(instance_key, &element_id)
         {
-            let vars = self.variables(instance_key);
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             match crate::feel::eval(&expression, &vars) {
                 Ok(value) => {
                     let mut update = HashMap::new();
@@ -9380,7 +9432,7 @@ impl Engine {
             result_variable,
         }) = self.element_kind(instance_key, &element_id)
         {
-            let vars = self.variables(instance_key);
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             let resolved_id = self.resolve_job_type(&vars, &decision_id);
             let Some(deployed) = self.state.decisions.get(&resolved_id).cloned() else {
                 let incident_key = self.mint_key();
@@ -10884,9 +10936,10 @@ impl Engine {
     fn select_exclusive_flow(
         &self,
         instance_key: Key,
+        element_instance_key: Key,
         element_id: &str,
     ) -> Result<Option<usize>, String> {
-        let variables = self.variables(instance_key);
+        let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         for (index, flow) in self
             .outgoing(instance_key, element_id)
@@ -10924,26 +10977,27 @@ impl Engine {
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected = match self.select_exclusive_flow(instance_key, &element_id) {
-            Ok(sel) => sel,
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                return (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                );
-            }
-        };
+        let selected =
+            match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
+                Ok(sel) => sel,
+                Err(reason) => {
+                    let incident_key = self.mint_key();
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
+                }
+            };
 
         match selected {
             Some(flow_index) => {
@@ -10956,7 +11010,7 @@ impl Engine {
                 // End-listener gate (ADR 0037): the gateway rests in COMPLETING
                 // while its end chain runs; `finalize_exclusive_gateway` re-selects
                 // the flow and emits the deferred completion once it drains.
-                let vars = self.variables(instance_key);
+                let vars = self.variables_for_element(instance_key, element_instance_key);
                 if let Some(job) = self.begin_end_listener_chain(
                     instance_key,
                     element_instance_key,
@@ -11013,7 +11067,7 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        match self.select_exclusive_flow(instance_key, &element_id) {
+        match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
             Ok(Some(flow_index)) => {
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
                 let mut events = vec![Event::ElementCompleted {
@@ -11075,9 +11129,10 @@ impl Engine {
     fn select_inclusive_flows(
         &self,
         instance_key: Key,
+        element_instance_key: Key,
         element_id: &str,
     ) -> Result<Vec<usize>, String> {
-        let variables = self.variables(instance_key);
+        let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         let mut selected = Vec::new();
         for (index, flow) in self
@@ -11151,26 +11206,27 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected = match self.select_inclusive_flows(instance_key, &element_id) {
-            Ok(sel) => sel,
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                return (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                );
-            }
-        };
+        let selected =
+            match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
+                Ok(sel) => sel,
+                Err(reason) => {
+                    let incident_key = self.mint_key();
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
+                }
+            };
         if selected.is_empty() {
             let incident_key = self.mint_key();
             return (
@@ -11195,7 +11251,7 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         }];
-        let vars = self.variables(instance_key);
+        let vars = self.variables_for_element(instance_key, element_instance_key);
         if let Some(job) = self.begin_end_listener_chain(
             instance_key,
             element_instance_key,
@@ -11241,7 +11297,7 @@ impl Engine {
             scope,
             &mut events,
         );
-        match self.select_inclusive_flows(instance_key, &element_id) {
+        match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
             Ok(selected) if !selected.is_empty() => {
                 events.push(Event::ElementCompleted {
                     instance_key,
@@ -11975,10 +12031,14 @@ impl Engine {
                     // child whose own cancel deferred on a user-task canceling
                     // listener) — otherwise the parent's termination orphans
                     // them. `discard_and_terminate_instance` force-completes
-                    // that deferred drain.
+                    // that deferred drain — and children an operator
+                    // `Suspended`: suspension pauses progress, it does not
+                    // detach the child from its ending parent.
                     matches!(
                         i.state,
-                        ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                        ProcessInstanceState::Active
+                            | ProcessInstanceState::Terminating
+                            | ProcessInstanceState::Suspended
                     ) && i
                         .parent_process_instance_key
                         .map(|p| ended.contains(&p))

@@ -413,10 +413,15 @@ impl Engine {
         locals: Vec<HashMap<String, Value>>,
     ) {
         // A join target does not activate as one plain element instance (it is
-        // guarded): run its regular activation and seed the instance it
-        // activates.
+        // guarded): queue its seeded guarded activation (after this command's
+        // terminations, in instruction order).
         if self.join_kind(instance_key, &element_id).is_some() {
-            self.activate_then_seed(log, queue, instance_key, element_id, scope, locals);
+            queue.push_back(Step::ActivateSeededJoin {
+                instance_key,
+                element_id,
+                scope,
+                locals,
+            });
             return;
         }
         // A multi-instance target's element-scoped variables land on its body
@@ -465,9 +470,13 @@ impl Engine {
         }
     }
 
-    /// Fallback for join targets: run the regular activation
-    /// synchronously, then write `locals` into the instance it activated.
-    fn activate_then_seed(
+    /// [`Step::ActivateSeededJoin`]: seed the join instance a modification's
+    /// activation takes over, then run the guarded activation. The waiting
+    /// instance (or, if none waits, a freshly opened one) gets its variable
+    /// scope and `locals` BEFORE the guard evaluates, so an accepted join
+    /// completes and routes with its locals in place, and a reused waiting
+    /// instance (which emits no `ElementActivated`) keeps them too.
+    pub(super) fn activate_seeded_join(
         &mut self,
         log: &mut Vec<Event>,
         queue: &mut VecDeque<Step>,
@@ -482,41 +491,43 @@ impl Engine {
             scope,
             via: None,
         };
-        let (events, followups) = self.process_step(step, queue);
-        let eik = events.iter().find_map(|e| match e {
-            Event::ElementActivated {
-                element_instance_key,
-                element_id: id,
-                scope: s,
-                ..
-            } if *id == element_id && *s == scope => Some(*element_instance_key),
-            _ => None,
-        });
-        for event in events {
-            self.emit(log, event);
+        if self.step_targets_dead_scope(&step) {
+            return;
         }
-        if let Some(eik) = eik {
-            let registered = self
-                .state
-                .instances
-                .get(&instance_key)
-                .map(|i| i.scope_parents.contains_key(&eik))
-                .unwrap_or(false);
-            if !registered {
-                self.emit(
-                    log,
-                    Event::VariableScopeCreated {
-                        instance_key,
-                        scope_key: eik,
-                        parent_scope_key: scope,
-                    },
-                );
-            }
-            for variables in locals {
-                for event in self.propagated_updates(instance_key, eik, variables, true) {
+        let eik = match self.join_eik(instance_key, &element_id) {
+            Some(eik) => eik,
+            None => {
+                let mut events = Vec::new();
+                let eik = self.open_join(instance_key, &element_id, scope, &mut events);
+                for event in events {
                     self.emit(log, event);
                 }
+                eik
             }
+        };
+        let registered = self
+            .state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.scope_parents.contains_key(&eik));
+        if !registered {
+            self.emit(
+                log,
+                Event::VariableScopeCreated {
+                    instance_key,
+                    scope_key: eik,
+                    parent_scope_key: scope,
+                },
+            );
+        }
+        for variables in locals {
+            for event in self.propagated_updates(instance_key, eik, variables, true) {
+                self.emit(log, event);
+            }
+        }
+        let (events, followups) = self.process_step(step, queue);
+        for event in events {
+            self.emit(log, event);
         }
         queue.extend(followups);
     }

@@ -41,8 +41,11 @@ impl Engine {
     /// call-activity element instance), if any. A call activity spawns exactly
     /// one child, found here by its `parentElementInstanceKey` back-link.
     /// Includes a `Terminating` child so an interrupt still reaps one already
-    /// mid-drain. Selection is deterministic (lowest instance key) so that, even
-    /// if state ever held multiple matches (a bug or partial-replay artifact),
+    /// mid-drain, and a `Suspended` child: suspension freezes the child's
+    /// progress, not its lifetime, so a host teardown must still reap it
+    /// (a surviving suspended child would run orphaned work once resumed).
+    /// Selection is deterministic (lowest instance key) so that, even if state
+    /// ever held multiple matches (a bug or partial-replay artifact),
     /// boundary-interrupt cancellation always targets the same child.
     pub(super) fn call_activity_child_of(&self, call_eik: Key) -> Option<Key> {
         self.state
@@ -51,7 +54,9 @@ impl Engine {
             .filter(|i| {
                 matches!(
                     i.state,
-                    ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                    ProcessInstanceState::Active
+                        | ProcessInstanceState::Terminating
+                        | ProcessInstanceState::Suspended
                 ) && i.parent_element_instance_key == Some(call_eik)
             })
             .map(|i| i.key)
@@ -119,34 +124,17 @@ impl Engine {
             }) => (called_process_id, propagate_all_parent_variables),
             _ => return (Vec::new(), Vec::new()),
         };
-        let scope = self.scope_of(instance_key, element_instance_key);
-        // A call activity that is a MULTI-INSTANCE child parks its token directly
-        // on the child element instance (minted by `activate_mi_child`, bypassing
-        // `activate`), whose own scope carries the per-child `inputElement` /
-        // `loopCounter` bindings written by `MultiInstanceChildActivated`. The
-        // ordinary retry above evaluates against the *enclosing* scope
-        // (`scope_of` = the MI body), which does NOT carry those bindings, so a
-        // callee-id `=calledElement` expression or an input mapping that reads
-        // `loopCounter` / `inputElement` would fail (or resolve wrongly) on the
-        // retry. Evaluate against the child element instance's own scope instead,
-        // so the spawn re-drive is MI-aware — re-evaluating both the callee id and
-        // the (once-applied) input mappings with the child bindings in view, and
-        // seeding them into the child process exactly as the first pass did
-        // (#1175). Its completion still routes back through `complete_mi_child`
+        // Evaluate the retry in the call activity's OWN variable view, exactly
+        // as its first pass did. `variables_for_element` resolves the element
+        // instance's registered scope when it has one — a MULTI-INSTANCE child's
+        // `inputElement` / `loopCounter` bindings (#1175), or element-local
+        // variables a process-instance modification seeded into it (#1374) —
+        // and otherwise falls back to the enclosing scope. Evaluating against
+        // the enclosing scope instead would re-fail (or resolve wrongly) a
+        // callee-id or input mapping that reads those element-local bindings.
+        // An MI child's completion still routes back through `complete_mi_child`
         // (via `complete_call_activity`'s MI-child detection).
-        let is_mi_child = scope != 0
-            && self
-                .state
-                .instances
-                .get(&instance_key)
-                .and_then(|i| i.multi_instances.get(&scope))
-                .map(|mi| mi.element_id == element_id)
-                .unwrap_or(false);
-        let eval_scope = if is_mi_child {
-            element_instance_key
-        } else {
-            scope
-        };
+        let eval_scope = element_instance_key;
         let element_vars = (*self.variables_for_element(instance_key, eval_scope)).clone();
         self.spawn_call_activity_child(
             instance_key,
