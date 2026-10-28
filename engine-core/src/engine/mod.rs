@@ -25,6 +25,7 @@ mod call_activity;
 mod debug;
 mod flow_scope;
 mod memory;
+mod modify;
 mod resolve;
 
 pub use debug::{BreakCondition, DebugSession};
@@ -4243,95 +4244,19 @@ impl Engine {
                     _ => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
 
-                // Instruction fields the engine does not act on yet are
-                // rejected explicitly — never silently ignored (#1374 scaffold;
-                // each later slice removes its own check as it lands).
-                Self::reject_unsupported_modification(
+                // Move instructions are not acted on yet: rejected explicitly —
+                // never silently ignored (#1374; `engine-modify-move` lands them).
+                Self::reject_unsupported_modification(instance_key, &move_instructions)?;
+
+                // Validate everything up front so the command is all-or-nothing,
+                // then apply (see `modify.rs`).
+                let plan = self.plan_modification(
                     instance_key,
                     &activate_instructions,
+                    &terminate_instructions,
                     &terminate_element_ids,
-                    &move_instructions,
                 )?;
-
-                // Validate up front so the command is all-or-nothing: every
-                // activate element id must exist in the process definition and
-                // every terminate key must be a currently-active element instance.
-                for a in &activate_instructions {
-                    let exists = self
-                        .process_of_instance(instance_key)
-                        .map(|p| p.element(&a.element_id).is_some())
-                        .unwrap_or(false);
-                    if !exists {
-                        return Err(EngineError::ElementNotFound {
-                            instance_key,
-                            element_id: a.element_id.clone(),
-                        });
-                    }
-                }
-                for &eik in &terminate_instructions {
-                    let active = self
-                        .state
-                        .instances
-                        .get(&instance_key)
-                        .map(|i| i.active.contains_key(&eik))
-                        .unwrap_or(false);
-                    if !active {
-                        return Err(EngineError::ElementInstanceNotFound {
-                            instance_key,
-                            element_instance_key: eik,
-                        });
-                    }
-                }
-
-                // Apply terminations first (deterministic key order), then merge
-                // any global variables and queue the activations at the process
-                // root scope.
-                let mut terminate: Vec<Key> = terminate_instructions;
-                terminate.sort_unstable();
-                terminate.dedup();
-                for eik in terminate {
-                    // The eik was validated against `instance.active` above, so
-                    // its element id must resolve. Skip defensively rather than
-                    // emitting a termination with an empty element_id, which
-                    // would corrupt downstream element aggregates.
-                    let Some(element_id) = self.element_id_of_instance(instance_key, eik) else {
-                        continue;
-                    };
-                    self.terminate_element_instance(&mut log, instance_key, eik, &element_id);
-                }
-
-                for a in &activate_instructions {
-                    if !a.variables.is_empty() {
-                        for event in self.propagated_updates(
-                            instance_key,
-                            instance_key,
-                            a.variables.clone(),
-                            false,
-                        ) {
-                            self.emit(&mut log, event);
-                        }
-                    }
-                    queue.push_back(Step::Activate {
-                        instance_key,
-                        element_id: a.element_id.clone(),
-                        scope: 0,
-                        via: None,
-                    });
-                }
-
-                // If the terminations drained the last token and nothing was
-                // activated to replace it, the instance is terminated (Zeebe
-                // modify semantics) rather than being auto-completed by
-                // `complete_finished_instances`.
-                let drained = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .map(|i| i.active.is_empty())
-                    .unwrap_or(true);
-                if drained && activate_instructions.is_empty() {
-                    self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
-                }
+                self.apply_modification(&mut log, &mut queue, instance_key, plan);
             }
 
             Command::DispatchStartInstance {
@@ -12909,8 +12834,6 @@ impl Engine {
     /// field order so the rejection is deterministic.
     fn reject_unsupported_modification(
         instance_key: Key,
-        activate_instructions: &[crate::command::ActivateElementInstruction],
-        terminate_element_ids: &[ElementId],
         move_instructions: &[crate::command::MoveInstruction],
     ) -> Result<(), EngineError> {
         let unsupported = |instruction| {
@@ -12919,21 +12842,6 @@ impl Engine {
                 instruction,
             })
         };
-        if activate_instructions
-            .iter()
-            .any(|a| a.ancestor_element_instance_key.is_some())
-        {
-            return unsupported("activate_instructions[].ancestor_element_instance_key");
-        }
-        if activate_instructions
-            .iter()
-            .any(|a| !a.variable_instructions.is_empty())
-        {
-            return unsupported("activate_instructions[].variable_instructions");
-        }
-        if !terminate_element_ids.is_empty() {
-            return unsupported("terminate_element_ids");
-        }
         if !move_instructions.is_empty() {
             return unsupported("move_instructions");
         }

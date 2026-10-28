@@ -1245,16 +1245,25 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
     ) {
-        if self.is_subprocess(instance_key, element_id) {
+        // Any element instance that owns an inner scope — a sub-process, a
+        // multi-instance body (its children), an ad-hoc container (its tools) —
+        // has that whole scope torn down; a call activity's child process
+        // instance is terminated with it. The root's own runtime record (its
+        // job, parked incidents, MI / ad-hoc bookkeeping) is then cleared by
+        // `boundary_root_teardown_events`.
+        if self.is_subprocess(instance_key, element_id)
+            || self.is_multi_instance_body(instance_key, element_instance_key)
+            || self.is_adhoc_container(instance_key, element_instance_key)
+        {
             self.terminate_subprocess_scope(log, instance_key, element_instance_key);
-        } else if let Some(job_key) = self.active_job_on(element_instance_key) {
-            self.emit(
-                log,
-                Event::JobCanceled {
-                    job_key,
-                    instance_key,
-                },
-            );
+        }
+        if let Some(child) = self.call_activity_child_of(element_instance_key) {
+            for event in self.discard_instance_events(child) {
+                self.emit(log, event);
+            }
+        }
+        for event in self.boundary_root_teardown_events(instance_key, element_instance_key) {
+            self.emit(log, event);
         }
 
         let mut user_task_keys: Vec<Key> = self
