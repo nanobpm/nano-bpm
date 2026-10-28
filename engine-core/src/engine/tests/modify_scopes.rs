@@ -1268,3 +1268,75 @@ fn call_activity_spawn_retry_keeps_element_locals() {
         .expect("child spawned on retry");
     assert_eq!(child.variables.get("childOrder"), Some(&Value::Int(42)));
 }
+
+/// `start -> sub[ ss -> fork -> {a(ja), b(jb)} -> join(parallel) -> se ] -> end`.
+fn join_in_sub() -> ProcessDefinition {
+    let mut b = ProcessBuilder::new("join-sub")
+        .start_event("start")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .parallel_gateway("fork")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .parallel_gateway("join")
+        .end_event("se")
+        .end_event("end");
+    for id in ["ss", "fork", "a", "b", "join", "se"] {
+        b = b.contained_in(id, "sub");
+    }
+    b.connect("start", "sub")
+        .connect("ss", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "se")
+        .connect("sub", "end")
+        .build()
+        .unwrap()
+}
+
+/// Join bookkeeping is keyed by element id per process instance, so activating
+/// a join under a flow-scope instance other than the one its waiting instance
+/// lives in would take over that instance's arrivals and variables. Both the
+/// plain and the element-local-variable activation paths must fail closed.
+#[test]
+fn rejects_join_activation_in_a_different_flow_scope_than_its_waiting_instance() {
+    for locals in [false, true] {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, join_in_sub(), HashMap::new());
+        complete_all(&mut engine, "ja");
+        let waiting = eiks(&engine, inst, "join");
+        assert_eq!(waiting.len(), 1, "join is waiting");
+        // A second `sub` instance, created by activating `b` from the root.
+        engine
+            .apply_command(modify(inst, vec![under("b", inst)]))
+            .unwrap();
+        let subs = eiks(&engine, inst, "sub");
+        assert_eq!(subs.len(), 2, "two sub instances");
+        let other = *subs
+            .iter()
+            .find(|s| **s != scope_of(&engine, inst, waiting[0]))
+            .unwrap();
+        let mut instruction = under("join", other);
+        if locals {
+            instruction.variable_instructions = vec![VariableInstruction {
+                variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                scope_id: Some("join".into()),
+            }];
+        }
+        let before = engine.instance(inst).unwrap().join_flows_taken("join");
+        assert!(
+            engine
+                .apply_command(modify(inst, vec![instruction]))
+                .is_err(),
+            "locals={locals}: cross-scope join activation must be rejected"
+        );
+        assert_eq!(eiks(&engine, inst, "join"), waiting, "locals={locals}");
+        assert_eq!(
+            engine.instance(inst).unwrap().join_flows_taken("join"),
+            before,
+            "locals={locals}"
+        );
+    }
+}

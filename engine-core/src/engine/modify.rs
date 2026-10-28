@@ -222,6 +222,39 @@ impl Engine {
             }
         }
 
+        // Join bookkeeping (waiting instance + arrivals) is keyed by element id
+        // per process instance, not per flow-scope instance. Activating a join
+        // whose waiting instance lives in a DIFFERENT flow-scope instance would
+        // take over that instance's arrivals and variables: fail closed.
+        for planned in &activations {
+            if self.join_kind(instance_key, &planned.element_id).is_none() {
+                continue;
+            }
+            let Some(waiting) = self.join_eik(instance_key, &planned.element_id) else {
+                continue;
+            };
+            if terminations.iter().any(|&t| {
+                t == waiting || self.is_ancestor_element_instance(instance_key, t, waiting)
+            }) {
+                continue;
+            }
+            let waiting_scope = self.scope_of(instance_key, waiting);
+            if !planned.resolution.to_create.is_empty()
+                || waiting_scope != planned.resolution.existing
+            {
+                return Err(invalid(
+                    instance_key,
+                    &process_id,
+                    format!(
+                        "an activate instruction for join element '{}' in a flow scope other \
+                         than that of its waiting instance '{waiting}' (flow scope \
+                         '{waiting_scope}')",
+                        planned.element_id
+                    ),
+                ));
+            }
+        }
+
         Ok(ModificationPlan {
             activations,
             terminations,
