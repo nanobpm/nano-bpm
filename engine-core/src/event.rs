@@ -12,6 +12,179 @@ use crate::state::types::{
     IncidentKind, IoMappingRedrive, Key, MessageSubscriptionKind, TimerKind,
 };
 
+/// One activation instruction of a [`crate::command::Command::ModifyInstance`]: place a new
+/// token at `element_id`, first merging `variables` into the instance's root
+/// scope. Mirrors Zeebe's `ProcessInstanceModificationActivateInstruction`:
+/// `ancestor_element_instance_key` selects the flow-scope instance to activate
+/// in and `variable_instructions` set variables on a named scope.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActivateElementInstruction {
+    /// The BPMN element id to activate a token at.
+    pub element_id: String,
+    /// Variables merged into the instance's root scope before the token is
+    /// placed (Zeebe's global variable instructions). Empty for none.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variables: HashMap<String, Value>,
+    /// The ancestor element instance (an existing flow-scope instance) to
+    /// activate the element under (Zeebe `ancestorElementInstanceKey`). `None`
+    /// (Zeebe's `-1`) = use the single existing instance of the flow scope, or
+    /// create it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ancestor_element_instance_key: Option<Key>,
+    /// Variable instructions, each optionally targeting a flow scope by element
+    /// id (Zeebe `variableInstructions[].scopeId`). Empty for none.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variable_instructions: Vec<VariableInstruction>,
+}
+
+/// A variable instruction of a modification (Zeebe
+/// `ProcessInstanceModificationVariableInstruction`): set `variables` on the
+/// flow scope identified by `scope_id` — an element id of the activated
+/// element or one of its flow scopes — or on the process root scope when
+/// `scope_id` is `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VariableInstruction {
+    /// The variables to set.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variables: HashMap<String, Value>,
+    /// The element id of the scope to set them on; `None` = process root.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scope_id: Option<ElementId>,
+}
+
+/// Which element instance(s) a [`MoveInstruction`] moves (Camunda 8.9
+/// `sourceElementInstruction`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MoveSource {
+    /// Every active instance of this element id (`sourceType: byId`).
+    ById(ElementId),
+    /// Exactly this element instance (`sourceType: byKey`).
+    ByKey(Key),
+}
+
+impl Default for MoveSource {
+    fn default() -> Self {
+        MoveSource::ById(String::new())
+    }
+}
+
+/// How a [`MoveInstruction`] picks the flow-scope instance its target is
+/// activated in (Camunda 8.9 `ancestorScopeInstruction`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AncestorScopeInstruction {
+    /// Infer the ancestor from the source instance's hierarchy
+    /// (`ancestorScopeType: inferred`; Zeebe
+    /// `inferAncestorScopeFromSourceHierarchy`). The default.
+    #[default]
+    Inferred,
+    /// Use this explicit ancestor element instance (`ancestorScopeType:
+    /// direct`; Zeebe `ancestorScopeKey`).
+    Direct(Key),
+    /// Use the source instance's direct flow-scope instance
+    /// (`ancestorScopeType: sourceParent`; Zeebe
+    /// `useSourceParentKeyAsAncestorScopeKey`).
+    SourceParent,
+}
+
+/// One move instruction of a [`crate::command::Command::ModifyInstance`] (Camunda 8.9
+/// `ProcessInstanceModificationMoveInstruction`): terminate the source element
+/// instance(s) and activate `target_element_id` in their place.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MoveInstruction {
+    /// The element instance(s) to move.
+    pub source: MoveSource,
+    /// The element to activate in place of each moved source instance.
+    pub target_element_id: ElementId,
+    /// How the target's flow-scope instance is chosen.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ancestor_scope: AncestorScopeInstruction,
+    /// Variable instructions applied for each activated target.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variable_instructions: Vec<VariableInstruction>,
+}
+
+impl ActivateElementInstruction {
+    /// Activate `element_id` in the process root scope with no variables.
+    pub fn new(element_id: impl Into<String>) -> Self {
+        Self {
+            element_id: element_id.into(),
+            ..Self::default()
+        }
+    }
+}
+
+/// A flow-scope element instance re-pointed by a migration (#1374).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MigratedElementInstance {
+    pub element_instance_key: Key,
+    pub source_element_id: ElementId,
+    pub target_element_id: ElementId,
+}
+
+/// What a migration did with a catch-event / boundary subscription (#1374).
+/// Zeebe retains a subscription whose trigger is unchanged and re-subscribes
+/// when the message name, correlation key or timer changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SubscriptionMigrationAction {
+    /// Kept as is, re-pointed at the target element.
+    #[default]
+    Retained,
+    /// Closed and opened again because its trigger changed.
+    Recreated,
+    /// Opened for a catch event that only exists in the target.
+    Created,
+    /// Closed because its catch event has no counterpart in the target.
+    Deleted,
+}
+
+/// The trigger of a migrated subscription (#1374).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MigratedSubscriptionTrigger {
+    Message {
+        subscription_key: Key,
+        message_name: String,
+        correlation_key: String,
+    },
+    Timer {
+        timer_key: Key,
+        due_at: u64,
+    },
+    Signal {
+        subscription_key: Key,
+        signal_name: String,
+    },
+}
+
+/// A catch-event / boundary subscription touched by a migration (#1374).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MigratedSubscription {
+    /// The element instance owning the subscription (the catch event itself,
+    /// or the activity a boundary event is attached to).
+    pub element_instance_key: Key,
+    /// The target catch-event element id the subscription now belongs to.
+    pub element_id: ElementId,
+    pub action: SubscriptionMigrationAction,
+    pub trigger: MigratedSubscriptionTrigger,
+}
+
+/// A call-activity child instance kept attached across a migration (#1374).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MigratedChildInstance {
+    pub call_activity_element_instance_key: Key,
+    pub child_instance_key: Key,
+    pub target_element_id: ElementId,
+}
+
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
 ///
@@ -765,6 +938,40 @@ pub enum Event {
         target_process_id: String,
         target_process_definition_key: Key,
         element_mappings: Vec<(ElementId, ElementId)>,
+        /// The flow-scope element instances (embedded / event sub-processes)
+        /// re-pointed by this migration (#1374). Additive; empty when none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        migrated_flow_scopes: Vec<MigratedElementInstance>,
+        /// Catch-event / boundary subscriptions retained, re-created, created
+        /// or deleted by this migration (#1374). Additive; empty when none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        subscriptions: Vec<MigratedSubscription>,
+        /// Call-activity child instances kept attached to their (migrated)
+        /// call-activity element instance (#1374). Additive; empty when none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        child_instances: Vec<MigratedChildInstance>,
+    },
+
+    /// A process instance was modified (Zeebe `ProcessInstanceModification
+    /// MODIFIED`): the accepted instructions of a
+    /// [`crate::Command::ModifyInstance`], recorded as an audit fact ahead of
+    /// the element activation / termination events the modification produces
+    /// (those carry the state change; this record's applier is a no-op).
+    /// Additive, replay-safe new variant (#1374).
+    ProcessInstanceModified {
+        instance_key: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        activate_instructions: Vec<ActivateElementInstruction>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        terminate_instructions: Vec<Key>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        terminate_element_ids: Vec<ElementId>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        move_instructions: Vec<MoveInstruction>,
+        /// Element instances (incl. created flow scopes) activated by the
+        /// modification (Zeebe `activatedElementInstanceKeys`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        activated_element_instance_keys: Vec<Key>,
     },
 
     /// A timer was armed: either on a timer intermediate catch event (the token
@@ -1376,6 +1583,7 @@ impl Event {
             Event::ProcessInstanceResumed { instance_key } => Some(*instance_key),
             Event::ProcessInstanceBusinessIdAssigned { instance_key, .. } => Some(*instance_key),
             Event::ProcessInstanceMigrated { instance_key, .. } => Some(*instance_key),
+            Event::ProcessInstanceModified { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceCreated { instance_key, .. } => Some(*instance_key),
             Event::AgentInstanceUpdated { instance_key, .. }
             | Event::AgentInstanceCompleted { instance_key, .. } => Some(*instance_key),

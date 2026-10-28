@@ -378,6 +378,22 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         | E::MigratedParallelJoinArityChanged { .. }
         | E::MigratedJoinFlowMissing { .. }
         | E::UnsupportedMigration { .. } => (409, e.to_string()),
+        // Process-instance modification / migration rejection surface (#1374),
+        // Zeebe parity: a malformed or unresolvable instruction is
+        // INVALID_ARGUMENT (400); an instance in the wrong state and a
+        // migration precondition the live instance violates are INVALID_STATE
+        // (409). (An unknown instance is `InstanceNotFound` → 404 above.)
+        E::ElementNotFound { .. }
+        | E::ElementInstanceNotFound { .. }
+        | E::ModificationInstructionNotYetSupported { .. }
+        | E::ModificationInstructionInvalid { .. }
+        | E::AmbiguousFlowScope { .. }
+        | E::AncestorScopeNotFound { .. }
+        | E::AncestorNotAnAncestor { .. }
+        | E::ElementNotActivatable { .. } => (400, e.to_string()),
+        E::InstanceNotActive { .. }
+        | E::MigrationFlowScopeChanged { .. }
+        | E::MigrationMultiInstanceMismatch { .. } => (409, e.to_string()),
         other => (500, other.to_string()),
     }
 }
@@ -2540,6 +2556,110 @@ mod tests {
                 *want,
                 "{err:?} must map to {want}"
             );
+        }
+    }
+
+    #[test]
+    fn engine_error_status_maps_modify_migrate_rejections() {
+        // #1374: every modification / migration rejection the engine surface
+        // defines maps to its Zeebe status class here, once — never the 500
+        // fallback.
+        use nanobpmn_engine_core::EngineError as E;
+        let pid = || "p".to_string();
+        let cases: Vec<(E, u16)> = vec![
+            (
+                E::ElementNotFound {
+                    instance_key: 1,
+                    element_id: "x".into(),
+                },
+                400,
+            ),
+            (
+                E::ElementInstanceNotFound {
+                    instance_key: 1,
+                    element_instance_key: 2,
+                },
+                400,
+            ),
+            (
+                E::ModificationInstructionNotYetSupported {
+                    instance_key: 1,
+                    instruction: "move_instructions",
+                },
+                400,
+            ),
+            (
+                E::ModificationInstructionInvalid {
+                    instance_key: 1,
+                    process_id: pid(),
+                    reason: "r".into(),
+                },
+                400,
+            ),
+            (
+                E::AmbiguousFlowScope {
+                    instance_key: 1,
+                    process_id: pid(),
+                    element_id: "x".into(),
+                },
+                400,
+            ),
+            (
+                E::AncestorScopeNotFound {
+                    instance_key: 1,
+                    process_id: pid(),
+                    ancestor_element_instance_key: 9,
+                },
+                400,
+            ),
+            (
+                E::AncestorNotAnAncestor {
+                    instance_key: 1,
+                    process_id: pid(),
+                    element_id: "x".into(),
+                    ancestor_element_instance_key: 9,
+                },
+                400,
+            ),
+            (
+                E::ElementNotActivatable {
+                    instance_key: 1,
+                    process_id: pid(),
+                    element_id: "x".into(),
+                    reason: "r".into(),
+                },
+                400,
+            ),
+            (
+                E::InstanceNotActive {
+                    instance_key: 1,
+                    process_id: pid(),
+                    state: "SUSPENDED",
+                },
+                409,
+            ),
+            (
+                E::MigrationFlowScopeChanged {
+                    instance_key: 1,
+                    element_id: "x".into(),
+                    source_flow_scope_id: None,
+                    target_flow_scope_id: Some("sub".into()),
+                },
+                409,
+            ),
+            (
+                E::MigrationMultiInstanceMismatch {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
+                    target_element_id: "b".into(),
+                },
+                409,
+            ),
+        ];
+        for (err, want) in cases {
+            let (got, msg) = engine_error_status(&err);
+            assert_eq!(got, want, "{err:?} -> {got} ({msg})");
+            assert_eq!(msg, err.to_string());
         }
     }
 

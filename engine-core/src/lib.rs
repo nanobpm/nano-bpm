@@ -108,8 +108,8 @@ pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT
 pub use command::form_id_of;
 pub use command::JobActivationOptions;
 pub use command::{
-    ActivateElementInstruction, Command, DecisionReference, FormResource, GenericResource,
-    UserTaskChangeset,
+    ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
+    GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,
 };
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
@@ -123,6 +123,10 @@ pub use engine::{BreakCondition, DebugSession};
 pub use event::decode_event_json;
 pub use event::Event;
 pub use event::EventDecodeError;
+pub use event::{
+    MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
+    MigratedSubscriptionTrigger, SubscriptionMigrationAction,
+};
 pub use feel::FeelError;
 pub use model::{
     AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,

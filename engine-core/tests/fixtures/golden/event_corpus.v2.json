@@ -2097,5 +2097,190 @@
       "reason": "unhandled BPMN error 'CARD_DECLINED': card declined",
       "redrive": null
     }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000018,
+      "instance_key": 53,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 54,
+      "instance_key": 53
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 54,
+      "instance_key": 53,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 54,
+      "instance_key": 53
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 54,
+      "instance_key": 53
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 53,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 55,
+      "instance_key": 53
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 55,
+      "instance_key": 53,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000018,
+      "element_id": "charge",
+      "element_instance_key": 55,
+      "instance_key": 53,
+      "job_key": 56,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 57
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 57,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "charge2": {
+            "end_listeners": [],
+            "id": "charge2",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "payment",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "end": {
+            "end_listeners": [],
+            "id": "end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "start": {
+            "end_listeners": [],
+            "id": "start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "charge2"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "order-v2",
+        "name": null,
+        "start_event": "start",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 58,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceMigrated": {
+      "child_instances": [],
+      "element_mappings": [
+        [
+          "charge",
+          "charge2"
+        ]
+      ],
+      "instance_key": 53,
+      "migrated_flow_scopes": [],
+      "subscriptions": [],
+      "target_process_definition_key": 58,
+      "target_process_id": "order-v2"
+    }
   }
 ]

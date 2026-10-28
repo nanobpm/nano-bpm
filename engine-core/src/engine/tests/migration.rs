@@ -30,6 +30,7 @@ fn modify_terminates_one_element_and_activates_another() {
             vec![ActivateElementInstruction {
                 element_id: "b".into(),
                 variables: HashMap::new(),
+                ..Default::default()
             }],
             vec![a_eik],
         ))
@@ -126,6 +127,7 @@ fn modify_activating_an_element_merges_global_variables() {
             vec![ActivateElementInstruction {
                 element_id: "b".into(),
                 variables: vars,
+                ..Default::default()
             }],
             vec![a_eik],
         ))
@@ -170,6 +172,7 @@ fn modify_rejects_unknown_instance_and_element_ids() {
             vec![ActivateElementInstruction {
                 element_id: "nope".into(),
                 variables: HashMap::new(),
+                ..Default::default()
             }],
             vec![],
         )),
@@ -217,6 +220,7 @@ fn modify_survives_replay() {
                 vec![ActivateElementInstruction {
                     element_id: "b".into(),
                     variables: HashMap::new(),
+                    ..Default::default()
                 }],
                 vec![a_eik],
             ))
@@ -750,6 +754,7 @@ fn migration_rejects_inclusive_join_with_unidentified_arrival_and_different_arit
             vec![crate::command::ActivateElementInstruction {
                 element_id: "join".to_string(),
                 variables: Default::default(),
+                ..Default::default()
             }],
             vec![c_eik],
         ))
@@ -1134,4 +1139,126 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
     );
     // The instance stays on its source definition — nothing was migrated.
     assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
+}
+
+/// #1374 scaffold: the Zeebe-parity `ModifyInstance` fields the engine does not
+/// act on yet are rejected explicitly (never silently ignored), atomically.
+#[test]
+fn modify_rejects_not_yet_supported_instruction_fields() {
+    use crate::command::{
+        AncestorScopeInstruction, MoveInstruction, MoveSource, VariableInstruction,
+    };
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let a_eik = active_eik_of(&engine, inst, "a");
+
+    let modify = |activate: Vec<ActivateElementInstruction>,
+                  by_id: Vec<String>,
+                  moves: Vec<MoveInstruction>| Command::ModifyInstance {
+        instance_key: inst,
+        activate_instructions: activate,
+        terminate_instructions: vec![a_eik],
+        terminate_element_ids: by_id,
+        move_instructions: moves,
+    };
+    let cases = [
+        (
+            modify(
+                vec![ActivateElementInstruction {
+                    element_id: "b".into(),
+                    ancestor_element_instance_key: Some(inst),
+                    ..Default::default()
+                }],
+                vec![],
+                vec![],
+            ),
+            "activate_instructions[].ancestor_element_instance_key",
+        ),
+        (
+            modify(
+                vec![ActivateElementInstruction {
+                    element_id: "b".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: HashMap::new(),
+                        scope_id: Some("b".into()),
+                    }],
+                    ..Default::default()
+                }],
+                vec![],
+                vec![],
+            ),
+            "activate_instructions[].variable_instructions",
+        ),
+        (
+            modify(vec![], vec!["a".into()], vec![]),
+            "terminate_element_ids",
+        ),
+        (
+            modify(
+                vec![],
+                vec![],
+                vec![MoveInstruction {
+                    source: MoveSource::ById("a".into()),
+                    target_element_id: "b".into(),
+                    ancestor_scope: AncestorScopeInstruction::SourceParent,
+                    variable_instructions: vec![],
+                }],
+            ),
+            "move_instructions",
+        ),
+    ];
+    for (command, instruction) in cases {
+        let err = engine.apply_command(command).unwrap_err();
+        assert_eq!(
+            err,
+            EngineError::ModificationInstructionNotYetSupported {
+                instance_key: inst,
+                instruction,
+            }
+        );
+        assert!(err.to_string().contains("not yet supported"), "{err}");
+        // Atomic: the bundled terminate of `a` did not happen.
+        assert_eq!(active_eik_of(&engine, inst, "a"), a_eik);
+    }
+}
+
+/// #1374 scaffold: a suspended instance exists but is in the wrong state for
+/// modification — `InstanceNotActive` (409), not `InstanceNotFound` (404).
+#[test]
+fn modify_of_suspended_instance_is_rejected_as_not_active() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    engine
+        .apply_command(Command::suspend_instance(inst))
+        .unwrap();
+    let err = engine
+        .apply_command(Command::modify_instance(inst, vec![], vec![]))
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::InstanceNotActive { instance_key, process_id, .. }
+            if *instance_key == inst && process_id == "two"),
+        "{err:?}"
+    );
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(999_999, vec![], vec![])),
+        Err(EngineError::InstanceNotFound {
+            instance_key: 999_999
+        })
+    );
 }

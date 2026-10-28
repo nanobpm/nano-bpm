@@ -24,6 +24,7 @@ engine's persisted shapes. They serve two jobs at once:
 
     engine_snapshot.v<N>.json   # a serialized EngineSnapshot (the snapshot graph)
     event_corpus.v<N>.json      # a serialized Vec<Event> (an ordered journal)
+    event_witnesses.v<N>.json   # serialized Vec<Event> shape witnesses (NOT a journal)
 
 `<N>` is the [`SNAPSHOT_FORMAT_VERSION`] (from L2 #1068,
 `engine-core/src/engine/mod.rs`) the fixture was produced at. The guard test
@@ -58,3 +59,14 @@ The `Event`/`EngineSnapshot` serde derives are feature-gated
 with `--features serde` — without it the types don't derive `Serialize`, the test
 compiles to nothing, and the guard silently passes. The `engine-core (clippy +
 test)` CI job is wired to pass `--features serde`; downstream tasks reuse it.
+
+## Shape witnesses (`event_witnesses.v<N>.json`)
+
+Some event frames / fields are part of the persisted shape before any engine
+path emits them (e.g. the #1374 modify / migrate surface — `ProcessInstanceModified`
+and the populated `ProcessInstanceMigrated` flow-scope / subscription /
+child-instance fields — landed as a scaffold ahead of their behaviour). They
+cannot appear in `event_corpus` (a real, replayable journal), so
+`build_event_witnesses` in `golden_serde_drift.rs` pins them here with every
+field non-default. This file is **not** replayed; it is refreshed by the same
+`UPDATE_GOLDEN=1` command.

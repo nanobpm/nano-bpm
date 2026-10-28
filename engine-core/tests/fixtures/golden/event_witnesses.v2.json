@@ -1,0 +1,150 @@
+[
+  {
+    "ProcessInstanceModified": {
+      "activate_instructions": [
+        {
+          "ancestor_element_instance_key": 2,
+          "element_id": "task",
+          "variable_instructions": [
+            {
+              "scope_id": "sub",
+              "variables": {
+                "x": {
+                  "Int": 1
+                }
+              }
+            }
+          ],
+          "variables": {
+            "x": {
+              "Int": 1
+            }
+          }
+        }
+      ],
+      "activated_element_instance_keys": [
+        5,
+        6
+      ],
+      "instance_key": 1,
+      "move_instructions": [
+        {
+          "ancestor_scope": {
+            "Direct": 2
+          },
+          "source": {
+            "ById": "a"
+          },
+          "target_element_id": "b",
+          "variable_instructions": [
+            {
+              "scope_id": "sub",
+              "variables": {
+                "x": {
+                  "Int": 1
+                }
+              }
+            }
+          ]
+        },
+        {
+          "ancestor_scope": "Inferred",
+          "source": {
+            "ByKey": 4
+          },
+          "target_element_id": "b",
+          "variable_instructions": []
+        },
+        {
+          "ancestor_scope": "SourceParent",
+          "source": {
+            "ById": "c"
+          },
+          "target_element_id": "b",
+          "variable_instructions": []
+        }
+      ],
+      "terminate_element_ids": [
+        "old"
+      ],
+      "terminate_instructions": [
+        3
+      ]
+    }
+  },
+  {
+    "ProcessInstanceMigrated": {
+      "child_instances": [
+        {
+          "call_activity_element_instance_key": 18,
+          "child_instance_key": 19,
+          "target_element_id": "call2"
+        }
+      ],
+      "element_mappings": [
+        [
+          "sub",
+          "sub2"
+        ]
+      ],
+      "instance_key": 1,
+      "migrated_flow_scopes": [
+        {
+          "element_instance_key": 8,
+          "source_element_id": "sub",
+          "target_element_id": "sub2"
+        }
+      ],
+      "subscriptions": [
+        {
+          "action": "Retained",
+          "element_id": "msg",
+          "element_instance_key": 9,
+          "trigger": {
+            "Message": {
+              "correlation_key": "c",
+              "message_name": "m",
+              "subscription_key": 10
+            }
+          }
+        },
+        {
+          "action": "Recreated",
+          "element_id": "timer",
+          "element_instance_key": 11,
+          "trigger": {
+            "Timer": {
+              "due_at": 13,
+              "timer_key": 12
+            }
+          }
+        },
+        {
+          "action": "Created",
+          "element_id": "sig",
+          "element_instance_key": 14,
+          "trigger": {
+            "Signal": {
+              "signal_name": "s",
+              "subscription_key": 15
+            }
+          }
+        },
+        {
+          "action": "Deleted",
+          "element_id": "gone",
+          "element_instance_key": 16,
+          "trigger": {
+            "Message": {
+              "correlation_key": "",
+              "message_name": "m2",
+              "subscription_key": 17
+            }
+          }
+        }
+      ],
+      "target_process_definition_key": 7,
+      "target_process_id": "p2"
+    }
+  }
+]
