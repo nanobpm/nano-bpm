@@ -159,18 +159,20 @@ impl Engine {
         Ok(())
     }
 
-    /// Every armed trigger resting on `element_instance_key`, sorted by key.
+    /// Every armed trigger resting on any of `hosts` (element-instance key ->
+    /// host element id), grouped by host and sorted by key. One pass over each
+    /// partition-wide trigger table per migration, not one per active element.
     fn armed_triggers_on(
         &self,
-        element_instance_key: Key,
-        host_element_id: &str,
+        hosts: &HashMap<Key, ElementId>,
         source: &ProcessDefinition,
-    ) -> Vec<ArmedTrigger> {
-        let mut out = Vec::new();
+    ) -> HashMap<Key, Vec<ArmedTrigger>> {
+        let mut by_host: HashMap<Key, Vec<ArmedTrigger>> = HashMap::new();
         for t in self.state.timers.values() {
-            if t.element_instance_key != element_instance_key
-                || t.state != state::TimerState::Created
-            {
+            let Some(host_element_id) = hosts.get(&t.element_instance_key) else {
+                continue;
+            };
+            if t.state != state::TimerState::Created {
                 continue;
             }
             let (catch_id, interrupting) = match &t.kind {
@@ -180,115 +182,133 @@ impl Engine {
                 state::TimerKind::NonInterruptingBoundary {
                     boundary_element_id,
                 } => (boundary_element_id.clone(), Some(false)),
-                state::TimerKind::IntermediateCatch => (host_element_id.to_string(), None),
+                state::TimerKind::IntermediateCatch => (host_element_id.clone(), None),
             };
             let Some(fingerprint) = source.element(&catch_id).and_then(timer_fingerprint) else {
                 continue;
             };
-            out.push(ArmedTrigger {
-                key: t.key,
-                catch_id,
-                interrupting,
-                fingerprint,
-                cancel: Event::TimerCanceled {
-                    timer_key: t.key,
-                    instance_key: t.instance_key,
-                    element_instance_key: t.element_instance_key,
-                    element_id: t.element_id.clone(),
-                },
-                report: Some(MigratedSubscriptionTrigger::Timer {
-                    timer_key: t.key,
-                    due_at: t.due_at,
-                }),
-            });
+            by_host
+                .entry(t.element_instance_key)
+                .or_default()
+                .push(ArmedTrigger {
+                    key: t.key,
+                    catch_id,
+                    interrupting,
+                    fingerprint,
+                    cancel: Event::TimerCanceled {
+                        timer_key: t.key,
+                        instance_key: t.instance_key,
+                        element_instance_key: t.element_instance_key,
+                        element_id: t.element_id.clone(),
+                    },
+                    report: Some(MigratedSubscriptionTrigger::Timer {
+                        timer_key: t.key,
+                        due_at: t.due_at,
+                    }),
+                });
         }
-        let catch_of = |kind: &state::MessageSubscriptionKind| match boundary_id_of(kind) {
-            Some((id, interrupting)) => Some((id, Some(interrupting))),
-            None if *kind == state::MessageSubscriptionKind::IntermediateCatch => {
-                Some((host_element_id.to_string(), None))
+        let catch_of = |kind: &state::MessageSubscriptionKind, host_element_id: &ElementId| {
+            match boundary_id_of(kind) {
+                Some((id, interrupting)) => Some((id, Some(interrupting))),
+                None if *kind == state::MessageSubscriptionKind::IntermediateCatch => {
+                    Some((host_element_id.clone(), None))
+                }
+                None => None,
             }
-            None => None,
         };
         for s in self.state.message_subscriptions.values() {
-            if s.element_instance_key != element_instance_key
-                || !matches!(
-                    s.state,
-                    state::MessageSubscriptionState::Open
-                        | state::MessageSubscriptionState::Opening
-                )
-            {
-                continue;
-            }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind) else {
+            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
                 continue;
             };
-            out.push(ArmedTrigger {
-                key: s.key,
-                catch_id,
-                interrupting,
-                fingerprint: TriggerFingerprint::Message(
-                    s.message_name.clone(),
-                    s.correlation_key.clone(),
-                ),
-                cancel: Self::disarm_subscription_event(s),
-                report: Some(MigratedSubscriptionTrigger::Message {
-                    subscription_key: s.key,
-                    message_name: s.message_name.clone(),
-                    correlation_key: s.correlation_key.clone(),
-                }),
-            });
+            if !matches!(
+                s.state,
+                state::MessageSubscriptionState::Open | state::MessageSubscriptionState::Opening
+            ) {
+                continue;
+            }
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+                continue;
+            };
+            by_host
+                .entry(s.element_instance_key)
+                .or_default()
+                .push(ArmedTrigger {
+                    key: s.key,
+                    catch_id,
+                    interrupting,
+                    fingerprint: TriggerFingerprint::Message(
+                        s.message_name.clone(),
+                        s.correlation_key.clone(),
+                    ),
+                    cancel: Self::disarm_subscription_event(s),
+                    report: Some(MigratedSubscriptionTrigger::Message {
+                        subscription_key: s.key,
+                        message_name: s.message_name.clone(),
+                        correlation_key: s.correlation_key.clone(),
+                    }),
+                });
         }
         for s in self.state.signal_subscriptions.values() {
-            if s.element_instance_key != element_instance_key
-                || s.state != state::MessageSubscriptionState::Open
-            {
-                continue;
-            }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind) else {
+            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
                 continue;
             };
-            out.push(ArmedTrigger {
-                key: s.key,
-                catch_id,
-                interrupting,
-                fingerprint: TriggerFingerprint::Signal(s.signal_name.clone()),
-                cancel: Event::SignalSubscriptionCanceled {
-                    subscription_key: s.key,
-                    instance_key: s.instance_key,
-                    element_instance_key: s.element_instance_key,
-                    element_id: s.element_id.clone(),
-                },
-                report: Some(MigratedSubscriptionTrigger::Signal {
-                    subscription_key: s.key,
-                    signal_name: s.signal_name.clone(),
-                }),
-            });
+            if s.state != state::MessageSubscriptionState::Open {
+                continue;
+            }
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+                continue;
+            };
+            by_host
+                .entry(s.element_instance_key)
+                .or_default()
+                .push(ArmedTrigger {
+                    key: s.key,
+                    catch_id,
+                    interrupting,
+                    fingerprint: TriggerFingerprint::Signal(s.signal_name.clone()),
+                    cancel: Event::SignalSubscriptionCanceled {
+                        subscription_key: s.key,
+                        instance_key: s.instance_key,
+                        element_instance_key: s.element_instance_key,
+                        element_id: s.element_id.clone(),
+                    },
+                    report: Some(MigratedSubscriptionTrigger::Signal {
+                        subscription_key: s.key,
+                        signal_name: s.signal_name.clone(),
+                    }),
+                });
         }
         for s in self.state.conditional_subscriptions.values() {
-            if s.element_instance_key != element_instance_key
-                || s.state != state::MessageSubscriptionState::Open
-            {
-                continue;
-            }
-            let Some((catch_id, interrupting)) = catch_of(&s.kind) else {
+            let Some(host_element_id) = hosts.get(&s.element_instance_key) else {
                 continue;
             };
-            out.push(ArmedTrigger {
-                key: s.key,
-                catch_id,
-                interrupting,
-                fingerprint: TriggerFingerprint::Conditional(s.condition.clone()),
-                cancel: Event::ConditionalSubscriptionCanceled {
-                    subscription_key: s.key,
-                    instance_key: s.instance_key,
-                    element_instance_key: s.element_instance_key,
-                    element_id: s.element_id.clone(),
-                },
-                report: None,
-            });
+            if s.state != state::MessageSubscriptionState::Open {
+                continue;
+            }
+            let Some((catch_id, interrupting)) = catch_of(&s.kind, host_element_id) else {
+                continue;
+            };
+            by_host
+                .entry(s.element_instance_key)
+                .or_default()
+                .push(ArmedTrigger {
+                    key: s.key,
+                    catch_id,
+                    interrupting,
+                    fingerprint: TriggerFingerprint::Conditional(s.condition.clone()),
+                    cancel: Event::ConditionalSubscriptionCanceled {
+                        subscription_key: s.key,
+                        instance_key: s.instance_key,
+                        element_instance_key: s.element_instance_key,
+                        element_id: s.element_id.clone(),
+                    },
+                    report: None,
+                });
         }
-        out.sort_by_key(|t| t.key);
-        out
+        for triggers in by_host.values_mut() {
+            triggers.sort_by_key(|t| t.key);
+        }
+        by_host
     }
 
     /// The fingerprint `target` (a catch element) would arm with, evaluating
@@ -378,6 +398,11 @@ impl Engine {
             .map(|i| i.active.iter().map(|(k, e)| (*k, e.clone())).collect())
             .unwrap_or_default();
         active.sort();
+        // Index triggers and lifecycle blockers once per migration so the
+        // per-element loop below is a lookup, not a partition-wide scan.
+        let hosts: HashMap<Key, ElementId> = active.iter().cloned().collect();
+        let mut armed_by_host = self.armed_triggers_on(&hosts, source);
+        let not_armable = self.hosts_not_armable_now(&hosts);
         for (eik, source_id) in active {
             let Some(target_id) = mapped.get(&source_id).cloned() else {
                 continue;
@@ -406,7 +431,7 @@ impl Engine {
                 .iter()
                 .filter_map(|b| mapped.get(&b.id).cloned())
                 .collect();
-            for armed in self.armed_triggers_on(eik, &source_id, source) {
+            for armed in armed_by_host.remove(&eik).unwrap_or_default() {
                 let vars = if armed.interrupting.is_some() {
                     &boundary_vars
                 } else {
@@ -484,7 +509,7 @@ impl Engine {
             // duplicate them. A host completing (end listeners / completion
             // incident) has already had its boundaries cancelled, so arming
             // here would leave triggers outliving the host.
-            if !self.boundaries_armable_now(eik) {
+            if not_armable.contains(&eik) {
                 continue;
             }
             // Target boundaries with no mapped source boundary are newly armed.
@@ -510,37 +535,50 @@ impl Engine {
         plan
     }
 
-    /// Whether `element_instance_key` is in its steady active phase, i.e. its
+    /// The `hosts` NOT in their steady active phase (computed in one pass), i.e. a
+    /// host is steady when its
     /// activation body has run (boundaries armed) and it has not begun
     /// completing (boundaries cancelled). False while any execution-listener
     /// job (start chain not drained, end chain running — including a `Failed`
     /// listener job parked on an incident) is outstanding, or while an active
     /// ioMapping-style incident will re-drive its activation or completion.
-    fn boundaries_armable_now(&self, element_instance_key: Key) -> bool {
-        let listener_outstanding = self.state.jobs.values().any(|j| {
-            j.element_instance_key == element_instance_key
-                && matches!(
-                    j.state,
-                    state::JobState::Created | state::JobState::Activated | state::JobState::Failed
-                )
-                && matches!(j.kind, state::JobKind::ExecutionListener { .. })
-        });
-        if listener_outstanding {
-            return false;
-        }
-        !self.state.incidents.values().any(|inc| {
-            inc.element_instance_key == element_instance_key
-                && inc.state == state::IncidentState::Active
-                && inc.job_key.is_none()
-                && match &inc.redrive {
-                    // Boundaries were armed on the first pass of a call
-                    // activity spawn; the host is otherwise steady.
-                    Some(state::IoMappingRedrive::CallActivitySpawn)
-                    | Some(state::IoMappingRedrive::AdHocCallActivitySpawn { .. }) => false,
-                    Some(_) => true,
-                    // Legacy/no-redrive ioMapping incidents replay activation.
-                    None => inc.kind == state::IncidentKind::IoMapping,
-                }
-        })
+    fn hosts_not_armable_now(&self, hosts: &HashMap<Key, ElementId>) -> HashSet<Key> {
+        let mut blocked: HashSet<Key> = self
+            .state
+            .jobs
+            .values()
+            .filter(|j| {
+                hosts.contains_key(&j.element_instance_key)
+                    && matches!(
+                        j.state,
+                        state::JobState::Created
+                            | state::JobState::Activated
+                            | state::JobState::Failed
+                    )
+                    && matches!(j.kind, state::JobKind::ExecutionListener { .. })
+            })
+            .map(|j| j.element_instance_key)
+            .collect();
+        blocked.extend(
+            self.state
+                .incidents
+                .values()
+                .filter(|inc| {
+                    hosts.contains_key(&inc.element_instance_key)
+                        && inc.state == state::IncidentState::Active
+                        && inc.job_key.is_none()
+                        && match &inc.redrive {
+                            // Boundaries were armed on the first pass of a call
+                            // activity spawn; the host is otherwise steady.
+                            Some(state::IoMappingRedrive::CallActivitySpawn)
+                            | Some(state::IoMappingRedrive::AdHocCallActivitySpawn { .. }) => false,
+                            Some(_) => true,
+                            // Legacy/no-redrive ioMapping incidents replay activation.
+                            None => inc.kind == state::IncidentKind::IoMapping,
+                        }
+                })
+                .map(|inc| inc.element_instance_key),
+        );
+        blocked
     }
 }

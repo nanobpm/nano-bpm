@@ -1325,3 +1325,64 @@ fn migration_does_not_arm_boundaries_for_completing_host() {
         "no trigger outlives host"
     );
 }
+
+#[test]
+fn migration_rejects_plain_to_multi_instance_subprocess() {
+    // A plain active sub-process carries no MI bookkeeping, so mapping it onto
+    // a multi-instance target would silently ignore the target's loop.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, sub_process("source", "sub", "a"));
+    let target_key = deploy_for_migration(
+        &mut engine,
+        rebuild_with_mi(sub_process("target", "sub2", "b"), "sub2"),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("sub", "sub2"), ("a", "b")]),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MigrationMultiInstanceMismatch { source_element_id, target_element_id, .. }
+            if source_element_id == "sub" && target_element_id == "sub2"
+    ));
+}
+
+#[test]
+fn migration_rejects_plain_to_multi_instance_task() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, sub_process("source", "sub", "a"));
+    let target_key = deploy_for_migration(
+        &mut engine,
+        rebuild_with_mi(sub_process("target", "sub2", "b"), "b"),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("sub", "sub2"), ("a", "b")]),
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MigrationMultiInstanceMismatch { source_element_id, .. }
+            if source_element_id == "a"
+    ));
+}
+
+fn rebuild_with_mi(mut def: ProcessDefinition, element: &str) -> ProcessDefinition {
+    let el = def.elements.get_mut(element).expect("element exists");
+    el.multi_instance = Some(crate::model::MultiInstance {
+        input_collection: "=[1,2]".to_string(),
+        input_element: None,
+        output_collection: None,
+        output_element: None,
+        completion_condition: None,
+        sequential: false,
+    });
+    def
+}

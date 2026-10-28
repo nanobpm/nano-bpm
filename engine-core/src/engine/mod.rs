@@ -4044,6 +4044,24 @@ impl Engine {
                         reason = "step 5 guarantees every active element is mapped"
                     )]
                     let tgt = mapped.get(eid).expect("step 5 guarantees a mapping");
+                    // Plain <-> multi-instance changes are rejected: the
+                    // preserved scope carries (or lacks) MI bookkeeping that
+                    // the target's loop characteristics would contradict.
+                    let source_mi = source_def
+                        .definition
+                        .element(eid)
+                        .is_some_and(|e| e.multi_instance.is_some());
+                    let target_mi = target
+                        .definition
+                        .element(tgt)
+                        .is_some_and(|e| e.multi_instance.is_some());
+                    if source_mi != target_mi {
+                        return Err(EngineError::MigrationMultiInstanceMismatch {
+                            instance_key,
+                            source_element_id: eid.clone(),
+                            target_element_id: tgt.clone(),
+                        });
+                    }
                     let expected =
                         match flow_scope::element_flow_scope_chain(&source_def.definition, eid)
                             .first()
