@@ -68,6 +68,61 @@ make install-hooks   # sets core.hooksPath -> .githooks (pre-push runs `make fmt
 The pre-push hook creates and cleans up the codegen stubs automatically. Bypass
 in an emergency with `git push --no-verify`.
 
+## Denying `unwrap`/`expect` in a crate (the clippy ratchet)
+
+Every first-party crate gates `clippy::unwrap_used` / `clippy::expect_used` at
+`deny` (epic #1357). When you enable the gate on a **new** crate — or clean a
+crate that is failing it — these are the traps the fleet hit:
+
+- **`clippy.toml` `allow-unwrap-in-tests` / `allow-expect-in-tests` only exempts
+  `#[cfg(test)]` modules and `#[test]` fns.** It does **not** cover
+  integration-test *helper* fns (non-`#[test]`) in `tests/*.rs`, nor anything in
+  `examples/`. Since the CI gate runs `cargo clippy --all-targets`, those are
+  flagged. Fix: add a file-level inner attribute to each `tests/*.rs` and
+  `examples/*.rs`, placed after any leading `//!` doc and `#![cfg(...)]` lines:
+
+  ```rust
+  #![allow(
+      clippy::unwrap_used,
+      clippy::expect_used,
+      reason = "non-production target (integration tests / examples)"
+  )]
+  ```
+
+- **Get the ground-truth site list from clippy, not a text grep.** A text count
+  of `.unwrap(`/`.expect(` that "stops at the first `#[cfg(test)]`" both
+  **over-counts** (~2x: matches test helpers, comments, `unwrap_or`) and
+  **under-counts** (a `#[cfg(test)]` `use`-import or a lone `#[cfg(test)]` const
+  mid-file ends the count early, hiding the real production sites below it —
+  read-model was estimated at ~5 and actually had 123; nano-server-raft ~8 vs
+  43). After enabling the gate, run
+  `cargo clippy --all-targets --message-format=json` and count the actual
+  `unwrap_used`/`expect_used` diagnostics — that is the number the gate enforces.
+
+- **Lock-poisoning on a recoverable path → recover, don't propagate.** The
+  established conversion for a poisoned `Mutex`/`RwLock` whose operations are
+  atomic under the lock is total and needs no `#[allow]` or import:
+
+  ```rust
+  .lock().unwrap_or_else(|e| e.into_inner())
+  // .read() / .write() likewise
+  ```
+
+  A poisoned lock here is recoverable (the guard's data is still consistent), so
+  we take the inner value rather than panic or bubble a `?`. After converting,
+  run the pinned-nightly `make fmt` — it reflows the longer chains.
+
+- **processos: gate with the exact CI invocation.** The default `duckdb-bundled`
+  feature compiles DuckDB's C++ from source (~20 min cold). Clippy/test exactly
+  as CI does — `DUCKDB_DOWNLOAD_LIB=1` (link a prebuilt lib) **and**
+  `--no-default-features` (turns `duckdb/bundled` off):
+
+  ```bash
+  cd processos
+  DUCKDB_DOWNLOAD_LIB=1 cargo clippy --no-default-features --all-targets -- -D warnings
+  DUCKDB_DOWNLOAD_LIB=1 cargo nextest run --no-default-features
+  ```
+
 ## BPMN Models need DI
 
 All BPMN Models need DI for rendering for humans.
