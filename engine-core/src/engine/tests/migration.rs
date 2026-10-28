@@ -945,10 +945,10 @@ fn migration_rejects_type_change() {
 }
 
 #[test]
-fn migration_rejects_unsupported_boundary_event() {
-    // The active service task carries an armed interrupting timer boundary event.
-    // Boundary events are not migratable in this phase (Zeebe rejects several
-    // such cases as "not supported yet") → rejected.
+fn migration_deletes_the_armed_timer_of_an_unmapped_boundary_event() {
+    // Zeebe parity (#1374): an armed boundary event whose catch event is not
+    // mapped is not carried over — its timer is canceled before the migration
+    // fact, and the target (which has no boundary) arms nothing.
     let mut engine = Engine::new();
     deploy_for_migration(
         &mut engine,
@@ -967,31 +967,36 @@ fn migration_rejects_unsupported_boundary_event() {
     let target_key =
         deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
     let inst = create_instance_key(&mut engine, "source");
-    let err = engine
+    let log = engine
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
             vec![("a".to_string(), "b".to_string())],
         ))
-        .unwrap_err();
+        .unwrap();
+    assert!(
+        matches!(log.first(), Some(Event::TimerCanceled { element_id, .. }) if element_id == "a")
+    );
     assert!(matches!(
-        err,
-        EngineError::UnsupportedMigration { element_id, .. } if element_id == "boundary"
+        log.get(1),
+        Some(Event::ProcessInstanceMigrated { .. })
     ));
+    assert_eq!(log.len(), 2);
+    assert!(engine
+        .state()
+        .timers
+        .values()
+        .all(|t| t.state != state::TimerState::Created));
 }
 
 #[test]
-fn unsupported_migration_reason_covers_every_reactive_boundary_kind() {
-    // Defect-class guard (#1173): every *reactive* boundary-event kind (one that
-    // can be armed on a still-active scope and fire during flow) must be rejected
-    // by the migration phase — "boundary events are not migratable yet". The
-    // escalation boundary was added to join reachability yet was initially
-    // omitted from `unsupported_migration_reason`; enumerate the whole class so a
-    // future boundary type cannot silently become "migratable" by omission.
-    // (`CompensationBoundaryEvent` is intentionally excluded — it is a passive
-    // marker that never fires reactively, so it is not in this guard.)
+fn unsupported_migration_reason_admits_every_boundary_kind_and_sub_process() {
+    // #1374: boundary events and embedded sub-processes are migratable (their
+    // runtime is planned in `engine/migration.rs`), so no boundary kind and no
+    // sub-process may be rejected by the element-class guard any more. Call
+    // activities and event-based gateways stay rejected until their slice lands.
     use crate::model::ElementKind;
-    let boundaries = [
+    let supported = [
         ElementKind::ErrorBoundaryEvent {
             attached_to: "host".to_string(),
             error_code: "E".to_string(),
@@ -1023,14 +1028,18 @@ fn unsupported_migration_reason_covers_every_reactive_boundary_kind() {
             escalation_code: "OVERLOAD".to_string(),
             interrupting: true,
         },
+        ElementKind::SubProcess {
+            start_event: "s".to_string(),
+        },
     ];
-    for kind in boundaries {
+    for kind in supported {
         assert_eq!(
             unsupported_migration_reason(&kind),
-            Some("boundary events are not migratable yet"),
-            "{kind:?} must be rejected by the migration phase"
+            None,
+            "{kind:?} is migratable"
         );
     }
+    assert!(unsupported_migration_reason(&ElementKind::EventBasedGateway).is_some());
 }
 
 #[test]
@@ -1096,10 +1105,8 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
     // scope. The applier re-points element ids but does NOT remap the scope
     // tree (`scopes` / `scope_parents` / `scope_variables`), so migrating such
     // an instance would leave its scope tree pointing at the source structure.
-    // Migration must be rejected as unsupported. (Here the enclosing sub-process
-    // is itself active and trips the sub-process guard first; the explicit
-    // flow-scope backstop guarantees the class stays rejected even if a future
-    // scope-owning element type is not caught by a more specific guard.)
+    // Since #1374 the scope tree is preserved and an inner token may migrate
+    // only together with its (mapped) enclosing sub-process.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
@@ -1126,6 +1133,7 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
         .unwrap();
     let target_key = deploy_for_migration(&mut engine, target);
 
+    // The active sub-process itself has no mapping → rejected (Zeebe).
     let err = engine
         .apply_command(Command::migrate_instance(
             inst,
@@ -1133,9 +1141,28 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
             vec![("inner".to_string(), "inner".to_string())],
         ))
         .unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::UnmappedActiveElement {
+            instance_key: inst,
+            element_id: "sub".to_string(),
+        }
+    );
+    // Mapping the sub-process onto the flat target's task moves `inner` out of
+    // its flow scope → rejected by `requireUnchangedFlowScope`.
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("inner".to_string(), "inner".to_string()),
+                ("sub".to_string(), "inner".to_string()),
+            ],
+        ))
+        .unwrap_err();
     assert!(
-        matches!(err, EngineError::UnsupportedMigration { .. }),
-        "an instance with an active token in a nested flow scope must not migrate; got {err:?}"
+        matches!(err, EngineError::MappedElementTypeChanged { .. }),
+        "got {err:?}"
     );
     // The instance stays on its source definition — nothing was migrated.
     assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
