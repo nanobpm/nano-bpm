@@ -1374,7 +1374,15 @@ fn migration_rejects_plain_to_multi_instance_task() {
     ));
 }
 
-fn rebuild_with_mi(mut def: ProcessDefinition, element: &str) -> ProcessDefinition {
+fn rebuild_with_mi(def: ProcessDefinition, element: &str) -> ProcessDefinition {
+    rebuild_with_mi_kind(def, element, false)
+}
+
+fn rebuild_with_mi_kind(
+    mut def: ProcessDefinition,
+    element: &str,
+    sequential: bool,
+) -> ProcessDefinition {
     let el = def.elements.get_mut(element).expect("element exists");
     el.multi_instance = Some(crate::model::MultiInstance {
         input_collection: "=[1,2]".to_string(),
@@ -1382,7 +1390,51 @@ fn rebuild_with_mi(mut def: ProcessDefinition, element: &str) -> ProcessDefiniti
         output_collection: None,
         output_element: None,
         completion_condition: None,
-        sequential: false,
+        sequential,
     });
     def
+}
+
+fn assert_loop_kind_change_rejected(source_sequential: bool, target_sequential: bool) {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        rebuild_with_mi_kind(sub_process("source", "sub", "a"), "a", source_sequential),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        rebuild_with_mi_kind(sub_process("target", "sub2", "b"), "b", target_sequential),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("sub", "sub2"), ("a", "b")]),
+        ))
+        .unwrap_err();
+    // Today an active MI source is rejected wholesale before the loop-kind
+    // guard runs; once MI migration lands, the guard must take over. Either
+    // way a parallel <-> sequential change must never be accepted.
+    assert!(
+        matches!(
+            err,
+            EngineError::UnsupportedMigration { ref element_id, .. } if element_id == "a"
+        ) || matches!(
+            err,
+            EngineError::MigrationMultiInstanceMismatch { ref source_element_id, ref target_element_id, .. }
+                if source_element_id == "a" && target_element_id == "b"
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn migration_rejects_parallel_to_sequential_multi_instance() {
+    assert_loop_kind_change_rejected(false, true);
+}
+
+#[test]
+fn migration_rejects_sequential_to_parallel_multi_instance() {
+    assert_loop_kind_change_rejected(true, false);
 }

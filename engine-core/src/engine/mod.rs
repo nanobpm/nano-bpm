@@ -4044,17 +4044,19 @@ impl Engine {
                         reason = "step 5 guarantees every active element is mapped"
                     )]
                     let tgt = mapped.get(eid).expect("step 5 guarantees a mapping");
-                    // Plain <-> multi-instance changes are rejected: the
-                    // preserved scope carries (or lacks) MI bookkeeping that
-                    // the target's loop characteristics would contradict.
+                    // Loop-kind changes are rejected (plain <-> multi-instance
+                    // and parallel <-> sequential): the preserved scope carries
+                    // (or lacks) MI bookkeeping — e.g. N concurrent inner
+                    // instances — that the target's loop characteristics would
+                    // contradict. `None` = plain, `Some(sequential)` = MI.
                     let source_mi = source_def
                         .definition
                         .element(eid)
-                        .is_some_and(|e| e.multi_instance.is_some());
+                        .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
                     let target_mi = target
                         .definition
                         .element(tgt)
-                        .is_some_and(|e| e.multi_instance.is_some());
+                        .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
                     if source_mi != target_mi {
                         return Err(EngineError::MigrationMultiInstanceMismatch {
                             instance_key,
@@ -12759,7 +12761,8 @@ pub enum EngineError {
         target_flow_scope_id: Option<String>,
     },
     /// A migration mapped a multi-instance element onto a non-multi-instance
-    /// one or vice versa. HTTP 409.
+    /// one or vice versa, or a parallel multi-instance element onto a
+    /// sequential one or vice versa. HTTP 409.
     MigrationMultiInstanceMismatch {
         instance_key: Key,
         source_element_id: String,
@@ -12949,7 +12952,7 @@ impl std::fmt::Display for EngineError {
             ),
             EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, target_element_id } => write!(
                 f,
-                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements is not supported."
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements, or between parallel and sequential multi-instance, is not supported."
             ),
             EngineError::MigrationCatchEventDetached { instance_key, element_id, target_element_id, catch_event_id, target_catch_event_id } => write!(
                 f,
