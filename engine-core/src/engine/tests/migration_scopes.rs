@@ -381,6 +381,76 @@ fn migration_recreates_timer_boundary_whose_timer_changed() {
         && matches!(s.trigger, MigratedSubscriptionTrigger::Timer { timer_key, .. } if timer_key == after[0].key)));
 }
 
+fn task_with_ni_timer_boundary(
+    id: &str,
+    boundary: &str,
+    millis: u64,
+    cycle: bool,
+) -> ProcessDefinition {
+    let b = ProcessBuilder::new(id)
+        .start_event("start")
+        .service_task("a", "work");
+    let b = if cycle {
+        b.non_interrupting_timer_cycle_boundary_event(boundary, "a", millis)
+    } else {
+        b.non_interrupting_timer_boundary_event(boundary, "a", millis)
+    };
+    b.end_event("end")
+        .end_event("side")
+        .connect("start", "a")
+        .connect("a", "end")
+        .connect(boundary, "side")
+        .build()
+        .unwrap()
+}
+
+/// A one-shot and a cycle timer with the same interval are different triggers:
+/// migrating between them must re-create the timer, never retain it (the
+/// fingerprint must include the `repeating` flag).
+fn assert_duration_cycle_migration_recreates(source_cycle: bool) {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        task_with_ni_timer_boundary("source", "t1", 60_000, source_cycle),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        task_with_ni_timer_boundary("target", "t2", 60_000, !source_cycle),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let old = live_timers(&engine, inst)[0].clone();
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a", "a"), ("t1", "t2")]),
+        ))
+        .unwrap();
+    let after = live_timers(&engine, inst);
+    assert_eq!(after.len(), 1);
+    assert_ne!(
+        after[0].key, old.key,
+        "duration<->cycle change must re-create the timer: {events:?}"
+    );
+    let subs = subscriptions_of(&events);
+    assert!(subs
+        .iter()
+        .any(|s| s.action == SubscriptionMigrationAction::Recreated && s.element_id == "t2"));
+    assert!(!subs
+        .iter()
+        .any(|s| s.action == SubscriptionMigrationAction::Retained));
+}
+
+#[test]
+fn migration_recreates_timer_when_duration_becomes_cycle() {
+    assert_duration_cycle_migration_recreates(false);
+}
+
+#[test]
+fn migration_recreates_timer_when_cycle_becomes_duration() {
+    assert_duration_cycle_migration_recreates(true);
+}
+
 #[test]
 fn migration_deletes_unmapped_boundary_and_creates_new_target_boundary() {
     // Source boundary has no counterpart (unmapped) → its timer is cancelled;

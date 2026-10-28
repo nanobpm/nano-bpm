@@ -35,7 +35,9 @@ use crate::model::{Element, ProcessDefinition};
 /// retaining and re-creating a subscription.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum TriggerFingerprint {
-    Timer(u64, Option<crate::model::TimerDef>),
+    /// `(duration, repeating, timer definition)` — `repeating` distinguishes a
+    /// one-shot duration from an equal-interval cycle (both have `timer: None`).
+    Timer(u64, bool, Option<crate::model::TimerDef>),
     Message(String, String),
     Signal(String),
     Conditional(String),
@@ -100,10 +102,16 @@ fn boundary_id_of(kind: &state::MessageSubscriptionKind) -> Option<(ElementId, b
 fn timer_fingerprint(element: &Element) -> Option<TriggerFingerprint> {
     match &element.kind {
         ElementKind::TimerBoundaryEvent {
-            duration_millis, ..
-        }
-        | ElementKind::TimerIntermediateCatchEvent { duration_millis } => Some(
-            TriggerFingerprint::Timer(*duration_millis, element.timer.clone()),
+            duration_millis,
+            repeating,
+            ..
+        } => Some(TriggerFingerprint::Timer(
+            *duration_millis,
+            *repeating,
+            element.timer.clone(),
+        )),
+        ElementKind::TimerIntermediateCatchEvent { duration_millis } => Some(
+            TriggerFingerprint::Timer(*duration_millis, false, element.timer.clone()),
         ),
         _ => None,
     }
