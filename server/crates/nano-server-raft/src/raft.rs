@@ -393,7 +393,9 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         | E::ElementNotActivatable { .. } => (400, e.to_string()),
         E::InstanceNotActive { .. }
         | E::MigrationFlowScopeChanged { .. }
-        | E::MigrationMultiInstanceMismatch { .. } => (409, e.to_string()),
+        | E::MigrationMultiInstanceMismatch { .. }
+        | E::MigrationCatchEventDetached { .. }
+        | E::MigrationCatchEventsMerged { .. } => (409, e.to_string()),
         other => (500, other.to_string()),
     }
 }
@@ -2652,6 +2654,25 @@ mod tests {
                     instance_key: 1,
                     source_element_id: "a".into(),
                     target_element_id: "b".into(),
+                },
+                409,
+            ),
+            (
+                E::MigrationCatchEventDetached {
+                    instance_key: 1,
+                    element_id: "a".into(),
+                    target_element_id: "b".into(),
+                    catch_event_id: "t1".into(),
+                    target_catch_event_id: "t2".into(),
+                },
+                409,
+            ),
+            (
+                E::MigrationCatchEventsMerged {
+                    instance_key: 1,
+                    element_id: "a".into(),
+                    target_catch_event_id: "t2".into(),
+                    source_catch_event_ids: vec!["t1".into(), "t1b".into()],
                 },
                 409,
             ),

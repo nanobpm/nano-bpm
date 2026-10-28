@@ -25,6 +25,7 @@ mod call_activity;
 mod debug;
 mod flow_scope;
 mod memory;
+mod migration;
 mod resolve;
 
 pub use debug::{BreakCondition, DebugSession};
@@ -3562,6 +3563,17 @@ impl Engine {
                     Some(state::MessageSubscriptionState::Opening)
                 ) && !self.instance_is_suspended(instance_key);
                 if advance {
+                    // The continuation metadata the canonical (message-partition)
+                    // record forwards can be stale: a migration re-points the
+                    // local `Opening` record's host and boundary ids but never the
+                    // remote copy. The local record is the source of truth for
+                    // where the token sits, so resolve the ids from it.
+                    let (element_id, kind) = self
+                        .state
+                        .message_subscriptions
+                        .get(&subscription_key)
+                        .map(|s| (s.element_id.clone(), s.kind.clone()))
+                        .unwrap_or((element_id, kind));
                     self.advance_correlated_token(
                         &mut log,
                         &mut queue,
@@ -3899,11 +3911,17 @@ impl Engine {
 
                 // The instance's current definition is the source of truth for its
                 // active elements' types (only the latest version is retained).
-                let source_def = self.state.processes.get(&source_process_id).ok_or(
-                    EngineError::ProcessNotFound {
+                // Resolved through the instance's pinned definition key, never
+                // the latest-by-id index: a same-process-id migration (v1 -> v2)
+                // must plan against the version the instance actually runs.
+                let source_def = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| self.state.definition_for(i))
+                    .ok_or(EngineError::ProcessNotFound {
                         process_id: source_process_id.clone(),
-                    },
-                )?;
+                    })?;
 
                 // 3. No duplicate source ids; every mapped source/target element
                 //    exists; each mapped pair keeps the same BPMN type (compared
@@ -3941,24 +3959,26 @@ impl Engine {
                     mapped.insert(src.clone(), tgt.clone());
                 }
 
-                // 4. Reject element classes this phase cannot remap safely.
-                //    Two sources of "unsupported":
-                //    (a) an active element instance whose own kind is a
-                //        sub-process, call activity, or event-based gateway (the
-                //        token rests directly on it, so it appears in `active`);
-                //    (b) an armed boundary event — its runtime (timer/subscription)
-                //        is stored against the *host* activity's element id with a
-                //        boundary `kind`, so the boundary element id lives inside
-                //        that kind rather than in `active`.
-                //    Zeebe rejects several of these as "not supported yet";
-                //    reproducing the rejection is parity.
+                // 4. Reject element classes Zeebe does not migrate yet: an
+                //    active element instance whose own kind is a call activity or
+                //    event-based gateway (`unsupported_migration_reason`).
+                //    Embedded sub-processes and boundary / intermediate catch
+                //    events are migrated (#1374): their flow scopes and
+                //    subscriptions are planned in `engine/migration.rs`.
                 #[allow(clippy::expect_used, reason = "instance existence checked above")]
                 let instance = self
                     .state
                     .instances
                     .get(&instance_key)
                     .expect("instance existence checked above");
-                let mut active_ids: Vec<String> = instance.active.values().cloned().collect();
+                let mut active_elements: Vec<(Key, String)> = instance
+                    .active
+                    .iter()
+                    .map(|(k, e)| (*k, e.clone()))
+                    .collect();
+                active_elements.sort();
+                let mut active_ids: Vec<String> =
+                    active_elements.iter().map(|(_, e)| e.clone()).collect();
                 active_ids.sort();
                 active_ids.dedup();
                 for eid in &active_ids {
@@ -3972,67 +3992,13 @@ impl Engine {
                         }
                     }
                 }
-                let boundary_reason = "boundary events are not migratable yet";
-                let mut armed_boundaries: Vec<String> = Vec::new();
-                for t in self.state.timers.values() {
-                    if t.instance_key == instance_key {
-                        match &t.kind {
-                            state::TimerKind::InterruptingBoundary {
-                                boundary_element_id,
-                            }
-                            | state::TimerKind::NonInterruptingBoundary {
-                                boundary_element_id,
-                            } => armed_boundaries.push(boundary_element_id.clone()),
-                            _ => {}
-                        }
-                    }
-                }
-                let boundary_kind = |kind: &state::MessageSubscriptionKind| match kind {
-                    state::MessageSubscriptionKind::InterruptingBoundary {
-                        boundary_element_id,
-                    }
-                    | state::MessageSubscriptionKind::NonInterruptingBoundary {
-                        boundary_element_id,
-                    } => Some(boundary_element_id.clone()),
-                    _ => None,
-                };
-                for s in self.state.message_subscriptions.values() {
-                    if s.instance_key == instance_key {
-                        if let Some(id) = boundary_kind(&s.kind) {
-                            armed_boundaries.push(id);
-                        }
-                    }
-                }
-                for s in self.state.signal_subscriptions.values() {
-                    if s.instance_key == instance_key {
-                        if let Some(id) = boundary_kind(&s.kind) {
-                            armed_boundaries.push(id);
-                        }
-                    }
-                }
-                for s in self.state.conditional_subscriptions.values() {
-                    if s.instance_key == instance_key {
-                        if let Some(id) = boundary_kind(&s.kind) {
-                            armed_boundaries.push(id);
-                        }
-                    }
-                }
-                if let Some(boundary_element_id) = armed_boundaries.into_iter().min() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id: boundary_element_id,
-                        reason: boundary_reason.to_string(),
-                    });
-                }
 
-                //    (c) an active multi-instance body or ad-hoc sub-process
-                //        container. Their per-element bookkeeping lives in
-                //        `ProcessInstance.multi_instances` / `adhoc_instances`,
-                //        which the applier (`state::apply`) does not remap, so
-                //        migrating one would leave that bookkeeping pointing at
-                //        the source element id and desync engine runtime. Zeebe
-                //        rejects these as "not supported yet"; reproducing the
-                //        rejection is parity.
+                //    An active multi-instance body or ad-hoc sub-process
+                //    container: their per-element bookkeeping lives in
+                //    `ProcessInstance.multi_instances` / `adhoc_instances`,
+                //    which the applier (`state::apply`) does not remap, so
+                //    migrating one would leave that bookkeeping pointing at
+                //    the source element id and desync engine runtime.
                 let mut unremappable: Vec<String> = instance
                     .multi_instances
                     .values()
@@ -4055,41 +4021,6 @@ impl Engine {
                     });
                 }
 
-                //    (d) Zeebe's "flow scope unchanged" precondition, enforced
-                //        categorically. The applier (`state::apply`) re-points
-                //        element ids but deliberately does NOT remap the scope
-                //        tree (`scopes` / `scope_parents` / `scope_variables`),
-                //        so an active element sitting inside a non-root flow
-                //        scope cannot be migrated without desyncing that tree.
-                //        Every element type that can own such a scope today is
-                //        already rejected above — an active embedded sub-process
-                //        appears in `active` (a), and multi-instance / ad-hoc
-                //        bodies via their bookkeeping maps (c) — so in the current
-                //        supported subset this is a defense-in-depth backstop.
-                //        Keeping it as an explicit precondition (rather than an
-                //        emergent property of those specific guards) prevents a
-                //        future scope-owning element type from silently slipping a
-                //        nested-scope token past them into the non-remapping
-                //        applier. `instance.scopes` keys are exactly the active
-                //        element instances that live in a non-root scope.
-                let mut scoped_active: Vec<String> = instance
-                    .scopes
-                    .keys()
-                    .filter_map(|element_instance_key| {
-                        instance.active.get(element_instance_key).cloned()
-                    })
-                    .collect();
-                scoped_active.sort();
-                scoped_active.dedup();
-                if let Some(element_id) = scoped_active.into_iter().next() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id,
-                        reason: "elements inside a nested flow scope are not migratable yet"
-                            .to_string(),
-                    });
-                }
-
                 // 5. Every active element instance must have a mapping.
                 for eid in &active_ids {
                     if !mapped.contains_key(eid) {
@@ -4098,6 +4029,68 @@ impl Engine {
                             element_id: eid.clone(),
                         });
                     }
+                }
+
+                // 5a. Zeebe `requireUnchangedFlowScope`: the target element's
+                //     flow scope must be the mapped target of the source
+                //     element's flow scope (the process itself for a
+                //     process-level element). The applier re-points the scope
+                //     tree by the same mapping, so this keeps it consistent.
+                //     Then the catch-event preconditions: mapped boundaries stay
+                //     attached and are not merged.
+                for (_, eid) in &active_elements {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "step 5 guarantees every active element is mapped"
+                    )]
+                    let tgt = mapped.get(eid).expect("step 5 guarantees a mapping");
+                    // Loop-kind changes are rejected (plain <-> multi-instance
+                    // and parallel <-> sequential): the preserved scope carries
+                    // (or lacks) MI bookkeeping — e.g. N concurrent inner
+                    // instances — that the target's loop characteristics would
+                    // contradict. `None` = plain, `Some(sequential)` = MI.
+                    let source_mi = source_def
+                        .definition
+                        .element(eid)
+                        .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
+                    let target_mi = target
+                        .definition
+                        .element(tgt)
+                        .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
+                    if source_mi != target_mi {
+                        return Err(EngineError::MigrationMultiInstanceMismatch {
+                            instance_key,
+                            source_element_id: eid.clone(),
+                            target_element_id: tgt.clone(),
+                        });
+                    }
+                    let expected =
+                        match flow_scope::element_flow_scope_chain(&source_def.definition, eid)
+                            .first()
+                        {
+                            Some(scope) => mapped.get(scope).cloned(),
+                            None => Some(target_process_id.clone()),
+                        };
+                    let actual = flow_scope::element_flow_scope_chain(&target.definition, tgt)
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| target_process_id.clone());
+                    if expected.as_deref() != Some(actual.as_str()) {
+                        return Err(EngineError::MigrationFlowScopeChanged {
+                            instance_key,
+                            element_id: eid.clone(),
+                            source_flow_scope_id: expected,
+                            target_flow_scope_id: Some(actual),
+                        });
+                    }
+                    Self::check_migrated_catch_events(
+                        instance_key,
+                        &source_def.definition,
+                        &target.definition,
+                        &mapped,
+                        eid,
+                        tgt,
+                    )?;
                 }
 
                 // 5b. An already-*open* parallel-gateway join (a token has
@@ -4207,6 +4200,20 @@ impl Engine {
                 // 6. All preconditions hold: emit the migration fact. The applier
                 //    rewrites the instance's process id and re-points every active
                 //    element instance and its attached runtime.
+                //    Subscriptions whose trigger changed (or whose catch event is
+                //    unmapped) are disarmed first, under their source ids; new
+                //    ones are armed after, under the target ids.
+                let source_definition = source_def.definition.clone();
+                let target_definition = target.definition.clone();
+                let plan = self.plan_migration(
+                    instance_key,
+                    &source_definition,
+                    &target_definition,
+                    &mapped,
+                );
+                for event in plan.before {
+                    self.emit(&mut log, event);
+                }
                 self.emit(
                     &mut log,
                     Event::ProcessInstanceMigrated {
@@ -4214,11 +4221,14 @@ impl Engine {
                         target_process_id,
                         target_process_definition_key,
                         element_mappings: mapping_instructions,
-                        migrated_flow_scopes: Vec::new(),
-                        subscriptions: Vec::new(),
+                        migrated_flow_scopes: plan.migrated_flow_scopes,
+                        subscriptions: plan.subscriptions,
                         child_instances: Vec::new(),
                     },
                 );
+                for event in plan.after {
+                    self.emit(&mut log, event);
+                }
             }
 
             Command::ModifyInstance {
@@ -6090,104 +6100,28 @@ impl Engine {
                     &element_id,
                 ));
             }
-            // A timer intermediate catch event arms a timer and parks the token;
-            // a clock tick (TriggerTimers) releases it once the timer is due.
-            Some(ElementKind::TimerIntermediateCatchEvent { duration_millis }) => {
-                let timer_key = self.mint_key();
-                let timer_def = self.timer_def_of(instance_key, &element_id);
-                let (due_at, _) = self.resolve_timer(
-                    &element_vars,
-                    timer_def.as_ref(),
-                    self.now,
-                    duration_millis,
-                );
-                events.push(Event::TimerCreated {
-                    timer_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    due_at,
-                    kind: state::TimerKind::IntermediateCatch,
-                });
-            }
-            // A message intermediate catch event opens a subscription and parks
-            // the token; a matching CorrelateMessage releases it.
-            Some(ElementKind::MessageIntermediateCatchEvent {
-                message_name,
-                correlation_key,
-            }) => {
-                let subscription_key = self.mint_key();
-                // The message name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity).
-                let message_name = self.resolve_event_name(&element_vars, &message_name);
-                // A declared correlation-key expression that fails to evaluate
-                // (missing variable, `null`, or a type error like `str + null`)
-                // must NOT silently open a subscription with an empty key — that
-                // key can never be matched by a published message, so the token
-                // would park forever with no error. Raise an ExpressionEvaluation
-                // incident instead (Zeebe parity); resolving it re-opens the
-                // subscription (see the `ResolveIncident` re-drive).
-                match self.resolve_correlation_value_checked(&element_vars, &correlation_key) {
-                    Err(reason) => {
-                        events.push(Event::IncidentRaised {
-                            incident_key: subscription_key,
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            kind: state::IncidentKind::ExpressionEvaluation,
-                            redrive: None,
-                            reason,
-                            job_key: None,
-                            created_at: self.now,
-                        });
-                    }
-                    Ok(correlation_value) => {
-                        let kind = state::MessageSubscriptionKind::IntermediateCatch;
-                        // Zeebe-style placement: the canonical subscription lives on the
-                        // partition owning `hash(correlation_key)`. When that is this
-                        // partition (always so single-partition), open it locally; else
-                        // park the token on an `Opening` record and let the host route an
-                        // `OpenMessageSubscription` to the message partition.
-                        if self.subscription_partition(&correlation_value) == self.partition_id {
-                            events.push(Event::MessageSubscriptionCreated {
-                                subscription_key,
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                message_name,
-                                correlation_key: correlation_value,
-                                kind,
-                            });
-                        } else {
-                            events.push(Event::MessageSubscriptionOpening {
-                                subscription_key,
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                message_name,
-                                correlation_key: correlation_value,
-                                kind,
-                            });
-                        }
-                    }
+            // A timer / message / signal intermediate catch event arms its
+            // trigger (timer or subscription) and parks the token; the clock
+            // tick, a matching CorrelateMessage or BroadcastSignal releases it.
+            // The arming itself is shared with migration (#1374) via
+            // `arm_catch_event`.
+            Some(
+                ElementKind::TimerIntermediateCatchEvent { .. }
+                | ElementKind::MessageIntermediateCatchEvent { .. }
+                | ElementKind::SignalIntermediateCatchEvent { .. },
+            ) => {
+                if let Some(element) = self
+                    .process_of_instance(instance_key)
+                    .and_then(|p| p.element(&element_id))
+                    .cloned()
+                {
+                    events.extend(self.arm_catch_event(
+                        instance_key,
+                        element_instance_key,
+                        &element_vars,
+                        &element,
+                    ));
                 }
-            }
-            // A signal intermediate catch event opens a signal subscription
-            // (name-only, no correlation key) and parks the token; a matching
-            // BroadcastSignal releases it.
-            Some(ElementKind::SignalIntermediateCatchEvent { signal_name }) => {
-                let subscription_key = self.mint_key();
-                // The signal name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity).
-                let signal_name = self.resolve_event_name(&element_vars, &signal_name);
-                events.push(Event::SignalSubscriptionCreated {
-                    subscription_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    signal_name,
-                    kind: state::MessageSubscriptionKind::IntermediateCatch,
-                });
             }
             // A conditional intermediate catch event evaluates its FEEL condition
             // on arrival: if already `true` the token passes straight through;
@@ -6205,18 +6139,17 @@ impl Engine {
                         element_instance_key,
                         element_id,
                     });
-                } else {
-                    let subscription_key = self.mint_key();
-                    let referenced_vars = sorted_referenced_vars(&condition);
-                    events.push(Event::ConditionalSubscriptionCreated {
-                        subscription_key,
+                } else if let Some(element) = self
+                    .process_of_instance(instance_key)
+                    .and_then(|p| p.element(&element_id))
+                    .cloned()
+                {
+                    events.extend(self.arm_catch_event(
                         instance_key,
                         element_instance_key,
-                        element_id,
-                        condition,
-                        referenced_vars,
-                        kind: state::MessageSubscriptionKind::IntermediateCatch,
-                    });
+                        &element_vars,
+                        &element,
+                    ));
                 }
             }
             // An embedded sub-process opens a token scope: it activates its inner
@@ -12828,11 +12761,32 @@ pub enum EngineError {
         target_flow_scope_id: Option<String>,
     },
     /// A migration mapped a multi-instance element onto a non-multi-instance
-    /// one or vice versa. HTTP 409.
+    /// one or vice versa, or a parallel multi-instance element onto a
+    /// sequential one or vice versa. HTTP 409.
     MigrationMultiInstanceMismatch {
         instance_key: Key,
         source_element_id: String,
         target_element_id: String,
+    },
+    /// A migration mapped a catch event attached to an active element (a
+    /// boundary event) onto a catch event that is not attached to that
+    /// element's mapped target. HTTP 409. Zeebe
+    /// `ERROR_CATCH_EVENT_DETACHED_FROM_ELEMENT`.
+    MigrationCatchEventDetached {
+        instance_key: Key,
+        element_id: String,
+        target_element_id: String,
+        catch_event_id: String,
+        target_catch_event_id: String,
+    },
+    /// Several catch events of one active element are mapped onto the same
+    /// target catch event. HTTP 409. Zeebe
+    /// `requireNoDuplicateTargetsInCatchEventMappings`.
+    MigrationCatchEventsMerged {
+        instance_key: Key,
+        element_id: String,
+        target_catch_event_id: String,
+        source_catch_event_ids: Vec<String>,
     },
     /// An AgentInstance command referenced an `agent_instance_key` that does not
     /// identify a known agent instance.
@@ -12948,16 +12902,7 @@ impl Engine {
 fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'static str> {
     use crate::model::ElementKind;
     match kind {
-        ElementKind::ErrorBoundaryEvent { .. }
-        | ElementKind::TimerBoundaryEvent { .. }
-        | ElementKind::MessageBoundaryEvent { .. }
-        | ElementKind::SignalBoundaryEvent { .. }
-        | ElementKind::ConditionalBoundaryEvent { .. }
-        | ElementKind::EscalationBoundaryEvent { .. } => {
-            Some("boundary events are not migratable yet")
-        }
         ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),
-        ElementKind::SubProcess { .. } => Some("embedded sub-processes are not migratable yet"),
         ElementKind::EventBasedGateway => Some("event-based gateways are not migratable yet"),
         _ => None,
     }
@@ -13007,7 +12952,16 @@ impl std::fmt::Display for EngineError {
             ),
             EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, target_element_id } => write!(
                 f,
-                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements is not supported."
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements, or between parallel and sequential multi-instance, is not supported."
+            ),
+            EngineError::MigrationCatchEventDetached { instance_key, element_id, target_element_id, catch_event_id, target_catch_event_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' is mapped to an element with id '{target_element_id}' and has a catch event with id '{catch_event_id}' that is mapped to a catch event with id '{target_catch_event_id}'. These mappings detach the catch event from the element in the target process. Catch events must stay attached to the same element instance."
+            ),
+            EngineError::MigrationCatchEventsMerged { instance_key, element_id, target_catch_event_id, source_catch_event_ids } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' has a catch event attached that is mapped to a catch event with id '{target_catch_event_id}'. There are multiple mapping instructions that target this catch event: '{}'. Catch events cannot be merged by process instance migration. Please ensure the mapping instructions target a catch event only once.",
+                source_catch_event_ids.join("', '")
             ),
             EngineError::ProcessNotFound { process_id } => {
                 write!(f, "no deployed process with id {process_id}")

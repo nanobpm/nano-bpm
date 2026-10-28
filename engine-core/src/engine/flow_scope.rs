@@ -18,13 +18,6 @@ use super::*;
 /// sub-processes, **innermost first** (empty for a process-level element, or an
 /// unknown id). Bounded by the element count, so a malformed cyclic `parent`
 /// chain cannot loop forever.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#1374 scaffold: consumed by the modify/migrate behaviour slices; drop this once used"
-    )
-)]
 pub(crate) fn element_flow_scope_chain(
     def: &crate::model::ProcessDefinition,
     element_id: &str,

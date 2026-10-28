@@ -1393,6 +1393,42 @@ impl Journal {
         }
     }
 
+    /// Restores spilled root variables of the instance an instance-addressed
+    /// command is about to evaluate expressions against. Migration and
+    /// modification may arm new boundary/catch subscriptions whose correlation
+    /// keys / timer expressions read root variables; job activation (the only
+    /// other restore path) is not part of either command, so without this the
+    /// engine would evaluate against the empty spill placeholder.
+    fn ensure_variables_resident_for_command(&mut self, command: &Command) {
+        let instance_key = match command {
+            Command::MigrateInstance { instance_key, .. }
+            | Command::ModifyInstance { instance_key, .. } => *instance_key,
+            _ => return,
+        };
+        self.restore_spilled_variables(instance_key);
+    }
+
+    /// Rehydrates `key`'s spilled root variables from the spill store (lean
+    /// mode: non-destructive `get`; classic: `take`). No-op when not spilled.
+    fn restore_spilled_variables(&mut self, key: Key) {
+        if !self.engine.is_variables_spilled(key) {
+            return;
+        }
+        let restored = if let Some(vstore) = self.varstore.as_ref() {
+            vstore.get(key)
+        } else {
+            self.spill.as_ref().and_then(|vs| vs.store.take(key))
+        };
+        match restored {
+            Some(vars) => self.engine.rehydrate_variables(key, Arc::new(vars)),
+            None => tracing::error!(
+                instance_key = key,
+                "spilled instance has no variable row in the spill store; the command \
+                 evaluates WITHOUT its process variables"
+            ),
+        }
+    }
+
     /// Rehydrates any cold instance a command is about to target, so the engine
     /// processes the command against complete hot state. Cheap when cold spill is
     /// unset or nothing relevant is cold (a few index lookups). Routing mirrors
@@ -1401,6 +1437,7 @@ impl Journal {
     /// (`TriggerTimers`), the instance key (`CancelInstance`), or an instance-root
     /// or element-instance scope key (`SetVariables`).
     fn ensure_resident_for_command(&mut self, command: &Command) {
+        self.ensure_variables_resident_for_command(command);
         let Some(cold) = self.cold.as_ref() else {
             return;
         };
@@ -1450,8 +1487,9 @@ impl Journal {
                     targets.push(*instance_key);
                 }
             }
-            Command::ModifyInstance { instance_key, .. } => {
-                // Modify addresses a single instance (activating/terminating its
+            Command::ModifyInstance { instance_key, .. }
+            | Command::MigrateInstance { instance_key, .. } => {
+                // Modify/migrate address a single instance (activating/terminating its
                 // element instances); page it in before the command applies.
                 if cold.index.contains(*instance_key) {
                     targets.push(*instance_key);
@@ -3146,6 +3184,81 @@ mod tests {
             "sub-process scope-local variable folded back into the worker's view"
         );
         assert!(!journal.engine.is_variables_spilled(key), "rehydrated");
+    }
+
+    #[test]
+    fn migration_of_a_spilled_instance_arms_boundaries_with_restored_variables() {
+        use nanobpmn_engine_core::{Event, ProcessBuilder, Value};
+
+        // A job-parked instance whose root variables are spilled is migrated onto
+        // a target that adds a message boundary correlated on `=key`. Migration
+        // performs no job activation, so the journal must restore the spilled
+        // root BEFORE planning, or the new subscription gets an empty key.
+        fn def(id: &str, with_boundary: bool) -> nanobpmn_engine_core::ProcessDefinition {
+            let mut b = ProcessBuilder::new(id)
+                .start_event("start")
+                .service_task("task", "work")
+                .end_event("end")
+                .connect("start", "task")
+                .connect("task", "end");
+            if with_boundary {
+                b = b
+                    .message_boundary_event("mb", "task", "cancel", "=key")
+                    .end_event("cancelled")
+                    .connect("mb", "cancelled");
+            }
+            b.build().expect("valid")
+        }
+        let deployed_key = |events: &[Event]| {
+            events
+                .iter()
+                .find_map(|e| match e {
+                    Event::ProcessDeployed {
+                        process_definition_key,
+                        ..
+                    } => Some(*process_definition_key),
+                    _ => None,
+                })
+                .expect("deployed")
+        };
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        journal.set_spill(Arc::clone(&store), 0);
+        let _ = journal
+            .apply_command(Command::DeployProcess(def("source", false)))
+            .unwrap();
+        let (events, _) = journal
+            .apply_command(Command::DeployProcess(def("target", true)))
+            .unwrap();
+        let target_key = deployed_key(&events);
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("key".to_string(), Value::Str("k1".into()));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("source", vars))
+            .unwrap();
+        let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+        journal.force_spill_scan();
+        assert!(journal.engine.is_variables_spilled(inst), "spilled");
+
+        let (events, _) = journal
+            .apply_command(Command::migrate_instance(
+                inst,
+                target_key,
+                vec![("task".into(), "task".into())],
+            ))
+            .unwrap();
+        let key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::MessageSubscriptionCreated {
+                    correlation_key, ..
+                } => Some(correlation_key.clone()),
+                _ => None,
+            })
+            .expect("new boundary subscription opened");
+        assert_eq!(key, "k1", "correlation key evaluated against restored root");
+        assert!(!journal.engine.is_variables_spilled(inst), "rehydrated");
     }
 
     #[test]
