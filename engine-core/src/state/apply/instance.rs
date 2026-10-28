@@ -343,6 +343,18 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     *id = (*target).to_string();
                 }
             };
+            // A retained boundary subscription names its boundary inside its
+            // kind; re-point it with the same mapping (the command handler has
+            // already re-created every subscription whose trigger changed).
+            let remap_subscription_kind = |kind: &mut MessageSubscriptionKind| match kind {
+                MessageSubscriptionKind::InterruptingBoundary {
+                    boundary_element_id,
+                }
+                | MessageSubscriptionKind::NonInterruptingBoundary {
+                    boundary_element_id,
+                } => remap_id(boundary_element_id),
+                _ => {}
+            };
 
             // Move the live-instance count from the source process id to the
             // target's, and re-point the instance itself.
@@ -432,21 +444,33 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             for timer in state.timers.values_mut() {
                 if timer.instance_key == *instance_key {
                     remap_id(&mut timer.element_id);
+                    match &mut timer.kind {
+                        TimerKind::InterruptingBoundary {
+                            boundary_element_id,
+                        }
+                        | TimerKind::NonInterruptingBoundary {
+                            boundary_element_id,
+                        } => remap_id(boundary_element_id),
+                        TimerKind::IntermediateCatch => {}
+                    }
                 }
             }
             for sub in state.message_subscriptions.values_mut() {
                 if sub.instance_key == *instance_key {
                     remap_id(&mut sub.element_id);
+                    remap_subscription_kind(&mut sub.kind);
                 }
             }
             for sub in state.signal_subscriptions.values_mut() {
                 if sub.instance_key == *instance_key {
                     remap_id(&mut sub.element_id);
+                    remap_subscription_kind(&mut sub.kind);
                 }
             }
             for sub in state.conditional_subscriptions.values_mut() {
                 if sub.instance_key == *instance_key {
                     remap_id(&mut sub.element_id);
+                    remap_subscription_kind(&mut sub.kind);
                 }
             }
             for incident in state.incidents.values_mut() {
@@ -454,13 +478,13 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     remap_id(&mut incident.element_id);
                 }
             }
-            // The scope tree (`scopes` / `scope_parents` / `scope_variables`) is
-            // intentionally NOT remapped: the command handler rejects any
-            // instance whose active tokens live inside a non-root flow scope
-            // (embedded sub-process, multi-instance, or ad-hoc) as unsupported,
-            // so an instance that reaches this applier is flat (root scope only)
-            // and has nothing to remap. See the "flow scope unchanged"
-            // precondition in `Command::MigrateInstance` validation.
+            // The scope tree (`scopes` / `scope_parents` / `scope_variables`)
+            // is keyed by element-instance keys, which migration preserves, so
+            // it needs no remapping: a migrated sub-process keeps its scope
+            // instance and its inner tokens were re-pointed via `active` above.
+            // The command handler guarantees (Zeebe `requireUnchangedFlowScope`)
+            // that every target element sits in the mapped target of its
+            // source flow scope, so the preserved tree stays consistent.
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
