@@ -6660,6 +6660,80 @@ impl ServerImpl {
         )
     }
 
+    async fn modify_process_instance_impl(
+        &self,
+        path_params: &models::ModifyProcessInstancePathParams,
+        body: &models::ProcessInstanceModificationInstruction,
+    ) -> Result<apis::process_instance::ModifyProcessInstanceResponse, ()> {
+        use apis::process_instance::ModifyProcessInstanceResponse as Resp;
+
+        let instance_key: u64 = match path_params.process_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    format!(
+                        "Process instance key '{}' is not a valid key.",
+                        path_params.process_instance_key
+                    ),
+                )));
+            }
+        };
+
+        let instructions = match modify_instructions_from_rest(body) {
+            Ok(i) => i,
+            Err(detail) => {
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid modification",
+                    400,
+                    detail,
+                )));
+            }
+        };
+
+        Ok(
+            match self.modify_instance_core(instance_key, instructions).await {
+                ModifyInstanceOutcome::Modified => Resp::Status204_TheProcessInstanceIsModified,
+                ModifyInstanceOutcome::BadRequest(detail) => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid modification",
+                        400,
+                        detail,
+                    ))
+                }
+                ModifyInstanceOutcome::NotFound(detail) => {
+                    Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                        "Process instance not found",
+                        404,
+                        detail,
+                    ))
+                }
+                ModifyInstanceOutcome::Conflict(detail) => {
+                    Resp::Status409_TheProcessInstanceIsNotInAStateThatAllowsModification(problem(
+                        "Invalid state",
+                        409,
+                        detail,
+                    ))
+                }
+                ModifyInstanceOutcome::Unavailable(detail) => {
+                    Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                        "Service unavailable",
+                        503,
+                        detail,
+                    ))
+                }
+                ModifyInstanceOutcome::Internal(detail) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        detail,
+                    ))
+                }
+            },
+        )
+    }
+
     async fn complete_job_impl(
         &self,
         path_params: &models::CompleteJobPathParams,
@@ -8040,6 +8114,70 @@ impl ServerImpl {
             mapping_instructions,
         );
         let _ = self.apply_partition_command(instance_key, command).await?;
+        self.signal_jobs_available();
+        Ok(())
+    }
+
+    /// Surface-independent core of "modify a process instance": leader-forward
+    /// (as a [`falcon::ClientFrame::ModifyInstance`] frame) when this node is
+    /// not the instance's leader, else apply [`Command::ModifyInstance`] via
+    /// [`Self::modify_instance_local`] and wait for commit. The v2 REST handler
+    /// and the intra-cluster frame handler share this single implementation;
+    /// the instruction set is already mapped onto the engine's command fields
+    /// ([`modify_instructions_from_rest`]).
+    pub(crate) async fn modify_instance_core(
+        &self,
+        instance_key: u64,
+        instructions: falcon::ModifyInstanceInstructions,
+    ) -> ModifyInstanceOutcome {
+        use ModifyInstanceOutcome as Out;
+
+        if let Some(node) = self.route_by_leader(instance_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link
+                    .modify_instance(instance_key.to_string(), instructions)
+                    .await
+                {
+                    Ok(r) if is_ok_status(r.status) => Out::Modified,
+                    Ok(r) => Out::from_status(r.status, peer_detail(&r)),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+
+        match self.modify_instance_local(instance_key, instructions).await {
+            Ok(()) => Out::Modified,
+            Err((status, detail)) => Out::from_status(status, detail),
+        }
+    }
+
+    /// Applies a modification on this node's owning partition. Returns `Ok(())`
+    /// on success, else `(status, detail)` where `status` is the HTTP code the
+    /// engine rejection maps to via the shared
+    /// [`crate::raft::engine_error_status`] (400 invalid / not-yet-supported
+    /// instruction, 404 unknown instance, 409 instance not active), or 503 when
+    /// the write is rejected during a hand-off pause / leader transition.
+    pub(crate) async fn modify_instance_local(
+        &self,
+        instance_key: u64,
+        instructions: falcon::ModifyInstanceInstructions,
+    ) -> Result<(), (u16, String)> {
+        let falcon::ModifyInstanceInstructions {
+            activate_instructions,
+            terminate_instructions,
+            terminate_element_ids,
+            move_instructions,
+        } = instructions;
+        let command = Command::ModifyInstance {
+            instance_key,
+            activate_instructions,
+            terminate_instructions,
+            terminate_element_ids,
+            move_instructions,
+        };
+        let _ = self.apply_partition_command(instance_key, command).await?;
+        // Activating an element may create jobs; wake any long-pollers.
         self.signal_jobs_available();
         Ok(())
     }
@@ -23024,6 +23162,173 @@ pub(crate) enum MigrateInstanceOutcome {
     Internal(String),
 }
 
+/// Surface-independent outcome of [`ServerImpl::modify_instance_core`].
+#[derive(Debug)]
+pub(crate) enum ModifyInstanceOutcome {
+    /// Every instruction was applied atomically.
+    Modified,
+    /// An instruction is invalid or not yet supported by the engine (400,
+    /// Zeebe `INVALID_ARGUMENT`); carries the engine's message.
+    BadRequest(String),
+    /// No process instance with the given key exists (404).
+    NotFound(String),
+    /// The instance exists but is not active, e.g. suspended (409, Zeebe
+    /// `INVALID_STATE`).
+    Conflict(String),
+    /// A transient, retryable Raft condition (handoff pause / leader
+    /// transition) rejected the write (503).
+    Unavailable(String),
+    /// An unexpected engine/peer error occurred (500).
+    Internal(String),
+}
+
+impl ModifyInstanceOutcome {
+    /// Maps the shared `(status, detail)` rejection shape (local apply or peer
+    /// `CommandResult`) onto the outcome, so the status mapping lives in one
+    /// place for both the local and the leader-forwarded path.
+    fn from_status(status: u16, detail: String) -> Self {
+        match status {
+            400 => Self::BadRequest(detail),
+            404 => Self::NotFound(detail),
+            409 => Self::Conflict(detail),
+            503 => Self::Unavailable(detail),
+            _ => Self::Internal(detail),
+        }
+    }
+}
+
+/// Parses an element-instance key carried in a modification instruction.
+/// A malformed key is invalid input (400).
+fn parse_modification_key(field: &str, raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>()
+        .map_err(|_| format!("{field} '{raw}' is not a valid key."))
+}
+
+/// Splits REST variable instructions into the engine's root-scope variables
+/// (an absent or empty `scopeId`) and scoped [`VariableInstruction`]s (a
+/// non-empty `scopeId`).
+fn split_variable_instructions(
+    instructions: Option<&Vec<models::ModifyProcessInstanceVariableInstruction>>,
+) -> (
+    std::collections::HashMap<String, Value>,
+    Vec<nanobpmn_engine_core::VariableInstruction>,
+) {
+    let mut root = std::collections::HashMap::new();
+    let mut scoped = Vec::new();
+    for vi in instructions.into_iter().flatten() {
+        let variables = from_object_map(&vi.variables);
+        match vi.scope_id.as_deref().filter(|s| !s.is_empty()) {
+            None => root.extend(variables),
+            Some(scope) => scoped.push(nanobpmn_engine_core::VariableInstruction {
+                variables,
+                scope_id: Some(scope.to_string()),
+            }),
+        }
+    }
+    (root, scoped)
+}
+
+/// Maps the full `ProcessInstanceModificationInstruction` request
+/// (spec/process-instances.yaml) onto the engine's `Command::ModifyInstance`
+/// fields: activate instructions (root + scoped variables,
+/// `ancestorElementInstanceKey` with `-1` = none), terminate by key and by id,
+/// and move instructions. Fields the engine does not yet act on are passed
+/// through faithfully so the engine — not this mapper — rejects them (400 with
+/// the engine's message). Only a malformed key is rejected here (400).
+fn modify_instructions_from_rest(
+    body: &models::ProcessInstanceModificationInstruction,
+) -> Result<falcon::ModifyInstanceInstructions, String> {
+    use nanobpmn_engine_core::{
+        ActivateElementInstruction, AncestorScopeInstruction, MoveInstruction, MoveSource,
+    };
+
+    let mut out = falcon::ModifyInstanceInstructions::default();
+
+    for a in body.activate_instructions.iter().flatten() {
+        let ancestor_element_instance_key = match a.ancestor_element_instance_key.as_ref() {
+            None => None,
+            Some(k) if k.0 == "-1" => None,
+            Some(k) => Some(parse_modification_key("ancestorElementInstanceKey", &k.0)?),
+        };
+        let (variables, variable_instructions) =
+            split_variable_instructions(a.variable_instructions.as_ref());
+        out.activate_instructions.push(ActivateElementInstruction {
+            element_id: a.element_id.clone(),
+            variables,
+            ancestor_element_instance_key,
+            variable_instructions,
+        });
+    }
+
+    for t in body.terminate_instructions.iter().flatten() {
+        match t {
+            models::ProcessInstanceModificationTerminateInstruction::ProcessInstanceModificationTerminateByKeyInstruction(k) => {
+                out.terminate_instructions.push(parse_modification_key(
+                    "elementInstanceKey",
+                    &k.element_instance_key.0,
+                )?);
+            }
+            models::ProcessInstanceModificationTerminateInstruction::ProcessInstanceModificationTerminateByIdInstruction(i) => {
+                out.terminate_element_ids.push(i.element_id.clone());
+            }
+        }
+    }
+
+    for m in body.move_instructions.iter().flatten() {
+        let source = match &m.source_element_instruction {
+            models::SourceElementInstruction::SourceElementIdInstruction(i) => {
+                MoveSource::ById(i.source_element_id.clone())
+            }
+            models::SourceElementInstruction::SourceElementInstanceKeyInstruction(k) => {
+                MoveSource::ByKey(parse_modification_key(
+                    "sourceElementInstanceKey",
+                    &k.source_element_instance_key.0,
+                )?)
+            }
+        };
+        // Spec: the default (absent) ancestor scope resembles a `direct`
+        // instruction with key `-1`, i.e. the engine's inferred default.
+        let ancestor_scope = match &m.ancestor_scope_instruction {
+            None => AncestorScopeInstruction::Inferred,
+            Some(models::AncestorScopeInstruction::DirectAncestorKeyInstruction(d)) => {
+                if d.ancestor_element_instance_key.0 == "-1" {
+                    AncestorScopeInstruction::Inferred
+                } else {
+                    AncestorScopeInstruction::Direct(parse_modification_key(
+                        "ancestorElementInstanceKey",
+                        &d.ancestor_element_instance_key.0,
+                    )?)
+                }
+            }
+            Some(models::AncestorScopeInstruction::InferredAncestorKeyInstruction(_)) => {
+                AncestorScopeInstruction::Inferred
+            }
+            Some(models::AncestorScopeInstruction::UseSourceParentKeyInstruction(_)) => {
+                AncestorScopeInstruction::SourceParent
+            }
+        };
+        // Move instructions carry every variable instruction verbatim (an
+        // empty `scopeId` = the process root scope), in request order.
+        let variable_instructions = m
+            .variable_instructions
+            .iter()
+            .flatten()
+            .map(|vi| nanobpmn_engine_core::VariableInstruction {
+                variables: from_object_map(&vi.variables),
+                scope_id: vi.scope_id.clone().filter(|s| !s.is_empty()),
+            })
+            .collect();
+        out.move_instructions.push(MoveInstruction {
+            source,
+            target_element_id: m.target_element_id.clone(),
+            ancestor_scope,
+            variable_instructions,
+        });
+    }
+
+    Ok(out)
+}
+
 /// Surface-independent outcome of [`ServerImpl::suspend_instance_core`] /
 /// [`ServerImpl::resume_instance_core`], mapped to the v2 REST response types so
 /// the `Command::suspend_instance` / `Command::resume_instance` and clustering
@@ -31478,6 +31783,291 @@ mod clustered_startup_tests {
                 .await,
             MigrateInstanceOutcome::BadRequest(_)
         ));
+    }
+
+    /// Deploys `s → a → b → e` (two service tasks) and starts one instance,
+    /// waiting until it projects Active with `a` active. Shared setup for the
+    /// `POST /v2/process-instances/{key}/modification` tests.
+    async fn modify_fixture(server: &ServerImpl) -> (u64, u64) {
+        let def = ProcessBuilder::new("modify-me")
+            .start_event("s")
+            .service_task("a", "work-a")
+            .service_task("b", "work-b")
+            .end_event("e")
+            .connect("s", "a")
+            .connect("a", "b")
+            .connect("b", "e")
+            .build()
+            .expect("valid definition");
+        let mut names = std::collections::HashMap::new();
+        names.insert("modify-me".to_string(), "modify-me.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![def],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy");
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("modify-me".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create the instance");
+        for _ in 0..200 {
+            if let Some(a) = server.store.element_instances().iter().find(|e| {
+                e.instance_key == instance_key
+                    && e.element_id == "a"
+                    && e.state == crate::readstore::ElementInstanceState::Active
+            }) {
+                return (instance_key, a.element_instance_key);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the instance never projected an active `a`");
+    }
+
+    async fn modify_via_rest(
+        server: &ServerImpl,
+        instance_key: &str,
+        body: serde_json::Value,
+    ) -> apis::process_instance::ModifyProcessInstanceResponse {
+        let body: models::ProcessInstanceModificationInstruction =
+            serde_json::from_value(body).expect("well-formed modification body");
+        server
+            .modify_process_instance_impl(
+                &models::ModifyProcessInstancePathParams {
+                    process_instance_key: instance_key.to_string(),
+                },
+                &body,
+            )
+            .await
+            .expect("handler never returns the 501 stub")
+    }
+
+    /// Success: activate `b` with a root variable and terminate `a` by key, in
+    /// one atomic modification — 204, `b` active, `a` terminated, the variable
+    /// on the root scope.
+    #[tokio::test]
+    async fn modify_instance_activates_terminates_and_sets_root_variables() {
+        use apis::process_instance::ModifyProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        let (instance_key, a_key) = modify_fixture(&server).await;
+
+        let resp = modify_via_rest(
+            &server,
+            &instance_key.to_string(),
+            serde_json::json!({
+                "activateInstructions": [{
+                    "elementId": "b",
+                    "variableInstructions": [{ "variables": { "x": 42 } }]
+                }],
+                "terminateInstructions": [{ "elementInstanceKey": a_key.to_string() }]
+            }),
+        )
+        .await;
+        assert!(
+            matches!(resp, Resp::Status204_TheProcessInstanceIsModified),
+            "unexpected response: {resp:?}"
+        );
+
+        let mut ok = false;
+        for _ in 0..200 {
+            let rows = server.store.element_instances();
+            let b_active = rows.iter().any(|e| {
+                e.instance_key == instance_key
+                    && e.element_id == "b"
+                    && e.state == crate::readstore::ElementInstanceState::Active
+            });
+            let a_gone = rows.iter().any(|e| {
+                e.element_instance_key == a_key
+                    && e.state != crate::readstore::ElementInstanceState::Active
+            });
+            let x_set = server.store.variables().iter().any(|v| {
+                v.instance_key == instance_key
+                    && v.scope_key == instance_key
+                    && v.name == "x"
+                    && v.value == "42"
+            });
+            if b_active && a_gone && x_set {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ok, "b active, a terminated, x=42 on the root scope");
+    }
+
+    /// 400: an unknown element id and an engine 'not yet supported' instruction
+    /// (a scoped variable instruction) are INVALID_ARGUMENT carrying the
+    /// engine's message; a malformed element-instance key is 400 too.
+    #[tokio::test]
+    async fn modify_instance_invalid_instruction_is_400() {
+        use apis::process_instance::ModifyProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        let (instance_key, _) = modify_fixture(&server).await;
+        let key = instance_key.to_string();
+
+        let resp = modify_via_rest(
+            &server,
+            &key,
+            serde_json::json!({ "activateInstructions": [{ "elementId": "nope" }] }),
+        )
+        .await;
+        assert!(
+            matches!(&resp, Resp::Status400_TheProvidedDataIsNotValid(p) if p.status == 400),
+            "unknown element: {resp:?}"
+        );
+
+        let resp = modify_via_rest(
+            &server,
+            &key,
+            serde_json::json!({
+                "activateInstructions": [{
+                    "elementId": "b",
+                    "variableInstructions": [{ "variables": { "y": 1 }, "scopeId": "b" }]
+                }]
+            }),
+        )
+        .await;
+        let expected = nanobpmn_engine_core::EngineError::ModificationInstructionNotYetSupported {
+            instance_key,
+            instruction: "activate_instructions[].variable_instructions",
+        }
+        .to_string();
+        match &resp {
+            Resp::Status400_TheProvidedDataIsNotValid(p) => {
+                assert_eq!(p.detail, expected);
+            }
+            other => panic!("scoped variables must be 400 not-yet-supported: {other:?}"),
+        }
+
+        let resp = modify_via_rest(
+            &server,
+            &key,
+            serde_json::json!({ "terminateInstructions": [{ "elementInstanceKey": "abc" }] }),
+        )
+        .await;
+        assert!(
+            matches!(resp, Resp::Status400_TheProvidedDataIsNotValid(_)),
+            "malformed key: {resp:?}"
+        );
+    }
+
+    /// 404: an unknown process-instance key.
+    #[tokio::test]
+    async fn modify_unknown_instance_is_404() {
+        use apis::process_instance::ModifyProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        let resp = modify_via_rest(
+            &server,
+            "999999999",
+            serde_json::json!({ "activateInstructions": [{ "elementId": "b" }] }),
+        )
+        .await;
+        assert!(
+            matches!(resp, Resp::Status404_TheProcessInstanceIsNotFound(_)),
+            "unexpected response: {resp:?}"
+        );
+    }
+
+    /// 409: a suspended instance is not active (Zeebe INVALID_STATE).
+    #[tokio::test]
+    async fn modify_suspended_instance_is_409() {
+        use apis::process_instance::ModifyProcessInstanceResponse as Resp;
+        let server = ServerImpl::default();
+        let (instance_key, _) = modify_fixture(&server).await;
+        assert!(matches!(
+            server.suspend_instance_core(instance_key).await,
+            TransitionInstanceOutcome::Ok
+        ));
+        let resp = modify_via_rest(
+            &server,
+            &instance_key.to_string(),
+            serde_json::json!({ "activateInstructions": [{ "elementId": "b" }] }),
+        )
+        .await;
+        assert!(
+            matches!(
+                resp,
+                Resp::Status409_TheProcessInstanceIsNotInAStateThatAllowsModification(_)
+            ),
+            "unexpected response: {resp:?}"
+        );
+    }
+
+    /// The REST → engine mapper carries the full request shape: ancestor key
+    /// (`-1` = none), scoped variables, terminate by id, and move instructions.
+    #[test]
+    fn modify_instructions_map_full_request_shape() {
+        use nanobpmn_engine_core::{AncestorScopeInstruction, MoveSource};
+        let body: models::ProcessInstanceModificationInstruction =
+            serde_json::from_value(serde_json::json!({
+                "activateInstructions": [
+                    { "elementId": "a", "ancestorElementInstanceKey": "-1" },
+                    {
+                        "elementId": "b",
+                        "ancestorElementInstanceKey": "7",
+                        "variableInstructions": [
+                            { "variables": { "r": 1 }, "scopeId": "" },
+                            { "variables": { "s": 2 }, "scopeId": "sub" }
+                        ]
+                    }
+                ],
+                "terminateInstructions": [
+                    { "elementInstanceKey": "11" },
+                    { "elementId": "c" }
+                ],
+                "moveInstructions": [
+                    {
+                        "sourceElementInstruction": { "sourceType": "byKey", "sourceElementInstanceKey": "13" },
+                        "targetElementId": "d",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "sourceParent" }
+                    },
+                    {
+                        "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
+                        "targetElementId": "d",
+                        "ancestorScopeInstruction": { "ancestorScopeType": "direct", "ancestorElementInstanceKey": "5" },
+                        "variableInstructions": [{ "variables": { "m": 3 } }]
+                    }
+                ]
+            }))
+            .expect("well-formed body");
+        let i = modify_instructions_from_rest(&body).expect("maps");
+
+        assert_eq!(i.activate_instructions.len(), 2);
+        assert_eq!(
+            i.activate_instructions[0].ancestor_element_instance_key,
+            None
+        );
+        let b = &i.activate_instructions[1];
+        assert_eq!(b.ancestor_element_instance_key, Some(7));
+        assert!(b.variables.contains_key("r"));
+        assert_eq!(b.variable_instructions.len(), 1);
+        assert_eq!(b.variable_instructions[0].scope_id.as_deref(), Some("sub"));
+        assert_eq!(i.terminate_instructions, vec![11]);
+        assert_eq!(i.terminate_element_ids, vec!["c".to_string()]);
+        assert_eq!(i.move_instructions.len(), 2);
+        assert_eq!(i.move_instructions[0].source, MoveSource::ByKey(13));
+        assert_eq!(
+            i.move_instructions[0].ancestor_scope,
+            AncestorScopeInstruction::SourceParent
+        );
+        assert_eq!(i.move_instructions[1].source, MoveSource::ById("a".into()));
+        assert_eq!(
+            i.move_instructions[1].ancestor_scope,
+            AncestorScopeInstruction::Direct(5)
+        );
+        assert_eq!(i.move_instructions[1].variable_instructions.len(), 1);
+        assert_eq!(
+            i.move_instructions[1].variable_instructions[0].scope_id,
+            None
+        );
     }
 
     #[tokio::test]

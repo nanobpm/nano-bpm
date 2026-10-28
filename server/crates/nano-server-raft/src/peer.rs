@@ -789,6 +789,20 @@ impl PeerLink {
         .await
     }
 
+    /// Forwards a `modifyProcessInstance` to the peer that owns the instance.
+    pub async fn modify_instance(
+        &self,
+        instance_key: String,
+        instructions: nano_falcon_protocol::ModifyInstanceInstructions,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| ClientFrame::ModifyInstance {
+            corr,
+            instance_key,
+            instructions,
+        })
+        .await
+    }
+
     /// Forwards a cross-partition subscription follow-up event (a
     /// `MessageSubscriptionOpening` or `RemoteMessageCorrelation`) to the peer
     /// that owns the target partition, so it applies the corresponding routed

@@ -818,6 +818,7 @@ async fn handle_client_frame(
         ClientFrame::SuspendInstance { .. } => "suspend_instance",
         ClientFrame::ResumeInstance { .. } => "resume_instance",
         ClientFrame::MigrateInstance { .. } => "migrate_instance",
+        ClientFrame::ModifyInstance { .. } => "modify_instance",
         ClientFrame::RouteSubscription { .. } => "route_subscription",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
         ClientFrame::UpdateJobTimeout { .. } => "update_job_timeout",
@@ -1479,6 +1480,16 @@ async fn handle_client_frame(
                 server
                     .migrate_instance_local(key, target_key, mapping_instructions)
                     .await
+            })
+            .await;
+        }
+        ClientFrame::ModifyInstance {
+            corr,
+            instance_key,
+            instructions,
+        } => {
+            forward_by_key_reply(conn, corr, &instance_key, |key| async move {
+                server.modify_instance_local(key, instructions).await
             })
             .await;
         }

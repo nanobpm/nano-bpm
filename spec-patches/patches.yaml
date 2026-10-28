@@ -282,3 +282,21 @@
   target: components.schemas.JobSearchQuerySortRequest.properties.field.enum
   append:
     - lastUpdateTime
+
+# --- modifyProcessInstance: upstream runtime conflict response (#1374) -------
+#
+# Zeebe's ProcessInstanceModificationModifyProcessor rejects a modification of
+# an instance that is not active (e.g. SUSPENDED) with INVALID_STATE, which the
+# Camunda gateway's error mapper turns into HTTP 409. The vendored response
+# table for modifyProcessInstance omits 409, so overlay it here (keeping spec/
+# byte-identical to upstream) rather than collapsing the rejection into a
+# misleading 400/404/500.
+- file: process-instances.yaml
+  target: paths./process-instances/{processInstanceKey}/modification.post.responses
+  merge:
+    "409":
+      description: The process instance is not in a state that allows modification.
+      content:
+        application/problem+json:
+          schema:
+            $ref: 'problem-detail.yaml#/components/schemas/ProblemDetail'
