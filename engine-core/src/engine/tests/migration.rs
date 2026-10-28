@@ -1168,13 +1168,10 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
     assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
 }
 
-/// #1374 scaffold: the Zeebe-parity `ModifyInstance` fields the engine does not
-/// act on yet are rejected explicitly (never silently ignored), atomically.
+/// #1374 scaffold: `move_instructions` (not acted on yet) are rejected explicitly (never silently ignored), atomically.
 #[test]
 fn modify_rejects_not_yet_supported_instruction_fields() {
-    use crate::command::{
-        AncestorScopeInstruction, MoveInstruction, MoveSource, VariableInstruction,
-    };
+    use crate::command::{AncestorScopeInstruction, MoveInstruction, MoveSource};
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(two_service_tasks()))
@@ -1196,52 +1193,19 @@ fn modify_rejects_not_yet_supported_instruction_fields() {
         terminate_element_ids: by_id,
         move_instructions: moves,
     };
-    let cases = [
-        (
-            modify(
-                vec![ActivateElementInstruction {
-                    element_id: "b".into(),
-                    ancestor_element_instance_key: Some(inst),
-                    ..Default::default()
-                }],
-                vec![],
-                vec![],
-            ),
-            "activate_instructions[].ancestor_element_instance_key",
+    let cases = [(
+        modify(
+            vec![],
+            vec![],
+            vec![MoveInstruction {
+                source: MoveSource::ById("a".into()),
+                target_element_id: "b".into(),
+                ancestor_scope: AncestorScopeInstruction::SourceParent,
+                variable_instructions: vec![],
+            }],
         ),
-        (
-            modify(
-                vec![ActivateElementInstruction {
-                    element_id: "b".into(),
-                    variable_instructions: vec![VariableInstruction {
-                        variables: HashMap::new(),
-                        scope_id: Some("b".into()),
-                    }],
-                    ..Default::default()
-                }],
-                vec![],
-                vec![],
-            ),
-            "activate_instructions[].variable_instructions",
-        ),
-        (
-            modify(vec![], vec!["a".into()], vec![]),
-            "terminate_element_ids",
-        ),
-        (
-            modify(
-                vec![],
-                vec![],
-                vec![MoveInstruction {
-                    source: MoveSource::ById("a".into()),
-                    target_element_id: "b".into(),
-                    ancestor_scope: AncestorScopeInstruction::SourceParent,
-                    variable_instructions: vec![],
-                }],
-            ),
-            "move_instructions",
-        ),
-    ];
+        "move_instructions",
+    )];
     for (command, instruction) in cases {
         let err = engine.apply_command(command).unwrap_err();
         assert_eq!(

@@ -36,13 +36,6 @@ pub(crate) fn element_flow_scope_chain(
 
 /// Where an element would be activated: an existing flow-scope instance to
 /// reuse plus the flow scopes that must be created beneath it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#1374 scaffold: consumed by the modify/migrate behaviour slices; drop this once used"
-    )
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FlowScopeResolution {
     /// The existing element instance to activate under (`0` = process root).
@@ -91,13 +84,6 @@ impl Engine {
     /// Whether `ancestor` is an ancestor scope instance of `element_instance_key`.
     /// The process root (`0`) is an ancestor of every element instance of an
     /// existing process instance; an instance is not its own ancestor.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "#1374 scaffold: consumed by the modify/migrate behaviour slices; drop this once used"
-        )
-    )]
     pub(crate) fn is_ancestor_element_instance(
         &self,
         instance_key: Key,
@@ -134,13 +120,6 @@ impl Engine {
 
     /// The active element instances of flow-scope element `flow_scope_id`
     /// (sorted), or `[0]` (the process root) for `None`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "#1374 scaffold: consumed by the modify/migrate behaviour slices; drop this once used"
-        )
-    )]
     pub(crate) fn flow_scope_instances(
         &self,
         instance_key: Key,
@@ -155,7 +134,12 @@ impl Engine {
         let mut keys: Vec<Key> = instance
             .active
             .iter()
-            .filter(|(_, e)| e.as_str() == id)
+            // A multi-instance body shares its element id with its children
+            // but is not a flow-scope instance of the inner elements: only the
+            // children are (Zeebe models the body as a separate element).
+            .filter(|(k, e)| {
+                e.as_str() == id && !self.is_multi_instance_body_structural(instance_key, **k)
+            })
             .map(|(k, _)| *k)
             .collect();
         keys.sort_unstable();
@@ -177,13 +161,6 @@ impl Engine {
     ///
     /// This only *resolves*; activating the `to_create` scopes is the caller's
     /// job.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "#1374 scaffold: consumed by the modify/migrate behaviour slices; drop this once used"
-        )
-    )]
     pub(crate) fn resolve_flow_scope(
         &self,
         instance_key: Key,

@@ -26,6 +26,7 @@ mod debug;
 mod flow_scope;
 mod memory;
 mod migration;
+mod modify;
 mod resolve;
 
 pub use debug::{BreakCondition, DebugSession};
@@ -345,6 +346,29 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+    },
+    /// Run the activation body of an element a process-instance modification
+    /// already activated and seeded with element-local variables (Zeebe sets a
+    /// modification's element-scoped variables BEFORE the element activates).
+    /// Queued in instruction order; the body's input mappings, FEEL attributes
+    /// and start listeners evaluate against the element's own (seeded) scope.
+    ResumeSeededActivation {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
+    /// A process-instance modification's activation of a join (parallel /
+    /// inclusive gateway with several incoming flows) carrying element-local
+    /// variables. Queued in instruction order — so it runs after the command's
+    /// terminations, like every other modification activation — and handled by
+    /// [`Engine::activate_seeded_join`], which seeds the join instance the
+    /// activation will take over BEFORE the guarded activation evaluates and
+    /// completes it.
+    ActivateSeededJoin {
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+        locals: Vec<HashMap<String, Value>>,
     },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
@@ -4253,95 +4277,19 @@ impl Engine {
                     _ => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
 
-                // Instruction fields the engine does not act on yet are
-                // rejected explicitly — never silently ignored (#1374 scaffold;
-                // each later slice removes its own check as it lands).
-                Self::reject_unsupported_modification(
+                // Move instructions are not acted on yet: rejected explicitly —
+                // never silently ignored (#1374; `engine-modify-move` lands them).
+                Self::reject_unsupported_modification(instance_key, &move_instructions)?;
+
+                // Validate everything up front so the command is all-or-nothing,
+                // then apply (see `modify.rs`).
+                let plan = self.plan_modification(
                     instance_key,
                     &activate_instructions,
+                    &terminate_instructions,
                     &terminate_element_ids,
-                    &move_instructions,
                 )?;
-
-                // Validate up front so the command is all-or-nothing: every
-                // activate element id must exist in the process definition and
-                // every terminate key must be a currently-active element instance.
-                for a in &activate_instructions {
-                    let exists = self
-                        .process_of_instance(instance_key)
-                        .map(|p| p.element(&a.element_id).is_some())
-                        .unwrap_or(false);
-                    if !exists {
-                        return Err(EngineError::ElementNotFound {
-                            instance_key,
-                            element_id: a.element_id.clone(),
-                        });
-                    }
-                }
-                for &eik in &terminate_instructions {
-                    let active = self
-                        .state
-                        .instances
-                        .get(&instance_key)
-                        .map(|i| i.active.contains_key(&eik))
-                        .unwrap_or(false);
-                    if !active {
-                        return Err(EngineError::ElementInstanceNotFound {
-                            instance_key,
-                            element_instance_key: eik,
-                        });
-                    }
-                }
-
-                // Apply terminations first (deterministic key order), then merge
-                // any global variables and queue the activations at the process
-                // root scope.
-                let mut terminate: Vec<Key> = terminate_instructions;
-                terminate.sort_unstable();
-                terminate.dedup();
-                for eik in terminate {
-                    // The eik was validated against `instance.active` above, so
-                    // its element id must resolve. Skip defensively rather than
-                    // emitting a termination with an empty element_id, which
-                    // would corrupt downstream element aggregates.
-                    let Some(element_id) = self.element_id_of_instance(instance_key, eik) else {
-                        continue;
-                    };
-                    self.terminate_element_instance(&mut log, instance_key, eik, &element_id);
-                }
-
-                for a in &activate_instructions {
-                    if !a.variables.is_empty() {
-                        for event in self.propagated_updates(
-                            instance_key,
-                            instance_key,
-                            a.variables.clone(),
-                            false,
-                        ) {
-                            self.emit(&mut log, event);
-                        }
-                    }
-                    queue.push_back(Step::Activate {
-                        instance_key,
-                        element_id: a.element_id.clone(),
-                        scope: 0,
-                        via: None,
-                    });
-                }
-
-                // If the terminations drained the last token and nothing was
-                // activated to replace it, the instance is terminated (Zeebe
-                // modify semantics) rather than being auto-completed by
-                // `complete_finished_instances`.
-                let drained = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .map(|i| i.active.is_empty())
-                    .unwrap_or(true);
-                if drained && activate_instructions.is_empty() {
-                    self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
-                }
+                self.apply_modification(&mut log, &mut queue, instance_key, plan);
             }
 
             Command::DispatchStartInstance {
@@ -4514,6 +4462,29 @@ impl Engine {
     ) -> Option<Paused> {
         loop {
             while let Some(step) = queue.pop_front() {
+                // A seeded join interleaves state-dependent writes with its
+                // guarded activation, so it emits directly into the log.
+                if let Step::ActivateSeededJoin {
+                    instance_key,
+                    element_id,
+                    scope,
+                    locals,
+                } = step
+                {
+                    let emitted_from = log.len();
+                    self.activate_seeded_join(
+                        log,
+                        &mut queue,
+                        instance_key,
+                        element_id,
+                        scope,
+                        locals,
+                    );
+                    if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                    continue;
+                }
                 let (events, followups) = self.process_step(step, &queue);
                 let emitted_from = log.len();
                 for event in events {
@@ -5187,6 +5158,11 @@ impl Engine {
                 instance_key,
                 scope,
                 ..
+            }
+            | Step::ActivateSeededJoin {
+                instance_key,
+                scope,
+                ..
             } => (*instance_key, Some(*scope), None, None),
             Step::Complete {
                 instance_key,
@@ -5209,6 +5185,11 @@ impl Engine {
                 ..
             }
             | Step::RetryActivation {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::ResumeSeededActivation {
                 instance_key,
                 element_instance_key,
                 ..
@@ -5472,7 +5453,48 @@ impl Engine {
                 // scope and re-run the activation body so the now-fixed input
                 // mappings are re-applied before the element's behaviour runs.
                 let scope = self.scope_of(instance_key, element_instance_key);
-                self.activate_body(instance_key, element_id, element_instance_key, scope)
+                // Re-evaluate in the same view as the first attempt: an element
+                // whose own scope is already registered (a modification seeded
+                // element-local variables, or a sub-process scope that holds no
+                // locals yet) evaluates in that scope; otherwise the enclosing
+                // scope.
+                let registered = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.scope_parents.contains_key(&element_instance_key))
+                    .unwrap_or(false);
+                let view = if registered {
+                    element_instance_key
+                } else {
+                    scope
+                };
+                self.activate_body_in(instance_key, element_id, element_instance_key, scope, view)
+            }
+            Step::ResumeSeededActivation {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.activate_body_in(
+                    instance_key,
+                    element_id,
+                    element_instance_key,
+                    scope,
+                    element_instance_key,
+                )
+            }
+            // Handled in `run_with` (it needs the log between its writes); this
+            // arm is unreachable — degrade to the plain guarded activation.
+            Step::ActivateSeededJoin {
+                instance_key,
+                element_id,
+                scope,
+                ..
+            } => {
+                debug_assert!(false, "ActivateSeededJoin is dispatched by run_with");
+                self.activate(instance_key, element_id, scope, None, pending)
             }
             Step::ActivateMiChild {
                 instance_key,
@@ -5663,6 +5685,20 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        self.activate_body_in(instance_key, element_id, element_instance_key, scope, scope)
+    }
+
+    /// [`activate_body`] evaluating against the variable view of `view_scope`
+    /// (the enclosing `scope` normally; the element's own seeded scope for a
+    /// [`Step::ResumeSeededActivation`]).
+    fn activate_body_in(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+        view_scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
@@ -5676,7 +5712,15 @@ impl Engine {
         // The element's own scope is registered by `activate` for a
         // sub-process/ad-hoc container (before this body runs); a leaf activity
         // registers it lazily below, only if its inputs produce values.
-        let scope_registered = is_sub_process || is_adhoc_container;
+        // A modification may have registered it already (seeded locals).
+        let scope_registered = is_sub_process
+            || is_adhoc_container
+            || self
+                .state
+                .instances
+                .get(&instance_key)
+                .map(|i| i.scope_parents.contains_key(&element_instance_key))
+                .unwrap_or(false);
         // A call activity's input mappings seed only its isolated child process
         // scope (applied in `spawn_call_activity_child`) — never the call
         // activity's own element scope — so they are NOT projected here. Routing
@@ -5700,7 +5744,7 @@ impl Engine {
         // variable resolves correctly (Zeebe parity). A sub-process's own inputs
         // are evaluated here against its *parent* scope and then applied local to
         // the new sub-process scope.
-        let element_vars = self.variables_for_element(instance_key, scope);
+        let element_vars = self.variables_for_element(instance_key, view_scope);
 
         let mut events: Vec<Event> = Vec::new();
         let followups: Vec<Step> = Vec::new();
@@ -6342,7 +6386,24 @@ impl Engine {
         // expressions are evaluated against the body's *enclosing* scope view, so
         // a multi-instance activity nested in a sub-process can read that
         // sub-process's locals.
-        let enclosing_vars = self.variables_for_element(instance_key, scope);
+        //
+        // A body whose scope is already registered (a re-drive, or a body a
+        // process-instance modification opened and seeded with element-scoped
+        // variables) evaluates in its own scope view, so those seeded locals are
+        // visible; on a first activation the body scope is not registered yet
+        // and holds no locals, so this is the enclosing view.
+        let view_scope = if self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| i.scope_parents.contains_key(&body_key))
+            .unwrap_or(false)
+        {
+            body_key
+        } else {
+            scope
+        };
+        let enclosing_vars = self.variables_for_element(instance_key, view_scope);
         // A CALL ACTIVITY's `zeebe:input` mappings seed only its isolated child
         // PROCESS scope — they are applied once in `spawn_call_activity_child` per
         // child, never local to the MI body scope. Applying them here would leak
@@ -9258,7 +9319,7 @@ impl Engine {
             result_variable,
         }) = self.element_kind(instance_key, &element_id)
         {
-            let vars = self.variables(instance_key);
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             match crate::feel::eval(&expression, &vars) {
                 Ok(value) => {
                     let mut update = HashMap::new();
@@ -9304,7 +9365,7 @@ impl Engine {
             result_variable,
         }) = self.element_kind(instance_key, &element_id)
         {
-            let vars = self.variables(instance_key);
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             let resolved_id = self.resolve_job_type(&vars, &decision_id);
             let Some(deployed) = self.state.decisions.get(&resolved_id).cloned() else {
                 let incident_key = self.mint_key();
@@ -10808,9 +10869,10 @@ impl Engine {
     fn select_exclusive_flow(
         &self,
         instance_key: Key,
+        element_instance_key: Key,
         element_id: &str,
     ) -> Result<Option<usize>, String> {
-        let variables = self.variables(instance_key);
+        let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         for (index, flow) in self
             .outgoing(instance_key, element_id)
@@ -10848,26 +10910,27 @@ impl Engine {
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected = match self.select_exclusive_flow(instance_key, &element_id) {
-            Ok(sel) => sel,
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                return (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                );
-            }
-        };
+        let selected =
+            match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
+                Ok(sel) => sel,
+                Err(reason) => {
+                    let incident_key = self.mint_key();
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
+                }
+            };
 
         match selected {
             Some(flow_index) => {
@@ -10880,7 +10943,7 @@ impl Engine {
                 // End-listener gate (ADR 0037): the gateway rests in COMPLETING
                 // while its end chain runs; `finalize_exclusive_gateway` re-selects
                 // the flow and emits the deferred completion once it drains.
-                let vars = self.variables(instance_key);
+                let vars = self.variables_for_element(instance_key, element_instance_key);
                 if let Some(job) = self.begin_end_listener_chain(
                     instance_key,
                     element_instance_key,
@@ -10937,7 +11000,7 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        match self.select_exclusive_flow(instance_key, &element_id) {
+        match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
             Ok(Some(flow_index)) => {
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
                 let mut events = vec![Event::ElementCompleted {
@@ -10999,9 +11062,10 @@ impl Engine {
     fn select_inclusive_flows(
         &self,
         instance_key: Key,
+        element_instance_key: Key,
         element_id: &str,
     ) -> Result<Vec<usize>, String> {
-        let variables = self.variables(instance_key);
+        let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         let mut selected = Vec::new();
         for (index, flow) in self
@@ -11075,26 +11139,27 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected = match self.select_inclusive_flows(instance_key, &element_id) {
-            Ok(sel) => sel,
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                return (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                );
-            }
-        };
+        let selected =
+            match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
+                Ok(sel) => sel,
+                Err(reason) => {
+                    let incident_key = self.mint_key();
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
+                }
+            };
         if selected.is_empty() {
             let incident_key = self.mint_key();
             return (
@@ -11119,7 +11184,7 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         }];
-        let vars = self.variables(instance_key);
+        let vars = self.variables_for_element(instance_key, element_instance_key);
         if let Some(job) = self.begin_end_listener_chain(
             instance_key,
             element_instance_key,
@@ -11165,7 +11230,7 @@ impl Engine {
             scope,
             &mut events,
         );
-        match self.select_inclusive_flows(instance_key, &element_id) {
+        match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
             Ok(selected) if !selected.is_empty() => {
                 events.push(Event::ElementCompleted {
                     instance_key,
@@ -11899,10 +11964,14 @@ impl Engine {
                     // child whose own cancel deferred on a user-task canceling
                     // listener) — otherwise the parent's termination orphans
                     // them. `discard_and_terminate_instance` force-completes
-                    // that deferred drain.
+                    // that deferred drain — and children an operator
+                    // `Suspended`: suspension pauses progress, it does not
+                    // detach the child from its ending parent.
                     matches!(
                         i.state,
-                        ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                        ProcessInstanceState::Active
+                            | ProcessInstanceState::Terminating
+                            | ProcessInstanceState::Suspended
                     ) && i
                         .parent_process_instance_key
                         .map(|p| ended.contains(&p))
@@ -12863,8 +12932,6 @@ impl Engine {
     /// field order so the rejection is deterministic.
     fn reject_unsupported_modification(
         instance_key: Key,
-        activate_instructions: &[crate::command::ActivateElementInstruction],
-        terminate_element_ids: &[ElementId],
         move_instructions: &[crate::command::MoveInstruction],
     ) -> Result<(), EngineError> {
         let unsupported = |instruction| {
@@ -12873,21 +12940,6 @@ impl Engine {
                 instruction,
             })
         };
-        if activate_instructions
-            .iter()
-            .any(|a| a.ancestor_element_instance_key.is_some())
-        {
-            return unsupported("activate_instructions[].ancestor_element_instance_key");
-        }
-        if activate_instructions
-            .iter()
-            .any(|a| !a.variable_instructions.is_empty())
-        {
-            return unsupported("activate_instructions[].variable_instructions");
-        }
-        if !terminate_element_ids.is_empty() {
-            return unsupported("terminate_element_ids");
-        }
         if !move_instructions.is_empty() {
             return unsupported("move_instructions");
         }

@@ -18,6 +18,7 @@ mod lifecycle;
 mod listeners;
 mod migration;
 mod migration_scopes;
+mod modify_scopes;
 mod multi_instance;
 mod timers_catch;
 mod user_task;

@@ -31904,7 +31904,7 @@ mod clustered_startup_tests {
     }
 
     /// 400: an unknown element id and an engine 'not yet supported' instruction
-    /// (a scoped variable instruction) are INVALID_ARGUMENT carrying the
+    /// (a move instruction) are INVALID_ARGUMENT carrying the
     /// engine's message; a malformed element-instance key is 400 too.
     #[tokio::test]
     async fn modify_instance_invalid_instruction_is_400() {
@@ -31928,23 +31928,23 @@ mod clustered_startup_tests {
             &server,
             &key,
             serde_json::json!({
-                "activateInstructions": [{
-                    "elementId": "b",
-                    "variableInstructions": [{ "variables": { "y": 1 }, "scopeId": "b" }]
+                "moveInstructions": [{
+                    "sourceElementInstruction": { "sourceType": "byId", "sourceElementId": "a" },
+                    "targetElementId": "b"
                 }]
             }),
         )
         .await;
         let expected = nanobpmn_engine_core::EngineError::ModificationInstructionNotYetSupported {
             instance_key,
-            instruction: "activate_instructions[].variable_instructions",
+            instruction: "move_instructions",
         }
         .to_string();
         match &resp {
             Resp::Status400_TheProvidedDataIsNotValid(p) => {
                 assert_eq!(p.detail, expected);
             }
-            other => panic!("scoped variables must be 400 not-yet-supported: {other:?}"),
+            other => panic!("move instructions must be 400 not-yet-supported: {other:?}"),
         }
 
         let resp = modify_via_rest(
