@@ -775,6 +775,36 @@ impl Engine {
             .is_some_and(|i| i.multi_instances.contains_key(&element_instance_key))
     }
 
+    /// Whether active element instance `element_instance_key` is a
+    /// multi-instance **body**, independent of whether its fan-out has been
+    /// registered yet: a body parked on an input-mapping / input-collection
+    /// incident is active before `MultiInstanceActivated` records it in
+    /// `multi_instances`. A body is an active instance of a multi-instance
+    /// element whose parent scope is not itself an instance of that element
+    /// (its children's parent scope is the body).
+    pub(crate) fn is_multi_instance_body_structural(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> bool {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return false;
+        };
+        if instance.multi_instances.contains_key(&element_instance_key) {
+            return true;
+        }
+        let Some(element_id) = instance.active.get(&element_instance_key) else {
+            return false;
+        };
+        if self.multi_instance_of(instance_key, element_id).is_none() {
+            return false;
+        }
+        let parent = instance.scopes.get(&element_instance_key).copied();
+        !parent
+            .and_then(|p| instance.active.get(&p))
+            .is_some_and(|pe| pe == element_id)
+    }
+
     /// Interrupts the activity `element_instance_key`/`element_id` because an
     /// interrupting timer or message boundary fired on it: tears down the work it
     /// owns, completes its element instance, and disarms any sibling boundaries.
@@ -1299,6 +1329,25 @@ impl Engine {
         }
         for event in self.cancel_all_conditional_subscriptions_on(element_instance_key) {
             self.emit(log, event);
+        }
+        // A terminated waiting join must not keep its arrivals: reset its
+        // `join_counts`/`join_flow_arrivals`/`join_instances` bookkeeping exactly
+        // as descendant-scope teardown does, so a later arrival cannot fire it
+        // against the cancelled branch's token.
+        if self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.join_instances.get(element_id))
+            == Some(&element_instance_key)
+        {
+            self.emit(
+                log,
+                Event::ParallelJoinReset {
+                    instance_key,
+                    element_id: element_id.to_string(),
+                },
+            );
         }
 
         self.emit(

@@ -95,7 +95,9 @@ impl Engine {
 
             // Zeebe's `-1` (and an absent key) = no ancestor selection.
             let ancestor = a.ancestor_element_instance_key;
-            if let Some(body) = ancestor.filter(|k| instance.multi_instances.contains_key(k)) {
+            if let Some(body) =
+                ancestor.filter(|k| self.is_multi_instance_body_structural(instance_key, *k))
+            {
                 return Err(not_activatable(format!(
                     "The activation of elements inside a multi-instance body is not supported: \
                      ancestor '{body}' is a multi-instance body"

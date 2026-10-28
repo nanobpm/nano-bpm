@@ -938,3 +938,95 @@ fn created_scope_boundaries_see_modification_variables() {
         assert_eq!(keys, vec!["o-1"]);
     }
 }
+
+/// Terminating a half-open parallel join by element id resets its join
+/// bookkeeping: the remaining branch's arrival must not fire the join against
+/// the cancelled branch's arrival.
+#[test]
+fn terminating_a_waiting_join_discards_its_arrivals() {
+    let def = ProcessBuilder::new("join-mod")
+        .start_event("start")
+        .parallel_gateway("split")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .parallel_gateway("join")
+        .end_event("done")
+        .connect("start", "split")
+        .connect("split", "a")
+        .connect("split", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    complete_all(&mut engine, "ja");
+    assert_eq!(eiks(&engine, inst, "join").len(), 1, "join is waiting");
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec!["join".into()],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    let events = {
+        let jobs = engine.activate_jobs("jb", "w", 10, 60_000, 0);
+        assert_eq!(jobs.len(), 1);
+        engine
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap()
+    };
+    assert_eq!(
+        activated(&events, "done"),
+        0,
+        "join fired on a cancelled arrival"
+    );
+    assert_eq!(engine.instance(inst).unwrap().join_flows_taken("join"), 1);
+}
+
+/// A multi-instance body parked on an input-collection incident (active, but
+/// not yet registered in `multi_instances`) is still a body: it is neither an
+/// implicit flow scope nor a selectable ancestor for its inner elements.
+#[test]
+fn an_incident_parked_multi_instance_body_is_not_a_flow_scope() {
+    let mut def = multi_instance_subprocess(false);
+    def.elements.get_mut("wave").unwrap().io = crate::model::IoMapping {
+        // A genuine body-level input failure (`badFactor` is a string).
+        inputs: vec![crate::model::Mapping {
+            source: "=badFactor + 1".to_string(),
+            target: "scaled".to_string(),
+        }],
+        outputs: Vec::new(),
+    };
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        def,
+        vars(&[
+            ("tasks", Value::List(vec![Value::Str("x".into())])),
+            ("badFactor", Value::Str("oops".into())),
+        ]),
+    );
+    let bodies = eiks(&engine, inst, "wave");
+    assert_eq!(bodies.len(), 1, "body parked on its incident");
+    assert!(engine.instance(inst).unwrap().multi_instances.is_empty());
+
+    let err = engine
+        .apply_command(modify(inst, vec![ActivateElementInstruction::new("impl")]))
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::ElementNotActivatable { element_id, .. } if element_id == "impl"),
+        "{err:?}"
+    );
+    let err = engine
+        .apply_command(modify(inst, vec![under("impl", bodies[0])]))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("inside a multi-instance body"),
+        "{err}"
+    );
+    assert!(eiks(&engine, inst, "impl").is_empty());
+}

@@ -137,7 +137,9 @@ impl Engine {
             // A multi-instance body shares its element id with its children
             // but is not a flow-scope instance of the inner elements: only the
             // children are (Zeebe models the body as a separate element).
-            .filter(|(k, e)| e.as_str() == id && !instance.multi_instances.contains_key(k))
+            .filter(|(k, e)| {
+                e.as_str() == id && !self.is_multi_instance_body_structural(instance_key, **k)
+            })
             .map(|(k, _)| *k)
             .collect();
         keys.sort_unstable();
