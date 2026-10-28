@@ -348,6 +348,16 @@ pub enum ClientFrame {
         target_process_definition_key: String,
         mapping_instructions: Vec<(String, String)>,
     },
+    /// **Intra-cluster only.** A gateway forwards a by-key process-instance
+    /// modification to the peer that owns the instance's partition. Answered by
+    /// a `CommandResult` (204 on success, 400 invalid instruction, 404 unknown
+    /// instance, 409 instance not active, 5xx otherwise).
+    #[serde(rename_all = "camelCase")]
+    ModifyInstance {
+        corr: u64,
+        instance_key: String,
+        instructions: ModifyInstanceInstructions,
+    },
     /// **Intra-cluster only.** Routes a cross-partition subscription follow-up
     /// (a `MessageSubscriptionOpening` opening a canonical subscription on its
     /// `hash(correlationKey)` partition, or a `RemoteMessageCorrelation` advancing
@@ -772,6 +782,30 @@ impl ClientFrame {
                 | ClientFrame::Heartbeat
         )
     }
+}
+
+/// The instruction set of a process-instance modification (`POST
+/// /v2/process-instances/{key}/modification`), already mapped from the REST
+/// request onto the engine's `Command::ModifyInstance` fields. It is the single
+/// payload shared by the REST handler, the intra-cluster
+/// [`ClientFrame::ModifyInstance`] forward and the owning node's local apply, so
+/// the three cannot drift.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModifyInstanceInstructions {
+    /// Elements to activate (with root variables, scoped variable instructions
+    /// and an optional ancestor element instance).
+    #[serde(default)]
+    pub activate_instructions: Vec<nanobpmn_engine_core::ActivateElementInstruction>,
+    /// Element instance keys to terminate (terminate-by-key).
+    #[serde(default)]
+    pub terminate_instructions: Vec<u64>,
+    /// Element ids whose active instances to terminate (terminate-by-id).
+    #[serde(default)]
+    pub terminate_element_ids: Vec<String>,
+    /// Move instructions (Camunda 8.9 `moveInstructions`).
+    #[serde(default)]
+    pub move_instructions: Vec<nanobpmn_engine_core::MoveInstruction>,
 }
 
 /// Which Falcon channel a connection arrived on. The public `/falcon` channel is
