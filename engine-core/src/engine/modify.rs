@@ -246,6 +246,10 @@ impl Engine {
         for planned in plan.activations {
             let mut scope = planned.resolution.existing;
             let mut lineage: Vec<(ElementId, Key)> = Vec::new();
+            // Scopes this instruction opens: their boundary events are armed
+            // only after the instruction's variables are written, so boundary
+            // expressions (correlation keys, timers) see them.
+            let mut fresh: Vec<(Key, ElementId, Key)> = Vec::new();
             for scope_id in &planned.resolution.to_create {
                 let reuse = created
                     .iter()
@@ -255,6 +259,7 @@ impl Engine {
                     Some(k) => k,
                     None => {
                         let k = self.open_flow_scope(log, instance_key, scope_id, scope);
+                        fresh.push((k, scope_id.clone(), scope));
                         created.push(((scope, scope_id.clone()), k));
                         k
                     }
@@ -287,6 +292,12 @@ impl Engine {
                 }
             }
 
+            for (key, scope_id, parent) in fresh {
+                for event in self.arm_boundary_events(instance_key, key, parent, &scope_id) {
+                    self.emit(log, event);
+                }
+            }
+
             if on_element.is_empty() {
                 queue.push_back(Step::Activate {
                     instance_key,
@@ -312,6 +323,7 @@ impl Engine {
                 continue;
             };
             let parent = self.scope_of(instance_key, eik);
+            self.release_mi_child(log, instance_key, eik, parent);
             self.terminate_element_instance(log, instance_key, eik, &element_id);
             terminated_any = true;
             self.terminate_drained_flow_scopes(log, instance_key, parent, &required);
@@ -331,8 +343,9 @@ impl Engine {
     }
 
     /// Opens flow scope `scope_id` under `parent` without running its start
-    /// event (Zeebe creates missing flow scopes this way): activates it,
-    /// registers its variable scope and arms its boundary events.
+    /// event (Zeebe creates missing flow scopes this way): activates it and
+    /// registers its variable scope. The caller arms its boundary events once
+    /// the instruction's variables are written.
     fn open_flow_scope(
         &mut self,
         log: &mut Vec<Event>,
@@ -360,9 +373,6 @@ impl Engine {
                 parent_scope_key: parent,
             },
         ] {
-            self.emit(log, event);
-        }
-        for event in self.arm_boundary_events(instance_key, key, parent, &element_id) {
             self.emit(log, event);
         }
         key
@@ -400,15 +410,17 @@ impl Engine {
         scope: Key,
         locals: Vec<HashMap<String, Value>>,
     ) {
-        // A join or multi-instance target does not activate as one plain
-        // element instance (a join is guarded, an MI element opens its body):
-        // queue its regular activation and seed the instance it activates.
-        if self.join_kind(instance_key, &element_id).is_some()
-            || self.multi_instance_of(instance_key, &element_id).is_some()
-        {
+        // A join target does not activate as one plain element instance (it is
+        // guarded): run its regular activation and seed the instance it
+        // activates.
+        if self.join_kind(instance_key, &element_id).is_some() {
             self.activate_then_seed(log, queue, instance_key, element_id, scope, locals);
             return;
         }
+        // A multi-instance target's element-scoped variables land on its body
+        // (Zeebe): open and seed the body, then queue its fan-out, which
+        // evaluates input mappings / input collection in the seeded body view.
+        let is_multi_instance = self.multi_instance_of(instance_key, &element_id).is_some();
         let eik = self.mint_key();
         for event in [
             Event::ElementActivating {
@@ -435,14 +447,23 @@ impl Engine {
                 self.emit(log, event);
             }
         }
-        queue.push_back(Step::ResumeSeededActivation {
-            instance_key,
-            element_instance_key: eik,
-            element_id,
-        });
+        if is_multi_instance {
+            queue.push_back(Step::RetryMiBodyActivation {
+                instance_key,
+                element_id,
+                body_key: eik,
+                scope,
+            });
+        } else {
+            queue.push_back(Step::ResumeSeededActivation {
+                instance_key,
+                element_instance_key: eik,
+                element_id,
+            });
+        }
     }
 
-    /// Fallback for join / multi-instance targets: run the regular activation
+    /// Fallback for join targets: run the regular activation
     /// synchronously, then write `locals` into the instance it activated.
     fn activate_then_seed(
         &mut self,
@@ -498,6 +519,36 @@ impl Engine {
         queue.extend(followups);
     }
 
+    /// A terminated multi-instance child leaves its body's bookkeeping (active
+    /// set, loop index) without contributing output, so a sibling's completion
+    /// still completes the body and aggregates the collection.
+    fn release_mi_child(&mut self, log: &mut Vec<Event>, instance_key: Key, child: Key, body: Key) {
+        let index = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.multi_instances.get(&body))
+            .and_then(|mi| {
+                mi.active
+                    .contains(&child)
+                    .then(|| mi.child_indices.get(&child))
+            })
+            .flatten()
+            .copied();
+        if let Some(index) = index {
+            self.emit(
+                log,
+                Event::MultiInstanceChildCompleted {
+                    instance_key,
+                    body_key: body,
+                    child_key: child,
+                    index,
+                    output: None,
+                },
+            );
+        }
+    }
+
     /// Zeebe `terminateFlowScopes`: starting at `scope`, terminate each flow
     /// scope instance left without active children (and not `required` by an
     /// activation of this command), walking up to — but excluding — the root.
@@ -523,6 +574,7 @@ impl Engine {
                 return;
             };
             let parent = self.scope_of(instance_key, scope);
+            self.release_mi_child(log, instance_key, scope, parent);
             self.terminate_element_instance(log, instance_key, scope, &element_id);
             scope = parent;
         }

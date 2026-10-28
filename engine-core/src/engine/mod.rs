@@ -5402,7 +5402,23 @@ impl Engine {
                 // scope and re-run the activation body so the now-fixed input
                 // mappings are re-applied before the element's behaviour runs.
                 let scope = self.scope_of(instance_key, element_instance_key);
-                self.activate_body(instance_key, element_id, element_instance_key, scope)
+                // Re-evaluate in the same view as the first attempt: an element
+                // whose own scope is already registered (a modification seeded
+                // element-local variables, or a sub-process scope that holds no
+                // locals yet) evaluates in that scope; otherwise the enclosing
+                // scope.
+                let registered = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.scope_parents.contains_key(&element_instance_key))
+                    .unwrap_or(false);
+                let view = if registered {
+                    element_instance_key
+                } else {
+                    scope
+                };
+                self.activate_body_in(instance_key, element_id, element_instance_key, scope, view)
             }
             Step::ResumeSeededActivation {
                 instance_key,
@@ -6385,7 +6401,24 @@ impl Engine {
         // expressions are evaluated against the body's *enclosing* scope view, so
         // a multi-instance activity nested in a sub-process can read that
         // sub-process's locals.
-        let enclosing_vars = self.variables_for_element(instance_key, scope);
+        //
+        // A body whose scope is already registered (a re-drive, or a body a
+        // process-instance modification opened and seeded with element-scoped
+        // variables) evaluates in its own scope view, so those seeded locals are
+        // visible; on a first activation the body scope is not registered yet
+        // and holds no locals, so this is the enclosing view.
+        let view_scope = if self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| i.scope_parents.contains_key(&body_key))
+            .unwrap_or(false)
+        {
+            body_key
+        } else {
+            scope
+        };
+        let enclosing_vars = self.variables_for_element(instance_key, view_scope);
         // A CALL ACTIVITY's `zeebe:input` mappings seed only its isolated child
         // PROCESS scope — they are applied once in `spawn_call_activity_child` per
         // child, never local to the MI body scope. Applying them here would leak

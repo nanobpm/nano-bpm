@@ -762,3 +762,179 @@ fn element_scoped_activation_keeps_instruction_order() {
         .collect();
     assert_eq!(job_types, vec!["jobA", "jobB"]);
 }
+
+/// A multi-instance target's element-scoped variables seed the MI body scope
+/// BEFORE its activation evaluates: the input collection reads them.
+#[test]
+fn element_scoped_variables_feed_a_multi_instance_input_collection() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        multi_instance_service_process(false),
+        vars(&[("items", Value::List(vec![Value::Int(1)]))]),
+    );
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "each".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[(
+                        "items",
+                        Value::List(vec![Value::Int(7), Value::Int(8), Value::Int(9)]),
+                    )]),
+                    scope_id: Some("each".into()),
+                }],
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+    // Original body + 1 child, plus the new body + 3 children.
+    assert_eq!(eiks(&engine, inst, "each").len(), 2 + 4);
+}
+
+/// Terminating one parallel MI child's last inner token releases the child
+/// from its body's bookkeeping, so the sibling's completion still completes
+/// the body (aggregating its output) and the token moves on.
+#[test]
+fn terminating_one_mi_child_still_lets_the_body_complete() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        multi_instance_subprocess(false),
+        vars(&[(
+            "tasks",
+            Value::List(vec![Value::Str("x".into()), Value::Str("y".into())]),
+        )]),
+    );
+    let first = eiks(&engine, inst, "impl")[0];
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![],
+            terminate_instructions: vec![first],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    complete_all(&mut engine, "do-work");
+    let instance = engine.instance(inst).unwrap();
+    assert!(instance.multi_instances.is_empty(), "MI record left behind");
+    assert!(instance.variables.contains_key("done_tasks"));
+    assert_eq!(eiks(&engine, inst, "sink").len(), 1);
+}
+
+/// Resolving an input-mapping incident on a seeded element re-evaluates
+/// against the same seeded element-local view as the first attempt.
+#[test]
+fn retry_of_a_seeded_activation_keeps_its_element_locals() {
+    let def = ProcessBuilder::new("seeded-retry")
+        .start_event("s")
+        .service_task("a", "jobA")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=local + missing".to_string(),
+                    target: "y".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "a")
+        .connect("a", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    let events = engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "t".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[("local", Value::Int(40))]),
+                    scope_id: Some("t".into()),
+                }],
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+    let incident = events
+        .iter()
+        .find_map(|e| match e {
+            Event::IncidentRaised { incident_key, .. } => Some(*incident_key),
+            _ => None,
+        })
+        .expect("`missing` is absent: incident");
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[("missing", Value::Int(2))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident))
+        .unwrap();
+    let t = eiks(&engine, inst, "t")[0];
+    let scope = &engine.instance(inst).unwrap().scope_variables[&t];
+    assert_eq!(scope.get("y"), Some(&Value::Int(42)));
+    assert_eq!(engine.activate_jobs("work", "w", 10, 60_000, 0).len(), 1);
+}
+
+/// A created flow scope's boundary events are armed AFTER the instruction's
+/// variables are written, so a correlation key supplied by the modification
+/// is captured. (Like an ordinary activation, the boundary evaluates in the
+/// host's enclosing scope view, so a global / outer-scope variable is used.)
+#[test]
+fn created_scope_boundaries_see_modification_variables() {
+    let def = ProcessBuilder::new("boundary-key")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .message_boundary_event("mb", "sub", "cancel", "orderId")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "b")
+        .connect("b", "se")
+        .connect("sub", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, def, HashMap::new());
+        engine
+            .apply_command(modify(
+                inst,
+                vec![ActivateElementInstruction {
+                    element_id: "b".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("orderId", Value::Str("o-1".into()))]),
+                        scope_id: None,
+                    }],
+                    ..Default::default()
+                }],
+            ))
+            .unwrap();
+        let keys: Vec<&str> = engine
+            .state()
+            .message_subscriptions
+            .values()
+            .filter(|s| s.instance_key == inst && s.element_id == "sub")
+            .map(|s| s.correlation_key.as_str())
+            .collect();
+        assert_eq!(keys, vec!["o-1"]);
+    }
+}
