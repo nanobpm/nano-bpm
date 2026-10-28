@@ -675,3 +675,90 @@ fn terminate_by_unknown_id_is_a_no_op() {
     assert!(events.is_empty(), "{events:?}");
     assert_eq!(eiks(&engine, inst, "t").len(), 1);
 }
+
+/// Zeebe sets an activation's element-scoped variables BEFORE the element
+/// activates: the target's input mappings see them.
+#[test]
+fn element_scoped_variables_are_visible_to_the_targets_input_mappings() {
+    let def = ProcessBuilder::new("seeded")
+        .start_event("s")
+        .service_task("a", "jobA")
+        .service_task("t", "work")
+        .with_io(
+            "t",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=local + 1".to_string(),
+                    target: "y".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "a")
+        .connect("a", "t")
+        .connect("t", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    let events = engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "t".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[("local", Value::Int(41))]),
+                    scope_id: Some("t".into()),
+                }],
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { .. })),
+        "input mapping must see the element-scoped variable: {events:?}"
+    );
+    let t = eiks(&engine, inst, "t")[0];
+    let scope = &engine.instance(inst).unwrap().scope_variables[&t];
+    assert_eq!(scope.get("local"), Some(&Value::Int(41)));
+    assert_eq!(scope.get("y"), Some(&Value::Int(42)));
+    assert_eq!(engine.activate_jobs("work", "w", 10, 60_000, 0).len(), 1);
+}
+
+/// Activations run in instruction order even when a later instruction seeds
+/// element-scoped variables.
+#[test]
+fn element_scoped_activation_keeps_instruction_order() {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let events = engine
+        .apply_command(modify(
+            inst,
+            vec![
+                ActivateElementInstruction {
+                    element_id: "a".into(),
+                    ..Default::default()
+                },
+                ActivateElementInstruction {
+                    element_id: "b".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("in_b", Value::Int(1))]),
+                        scope_id: Some("b".into()),
+                    }],
+                    ..Default::default()
+                },
+            ],
+        ))
+        .unwrap();
+    let job_types: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::JobCreated { job_type, .. } => Some(job_type.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(job_types, vec!["jobA", "jobB"]);
+}

@@ -346,6 +346,16 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// Run the activation body of an element a process-instance modification
+    /// already activated and seeded with element-local variables (Zeebe sets a
+    /// modification's element-scoped variables BEFORE the element activates).
+    /// Queued in instruction order; the body's input mappings, FEEL attributes
+    /// and start listeners evaluate against the element's own (seeded) scope.
+    ResumeSeededActivation {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
     /// item and bindings are read from the body's runtime state.
@@ -5128,6 +5138,11 @@ impl Engine {
                 element_instance_key,
                 ..
             }
+            | Step::ResumeSeededActivation {
+                instance_key,
+                element_instance_key,
+                ..
+            }
             | Step::AdvanceListener {
                 instance_key,
                 element_instance_key,
@@ -5389,6 +5404,20 @@ impl Engine {
                 let scope = self.scope_of(instance_key, element_instance_key);
                 self.activate_body(instance_key, element_id, element_instance_key, scope)
             }
+            Step::ResumeSeededActivation {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.activate_body_in(
+                    instance_key,
+                    element_id,
+                    element_instance_key,
+                    scope,
+                    element_instance_key,
+                )
+            }
             Step::ActivateMiChild {
                 instance_key,
                 element_id,
@@ -5578,6 +5607,20 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        self.activate_body_in(instance_key, element_id, element_instance_key, scope, scope)
+    }
+
+    /// [`activate_body`] evaluating against the variable view of `view_scope`
+    /// (the enclosing `scope` normally; the element's own seeded scope for a
+    /// [`Step::ResumeSeededActivation`]).
+    fn activate_body_in(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+        view_scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
@@ -5591,7 +5634,15 @@ impl Engine {
         // The element's own scope is registered by `activate` for a
         // sub-process/ad-hoc container (before this body runs); a leaf activity
         // registers it lazily below, only if its inputs produce values.
-        let scope_registered = is_sub_process || is_adhoc_container;
+        // A modification may have registered it already (seeded locals).
+        let scope_registered = is_sub_process
+            || is_adhoc_container
+            || self
+                .state
+                .instances
+                .get(&instance_key)
+                .map(|i| i.scope_parents.contains_key(&element_instance_key))
+                .unwrap_or(false);
         // A call activity's input mappings seed only its isolated child process
         // scope (applied in `spawn_call_activity_child`) — never the call
         // activity's own element scope — so they are NOT projected here. Routing
@@ -5615,7 +5666,7 @@ impl Engine {
         // variable resolves correctly (Zeebe parity). A sub-process's own inputs
         // are evaluated here against its *parent* scope and then applied local to
         // the new sub-process scope.
-        let element_vars = self.variables_for_element(instance_key, scope);
+        let element_vars = self.variables_for_element(instance_key, view_scope);
 
         let mut events: Vec<Event> = Vec::new();
         let followups: Vec<Step> = Vec::new();

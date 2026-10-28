@@ -385,9 +385,66 @@ impl Engine {
             .find(|k| self.element_id_of_instance(instance_key, *k).as_deref() == Some(scope_id))
     }
 
-    /// Activates `element_id` synchronously so its own variable scope exists,
-    /// writes `locals` into it, then queues the activation's follow-ups.
+    /// Zeebe order for element-scoped variable instructions: create the
+    /// element instance and its variable scope, write `locals` into it, and only
+    /// then run the activation (input mappings, listeners, job/user-task
+    /// creation) — queued behind earlier instructions' activations so the
+    /// command's instruction order is kept, and evaluated against the seeded
+    /// scope so the element sees its own modification variables.
     fn activate_with_local_variables(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        instance_key: Key,
+        element_id: ElementId,
+        scope: Key,
+        locals: Vec<HashMap<String, Value>>,
+    ) {
+        // A join or multi-instance target does not activate as one plain
+        // element instance (a join is guarded, an MI element opens its body):
+        // queue its regular activation and seed the instance it activates.
+        if self.join_kind(instance_key, &element_id).is_some()
+            || self.multi_instance_of(instance_key, &element_id).is_some()
+        {
+            self.activate_then_seed(log, queue, instance_key, element_id, scope, locals);
+            return;
+        }
+        let eik = self.mint_key();
+        for event in [
+            Event::ElementActivating {
+                instance_key,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+            },
+            Event::ElementActivated {
+                instance_key,
+                element_instance_key: eik,
+                element_id: element_id.clone(),
+                scope,
+            },
+            Event::VariableScopeCreated {
+                instance_key,
+                scope_key: eik,
+                parent_scope_key: scope,
+            },
+        ] {
+            self.emit(log, event);
+        }
+        for variables in locals {
+            for event in self.propagated_updates(instance_key, eik, variables, true) {
+                self.emit(log, event);
+            }
+        }
+        queue.push_back(Step::ResumeSeededActivation {
+            instance_key,
+            element_instance_key: eik,
+            element_id,
+        });
+    }
+
+    /// Fallback for join / multi-instance targets: run the regular activation
+    /// synchronously, then write `locals` into the instance it activated.
+    fn activate_then_seed(
         &mut self,
         log: &mut Vec<Event>,
         queue: &mut VecDeque<Step>,
