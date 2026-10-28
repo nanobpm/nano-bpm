@@ -23,6 +23,7 @@ mod api;
 mod boundary;
 mod call_activity;
 mod debug;
+mod flow_scope;
 mod memory;
 mod resolve;
 
@@ -4213,6 +4214,9 @@ impl Engine {
                         target_process_id,
                         target_process_definition_key,
                         element_mappings: mapping_instructions,
+                        migrated_flow_scopes: Vec::new(),
+                        subscriptions: Vec::new(),
+                        child_instances: Vec::new(),
                     },
                 );
             }
@@ -4221,12 +4225,33 @@ impl Engine {
                 instance_key,
                 activate_instructions,
                 terminate_instructions,
+                terminate_element_ids,
+                move_instructions,
             } => {
-                // Only an active instance can be modified (Zeebe parity).
+                // Only an active instance can be modified (Zeebe parity): an
+                // unknown or finished instance is not found (404); a live but
+                // suspended one is in the wrong state (409).
                 match self.state.instances.get(&instance_key) {
                     Some(instance) if instance.state == ProcessInstanceState::Active => {}
+                    Some(instance) if instance.state == ProcessInstanceState::Suspended => {
+                        return Err(EngineError::InstanceNotActive {
+                            instance_key,
+                            process_id: instance.process_id.clone(),
+                            state: instance.state.as_str(),
+                        })
+                    }
                     _ => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
+
+                // Instruction fields the engine does not act on yet are
+                // rejected explicitly — never silently ignored (#1374 scaffold;
+                // each later slice removes its own check as it lands).
+                Self::reject_unsupported_modification(
+                    instance_key,
+                    &activate_instructions,
+                    &terminate_element_ids,
+                    &move_instructions,
+                )?;
 
                 // Validate up front so the command is all-or-nothing: every
                 // activate element id must exist in the process definition and
@@ -8887,12 +8912,12 @@ impl Engine {
         }
         // Nested container: walk the element-instance tree (inner instance →
         // parent container) and read this tool's job type off the parent catalog.
-        let inner = self.scope_of(instance_key, container_key);
-        let parent = if inner != 0 {
-            self.scope_of(instance_key, inner)
-        } else {
-            0
-        };
+        // Ancestors innermost-first: [inner instance, parent container, …].
+        let parent = self
+            .ancestor_element_instances(instance_key, container_key)
+            .get(1)
+            .copied()
+            .unwrap_or(0);
         let parent_element_id = self.element_id_of_instance(instance_key, parent)?;
         self.adhoc_def_of(instance_key, &parent_element_id)?
             .tools
@@ -12737,6 +12762,78 @@ pub enum EngineError {
         element_id: String,
         reason: String,
     },
+    // ---- Process-instance modification / migration rejection surface (#1374).
+    // Shape-only scaffold: later slices construct these; the REST status class
+    // of each is mapped once in `engine_error_status` (nano-server-raft).
+    /// A `ModifyInstance` carried an instruction (field) the engine does not act
+    /// on yet. Rejected explicitly rather than silently ignored. HTTP 400.
+    ModificationInstructionNotYetSupported {
+        instance_key: Key,
+        /// The command field, e.g. `move_instructions`.
+        instruction: &'static str,
+    },
+    /// A `ModifyInstance` instruction is malformed (e.g. a move with neither
+    /// source nor target, or duplicate move sources). HTTP 400. Zeebe
+    /// INVALID_ARGUMENT.
+    ModificationInstructionInvalid {
+        instance_key: Key,
+        process_id: String,
+        reason: String,
+    },
+    /// The instance exists but is not in a modifiable/migratable state (e.g.
+    /// suspended). HTTP 409. Zeebe INVALID_STATE.
+    InstanceNotActive {
+        instance_key: Key,
+        process_id: String,
+        state: &'static str,
+    },
+    /// An activate instruction's element has a flow scope with more than one
+    /// active instance and no ancestor was selected. HTTP 400.
+    AmbiguousFlowScope {
+        instance_key: Key,
+        process_id: String,
+        element_id: String,
+    },
+    /// An activate instruction's `ancestor_element_instance_key` does not exist
+    /// or is not active in the instance. HTTP 400.
+    AncestorScopeNotFound {
+        instance_key: Key,
+        process_id: String,
+        ancestor_element_instance_key: Key,
+    },
+    /// An activate instruction's `ancestor_element_instance_key` is not an
+    /// ancestor (flow-scope instance) of the element to activate. HTTP 400.
+    AncestorNotAnAncestor {
+        instance_key: Key,
+        process_id: String,
+        element_id: String,
+        ancestor_element_instance_key: Key,
+    },
+    /// An activate/move target cannot be activated by modification (a start
+    /// event inside a sub-process, a boundary event, an element inside a
+    /// multi-instance body, …). HTTP 400.
+    ElementNotActivatable {
+        instance_key: Key,
+        process_id: String,
+        element_id: String,
+        reason: String,
+    },
+    /// A migration mapping would change the flow scope of an active element.
+    /// HTTP 409. Zeebe `ERROR_MESSAGE_ELEMENT_FLOW_SCOPE_CHANGED`. (An
+    /// unsupported element class in migration is [`EngineError::UnsupportedMigration`].)
+    MigrationFlowScopeChanged {
+        instance_key: Key,
+        element_id: String,
+        source_flow_scope_id: Option<String>,
+        target_flow_scope_id: Option<String>,
+    },
+    /// A migration mapped a multi-instance element onto a non-multi-instance
+    /// one or vice versa. HTTP 409.
+    MigrationMultiInstanceMismatch {
+        instance_key: Key,
+        source_element_id: String,
+        target_element_id: String,
+    },
     /// An AgentInstance command referenced an `agent_instance_key` that does not
     /// identify a known agent instance.
     AgentInstanceNotFound { agent_instance_key: Key },
@@ -12805,6 +12902,45 @@ pub enum EngineError {
     },
 }
 
+impl Engine {
+    /// Rejects the [`Command::ModifyInstance`] instruction fields the engine
+    /// does not act on yet with
+    /// [`EngineError::ModificationInstructionNotYetSupported`], in a fixed
+    /// field order so the rejection is deterministic.
+    fn reject_unsupported_modification(
+        instance_key: Key,
+        activate_instructions: &[crate::command::ActivateElementInstruction],
+        terminate_element_ids: &[ElementId],
+        move_instructions: &[crate::command::MoveInstruction],
+    ) -> Result<(), EngineError> {
+        let unsupported = |instruction| {
+            Err(EngineError::ModificationInstructionNotYetSupported {
+                instance_key,
+                instruction,
+            })
+        };
+        if activate_instructions
+            .iter()
+            .any(|a| a.ancestor_element_instance_key.is_some())
+        {
+            return unsupported("activate_instructions[].ancestor_element_instance_key");
+        }
+        if activate_instructions
+            .iter()
+            .any(|a| !a.variable_instructions.is_empty())
+        {
+            return unsupported("activate_instructions[].variable_instructions");
+        }
+        if !terminate_element_ids.is_empty() {
+            return unsupported("terminate_element_ids");
+        }
+        if !move_instructions.is_empty() {
+            return unsupported("move_instructions");
+        }
+        Ok(())
+    }
+}
+
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's
 /// "not supported yet" migration rejections. Returns `Some(reason)` when a
 /// migration touching an active element (or armed boundary runtime) of this kind
@@ -12835,6 +12971,44 @@ impl std::fmt::Display for EngineError {
             EngineError::AgentInstanceAlreadyExists { element_instance_key, agent_instance_key } => write!(f, "element instance {element_instance_key} is already associated with agent instance {agent_instance_key}"),
             EngineError::AgentInstanceActiveWriter { agent_instance_key, element_instance_key } => write!(f, "agent instance {agent_instance_key} still has an active writer on element instance {element_instance_key}"),
             EngineError::AgentHistoryInvalid { reason } => write!(f, "invalid agent history: {reason}"),
+            EngineError::ModificationInstructionNotYetSupported { instance_key, instruction } => write!(
+                f,
+                "Expected to modify process instance '{instance_key}' but it contains '{instruction}', which is not yet supported"
+            ),
+            EngineError::ModificationInstructionInvalid { process_id, reason, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains an invalid instruction: {reason}"
+            ),
+            EngineError::InstanceNotActive { instance_key, process_id, state } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but process instance '{instance_key}' is {state}"
+            ),
+            EngineError::AmbiguousFlowScope { process_id, element_id, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions for an element that has a flow scope with more than one active instance: '{element_id}'. Can't decide in which instance of the flow scope the element should be activated. Please specify an ancestor element instance key for this activate instruction."
+            ),
+            EngineError::AncestorScopeNotFound { process_id, ancestor_element_instance_key, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions with an ancestor scope key that does not exist, or is not in an active state: '{ancestor_element_instance_key}'"
+            ),
+            EngineError::AncestorNotAnAncestor { process_id, element_id, ancestor_element_instance_key, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions with an ancestor scope key that is not an ancestor of the element to activate: '{ancestor_element_instance_key}' is not an ancestor of '{element_id}'"
+            ),
+            EngineError::ElementNotActivatable { process_id, element_id, reason, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions for elements that are unsupported: '{element_id}'. {reason}."
+            ),
+            EngineError::MigrationFlowScopeChanged { instance_key, element_id, source_flow_scope_id, target_flow_scope_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but the flow scope of active element with id '{element_id}' is changed. The flow scope of the active element is expected to be '{}' but was '{}'. The flow scope of an element cannot be changed during migration yet.",
+                source_flow_scope_id.as_deref().unwrap_or("<process>"),
+                target_flow_scope_id.as_deref().unwrap_or("<process>")
+            ),
+            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, target_element_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements is not supported."
+            ),
             EngineError::ProcessNotFound { process_id } => {
                 write!(f, "no deployed process with id {process_id}")
             }

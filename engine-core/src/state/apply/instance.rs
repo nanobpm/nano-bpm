@@ -314,6 +314,10 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             }
         }
 
+        // An audit record: the modification's state change is carried by the
+        // activation / termination events that follow it.
+        Event::ProcessInstanceModified { .. } => {}
+
         Event::ProcessInstanceBusinessIdAssigned {
             instance_key,
             business_id,
@@ -328,6 +332,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
             target_process_id,
             target_process_definition_key,
             element_mappings,
+            ..
         } => {
             let remap: HashMap<&str, &str> = element_mappings
                 .iter()

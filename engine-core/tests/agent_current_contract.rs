@@ -523,8 +523,11 @@ fn active_writer_blocks_reassociation_before_job_context_validation() {
             activate_instructions: vec![ActivateElementInstruction {
                 element_id: "agent".into(),
                 variables: Default::default(),
+                ..Default::default()
             }],
             terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
         })
         .unwrap();
     let other = engine

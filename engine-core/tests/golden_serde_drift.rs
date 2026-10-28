@@ -63,8 +63,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
-    Command, Engine, EngineSnapshot, Event, ProcessBuilder, ProcessDefinition, Value,
-    SNAPSHOT_FORMAT_VERSION,
+    ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
+    MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
+    MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder, ProcessDefinition,
+    SubscriptionMigrationAction, Value, VariableInstruction, SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus, relative to the crate root.
@@ -86,6 +88,9 @@ fn snapshot_golden_name() -> String {
 }
 fn event_corpus_golden_name() -> String {
     format!("event_corpus.v{SNAPSHOT_FORMAT_VERSION}.json")
+}
+fn event_witnesses_golden_name() -> String {
+    format!("event_witnesses.v{SNAPSHOT_FORMAT_VERSION}.json")
 }
 
 /// Serialize `value` to a **canonical**, deterministic, human-readable JSON
@@ -516,8 +521,197 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("throw job C error"),
     );
 
+    // Migration witness (#1374): instance D (waiting on `charge`) is migrated
+    // onto `order-v2`, pinning a real, replayable `ProcessInstanceMigrated`
+    // frame incl. its additive `migrated_flow_scopes` / `subscriptions` /
+    // `child_instances`. No modify step here: a modification that re-activates
+    // `charge` leaves a second (canceled) job on D, and `jobs_by_instance` is a
+    // `HashSet` — that would break the one-job-per-instance determinism
+    // contract above. The populated modify shape is pinned by
+    // `build_event_witnesses` instead.
+    let created_d = engine
+        .apply_command_at(Command::create_instance("order"), T0 + 18)
+        .expect("create instance D");
+    let inst_d = created_d
+        .iter()
+        .find_map(|e| e.instance_key())
+        .expect("instance D key");
+    journal.extend(created_d);
+    let order_v2: ProcessDefinition = ProcessBuilder::new("order-v2")
+        .start_event("start")
+        .service_task("charge2", "payment")
+        .end_event("end")
+        .connect("start", "charge2")
+        .connect("charge2", "end")
+        .build()
+        .expect("build order-v2 process");
+    let deployed_v2 = engine
+        .apply_command_at(Command::DeployProcess(order_v2), T0 + 20)
+        .expect("deploy order-v2");
+    let v2_key = deployed_v2
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .expect("order-v2 definition key");
+    journal.extend(deployed_v2);
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::migrate_instance(
+                    inst_d,
+                    v2_key,
+                    vec![("charge".to_string(), "charge2".to_string())],
+                ),
+                T0 + 21,
+            )
+            .expect("migrate instance D"),
+    );
+
     let snapshot = engine.snapshot();
     (snapshot, journal)
+}
+
+/// Serialized-shape witnesses for event frames / fields the executed corpus
+/// cannot yet produce (#1374): the modify / migrate behaviour that populates
+/// them lands in later slices, but the persisted shape is pinned here, once,
+/// with every new field non-default.
+fn build_event_witnesses() -> Vec<Event> {
+    let mut vars = HashMap::new();
+    vars.insert("x".to_string(), Value::Int(1));
+    let scoped = VariableInstruction {
+        variables: vars.clone(),
+        scope_id: Some("sub".to_string()),
+    };
+    vec![
+        Event::ProcessInstanceModified {
+            instance_key: 1,
+            activate_instructions: vec![ActivateElementInstruction {
+                element_id: "task".to_string(),
+                variables: vars,
+                ancestor_element_instance_key: Some(2),
+                variable_instructions: vec![scoped.clone()],
+            }],
+            terminate_instructions: vec![3],
+            terminate_element_ids: vec!["old".to_string()],
+            move_instructions: vec![
+                MoveInstruction {
+                    source: MoveSource::ById("a".to_string()),
+                    target_element_id: "b".to_string(),
+                    ancestor_scope: AncestorScopeInstruction::Direct(2),
+                    variable_instructions: vec![scoped],
+                },
+                MoveInstruction {
+                    source: MoveSource::ByKey(4),
+                    target_element_id: "b".to_string(),
+                    ancestor_scope: AncestorScopeInstruction::Inferred,
+                    variable_instructions: vec![],
+                },
+                MoveInstruction {
+                    source: MoveSource::ById("c".to_string()),
+                    target_element_id: "b".to_string(),
+                    ancestor_scope: AncestorScopeInstruction::SourceParent,
+                    variable_instructions: vec![],
+                },
+            ],
+            activated_element_instance_keys: vec![5, 6],
+        },
+        Event::ProcessInstanceMigrated {
+            instance_key: 1,
+            target_process_id: "p2".to_string(),
+            target_process_definition_key: 7,
+            element_mappings: vec![("sub".to_string(), "sub2".to_string())],
+            migrated_flow_scopes: vec![MigratedElementInstance {
+                element_instance_key: 8,
+                source_element_id: "sub".to_string(),
+                target_element_id: "sub2".to_string(),
+            }],
+            subscriptions: vec![
+                MigratedSubscription {
+                    element_instance_key: 9,
+                    element_id: "msg".to_string(),
+                    action: SubscriptionMigrationAction::Retained,
+                    trigger: MigratedSubscriptionTrigger::Message {
+                        subscription_key: 10,
+                        message_name: "m".to_string(),
+                        correlation_key: "c".to_string(),
+                    },
+                },
+                MigratedSubscription {
+                    element_instance_key: 11,
+                    element_id: "timer".to_string(),
+                    action: SubscriptionMigrationAction::Recreated,
+                    trigger: MigratedSubscriptionTrigger::Timer {
+                        timer_key: 12,
+                        due_at: 13,
+                    },
+                },
+                MigratedSubscription {
+                    element_instance_key: 14,
+                    element_id: "sig".to_string(),
+                    action: SubscriptionMigrationAction::Created,
+                    trigger: MigratedSubscriptionTrigger::Signal {
+                        subscription_key: 15,
+                        signal_name: "s".to_string(),
+                    },
+                },
+                MigratedSubscription {
+                    element_instance_key: 16,
+                    element_id: "gone".to_string(),
+                    action: SubscriptionMigrationAction::Deleted,
+                    trigger: MigratedSubscriptionTrigger::Message {
+                        subscription_key: 17,
+                        message_name: "m2".to_string(),
+                        correlation_key: String::new(),
+                    },
+                },
+            ],
+            child_instances: vec![MigratedChildInstance {
+                call_activity_element_instance_key: 18,
+                child_instance_key: 19,
+                target_element_id: "call2".to_string(),
+            }],
+        },
+    ]
+}
+
+/// Pins the #1374 modify / migrate frame shapes (see [`build_event_witnesses`])
+/// and proves they round-trip through the canonical journal decoder.
+#[test]
+fn event_witnesses_shape_is_pinned_to_version() {
+    let witnesses = build_event_witnesses();
+    assert_or_update_golden(&event_witnesses_golden_name(), &canonical_json(&witnesses));
+    for event in &witnesses {
+        let json = serde_json::to_string(event).expect("serialize witness");
+        let decoded = nanobpmn_engine_core::decode_event_json(&json).expect("decode witness");
+        assert_eq!(&decoded, event);
+    }
+}
+
+/// The #1374 additive fields default when absent: a pre-#1374
+/// `ProcessInstanceMigrated` record (no flow-scope / subscription / child
+/// fields) still decodes — the property that lets this change skip a
+/// `SNAPSHOT_FORMAT_VERSION` bump.
+#[test]
+fn pre_1374_migrated_record_decodes_with_defaults() {
+    let old = r#"{"ProcessInstanceMigrated":{"instance_key":1,"target_process_id":"p2","target_process_definition_key":7,"element_mappings":[["a","b"]]}}"#;
+    let decoded = nanobpmn_engine_core::decode_event_json(old).expect("decode old record");
+    assert_eq!(
+        decoded,
+        Event::ProcessInstanceMigrated {
+            instance_key: 1,
+            target_process_id: "p2".to_string(),
+            target_process_definition_key: 7,
+            element_mappings: vec![("a".to_string(), "b".to_string())],
+            migrated_flow_scopes: vec![],
+            subscriptions: vec![],
+            child_instances: vec![],
+        }
+    );
 }
 
 /// Guards the `EngineSnapshot` / `State` serialized shape against silent drift.

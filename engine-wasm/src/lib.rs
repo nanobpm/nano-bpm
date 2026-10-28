@@ -934,6 +934,8 @@ impl TestEngine {
             instance_key: key,
             activate_instructions,
             terminate_instructions,
+            terminate_element_ids: Vec::new(),
+            move_instructions: Vec::new(),
         })
         .map_err(|e| js_err(&format!("modify instance error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -3649,6 +3651,7 @@ fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction
         out.push(ActivateElementInstruction {
             element_id,
             variables,
+            ..ActivateElementInstruction::default()
         });
     }
     Ok(out)

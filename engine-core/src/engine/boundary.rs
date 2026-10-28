@@ -94,16 +94,6 @@ impl Engine {
             .min()
     }
 
-    /// The element instance of the embedded sub-process that encloses
-    /// `element_instance_key`, or `0` if it lives in the process-level scope.
-    pub(crate) fn scope_of(&self, instance_key: Key, element_instance_key: Key) -> Key {
-        self.state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.scopes.get(&element_instance_key).copied())
-            .unwrap_or(0)
-    }
-
     /// The element id of an active element instance, if it is still active.
     pub(crate) fn element_id_of_instance(
         &self,
@@ -131,22 +121,21 @@ impl Engine {
         from_eik: Key,
         error_code: &str,
     ) -> Option<(ElementId, Key, ElementId)> {
-        let mut element_id = from_element_id.to_string();
-        let mut eik = from_eik;
-        loop {
+        if let Some(boundary_id) =
+            self.find_error_boundary(instance_key, from_element_id, error_code)
+        {
+            return Some((boundary_id, from_eik, from_element_id.to_string()));
+        }
+        // Propagate up the enclosing sub-process scopes (innermost first).
+        for eik in self.ancestor_element_instances(instance_key, from_eik) {
+            let element_id = self.element_id_of_instance(instance_key, eik)?;
             if let Some(boundary_id) =
                 self.find_error_boundary(instance_key, &element_id, error_code)
             {
                 return Some((boundary_id, eik, element_id));
             }
-            // Propagate to the enclosing sub-process, if any.
-            let parent = self.scope_of(instance_key, eik);
-            if parent == 0 {
-                return None;
-            }
-            element_id = self.element_id_of_instance(instance_key, parent)?;
-            eik = parent;
         }
+        None
     }
 
     /// The escalation boundary attached to `activity_id` that catches
@@ -213,35 +202,18 @@ impl Engine {
         from_scope_eik: Key,
         escalation_code: &str,
     ) -> Option<(ElementId, Key, ElementId, bool)> {
-        let mut eik = from_scope_eik;
-        while eik != 0 {
+        let scopes = std::iter::once(from_scope_eik)
+            .filter(|eik| *eik != 0)
+            .chain(self.ancestor_element_instances(instance_key, from_scope_eik));
+        for eik in scopes {
             let element_id = self.element_id_of_instance(instance_key, eik)?;
             if let Some((boundary_id, interrupting)) =
                 self.find_escalation_boundary(instance_key, &element_id, escalation_code)
             {
                 return Some((boundary_id, eik, element_id, interrupting));
             }
-            eik = self.scope_of(instance_key, eik);
         }
         None
-    }
-
-    pub(crate) fn scope_descendants(&self, instance_key: Key, scope_eik: Key) -> Vec<Key> {
-        let Some(instance) = self.state.instances.get(&instance_key) else {
-            return Vec::new();
-        };
-        let mut result = Vec::new();
-        let mut stack = vec![scope_eik];
-        while let Some(parent) = stack.pop() {
-            for (child, p) in &instance.scopes {
-                if *p == parent {
-                    result.push(*child);
-                    stack.push(*child);
-                }
-            }
-        }
-        result.sort_unstable();
-        result
     }
 
     /// Terminates a sub-process scope: cancels every in-play job, armed timer and
