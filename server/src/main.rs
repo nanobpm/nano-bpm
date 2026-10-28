@@ -33159,6 +33159,84 @@ mod clustered_startup_tests {
         );
     }
 
+    /// A modification submitted to a non-owning gateway is forwarded to the
+    /// owner over the `ModifyInstance` Falcon frame: the mutation lands on the
+    /// owner, and an engine rejection's status survives the round trip.
+    #[tokio::test]
+    async fn modify_instance_forwards_to_the_owning_peer() {
+        let node0 = clustered_node(0);
+        let (instance_key, a_key) = modify_fixture(&node0).await;
+
+        let node0_url = serve_node(&node0).await;
+        let topology = cluster::Topology {
+            node_id: 1,
+            peers: vec![node0_url, "http://unused".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node1 = build_server_in_memory(journals, topology);
+        assert!(
+            node1.remote_owner_of(instance_key).is_some(),
+            "the instance's partition is owned by a peer, so the core must forward"
+        );
+
+        let instructions = |body: serde_json::Value| {
+            let body: models::ProcessInstanceModificationInstruction =
+                serde_json::from_value(body).expect("well-formed modification body");
+            modify_instructions_from_rest(&body).expect("valid instructions")
+        };
+        let ok = node1
+            .modify_instance_core(
+                instance_key,
+                instructions(serde_json::json!({
+                    "activateInstructions": [{ "elementId": "b" }],
+                    "terminateInstructions": [{ "elementInstanceKey": a_key.to_string() }]
+                })),
+            )
+            .await;
+        assert!(
+            matches!(ok, ModifyInstanceOutcome::Modified),
+            "the forwarded modification should succeed: {ok:?}"
+        );
+        let mut applied = false;
+        for _ in 0..200 {
+            let rows = node0.store.element_instances();
+            let b_active = rows.iter().any(|e| {
+                e.instance_key == instance_key
+                    && e.element_id == "b"
+                    && e.state == crate::readstore::ElementInstanceState::Active
+            });
+            let a_gone = rows.iter().any(|e| {
+                e.element_instance_key == a_key
+                    && e.state != crate::readstore::ElementInstanceState::Active
+            });
+            if b_active && a_gone {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(applied, "the owner applied the forwarded modification");
+
+        let rejected = node1
+            .modify_instance_core(
+                instance_key,
+                instructions(serde_json::json!({
+                    "activateInstructions": [{ "elementId": "no-such-element" }]
+                })),
+            )
+            .await;
+        assert!(
+            matches!(rejected, ModifyInstanceOutcome::BadRequest(_)),
+            "the owner's 400 rejection must survive the forward: {rejected:?}"
+        );
+    }
+
     #[tokio::test]
     async fn get_process_instance_forwards_to_the_owning_peer() {
         // A GET-by-key read for a remote-owned instance must be answered by the
