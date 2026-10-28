@@ -3563,6 +3563,17 @@ impl Engine {
                     Some(state::MessageSubscriptionState::Opening)
                 ) && !self.instance_is_suspended(instance_key);
                 if advance {
+                    // The continuation metadata the canonical (message-partition)
+                    // record forwards can be stale: a migration re-points the
+                    // local `Opening` record's host and boundary ids but never the
+                    // remote copy. The local record is the source of truth for
+                    // where the token sits, so resolve the ids from it.
+                    let (element_id, kind) = self
+                        .state
+                        .message_subscriptions
+                        .get(&subscription_key)
+                        .map(|s| (s.element_id.clone(), s.kind.clone()))
+                        .unwrap_or((element_id, kind));
                     self.advance_correlated_token(
                         &mut log,
                         &mut queue,
@@ -3900,11 +3911,17 @@ impl Engine {
 
                 // The instance's current definition is the source of truth for its
                 // active elements' types (only the latest version is retained).
-                let source_def = self.state.processes.get(&source_process_id).ok_or(
-                    EngineError::ProcessNotFound {
+                // Resolved through the instance's pinned definition key, never
+                // the latest-by-id index: a same-process-id migration (v1 -> v2)
+                // must plan against the version the instance actually runs.
+                let source_def = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| self.state.definition_for(i))
+                    .ok_or(EngineError::ProcessNotFound {
                         process_id: source_process_id.clone(),
-                    },
-                )?;
+                    })?;
 
                 // 3. No duplicate source ids; every mapped source/target element
                 //    exists; each mapped pair keeps the same BPMN type (compared

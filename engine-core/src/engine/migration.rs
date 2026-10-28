@@ -393,9 +393,25 @@ impl Engine {
                 });
             }
             let scope = self.scope_of(instance_key, eik);
-            let vars = self.variables_for_element(instance_key, scope);
-            let mut covered: Vec<ElementId> = Vec::new();
+            // Boundaries evaluate against the enclosing scope (as at activation);
+            // an intermediate catch evaluates against its own element-instance
+            // view so its input-mapped locals stay visible.
+            let boundary_vars = self.variables_for_element(instance_key, scope);
+            let catch_vars = self.variables_for_element(instance_key, eik);
+            // A target boundary explicitly mapped from a source boundary on this
+            // element is never "new": if its source trigger is no longer armed
+            // (a one-shot non-interrupting timer that already fired) it must not
+            // be re-armed, or the side path would run twice.
+            let mut covered: Vec<ElementId> = Self::armable_boundaries(source, &source_id)
+                .iter()
+                .filter_map(|b| mapped.get(&b.id).cloned())
+                .collect();
             for armed in self.armed_triggers_on(eik, &source_id, source) {
+                let vars = if armed.interrupting.is_some() {
+                    &boundary_vars
+                } else {
+                    &catch_vars
+                };
                 let target_catch = mapped
                     .get(&armed.catch_id)
                     .and_then(|tc| target.element(tc))
@@ -418,7 +434,7 @@ impl Engine {
                     Some(_) => boundary_interrupting(&target_catch.kind),
                     None => None,
                 };
-                let unchanged = self.target_fingerprint(&vars, &target_catch).as_ref()
+                let unchanged = self.target_fingerprint(vars, &target_catch).as_ref()
                     == Some(&armed.fingerprint)
                     && target_interrupting == armed.interrupting;
                 if unchanged {
@@ -443,11 +459,11 @@ impl Engine {
                     });
                 }
                 let armed_events = if armed.interrupting.is_some() {
-                    self.arm_boundary(instance_key, eik, &target_id, &vars, &target_catch)
+                    self.arm_boundary(instance_key, eik, &target_id, vars, &target_catch)
                         .into_iter()
                         .collect()
                 } else {
-                    self.arm_catch_event(instance_key, eik, &vars, &target_catch)
+                    self.arm_catch_event(instance_key, eik, vars, &target_catch)
                 };
                 for event in armed_events {
                     if let Some(trigger) = Self::report_of(&event) {
@@ -461,13 +477,19 @@ impl Engine {
                     plan.after.push(event);
                 }
             }
-            // Target boundaries with no mapped source trigger are newly armed.
+            // An element still running its start execution-listener chain has
+            // not run its activation body yet; that body arms the (now target)
+            // boundaries when the chain drains, so arming here would duplicate.
+            if self.start_listeners_pending(eik) {
+                continue;
+            }
+            // Target boundaries with no mapped source boundary are newly armed.
             for boundary in Self::armable_boundaries(target, &target_id) {
                 if covered.contains(&boundary.id) {
                     continue;
                 }
                 if let Some(event) =
-                    self.arm_boundary(instance_key, eik, &target_id, &vars, &boundary)
+                    self.arm_boundary(instance_key, eik, &target_id, &boundary_vars, &boundary)
                 {
                     if let Some(trigger) = Self::report_of(&event) {
                         plan.subscriptions.push(MigratedSubscription {
@@ -482,5 +504,25 @@ impl Engine {
             }
         }
         plan
+    }
+
+    /// Whether `element_instance_key` is still parked in its `start`
+    /// execution-listener chain (ADR 0037), i.e. its activation body — which
+    /// arms its boundary events — has not run yet.
+    fn start_listeners_pending(&self, element_instance_key: Key) -> bool {
+        self.state.jobs.values().any(|j| {
+            j.element_instance_key == element_instance_key
+                && matches!(
+                    j.state,
+                    state::JobState::Created | state::JobState::Activated
+                )
+                && matches!(
+                    j.kind,
+                    state::JobKind::ExecutionListener {
+                        event_type: crate::model::ListenerEventType::Start,
+                        ..
+                    }
+                )
+        })
     }
 }

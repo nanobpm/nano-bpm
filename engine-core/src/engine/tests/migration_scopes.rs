@@ -879,3 +879,288 @@ fn migration_retains_timer_of_intermediate_catch_event() {
     assert_eq!(after[0].element_id, "wait2");
     assert_eq!(after[0].due_at, before[0].due_at);
 }
+
+/// Copilot #1380: the planner must read the instance's PINNED source version,
+/// not the latest deployment of the same process id. v1 (60s) -> v2 (120s)
+/// changes the timer, so it is re-created rather than retained.
+#[test]
+fn same_process_id_migration_plans_against_the_pinned_source_version() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, task_with_timer_boundary("p", "a", "t", 60_000));
+    let inst = create_instance_key(&mut engine, "p");
+    let v2 = deploy_for_migration(
+        &mut engine,
+        task_with_timer_boundary("p", "a", "t", 120_000),
+    );
+    let before = live_timers(&engine, inst);
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            v2,
+            pairs(&[("a", "a"), ("t", "t")]),
+        ))
+        .unwrap();
+    assert_eq!(
+        subscriptions_of(&events)
+            .iter()
+            .map(|s| s.action)
+            .collect::<Vec<_>>(),
+        vec![
+            SubscriptionMigrationAction::Deleted,
+            SubscriptionMigrationAction::Recreated
+        ]
+    );
+    let after = live_timers(&engine, inst);
+    assert_eq!(after.len(), 1);
+    assert_ne!(after[0].key, before[0].key);
+}
+
+/// Copilot #1380: a removed boundary in a same-process-id v2 must have its
+/// v1 timer cancelled (the latest definition does not know the boundary).
+#[test]
+fn same_process_id_migration_cancels_timer_of_removed_boundary() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, task_with_timer_boundary("p", "a", "t", 60_000));
+    let inst = create_instance_key(&mut engine, "p");
+    let v2 = deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("p")
+            .start_event("start")
+            .service_task("a", "work")
+            .end_event("end")
+            .connect("start", "a")
+            .connect("a", "end")
+            .build()
+            .unwrap(),
+    );
+    engine
+        .apply_command(Command::migrate_instance(inst, v2, pairs(&[("a", "a")])))
+        .unwrap();
+    assert!(live_timers(&engine, inst).is_empty());
+}
+
+fn task_with_non_interrupting_timer(id: &str, task: &str, boundary: &str) -> ProcessDefinition {
+    ProcessBuilder::new(id)
+        .start_event("start")
+        .service_task(task, "work")
+        .non_interrupting_timer_boundary_event(boundary, task, 1_000)
+        .end_event("end")
+        .end_event("side")
+        .connect("start", task)
+        .connect(task, "end")
+        .connect(boundary, "side")
+        .build()
+        .unwrap()
+}
+
+/// Copilot #1380: a one-shot non-interrupting timer that already fired is not
+/// armed any more; mapping it onto an identical target boundary must not
+/// re-arm it (the side path would run twice).
+#[test]
+fn migration_does_not_rearm_a_mapped_fired_non_interrupting_timer() {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        task_with_non_interrupting_timer("source", "a", "t1"),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        task_with_non_interrupting_timer("target", "b", "t2"),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let due = live_timers(&engine, inst)[0].due_at;
+    engine.trigger_timers(due);
+    assert!(live_timers(&engine, inst).is_empty());
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a", "b"), ("t1", "t2")]),
+        ))
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::TimerCreated { .. })),
+        "a fired mapped timer must not be re-armed: {events:?}"
+    );
+    assert!(live_timers(&engine, inst).is_empty());
+}
+
+/// Copilot #1380: an element parked in its start-listener chain has not armed
+/// its boundaries yet; migration must leave arming to the activation body, or
+/// the boundary is armed twice once the listener completes.
+#[test]
+fn migration_defers_boundary_arming_for_pending_start_listener() {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("source")
+            .start_event("start")
+            .service_task("a", "work")
+            .end_event("end")
+            .connect("start", "a")
+            .connect("a", "end")
+            .with_listeners("a", vec![el(ListenerEventType::Start, "audit")], Vec::new())
+            .build()
+            .unwrap(),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        task_with_timer_boundary("target", "b", "t2", 60_000),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a", "b")]),
+        ))
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::TimerCreated { .. })));
+
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1);
+    engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert_eq!(
+        live_timers(&engine, inst).len(),
+        1,
+        "boundary armed exactly once"
+    );
+}
+
+/// Copilot #1380: an intermediate catch whose correlation key reads an
+/// input-mapped local must be fingerprinted against its element-instance view;
+/// otherwise the unchanged subscription is cancelled and re-arming raises an
+/// expression incident.
+#[test]
+fn migration_retains_input_mapped_message_catch() {
+    let catch = |id: &str, c: &str| {
+        ProcessBuilder::new(id)
+            .start_event("start")
+            .message_intermediate_catch_event(c, "paid", "=key")
+            .with_io(
+                c,
+                crate::model::IoMapping {
+                    inputs: vec![crate::model::Mapping {
+                        source: "=\"o1\"".to_string(),
+                        target: "key".to_string(),
+                    }],
+                    outputs: Vec::new(),
+                },
+            )
+            .end_event("end")
+            .connect("start", c)
+            .connect(c, "end")
+            .build()
+            .unwrap()
+    };
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, catch("source", "c1"));
+    let target_key = deploy_for_migration(&mut engine, catch("target", "c2"));
+    let inst = create_instance_key(&mut engine, "source");
+    let sub = live_message_subs(&engine, inst)[0].clone();
+    assert_eq!(sub.correlation_key, "o1");
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("c1", "c2")]),
+        ))
+        .unwrap();
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::IncidentRaised { .. })));
+    assert_eq!(
+        subscriptions_of(&events)
+            .iter()
+            .map(|s| s.action)
+            .collect::<Vec<_>>(),
+        vec![SubscriptionMigrationAction::Retained]
+    );
+    assert_eq!(live_message_subs(&engine, inst)[0].key, sub.key);
+}
+
+/// Copilot #1380: a retained OFF-partition message boundary is re-pointed only
+/// on the instance partition; the canonical record on the message partition
+/// still forwards the source host/boundary ids. The continuation must resolve
+/// them from the local record so the TARGET boundary's flow runs.
+#[test]
+fn off_partition_boundary_correlates_onto_migrated_target_boundary() {
+    const N: u64 = 2;
+    let order = ('a'..='z')
+        .map(|c| c.to_string())
+        .find(|k| state::subscription_partition(k, N) == 1)
+        .unwrap();
+    let mut engine = Engine::with_partition(0);
+    engine.set_num_partitions(N);
+    deploy_for_migration(
+        &mut engine,
+        task_with_message_boundary("source", "a", "m1", "cancel"),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        task_with_message_boundary("target", "b", "m2", "cancel"),
+    );
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "source",
+            vars(&[("key", Value::Str(order))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let (sub_key, eik, stale_eid, stale_kind) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::MessageSubscriptionOpening {
+                subscription_key,
+                element_instance_key,
+                element_id,
+                kind,
+                ..
+            } => Some((
+                *subscription_key,
+                *element_instance_key,
+                element_id.clone(),
+                kind.clone(),
+            )),
+            _ => None,
+        })
+        .expect("off-partition Opening record");
+
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a", "b"), ("m1", "m2")]),
+        ))
+        .unwrap();
+
+    // The remote partition forwards the stale (source) ids.
+    let advanced = engine
+        .apply_command(Command::CorrelateMessageSubscription {
+            subscription_key: sub_key,
+            message_key: 999_999,
+            instance_key: inst,
+            element_instance_key: eik,
+            element_id: stale_eid,
+            kind: stale_kind,
+            variables: HashMap::new(),
+        })
+        .unwrap();
+    assert!(
+        advanced.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_id, .. } if element_id == "m2"
+        )),
+        "the target boundary's flow runs: {advanced:?}"
+    );
+    assert!(engine.is_completed(inst));
+}
