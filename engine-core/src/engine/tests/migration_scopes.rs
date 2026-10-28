@@ -1164,3 +1164,164 @@ fn off_partition_boundary_correlates_onto_migrated_target_boundary() {
     );
     assert!(engine.is_completed(inst));
 }
+
+fn incident_key_of(engine: &Engine, inst: Key) -> Key {
+    engine
+        .state
+        .incidents
+        .values()
+        .find(|i| i.instance_key == inst && i.state == state::IncidentState::Active)
+        .expect("active incident")
+        .key
+}
+
+fn timer_created(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, Event::TimerCreated { .. }))
+}
+
+/// Copilot #1380: a host whose start listener FAILED (incident) still has not
+/// run its activation body; recovery arms the boundaries, so migration must not.
+#[test]
+fn migration_defers_boundary_arming_for_failed_start_listener() {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("source")
+            .start_event("start")
+            .service_task("a", "work")
+            .end_event("end")
+            .connect("start", "a")
+            .connect("a", "end")
+            .with_listeners("a", vec![el(ListenerEventType::Start, "audit")], Vec::new())
+            .build()
+            .unwrap(),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        task_with_timer_boundary("target", "b", "t2", 60_000),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::fail_job(listener[0].key, 0, "boom"))
+        .unwrap();
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a", "b")]),
+        ))
+        .unwrap();
+    assert!(!timer_created(&events), "{events:?}");
+
+    engine
+        .apply_command(Command::update_job_retries(listener[0].key, 1))
+        .unwrap();
+    let incident = incident_key_of(&engine, inst);
+    engine
+        .apply_command(Command::resolve_incident(incident))
+        .unwrap();
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert_eq!(live_timers(&engine, inst).len(), 1, "armed exactly once");
+}
+
+/// Copilot #1380: a host parked on an input-mapping incident re-runs its
+/// activation body (arming boundaries) on resolution; migration must not arm.
+#[test]
+fn migration_defers_boundary_arming_for_input_mapping_incident() {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("source")
+            .start_event("start")
+            .service_task("a", "work")
+            .with_io(
+                "a",
+                crate::model::IoMapping {
+                    inputs: vec![crate::model::Mapping {
+                        source: "=\"x\" + missingVar".to_string(),
+                        target: "y".to_string(),
+                    }],
+                    outputs: Vec::new(),
+                },
+            )
+            .end_event("end")
+            .connect("start", "a")
+            .connect("a", "end")
+            .build()
+            .unwrap(),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        task_with_timer_boundary("target", "b", "t2", 60_000),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let incident = incident_key_of(&engine, inst);
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a", "b")]),
+        ))
+        .unwrap();
+    assert!(!timer_created(&events), "{events:?}");
+
+    engine
+        .apply_command(Command::resolve_incident(incident))
+        .unwrap();
+    assert_eq!(live_timers(&engine, inst).len(), 1, "armed exactly once");
+}
+
+/// Copilot #1380: a host running its end-listener chain has already had its
+/// boundaries cancelled; arming new ones would outlive the host.
+#[test]
+fn migration_does_not_arm_boundaries_for_completing_host() {
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("source")
+            .start_event("start")
+            .service_task("a", "work")
+            .end_event("end")
+            .connect("start", "a")
+            .connect("a", "end")
+            .with_listeners("a", Vec::new(), vec![el(ListenerEventType::End, "audit")])
+            .build()
+            .unwrap(),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        task_with_timer_boundary("target", "b", "t2", 60_000),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let job = engine.activate_jobs("work", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::complete_job(job[0].key))
+        .unwrap();
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("a", "b")]),
+        ))
+        .unwrap();
+    assert!(!timer_created(&events), "{events:?}");
+    assert!(live_timers(&engine, inst).is_empty());
+
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert!(
+        live_timers(&engine, inst).is_empty(),
+        "no trigger outlives host"
+    );
+}

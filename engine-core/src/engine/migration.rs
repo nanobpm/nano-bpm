@@ -477,10 +477,14 @@ impl Engine {
                     plan.after.push(event);
                 }
             }
-            // An element still running its start execution-listener chain has
-            // not run its activation body yet; that body arms the (now target)
-            // boundaries when the chain drains, so arming here would duplicate.
-            if self.start_listeners_pending(eik) {
+            // Only a host in its steady active phase gets newly armed target
+            // boundaries. A host still in its start-listener chain or parked on
+            // an activation-phase incident will (re-)run its activation body,
+            // which arms the (now target) boundaries — arming here would
+            // duplicate them. A host completing (end listeners / completion
+            // incident) has already had its boundaries cancelled, so arming
+            // here would leave triggers outliving the host.
+            if !self.boundaries_armable_now(eik) {
                 continue;
             }
             // Target boundaries with no mapped source boundary are newly armed.
@@ -506,23 +510,37 @@ impl Engine {
         plan
     }
 
-    /// Whether `element_instance_key` is still parked in its `start`
-    /// execution-listener chain (ADR 0037), i.e. its activation body — which
-    /// arms its boundary events — has not run yet.
-    fn start_listeners_pending(&self, element_instance_key: Key) -> bool {
-        self.state.jobs.values().any(|j| {
+    /// Whether `element_instance_key` is in its steady active phase, i.e. its
+    /// activation body has run (boundaries armed) and it has not begun
+    /// completing (boundaries cancelled). False while any execution-listener
+    /// job (start chain not drained, end chain running — including a `Failed`
+    /// listener job parked on an incident) is outstanding, or while an active
+    /// ioMapping-style incident will re-drive its activation or completion.
+    fn boundaries_armable_now(&self, element_instance_key: Key) -> bool {
+        let listener_outstanding = self.state.jobs.values().any(|j| {
             j.element_instance_key == element_instance_key
                 && matches!(
                     j.state,
-                    state::JobState::Created | state::JobState::Activated
+                    state::JobState::Created | state::JobState::Activated | state::JobState::Failed
                 )
-                && matches!(
-                    j.kind,
-                    state::JobKind::ExecutionListener {
-                        event_type: crate::model::ListenerEventType::Start,
-                        ..
-                    }
-                )
+                && matches!(j.kind, state::JobKind::ExecutionListener { .. })
+        });
+        if listener_outstanding {
+            return false;
+        }
+        !self.state.incidents.values().any(|inc| {
+            inc.element_instance_key == element_instance_key
+                && inc.state == state::IncidentState::Active
+                && inc.job_key.is_none()
+                && match &inc.redrive {
+                    // Boundaries were armed on the first pass of a call
+                    // activity spawn; the host is otherwise steady.
+                    Some(state::IoMappingRedrive::CallActivitySpawn)
+                    | Some(state::IoMappingRedrive::AdHocCallActivitySpawn { .. }) => false,
+                    Some(_) => true,
+                    // Legacy/no-redrive ioMapping incidents replay activation.
+                    None => inc.kind == state::IncidentKind::IoMapping,
+                }
         })
     }
 }
