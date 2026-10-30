@@ -2662,7 +2662,12 @@ impl Journal {
                             .to_string()),
                         None => Ok(None),
                     },
-                    None => Ok(None),
+                    // No legacy tier to check: an empty var store cannot prove
+                    // a lean-over-legacy placeholder's payload is gone — fail
+                    // closed (Copilot review on #1387).
+                    None => Err("var store has no row and no legacy spill tier is wired \
+                                 to rule out an unmigrated legacy row"
+                        .to_string()),
                 },
             };
         }
@@ -4163,6 +4168,30 @@ mod tests {
         assert!(rebooted.try_engine_snapshot_quarantining().is_none());
         assert!(rebooted.reconcile_offheap_orphans().is_empty());
         assert!(rebooted.engine.is_variables_spilled(keys[0]));
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(vpath.parent().unwrap());
+    }
+
+    // Copilot review on #1387: lean mode over a legacy placeholder snapshot
+    // with the legacy tier unwired — an empty var store proves nothing.
+    #[test]
+    fn lean_with_unwired_legacy_tier_is_not_quarantined() {
+        let path = restart_store_path("orphan-lean-unwired");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let vpath = restart_store_path("orphan-lean-unwired-vs");
+        let mut rebooted = Journal::in_memory();
+        rebooted.restore_engine_from_snapshot(legacy);
+        let varstore = Arc::new(crate::varstore::VarStore::open(Some(&vpath)).unwrap());
+        rebooted.set_varstore(varstore);
+
+        assert!(rebooted.try_engine_snapshot_quarantining().is_none());
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.engine.is_variables_spilled(keys[0]));
+        assert!(rebooted.quarantined_orphans().is_empty());
 
         drop(rebooted);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
