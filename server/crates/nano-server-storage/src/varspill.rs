@@ -367,6 +367,14 @@ impl ForgetFaultInjection {
 }
 
 /// A SQLite-backed key → variables map for spilled instance payloads.
+/// Decodes a stored JSON row, surfacing a malformed row as a typed error (an
+/// *unreadable* row, not an absent one — #1383).
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(json: &str) -> rusqlite::Result<T> {
+    serde_json::from_str(json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
 pub struct VarSpillStore {
     conn: Arc<Mutex<Connection>>,
     /// Mutation counter shared by [`put`](Self::put) / [`take`](Self::take) /
@@ -798,10 +806,19 @@ impl VarSpillStore {
     /// Used to fold spilled payloads into a self-contained snapshot (#1331): the
     /// live instance stays spilled, so its row must survive the read.
     pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
+        self.try_get(key).ok().flatten()
+    }
+
+    /// The fallible form of [`get`](Self::get) that keeps the two failure modes
+    /// apart (#1383): `Ok(None)` is a **definitive absence** (the store read fine
+    /// and holds no row for `key`; retrying can never succeed), while `Err` is a
+    /// **transient/unreadable** failure (SQLite/IO error or an undecodable row),
+    /// where a fail-closed caller must retry rather than proceed.
+    pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<HashMap<String, Value>>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
+        let json = Self::try_select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
         drop(conn);
-        serde_json::from_str(&json).ok()
+        json.map(|j| decode(&j)).transpose()
     }
 
     /// Removes and returns the payload for `key`, or `None` if absent. A spilled
@@ -818,9 +835,14 @@ impl VarSpillStore {
 
     /// The single-column text row for `key` under `sql`, or `None` if absent.
     fn select(conn: &Connection, sql: &str, key: Key) -> Option<String> {
+        Self::try_select(conn, sql, key).ok()?
+    }
+
+    /// The fallible form of [`select`](Self::select): `Ok(None)` when the row is
+    /// absent, `Err` when the query itself fails.
+    fn try_select(conn: &Connection, sql: &str, key: Key) -> rusqlite::Result<Option<String>> {
         conn.query_row(sql, params![key as i64], |r| r.get(0))
             .optional()
-            .ok()?
     }
 
     /// Persists a whole-instance cold [`InstanceSnapshot`] under `key`, replacing
@@ -844,10 +866,17 @@ impl VarSpillStore {
     /// absent. Used to fold a still-cold instance into a self-contained snapshot
     /// (#1331) while it stays off-heap.
     pub fn get_cold(&self, key: Key) -> Option<InstanceSnapshot> {
+        self.try_get_cold(key).ok().flatten()
+    }
+
+    /// The fallible form of [`get_cold`](Self::get_cold): `Ok(None)` for a
+    /// definitive absence, `Err` for an unreadable store/row (see
+    /// [`try_get`](Self::try_get), #1383).
+    pub fn try_get_cold(&self, key: Key) -> rusqlite::Result<Option<InstanceSnapshot>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
+        let json = Self::try_select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         drop(conn);
-        serde_json::from_str(&json).ok()
+        json.map(|j| decode(&j)).transpose()
     }
 
     /// Removes and returns the cold snapshot for `key`, or `None` if absent.

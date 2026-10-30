@@ -23566,6 +23566,14 @@ fn debug_rest_enabled() -> bool {
 /// Whether per-partition Raft replication is enabled (env `NANOBPMN_RAFT`). Off
 /// by default, so the classic single-writer path is byte-identical and carries
 /// zero Raft overhead unless a deployer explicitly opts in.
+/// Whether boot-time off-heap orphan reconciliation (#1383) may run. It is a
+/// purely local state mutation, so it is confined to non-Raft startup: under
+/// Raft, an unresolved spilled orphan must stay flagged so strict capture fails
+/// closed instead of publishing incomplete state.
+fn boot_offheap_reconcile_allowed(raft: bool) -> bool {
+    !raft
+}
+
 fn raft_enabled() -> bool {
     std::env::var("NANOBPMN_RAFT")
         .map(|v| {
@@ -24670,6 +24678,24 @@ async fn main() {
             }
             if evicted > 0 {
                 tracing::info!("evicted {evicted} completed instance(s) from hot state");
+            }
+
+            // Boot-time off-heap reconciliation (#1383): quarantine any recovered
+            // variable-spilled instance whose spill row is definitively missing
+            // (e.g. carried over from a pre-#1331 snapshot), so the loss surfaces
+            // at upgrade time in one summary line instead of silently blocking
+            // snapshots. Each journal logs its own summary.
+            //
+            // Never under Raft: clearing `variables_spilled` locally before Raft
+            // bootstrap would bypass strict capture's missing-row check and let
+            // Raft publish (and purge logs behind) incomplete state without a
+            // replicated transition recording the loss (Copilot review on #1387).
+            if boot_offheap_reconcile_allowed(raft_enabled()) {
+                for handle in server.engine.all() {
+                    handle
+                        .with(|journal| journal.reconcile_offheap_orphans())
+                        .await;
+                }
             }
 
             if recovered {
@@ -33408,6 +33434,13 @@ mod clustered_startup_tests {
 
         part0.raft.shutdown().await.expect("clean shutdown node 0");
         part1.raft.shutdown().await.expect("clean shutdown node 1");
+    }
+
+    #[test]
+    fn boot_offheap_reconcile_is_disabled_under_raft() {
+        // #1387: Raft startup must leave unresolved spilled orphans flagged.
+        assert!(!boot_offheap_reconcile_allowed(true));
+        assert!(boot_offheap_reconcile_allowed(false));
     }
 
     #[tokio::test]
