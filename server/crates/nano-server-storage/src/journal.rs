@@ -154,6 +154,16 @@ impl Commit {
     }
 }
 
+/// How a snapshot fold treats an off-heap row that is **definitively absent**
+/// from a wired, readable store (#1383). Unreadable stores always fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanPolicy {
+    /// Fail the capture (Raft: the snapshot is replicated and purges the log).
+    Strict,
+    /// Quarantine the orphan and proceed (local journal rotation only).
+    Quarantine,
+}
+
 /// The engine plus its durable event log.
 pub struct Journal {
     engine: Engine,
@@ -2369,7 +2379,7 @@ impl Journal {
         let mut snap = self.engine.snapshot();
         // Best-effort (see the doc above): a failed fold is logged and left
         // as-is; durable recovery points use `try_engine_snapshot` instead.
-        let _ = self.fold_offheap_into(&mut snap);
+        let _ = self.fold_offheap_into(&mut snap, OrphanPolicy::Strict);
         snap
     }
 
@@ -2385,9 +2395,28 @@ impl Journal {
     /// not read (a transient SQLite/read/deserialization failure turned into
     /// durable data loss). Returning `None` aborts the rotation before the seal,
     /// so no segment becomes eligible for compaction and the next tick retries.
+    ///
+    /// **Strict** (Copilot review on #1387): a definitively absent row also
+    /// fails the capture here. This is the Raft snapshot builder's capture
+    /// (`get_snapshot_builder`): a Raft snapshot lets openraft purge the covered
+    /// log and is shipped to peers, so a replica-local cache miss must never be
+    /// turned into replicated state loss without a replicated transition
+    /// recording it. Only the local journal rotation tolerates orphans — see
+    /// [`try_engine_snapshot_quarantining`](Journal::try_engine_snapshot_quarantining).
     pub fn try_engine_snapshot(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
         let mut snap = self.engine.snapshot();
-        self.fold_offheap_into(&mut snap)?;
+        self.fold_offheap_into(&mut snap, OrphanPolicy::Strict)?;
+        Some(snap)
+    }
+
+    /// The local-journal-rotation capture (#1383): like
+    /// [`try_engine_snapshot`](Journal::try_engine_snapshot), fail-closed on an
+    /// *unreadable* store, but a row that is **definitively absent** from a
+    /// readable, wired store is quarantined (logged once, see `note_orphan`) so a
+    /// permanently lost payload cannot block local snapshots + compaction forever.
+    pub fn try_engine_snapshot_quarantining(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        let mut snap = self.engine.snapshot();
+        self.fold_offheap_into(&mut snap, OrphanPolicy::Quarantine)?;
         Some(snap)
     }
 
@@ -2400,12 +2429,16 @@ impl Journal {
     /// store is instead quarantined (#1383, see `note_orphan`). The `engine_snapshot` wrapper ignores the `None` (a
     /// payload that cannot be found is logged as an error and left as-is rather
     /// than silently serialized as an empty map); `try_engine_snapshot` honours it.
-    fn fold_offheap_into(&self, snap: &mut nanobpmn_engine_core::EngineSnapshot) -> Option<()> {
+    fn fold_offheap_into(
+        &self,
+        snap: &mut nanobpmn_engine_core::EngineSnapshot,
+        policy: OrphanPolicy,
+    ) -> Option<()> {
         // Cold rows carry their variables inline (a variable-spilled instance is
         // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
         // fold keeps them as-is; the loop below only resolves *resident*
         // variable-spilled instances.
-        self.fold_cold_into(&mut snap.state)?;
+        self.fold_cold_into(&mut snap.state, policy)?;
         for instance in snap.state.instances.values_mut() {
             if !instance.variables_spilled {
                 continue;
@@ -2418,17 +2451,28 @@ impl Journal {
                 // Definitive absence (#1383): the store read fine and has no row,
                 // so retrying can never succeed. The variables are already lost;
                 // blocking the snapshot would only stall compaction for every
-                // other instance forever. Quarantine: snapshot the instance with
-                // an empty (no longer "spilled") variable set and proceed.
-                Ok(None) => {
+                // other instance forever. Quarantine: clear the spilled flag and
+                // KEEP the resident map — a legacy spilled instance may already
+                // hold values merged in from journal-tail variable updates, and
+                // those survive (Copilot review on #1387). Strict captures (Raft)
+                // fail closed instead.
+                Ok(None) if policy == OrphanPolicy::Quarantine => {
                     self.note_orphan(
                         instance.key,
                         "snapshot: spilled instance has no variable row in the spill store; \
-                         its variables are lost — quarantined (snapshotted with empty \
-                         variables) so snapshots and compaction are not blocked",
+                         its spilled variables are lost — quarantined (snapshotted with its \
+                         surviving resident variables) so snapshots and compaction are not \
+                         blocked",
                     );
-                    instance.variables = Arc::new(HashMap::new());
                     instance.variables_spilled = false;
+                }
+                Ok(None) => {
+                    tracing::error!(
+                        instance_key = instance.key,
+                        "snapshot (strict): spilled instance has no variable row; aborting \
+                         this snapshot"
+                    );
+                    return None;
                 }
                 // Unreadable (SQLite/IO/decode): possibly transient — fail closed
                 // so the rotation aborts before the seal and the next tick retries.
@@ -2493,8 +2537,16 @@ impl Journal {
         let mut orphans = Vec::new();
         for key in spilled {
             if matches!(self.peek_spilled_variables(key), Ok(None)) {
-                self.engine
-                    .rehydrate_variables(key, Arc::new(HashMap::new()));
+                // Keep the resident map (it may hold journal-tail updates merged
+                // in after the legacy snapshot) — only the spilled flag clears.
+                let current = self
+                    .engine
+                    .state()
+                    .instances
+                    .get(&key)
+                    .map(|i| Arc::clone(&i.variables))
+                    .unwrap_or_default();
+                self.engine.rehydrate_variables(key, current);
                 self.quarantined
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -2508,8 +2560,8 @@ impl Journal {
                 count = orphans.len(),
                 instance_keys = ?orphans,
                 "boot reconciliation: quarantined spilled instance(s) whose variable row \
-                 is missing from the spill store; their variables are lost and they now \
-                 carry an empty variable set"
+                 is missing from the spill store; their spilled variables are lost and \
+                 they keep only their surviving resident variables"
             );
         }
         orphans
@@ -2532,7 +2584,11 @@ impl Journal {
     /// variable-spilled instance is never cold-shed —
     /// [`Engine::snapshot_instance`] refuses it), so the returned payloads are
     /// authoritative.
-    fn fold_cold_into(&self, state: &mut nanobpmn_engine_core::State) -> Option<VarUpsertDelta> {
+    fn fold_cold_into(
+        &self,
+        state: &mut nanobpmn_engine_core::State,
+        policy: OrphanPolicy,
+    ) -> Option<VarUpsertDelta> {
         let mut folded = Vec::new();
         // No cold tier configured is not a failure — nothing to fold, so succeed
         // with an empty delta. Only an indexed cold row that will not read fails
@@ -2551,11 +2607,18 @@ impl Journal {
                 // Definitive absence (#1383): the whole instance is already lost
                 // and can never be folded in; quarantine it (log once) rather
                 // than block every future snapshot and all compaction.
-                Ok(None) => self.note_orphan(
+                Ok(None) if policy == OrphanPolicy::Quarantine => self.note_orphan(
                     key,
                     "snapshot: cold instance has no row in the spill store; it is lost \
                      — quarantined (omitted) so snapshots and compaction are not blocked",
                 ),
+                Ok(None) => {
+                    tracing::error!(
+                        instance_key = key,
+                        "snapshot (strict): cold instance has no row; aborting this snapshot"
+                    );
+                    return None;
+                }
                 // Unreadable: possibly transient — fail closed and retry.
                 Err(err) => {
                     tracing::error!(
@@ -2574,21 +2637,38 @@ impl Journal {
     /// Reads a spilled instance's variables without consuming them: from the
     /// authoritative var store in lean mode, else from the spill cache.
     ///
-    /// `Ok(None)` is a definitive absence (readable store, no row — or no spill
-    /// store wired at all, so the payload can never be found); `Err` is an
-    /// unreadable store/row (#1383).
-    fn peek_spilled_variables(&self, key: Key) -> rusqlite::Result<Option<HashMap<String, Value>>> {
-        if let Some(vstore) = self.varstore.as_ref() {
-            return vstore.try_get(key);
-        }
-        match self
+    /// `Ok(None)` is a definitive absence — **only** a successful lookup in a
+    /// wired, readable store establishes it. `Err` covers an unreadable
+    /// store/row (#1383), **no store wired at all** (startup may continue
+    /// without the spill tier, so an unwired store proves nothing about the row
+    /// on disk), and a lean-mode miss whose legacy spill row still exists (a
+    /// lean-over-legacy transition that has not migrated it yet) — all of which
+    /// must fail closed rather than be quarantined (Copilot review on #1387).
+    fn peek_spilled_variables(&self, key: Key) -> Result<Option<HashMap<String, Value>>, String> {
+        let legacy = self
             .spill
             .as_ref()
             .map(|vs| &vs.store)
-            .or(self.cold.as_ref().map(|c| &c.store))
-        {
-            Some(store) => store.try_get(key),
-            None => Ok(None),
+            .or(self.cold.as_ref().map(|c| &c.store));
+        if let Some(vstore) = self.varstore.as_ref() {
+            return match vstore.try_get(key).map_err(|e| e.to_string())? {
+                Some(vars) => Ok(Some(vars)),
+                // Don't restore the (possibly stale) legacy row; just refuse to
+                // call the payload lost while it still exists.
+                None => match legacy {
+                    Some(store) => match store.try_get(key).map_err(|e| e.to_string())? {
+                        Some(_) => Err("var store has no row but a legacy spill row exists \
+                                        (unmigrated lean-over-legacy state)"
+                            .to_string()),
+                        None => Ok(None),
+                    },
+                    None => Ok(None),
+                },
+            };
+        }
+        match legacy {
+            Some(store) => store.try_get(key).map_err(|e| e.to_string()),
+            None => Err("no spill store wired; cannot establish row absence".to_string()),
         }
     }
 
@@ -2627,7 +2707,7 @@ impl Journal {
         // off-heap payload could not be folded in, so an incomplete snapshot is
         // never sealed/written and its covered prefix never becomes eligible for
         // compaction — the caller skips this tick and retries.
-        let snap = self.try_engine_snapshot()?;
+        let snap = self.try_engine_snapshot_quarantining()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
             return None;
@@ -2708,7 +2788,7 @@ impl Journal {
         &self,
     ) -> Option<(nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta)> {
         let mut snap = self.engine.snapshot_control_only();
-        let cold_upserts = self.fold_cold_into(&mut snap.state)?;
+        let cold_upserts = self.fold_cold_into(&mut snap.state, OrphanPolicy::Quarantine)?;
         for (key, _) in &cold_upserts {
             if let Some(inst) = snap.state.instances.get_mut(key)
                 && !inst.variables.is_empty()
@@ -3839,9 +3919,14 @@ mod tests {
         let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
         store.forget(&[keys[0]]).unwrap();
 
+        assert!(
+            journal.try_engine_snapshot().is_none(),
+            "the strict (Raft) capture must not publish a replica-local orphan"
+        );
+        assert!(journal.quarantined_orphans().is_empty());
         let snap = journal
-            .try_engine_snapshot()
-            .expect("a definitive orphan must not block the snapshot");
+            .try_engine_snapshot_quarantining()
+            .expect("a definitive orphan must not block the local rotation");
         let orphan = &snap.state.instances[&keys[0]];
         assert!(
             !orphan.variables_spilled,
@@ -3858,7 +3943,7 @@ mod tests {
         );
         assert_eq!(journal.quarantined_orphans(), vec![keys[0]]);
         // Repeated ticks keep succeeding (no retry-forever).
-        assert!(journal.try_engine_snapshot().is_some());
+        assert!(journal.try_engine_snapshot_quarantining().is_some());
 
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
@@ -3903,7 +3988,7 @@ mod tests {
         let new_path = restart_store_path("orphan-boot-new");
         let mut rebooted = reboot_from(&new_path, legacy);
         assert!(
-            rebooted.try_engine_snapshot().is_some(),
+            rebooted.try_engine_snapshot_quarantining().is_some(),
             "orphans must not block the snapshot even before reconciliation"
         );
 
@@ -3959,8 +4044,12 @@ mod tests {
             .forget(&[key])
             .unwrap();
 
+        assert!(
+            journal.try_engine_snapshot().is_none(),
+            "the strict (Raft) capture must not omit a replica-local cold orphan"
+        );
         let snap = journal
-            .try_engine_snapshot()
+            .try_engine_snapshot_quarantining()
             .expect("classic snapshot proceeds past a definitive cold orphan");
         assert!(!snap.state.instances.contains_key(&key));
         assert!(
@@ -3995,5 +4084,88 @@ mod tests {
         );
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review on #1387: a legacy spilled instance whose resident map
+    // already holds journal-tail variable updates must KEEP them when the
+    // orphan is quarantined — both in the rotation fold and at boot.
+    #[test]
+    fn quarantine_preserves_surviving_resident_variables() {
+        use nanobpmn_engine_core::Value;
+
+        let old_path = restart_store_path("orphan-tail-old");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let mut legacy = journal.engine.snapshot();
+        drop(journal);
+        let key = keys[0];
+        let inst = legacy.state.instances.get_mut(&key).unwrap();
+        assert!(inst.variables_spilled);
+        let mut tail = HashMap::new();
+        tail.insert("late".to_string(), Value::Str("tail-update".to_string()));
+        inst.variables = Arc::new(tail);
+
+        let new_path = restart_store_path("orphan-tail-new");
+        let mut rebooted = reboot_from(&new_path, legacy);
+        let snap = rebooted.try_engine_snapshot_quarantining().unwrap();
+        assert_eq!(
+            snap.state.instances[&key].variables.get("late"),
+            Some(&Value::Str("tail-update".to_string())),
+            "rotation fold keeps surviving resident variables"
+        );
+        assert_eq!(rebooted.reconcile_offheap_orphans(), vec![key]);
+        assert_eq!(
+            rebooted.engine.state().instances[&key]
+                .variables
+                .get("late"),
+            Some(&Value::Str("tail-update".to_string())),
+            "boot reconciliation keeps surviving resident variables"
+        );
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+    }
+
+    // Copilot review on #1387: with NO spill store wired, absence cannot be
+    // proven — neither the fold nor boot reconciliation may quarantine.
+    #[test]
+    fn unwired_spill_store_is_not_proof_of_absence() {
+        let path = restart_store_path("orphan-unwired");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let mut rebooted = Journal::in_memory();
+        rebooted.restore_engine_from_snapshot(legacy);
+
+        assert!(rebooted.try_engine_snapshot_quarantining().is_none());
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.engine.is_variables_spilled(keys[0]));
+        assert!(rebooted.quarantined_orphans().is_empty());
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review on #1387: lean mode enabled over a legacy spilled
+    // snapshot — the new var store misses but the legacy spill row survives.
+    // That is not an orphan: fail closed, never clear the flag.
+    #[test]
+    fn lean_over_legacy_spill_row_is_not_quarantined() {
+        let path = restart_store_path("orphan-lean-legacy");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let vpath = restart_store_path("orphan-lean-legacy-vs");
+        let mut rebooted = reboot_from(&path, legacy);
+        let varstore = Arc::new(crate::varstore::VarStore::open(Some(&vpath)).unwrap());
+        rebooted.set_varstore(varstore);
+
+        assert!(rebooted.try_engine_snapshot_quarantining().is_none());
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.engine.is_variables_spilled(keys[0]));
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(vpath.parent().unwrap());
     }
 }
