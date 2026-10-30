@@ -24672,6 +24672,17 @@ async fn main() {
                 tracing::info!("evicted {evicted} completed instance(s) from hot state");
             }
 
+            // Boot-time off-heap reconciliation (#1383): quarantine any recovered
+            // variable-spilled instance whose spill row is definitively missing
+            // (e.g. carried over from a pre-#1331 snapshot), so the loss surfaces
+            // at upgrade time in one summary line instead of silently blocking
+            // snapshots. Each journal logs its own summary.
+            for handle in server.engine.all() {
+                handle
+                    .with(|journal| journal.reconcile_offheap_orphans())
+                    .await;
+            }
+
             if recovered {
                 tracing::info!(
                     "recovered engine state by replaying journal at {}",

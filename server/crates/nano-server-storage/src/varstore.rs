@@ -191,6 +191,12 @@ impl VarStore {
     /// instance on job activation must leave the durable row in place for the next
     /// recovery. `None` if the instance is absent.
     pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
+        self.try_get(key).ok().flatten()
+    }
+
+    /// The fallible form of [`get`](Self::get) (#1383): `Ok(None)` is a
+    /// definitive absence (no row), `Err` an unreadable store or row.
+    pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<HashMap<String, Value>>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json: Option<String> = conn
             .query_row(
@@ -198,9 +204,9 @@ impl VarStore {
                 params![key as i64],
                 |r| r.get(0),
             )
-            .optional()
-            .ok()?;
-        serde_json::from_str(&json?).ok()
+            .optional()?;
+        drop(conn);
+        json.map(|j| crate::varspill::decode(&j)).transpose()
     }
 
     /// The last checkpointed event position for `partition` (0 if never
