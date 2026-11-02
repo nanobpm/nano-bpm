@@ -802,15 +802,10 @@ impl VarSpillStore {
         Ok(())
     }
 
-    /// Returns the payload for `key` **without removing it**, or `None` if absent.
-    /// Used to fold spilled payloads into a self-contained snapshot (#1331): the
-    /// live instance stays spilled, so its row must survive the read.
-    pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
-        self.try_get(key).ok().flatten()
-    }
-
-    /// The fallible form of [`get`](Self::get) that keeps the two failure modes
-    /// apart (#1383): `Ok(None)` is a **definitive absence** (the store read fine
+    /// Returns the payload for `key` **without removing it** (used to fold
+    /// spilled payloads into a self-contained snapshot, #1331, and to rehydrate
+    /// an activated job's variables before the row is forgotten, #1388). Keeps
+    /// the two failure modes apart (#1383): `Ok(None)` is a **definitive absence** (the store read fine
     /// and holds no row for `key`; retrying can never succeed), while `Err` is a
     /// **transient/unreadable** failure (SQLite/IO error or an undecodable row),
     /// where a fail-closed caller must retry rather than proceed.
@@ -821,25 +816,10 @@ impl VarSpillStore {
         json.map(|j| decode(&j)).transpose()
     }
 
-    /// Removes and returns the payload for `key`, or `None` if absent. A spilled
-    /// instance is rehydrated exactly once (on activation), so taking the row on
-    /// read keeps the store bounded to the still-cold backlog.
-    pub fn take(&self, key: Key) -> Option<HashMap<String, Value>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let json = Self::select(&conn, "SELECT vars FROM spill WHERE key = ?1", key)?;
-        let _ = conn.execute("DELETE FROM spill WHERE key = ?1", params![key as i64]);
-        drop(conn);
-        self.note_activity();
-        serde_json::from_str(&json).ok()
-    }
-
-    /// The single-column text row for `key` under `sql`, or `None` if absent.
-    fn select(conn: &Connection, sql: &str, key: Key) -> Option<String> {
-        Self::try_select(conn, sql, key).ok()?
-    }
-
-    /// The fallible form of [`select`](Self::select): `Ok(None)` when the row is
-    /// absent, `Err` when the query itself fails.
+    /// The single-column text row for `key` under `sql`: `Ok(None)` when the row
+    /// is absent, `Err` when the query itself fails. There is deliberately no
+    /// infallible variant (#1388): folding an `Err` into "absent" is how an
+    /// unreadable row used to be destroyed or an instance silently dropped.
     fn try_select(conn: &Connection, sql: &str, key: Key) -> rusqlite::Result<Option<String>> {
         conn.query_row(sql, params![key as i64], |r| r.get(0))
             .optional()
@@ -862,34 +842,16 @@ impl VarSpillStore {
         Ok(())
     }
 
-    /// Returns the cold snapshot for `key` **without removing it**, or `None` if
-    /// absent. Used to fold a still-cold instance into a self-contained snapshot
-    /// (#1331) while it stays off-heap.
-    pub fn get_cold(&self, key: Key) -> Option<InstanceSnapshot> {
-        self.try_get_cold(key).ok().flatten()
-    }
-
-    /// The fallible form of [`get_cold`](Self::get_cold): `Ok(None)` for a
-    /// definitive absence, `Err` for an unreadable store/row (see
-    /// [`try_get`](Self::try_get), #1383).
+    /// Returns the cold snapshot for `key` **without removing it**: `Ok(None)`
+    /// for a definitive absence, `Err` for an unreadable store/row (see
+    /// [`try_get`](Self::try_get), #1383). Rehydration reads with this, restores
+    /// the instance into the engine, and only then [`forget`](Self::forget)s the
+    /// row (#1388) — the row is never deleted before its contents are safe.
     pub fn try_get_cold(&self, key: Key) -> rusqlite::Result<Option<InstanceSnapshot>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json = Self::try_select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
         drop(conn);
         json.map(|j| decode(&j)).transpose()
-    }
-
-    /// Removes and returns the cold snapshot for `key`, or `None` if absent.
-    /// Destructive on read (like [`take`](VarSpillStore::take)): rehydrating an
-    /// instance takes its snapshot back out, so the cold table holds only the
-    /// still-dormant backlog.
-    pub fn take_cold(&self, key: Key) -> Option<InstanceSnapshot> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let json = Self::select(&conn, "SELECT snapshot FROM cold WHERE key = ?1", key)?;
-        let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
-        drop(conn);
-        self.note_activity();
-        serde_json::from_str(&json).ok()
     }
 
     /// Drops any spilled variable and cold-snapshot rows for `keys`, in one
@@ -1093,7 +1055,7 @@ mod tests {
     fn round_trips_a_payload() {
         let store = VarSpillStore::open(None).unwrap();
         store.put(7, &vars("hello")).unwrap();
-        let got = store.take(7).expect("payload present");
+        let got = store.try_get(7).unwrap().expect("payload present");
         assert_eq!(got.get("data"), Some(&Value::Str("hello".to_string())));
     }
 
@@ -1124,19 +1086,19 @@ mod tests {
 
         // Every public path must still work — no panics.
         store.put(2, &vars("after-poison")).unwrap();
-        assert_eq!(store.get(1), Some(vars("before-poison")));
-        assert_eq!(store.take(2), Some(vars("after-poison")));
+        assert_eq!(store.try_get(1).unwrap(), Some(vars("before-poison")));
+        assert_eq!(store.try_get(2).unwrap(), Some(vars("after-poison")));
         let snapshot = cold_snapshot(3, "cold");
         store.put_cold(3, &snapshot).unwrap();
-        assert_eq!(store.get_cold(3), Some(snapshot.clone()));
-        assert_eq!(store.take_cold(3), Some(snapshot));
+        assert_eq!(store.try_get_cold(3).unwrap(), Some(snapshot.clone()));
+        assert_eq!(store.try_get_cold(3).unwrap(), Some(snapshot));
         let (file_bytes, live_bytes) = store.db_page_stats();
         assert!(
             live_bytes > 0,
             "stats still read: ({file_bytes}, {live_bytes})"
         );
         store.forget(&[1]).unwrap();
-        assert!(store.get(1).is_none(), "forget still deletes");
+        assert!(store.try_get(1).unwrap().is_none(), "forget still deletes");
     }
 
     /// Epic #1357 / #1366 failure-injection guard: on a **file-backed** store the
@@ -1188,15 +1150,15 @@ mod tests {
             "forget worker survived the poison and drained its queue"
         );
         assert!(
-            store.get(1).is_none(),
+            store.try_get(1).unwrap().is_none(),
             "the async forget still deleted key 1 through the recovered lock"
         );
 
         // Foreground writes keep working through the recovered (still-poisoned)
         // lock, so the store stays available end to end.
         store.put(3, &vars("c")).unwrap();
-        assert_eq!(store.get(2), Some(vars("b")));
-        assert_eq!(store.get(3), Some(vars("c")));
+        assert_eq!(store.try_get(2).unwrap(), Some(vars("b")));
+        assert_eq!(store.try_get(3).unwrap(), Some(vars("c")));
 
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1301,10 +1263,14 @@ mod tests {
             .unwrap();
         }
         store.put(3, &vars("c")).unwrap();
-        assert_eq!(store.get(3), Some(vars("c")), "key 3 reinserted");
+        assert_eq!(
+            store.try_get(3).unwrap(),
+            Some(vars("c")),
+            "key 3 reinserted"
+        );
         store.forget_async(&[3]);
         assert!(
-            store.get(3).is_none(),
+            store.try_get(3).unwrap().is_none(),
             "post-fault forget_async falls back to a synchronous delete"
         );
 
@@ -1534,21 +1500,30 @@ mod tests {
             store.put(1, &vars).unwrap();
         }
         let store = VarSpillStore::open(Some(&path)).unwrap();
-        assert_eq!(store.get(1), Some(vars.clone()), "row survives re-open");
-        assert_eq!(store.get(1), Some(vars.clone()), "get does not consume");
-        assert_eq!(store.take(1), Some(vars), "take still returns it");
-        assert!(store.get(1).is_none(), "take consumed it");
+        assert_eq!(
+            store.try_get(1).unwrap(),
+            Some(vars.clone()),
+            "row survives re-open"
+        );
+        assert_eq!(
+            store.try_get(1).unwrap(),
+            Some(vars.clone()),
+            "get does not consume"
+        );
+        assert_eq!(store.try_get(1).unwrap(), Some(vars), "still returned");
+        store.forget(&[1]).unwrap();
+        assert!(store.try_get(1).unwrap().is_none(), "forget removes it");
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn take_is_destructive_and_absent_is_none() {
+    fn reads_are_non_destructive_and_absent_is_ok_none() {
         let store = VarSpillStore::open(None).unwrap();
         store.put(1, &vars("x")).unwrap();
-        assert!(store.take(1).is_some());
-        assert!(store.take(1).is_none(), "second take sees nothing");
-        assert!(store.take(999).is_none(), "absent key is None");
+        assert!(store.try_get(1).unwrap().is_some());
+        assert!(store.try_get(1).unwrap().is_some(), "a read never consumes");
+        assert!(store.try_get(999).unwrap().is_none(), "absent key is None");
     }
 
     fn cold_snapshot(key: Key, payload: &str) -> InstanceSnapshot {
@@ -1598,10 +1573,16 @@ mod tests {
         let store = VarSpillStore::open(None).unwrap();
         let snapshot = cold_snapshot(42, "payload");
         store.put_cold(42, &snapshot).unwrap();
-        let got = store.take_cold(42).expect("snapshot present");
+        let got = store.try_get_cold(42).unwrap().expect("snapshot present");
         assert_eq!(got, snapshot);
-        assert!(store.take_cold(42).is_none(), "take_cold is destructive");
-        assert!(store.take_cold(7).is_none(), "absent key is None");
+        assert!(
+            store.try_get_cold(42).unwrap().is_some(),
+            "read is non-destructive"
+        );
+        assert!(
+            store.try_get_cold(7).unwrap().is_none(),
+            "absent key is None"
+        );
     }
 
     // #1331: the new cold-read contract — a cold row must survive a process
@@ -1628,23 +1609,54 @@ mod tests {
         }
         let store = VarSpillStore::open(Some(&path)).unwrap();
         assert_eq!(
-            store.get_cold(9),
+            store.try_get_cold(9).unwrap(),
             Some(snapshot.clone()),
             "cold row survives re-open"
         );
         assert_eq!(
-            store.get_cold(9),
+            store.try_get_cold(9).unwrap(),
             Some(snapshot.clone()),
             "get_cold does not consume the row"
         );
         assert_eq!(
-            store.take_cold(9),
+            store.try_get_cold(9).unwrap(),
             Some(snapshot),
-            "take_cold still returns it"
+            "still returned"
         );
-        assert!(store.get_cold(9).is_none(), "take_cold consumed it");
+        store.forget(&[9]).unwrap();
+        assert!(
+            store.try_get_cold(9).unwrap().is_none(),
+            "forget removes it"
+        );
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // #1388: an undecodable row is `Err` (unreadable), never `Ok(None)`, and a
+    // read never deletes it — on both tiers.
+    #[test]
+    fn undecodable_rows_are_err_and_survive_the_read() {
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(1, &vars("x")).unwrap();
+        store.put_cold(2, &cold_snapshot(2, "y")).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE spill SET vars = 'nope{' WHERE key = 1", [])
+                .unwrap();
+            conn.execute("UPDATE cold SET snapshot = 'nope{' WHERE key = 2", [])
+                .unwrap();
+        }
+        assert!(store.try_get(1).is_err());
+        assert!(store.try_get_cold(2).is_err());
+        let conn = store.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM spill) + (SELECT COUNT(*) FROM cold)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "unreadable rows are never deleted by a read");
     }
 
     #[test]
@@ -1658,14 +1670,26 @@ mod tests {
         // no-op, and an untouched key (3) survives.
         store.forget(&[1, 2, 99]).unwrap();
 
-        assert!(store.take(1).is_none(), "forgotten spill row gone");
-        assert!(store.take(2).is_none(), "forgotten spill row gone");
-        assert!(store.take(3).is_some(), "untouched spill row survives");
+        assert!(
+            store.try_get(1).unwrap().is_none(),
+            "forgotten spill row gone"
+        );
+        assert!(
+            store.try_get(2).unwrap().is_none(),
+            "forgotten spill row gone"
+        );
+        assert!(
+            store.try_get(3).unwrap().is_some(),
+            "untouched spill row survives"
+        );
 
         // forget also clears the cold tier for the same key.
         store.put(4, &vars("d")).unwrap();
         store.forget(&[4]).unwrap();
-        assert!(store.take(4).is_none(), "forget clears spill tier for key");
+        assert!(
+            store.try_get(4).unwrap().is_none(),
+            "forget clears spill tier for key"
+        );
 
         // Empty slice is a cheap no-op.
         store.forget(&[]).unwrap();
@@ -1765,14 +1789,17 @@ mod tests {
         assert!(store.flush_forgets(), "forget worker flushed");
 
         assert!(
-            store.take(1).is_none(),
+            store.try_get(1).unwrap().is_none(),
             "async-forgotten row gone after flush"
         );
         assert!(
-            store.take(2).is_none(),
+            store.try_get(2).unwrap().is_none(),
             "async-forgotten row gone after flush"
         );
-        assert!(store.take(3).is_some(), "untouched row survives");
+        assert!(
+            store.try_get(3).unwrap().is_some(),
+            "untouched row survives"
+        );
 
         // Empty slice is a cheap no-op (no message queued).
         store.forget_async(&[]);
@@ -1790,7 +1817,7 @@ mod tests {
         store.put(5, &vars("x")).unwrap();
         store.forget_async(&[5]);
         assert!(
-            store.take(5).is_none(),
+            store.try_get(5).unwrap().is_none(),
             "in-memory forget_async is synchronous"
         );
         // flush is a no-op when there is no worker.

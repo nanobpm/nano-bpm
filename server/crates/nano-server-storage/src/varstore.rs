@@ -186,16 +186,10 @@ impl VarStore {
         Ok(())
     }
 
-    /// Reads an instance's current variable map **non-destructively** (unlike the
-    /// spill cache's `take`): the store is authoritative, so rehydrating a spilled
-    /// instance on job activation must leave the durable row in place for the next
-    /// recovery. `None` if the instance is absent.
-    pub fn get(&self, key: Key) -> Option<HashMap<String, Value>> {
-        self.try_get(key).ok().flatten()
-    }
-
-    /// The fallible form of [`get`](Self::get) (#1383): `Ok(None)` is a
-    /// definitive absence (no row), `Err` an unreadable store or row.
+    /// Reads an instance's current variable map **non-destructively**: the store
+    /// is authoritative, so rehydrating a spilled instance must leave the durable
+    /// row in place. `Ok(None)` is a definitive absence (no row), `Err` an
+    /// unreadable store or row (#1383); there is no infallible form (#1388).
     pub fn try_get(&self, key: Key) -> rusqlite::Result<Option<HashMap<String, Value>>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let json: Option<String> = conn
@@ -342,7 +336,7 @@ mod tests {
 
         // Every public path must still work — no panics.
         store.put_current(2, &vars("after")).unwrap();
-        assert_eq!(store.get(2), Some(vars("after")));
+        assert_eq!(store.try_get(2).unwrap(), Some(vars("after")));
         store.checkpoint(0, 2, &[(3, &vars("c"))], &[1]).unwrap();
         assert_eq!(store.position(0), 2);
         let all = store.load_all();
@@ -449,7 +443,10 @@ mod tests {
         );
         assert_eq!(store.len(), 500, "all rows survive the checkpoint");
         assert_eq!(
-            store.get(499).and_then(|m| m.get("data").cloned()),
+            store
+                .try_get(499)
+                .unwrap()
+                .and_then(|m| m.get("data").cloned()),
             Some(Value::Str("payload-499".into()))
         );
         let _ = std::fs::remove_dir_all(&dir);
