@@ -140,6 +140,39 @@ test('the gap ratchet: a new cell cannot hide under a wildcard gap, and the base
   assert.deepEqual(shrinkGaps(assignments, ['element:Task', 'intent:Job:CREATED', 'intent:Job:GONE']), ['intent:Job:CREATED']);
 });
 
+test('a wildcard rule can never claim a per-site failure:/rejection: cell', () => {
+  const ids = ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR', 'rejection:JobProcessor.processRecord:NOT_FOUND'];
+  // A family wildcard is rejected for both per-site families…
+  const errors = check(ids, [{ match: 'failure:*', ...gap }, { match: 'rejection:*', ...gap }], []);
+  assert.match(errors[0], /per-site cell failure:BpmnJobBehavior\.evalTypeExp:EXTRACT_VALUE_ERROR is claimed by wildcard rule "failure:\*"/);
+  assert.match(errors[1], /per-site cell rejection:JobProcessor\.processRecord:NOT_FOUND is claimed by wildcard rule "rejection:\*"/);
+  // …and so is a partial wildcard that still matches a per-site cell.
+  const partial = check(['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR'], [{ match: 'failure:BpmnJobBehavior.*', ...gap }], []);
+  assert.match(partial[0], /claimed by wildcard rule "failure:BpmnJobBehavior\.\*"/);
+  // An exact, wildcard-free rule claims it cleanly (a baseline gap).
+  assert.deepEqual(
+    check(ids, [
+      { match: 'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR', ...gap },
+      { match: 'rejection:JobProcessor.processRecord:NOT_FOUND', ...gap },
+    ]),
+    [],
+  );
+});
+
+test('a new per-site site appearing on a pin bump fails the drift guard', () => {
+  // The surface gained a site the committed baseline does not list. Even though
+  // an exact gap rule claims it, the ratchet rejects it: it is a NEW gap.
+  const ids = ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR', 'failure:BpmnJobBehavior.evalRetriesExp:EXTRACT_VALUE_ERROR'];
+  const rules = ids.map((id) => ({ match: id, ...gap }));
+  const errors = check(ids, rules, ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR']);
+  assert.deepEqual(errors, [
+    'new gap cell: failure:BpmnJobBehavior.evalRetriesExp:EXTRACT_VALUE_ERROR is not in the gaps.json baseline; give it evidence or an out-of-scope rule',
+  ]);
+  // And a wildcard cannot smuggle it past the ratchet either.
+  const smuggled = check(ids, [{ match: 'failure:*', ...gap }], ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR']);
+  assert.ok(smuggled.some((e) => /claimed by wildcard rule/.test(e)));
+});
+
 test('globs treat only * as a wildcard', () => {
   assert.ok(globToRegExp('validation:V:*').test('validation:V:a-b'));
   assert.ok(!globToRegExp('guard:a.b').test('guard:aXb'));

@@ -33,6 +33,21 @@ export const STATUSES = ['parity', 'nano-tested', 'gap', 'out-of-scope'];
 export const CORPUS = 'engine-core/tests/conformance/corpus/';
 const RULE_KEYS = new Set(['match', 'status', 'evidence', 'issue', 'note']);
 
+/**
+ * Cell families that name a single Zeebe source site (`failure:<Class>.<method>:…`,
+ * `rejection:<Class>.<method>:…`). Because one site is one behaviour, a wildcard
+ * `match` must never claim a whole family of them at once — that would let one
+ * rule (or one piece of evidence) silently absorb dozens of distinct sites,
+ * exactly the drift the per-site cells exist to expose. These cells may only be
+ * claimed by an exact, wildcard-free rule.
+ */
+export const PER_SITE_FAMILIES = new Set(['failure', 'rejection']);
+
+/** True when `match` contains no `*` wildcard. */
+export function isExactMatch(match) {
+  return typeof match === 'string' && !match.includes('*');
+}
+
 /** `*` matches any run of characters; everything else is literal. */
 export function globToRegExp(glob) {
   const body = glob
@@ -158,9 +173,19 @@ export function evaluate(surface, coverage, fs, gaps, pin) {
   const claims = rules.map(() => []);
   const assignments = new Map();
   for (const { id } of surface.cells) {
+    const family = id.slice(0, id.indexOf(':'));
     const k = matchers.findIndex((m) => m !== null && m.test(id));
     if (k < 0) {
       errors.push(`unmapped cell: ${id}`);
+      continue;
+    }
+    // A per-site cell names one Zeebe source site; only an exact rule may claim
+    // it. If the first match is a wildcard, the cell is unclaimable as mapped.
+    if (PER_SITE_FAMILIES.has(family) && !isExactMatch(rules[k].match)) {
+      errors.push(
+        `per-site cell ${id} is claimed by wildcard rule ${JSON.stringify(rules[k].match)}: ` +
+          `${family}: cells need an exact (wildcard-free) match`,
+      );
       continue;
     }
     claims[k].push(id);

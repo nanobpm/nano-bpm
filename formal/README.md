@@ -451,7 +451,14 @@ Zeebe declares, one **cell** per behaviour, in `zeebe-surface.json`:
 | `incident:<ErrorType>` | incident type | `ErrorType` |
 | `intent:<Record>:<INTENT>` | record intent | every `*Intent` enum in `protocol/record/intent` |
 | `validation:<Validator>:<message>` | deploy-time rejection message | `addError` calls in the bpmn-model and engine deployment validators |
-| `rejection:<Class>:<RejectionType>` | command rejection a processing-layer class produces: a processor, or a validator/helper that builds the rejection a processor writes | `RejectionType.X` uses under `engine/processing` (comparisons excluded), checked against the SBE schema |
+| `failure:<Class>.<method>:<ErrorType>` | each `new Failure(...)` construction site | `new Failure(` under `engine/processing`; `<Class>.<method>` is the enclosing top-level class and named method (a lambda is attributed to its enclosing named method); the `ErrorType` constant, empty for a message-only `Failure`, `forwarded` for a re-wrap |
+| `rejection:<Class>.<method>:<RejectionType>` | each command-rejection site | `RejectionType.X` uses under `engine/processing` (comparisons and SBE sentinels excluded), checked against the SBE schema; same `<Class>.<method>` scope rules as `failure:` |
+
+The `failure:` and `rejection:` families name a single Zeebe **source site** and
+are a shared contract with the trace harness in `formal/traces/` (#1391); the
+full grammar is specified in `formal/parity/README.md`. Unlike the coarser
+families, a per-site cell may only be claimed by an exact, wildcard-free
+coverage rule — `check.mjs` rejects a wildcard that matches one.
 
 Each cell records the source lines it was read from. The extractor fails
 loudly when an anchor it relies on moves or changes shape. It also fails when
@@ -468,7 +475,9 @@ have no cells yet.
 ### Mapping cells to evidence
 
 `coverage.json` holds ordered rules. The first rule whose `match` fits a cell
-claims it, and `*` in a `match` matches any run of characters. Each rule has
+claims it, and `*` in a `match` matches any run of characters — except that a
+per-site `failure:`/`rejection:` cell may only be claimed by an exact,
+wildcard-free `match` (see the family table above). Each rule has
 one status:
 
 | Status | Required | Meaning |
@@ -481,6 +490,7 @@ one status:
 `check.mjs` fails on any of these:
 
 - an unmapped cell, including new cells from a Zeebe bump
+- a per-site `failure:`/`rejection:` cell claimed by a wildcard rule
 - a rule that claims no cell
 - evidence that does not resolve (a renamed test, a missing fixture, a
   fixture or test that does not declare the cell, or one that declares a cell
