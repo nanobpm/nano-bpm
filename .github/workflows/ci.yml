@@ -715,7 +715,15 @@ jobs:
             formal/lean/.lake
           key: lean-${{ hashFiles('formal/lean/lean-toolchain', 'formal/lean/lakefile.lean', 'formal/lean/lake-manifest.json') }}
       - uses: dtolnay/rust-toolchain@1.99.0
-      - name: Lean build + FEEL differential fuzz
+      - uses: actions/cache@v4
+        with:
+          # feel-scala jar (formal/feel-scala/fetch-feel-scala.sh): its version is
+          # derived from the Zeebe pin, so the pin's hash is the cache key.
+          path: ~/.cache/nanobpm-feel-scala
+          key: feel-scala-${{ hashFiles('formal/parity/zeebe-pin.json') }}
+      - name: Feel-scala gate tests
+        run: node --test formal/feel-scala/*.test.mjs
+      - name: Lean build + FEEL differential fuzz (Lean, Rust, feel-scala)
         run: formal/lean/feel-diff.sh
 
   processos:
