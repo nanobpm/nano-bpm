@@ -252,6 +252,22 @@ pub struct Journal {
 
 /// Cold-spill state held by a [`Journal`]: the shared disk store, the resident
 /// routing index, and the resident-byte watermarks that gate the sweep.
+/// Outcome of [`Journal::rehydrate_cold`] (#1388). `Unreadable` is the
+/// transient case a command must fail closed on rather than run against state
+/// missing the instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+enum ColdRehydration {
+    /// Cold spill unset, or `key` is not cold — nothing to do.
+    NotCold,
+    /// The instance is resident again.
+    Restored,
+    /// The store is readable but has no row: lost, quarantined.
+    Absent,
+    /// The row could not be read; the instance stays cold and routable.
+    Unreadable,
+}
+
 struct ColdSpill {
     store: Arc<VarSpillStore>,
     index: ColdIndex,
@@ -1417,10 +1433,10 @@ impl Journal {
     ///   already lost; quarantined via the #1383 orphan path (logged once,
     ///   listed in [`quarantined_orphans`](Journal::quarantined_orphans)) and
     ///   the stale index entry dropped so it cannot loop.
-    fn rehydrate_cold(&mut self, key: Key) -> bool {
+    fn rehydrate_cold(&mut self, key: Key) -> ColdRehydration {
         let store = match self.cold.as_ref() {
             Some(cold) if cold.index.contains(key) => Arc::clone(&cold.store),
-            _ => return false,
+            _ => return ColdRehydration::NotCold,
         };
         match store.try_get_cold(key) {
             Ok(Some(snapshot)) => {
@@ -1439,7 +1455,7 @@ impl Journal {
                          be forgotten (latched for retry)"
                     );
                 }
-                true
+                ColdRehydration::Restored
             }
             Ok(None) => {
                 if let Some(cold) = self.cold.as_mut() {
@@ -1450,7 +1466,7 @@ impl Journal {
                     "cold rehydration: cold instance has no row in the spill store; it is \
                      lost — quarantined (routing entry dropped)",
                 );
-                false
+                ColdRehydration::Absent
             }
             Err(err) => {
                 self.offheap_read_failures.fetch_add(1, Ordering::Relaxed);
@@ -1460,7 +1476,7 @@ impl Journal {
                     "cold rehydration: cold instance's row could not be read; keeping it \
                      cold and routable (will retry)"
                 );
-                false
+                ColdRehydration::Unreadable
             }
         }
     }
@@ -1472,9 +1488,15 @@ impl Journal {
     /// incident key, message name+correlation (`CorrelateMessage`), timer due-time
     /// (`TriggerTimers`), the instance key (`CancelInstance`), or an instance-root
     /// or element-instance scope key (`SetVariables`).
-    fn ensure_resident_for_command(&mut self, command: &Command) {
+    ///
+    /// Fails closed (#1388): if any targeted cold instance's row is unreadable
+    /// the command is rejected with the retryable
+    /// [`EngineError::InstanceUnavailable`] BEFORE it reaches the engine, so it
+    /// can never run against state missing that instance (a misleading 404, or
+    /// a message correlated/buffered as if the cold subscriber did not exist).
+    fn ensure_resident_for_command(&mut self, command: &Command) -> Result<(), EngineError> {
         let Some(cold) = self.cold.as_ref() else {
-            return;
+            return Ok(());
         };
         let mut targets: Vec<Key> = Vec::new();
         match command {
@@ -1544,8 +1566,15 @@ impl Journal {
             }
             _ => {}
         }
+        let mut unavailable = None;
         for key in targets {
-            self.rehydrate_cold(key);
+            if self.rehydrate_cold(key) == ColdRehydration::Unreadable {
+                unavailable.get_or_insert(key);
+            }
+        }
+        match unavailable {
+            Some(instance_key) => Err(EngineError::InstanceUnavailable { instance_key }),
+            None => Ok(()),
         }
     }
 
@@ -1936,7 +1965,7 @@ impl Journal {
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
-        self.ensure_resident_for_command(&command);
+        self.ensure_resident_for_command(&command)?;
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
             .iter()
@@ -1969,7 +1998,7 @@ impl Journal {
         &mut self,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
-        self.ensure_resident_for_command(&command);
+        self.ensure_resident_for_command(&command)?;
         let events = Arc::new(self.engine.apply_command(command)?);
         let commit = self.persist(&events);
         self.maybe_spill();
@@ -2250,7 +2279,8 @@ impl Journal {
         if let Some(cold) = self.cold.as_ref() {
             let candidates = cold.index.instances_for_job_type(job_type, max_jobs);
             for key in candidates {
-                self.rehydrate_cold(key);
+                // Unreadable rows stay cold; their jobs are simply not offered.
+                let _ = self.rehydrate_cold(key);
             }
         }
     }
@@ -2367,7 +2397,8 @@ impl Journal {
         if let Some(cold) = self.cold.as_ref() {
             let due = cold.index.instances_due(now);
             for key in due {
-                self.rehydrate_cold(key);
+                // An unreadable row stays cold and armed; the next tick retries.
+                let _ = self.rehydrate_cold(key);
             }
         }
         let events = Arc::new(self.engine.trigger_timers(now));
@@ -4118,7 +4149,11 @@ mod tests {
         let (mut journal, key) = cold_file_journal(&path);
         corrupt_row(&path, "cold", "snapshot", key);
 
-        let _ = journal.apply_command(Command::cancel_instance(key));
+        assert_eq!(
+            journal.apply_command(Command::cancel_instance(key)).err(),
+            Some(EngineError::InstanceUnavailable { instance_key: key }),
+            "unreadable cold row must fail the command closed, never NotFound"
+        );
         assert_eq!(journal.cold_count(), 1, "cold index entry kept");
         assert_eq!(raw_row_count(&path, "cold", key), 1, "cold row kept");
         assert!(journal.offheap_read_failures() >= 1, "failure observable");
@@ -4137,7 +4172,11 @@ mod tests {
         break_store(&path);
 
         let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
-        let _ = journal.apply_command(Command::cancel_instance(key));
+        assert_eq!(
+            journal.apply_command(Command::cancel_instance(key)).err(),
+            Some(EngineError::InstanceUnavailable { instance_key: key }),
+            "unreadable store fails the command closed, never NotFound"
+        );
         assert_eq!(journal.cold_count(), 1, "cold index entry kept");
         assert!(journal.offheap_read_failures() >= 2);
         assert!(journal.quarantined_orphans().is_empty());

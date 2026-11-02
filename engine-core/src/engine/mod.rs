@@ -12803,6 +12803,10 @@ pub enum EngineError {
         agent_instance_key: Key,
         limit: crate::agent::AgentLimitKind,
     },
+    /// The instance exists but its off-heap (cold-spilled) state could not be
+    /// read back right now, so the command was not applied (#1388). Transient
+    /// and retryable (503) — distinct from [`EngineError::InstanceNotFound`].
+    InstanceUnavailable { instance_key: Key },
 }
 
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's
@@ -12883,6 +12887,13 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::InstanceNotFound { instance_key } => {
                 write!(f, "no active process instance with key {instance_key}")
+            }
+            EngineError::InstanceUnavailable { instance_key } => {
+                write!(
+                    f,
+                    "process instance {instance_key} is temporarily unavailable \
+                     (its off-heap state could not be read); retry"
+                )
             }
             EngineError::InstanceTransitionInvalid {
                 instance_key,
