@@ -280,7 +280,9 @@ export function baselineGrowth(base, head, basePin, headPin) {
   for (const id of added) {
     if (samePin) {
       if (id.startsWith('failure:') && !baseHasFailure) continue; // one-time family seed
-      const parent = coarseCellId(id);
+      // Refinement applies to rejection: cells only; failure: cells enter solely
+      // through the one-time seed above, never via a removed coarse gap.
+      const parent = id.startsWith('rejection:') ? coarseCellId(id) : null;
       if (parent !== null && before.has(parent) && removed.has(parent)) continue; // a refinement
     }
     errors.push(

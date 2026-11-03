@@ -352,17 +352,11 @@ function braceContext(src, open) {
   let i = open - 1;
   while (i >= 0 && /\s/.test(src[i])) i--;
   if (src[i] !== ')') {
-    // Try skipping a `throws T1, T2` clause: scan back over the exception names
-    // to the word `throws`, then to the `)` that closes the parameter list.
-    let j = i;
-    while (j >= 0 && /[\w.,]/.test(src[j])) j--;
-    const end = j; // first char not part of the exception-name list
-    let k = end;
-    while (k >= 0 && /\s/.test(src[k])) k--;
-    if (src.slice(Math.max(0, k - 5), k + 1) === 'throws') {
-      i = k - 6;
-      while (i >= 0 && /\s/.test(src[i])) i--;
-    }
+    // Try skipping a complete `throws T1, T2` clause (names may be qualified or
+    // generic, separated by commas with arbitrary whitespace/newlines).
+    const head = src.slice(Math.max(0, open - 2000), open);
+    const m = /\)\s*throws\s+[\w.<>?]+(?:\s*,\s*[\w.<>?]+)*\s*$/.exec(head);
+    if (m) i = open - head.length + m.index;
   }
   if (src[i] === ')') {
     // Balance-match back to the opening `(` of the parameter list.
@@ -383,6 +377,15 @@ function braceContext(src, open) {
       const end = k;
       while (k >= 0 && /\w/.test(src[k])) k--;
       const name = src.slice(k + 1, end + 1);
+      // The keyword before the name: `record P(...) {` is a class header and
+      // `new T(...) {` an anonymous-class body (transparent, like a lambda).
+      let w = k;
+      while (w >= 0 && /\s/.test(src[w])) w--;
+      let v = w;
+      while (v >= 0 && /\w/.test(src[v])) v--;
+      const prev = src.slice(v + 1, w + 1);
+      if (name && prev === 'record') return { kind: 'class', name };
+      if (name && prev === 'new') return { kind: 'other' };
       if (name && !CONTROL.has(name)) return { kind: 'method', name };
     }
   }

@@ -245,6 +245,12 @@ test('the failure: family seeds once, then is shrink-only', () => {
   assert.deepEqual(baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A), []);
   // Once any failure: cell is in the base, the family is shrink-only like the rest.
   assert.match(baselineGrowth([f1], [f1, f2], PIN_A, PIN_A)[0], new RegExp(`adds ${f2.replace(/\./g, '\\.')}`));
+  // Removing a coarse incident: gap must not open a back door for new failure: cells.
+  const g = 'failure:P.g:FORM_NOT_FOUND';
+  assert.equal(
+    baselineGrowth(['failure:P.f:UNKNOWN', 'incident:FORM_NOT_FOUND'], ['failure:P.f:UNKNOWN', g], PIN_A, PIN_A).length,
+    1,
+  );
 });
 
 test('coarseCellId maps a per-site cell to its coarse parent, from the extractor grammar', () => {

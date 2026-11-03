@@ -379,6 +379,22 @@ test('enclosingScope attributes a construction to its top-level class and named 
   assert.deepEqual(enclosingScope(src, at('helperThree')), { cls: 'Outer', method: 'gamma' });
 });
 
+test('enclosingScope handles multi-exception throws, anonymous classes and records', () => {
+  const src = stripComments(
+    'package p;\n' +
+      'public class Outer {\n' +
+      '  void f() throws IOException,\n      RuntimeException {\n    siteA();\n  }\n' +
+      '  void g() {\n    Runnable r = new Runnable() {\n      { siteB(); }\n    };\n  }\n' +
+      '}\n',
+  );
+  const at = (needle) => src.indexOf(needle);
+  const rec = stripComments('package p;\nrecord P(int x) {\n  void h() { siteC(); }\n  { siteD(); }\n}\n');
+  assert.deepEqual(enclosingScope(src, at('siteA')), { cls: 'Outer', method: 'f' });
+  assert.deepEqual(enclosingScope(src, at('siteB')), { cls: 'Outer', method: 'g' });
+  assert.deepEqual(enclosingScope(rec, rec.indexOf('siteC')), { cls: 'P', method: 'h' });
+  assert.deepEqual(enclosingScope(rec, rec.indexOf('siteD')), { cls: 'P', method: '' });
+});
+
 test('failure family emits one cell per construction site, keyed by class.method and error type', () => {
   const errRel = 'zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record/value/ErrorType.java';
   const errEnum = 'public enum ErrorType { UNKNOWN, EXTRACT_VALUE_ERROR, FORM_NOT_FOUND; }';
