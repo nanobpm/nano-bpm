@@ -4,12 +4,20 @@
 // Every cell of the derived `zeebe-surface.json` must be claimed by a rule in
 // `coverage.json`, and every claim must be checkable:
 //
-//   parity       evidence: conformance-corpus fixtures carrying a captured
-//                Zeebe verdict (accept/reject — a `diverge` fixture is not parity)
-//                that declare each claimed cell in `<!-- zeebe-cells: … -->`
+//   parity       evidence: `traces:<scenario>` — a captured Zeebe trace
+//                (formal/traces/goldens/<scenario>.cells.json) whose recorded
+//                cells touch each claimed cell — or a conformance-corpus
+//                fixture carrying a captured Zeebe verdict (accept/reject — a
+//                `diverge` fixture is not parity) whose declared
+//                `<!-- zeebe-cells: … -->` are each touched by some captured
+//                trace. A cell may carry `parity` ONLY while a captured Zeebe
+//                trace touches it (#1391).
 //   nano-tested  evidence: `path::test_fn`, a `#[test]` in that file whose
 //                attribute block declares each claimed cell in
-//                `// zeebe-cells: …`
+//                `// zeebe-cells: …`. TRANSITIONAL and ratcheted
+//                (`nano-tested.json`): the set may only shrink — promote a
+//                cell to `parity` as soon as a captured trace covers it;
+//                CI fails when the set grows (`--base-nano-tested`).
 //   gap          issue: the tracking issue that closes the gap. Ratcheted:
 //                only cells frozen in `gaps.json` may be gaps, so a cell a pin
 //                bump adds cannot hide under a wildcard, and the baseline may
@@ -17,15 +25,18 @@
 //   out-of-scope issue + note: why the cell has no Nano meaning
 //
 // Fails on an unmapped cell, a dead rule (claims no cell), unverifiable
-// evidence, a malformed rule, or a surface extracted from a different Zeebe
+// evidence, a malformed rule, a cell id in a trace cells file that
+// `extract.mjs` does not know (grammar drift between the capture harness and
+// the extractor), or a surface extracted from a different Zeebe
 // revision than `zeebe-pin.json`, or a `coverage.json` not yet reviewed at that
-// revision (`reviewedAt`), or a `gaps.json` out of step with the gap cells.
+// revision (`reviewedAt`), or a `gaps.json` / `nano-tested.json` out of step
+// with the assignments.
 // Prints per-family counts, and appends a Markdown table to
 // $GITHUB_STEP_SUMMARY when set.
 //
-// Usage: node formal/parity/check.mjs [--update-gaps | --base-gaps <target-branch gaps.json> [--base-pin <target-branch zeebe-pin.json>]]
+// Usage: node formal/parity/check.mjs [--update-gaps | --update-ratchet | --base-gaps <target-branch gaps.json> [--base-pin <target-branch zeebe-pin.json>] [--base-surface <target-branch zeebe-surface.json>] [--base-nano-tested <target-branch nano-tested.json>]]
 
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -33,6 +44,7 @@ import { coarseCellId } from './extract.mjs';
 
 export const STATUSES = ['parity', 'nano-tested', 'gap', 'out-of-scope'];
 export const CORPUS = 'engine-core/tests/conformance/corpus/';
+export const TRACES = 'formal/traces/';
 const RULE_KEYS = new Set(['match', 'status', 'evidence', 'issue', 'note']);
 
 /**
@@ -88,10 +100,30 @@ function testHeader(text, name) {
   return lines.slice(i, fn);
 }
 
+/**
+ * The cell ids a captured Zeebe trace touched (`formal/traces/goldens/
+ * <scenario>.cells.json`). Returns null when the cells file cannot be read.
+ */
+export function traceCells(text) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  return Array.isArray(parsed?.cells) ? parsed.cells : null;
+}
+
 /** Cells an evidence reference declares, or null if it cannot be read. */
 function declaredCells(status, ref, fs) {
   if (typeof ref !== 'string') return null;
-  if (status === 'parity') return fs.exists(ref) ? fixtureCells(fs.read(ref)) : null;
+  if (status === 'parity') {
+    if (ref.startsWith('traces:')) {
+      const path = `${TRACES}goldens/${ref.slice('traces:'.length)}.cells.json`;
+      return fs.exists(path) ? traceCells(fs.read(path)) : null;
+    }
+    return fs.exists(ref) ? fixtureCells(fs.read(ref)) : null;
+  }
   const sep = ref.indexOf('::');
   const path = ref.slice(0, sep);
   return sep > 0 && fs.exists(path) ? testCells(fs.read(path), ref.slice(sep + 2)) : null;
@@ -101,8 +133,21 @@ function declaredCells(status, ref, fs) {
 export function evidenceProblems(status, ref, fs) {
   if (typeof ref !== 'string' || ref.length === 0) return ['evidence must be a non-empty string'];
   if (status === 'parity') {
+    if (ref.startsWith('traces:')) {
+      const scenario = ref.slice('traces:'.length);
+      // The scenario name becomes a file path segment — never allow traversal.
+      if (!/^[A-Za-z0-9][A-Za-z0-9-]*$/.test(scenario)) return [`bad scenario name in ${ref}`];
+      const cellsPath = `${TRACES}goldens/${scenario}.cells.json`;
+      if (!fs.exists(`${TRACES}scenarios/${scenario}/script.json`)) return [`missing scenario: ${ref}`];
+      if (!fs.exists(`${TRACES}goldens/${scenario}.trace.json`)) return [`missing golden trace for ${ref}`];
+      if (!fs.exists(cellsPath)) return [`missing touched-cells file for ${ref}`];
+      const cells = traceCells(fs.read(cellsPath));
+      if (cells === null) return [`unparseable touched-cells file: ${cellsPath}`];
+      if (cells.length === 0) return [`${cellsPath} declares no cells`];
+      return [];
+    }
     if (!ref.startsWith(CORPUS) || !ref.endsWith('.bpmn')) {
-      return [`parity evidence must be a ${CORPUS}*.bpmn fixture: ${ref}`];
+      return [`parity evidence must be a traces:<scenario> ref or a ${CORPUS}*.bpmn fixture: ${ref}`];
     }
     if (!fs.exists(ref)) return [`missing fixture: ${ref}`];
     const verdict = /<!--\s*verdict:\s*(\w+)/.exec(fs.read(ref));
@@ -151,11 +196,51 @@ export function ruleProblems(rule, fs) {
 }
 
 /**
- * Check `coverage` against `surface`, the `gaps` baseline (`gaps.json`'s cell
- * list) and, when given, the `pin`. Returns `{ errors, assignments }`, where
- * `assignments` maps each cell id to the status of the first rule claiming it.
+ * The union of cells touched by every committed captured Zeebe trace
+ * (`formal/traces/goldens/ *.cells.json`), and the problems found reading them.
+ *
+ * Every id in a cells file must be a cell `extract.mjs` emits for the pinned
+ * Zeebe (`known`): the capture harness (Java) and the static extractor (JS)
+ * implement one shared cell-id grammar, so an unknown id means that grammar
+ * drifted — fail loudly rather than silently dropping the cell. Cells files
+ * captured at another Zeebe revision are stale: refresh them
+ * (`formal/traces/capture.sh`) on a pin bump.
  */
-export function evaluate(surface, coverage, fs, gaps, pin) {
+export function loadTouchedCells(fs, known, pinSha) {
+  const touched = new Set();
+  const errors = [];
+  const pinFile = `${TRACES}goldens/PIN`;
+  if (!fs.exists(pinFile)) {
+    return { touched, errors: [`missing ${pinFile}: capture the Zeebe goldens (formal/traces/capture.sh)`] };
+  }
+  const capturedAt = fs.read(pinFile).trim();
+  if (pinSha && capturedAt !== pinSha) {
+    errors.push(
+      `trace goldens were captured at ${capturedAt}, but zeebe-pin.json pins ${pinSha}: refresh them (formal/traces/capture.sh)`,
+    );
+  }
+  for (const path of fs.list(`${TRACES}goldens`).filter((f) => f.endsWith('.cells.json'))) {
+    const full = `${TRACES}goldens/${path}`;
+    const cells = traceCells(fs.read(full));
+    if (cells === null) {
+      errors.push(`unparseable touched-cells file: ${full}`);
+      continue;
+    }
+    for (const c of cells) {
+      if (known && !known.has(c)) errors.push(`${full} lists a cell extract.mjs does not know: ${c}`);
+      touched.add(c);
+    }
+  }
+  return { touched, errors };
+}
+
+/**
+ * Check `coverage` against `surface`, the `gaps` baseline (`gaps.json`'s cell
+ * list), the `nanoTested` baseline (`nano-tested.json`'s cell list) and, when
+ * given, the `pin`. Returns `{ errors, assignments }`, where `assignments`
+ * maps each cell id to the status of the first rule claiming it.
+ */
+export function evaluate(surface, coverage, fs, gaps, pin, nanoTested) {
   const errors = [];
   if (pin) {
     const id = (z) => `${z?.repository}@${z?.ref}(${z?.sha})`;
@@ -194,6 +279,23 @@ export function evaluate(surface, coverage, fs, gaps, pin) {
     assignments.set(id, rules[k].status);
   }
   const known = new Set(surface.cells.map((c) => c.id));
+  // `parity` means "verified against a captured Zeebe trace" (#1391): load the
+  // cells every committed trace touches, then require every parity-claimed
+  // cell to be among them.
+  const { touched, errors: traceErrors } = loadTouchedCells(fs, known, pin?.sha);
+  errors.push(...traceErrors);
+  const parityTouched = new Set(touched);
+  // A corpus fixture carries a captured Zeebe VERDICT (accept/reject), which is
+  // itself parity evidence for the validation cells it declares — as long as
+  // each declared cell is also touched by some captured trace.
+  for (const r of rules) {
+    if (r?.status !== 'parity' || !Array.isArray(r.evidence)) continue;
+    for (const ref of r.evidence) {
+      if (typeof ref === 'string' && !ref.startsWith('traces:') && fs.exists(ref)) {
+        for (const c of fixtureCells(fs.read(ref))) parityTouched.add(c);
+      }
+    }
+  }
   rules.forEach((r, k) => {
     if (matchers[k] !== null && claims[k].length === 0) errors.push(`dead rule (claims no cell): ${r.match}`);
     // A claim is only as good as its evidence: each claimed cell must be one a
@@ -211,9 +313,13 @@ export function evaluate(surface, coverage, fs, gaps, pin) {
     }
     for (const c of claims[k]) {
       if (!declared.has(c)) errors.push(`rule ${JSON.stringify(r.match)}: no evidence declares ${c}`);
+      if (r.status === 'parity' && !parityTouched.has(c)) {
+        errors.push(`parity cell ${c} is not touched by any captured Zeebe trace (formal/traces/goldens/*.cells.json)`);
+      }
     }
   });
   errors.push(...gapProblems(assignments, gaps));
+  if (nanoTested !== undefined) errors.push(...nanoTestedProblems(assignments, nanoTested));
   return { errors, assignments };
 }
 
@@ -241,6 +347,72 @@ export function gapProblems(assignments, gaps) {
     );
   }
   return errors;
+}
+
+/**
+ * The nano-tested ratchet (#1391): `nano-tested` is a TRANSITIONAL status — it
+ * means "asserted by a nano test, not yet verified against a captured Zeebe
+ * trace". The committed `nano-tested.json` baseline must list exactly the
+ * cells currently assigned `nano-tested`, so the set cannot drift silently;
+ * CI (`--base-nano-tested`) additionally refuses any growth against the target
+ * branch. Promote a cell to `parity` (with `traces:<scenario>` evidence) as
+ * soon as a captured trace covers it, then regenerate with `--update-ratchet`.
+ */
+export function nanoTestedProblems(assignments, nanoTested) {
+  if (!Array.isArray(nanoTested)) return ['nano-tested.json must have a cells array'];
+  const errors = [];
+  const sorted = [...new Set(nanoTested)].sort();
+  if (sorted.length !== nanoTested.length || sorted.some((c, i) => c !== nanoTested[i])) {
+    errors.push('nano-tested.json cells must be sorted and unique: run check.mjs --update-ratchet');
+  }
+  const baseline = new Set(nanoTested);
+  for (const [id, status] of assignments) {
+    if (status === 'nano-tested' && !baseline.has(id)) {
+      errors.push(`new nano-tested cell: ${id} is not in the nano-tested.json baseline; promote it to parity (a captured trace) or run check.mjs --update-ratchet`);
+    }
+  }
+  for (const id of baseline) {
+    const status = assignments.get(id);
+    if (status === 'nano-tested') continue;
+    errors.push(
+      status === undefined
+        ? `nano-tested.json lists ${id}, which is no longer a mapped cell: run check.mjs --update-ratchet`
+        : `nano-tested.json lists ${id}, now ${status}: run check.mjs --update-ratchet to shrink the baseline`,
+    );
+  }
+  return errors;
+}
+
+/** The current nano-tested cells that were already in the baseline (shrink-only). */
+export function shrinkNanoTested(assignments, nanoTested) {
+  const baseline = new Set(nanoTested);
+  return [...assignments].filter(([id, s]) => s === 'nano-tested' && baseline.has(id)).map(([id]) => id).sort();
+}
+
+/**
+ * Ids the head nano-tested baseline illegitimately adds over the target
+ * branch's. `nano-tested` is transitional, so the ratchet is strict: the set
+ * may only shrink. The one exception is a Zeebe **pin bump** (`basePin.sha`
+ * differs from `headPin.sha`, or `basePin` absent — fail-closed): brand-new
+ * cells the bump introduces may enter as `nano-tested` while their traces are
+ * captured, but only if the base baseline does not already list them.
+ */
+export function nanoTestedGrowth(base, head, basePin, headPin) {
+  if (!Array.isArray(base)) {
+    // The target branch predates the ratchet (no nano-tested.json there):
+    // everything was effectively nano-tested, so any head set is a shrink.
+    if (base === null) return [];
+    return ['base nano-tested.json must have a cells array'];
+  }
+  const before = new Set(base);
+  const added = head.filter((id) => !before.has(id));
+  if (added.length === 0) return [];
+  const pinBump = basePin == null || headPin == null || basePin.sha !== headPin.sha;
+  if (pinBump) return [];
+  return added.map(
+    (id) =>
+      `nano-tested.json adds ${id}, which the target branch's baseline does not list: nano-tested is transitional and may only shrink — promote the cell to parity with a captured trace instead`,
+  );
 }
 
 /**
@@ -343,9 +515,11 @@ function main() {
   const fs = {
     exists: (p) => existsSync(join(root, p)),
     read: (p) => readFileSync(join(root, p), 'utf8'),
+    list: (p) => (existsSync(join(root, p)) ? readdirSync(join(root, p)) : []),
   };
   const surface = load('zeebe-surface.json');
   const gapsFile = load('gaps.json');
+  const nanoTestedFile = load('nano-tested.json');
   const coverage = load('coverage.json');
   if (process.argv.includes('--update-gaps')) {
     const { assignments } = evaluate(surface, coverage, fs, gapsFile.cells);
@@ -354,14 +528,21 @@ function main() {
     console.log(`gaps.json: ${gapsFile.cells.length} -> ${cells.length} cells`);
     return;
   }
+  if (process.argv.includes('--update-ratchet')) {
+    const { assignments } = evaluate(surface, coverage, fs, gapsFile.cells);
+    const cells = shrinkNanoTested(assignments, nanoTestedFile.cells);
+    writeFileSync(join(here, 'nano-tested.json'), `${JSON.stringify({ ...nanoTestedFile, cells }, null, 2)}\n`);
+    console.log(`nano-tested.json: ${nanoTestedFile.cells.length} -> ${cells.length} cells`);
+    return;
+  }
   const headPin = load('zeebe-pin.json');
-  const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, headPin);
+  const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, headPin, nanoTestedFile.cells);
   const baseArg = process.argv.indexOf('--base-gaps');
+  let basePin = null;
   if (baseArg !== -1) {
     const basePath = process.argv[baseArg + 1];
     if (!basePath) throw new Error('--base-gaps needs a file path');
     const pinArg = process.argv.indexOf('--base-pin');
-    let basePin = null;
     if (pinArg !== -1) {
       const pinPath = process.argv[pinArg + 1];
       if (!pinPath) throw new Error('--base-pin needs a file path');
@@ -377,6 +558,12 @@ function main() {
       baseSurfaceIds = cells.map((c) => c.id);
     }
     errors.push(...baselineGrowth(JSON.parse(readFileSync(basePath, 'utf8')).cells, gapsFile.cells, basePin, headPin, baseSurfaceIds));
+  }
+  const ntArg = process.argv.indexOf('--base-nano-tested');
+  if (ntArg !== -1) {
+    const ntPath = process.argv[ntArg + 1];
+    if (!ntPath) throw new Error('--base-nano-tested needs a file path');
+    errors.push(...nanoTestedGrowth(JSON.parse(readFileSync(ntPath, 'utf8')).cells, nanoTestedFile.cells, basePin, headPin));
   }
   const report = markdownReport(tally(assignments), surface);
   process.stdout.write(report);

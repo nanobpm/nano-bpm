@@ -78,7 +78,8 @@ exists, while `failure:` records every site that raises it.
 | `zeebe-surface.json` | **derived, committed** — every cell + its source lines; never hand-edit |
 | `coverage.json` | ordered rules mapping each cell to evidence; `reviewedAt` pins the reviewed sha |
 | `gaps.json` | **derived, committed** ratchet baseline of `gap` cells; may only shrink |
-| `check.mjs` | the guard: mapping, evidence, ratchet, per-site wildcard ban |
+| `nano-tested.json` | **derived, committed** ratchet baseline of `nano-tested` cells; may only shrink |
+| `check.mjs` | the guard: mapping, evidence, ratchets, per-site wildcard ban, parity-requires-trace |
 | `*.test.mjs` | extractor and guard tests (`node --test formal/parity/*.test.mjs`) |
 
 Regenerate the derived artifacts after changing the extractor or bumping the
@@ -87,8 +88,47 @@ pin:
 ```bash
 node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"   # zeebe-surface.json
 node formal/parity/check.mjs --update-gaps                          # shrink gaps.json
+node formal/parity/check.mjs --update-ratchet                       # shrink nano-tested.json
 node formal/parity/check.mjs                                        # guard + report
 ```
+
+## `parity` requires a captured Zeebe trace (#1391)
+
+A cell may carry the `parity` status **only while a captured Zeebe trace
+touches it**. The trace harness (`formal/traces/`) runs each scenario on the
+pinned Zeebe and records the cells it touched in
+`formal/traces/goldens/<scenario>.cells.json`; `check.mjs` unions those files
+and rejects any `parity`-claimed cell absent from the union. Two evidence
+forms count:
+
+- **`traces:<scenario>`** — the scenario's own cells file. This is the primary
+  form for runtime behaviour (element lifecycle, intents, incidents,
+  per-site `failure:`/`rejection:` cells).
+- a **conformance-corpus fixture** with a captured Zeebe verdict
+  (accept/reject) whose declared `zeebe-cells` are each also touched by some
+  trace — the deploy-validation cells.
+
+Because the capture harness (Java) and `extract.mjs` (JS) implement one shared
+cell-id grammar, `check.mjs` also rejects any id in a cells file that the
+extractor does not emit for the pinned Zeebe — grammar drift fails the build
+instead of silently breaking the join. The goldens must have been captured at
+the pinned revision (`goldens/PIN` == `zeebe-pin.json`'s sha); a pin bump
+fails the guard until `formal/traces/capture.sh` refreshes them.
+
+## `nano-tested` is transitional and ratcheted (#1391)
+
+`nano-tested` means "a nano test asserts this, but no captured Zeebe trace
+covers it yet" — a **transitional** status on the way to `parity`.
+`nano-tested.json` commits the exact set of `nano-tested` cells:
+
+- `check.mjs` fails when the assigned set and the baseline disagree (a new
+  `nano-tested` cell, or one promoted/removed without regenerating).
+- CI (`--base-nano-tested`) fails when the set **grows** against the target
+  branch — same pin. On a pin bump, brand-new cells may enter as
+  `nano-tested` while their traces are captured.
+- Promote a cell to `parity` (with `traces:<scenario>` evidence) as soon as a
+  captured trace covers it, then run `check.mjs --update-ratchet` to shrink
+  the baseline.
 
 ## The gap ratchet is pin-aware and permits only refinements
 

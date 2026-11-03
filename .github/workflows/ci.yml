@@ -263,6 +263,12 @@ jobs:
         # serde-gated snapshot round-trip tests; see the Clippy step above for why
         # it must not be dropped.
         run: cargo nextest run --features serde
+      - name: Zeebe trace corpus report
+        working-directory: engine-core
+        # Prints the harvested-corpus counts (#1391 step 2) into the CI log —
+        # harvested / runnable / diverging / out-of-scope — and re-asserts that
+        # the committed h-* scenarios agree with harvest/summary.json.
+        run: cargo nextest run --features serde --test zeebe_traces corpus_report -- --nocapture
       - name: Doctests
         working-directory: engine-core
         run: cargo test --doc --features serde
@@ -669,7 +675,7 @@ jobs:
         run: |
           # The derived artifacts must be committed: extraction would recreate a
           # deleted surface as an untracked file, which `git diff` cannot see.
-          git ls-files --error-unmatch formal/parity/zeebe-surface.json formal/parity/gaps.json
+          git ls-files --error-unmatch formal/parity/zeebe-surface.json formal/parity/gaps.json formal/parity/nano-tested.json
           node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"
           git diff --exit-code -- formal/parity/zeebe-surface.json
       - name: Parity matrix tests
@@ -690,7 +696,15 @@ jobs:
             git show FETCH_HEAD:formal/parity/zeebe-pin.json > "$RUNNER_TEMP/base-pin.json"
             # The one-time failure: seed is gated on the base SURFACE (--base-surface).
             git show FETCH_HEAD:formal/parity/zeebe-surface.json > "$RUNNER_TEMP/base-surface.json"
-            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json" --base-pin "$RUNNER_TEMP/base-pin.json" --base-surface "$RUNNER_TEMP/base-surface.json"
+            # nano-tested is transitional (#1391): its baseline may only shrink.
+            # Absent on the base (pre-ratchet) reads as "everything was
+            # nano-tested", so any head cell is a shrink and passes.
+            if git cat-file -e FETCH_HEAD:formal/parity/nano-tested.json 2>/dev/null; then
+              git show FETCH_HEAD:formal/parity/nano-tested.json > "$RUNNER_TEMP/base-nano-tested.json"
+            else
+              echo '{"cells": null}' > "$RUNNER_TEMP/base-nano-tested.json"  # null = pre-ratchet base: any head is a shrink
+            fi
+            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json" --base-pin "$RUNNER_TEMP/base-pin.json" --base-surface "$RUNNER_TEMP/base-surface.json" --base-nano-tested "$RUNNER_TEMP/base-nano-tested.json"
           else
             echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
             node formal/parity/check.mjs
