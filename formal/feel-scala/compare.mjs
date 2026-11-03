@@ -16,7 +16,9 @@
 //   - a listed issue reference that is malformed / undeclared.
 //
 // Usage: compare.mjs <corpus.tsv> <feel-scala-outcomes.txt> [known-divergences.json]
-//        compare.mjs --stubs <corpus.tsv> <outcomes.txt>   (print unlisted rows as JSON stubs)
+//        compare.mjs --stubs <corpus.tsv> <outcomes.txt> [known-divergences.json]
+//          (print UNLISTED divergent rows as JSON stubs — rows already listed in
+//           known-divergences.json are excluded, so the output can be appended)
 import { readFileSync, writeSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -86,17 +88,34 @@ export function compare(rows, known) {
   return { failures, divergent, checked: rows.length };
 }
 
+/**
+ * Divergent rows NOT already listed in `known`, as JSON stubs (`issue: ''`) for
+ * the author to append to known-divergences.json and assign an issue. Emitting
+ * an already-listed row would append a duplicate the gate then rejects, so
+ * listed `(expr, context)` keys are excluded. A corpus can repeat a row; one
+ * stub covers every occurrence of its key.
+ */
+export function unlistedStubs(rows, known) {
+  const listed = new Set((known.cases ?? []).map((c) => key(c.expr, c.context)));
+  const seen = new Set();
+  return rows
+    .filter((r) => r.nano !== r.feelScala)
+    .filter((r) => !listed.has(key(r.expr, r.context)))
+    .filter((r) => !seen.has(key(r.expr, r.context)) && seen.add(key(r.expr, r.context)))
+    .map((r) => ({ ...r, issue: '' }));
+}
+
 function main(argv) {
   if (argv[0] === '--stubs') {
-    const rows = parseRows(readFileSync(argv[1], 'utf8'), readFileSync(argv[2], 'utf8'));
-    // A corpus can repeat a row; one entry covers every occurrence of its key.
-    const seen = new Set();
-    const stubs = rows
-      .filter((r) => r.nano !== r.feelScala)
-      .filter((r) => !seen.has(key(r.expr, r.context)) && seen.add(key(r.expr, r.context)))
-      .map((r) => ({ ...r, issue: '' }));
+    const [, corpus, outcomes, knownPath = DEFAULT_KNOWN] = argv;
+    if (!corpus || !outcomes) {
+      console.error('usage: compare.mjs --stubs <corpus.tsv> <outcomes.txt> [known-divergences.json]');
+      return 2;
+    }
+    const rows = parseRows(readFileSync(corpus, 'utf8'), readFileSync(outcomes, 'utf8'));
+    const known = JSON.parse(readFileSync(knownPath, 'utf8'));
     // Synchronous: a buffered pipe write would be cut short by process.exit.
-    writeSync(1, `${JSON.stringify(stubs, null, 2)}\n`);
+    writeSync(1, `${JSON.stringify(unlistedStubs(rows, known), null, 2)}\n`);
     return 0;
   }
   const [corpus, outcomes, knownPath = DEFAULT_KNOWN] = argv;

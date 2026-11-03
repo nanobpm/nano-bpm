@@ -1,5 +1,5 @@
 {
-  "$comment": "Known nano-vs-feel-scala FEEL divergences over the generated corpus (formal/lean feelfuzz, default seed, 3000 cases). Every entry must still diverge exactly as listed: compare.mjs fails on unlisted, changed and stale entries. Regenerate stubs with `compare.mjs --stubs` and assign each an issue.",
+  "$comment": "Known nano-vs-feel-scala FEEL divergences over the generated corpus (formal/lean feelfuzz, default seed, 3000 cases). Every entry must still diverge exactly as listed: compare.mjs fails on unlisted, changed and stale entries. Regenerate stubs with `compare.mjs --stubs` (emits only divergences not already listed here) and assign each an issue.",
   "issues": {
     "#1392": "type error: nano raises an evaluation error, feel-scala yields null (suppressed failure)",
     "#1393": "non-boolean if-condition: nano yields null, feel-scala takes the else branch",

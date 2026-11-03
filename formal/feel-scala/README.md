@@ -39,7 +39,7 @@ stale and the gate tells you to remove them.
 ```bash
 formal/lean/feel-diff.sh                      # whole pipeline, as the CI job runs it
 node --test formal/feel-scala/*.test.mjs      # gate tests (incl. the seeded-divergence failure)
-node formal/feel-scala/compare.mjs --stubs corpus.tsv outcomes.txt  # unlisted divergences as JSON stubs
+node formal/feel-scala/compare.mjs --stubs corpus.tsv outcomes.txt  # divergences NOT already listed, as JSON stubs to append
 ```
 
 A Zeebe pin bump can change the feel-scala version. The CI cache key is the hash

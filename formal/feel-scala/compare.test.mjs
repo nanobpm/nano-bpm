@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { compare, citesDeclaredIssue, parseRows, DEFAULT_KNOWN } from './compare.mjs';
+import { compare, citesDeclaredIssue, parseRows, unlistedStubs, DEFAULT_KNOWN } from './compare.mjs';
 
 const corpus = ['1\t\tok:num:1', '(1 + true)\t\terr', '(if 1 then 2 else 3)\tv0=null\tok:null'].join('\n');
 const agreeing = ['ok:num:1', 'err', 'ok:null'].join('\n');
@@ -62,6 +62,21 @@ test('inherited / non-#N issue names are never a declared issue', () => {
     assert.match(compare(parseRows(corpus, seeded), known).failures.join('\n'), /undeclared issue/, String(issue));
     assert.equal(citesDeclaredIssue({}, issue), false);
   }
+});
+
+test('--stubs excludes already-listed divergences and emits unlisted ones once', () => {
+  // Two divergences: one listed (#1392), one not. The listed row must not
+  // appear — appending it would create a duplicate the gate rejects.
+  const rows = parseRows(corpus, ['ok:num:1', 'ok:null', 'ok:bool:true'].join('\n'));
+  const known = { issues, cases: [{ expr: '(1 + true)', context: '', nano: 'err', feelScala: 'ok:null', issue: '#1392' }] };
+  const stubs = unlistedStubs(rows, known);
+  assert.deepEqual(stubs, [{ expr: '(if 1 then 2 else 3)', context: 'v0=null', nano: 'ok:null', feelScala: 'ok:bool:true', issue: '' }]);
+});
+
+test('--stubs emits nothing when every divergence is already listed', () => {
+  const rows = parseRows(corpus, ['ok:num:1', 'ok:null', 'ok:null'].join('\n'));
+  const known = { issues, cases: [{ expr: '(1 + true)', context: '', nano: 'err', feelScala: 'ok:null', issue: '#1392' }] };
+  assert.deepEqual(unlistedStubs(rows, known), []);
 });
 
 test('empty corpus and outcome-count mismatch are rejected', () => {
