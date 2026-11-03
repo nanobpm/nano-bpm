@@ -226,8 +226,31 @@ export function loadTouchedCells(fs, known, pinSha, normaliser) {
       `trace goldens were captured at ${capturedAt}, but zeebe-pin.json pins ${pinSha}: refresh them (formal/traces/capture.sh)`,
     );
   }
+  // Scenarios the differential runner ACCEPTS mismatches for
+  // (`allowlist.json`, `zeebe_traces.rs::verdict`) are known divergences: their
+  // traces are never parity evidence.
+  const allowed = new Set();
+  const allowFile = `${TRACES}allowlist.json`;
+  if (fs.exists(allowFile)) {
+    let entries;
+    try {
+      entries = JSON.parse(fs.read(allowFile))?.entries;
+    } catch {
+      entries = undefined;
+    }
+    if (!Array.isArray(entries)) errors.push(`${allowFile} must have an entries array`);
+    else for (const e of entries) if (typeof e?.scenario === 'string') allowed.add(e.scenario);
+  }
   for (const path of fs.list(`${TRACES}goldens`).filter((f) => f.endsWith('.cells.json'))) {
     const full = `${TRACES}goldens/${path}`;
+    const scenario = path.slice(0, -'.cells.json'.length);
+    // An orphan cells file (no scenario script or no golden trace) is not
+    // backed by anything the differential runner replays: reject it.
+    if (!fs.exists(`${TRACES}scenarios/${scenario}/script.json`) || !fs.exists(`${TRACES}goldens/${scenario}.trace.json`)) {
+      errors.push(`${full} has no matching scenario script and golden trace: orphan cells file`);
+      continue;
+    }
+    if (allowed.has(scenario)) continue;
     const cells = traceCells(fs.read(full));
     if (cells === null) {
       errors.push(`unparseable touched-cells file: ${full}`);

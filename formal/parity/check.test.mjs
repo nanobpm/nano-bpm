@@ -507,3 +507,20 @@ test('coarseCellId maps a per-site cell to its coarse parent, from the extractor
   assert.equal(coarseCellId('rejection:JobProcessor:NOT_FOUND'), null);
   assert.equal(coarseCellId('intent:Job:CREATED'), null);
 });
+
+test('an orphan cells file (no scenario or trace) is rejected and contributes no cells', () => {
+  const files = { ...FILES, [`${TRACES}goldens/orph.cells.json`]: '{"scenario":"orph","cells":["element:Orph"]}' };
+  const ofs = { exists: (p) => p in files, read: (p) => files[p], list: (p) => (p === `${TRACES}goldens` ? [...DIRS[p], 'orph.cells.json'] : DIRS[p] ?? []) };
+  const { touched, errors } = loadTouchedCells(ofs, undefined, 'abc');
+  assert.ok(!touched.has('element:Orph'));
+  assert.ok(errors.some((e) => e.includes('orphan cells file')), errors.join('\n'));
+});
+
+test('an allow-listed scenario is never parity evidence', () => {
+  const files = { ...FILES, [`${TRACES}allowlist.json`]: '{"entries":[{"scenario":"s2","issue":"#1","reason":"x"}]}' };
+  const afs = { exists: (p) => p in files, read: (p) => files[p], list: (p) => DIRS[p] ?? [] };
+  const { touched, errors } = loadTouchedCells(afs, undefined, 'abc');
+  assert.deepEqual(errors, []);
+  assert.ok(!touched.has('element:Other'));
+  assert.ok(touched.has('element:Task'));
+});
