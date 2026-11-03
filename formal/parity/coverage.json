@@ -3,6 +3,380 @@
   "reviewedAt": "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
   "rules": [
     {
+      "match": "element:ExclusiveGateway",
+      "status": "parity",
+      "evidence": [
+        "traces:exclusive-gateway-default"
+      ]
+    },
+    {
+      "match": "element:ScriptTask",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldCreateIncidentIfJobRetriesExpressionEvaluationFailed-SCRIPT-TASK"
+      ]
+    },
+    {
+      "match": "element:SendTask",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldCreateIncidentIfJobRetriesExpressionEvaluationFailed-SEND-TASK"
+      ]
+    },
+    {
+      "match": "element:IntermediateThrowEvent",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentAndCreateNewIncidentWhenContinuationFails-INTERMEDIATE-THROW-EVENT"
+      ]
+    },
+    {
+      "match": "failure:ExpressionProcessor.evaluateVariableMappingExpression:IO_MAPPING_ERROR",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentAndCreateNewIncidentWhenContinuationFails-INTERMEDIATE-THROW-EVENT"
+      ]
+    },
+    {
+      "match": "incident:IO_MAPPING_ERROR",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentAndCreateNewIncidentWhenContinuationFails-INTERMEDIATE-THROW-EVENT"
+      ]
+    },
+    {
+      "match": "element:BusinessRuleTask",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
+      ]
+    },
+    {
+      "match": "failure:ExpressionProcessor.createFailureMessage:EXTRACT_VALUE_ERROR",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
+      ]
+    },
+    {
+      "match": "intent:AsyncRequest:PROCESSED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:AsyncRequest:RECEIVED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:ProcessInstance:CANCELING",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:ProcessInstance:ELEMENT_TERMINATED",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
+      ]
+    },
+    {
+      "match": "intent:ProcessInstance:ELEMENT_TERMINATING",
+      "status": "parity",
+      "evidence": [
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
+      ]
+    },
+    {
+      "match": "intent:ProcessInstanceBatch:TERMINATED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "incident:JOB_NO_RETRIES",
+      "status": "parity",
+      "evidence": [
+        "traces:job-no-retries-incident"
+      ]
+    },
+    {
+      "match": "intent:Job:FAILED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-no-retries-incident"
+      ]
+    },
+    {
+      "match": "element:EndEvent",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "element:SequenceFlow",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "element:ServiceTask",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "element:StartEvent",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "incident:EXTRACT_VALUE_ERROR",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:Incident:CREATED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:Incident:RESOLVED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:Job:COMPLETED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:Job:CREATED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:JobBatch:ACTIVATED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:ProcessEvent:TRIGGERED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:ProcessEvent:TRIGGERING",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:ProcessInstance:ELEMENT_ACTIVATED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:ProcessInstance:ELEMENT_ACTIVATING",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:ProcessInstance:ELEMENT_COMPLETED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:ProcessInstance:ELEMENT_COMPLETING",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:ProcessInstance:SEQUENCE_FLOW_TAKEN",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:ProcessInstanceCreation:CREATED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:Variable:CREATED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:Variable:UPDATED",
+      "status": "parity",
+      "evidence": [
+        "traces:job-type-expression-failure"
+      ]
+    },
+    {
+      "match": "intent:VariableDocument:UPDATED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "element:IntermediateCatchEvent",
+      "status": "parity",
+      "evidence": [
+        "traces:message-catch"
+      ]
+    },
+    {
+      "match": "intent:Message:EXPIRED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:Message:PUBLISHED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:MessageSubscription:CORRELATED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:MessageSubscription:CORRELATING",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:MessageSubscription:CREATED",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:ProcessMessageSubscription:CORRELATED",
+      "status": "parity",
+      "evidence": [
+        "traces:message-catch"
+      ]
+    },
+    {
+      "match": "intent:ProcessMessageSubscription:CREATED",
+      "status": "parity",
+      "evidence": [
+        "traces:message-catch"
+      ]
+    },
+    {
+      "match": "intent:ProcessMessageSubscription:CREATING",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:ProcessInstanceCreation:CREATE",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "rejection:ProcessInstanceCreationHelper.getProcess:NOT_FOUND",
+      "status": "parity",
+      "evidence": [
+        "traces:service-task-complete"
+      ]
+    },
+    {
+      "match": "intent:Timer:CREATED",
+      "status": "parity",
+      "evidence": [
+        "traces:timer-catch"
+      ]
+    },
+    {
+      "match": "intent:Timer:TRIGGERED",
+      "status": "parity",
+      "evidence": [
+        "traces:timer-catch"
+      ]
+    },
+    {
+      "match": "element:UserTask",
+      "status": "parity",
+      "evidence": [
+        "traces:user-task-complete"
+      ]
+    },
+    {
+      "match": "intent:UserTask:COMPLETED",
+      "status": "parity",
+      "evidence": [
+        "traces:user-task-complete"
+      ]
+    },
+    {
+      "match": "intent:UserTask:COMPLETING",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
+      "match": "intent:UserTask:CREATED",
+      "status": "parity",
+      "evidence": [
+        "traces:user-task-complete"
+      ]
+    },
+    {
+      "match": "intent:UserTask:CREATING",
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
+    },
+    {
       "match": "element:AdHocSubProcess",
       "status": "nano-tested",
       "evidence": [
@@ -17,24 +391,10 @@
       ]
     },
     {
-      "match": "element:BusinessRuleTask",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/jobs.rs::business_rule_task_evaluates_decision_and_binds_result_variable"
-      ]
-    },
-    {
       "match": "element:CallActivity",
       "status": "nano-tested",
       "evidence": [
         "engine-core/src/engine/tests/call_activity.rs::a_call_activity_spawns_a_distinct_child_process_instance_with_parent_linkage"
-      ]
-    },
-    {
-      "match": "element:EndEvent",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::should_complete_immediately_when_no_task"
       ]
     },
     {
@@ -45,31 +405,10 @@
       ]
     },
     {
-      "match": "element:ExclusiveGateway",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::should_route_exclusive_gateway_by_variable"
-      ]
-    },
-    {
       "match": "element:InclusiveGateway",
       "status": "nano-tested",
       "evidence": [
         "engine-core/src/engine/tests/boundary.rs::inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed"
-      ]
-    },
-    {
-      "match": "element:IntermediateCatchEvent",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/timers_catch.rs::should_park_on_timer_then_fire_when_due"
-      ]
-    },
-    {
-      "match": "element:IntermediateThrowEvent",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::link_events_route_by_matching_name"
       ]
     },
     {
@@ -94,41 +433,6 @@
       ]
     },
     {
-      "match": "element:ScriptTask",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::inline_script_task_evaluates_feel_and_writes_result_variable"
-      ]
-    },
-    {
-      "match": "element:SendTask",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/bpmn/tests.rs::should_parse_a_send_task_as_a_job_based_service_task"
-      ]
-    },
-    {
-      "match": "element:SequenceFlow",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::should_route_exclusive_gateway_by_variable"
-      ]
-    },
-    {
-      "match": "element:ServiceTask",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/jobs.rs::should_park_on_service_task_then_complete_on_job"
-      ]
-    },
-    {
-      "match": "element:StartEvent",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::should_complete_immediately_when_no_task"
-      ]
-    },
-    {
       "match": "element:SubProcess",
       "status": "nano-tested",
       "evidence": [
@@ -140,13 +444,6 @@
       "status": "nano-tested",
       "evidence": [
         "engine-core/src/bpmn/tests.rs::should_parse_abstract_task_and_manual_task_as_pass_through"
-      ]
-    },
-    {
-      "match": "element:UserTask",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/user_task.rs::should_link_a_user_task_to_its_deployed_form_key"
       ]
     },
     {
@@ -300,27 +597,6 @@
       "status": "nano-tested",
       "evidence": [
         "engine-core/src/engine/tests/incidents.rs::should_raise_incident_when_no_exclusive_flow_matches"
-      ]
-    },
-    {
-      "match": "incident:EXTRACT_VALUE_ERROR",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/incidents.rs::adhoc_output_collection_non_array_target_raises_extract_value_incident"
-      ]
-    },
-    {
-      "match": "incident:IO_MAPPING_ERROR",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/incidents.rs::message_catch_output_mapping_incident_resolves_via_complete_not_reopen"
-      ]
-    },
-    {
-      "match": "incident:JOB_NO_RETRIES",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/incidents.rs::should_raise_an_incident_when_a_job_fails_with_no_retries_left"
       ]
     },
     {
@@ -505,12 +781,6 @@
     },
     {
       "match": "failure:BpmnDecisionBehavior.evaluateDecision:DECISION_EVALUATION_ERROR",
-      "status": "gap",
-      "issue": 1249,
-      "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
-    },
-    {
-      "match": "failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR",
       "status": "gap",
       "issue": 1249,
       "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
@@ -762,19 +1032,7 @@
       "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
     },
     {
-      "match": "failure:ExpressionProcessor.createFailureMessage:EXTRACT_VALUE_ERROR",
-      "status": "gap",
-      "issue": 1249,
-      "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
-    },
-    {
       "match": "failure:ExpressionProcessor.evaluateExpressionAsEither:EXTRACT_VALUE_ERROR",
-      "status": "gap",
-      "issue": 1249,
-      "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
-    },
-    {
-      "match": "failure:ExpressionProcessor.evaluateVariableMappingExpression:IO_MAPPING_ERROR",
       "status": "gap",
       "issue": 1249,
       "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
@@ -1831,12 +2089,6 @@
     },
     {
       "match": "rejection:ProcessInstanceCreationHelper.findRelevantProcess:INVALID_ARGUMENT",
-      "status": "gap",
-      "issue": 1249,
-      "note": "Per-site Zeebe command rejection; needs differential scenario evidence against Zeebe."
-    },
-    {
-      "match": "rejection:ProcessInstanceCreationHelper.getProcess:NOT_FOUND",
       "status": "gap",
       "issue": 1249,
       "note": "Per-site Zeebe command rejection; needs differential scenario evidence against Zeebe."

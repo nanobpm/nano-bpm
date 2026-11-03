@@ -72,4 +72,14 @@ public class CellIdsTest {
         CellIds.intentCell("ProcessInstanceIntent", "ELEMENT_ACTIVATED"));
     assertEquals("incident:JOB_NO_RETRIES", CellIds.incidentCell("JOB_NO_RETRIES"));
   }
+
+  /**
+   * The process instance itself touches no {@code element:} cell: {@code extract.mjs} emits no
+   * {@code element:Process} (the BPMN {@code <process>} is the container, not a flow element).
+   */
+  @Test
+  public void processInstanceRecordsTouchNoElementCell() {
+    assertEquals(null, CellIds.elementCellOrNull("PROCESS"));
+    assertEquals("element:ServiceTask", CellIds.elementCellOrNull("SERVICE_TASK"));
+  }
 }

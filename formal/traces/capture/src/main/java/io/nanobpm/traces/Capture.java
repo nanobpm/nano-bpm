@@ -174,7 +174,10 @@ public final class Capture {
       if (r.getValueType() == ValueType.PROCESS_INSTANCE && value.has("elementId")) {
         elementIds.put(r.getKey(), value.get("elementId").asText());
         if (r.getRecordType() == RecordType.EVENT) {
-          cells.add(CellIds.elementCell(value.get("bpmnElementType").asText()));
+          final String elementCell = CellIds.elementCellOrNull(value.get("bpmnElementType").asText());
+          if (elementCell != null) {
+            cells.add(elementCell);
+          }
         }
         if (instanceKey < 0 && value.has("processInstanceKey")) {
           instanceKey = value.get("processInstanceKey").asLong();
