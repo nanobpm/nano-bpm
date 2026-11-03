@@ -1,8 +1,8 @@
 # Test-Studio record loop — worked example + guard
 
 A runnable example that drives a **Test-Studio-style recording session** entirely
-through the committed `@nanobpm/engine-wasm` `TestEngine`, and asserts the
-behaviour so it cannot silently regress on a stale/un-regenerated `pkg`.
+through the `@nanobpm/engine-wasm` `TestEngine` built from source, and asserts
+the behaviour so it cannot silently regress.
 
 ## Why this exists
 
@@ -33,7 +33,7 @@ collapse into behaviour the engine already has:
 
 ## What the probe asserts
 
-`verify.mjs`, run against **both** committed wasm variants (`lean` + `readmodel`):
+`verify.mjs`, run against **both** wasm variants (`lean` + `readmodel`):
 
 1. **Record by mocking every job** — a service task and a connector-style task
    both surface as `Created` jobs, in order, and are mocked to completion. No job
@@ -70,10 +70,11 @@ below as a residual rather than asserted here.
 ## Run
 
 ```sh
-npm install   # links the committed ../../pkg
+make -C ../../.. console-wasm   # builds ../../pkg (a gitignored build output)
+npm install                     # links ../../pkg
 npm test
 ```
 
-Like the sibling probes, this runs against the committed `engine-wasm/pkg/`, so
-source-only changes are not verified until the package is regenerated
-(`make console-wasm`).
+Like the sibling probes, this runs against `engine-wasm/pkg/` as last built, so
+re-run `make console-wasm` after an engine change. CI always builds it from the
+PR's own source.

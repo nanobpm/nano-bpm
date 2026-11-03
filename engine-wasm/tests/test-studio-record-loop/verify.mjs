@@ -1,4 +1,4 @@
-// Test-Studio-style record loop, run against the committed `@nanobpm/engine-wasm`
+// Test-Studio-style record loop, run against the built `@nanobpm/engine-wasm`
 // TestEngine — a worked example AND a regression guard.
 //
 // Camunda's "Test Studio" recording feature needs per-instance isolation so a
@@ -26,9 +26,8 @@
 //     An `everyStep` breakpoint re-parks the run at nested call activities too
 //     (an id-scoped `elementActivated` breakpoint only matches its own element id).
 //
-// Run against the committed artifacts: `npm install && npm test` (this installs
-// the checked-in `engine-wasm/pkg` — it does not regenerate WASM; run `make
-// console-wasm` first if you want to test freshly built artifacts).
+// Run: `make console-wasm` (from the repo root; engine-wasm/pkg is a gitignored
+// build output, #668), then `npm install && npm test` here.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -221,7 +220,7 @@ function callActivityWaitState(TestEngine) {
   }
 }
 
-// The advertised behaviour must hold on BOTH committed wasm variants, so a stale or
+// The advertised behaviour must hold on BOTH wasm variants, so a stale or
 // un-regenerated pkg cannot pass the native Rust tests while regressing here.
 for (const variant of ["lean", "readmodel"]) {
   const entry = variant === "lean" ? "@nanobpm/engine-wasm" : "@nanobpm/engine-wasm/readmodel";

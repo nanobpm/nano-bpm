@@ -29,8 +29,8 @@ vscode-bpmn-debug (#652)                   bpmn-js webview: highlights the pause
 - **`engine-core`** gained a stepping executor: the shared fixpoint loop can pause
   at a breakpoint mid-command and resume with run-to-completion parity.
 - **`engine-wasm`** exposes that surface to JavaScript as `TestEngine.debug*`. The
-  built package is **committed** under `engine-wasm/pkg/`, so the JavaScript layers
-  need **no Rust toolchain and no `wasm-pack`** to run.
+  built package lives under `engine-wasm/pkg/`, a build output that is **not
+  committed**: build it once with `make console-wasm` (see Prerequisites).
 - **`dap-adapter`** is a standalone [Debug Adapter
   Protocol](https://microsoft.github.io/debug-adapter-protocol/) server that any
   DAP client can drive. See [`dap-adapter/README.md`](../dap-adapter/README.md).
@@ -43,11 +43,14 @@ vscode-bpmn-debug (#652)                   bpmn-js webview: highlights the pause
 
 ## Prerequisites
 
-- **Node.js ≥ 22** (`node --version`). That is all Path A needs — the wasm engine
-  is prebuilt and committed.
+- **Node.js ≥ 22** (`node --version`).
+- **The wasm engine package, built once:** a Rust toolchain plus wasm-pack
+  (`make install-wasm-pack`), then `make console-wasm` from the repo root. It
+  writes `engine-wasm/pkg/`, which the adapter links via
+  `file:../engine-wasm/pkg`. The package is a gitignored build output, so a
+  fresh clone does not have it. Re-run `make console-wasm` after changing the
+  engine.
 - **VS Code** — only for Path B.
-- No Rust toolchain is required for either path (you are consuming the committed
-  `engine-wasm/pkg/`, not rebuilding it).
 
 ## Path A — 30-second headless proof
 
@@ -57,7 +60,7 @@ against the wasm engine — `launch → setBreakpoints → configurationDone →
 
 ```bash
 cd dap-adapter
-npm install        # resolves @nanobpm/engine-wasm from the committed ../engine-wasm/pkg
+npm install        # links @nanobpm/engine-wasm from ../engine-wasm/pkg (built by make console-wasm)
 npm run build      # tsc → dist/ (the adapter binary dist/index.js)
 npm test           # vitest: source-map units + the headless DAP integration test
 ```
@@ -165,7 +168,7 @@ test break on the start event.
 
 | Symptom | Cause / fix |
 |---|---|
-| `npm install` can't resolve `@nanobpm/engine-wasm` | Run it from **inside `dap-adapter/`**; the dep is `file:../engine-wasm/pkg` and that path is committed. |
+| `npm install` can't resolve `@nanobpm/engine-wasm` | Run it from **inside `dap-adapter/`**; the dep is `file:../engine-wasm/pkg`. That directory is a build output: run `make console-wasm` from the repo root first. |
 | The webview panel is **blank** | Your `.bpmn` has no diagram interchange. Use a Modeler/console-authored file with a `bpmndi:BPMNDiagram` (the test fixture is DI-free by design). |
 | Breakpoint on a **service task** doesn't feel "mid-run" | Expected — it parks where the job would anyway. Break on the start event or another upstream node. |
 | The extension launches but the adapter errors on start | Build the adapter first: `cd dap-adapter && npm run build` (the extension runs `../dap-adapter/dist/index.js`). |

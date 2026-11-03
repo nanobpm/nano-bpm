@@ -20,9 +20,15 @@ on:
     paths:
       - '.github/workflows/parity-camunda-daily.yml'
       # Everything the differential consumes: the runner, driver, backends and
-      # corpus, the nano read-model wasm it runs, and the Zeebe pin.
+      # corpus, the sources the nano read-model wasm is built from (#668: the
+      # wasm is built per run, not committed), and the Zeebe pin.
       - 'formal/parity/runtime/**'
-      - 'engine-wasm/pkg/readmodel/**'
+      - 'engine-core/**'
+      - 'engine-wasm/**'
+      - 'read-model/**'
+      - 'Makefile'
+      - 'scripts/wasm-cc-env.sh'
+      - '.github/actions/engine-wasm-pkg/**'
       - 'formal/parity/zeebe-surface.json'
 
 permissions:
@@ -42,6 +48,8 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Build engine-wasm/pkg (the nano backend's read-model wasm)
+        uses: ./.github/actions/engine-wasm-pkg
       - name: Start Camunda 8 (version derived from the Zeebe pin)
         run: formal/parity/runtime/start-camunda.sh "" 8080
       - name: Two-backend differential

@@ -178,13 +178,16 @@ one parity test):**
 - Regenerate the grammar artifact: `cd processos && cargo run -- emit-gbnf --out
   assets/ir.gbnf` (commit the result — it is a checked-in derived artifact).
 
-**3. `engine-wasm` — thin pass-through, but regenerate the committed
-artifacts (silent):**
+**3. `engine-wasm` — thin pass-through (silent):**
 
 - `engine-core/src/ffi.rs` and `engine-wasm/src/lib.rs` enumerate no element
-  types (JSON snapshots), so no code change — **but** the compiled wasm and its
-  generated `.d.ts`/`.js` are committed. Rebuild: `make console-wasm`
-  (regenerates `engine-wasm/pkg/`). The Bojtos framework packages that consume
+  types (JSON snapshots), so no code change. The compiled wasm package
+  `engine-wasm/pkg/` is a **gitignored build output — never commit it** (#668).
+  Build it locally with `make console-wasm` (needs wasm-pack: `make
+  install-wasm-pack`). CI builds it from the PR's own source
+  (`.github/actions/engine-wasm-pkg`, shared with the jobs that need it as the
+  `engine-wasm-pkg` artifact) and fails if anything under it is tracked. The
+  published `@nanobpm/engine-wasm` is built from the tag at release. The Bojtos framework packages that consume
   it (`@nanobpm/bojtos-kit` / `-react`) live in the separate `nanobpm/bojtos`
   repo and are element-type-agnostic, so they need no change here.
 
