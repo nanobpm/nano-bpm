@@ -3,6 +3,8 @@
   "process": "wf-child",
   "jobs": [],
   "jobCompletionOrder": [],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
   "messageCorrelation": [],
   "timerTicks": [],
   "needs": []

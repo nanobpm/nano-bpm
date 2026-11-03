@@ -10,6 +10,8 @@
   "jobCompletionOrder": [
     "task"
   ],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
   "messageCorrelation": [],
   "timerTicks": [],
   "needs": []

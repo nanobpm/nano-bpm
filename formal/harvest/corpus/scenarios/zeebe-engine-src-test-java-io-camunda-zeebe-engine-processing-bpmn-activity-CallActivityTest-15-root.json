@@ -1,16 +1,13 @@
 {
   "generated": "formal/harvest/normalise.mjs",
   "process": "root",
-  "jobs": [
-    {
-      "element": "call",
-      "jobType": "call"
-    }
-  ],
-  "jobCompletionOrder": [
-    "call"
-  ],
+  "jobs": [],
+  "jobCompletionOrder": [],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
   "messageCorrelation": [],
   "timerTicks": [],
-  "needs": []
+  "needs": [
+    "call-activity"
+  ]
 }

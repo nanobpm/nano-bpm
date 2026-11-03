@@ -53,12 +53,8 @@
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-15-root",
     "processId": "root",
-    "status": "diverging",
-    "detail": "expected-job-not-created: call",
-    "observed": {
-      "completed": [],
-      "waitingJobs": []
-    }
+    "status": "out-of-scope",
+    "detail": "driver-capability: call-activity"
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-19-level3",
@@ -150,11 +146,12 @@
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventElementTest-1-process2",
     "processId": "process2",
-    "status": "diverging",
-    "detail": "expected-job-not-created: userTask_1",
+    "status": "runnable",
+    "detail": "completed-cleanly",
     "observed": {
-      "completed": [],
-      "waitingJobs": []
+      "completed": [
+        "userTask_1"
+      ]
     }
   },
   {
@@ -300,19 +297,21 @@
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-17-process",
     "processId": "process",
-    "status": "diverging",
-    "detail": "expected-job-not-created: task-1",
+    "status": "unverified",
+    "detail": "instance-did-not-complete",
     "observed": {
-      "completed": [],
-      "waitingJobs": [
+      "completed": [
         "task-3"
-      ]
+      ],
+      "openIncidents": 2,
+      "activeLeft": 2,
+      "allDone": false
     }
   },
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-18-process",
     "processId": "process",
-    "status": "diverging",
+    "status": "unverified",
     "detail": "instance-did-not-complete",
     "observed": {
       "completed": [
@@ -413,7 +412,7 @@
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-5-process",
     "processId": "process",
-    "status": "diverging",
+    "status": "unverified",
     "detail": "instance-did-not-complete",
     "observed": {
       "completed": [
@@ -451,7 +450,7 @@
   {
     "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-8-process",
     "processId": "process",
-    "status": "diverging",
+    "status": "unverified",
     "detail": "instance-did-not-complete",
     "observed": {
       "completed": [],

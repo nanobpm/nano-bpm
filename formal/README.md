@@ -544,7 +544,7 @@ formal/harvest/
 │                           #   model API (tools/HarvestExtract.java vs the pinned jar)
 ├── normalise.mjs           # BPMN -> corpus format: scenario script + coverage tags
 ├── run.mjs                 # runs each scenario vs the engine-wasm TestEngine
-├── report.mjs              # harvested / runnable / diverging / out-of-scope counts
+├── report.mjs              # harvested / runnable / unverified / out-of-scope counts
 ├── harvest.sh              # the whole pipeline, pinned + reproducible
 └── corpus/                 # GENERATED: ir/, bpmn/ (with DI), scenarios/, report.json
 ```
@@ -560,13 +560,22 @@ byte-reproducible. Anything else — a lambda that nests, a non-literal process
 id, an unsupported builder method — is recorded **out of scope** with its
 reason, never silently dropped.
 
-The differential run classifies each normalised model:
+The normaliser derives the scenario script from the BPMN graph. Only genuinely
+job-producing elements — `serviceTask`, `sendTask`, `businessRuleTask`,
+`scriptTask` (the tags engine-core models as `NodeKind::Service`) — become
+scenario jobs. A `userTask` becomes a `userTasks` step (completed via
+`completeUserTask`, never present in `snap.jobs`); an abstract `task`,
+`manualTask`, or `receiveTask` is a pass-through (no job); a `callActivity`
+tags the scenario `needs: ["call-activity"]` (this slice's runner deploys only
+the harvested model, so the callee is never present).
+
+The Nano run classifies each normalised model:
 
 | Status | Meaning |
 |---|---|
 | `runnable` | Nano deployed, ran, and completed the scenario cleanly |
-| `diverging` | Nano accepted and ran it but the observable outcome differs (did not complete, incident, stranded element) — a parity-issue candidate on Camunda's surface |
-| `out-of-scope` | Nano rejected the deploy (unimplemented surface), or the scenario needs a driver capability (variables / messages / timers) the deterministic empty-variable runner does not supply — a driver limitation, NOT a divergence |
+| `unverified` | Nano accepted and ran it but the instance did not complete cleanly (no completion, incident, stranded element/job). This slice harvests **no Zeebe oracle** — the engine tests assert on Zeebe's record stream, which the static harvest does not reproduce — so a non-clean Nano outcome is *unverified*: it may be a genuine Nano gap, the expected Zeebe outcome, or a driver limitation. It is never presented as a parity divergence |
+| `out-of-scope` | Nano rejected the deploy (unimplemented surface), or the scenario needs a driver capability (variables / messages / timers / call-activity) the deterministic empty-variable runner does not supply — a driver limitation, NOT a divergence |
 
 ```bash
 formal/harvest/harvest.sh                # full pipeline -> corpus/ + report.json
@@ -574,6 +583,8 @@ node --test formal/harvest/*.test.mjs    # parser / normaliser / classifier test
 ```
 
 CI (the `formal (tlc)` job) regenerates the corpus and report and
-`git diff --exit-code`s them, so a forgotten regeneration or a non-reproducible
-harvest fails the build. To bump the pin, update `zeebe-test-pin.json` (keep its
-`sha` equal to `formal/parity/zeebe-pin.json`'s) and re-run `harvest.sh`.
+`git diff --exit-code`s them — plus a `git status --porcelain` untracked check
+and a tracked-ness guard over every committed corpus file — so a forgotten
+regeneration, a non-reproducible harvest, or a stale/untracked generated
+artifact fails the build. To bump the pin, update `zeebe-test-pin.json` (keep
+its `sha` equal to `formal/parity/zeebe-pin.json`'s) and re-run `harvest.sh`.

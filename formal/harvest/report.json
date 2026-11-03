@@ -10,25 +10,15 @@
   "counts": {
     "scannedFiles": 81,
     "harvested": 53,
-    "runnable": 32,
-    "diverging": 6,
-    "outOfScope": 485
+    "runnable": 33,
+    "unverified": 4,
+    "outOfScope": 486
   },
-  "diverging": [
-    {
-      "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-15-root",
-      "processId": "root",
-      "detail": "expected-job-not-created: call"
-    },
-    {
-      "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventElementTest-1-process2",
-      "processId": "process2",
-      "detail": "expected-job-not-created: userTask_1"
-    },
+  "unverified": [
     {
       "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-17-process",
       "processId": "process",
-      "detail": "expected-job-not-created: task-1"
+      "detail": "instance-did-not-complete"
     },
     {
       "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-18-process",
@@ -49,7 +39,7 @@
   "outOfScopeBreakdown": {
     "unparseable": 470,
     "normalise": 2,
-    "run": 13
+    "run": 14
   },
   "runnableIds": [
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-1-child-process",
@@ -66,6 +56,7 @@
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-7-wf-child",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-JobPriorityTest-0-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-2-process",
+    "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventElementTest-1-process2",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventCompatibilityTest-0-child-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-21-child-process",
     "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-23-child-process",

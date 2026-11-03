@@ -3,6 +3,8 @@
   "process": "process",
   "jobs": [],
   "jobCompletionOrder": [],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
   "messageCorrelation": [],
   "timerTicks": [],
   "needs": [

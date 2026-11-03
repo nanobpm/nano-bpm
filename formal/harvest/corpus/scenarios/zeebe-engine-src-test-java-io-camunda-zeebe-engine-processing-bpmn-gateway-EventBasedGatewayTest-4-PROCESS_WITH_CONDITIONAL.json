@@ -3,6 +3,8 @@
   "process": "PROCESS_WITH_CONDITIONAL",
   "jobs": [],
   "jobCompletionOrder": [],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
   "messageCorrelation": [],
   "timerTicks": [],
   "needs": [

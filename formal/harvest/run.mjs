@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Runs the harvested Zeebe engine-test scenarios differentially against Nano
-// (#1249) and classifies each as runnable / diverging / out-of-scope.
+// Runs the harvested Zeebe engine-test scenarios against Nano (#1249) and
+// classifies each as runnable / unverified / out-of-scope.
 //
 //   node formal/harvest/run.mjs [--corpus formal/harvest/corpus] [--engine <path-to-@nanobpm/engine-wasm>]
 //
@@ -9,17 +9,24 @@
 //   * deploy the BPMN to a fresh Nano `TestEngine` (the engine-wasm backend the
 //     parity suite's scenario driver, #1240 slice 5, also targets);
 //   * create an instance and drive the scenario: complete each `Created` job in
-//     the scenario's `jobCompletionOrder`, until the instance completes or no
-//     progress is possible;
+//     the scenario's `jobCompletionOrder` and each `Created` user task in its
+//     `userTaskCompletionOrder`, until the instance completes or no progress is
+//     possible;
 //   * classify the outcome:
 //       runnable     — the instance deployed, ran, and completed cleanly;
-//       diverging    — Nano accepted and ran the model but the observable
-//                      outcome differs from the Zeebe-implied expectation (the
-//                      instance did NOT complete, raised an incident, or left
-//                      jobs/elements stranded). Each is a parity issue candidate;
+//       unverified   — Nano accepted and ran the model but the instance did NOT
+//                      complete cleanly (incident, stranded jobs/elements, or a
+//                      job the scenario expected was never created). This slice
+//                      harvests NO Zeebe oracle (the engine tests assert on the
+//                      Zeebe record stream, which the static harvest does not
+//                      reproduce), so a non-clean Nano outcome is UNVERIFIED —
+//                      it may be a genuine Nano gap, or the expected Zeebe
+//                      outcome for this model, or a driver limitation. It is
+//                      never presented as a parity divergence;
 //       out-of-scope — Nano REJECTED the deploy (the model uses surface Nano
 //                      does not implement) or the scenario needs a driver
-//                      capability this slice does not drive (messages, timers).
+//                      capability this slice does not drive (messages, timers,
+//                      call-activity callee deployment).
 //
 // The result feeds report.mjs. This runner is hermetic: it uses the committed
 // engine-wasm artifacts and does no network I/O.
@@ -52,7 +59,7 @@ const MAX_STEPS = 200; // runaway guard: a healthy scenario completes well withi
 
 /**
  * Run one scenario against a fresh TestEngine. Returns
- *   { status: 'runnable'|'diverging'|'out-of-scope', detail, observed }
+ *   { status: 'runnable'|'unverified'|'out-of-scope', detail, observed }
  */
 export function runScenario(TestEngine, id, xml, scenario) {
   const eng = new TestEngine();
@@ -71,10 +78,10 @@ export function runScenario(TestEngine, id, xml, scenario) {
       return { status: 'out-of-scope', detail: 'scenario-needs-message-or-timer-driver' };
     }
     // A scenario that needs variables / event-based / catch-event / sub-process
-    // driving (tagged at normalise time) cannot be driven deterministically by
-    // this slice's empty-variable runner. Record it out-of-scope — a driver
-    // limitation, NOT a Nano divergence — so a data-dependent route is never
-    // mis-reported as a parity defect.
+    // / call-activity driving (tagged at normalise time) cannot be driven
+    // deterministically by this slice's empty-variable runner. Record it
+    // out-of-scope — a driver limitation, NOT a Nano divergence — so a
+    // data-dependent route is never mis-reported as a parity defect.
     if ((scenario.needs?.length ?? 0) > 0) {
       return { status: 'out-of-scope', detail: `driver-capability: ${scenario.needs.join(', ')}` };
     }
@@ -83,32 +90,51 @@ export function runScenario(TestEngine, id, xml, scenario) {
     try {
       snap = JSON.parse(eng.createInstance(scenario.process, '{}'));
     } catch (e) {
-      return { status: 'diverging', detail: `createInstance-threw: ${String(e?.message ?? e).slice(0, 160)}` };
+      return { status: 'unverified', detail: `createInstance-threw: ${String(e?.message ?? e).slice(0, 160)}` };
     }
 
-    const order = scenario.jobCompletionOrder ?? [];
+    // Drive jobs and user tasks in the scenario's declared (topological) order,
+    // merging the two streams by position. A healthy model surfaces each
+    // scheduled job as `Created` in snap.jobs and each user task as `Created` in
+    // snap.userTasks; completing it advances the instance.
+    const steps = [
+      ...(scenario.jobCompletionOrder ?? []).map((elementId) => ({ kind: 'job', elementId })),
+      ...(scenario.userTaskCompletionOrder ?? []).map((elementId) => ({ kind: 'userTask', elementId })),
+    ];
     const completed = [];
-    let steps = 0;
-    // Drive jobs in the scenario's declared order. A healthy model surfaces each
-    // scheduled job as `Created` in turn; completing it advances the instance.
-    for (const elementId of order) {
-      if (steps++ > MAX_STEPS) {
-        return { status: 'diverging', detail: 'runaway: exceeded step guard', observed: { completed } };
+    let guard = 0;
+    for (const step of steps) {
+      if (guard++ > MAX_STEPS) {
+        return { status: 'unverified', detail: 'runaway: exceeded step guard', observed: { completed } };
       }
-      const job = (snap.jobs ?? []).find((j) => j.elementId === elementId && j.state === 'Created');
-      if (!job) {
-        // The job the scenario expects is not waiting. Either the instance
-        // already completed (fine if this was the last) or the route diverged.
-        const done = (snap.instances ?? []).every((i) => i.completed);
-        if (done) break;
-        return {
-          status: 'diverging',
-          detail: `expected-job-not-created: ${elementId}`,
-          observed: { completed, waitingJobs: (snap.jobs ?? []).map((j) => j.elementId) },
-        };
+      if (step.kind === 'job') {
+        const job = (snap.jobs ?? []).find((j) => j.elementId === step.elementId && j.state === 'Created');
+        if (!job) {
+          // The job the scenario expects is not waiting. Either the instance
+          // already completed (fine if this was the last) or the run diverged.
+          const done = (snap.instances ?? []).every((i) => i.completed);
+          if (done) break;
+          return {
+            status: 'unverified',
+            detail: `expected-job-not-created: ${step.elementId}`,
+            observed: { completed, waitingJobs: (snap.jobs ?? []).map((j) => j.elementId) },
+          };
+        }
+        snap = JSON.parse(eng.completeJob(job.key, '{}'));
+      } else {
+        const ut = (snap.userTasks ?? []).find((t) => t.elementId === step.elementId && t.state === 'Created');
+        if (!ut) {
+          const done = (snap.instances ?? []).every((i) => i.completed);
+          if (done) break;
+          return {
+            status: 'unverified',
+            detail: `expected-user-task-not-created: ${step.elementId}`,
+            observed: { completed, waitingUserTasks: (snap.userTasks ?? []).map((t) => t.elementId) },
+          };
+        }
+        snap = JSON.parse(eng.completeUserTask(ut.key, '{}'));
       }
-      snap = JSON.parse(eng.completeJob(job.key, '{}'));
-      completed.push(elementId);
+      completed.push(step.elementId);
     }
 
     const instances = snap.instances ?? [];
@@ -120,7 +146,7 @@ export function runScenario(TestEngine, id, xml, scenario) {
       return { status: 'runnable', detail: 'completed-cleanly', observed: { completed } };
     }
     return {
-      status: 'diverging',
+      status: 'unverified',
       detail: allDone
         ? `completed-with-residue: incidents=${openIncidents} active=${activeLeft}`
         : 'instance-did-not-complete',

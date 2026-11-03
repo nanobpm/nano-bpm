@@ -187,6 +187,148 @@ test('cellsFor tags element cells present in the surface', () => {
   assert.ok(cells.includes('element:EndEvent'));
 });
 
+// --- job-derivation: only job-producing tags schedule jobs (#1397 review) ---
+// The defect class: the normaliser derived a job for EVERY task-shaped element,
+// so a userTask / callActivity / abstract task made the runner stop on
+// `expected-job-not-created` — a driver error counted as a Nano divergence.
+
+const TASK_VARIANTS_XML = `<?xml version="1.0"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:ns0="http://camunda.org/schema/zeebe/1.0">
+  <process id="process" isExecutable="true">
+    <startEvent id="start"><outgoing>f1</outgoing></startEvent>
+    <userTask id="ut"><incoming>f1</incoming><outgoing>f2</outgoing></userTask>
+    <task id="plain"><incoming>f2</incoming><outgoing>f3</outgoing></task>
+    <manualTask id="manual"><incoming>f3</incoming><outgoing>f4</outgoing></manualTask>
+    <receiveTask id="recv"><incoming>f4</incoming><outgoing>f5</outgoing></receiveTask>
+    <serviceTask id="svc">
+      <extensionElements><ns0:taskDefinition type="svc-type"/></extensionElements>
+      <incoming>f5</incoming><outgoing>f6</outgoing>
+    </serviceTask>
+    <endEvent id="end"><incoming>f6</incoming></endEvent>
+    <sequenceFlow id="f1" sourceRef="start" targetRef="ut"/>
+    <sequenceFlow id="f2" sourceRef="ut" targetRef="plain"/>
+    <sequenceFlow id="f3" sourceRef="plain" targetRef="manual"/>
+    <sequenceFlow id="f4" sourceRef="manual" targetRef="recv"/>
+    <sequenceFlow id="f5" sourceRef="recv" targetRef="svc"/>
+    <sequenceFlow id="f6" sourceRef="svc" targetRef="end"/>
+  </process>
+</definitions>`;
+
+test('scenarioFor derives jobs ONLY for job-producing tags', () => {
+  const g = bpmnToGraph(TASK_VARIANTS_XML);
+  g.processId = 'process';
+  const { scenario, outOfScope } = scenarioFor(g);
+  assert.equal(outOfScope, null);
+  // Only the serviceTask schedules a job; userTask goes to userTasks, and the
+  // abstract task / manualTask / receiveTask are pass-throughs (no job).
+  assert.deepEqual(scenario.jobs, [{ element: 'svc', jobType: 'svc-type' }]);
+  assert.deepEqual(scenario.jobCompletionOrder, ['svc']);
+  assert.deepEqual(scenario.userTasks, ['ut']);
+  assert.deepEqual(scenario.userTaskCompletionOrder, ['ut']);
+  assert.deepEqual(scenario.needs, []);
+});
+
+test('scenarioFor tags a callActivity as needing the call-activity driver, never a job', () => {
+  const xml = `<?xml version="1.0"?>
+  <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:ns0="http://camunda.org/schema/zeebe/1.0">
+    <process id="root" isExecutable="true">
+      <startEvent id="start"><outgoing>f1</outgoing></startEvent>
+      <callActivity id="call">
+        <extensionElements><ns0:calledElement processId="child"/></extensionElements>
+        <incoming>f1</incoming><outgoing>f2</outgoing>
+      </callActivity>
+      <endEvent id="end"><incoming>f2</incoming></endEvent>
+      <sequenceFlow id="f1" sourceRef="start" targetRef="call"/>
+      <sequenceFlow id="f2" sourceRef="call" targetRef="end"/>
+    </process>
+  </definitions>`;
+  const g = bpmnToGraph(xml);
+  g.processId = 'root';
+  const { scenario, outOfScope } = scenarioFor(g);
+  assert.equal(outOfScope, null);
+  assert.deepEqual(scenario.jobs, []);
+  assert.deepEqual(scenario.jobCompletionOrder, []);
+  assert.ok(scenario.needs.includes('call-activity'));
+});
+
+// --- runScenario classification ---------------------------------------------
+// A non-clean Nano run is UNVERIFIED (this slice harvests no Zeebe oracle),
+// never "diverging"; a user task is completed via completeUserTask.
+
+/** A minimal TestEngine stub: deploy ok, parks one user task, completes it. */
+function userTaskEngineStub() {
+  let utCompleted = false;
+  return class {
+    deploy() { return '{}'; }
+    createInstance() {
+      return JSON.stringify({
+        instances: [{ completed: false, activeElements: [{}] }],
+        jobs: [],
+        userTasks: [{ key: '7', elementId: 'ut', state: 'Created' }],
+        incidents: [],
+      });
+    }
+    completeUserTask() {
+      utCompleted = true;
+      return JSON.stringify({
+        instances: [{ completed: true, activeElements: [] }],
+        jobs: [], userTasks: [], incidents: [],
+      });
+    }
+    completeJob() { throw new Error('no jobs in this model'); }
+    free() {}
+    get utCompleted() { return utCompleted; }
+  };
+}
+
+test('runScenario completes a user task via completeUserTask and reports runnable', async () => {
+  const { runScenario } = await import('./run.mjs');
+  const Eng = userTaskEngineStub();
+  const r = runScenario(Eng, 'x', '<xml/>', {
+    process: 'process', jobs: [], jobCompletionOrder: [],
+    userTasks: ['ut'], userTaskCompletionOrder: ['ut'],
+    messageCorrelation: [], timerTicks: [], needs: [],
+  });
+  assert.equal(r.status, 'runnable');
+  assert.deepEqual(r.observed.completed, ['ut']);
+});
+
+test('runScenario classifies a non-clean Nano run as unverified, never diverging', async () => {
+  const { runScenario } = await import('./run.mjs');
+  class Stuck {
+    deploy() { return '{}'; }
+    createInstance() {
+      return JSON.stringify({
+        instances: [{ completed: false, activeElements: [{}] }],
+        jobs: [], userTasks: [], incidents: [],
+      });
+    }
+    free() {}
+  }
+  const r = runScenario(Stuck, 'x', '<xml/>', {
+    process: 'process', jobs: [], jobCompletionOrder: [],
+    userTasks: [], userTaskCompletionOrder: [],
+    messageCorrelation: [], timerTicks: [], needs: [],
+  });
+  assert.equal(r.status, 'unverified');
+  assert.equal(r.detail, 'instance-did-not-complete');
+});
+
+test('runScenario routes a call-activity scenario to out-of-scope (driver capability)', async () => {
+  const { runScenario } = await import('./run.mjs');
+  class Eng {
+    deploy() { return '{}'; }
+    free() {}
+  }
+  const r = runScenario(Eng, 'x', '<xml/>', {
+    process: 'root', jobs: [], jobCompletionOrder: [],
+    userTasks: [], userTaskCompletionOrder: [],
+    messageCorrelation: [], timerTicks: [], needs: ['call-activity'],
+  });
+  assert.equal(r.status, 'out-of-scope');
+  assert.match(r.detail, /driver-capability: call-activity/);
+});
+
 // --- canonicaliseXml ---------------------------------------------------------
 
 test('canonicaliseXml rewrites random-UUID ids deterministically', () => {

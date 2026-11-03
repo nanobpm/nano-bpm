@@ -38,6 +38,8 @@ export class NormaliseError extends Error {}
 // ---------------------------------------------------------------------------
 
 // BPMN flow-node tag -> the coverage-matrix element cell + the scenario kind.
+// NOTE: 'task' here means "task-shaped graph node", NOT "job-producing". Only
+// the tags in JOB_TASK_TAGS actually activate a job Nano's runner can complete.
 const ELEMENT_TAGS = {
   startEvent: 'start', endEvent: 'end',
   serviceTask: 'task', sendTask: 'task', receiveTask: 'task',
@@ -49,6 +51,18 @@ const ELEMENT_TAGS = {
   boundaryEvent: 'boundary',
   subProcess: 'subProcess', adHocSubProcess: 'adHocSubProcess',
 };
+
+// The tags Nano executes as a JOB (a `zeebe:taskDefinition`-driven work step the
+// runner completes with completeJob): service/send/business-rule/script tasks
+// (engine-core/src/bpmn/walk.rs models all four as NodeKind::Service). Every
+// other task-shaped element is NOT a job:
+//   * userTask      — parks a USER task (snap.userTasks, completed via
+//                     completeUserTask), never appears in snap.jobs;
+//   * callActivity  — starts a child process instance, produces no job;
+//   * task/manualTask/receiveTask — pass-through (no execution semantics).
+// Deriving a job for any of these makes the runner stop on
+// `expected-job-not-created` — a driver error, not a parity signal.
+const JOB_TASK_TAGS = new Set(['serviceTask', 'sendTask', 'businessRuleTask', 'scriptTask']);
 
 // BPMN element tag -> the Zeebe BpmnElementType name used in coverage cells.
 const ELEMENT_CELL = {
@@ -158,8 +172,10 @@ export function scenarioFor(graph) {
   }
 
   const jobs = order
-    .filter((id) => graph.nodes[id] === 'task')
+    .filter((id) => graph.nodes[id] === 'task' && JOB_TASK_TAGS.has(graph.nodes[`__tag:${id}`]))
     .map((id) => ({ element: id, jobType: graph.jobTypes[id] ?? id }));
+  const userTasks = order
+    .filter((id) => graph.nodes[`__tag:${id}`] === 'userTask');
 
   // Driver capabilities the scenario needs beyond "complete each Created job
   // with empty variables". A model that carries any of these cannot be driven
@@ -173,12 +189,20 @@ export function scenarioFor(graph) {
   if (nodeSet.includes('intermediateCatch') || nodeSet.includes('boundary')) needs.push('catch-event');
   if (nodeSet.includes('subProcess') || nodeSet.includes('adHocSubProcess')) needs.push('sub-process');
   if (Object.keys(graph.events).length > 0) needs.push('event-definition');
+  // A call activity starts a child process instance; this slice's runner deploys
+  // only the harvested model, so the callee is never present. Tag the driver
+  // capability rather than schedule a `call` job that can never exist.
+  if (nodeIds.some((id) => graph.nodes[`__tag:${id}`] === 'callActivity')) needs.push('call-activity');
 
   const scenario = {
     generated: 'formal/harvest/normalise.mjs',
     process: graph.processId,
     jobs,
     jobCompletionOrder: jobs.map((j) => j.element),
+    // User tasks the runner must complete via completeUserTask (they park in
+    // snap.userTasks, never in snap.jobs), in topological order.
+    userTasks,
+    userTaskCompletionOrder: userTasks,
     messageCorrelation: [],
     timerTicks: [],
     // The driver capabilities this scenario assumes. Empty = the happy-path

@@ -40,15 +40,19 @@ test('buildReport aggregates the four acceptance counts', () => {
   writeFileSync(join(dir, 'unparseable.json'), JSON.stringify([{ id: 'd' }, { id: 'e' }]));
   writeFileSync(join(dir, 'run-results.json'), JSON.stringify([
     { id: 'a', processId: 'p', status: 'runnable', detail: 'completed-cleanly' },
-    { id: 'b', processId: 'p', status: 'diverging', detail: 'instance-did-not-complete' },
+    { id: 'b', processId: 'p', status: 'unverified', detail: 'instance-did-not-complete' },
   ]));
   const report = buildReport(dir);
   assert.equal(report.counts.scannedFiles, 10);
   assert.equal(report.counts.harvested, 5);
   assert.equal(report.counts.runnable, 1);
-  assert.equal(report.counts.diverging, 1);
+  assert.equal(report.counts.unverified, 1);
   // out-of-scope = unparseable(2) + normalise(1) + run(0)
   assert.equal(report.counts.outOfScope, 3);
-  assert.equal(report.diverging.length, 1);
-  assert.equal(report.diverging[0].processId, 'p');
+  assert.equal(report.unverified.length, 1);
+  assert.equal(report.unverified[0].processId, 'p');
+  // A non-clean Nano run is never labelled a parity divergence: the report has
+  // no `diverging` field at all (#1397 review — no Zeebe oracle is harvested).
+  assert.ok(!('diverging' in report));
+  assert.ok(!('diverging' in report.counts));
 });
