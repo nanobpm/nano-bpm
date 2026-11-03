@@ -73,6 +73,25 @@ pub fn eval_string(expr: &str, ctx: &HashMap<String, Value>) -> Result<String, F
     })
 }
 
+/// Evaluates a FEEL expression that must produce a **string**, with no
+/// coercion — the strict form of [`eval_string`] for contexts where Zeebe
+/// requires the result to BE a string (a `zeebe:taskDefinition` job type:
+/// `BpmnJobBehavior.evalTypeExp` raises `EXTRACT_VALUE_ERROR` on a non-string
+/// result rather than rendering it). Unlike [`eval_string`], which renders
+/// numbers, booleans, lists and temporal values to their FEEL text, this
+/// accepts only a genuine string result; anything else — including the
+/// temporals that [`value::FeelVal::into_value`] would convert to a string at
+/// the API boundary — is an error naming the actual result type.
+pub fn eval_strict_string(expr: &str, ctx: &HashMap<String, Value>) -> Result<String, FeelError> {
+    match evaluate(expr, ctx)? {
+        value::FeelVal::Str(s) => Ok(s),
+        other => Err(FeelError(format!(
+            "expected a string result, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
 /// Evaluates a FEEL expression expecting a boolean result (a sequence-flow
 /// condition). A non-boolean result is an error.
 pub fn eval_bool(expr: &str, ctx: &HashMap<String, Value>) -> Result<bool, FeelError> {
