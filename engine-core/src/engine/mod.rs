@@ -3074,11 +3074,20 @@ impl Engine {
                             // variables — a clean retry. The incident sits on the
                             // CONTAINER (activation happens before the child
                             // exists), so `element_instance_key` is the container.
+                            // The seed is overlaid with the operator's
+                            // post-incident scope corrections (see
+                            // [`Self::adhoc_tool_redrive_seed`]) so a seed value
+                            // that IS the failure can be corrected.
+                            let variables = self.adhoc_tool_redrive_seed(
+                                instance_key,
+                                element_instance_key,
+                                variables.clone(),
+                            );
                             queue.push_back(Step::ActivateAdHocTool {
                                 instance_key,
                                 container_key: element_instance_key,
                                 element_id: tool_element_id.clone(),
-                                variables: variables.clone(),
+                                variables,
                             });
                         } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
                             precomputed_output,
@@ -3281,7 +3290,9 @@ impl Engine {
                                     element_id,
                                 })),
                             // Ad-hoc tool job-type failure (#1390): re-activate the
-                            // tool with its preserved seed. (Surfaces as
+                            // tool with its preserved seed, overlaid with the
+                            // operator's post-incident scope corrections (see
+                            // [`Self::adhoc_tool_redrive_seed`]). (Surfaces as
                             // `ExtractValueError`, handled above; this arm keeps the
                             // `IoMapping` match exhaustive.)
                             Some(state::IoMappingRedrive::AdHocToolJobType {
@@ -3291,7 +3302,11 @@ impl Engine {
                                 instance_key,
                                 container_key: element_instance_key,
                                 element_id: tool_element_id,
-                                variables,
+                                variables: self.adhoc_tool_redrive_seed(
+                                    instance_key,
+                                    element_instance_key,
+                                    variables,
+                                ),
                             }),
                             // Call-activity output: re-project the captured child
                             // result through the output mappings and complete.
@@ -8175,55 +8190,52 @@ impl Engine {
         // A nested DECLARATIVE (BPMN_TASK) container creates no agent job, so
         // its catalog job type (falling back to its element id) is never used
         // and must not be validated.
+        //
+        // The expression is resolved ONCE here and the resolved value threaded
+        // into the job-minting branches below: re-evaluating it after the
+        // child-creation events are queued would let a non-deterministic
+        // expression pass this gate and fail the second evaluation, stranding a
+        // created child with `redrive: None`.
         let nested_is_declarative = self
             .adhoc_def_of(instance_key, &element_id)
             .is_some_and(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask);
-        if let (false, Some(crate::model::AdHocToolKind::ServiceTask { job_type })) =
-            (nested_is_declarative, &tool_kind)
-        {
-            if let Err(reason) = self.resolve_job_type(&child_vars, job_type) {
-                let event = self.extract_value_incident(
-                    instance_key,
-                    container_key,
-                    container_element_id.clone().unwrap_or_default(),
-                    reason,
-                    Some(state::IoMappingRedrive::AdHocToolJobType {
-                        element_id: element_id.clone(),
-                        variables: redrive_seed.clone(),
-                    }),
-                );
-                return (vec![event], Vec::new());
-            }
-        }
-        // A nested AGENTIC container whose catalog entry is missing (or not a
-        // service-task kind) falls back to the element id as its job type (see
-        // the nested branch below); validate that fallback up front too, with
-        // the same nothing-created clean-retry shape.
-        let nested_agentic_fallback_type = if self.adhoc_def_of(instance_key, &element_id).is_some()
-            && !nested_is_declarative
-            && !matches!(
-                tool_kind,
-                Some(crate::model::AdHocToolKind::ServiceTask { .. })
-            ) {
-            Some(element_id.clone())
-        } else {
+        let resolved_tool_job_type = if nested_is_declarative {
             None
-        };
-        if let Some(raw_type) = nested_agentic_fallback_type {
-            if let Err(reason) = self.resolve_job_type(&child_vars, &raw_type) {
-                let event = self.extract_value_incident(
-                    instance_key,
-                    container_key,
-                    container_element_id.clone().unwrap_or_default(),
-                    reason,
-                    Some(state::IoMappingRedrive::AdHocToolJobType {
-                        element_id: element_id.clone(),
-                        variables: redrive_seed.clone(),
-                    }),
-                );
-                return (vec![event], Vec::new());
+        } else {
+            // A nested AGENTIC container whose catalog entry is missing (or not
+            // a service-task kind) falls back to the element id as its job type
+            // (see the nested branch below); a non-service-task leaf tool (user
+            // task, subProcess, callActivity, pass-through) mints no job and
+            // resolves no type.
+            let raw_type = match &tool_kind {
+                Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => {
+                    Some(job_type.clone())
+                }
+                _ if self.adhoc_def_of(instance_key, &element_id).is_some() => {
+                    Some(element_id.clone())
+                }
+                _ => None,
+            };
+            match raw_type {
+                Some(raw_type) => match self.resolve_job_type(&child_vars, &raw_type) {
+                    Ok(resolved) => Some(resolved),
+                    Err(reason) => {
+                        let event = self.extract_value_incident(
+                            instance_key,
+                            container_key,
+                            container_element_id.clone().unwrap_or_default(),
+                            reason,
+                            Some(state::IoMappingRedrive::AdHocToolJobType {
+                                element_id: element_id.clone(),
+                                variables: redrive_seed.clone(),
+                            }),
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                },
+                None => None,
             }
-        }
+        };
 
         let mut events = vec![
             Event::ElementActivating {
@@ -8327,29 +8339,11 @@ impl Engine {
                         Value::List(Self::advertised_adhoc_catalog(&nested_def)),
                     )]),
                 });
-                let job_type = match &tool_kind {
-                    Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => job_type.clone(),
-                    _ => element_id.clone(),
-                };
-                let job_type = match self.resolve_job_type(&child_vars, &job_type) {
-                    Ok(job_type) => job_type,
-                    Err(reason) => {
-                        // #1390: a failed nested-container job-type expression
-                        // parks the tool child on an EXTRACT_VALUE_ERROR
-                        // incident — no agent job; the parent container keeps
-                        // waiting for the child. Unreachable on a first pass (the
-                        // same expression was validated before any child-creation
-                        // side effect above); kept for the resolve-time retry,
-                        // where the operator may have introduced a new failure.
-                        events.push(self.extract_value_incident(
-                            instance_key,
-                            child_key,
-                            element_id,
-                            reason,
-                            None,
-                        ));
-                        return (events, followups);
-                    }
+                // Resolved once, before any child-creation side effect (above) —
+                // a nested agentic container always carries `Some` here, so the
+                // type is never re-evaluated against a possibly-changed view.
+                let Some(job_type) = resolved_tool_job_type.clone() else {
+                    unreachable!("nested agentic container resolved its job type above");
                 };
                 let job_key = self.mint_key();
                 let priority = self.resolve_priority(&child_vars, None);
@@ -8369,25 +8363,12 @@ impl Engine {
         }
 
         match tool_kind {
-            Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => {
-                let job_type = match self.resolve_job_type(&child_vars, &job_type) {
-                    Ok(job_type) => job_type,
-                    Err(reason) => {
-                        // #1390: a failed tool job-type expression parks the tool
-                        // child on an EXTRACT_VALUE_ERROR incident — no job; the
-                        // container keeps waiting for the child. Unreachable on a
-                        // first pass (validated before any child-creation side
-                        // effect above); kept for the resolve-time retry, where
-                        // the operator may have introduced a new failure.
-                        events.push(self.extract_value_incident(
-                            instance_key,
-                            child_key,
-                            element_id,
-                            reason,
-                            None,
-                        ));
-                        return (events, followups);
-                    }
+            Some(crate::model::AdHocToolKind::ServiceTask { .. }) => {
+                // Resolved once, before any child-creation side effect (above) —
+                // a service-task tool always carries `Some` here, so the type is
+                // never re-evaluated against a possibly-changed view.
+                let Some(job_type) = resolved_tool_job_type else {
+                    unreachable!("service-task tool resolved its job type above");
                 };
                 let job_key = self.mint_key();
                 let priority = self.resolve_priority(&child_vars, None);
@@ -8864,6 +8845,17 @@ impl Engine {
             AdHocPostTool::Continue => {}
         }
         if others == 0 {
+            // A sibling tool whose activation failed before its child was created
+            // (#1390) never entered the active set, so the set can drain while
+            // its incident parks on the container. Do NOT treat that as "the
+            // turn drained": re-emitting the agent job (or completing a
+            // declarative container) would let the agent complete the container
+            // — or complete it directly — out from under the parked retry,
+            // destroying the state its `AdHocToolJobType` redrive needs. Park
+            // until the incident is resolved; resolution re-drives the tool.
+            if self.adhoc_container_blocked_by_incident(instance_key, container_key) {
+                return (events, Vec::new());
+            }
             // The declarative (BPMN_TASK) variant activates its collection once
             // and completes when those elements drain — there is no agent to
             // re-emit a job for (ADR 0023 v1.1). The agentic (JOB_WORKER) variant
@@ -9165,6 +9157,87 @@ impl Engine {
             })
     }
 
+    /// The redrive seed for a failed ad-hoc tool activation
+    /// ([`state::IoMappingRedrive::AdHocToolJobType`]) overlaid with the
+    /// operator's corrections — the `SetVariables` written since the incident was
+    /// raised, which Zeebe propagation lands in the nearest scope defining each
+    /// name (the container scope, an ancestor, or the root). Without the overlay
+    /// a seed value that IS the failure (`=toolType` seeded `toolType = 42` by
+    /// the agent) shadows the corrected variable forever: the retry re-applies
+    /// the seed and fails again with no scope the operator could ever edit.
+    /// Writes that post-date the seed are the correction channel, so they win
+    /// over the frozen seed; the seed still supplies everything the operator did
+    /// not touch.
+    fn adhoc_tool_redrive_seed(
+        &self,
+        instance_key: Key,
+        container_key: Key,
+        seed: HashMap<String, Value>,
+    ) -> HashMap<String, Value> {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return seed;
+        };
+        let mut overlay: HashMap<String, Value> = HashMap::new();
+        let mut cur = self.variable_scope_of(instance, container_key);
+        loop {
+            let scope_vars = if cur == 0 || cur == instance.key {
+                Some(instance.variables.as_ref())
+            } else {
+                instance.scope_variables.get(&cur)
+            };
+            if let Some(vars) = scope_vars {
+                for (name, value) in vars {
+                    // Nearest scope wins; a name already taken from a nearer
+                    // scope is not overwritten by an ancestor.
+                    overlay.entry(name.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            if cur == 0 || cur == instance.key {
+                break;
+            }
+            // `scope_parents` records `0` for a scope hanging straight off the
+            // root (the root is implicit); any unregistered key also ends the
+            // walk at the root, which the next iteration visits.
+            cur = instance.scope_parents.get(&cur).copied().unwrap_or(0);
+        }
+        // The frozen seed shadows the whole scope chain on a read, so a
+        // correction can only win by coming through this overlay: the scope
+        // chain's current values take precedence, and the seed fills in only
+        // what no scope holds.
+        let mut merged = overlay;
+        for (name, value) in seed {
+            merged.entry(name).or_insert(value);
+        }
+        merged
+    }
+
+    /// `true` while an ACTIVE incident parks on this ad-hoc container element
+    /// instance (e.g. a tool whose job-type expression failed before its child
+    /// was created — #1390). Such a tool is outstanding work that never entered
+    /// the container's `active` set, so natural advancement (re-emitting the
+    /// agent job when the active set drains, or completing a declarative
+    /// container) must not proceed while its incident is unresolved: a re-minted
+    /// agent could complete the container out from under the parked retry, and
+    /// completing the container destroys the state the retry needs.
+    fn adhoc_container_blocked_by_incident(&self, instance_key: Key, container_key: Key) -> bool {
+        self.state
+            .instances
+            .get(&instance_key)
+            .map(|i| {
+                i.incidents.iter().any(|k| {
+                    self.state
+                        .incidents
+                        .get(k)
+                        .map(|inc| {
+                            inc.state == state::IncidentState::Active
+                                && inc.element_instance_key == container_key
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Completes an ad-hoc container (ADR 0023 seam 2): when `cancel`, cancels any
     /// tool children still running; writes the aggregated `outputCollection` into
     /// the enclosing (flow) scope; drops the container's runtime state; and takes
@@ -9189,6 +9262,20 @@ impl Engine {
             None => return (Vec::new(), Vec::new()),
         };
         let scope = self.scope_of(instance_key, container_key);
+
+        // A NATURAL completion must not advance the container while an active
+        // incident parks on it: a tool whose activation failed before its child
+        // was created (#1390, e.g. a bad job-type expression) is outstanding
+        // work that never entered the `active` set, so the set can drain (or an
+        // agent can signal completion) while the failure is unresolved.
+        // Completing here would tear down the container state the incident's
+        // `AdHocToolJobType` redrive needs to retry the tool. Park instead; the
+        // incident's resolution re-drives the container. An explicit `cancel`
+        // (agent `cancelRemainingInstances`, MI cancel-remaining, terminate)
+        // still proceeds — it is the sanctioned way out of a parked container.
+        if !cancel && self.adhoc_container_blocked_by_incident(instance_key, container_key) {
+            return (Vec::new(), Vec::new());
+        }
 
         // A JOB_WORKER ad-hoc container that is a MULTI-INSTANCE child (its token
         // parks in an MI body whose loop element is this container): its

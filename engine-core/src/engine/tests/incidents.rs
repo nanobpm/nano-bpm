@@ -3037,3 +3037,302 @@ fn nested_declarative_adhoc_with_long_id_is_not_job_type_validated() {
         "the nested declarative container activated its collection",
     );
 }
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_tool_job_type_redrive_applies_scope_corrections_over_the_frozen_seed() {
+    // #1390 review: when the invalid type came from the ACTIVATION SEED (the
+    // agent passed `toolType = 42` in the activate-element variables), the
+    // frozen redrive seed shadows the operator's `SetVariables` correction on
+    // the container scope — the seed was captured before any scope write could
+    // exist. The redrive must overlay the incident scope's (later) writes onto
+    // the seed so the correction wins; otherwise the retry re-applies `42`
+    // forever and the incident can never be cleared.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+
+    // The agent activates toolA with a seed whose `toolType` is a NUMBER: the
+    // job-type expression fails on the seed value itself.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element_with(
+                    "toolA",
+                    &[("toolType", Value::Int(42))],
+                )],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the seed's non-string type fails");
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    let incident_key = active[0].key;
+
+    // The operator corrects `toolType` on the container scope and resolves:
+    // the retry must see the correction, not the frozen seed's `42`.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the corrected scope variable wins over the frozen seed: {:?}",
+        engine.active_incidents()
+    );
+    let jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the retried tool minted its job under the corrected type",
+    );
+    assert_eq!(jobs[0].element_id, "toolA");
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_tool_job_type_incident_blocks_agent_job_reemit_until_resolved() {
+    // #1390 review: a tool whose activation failed before its child was created
+    // never entered the container's active set, so completing the turn's OTHER
+    // tool drains the set and would re-emit the agent job — letting the agent
+    // complete the container out from under the parked retry. The container
+    // must park (no new agent job) while the incident is unresolved.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="work-b" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+
+    // The agent activates toolA (whose type expression fails) and toolB (fine)
+    // in one turn.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(engine.active_incidents().len(), 1);
+    let incident_key = engine.active_incidents()[0].key;
+
+    // Completing toolB drains the active set — but the container must NOT
+    // re-emit its agent job while toolA's incident is unresolved.
+    let tool_b = engine
+        .activate_jobs("work-b", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolB")
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job_with_result(
+            tool_b.key,
+            HashMap::from([("result".to_string(), Value::Int(1))]),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no new agent turn while the failed tool's incident is unresolved",
+    );
+    assert!(!engine.state().instances.is_empty());
+
+    // Resolve (with the type fixed): the failed tool re-activates, and once it
+    // drains the agent job is re-emitted for the next turn.
+    engine
+        .apply_command(Command::set_variables(
+            engine.state().instances.keys().copied().next().unwrap(),
+            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let tool_a = engine
+        .activate_jobs("work-a", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("resolving re-activated toolA");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            tool_a.key,
+            HashMap::from([("result".to_string(), Value::Int(2))]),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .len(),
+        1,
+        "once the incident is resolved and the retried tool drains, the next agent turn is emitted",
+    );
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_resolved() {
+    // #1390 review: in a DECLARATIVE (BPMN_TASK) container, a tool whose
+    // activation failed before its child was created is not in the active set,
+    // so the collection draining would complete the container and destroy the
+    // state the incident's redrive needs. Completion must park until the
+    // incident is resolved.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:adHoc activeElementsCollection="=[&quot;toolA&quot;, &quot;toolB&quot;]" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="work-b" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    // toolA's type expression fails on activation; toolB activates fine.
+    assert_eq!(engine.active_incidents().len(), 1);
+    let incident_key = engine.active_incidents()[0].key;
+    let tool_b = engine
+        .activate_jobs("work-b", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolB")
+        .unwrap();
+
+    // Draining the collection (toolB completes) must NOT complete the
+    // container while toolA's incident is unresolved.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            tool_b.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert!(
+        !engine.is_completed(inst),
+        "the declarative container parks on the failed tool's incident",
+    );
+
+    // Fix the type and resolve: toolA re-activates, and completing it lets the
+    // container (and the instance) complete.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let tool_a = engine
+        .activate_jobs("work-a", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("resolving re-activated toolA");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            tool_a.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "once the retried tool drains, the declarative container completes",
+    );
+}
