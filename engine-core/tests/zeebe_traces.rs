@@ -26,7 +26,9 @@ use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::xml::{local_name, tokenize, Token};
-use nanobpmn_engine_core::{Command, Engine, EngineError, Event, IncidentKind, Key, Value};
+use nanobpmn_engine_core::{
+    Command, Engine, EngineError, Event, IncidentKind, JobActivationOptions, Key, Value,
+};
 use serde_json::{json, Map, Value as J};
 
 fn traces_dir() -> PathBuf {
@@ -342,7 +344,15 @@ struct NanoRun<'a> {
     sc: &'a Scenario,
     engine: Engine,
     now: u64,
+    /// The script's target instance: the instance the most recent explicit
+    /// `createInstance` step created. `updateVariables` aims at it, mirroring
+    /// the Java runner, which keeps the key its create command returned. A
+    /// call-activity child (`parent_process_instance_key.is_some()`) is NOT
+    /// adopted — it is spawned by the engine, not by a script step.
     instance: Key,
+    /// The process id of the script's target instance. Kept in sync with
+    /// `instance`; completion/variable labels resolve through `element_ids`
+    /// instead, so a spawned child never relabels the parent's records.
     process_id: String,
     element_ids: HashMap<Key, String>,
     jobs_by_type: HashMap<String, Key>,
@@ -398,6 +408,21 @@ impl<'a> NanoRun<'a> {
         self.engine.apply_command_at(cmd, self.now)
     }
 
+    /// Activate exactly the job the script step selected. `jobs_by_type` tracks
+    /// the NEWEST job of a type, but a type-based `ActivateJobs` hands out the
+    /// OLDEST activatable one — with two live jobs of one type the completion
+    /// then targets a job that was never activated (`JobNotActivated`).
+    fn activate_selected(&mut self, key: Key) -> Vec<Event> {
+        let act = Command::activate_jobs_by_key(
+            vec![key],
+            "trace-runner",
+            300_000,
+            self.now,
+            JobActivationOptions::default(),
+        );
+        self.apply(act).expect("activate jobs")
+    }
+
     /// Execute one script step; returns its RAW records.
     fn step(&mut self, step: &J) -> Vec<J> {
         let op = step["op"].as_str().expect("op");
@@ -413,8 +438,7 @@ impl<'a> NanoRun<'a> {
                 let key = Self::key(&self.jobs_by_type, &ty, "job of type");
                 let mut events = Vec::new();
                 if !reject {
-                    let act = Command::activate_jobs(ty, "trace-runner", 1, 300_000, self.now);
-                    events.extend(self.apply(act).expect("activate jobs"));
+                    events.extend(self.activate_selected(key));
                 }
                 self.apply(Command::complete_job_with(key, vars)).map(|e| {
                     events.extend(e);
@@ -424,8 +448,7 @@ impl<'a> NanoRun<'a> {
             "failJob" => {
                 let ty = step["jobType"].as_str().expect("jobType").to_string();
                 let key = Self::key(&self.jobs_by_type, &ty, "job of type");
-                let act = Command::activate_jobs(ty, "trace-runner", 1, 300_000, self.now);
-                let mut events = self.apply(act).expect("activate jobs");
+                let mut events = self.activate_selected(key);
                 let retries = step["retries"].as_i64().expect("retries") as i32;
                 let msg = step["errorMessage"].as_str().unwrap_or_default();
                 self.apply(Command::fail_job(key, retries, msg)).map(|e| {
@@ -525,10 +548,18 @@ impl<'a> NanoRun<'a> {
                 instance_key,
                 process_id,
                 variables,
+                parent_process_instance_key,
                 ..
             } => {
-                self.instance = *instance_key;
-                self.process_id = process_id.clone();
+                // Only an explicit `createInstance` step moves the script's
+                // target. A call-activity child (has a parent) is spawned by
+                // the engine; adopting it would redirect a later
+                // `updateVariables` to the child while the Java runner keeps
+                // targeting the key its create command returned.
+                if parent_process_instance_key.is_none() {
+                    self.instance = *instance_key;
+                    self.process_id = process_id.clone();
+                }
                 self.element_ids.insert(*instance_key, process_id.clone());
                 let mut out = vec![
                     self.lifecycle("ELEMENT_ACTIVATING", process_id),
@@ -537,8 +568,15 @@ impl<'a> NanoRun<'a> {
                 out.extend(self.variable_records(*instance_key, process_id.clone(), variables));
                 out
             }
-            Event::ProcessInstanceCompleted { .. } => {
-                let pid = self.process_id.clone();
+            Event::ProcessInstanceCompleted { instance_key } => {
+                // Label with the COMPLETED instance's process, not the
+                // last-created one: a call-activity child created after the
+                // parent must not relabel the parent's completion.
+                let pid = self
+                    .element_ids
+                    .get(instance_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{instance_key}"));
                 vec![
                     self.lifecycle("ELEMENT_COMPLETING", &pid),
                     self.lifecycle("ELEMENT_COMPLETED", &pid),
@@ -575,9 +613,21 @@ impl<'a> NanoRun<'a> {
                     json!({"elementId": id, "bpmnElementType": "SEQUENCE_FLOW"}),
                 )]
             }
-            Event::VariablesUpdated { variables, .. } => {
-                let pid = self.process_id.clone();
-                self.variable_records(self.instance, pid, variables)
+            Event::VariablesUpdated {
+                instance_key,
+                variables,
+            } => {
+                // Use the event's OWN instance key for both the known-variable
+                // set and the scope label: the script target may be a
+                // different instance (e.g. message correlation updates A
+                // while B was created last), and A's variables are CREATED in
+                // A's scope regardless of what B already holds.
+                let pid = self
+                    .element_ids
+                    .get(instance_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{instance_key}"));
+                self.variable_records(*instance_key, pid, variables)
             }
             Event::ScopedVariablesUpdated {
                 scope_key,
@@ -1187,4 +1237,323 @@ fn cell_id_grammar() {
     ] {
         assert!(!well_formed_cell(bad), "{bad}");
     }
+}
+
+// ───────────────────────────── adapter regressions ──────────────────────────────
+
+/// Write a scratch scenario (model + script) into a unique temp dir and run it
+/// through the adapter. The inline models carry DI because `load_scenario`
+/// enforces it (AGENTS.md); these tests exercise the runner's command/event
+/// correlation, not the loader.
+fn run_scratch(tag: &str, xml: &str, script: &str) -> Vec<J> {
+    let tmp = std::env::temp_dir().join(format!(
+        "nano-trace-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::create_dir_all(&tmp).unwrap();
+    fs::write(tmp.join("process.bpmn"), xml).unwrap();
+    fs::write(tmp.join("script.json"), script).unwrap();
+    let sc = load_scenario(&tmp).unwrap_or_else(|e| panic!("{e}"));
+    let trace = nano_trace(&load_spec(), &sc);
+    fs::remove_dir_all(&tmp).unwrap();
+    trace
+}
+
+/// Records of one step carrying `valueType`/`intent`.
+fn records_of<'a>(step: &'a J, value_type: &str, intent: &str) -> Vec<&'a J> {
+    step["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["valueType"] == value_type && r["intent"] == intent)
+        .collect()
+}
+
+/// A two-service-task model whose tasks share the job type `work`.
+const TWO_TASKS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_two_tasks" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="two-tasks" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="taskA">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" retries="3" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:serviceTask id="taskB">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" retries="3" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="taskA" />
+    <bpmn:sequenceFlow id="f2" sourceRef="taskA" targetRef="taskB" />
+    <bpmn:sequenceFlow id="f3" sourceRef="taskB" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="two-tasks">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="taskA_di" bpmnElement="taskA">
+        <dc:Bounds x="250" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="taskB_di" bpmnElement="taskB">
+        <dc:Bounds x="410" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="570" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="250" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="350" y="118" />
+        <di:waypoint x="410" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="510" y="118" />
+        <di:waypoint x="570" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
+
+/// A call-activity parent (`caller`) invoking a trivial child (`child`). The
+/// default `propagateAllParentVariables` copies the parent's variables into
+/// the child at spawn, so the child creation carries `x`.
+const CALL_ACTIVITY_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_call" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="caller" isExecutable="true">
+    <bpmn:startEvent id="pstart" />
+    <bpmn:callActivity id="call">
+      <bpmn:extensionElements>
+        <zeebe:calledElement processId="child" />
+      </bpmn:extensionElements>
+    </bpmn:callActivity>
+    <bpmn:endEvent id="pend" />
+    <bpmn:sequenceFlow id="pf1" sourceRef="pstart" targetRef="call" />
+    <bpmn:sequenceFlow id="pf2" sourceRef="call" targetRef="pend" />
+  </bpmn:process>
+  <bpmn:process id="child" isExecutable="true">
+    <bpmn:startEvent id="cstart" />
+    <bpmn:endEvent id="cend" />
+    <bpmn:sequenceFlow id="cf1" sourceRef="cstart" targetRef="cend" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="caller">
+      <bpmndi:BPMNShape id="pstart_di" bpmnElement="pstart">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="call_di" bpmnElement="call">
+        <dc:Bounds x="250" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="pend_di" bpmnElement="pend">
+        <dc:Bounds x="412" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="pf1_di" bpmnElement="pf1">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="250" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="pf2_di" bpmnElement="pf2">
+        <di:waypoint x="350" y="118" />
+        <di:waypoint x="412" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+    <bpmndi:BPMNPlane id="BPMNPlane_2" bpmnElement="child">
+      <bpmndi:BPMNShape id="cstart_di" bpmnElement="cstart">
+        <dc:Bounds x="160" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="cend_di" bpmnElement="cend">
+        <dc:Bounds x="412" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="cf1_di" bpmnElement="cf1">
+        <di:waypoint x="196" y="318" />
+        <di:waypoint x="412" y="318" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
+
+/// A message-catch model: start → catch `go` (correlation `k`) → end.
+const MESSAGE_CATCH_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_msg" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="msg-catch" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:intermediateCatchEvent id="catch">
+      <bpmn:messageEventDefinition messageRef="m" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="catch" />
+    <bpmn:sequenceFlow id="f2" sourceRef="catch" targetRef="end" />
+    <bpmn:message id="m" name="go">
+      <bpmn:extensionElements>
+        <zeebe:subscription correlationKey="k" />
+      </bpmn:extensionElements>
+    </bpmn:message>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="msg-catch">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="catch_di" bpmnElement="catch">
+        <dc:Bounds x="250" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="412" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="250" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="286" y="118" />
+        <di:waypoint x="412" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
+
+/// With two live jobs of one type, completing the NEWEST must not fail with
+/// `JobNotActivated`: the adapter activates exactly the selected key (a
+/// type-based activation hands out the OLDEST job, so completion of the
+/// newest then rejected).
+#[test]
+fn complete_job_activates_the_selected_key() {
+    let trace = run_scratch(
+        "jobsel",
+        TWO_TASKS_XML,
+        r#"{"description": "two live jobs, one type", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "two-tasks"},
+            {"op": "createInstance", "bpmnProcessId": "two-tasks"},
+            {"op": "completeJob", "jobType": "work"}
+        ]}"#,
+    );
+    let step = &trace[2];
+    assert!(
+        records_of(step, "JOB", "COMPLETED").len() == 1,
+        "the selected job must complete: {}",
+        step
+    );
+    assert!(
+        step["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["recordType"] != "COMMAND_REJECTION"),
+        "no rejection expected: {step}"
+    );
+}
+
+/// A call-activity child is spawned by the engine, not by a script step: it
+/// must not become the script's target instance. A later `updateVariables`
+/// still targets the PARENT (as the Java runner does with the key its create
+/// command returned), so the parent's `x` renders UPDATED in the caller's
+/// scope — not CREATED against the child.
+#[test]
+fn spawned_child_does_not_steal_the_script_target() {
+    let trace = run_scratch(
+        "childtarget",
+        CALL_ACTIVITY_XML,
+        r#"{"description": "call activity target", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "caller", "variables": {"x": 1}},
+            {"op": "updateVariables", "variables": {"x": 2}}
+        ]}"#,
+    );
+    let step = &trace[1];
+    let vars = records_of(step, "VARIABLE", "UPDATED");
+    assert_eq!(vars.len(), 1, "parent x must be UPDATED: {step}");
+    assert_eq!(
+        vars[0]["scopeElementId"], "caller",
+        "the update lands on the parent instance: {step}"
+    );
+}
+
+/// Completion is labelled with the COMPLETED instance's process: after a call
+/// activity spawns `child`, the parent's later completion still renders as
+/// `caller`, not as the most recently created process.
+#[test]
+fn completion_is_labelled_with_the_completed_instance() {
+    let trace = run_scratch(
+        "completelabel",
+        CALL_ACTIVITY_XML,
+        r#"{"description": "call activity completion label", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "caller"}
+        ]}"#,
+    );
+    let step = &trace[0];
+    let completing: Vec<&J> = step["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["valueType"] == "PROCESS_INSTANCE" && r["intent"] == "ELEMENT_COMPLETING")
+        .collect();
+    // Normalised records carry the value's fields at the top level.
+    let labels: BTreeSet<String> = completing
+        .iter()
+        .map(|r| r["elementId"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        labels.contains("caller"),
+        "the parent's completion must be labelled `caller`, got {labels:?}: {step}"
+    );
+    assert!(
+        labels.contains("child"),
+        "the child's completion must be labelled `child`, got {labels:?}: {step}"
+    );
+}
+
+/// `VariablesUpdated` is keyed by the EVENT's instance, not the script's
+/// last-created one: message-correlating `paid` into instance A renders
+/// CREATED in A's scope even though B (created later, holding `paid`) is the
+/// current script target.
+#[test]
+fn variables_updated_uses_the_events_instance_key() {
+    let trace = run_scratch(
+        "msgvars",
+        MESSAGE_CATCH_XML,
+        r#"{"description": "message vars land on the correlated instance", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "msg-catch", "variables": {"k": "a"}},
+            {"op": "createInstance", "bpmnProcessId": "msg-catch", "variables": {"k": "b", "paid": false}},
+            {"op": "publishMessage", "name": "go", "correlationKey": "a", "variables": {"paid": true}}
+        ]}"#,
+    );
+    let step = &trace[2];
+    let vars: Vec<&J> = step["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        // Normalised VARIABLE records keep `intent` and the value's `name` at
+        // the top level (the normaliser flattens the selected fields).
+        .filter(|r| r["valueType"] == "VARIABLE" && r["name"] == "paid")
+        .collect();
+    assert_eq!(vars.len(), 1, "one paid record expected: {step}");
+    assert_eq!(
+        vars[0]["intent"], "CREATED",
+        "paid is new in A's scope even though B already holds it: {step}"
+    );
+    assert_eq!(
+        vars[0]["scopeElementId"], "msg-catch",
+        "labelled with A's process: {step}"
+    );
 }
