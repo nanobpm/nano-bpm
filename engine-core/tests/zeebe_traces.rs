@@ -1,0 +1,1121 @@
+//! Zeebe differential-trace runner (epic #1391, step 1 — the core guarantee).
+//!
+//! Every scenario under `formal/traces/scenarios/<name>/` (a DI-bearing
+//! `process.bpmn` + a `script.json` command script) is executed on
+//! engine-core, its events are rendered as RAW Zeebe-shaped records, and those
+//! are normalised by THE shared normaliser spec `formal/traces/normaliser.json`
+//! — the same spec the JVM capture harness (`formal/traces/capture/`) applies
+//! to the pinned Zeebe engine's records. The result must equal the committed
+//! Zeebe golden `formal/traces/goldens/<name>.trace.json`, step by step.
+//!
+//! A difference fails CI unless the scenario is listed in
+//! `formal/traces/allowlist.json` with an issue reference; a listed scenario
+//! that no longer diverges (a *stale* entry) fails too, so the allow-list can
+//! only shrink honestly. Goldens are refreshed (offline, never in CI) with
+//! `formal/traces/capture.sh`; see `formal/traces/README.md`.
+#![cfg(feature = "serde")]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
+)]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use nanobpmn_engine_core::bpmn::parse_bpmn;
+use nanobpmn_engine_core::{Command, Engine, EngineError, Event, IncidentKind, Key, Value};
+use serde_json::{json, Map, Value as J};
+
+fn traces_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../formal/traces")
+}
+
+fn read_json(path: &Path) -> J {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+// ───────────────────────────── normaliser ──────────────────────────────
+
+/// Apply the shared normaliser spec to one step's RAW records. Mirrors
+/// `Normaliser.java` in the capture harness; both implement the algorithm
+/// written in the spec's `doc` field.
+fn normalise(spec: &J, raw: &[J]) -> Vec<J> {
+    assert_eq!(spec["version"], 1, "unsupported normaliser spec version");
+    let lanes = spec["lanes"].as_array().expect("spec.lanes");
+    let mut out: Vec<Vec<J>> = vec![Vec::new(); lanes.len() + 1];
+    for r in raw {
+        let record_type = r["recordType"].as_str().unwrap_or_default();
+        if record_type == "COMMAND_REJECTION" {
+            let mut n = Map::new();
+            n.insert("recordType".into(), json!(record_type));
+            for f in spec["rejection"]["fields"]
+                .as_array()
+                .expect("rejection.fields")
+            {
+                let f = f.as_str().expect("field name");
+                n.insert(f.into(), r.get(f).cloned().unwrap_or(J::Null));
+            }
+            out[lanes.len()].push(J::Object(n));
+            continue;
+        }
+        if record_type != "EVENT" {
+            continue;
+        }
+        for (i, lane) in lanes.iter().enumerate() {
+            let listed = lane["intents"]
+                .as_array()
+                .expect("lane.intents")
+                .iter()
+                .any(|x| *x == r["intent"]);
+            if lane["valueType"] != r["valueType"] || !listed {
+                continue;
+            }
+            let mut n = Map::new();
+            n.insert("valueType".into(), r["valueType"].clone());
+            n.insert("intent".into(), r["intent"].clone());
+            for f in lane["fields"].as_array().expect("lane.fields") {
+                let f = f.as_str().expect("field name");
+                n.insert(f.into(), r["value"].get(f).cloned().unwrap_or(J::Null));
+            }
+            out[i].push(J::Object(n));
+        }
+    }
+    out.into_iter().flatten().collect()
+}
+
+// ───────────────────────────── scenario loading ──────────────────────────────
+
+/// A loaded scenario: the model plus the facts the adapter needs from its XML.
+struct Scenario {
+    name: String,
+    xml: String,
+    script: J,
+    /// element id -> Zeebe `BpmnElementType` (derived from the BPMN tag name).
+    element_types: HashMap<String, String>,
+    /// (source, target) -> sequence-flow id.
+    flows: HashMap<(String, String), String>,
+}
+
+/// One XML start/empty tag: local name + attributes.
+struct Tag {
+    name: String,
+    attrs: HashMap<String, String>,
+}
+
+fn tags(xml: &str) -> Vec<Tag> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find('<') {
+        rest = &rest[start + 1..];
+        let end = rest.find('>').unwrap_or(rest.len());
+        let body = rest[..end].trim_end_matches('/');
+        rest = &rest[end..];
+        if body.starts_with(['/', '?', '!']) {
+            continue;
+        }
+        let mut parts = body.splitn(2, char::is_whitespace);
+        let qname = parts.next().unwrap_or_default();
+        // Extension elements (`zeebe:userTask`, …) are not BPMN elements.
+        if qname.starts_with("zeebe:") {
+            continue;
+        }
+        let name = qname.rsplit(':').next().unwrap_or_default().to_string();
+        let mut attrs = HashMap::new();
+        let mut a = parts.next().unwrap_or_default();
+        while let Some(eq) = a.find("=\"") {
+            let key = a[..eq].trim().to_string();
+            let after = &a[eq + 2..];
+            let close = after.find('"').unwrap_or(after.len());
+            attrs.insert(key, after[..close].to_string());
+            a = &after[(close + 1).min(after.len())..];
+        }
+        out.push(Tag { name, attrs });
+    }
+    out
+}
+
+/// `serviceTask` -> `SERVICE_TASK` (Zeebe's `BpmnElementType` naming).
+fn zeebe_element_type(tag: &str) -> String {
+    let mut out = String::new();
+    for c in tag.chars() {
+        if c.is_ascii_uppercase() {
+            out.push('_');
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out
+}
+
+const FLOW_NODE_TAGS: &[&str] = &[
+    "startEvent",
+    "endEvent",
+    "intermediateCatchEvent",
+    "intermediateThrowEvent",
+    "boundaryEvent",
+    "task",
+    "serviceTask",
+    "userTask",
+    "sendTask",
+    "receiveTask",
+    "scriptTask",
+    "businessRuleTask",
+    "manualTask",
+    "callActivity",
+    "subProcess",
+    "adHocSubProcess",
+    "exclusiveGateway",
+    "parallelGateway",
+    "inclusiveGateway",
+    "eventBasedGateway",
+];
+
+/// Load and validate a scenario directory. Refuses a model without DI
+/// (AGENTS.md: all BPMN models need DI): a `BPMNPlane` must exist, every flow
+/// node needs a `BPMNShape` and every sequence flow a `BPMNEdge`.
+fn load_scenario(dir: &Path) -> Result<Scenario, String> {
+    let name = dir.file_name().unwrap().to_string_lossy().to_string();
+    let xml = fs::read_to_string(dir.join("process.bpmn"))
+        .map_err(|e| format!("{name}: process.bpmn: {e}"))?;
+    let script: J = serde_json::from_str(
+        &fs::read_to_string(dir.join("script.json"))
+            .map_err(|e| format!("{name}: script.json: {e}"))?,
+    )
+    .map_err(|e| format!("{name}: script.json: {e}"))?;
+    if !script["steps"].is_array() {
+        return Err(format!("{name}: script.json has no `steps` array"));
+    }
+    let all = tags(&xml);
+    let mut element_types = HashMap::new();
+    let mut flows = HashMap::new();
+    let mut needs_shape = BTreeSet::new();
+    let mut needs_edge = BTreeSet::new();
+    let mut shapes = BTreeSet::new();
+    let mut edges = BTreeSet::new();
+    let mut plane = false;
+    for t in &all {
+        let id = t.attrs.get("id").cloned().unwrap_or_default();
+        match t.name.as_str() {
+            "process" => {
+                element_types.insert(id, "PROCESS".to_string());
+            }
+            "sequenceFlow" => {
+                let key = (t.attrs["sourceRef"].clone(), t.attrs["targetRef"].clone());
+                if flows.insert(key, id.clone()).is_some() {
+                    return Err(format!(
+                        "{name}: two sequence flows share source and target"
+                    ));
+                }
+                needs_edge.insert(id);
+            }
+            "BPMNPlane" => plane = true,
+            "BPMNShape" => {
+                shapes.insert(t.attrs.get("bpmnElement").cloned().unwrap_or_default());
+            }
+            "BPMNEdge" => {
+                edges.insert(t.attrs.get("bpmnElement").cloned().unwrap_or_default());
+            }
+            tag if FLOW_NODE_TAGS.contains(&tag) => {
+                element_types.insert(id.clone(), zeebe_element_type(tag));
+                needs_shape.insert(id);
+            }
+            _ => {}
+        }
+    }
+    let missing: Vec<String> = needs_shape
+        .difference(&shapes)
+        .chain(needs_edge.difference(&edges))
+        .cloned()
+        .collect();
+    if !plane || !missing.is_empty() {
+        return Err(format!(
+            "{name}: process.bpmn lacks BPMN DI (AGENTS.md: all BPMN models need DI); \
+             plane={plane}, elements without a shape/edge: {missing:?}"
+        ));
+    }
+    Ok(Scenario {
+        name,
+        xml,
+        script,
+        element_types,
+        flows,
+    })
+}
+
+fn scenario_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fs::read_dir(traces_dir().join("scenarios"))
+        .expect("formal/traces/scenarios")
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+// ───────────────────────────── nano adapter ──────────────────────────────
+
+fn to_value(j: &J) -> Value {
+    match j {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Number(n) => n
+            .as_i64()
+            .map(Value::Int)
+            .unwrap_or_else(|| Value::Double(n.as_f64().unwrap_or_default())),
+        J::String(s) => Value::Str(s.clone()),
+        J::Array(a) => Value::List(a.iter().map(to_value).collect()),
+        J::Object(o) => Value::Map(o.iter().map(|(k, v)| (k.clone(), to_value(v))).collect()),
+    }
+}
+
+fn to_json(v: &Value) -> J {
+    match v {
+        Value::Null => J::Null,
+        Value::Bool(b) => json!(b),
+        Value::Int(i) => json!(i),
+        Value::Double(d) => json!(d),
+        Value::Str(s) => json!(s),
+        Value::List(l) => J::Array(l.iter().map(to_json).collect()),
+        Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.clone(), to_json(v))).collect()),
+    }
+}
+
+fn variables(step: &J) -> HashMap<String, Value> {
+    step["variables"]
+        .as_object()
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), to_value(v))).collect())
+        .unwrap_or_default()
+}
+
+/// nano incident kind -> Zeebe `ErrorType` (mirrors the server's REST
+/// `incident_error_type_enum`; exhaustive so a new kind must be mapped here).
+fn zeebe_error_type(kind: IncidentKind) -> &'static str {
+    match kind {
+        IncidentKind::JobNoRetries => "JOB_NO_RETRIES",
+        IncidentKind::NoMatchingSequenceFlow => "CONDITION_ERROR",
+        IncidentKind::ExpressionEvaluation => "EXTRACT_VALUE_ERROR",
+        IncidentKind::UnhandledError => "UNHANDLED_ERROR_EVENT",
+        IncidentKind::DecisionEvaluation => "DECISION_EVALUATION_ERROR",
+        IncidentKind::CalledElementError => "CALLED_ELEMENT_ERROR",
+        IncidentKind::IoMapping => "IO_MAPPING_ERROR",
+    }
+}
+
+/// A rejected command's Zeebe `RejectionType`.
+fn zeebe_rejection_type(err: &EngineError) -> &'static str {
+    match err {
+        EngineError::ProcessNotFound { .. }
+        | EngineError::JobNotFound { .. }
+        | EngineError::IncidentNotFound { .. }
+        | EngineError::ScopeNotFound { .. }
+        | EngineError::InstanceNotFound { .. }
+        | EngineError::ElementNotFound { .. }
+        | EngineError::ElementInstanceNotFound { .. }
+        | EngineError::UserTaskNotFound { .. } => "NOT_FOUND",
+        EngineError::JobNotActive { .. }
+        | EngineError::JobNotActivated { .. }
+        | EngineError::UserTaskNotActive { .. }
+        | EngineError::IncidentNotResolvable { .. }
+        | EngineError::InstanceTransitionInvalid { .. } => "INVALID_STATE",
+        _ => "INVALID_ARGUMENT",
+    }
+}
+
+/// The Zeebe (valueType, intent) of the command a script op writes.
+fn command_of(op: &str) -> (&'static str, &'static str) {
+    match op {
+        "createInstance" => ("PROCESS_INSTANCE_CREATION", "CREATE"),
+        "completeJob" => ("JOB", "COMPLETE"),
+        "failJob" => ("JOB", "FAIL"),
+        "completeUserTask" => ("USER_TASK", "COMPLETE"),
+        "publishMessage" => ("MESSAGE", "PUBLISH"),
+        "resolveIncident" => ("INCIDENT", "RESOLVE"),
+        "updateVariables" => ("VARIABLE_DOCUMENT", "UPDATE"),
+        other => panic!("unknown op `{other}`"),
+    }
+}
+
+/// Runs one scenario on engine-core, rendering nano events as RAW records in
+/// Zeebe's record shape (`{recordType, valueType, intent, value}`).
+struct NanoRun<'a> {
+    sc: &'a Scenario,
+    engine: Engine,
+    now: u64,
+    instance: Key,
+    process_id: String,
+    element_ids: HashMap<Key, String>,
+    jobs_by_type: HashMap<String, Key>,
+    jobs: HashMap<Key, (String, String, i64)>,
+    user_tasks: HashMap<String, Key>,
+    user_task_elements: HashMap<Key, String>,
+    incidents: HashMap<String, Key>,
+    incident_info: HashMap<Key, (String, &'static str)>,
+    timers: HashMap<Key, String>,
+    subscriptions: HashMap<Key, (String, String)>,
+    /// variables known per scope element id (CREATED vs UPDATED).
+    known: BTreeMap<String, BTreeSet<String>>,
+}
+
+fn event(value_type: &str, intent: &str, value: J) -> J {
+    json!({"recordType": "EVENT", "valueType": value_type, "intent": intent, "value": value})
+}
+
+impl<'a> NanoRun<'a> {
+    fn new(sc: &'a Scenario) -> Self {
+        let mut engine = Engine::new();
+        let defs = parse_bpmn(&sc.xml).unwrap_or_else(|e| panic!("{}: parse: {e:?}", sc.name));
+        engine
+            .apply_command_at(Command::DeployResources(defs), 0)
+            .unwrap_or_else(|e| panic!("{}: deploy: {e:?}", sc.name));
+        NanoRun {
+            sc,
+            engine,
+            now: 0,
+            instance: 0,
+            process_id: String::new(),
+            element_ids: HashMap::new(),
+            jobs_by_type: HashMap::new(),
+            jobs: HashMap::new(),
+            user_tasks: HashMap::new(),
+            user_task_elements: HashMap::new(),
+            incidents: HashMap::new(),
+            incident_info: HashMap::new(),
+            timers: HashMap::new(),
+            subscriptions: HashMap::new(),
+            known: BTreeMap::new(),
+        }
+    }
+
+    fn key(map: &HashMap<String, Key>, id: &str, what: &str) -> Key {
+        *map.get(id)
+            .unwrap_or_else(|| panic!("no {what} '{id}' has been created yet"))
+    }
+
+    fn apply(&mut self, cmd: Command) -> Result<Vec<Event>, EngineError> {
+        self.engine.apply_command_at(cmd, self.now)
+    }
+
+    /// Execute one script step; returns its RAW records.
+    fn step(&mut self, step: &J) -> Vec<J> {
+        let op = step["op"].as_str().expect("op");
+        let reject = step["expectRejection"].as_bool().unwrap_or(false);
+        let vars = variables(step);
+        let result: Result<Vec<Event>, EngineError> = match op {
+            "createInstance" => {
+                let pid = step["bpmnProcessId"].as_str().expect("bpmnProcessId");
+                self.apply(Command::create_instance_with(pid, vars))
+            }
+            "completeJob" => {
+                let ty = step["jobType"].as_str().expect("jobType").to_string();
+                let key = Self::key(&self.jobs_by_type, &ty, "job of type");
+                let mut events = Vec::new();
+                if !reject {
+                    let act = Command::activate_jobs(ty, "trace-runner", 1, 300_000, self.now);
+                    events.extend(self.apply(act).expect("activate jobs"));
+                }
+                self.apply(Command::complete_job_with(key, vars)).map(|e| {
+                    events.extend(e);
+                    events
+                })
+            }
+            "failJob" => {
+                let ty = step["jobType"].as_str().expect("jobType").to_string();
+                let key = Self::key(&self.jobs_by_type, &ty, "job of type");
+                let act = Command::activate_jobs(ty, "trace-runner", 1, 300_000, self.now);
+                let mut events = self.apply(act).expect("activate jobs");
+                let retries = step["retries"].as_i64().expect("retries") as i32;
+                let msg = step["errorMessage"].as_str().unwrap_or_default();
+                self.apply(Command::fail_job(key, retries, msg)).map(|e| {
+                    events.extend(e);
+                    events
+                })
+            }
+            "completeUserTask" => {
+                let id = step["elementId"].as_str().expect("elementId");
+                let key = Self::key(&self.user_tasks, id, "user task");
+                self.apply(Command::complete_user_task_with(key, vars))
+            }
+            "publishMessage" => {
+                let name = step["name"].as_str().expect("name");
+                let ck = step["correlationKey"].as_str().expect("correlationKey");
+                self.apply(Command::correlate_message_with(name, ck, vars))
+            }
+            "advanceClock" => {
+                self.now += step["millis"].as_u64().expect("millis");
+                let now = self.now;
+                self.apply(Command::TriggerTimers { now })
+            }
+            "resolveIncident" => {
+                let id = step["elementId"].as_str().expect("elementId");
+                let key = Self::key(&self.incidents, id, "incident");
+                self.apply(Command::resolve_incident(key))
+            }
+            "updateVariables" => self.apply(Command::set_variables(self.instance, vars)),
+            other => panic!("{}: unknown op `{other}`", self.sc.name),
+        };
+        match result {
+            Ok(events) => events.iter().flat_map(|e| self.render(e)).collect(),
+            Err(err) => {
+                let (value_type, intent) = command_of(op);
+                vec![json!({
+                    "recordType": "COMMAND_REJECTION",
+                    "valueType": value_type,
+                    "intent": intent,
+                    "rejectionType": zeebe_rejection_type(&err),
+                    "value": {},
+                })]
+            }
+        }
+    }
+
+    fn element(&self, id: &str) -> J {
+        let ty = self
+            .sc
+            .element_types
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| format!("?{id}"));
+        json!({"elementId": id, "bpmnElementType": ty})
+    }
+
+    fn lifecycle(&self, intent: &str, id: &str) -> J {
+        event("PROCESS_INSTANCE", intent, self.element(id))
+    }
+
+    fn variable_records(&mut self, scope: String, vars: &HashMap<String, Value>) -> Vec<J> {
+        let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
+        let known = self.known.entry(scope.clone()).or_default();
+        sorted
+            .into_iter()
+            .map(|(name, v)| {
+                let intent = if known.insert(name.clone()) {
+                    "CREATED"
+                } else {
+                    "UPDATED"
+                };
+                event(
+                    "VARIABLE",
+                    intent,
+                    json!({"name": name, "value": to_json(v), "scopeElementId": scope}),
+                )
+            })
+            .collect()
+    }
+
+    fn job_value(&self, key: Key, retries: Option<i64>) -> J {
+        let (el, ty, r) = self.jobs.get(&key).cloned().unwrap_or_default();
+        json!({"elementId": el, "type": ty, "retries": retries.unwrap_or(r)})
+    }
+
+    /// Render one nano event as zero or more RAW Zeebe-shaped records.
+    fn render(&mut self, e: &Event) -> Vec<J> {
+        match e {
+            Event::ProcessInstanceCreated {
+                instance_key,
+                process_id,
+                variables,
+                ..
+            } => {
+                self.instance = *instance_key;
+                self.process_id = process_id.clone();
+                self.element_ids.insert(*instance_key, process_id.clone());
+                let mut out = vec![
+                    self.lifecycle("ELEMENT_ACTIVATING", process_id),
+                    self.lifecycle("ELEMENT_ACTIVATED", process_id),
+                ];
+                out.extend(self.variable_records(process_id.clone(), variables));
+                out
+            }
+            Event::ProcessInstanceCompleted { .. } => {
+                let pid = self.process_id.clone();
+                vec![
+                    self.lifecycle("ELEMENT_COMPLETING", &pid),
+                    self.lifecycle("ELEMENT_COMPLETED", &pid),
+                ]
+            }
+            Event::ElementActivating {
+                element_instance_key,
+                element_id,
+                ..
+            } => {
+                self.element_ids
+                    .insert(*element_instance_key, element_id.to_string());
+                vec![self.lifecycle("ELEMENT_ACTIVATING", element_id)]
+            }
+            Event::ElementActivated { element_id, .. } => {
+                vec![self.lifecycle("ELEMENT_ACTIVATED", element_id)]
+            }
+            Event::ElementCompleting { element_id, .. } => {
+                vec![self.lifecycle("ELEMENT_COMPLETING", element_id)]
+            }
+            Event::ElementCompleted { element_id, .. } => {
+                vec![self.lifecycle("ELEMENT_COMPLETED", element_id)]
+            }
+            Event::SequenceFlowTaken { from, to, .. } => {
+                let id = self
+                    .sc
+                    .flows
+                    .get(&(from.to_string(), to.to_string()))
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{from}->{to}"));
+                vec![event(
+                    "PROCESS_INSTANCE",
+                    "SEQUENCE_FLOW_TAKEN",
+                    json!({"elementId": id, "bpmnElementType": "SEQUENCE_FLOW"}),
+                )]
+            }
+            Event::VariablesUpdated { variables, .. } => {
+                let pid = self.process_id.clone();
+                self.variable_records(pid, variables)
+            }
+            Event::ScopedVariablesUpdated {
+                scope_key,
+                variables,
+                ..
+            } => {
+                let scope = self
+                    .element_ids
+                    .get(scope_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{scope_key}"));
+                self.variable_records(scope, variables)
+            }
+            Event::JobCreated {
+                job_key,
+                element_id,
+                job_type,
+                retries,
+                ..
+            } => {
+                self.jobs_by_type.insert(job_type.clone(), *job_key);
+                self.jobs.insert(
+                    *job_key,
+                    (
+                        element_id.to_string(),
+                        job_type.clone(),
+                        i64::from(*retries),
+                    ),
+                );
+                vec![event("JOB", "CREATED", self.job_value(*job_key, None))]
+            }
+            Event::JobCompleted { job_key, .. } => {
+                vec![event("JOB", "COMPLETED", self.job_value(*job_key, None))]
+            }
+            Event::JobFailed {
+                job_key, retries, ..
+            } => {
+                if let Some(j) = self.jobs.get_mut(job_key) {
+                    j.2 = i64::from(*retries);
+                }
+                vec![event("JOB", "FAILED", self.job_value(*job_key, None))]
+            }
+            Event::JobRetriesUpdated {
+                job_key, retries, ..
+            } => {
+                if let Some(j) = self.jobs.get_mut(job_key) {
+                    j.2 = i64::from(*retries);
+                }
+                vec![event(
+                    "JOB",
+                    "RETRIES_UPDATED",
+                    self.job_value(*job_key, None),
+                )]
+            }
+            Event::JobCanceled { job_key, .. } => {
+                vec![event("JOB", "CANCELED", self.job_value(*job_key, None))]
+            }
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                ..
+            } => {
+                self.user_tasks
+                    .insert(element_id.to_string(), *user_task_key);
+                self.user_task_elements
+                    .insert(*user_task_key, element_id.to_string());
+                vec![event(
+                    "USER_TASK",
+                    "CREATED",
+                    json!({"elementId": element_id}),
+                )]
+            }
+            Event::UserTaskCompleted { user_task_key, .. } => {
+                let el = self.user_task_elements.get(user_task_key).cloned();
+                vec![event("USER_TASK", "COMPLETED", json!({"elementId": el}))]
+            }
+            Event::UserTaskCanceled { user_task_key, .. } => {
+                let el = self.user_task_elements.get(user_task_key).cloned();
+                vec![event("USER_TASK", "CANCELED", json!({"elementId": el}))]
+            }
+            Event::MessageSubscriptionCreated {
+                subscription_key,
+                element_id,
+                message_name,
+                ..
+            } => {
+                let v = (element_id.to_string(), message_name.clone());
+                self.subscriptions.insert(*subscription_key, v.clone());
+                vec![event(
+                    "PROCESS_MESSAGE_SUBSCRIPTION",
+                    "CREATED",
+                    json!({"elementId": v.0, "messageName": v.1}),
+                )]
+            }
+            Event::MessageCorrelated {
+                subscription_key, ..
+            } => {
+                let (el, name) = self
+                    .subscriptions
+                    .get(subscription_key)
+                    .cloned()
+                    .unwrap_or_default();
+                vec![event(
+                    "PROCESS_MESSAGE_SUBSCRIPTION",
+                    "CORRELATED",
+                    json!({"elementId": el, "messageName": name}),
+                )]
+            }
+            Event::MessageSubscriptionCanceled {
+                subscription_key, ..
+            } => {
+                let (el, name) = self
+                    .subscriptions
+                    .get(subscription_key)
+                    .cloned()
+                    .unwrap_or_default();
+                vec![event(
+                    "PROCESS_MESSAGE_SUBSCRIPTION",
+                    "DELETED",
+                    json!({"elementId": el, "messageName": name}),
+                )]
+            }
+            Event::TimerCreated {
+                timer_key,
+                element_id,
+                ..
+            } => {
+                self.timers.insert(*timer_key, element_id.to_string());
+                vec![event(
+                    "TIMER",
+                    "CREATED",
+                    json!({"targetElementId": element_id}),
+                )]
+            }
+            Event::TimerTriggered { element_id, .. } => {
+                vec![event(
+                    "TIMER",
+                    "TRIGGERED",
+                    json!({"targetElementId": element_id}),
+                )]
+            }
+            Event::TimerCanceled { element_id, .. } => {
+                vec![event(
+                    "TIMER",
+                    "CANCELED",
+                    json!({"targetElementId": element_id}),
+                )]
+            }
+            Event::IncidentRaised {
+                incident_key,
+                element_id,
+                kind,
+                ..
+            } => {
+                let info = (element_id.to_string(), zeebe_error_type(*kind));
+                self.incidents.insert(info.0.clone(), *incident_key);
+                self.incident_info.insert(*incident_key, info.clone());
+                vec![event(
+                    "INCIDENT",
+                    "CREATED",
+                    json!({"elementId": info.0, "errorType": info.1}),
+                )]
+            }
+            Event::IncidentResolved { incident_key, .. } => {
+                let (el, ty) = self
+                    .incident_info
+                    .get(incident_key)
+                    .cloned()
+                    .unwrap_or_default();
+                vec![event(
+                    "INCIDENT",
+                    "RESOLVED",
+                    json!({"elementId": el, "errorType": ty}),
+                )]
+            }
+            // Everything else has no counterpart in the normaliser's lanes.
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Run a scenario on engine-core and normalise it: the comparable trace.
+fn nano_trace(spec: &J, sc: &Scenario) -> Vec<J> {
+    let mut run = NanoRun::new(sc);
+    sc.script["steps"]
+        .as_array()
+        .expect("steps")
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let raw = run.step(step);
+            json!({"step": i, "op": step["op"], "records": normalise(spec, &raw)})
+        })
+        .collect()
+}
+
+// ───────────────────────────── differential verdict ──────────────────────────────
+
+/// First difference between the Zeebe golden steps and nano's, if any.
+fn diff(golden: &[J], nano: &[J]) -> Option<String> {
+    for i in 0..golden.len().max(nano.len()) {
+        let (g, n) = (golden.get(i), nano.get(i));
+        if g != n {
+            return Some(format!(
+                "step {i}:\n  zeebe: {}\n  nano:  {}",
+                g.map(J::to_string).unwrap_or_else(|| "<none>".into()),
+                n.map(J::to_string).unwrap_or_else(|| "<none>".into())
+            ));
+        }
+    }
+    None
+}
+
+/// Judge per-scenario outcomes (`name -> Some(diff)` when diverging) against
+/// the allow-list. Fails on: an unlisted divergence, a listed entry without an
+/// issue reference, and a STALE entry (listed but not diverging / unknown).
+fn verdict(outcomes: &BTreeMap<String, Option<String>>, allowlist: &J) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    let mut listed = BTreeSet::new();
+    for entry in allowlist["entries"].as_array().expect("allowlist.entries") {
+        let scenario = entry["scenario"].as_str().unwrap_or_default().to_string();
+        let issue = entry["issue"].as_str().unwrap_or_default();
+        let ok_ref = issue
+            .strip_prefix('#')
+            .or_else(|| issue.rsplit_once("/issues/").map(|(_, n)| n))
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        if !ok_ref {
+            errors.push(format!(
+                "allow-list entry `{scenario}` lacks an issue reference (`#N`)"
+            ));
+        }
+        match outcomes.get(&scenario) {
+            Some(Some(_)) => {}
+            Some(None) => errors.push(format!(
+                "STALE allow-list entry `{scenario}` ({issue}): the scenario no longer diverges \
+                 from Zeebe — remove the entry"
+            )),
+            None => errors.push(format!(
+                "STALE allow-list entry `{scenario}` ({issue}): no such scenario"
+            )),
+        }
+        listed.insert(scenario);
+    }
+    for (name, d) in outcomes {
+        if let Some(d) = d {
+            if !listed.contains(name) {
+                errors.push(format!("scenario `{name}` diverges from Zeebe:\n{d}"));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn load_spec() -> J {
+    read_json(&traces_dir().join("normaliser.json"))
+}
+
+/// Run every scenario: `name -> Some(diff)` when nano diverges from the golden.
+fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
+    let goldens = traces_dir().join("goldens");
+    scenario_dirs()
+        .iter()
+        .map(|dir| {
+            let sc = load_scenario(dir).unwrap_or_else(|e| panic!("{e}"));
+            let golden = read_json(&goldens.join(format!("{}.trace.json", sc.name)));
+            let steps = golden["steps"].as_array().expect("golden steps").clone();
+            let d = diff(&steps, &nano_trace(spec, &sc));
+            (sc.name, d)
+        })
+        .collect()
+}
+
+// ───────────────────────────── the gate ──────────────────────────────
+
+/// THE differential gate: every scenario's nano trace equals its Zeebe golden,
+/// modulo the issue-referenced allow-list (which must not be stale).
+#[test]
+fn corpus_matches_zeebe_goldens() {
+    let spec = load_spec();
+    let outcomes = run_corpus(&spec);
+    assert!(!outcomes.is_empty(), "the trace corpus is empty");
+    let allowlist = read_json(&traces_dir().join("allowlist.json"));
+    if let Err(errors) = verdict(&outcomes, &allowlist) {
+        panic!(
+            "Zeebe differential traces failed:\n\n{}\n\nSee formal/traces/README.md.",
+            errors.join("\n\n")
+        );
+    }
+}
+
+/// Goldens are captured per pin: the stamped pin must be the one in
+/// `formal/parity/zeebe-pin.json` (the single source of truth for the version),
+/// and every scenario has exactly one golden trace + touched-cells file.
+#[test]
+fn goldens_match_the_zeebe_pin_and_the_scenarios() {
+    let pin = read_json(&traces_dir().join("../parity/zeebe-pin.json"));
+    let sha = pin["sha"].as_str().expect("pin sha");
+    let goldens = traces_dir().join("goldens");
+    let stamped = fs::read_to_string(goldens.join("PIN")).expect("goldens/PIN");
+    assert_eq!(
+        stamped.trim(),
+        sha,
+        "goldens were captured at another Zeebe pin — run formal/traces/capture.sh and commit the diff"
+    );
+    let names: BTreeSet<String> = scenario_dirs()
+        .iter()
+        .map(|d| d.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    let mut golden_names = BTreeSet::new();
+    for entry in fs::read_dir(&goldens).unwrap() {
+        let file = entry.unwrap().file_name().to_string_lossy().to_string();
+        if let Some(n) = file.strip_suffix(".trace.json") {
+            golden_names.insert(n.to_string());
+            let cells = read_json(&goldens.join(format!("{n}.cells.json")));
+            assert_eq!(cells["zeebePin"], sha, "{n}.cells.json pin");
+            let golden = read_json(&goldens.join(&file));
+            assert_eq!(golden["zeebePin"], sha, "{file} pin");
+            for cell in cells["cells"].as_array().expect("cells") {
+                let c = cell.as_str().expect("cell id");
+                assert!(
+                    well_formed_cell(c),
+                    "{n}.cells.json: malformed cell id `{c}`"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        names, golden_names,
+        "scenarios without a golden (or orphan goldens)"
+    );
+}
+
+/// Grammar of the touched-cell ids (shared with `formal/parity/extract.mjs`):
+/// `failure:<Class>.<method>:<ErrorType>`, `rejection:<Class>.<method>:<RejectionType>`
+/// and the coarse `element:` / `intent:` / `incident:` families.
+fn well_formed_cell(c: &str) -> bool {
+    let ident = |s: &str| s.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    let upper = |s: &str| s.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_');
+    match c.split_once(':') {
+        Some(("failure" | "rejection", rest)) => {
+            let Some((site, ty)) = rest.rsplit_once(':') else {
+                return false;
+            };
+            let Some((class, method)) = site.split_once('.') else {
+                return false;
+            };
+            !class.is_empty()
+                && ident(class)
+                && ident(method)
+                && upper(ty)
+                && (c.starts_with("failure:") || !ty.is_empty())
+        }
+        Some(("element", rest)) => !rest.is_empty() && ident(rest),
+        Some(("incident", rest)) => !rest.is_empty() && upper(rest),
+        Some(("intent", rest)) => rest
+            .split_once(':')
+            .is_some_and(|(a, b)| ident(a) && !b.is_empty() && upper(b)),
+        _ => false,
+    }
+}
+
+// ───────────────────────────── tests of the harness itself ──────────────────────────────
+
+fn raw_event(value_type: &str, intent: &str, value: J) -> J {
+    event(value_type, intent, value)
+}
+
+#[test]
+fn normaliser_keeps_lane_order_selects_fields_and_drops_the_rest() {
+    let spec = load_spec();
+    let raw = vec![
+        raw_event(
+            "JOB",
+            "CREATED",
+            json!({"elementId": "t", "type": "w", "retries": 3, "worker": "x"}),
+        ),
+        raw_event(
+            "PROCESS_INSTANCE",
+            "ELEMENT_ACTIVATED",
+            json!({"elementId": "t", "bpmnElementType": "SERVICE_TASK", "flowScopeKey": 9}),
+        ),
+        json!({"recordType": "COMMAND", "valueType": "JOB", "intent": "COMPLETE", "value": {}}),
+        raw_event("JOB", "TIMED_OUT", json!({})),
+        raw_event("JOB_BATCH", "ACTIVATED", json!({})),
+        json!({"recordType": "COMMAND_REJECTION", "valueType": "JOB", "intent": "COMPLETE", "rejectionType": "NOT_FOUND", "rejectionReason": "x", "value": {}}),
+        raw_event(
+            "PROCESS_INSTANCE",
+            "ELEMENT_COMPLETED",
+            json!({"elementId": "t"}),
+        ),
+    ];
+    assert_eq!(
+        normalise(&spec, &raw),
+        vec![
+            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "t", "bpmnElementType": "SERVICE_TASK"}),
+            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_COMPLETED", "elementId": "t", "bpmnElementType": null}),
+            json!({"valueType": "JOB", "intent": "CREATED", "elementId": "t", "type": "w", "retries": 3}),
+            json!({"recordType": "COMMAND_REJECTION", "valueType": "JOB", "intent": "COMPLETE", "rejectionType": "NOT_FOUND"}),
+        ]
+    );
+}
+
+#[test]
+fn normaliser_does_not_compare_interleaving_across_lanes() {
+    let spec = load_spec();
+    let pi = raw_event(
+        "PROCESS_INSTANCE",
+        "ELEMENT_ACTIVATED",
+        json!({"elementId": "a"}),
+    );
+    let job = raw_event("JOB", "CREATED", json!({"elementId": "a"}));
+    assert_eq!(
+        normalise(&spec, &[pi.clone(), job.clone()]),
+        normalise(&spec, &[job, pi])
+    );
+}
+
+#[test]
+fn normaliser_spec_lanes_are_unique_and_well_formed() {
+    let spec = load_spec();
+    let mut seen = BTreeSet::new();
+    for lane in spec["lanes"].as_array().unwrap() {
+        let vt = lane["valueType"].as_str().unwrap();
+        assert!(seen.insert(vt.to_string()), "duplicate lane {vt}");
+        assert!(
+            !lane["intents"].as_array().unwrap().is_empty(),
+            "{vt}: no intents"
+        );
+        assert!(lane["fields"].is_array(), "{vt}: no fields");
+    }
+}
+
+fn first_scenario() -> (J, Scenario, Vec<J>) {
+    let spec = load_spec();
+    let dir = traces_dir().join("scenarios/service-task-complete");
+    let sc = load_scenario(&dir).unwrap();
+    let golden = read_json(&traces_dir().join("goldens/service-task-complete.trace.json"));
+    let steps = golden["steps"].as_array().unwrap().clone();
+    (spec, sc, steps)
+}
+
+#[test]
+fn seeded_divergence_fails_the_runner_unless_allow_listed() {
+    let (spec, sc, mut golden) = first_scenario();
+    assert_eq!(
+        diff(&golden, &nano_trace(&spec, &sc)),
+        None,
+        "precondition: passes"
+    );
+    // Seed a divergence: Zeebe "says" the job was created with 4 retries.
+    let records = golden[0]["records"].as_array_mut().unwrap();
+    let job = records
+        .iter_mut()
+        .find(|r| r["valueType"] == "JOB")
+        .unwrap();
+    job["retries"] = json!(4);
+    let d = diff(&golden, &nano_trace(&spec, &sc));
+    assert!(d.as_deref().is_some_and(|d| d.contains("step 0")), "{d:?}");
+    let outcomes = BTreeMap::from([(sc.name.clone(), d)]);
+    let err = verdict(&outcomes, &json!({"entries": []})).unwrap_err();
+    assert!(err[0].contains("diverges from Zeebe"), "{err:?}");
+    let listed = json!({"entries": [{"scenario": sc.name, "issue": "#1391", "reason": "seeded"}]});
+    assert_eq!(verdict(&outcomes, &listed), Ok(()));
+}
+
+#[test]
+fn stale_allow_list_entry_fails_the_runner() {
+    let (spec, sc, golden) = first_scenario();
+    let outcomes = BTreeMap::from([(sc.name.clone(), diff(&golden, &nano_trace(&spec, &sc)))]);
+    let stale =
+        json!({"entries": [{"scenario": sc.name, "issue": "#1391", "reason": "fixed since"}]});
+    let err = verdict(&outcomes, &stale).unwrap_err();
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].starts_with("STALE allow-list entry"), "{err:?}");
+    let unknown = json!({"entries": [{"scenario": "no-such-scenario", "issue": "#1391"}]});
+    assert!(verdict(&outcomes, &unknown).unwrap_err()[0].contains("no such scenario"));
+}
+
+#[test]
+fn allow_list_entry_without_issue_reference_fails() {
+    let outcomes = BTreeMap::from([("s".to_string(), Some("d".to_string()))]);
+    let err = verdict(
+        &outcomes,
+        &json!({"entries": [{"scenario": "s", "issue": "soon"}]}),
+    )
+    .unwrap_err();
+    assert!(err[0].contains("lacks an issue reference"), "{err:?}");
+    let url = "https://github.com/nanobpm/nano-bpm/issues/1391";
+    assert_eq!(
+        verdict(
+            &outcomes,
+            &json!({"entries": [{"scenario": "s", "issue": url}]})
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn scenario_without_di_is_rejected() {
+    let src = traces_dir().join("scenarios/service-task-complete");
+    let tmp = std::env::temp_dir().join(format!("nano-trace-no-di-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+    let xml = fs::read_to_string(src.join("process.bpmn")).unwrap();
+    let cut = xml.find("<bpmndi:BPMNDiagram").unwrap();
+    fs::write(
+        tmp.join("process.bpmn"),
+        format!("{}</bpmn:definitions>\n", &xml[..cut]),
+    )
+    .unwrap();
+    fs::copy(src.join("script.json"), tmp.join("script.json")).unwrap();
+    let err = load_scenario(&tmp)
+        .err()
+        .expect("a DI-less scenario must be rejected");
+    assert!(err.contains("lacks BPMN DI"), "{err}");
+    // A diagram that misses one element's shape is rejected too.
+    let partial = xml.replace("bpmnElement=\"task\"", "bpmnElement=\"elsewhere\"");
+    fs::write(tmp.join("process.bpmn"), partial).unwrap();
+    let err = load_scenario(&tmp)
+        .err()
+        .expect("partial DI must be rejected");
+    assert!(err.contains("\"task\""), "{err}");
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn cell_id_grammar() {
+    for ok in [
+        "failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR",
+        "failure:Foo.:",
+        "rejection:JobCommandPreconditionValidator.checkJobState:NOT_FOUND",
+        "element:ServiceTask",
+        "intent:ProcessInstance:ELEMENT_ACTIVATED",
+        "incident:CONDITION_ERROR",
+    ] {
+        assert!(well_formed_cell(ok), "{ok}");
+    }
+    for bad in [
+        "failure:BpmnJobBehavior:EXTRACT_VALUE_ERROR",
+        "failure:a.b.C.m:X",
+        "rejection:Foo.bar:",
+        "incident:",
+        "thing:x",
+    ] {
+        assert!(!well_formed_cell(bad), "{bad}");
+    }
+}

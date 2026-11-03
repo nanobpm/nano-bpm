@@ -1,0 +1,24 @@
+{
+  "description": "A service task's job is completed with a variable; creating an instance of an undeployed process is rejected.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "service-task",
+      "variables": {
+        "x": 1
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work",
+      "variables": {
+        "result": "ok"
+      }
+    },
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "not-deployed",
+      "expectRejection": true
+    }
+  ]
+}

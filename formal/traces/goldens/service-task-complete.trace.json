@@ -1,0 +1,136 @@
+{
+  "scenario" : "service-task-complete",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "service-task",
+      "bpmnElementType" : "PROCESS"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "service-task",
+      "bpmnElementType" : "PROCESS"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f1",
+      "bpmnElementType" : "SEQUENCE_FLOW"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "task",
+      "bpmnElementType" : "SERVICE_TASK"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "task",
+      "bpmnElementType" : "SERVICE_TASK"
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "task",
+      "type" : "work",
+      "retries" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "x",
+      "value" : 1,
+      "scopeElementId" : "service-task"
+    } ]
+  }, {
+    "step" : 1,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "task",
+      "bpmnElementType" : "SERVICE_TASK"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "task",
+      "bpmnElementType" : "SERVICE_TASK"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f2",
+      "bpmnElementType" : "SEQUENCE_FLOW"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "service-task",
+      "bpmnElementType" : "PROCESS"
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "service-task",
+      "bpmnElementType" : "PROCESS"
+    }, {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "task",
+      "type" : "work",
+      "retries" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "result",
+      "value" : "ok",
+      "scopeElementId" : "service-task"
+    } ]
+  }, {
+    "step" : 2,
+    "op" : "createInstance",
+    "records" : [ {
+      "recordType" : "COMMAND_REJECTION",
+      "valueType" : "PROCESS_INSTANCE_CREATION",
+      "intent" : "CREATE",
+      "rejectionType" : "NOT_FOUND"
+    } ]
+  } ]
+}
