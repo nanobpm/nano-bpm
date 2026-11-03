@@ -4647,15 +4647,19 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             instance_key,
             element_instance_key,
             element_id,
-            ..
+            scope,
         } => {
+            // A token parked in `ACTIVATING` on an activation-time incident
+            // never emits `ElementActivated`, so stamp its scope here. `0` is
+            // ambiguous (root scope, or a legacy record predating the field)
+            // and must not overwrite an already-known scope on replay.
             upsert_element_instance(
                 tx,
                 now_ms,
                 *instance_key,
                 *element_instance_key,
                 element_id,
-                None,
+                (*scope != 0).then_some(*scope),
             )?;
         }
 
@@ -10278,6 +10282,25 @@ mod element_instance_tests {
         let parent = store.process_instance(INST).expect("parent row exists");
         assert_eq!(parent.parent_process_instance_key, None);
         assert_eq!(parent.parent_element_instance_key, None);
+    }
+
+    #[test]
+    fn activating_only_element_is_scoped_and_legacy_zero_keeps_known_scope() {
+        // A token parked in ACTIVATING on an activation-time incident never
+        // emits ElementActivated: its scope must come from ElementActivating.
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        let activating = |scope| Event::ElementActivating {
+            instance_key: INST,
+            element_instance_key: TASK_EI,
+            element_id: "t".to_string(),
+            scope,
+        };
+        store.export(&[&activating(77)]).unwrap();
+        assert_eq!(store.element_instance(TASK_EI).unwrap().scope_key, 77);
+        // A legacy (default-zero) record must not clobber the known scope.
+        store.export(&[&activating(0)]).unwrap();
+        assert_eq!(store.element_instance(TASK_EI).unwrap().scope_key, 77);
     }
 
     #[test]
