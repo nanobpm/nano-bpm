@@ -20,7 +20,7 @@
     reason = "non-production target (integration tests / examples); the production deny-unwrap gate (#1357) applies to the library crate only"
 )]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -424,6 +424,16 @@ struct NanoRun<'a> {
     /// activity's BPMN element id, so the type lookup alone cannot tell
     /// them apart.
     mi_bodies: HashMap<Key, Key>,
+    /// Element instances activated but not yet completed, in activation
+    /// order: `(element-instance key, element id, process-instance key)`.
+    /// nano's `ProcessInstanceTerminated` carries the whole termination
+    /// cascade in one event; Zeebe writes TERMINATING/TERMINATED for every
+    /// active element (innermost/latest first) between the process root's
+    /// TERMINATING and TERMINATED. These are those elements.
+    active_elements: Vec<(Key, String, Key)>,
+    /// Instances whose root TERMINATING was already rendered (a deferred
+    /// cancel with `canceling` listeners emits `ProcessInstanceTerminating`).
+    terminating: HashSet<Key>,
     jobs_by_type: HashMap<String, Key>,
     jobs: HashMap<Key, (String, String, i64)>,
     /// job key -> (process-instance key, element-instance key).
@@ -468,6 +478,8 @@ impl<'a> NanoRun<'a> {
             process_id: String::new(),
             element_ids: HashMap::new(),
             mi_bodies: HashMap::new(),
+            active_elements: Vec::new(),
+            terminating: HashSet::new(),
             jobs_by_type: HashMap::new(),
             jobs: HashMap::new(),
             job_scopes: HashMap::new(),
@@ -745,6 +757,7 @@ impl<'a> NanoRun<'a> {
                     .get(instance_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{instance_key}"));
+                self.terminating.insert(*instance_key);
                 vec![self.lifecycle("ELEMENT_TERMINATING", &pid, *instance_key, *instance_key)]
             }
             Event::ProcessInstanceTerminated { instance_key } => {
@@ -753,7 +766,25 @@ impl<'a> NanoRun<'a> {
                     .get(instance_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{instance_key}"));
-                vec![self.lifecycle("ELEMENT_TERMINATED", &pid, *instance_key, *instance_key)]
+                let mut out = Vec::new();
+                if self.terminating.insert(*instance_key) {
+                    out.push(self.lifecycle(
+                        "ELEMENT_TERMINATING",
+                        &pid,
+                        *instance_key,
+                        *instance_key,
+                    ));
+                }
+                let (doomed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.active_elements)
+                    .into_iter()
+                    .partition(|(_, _, pi)| pi == instance_key);
+                self.active_elements = kept;
+                for (eik, id, pi) in doomed.into_iter().rev() {
+                    out.push(self.lifecycle("ELEMENT_TERMINATING", &id, eik, pi));
+                    out.push(self.lifecycle("ELEMENT_TERMINATED", &id, eik, pi));
+                }
+                out.push(self.lifecycle("ELEMENT_TERMINATED", &pid, *instance_key, *instance_key));
+                out
             }
             Event::ElementActivating {
                 instance_key,
@@ -775,6 +806,11 @@ impl<'a> NanoRun<'a> {
                 }
                 self.element_ids
                     .insert(*element_instance_key, element_id.to_string());
+                self.active_elements.push((
+                    *element_instance_key,
+                    element_id.to_string(),
+                    *instance_key,
+                ));
                 vec![self.lifecycle(
                     "ELEMENT_ACTIVATING",
                     element_id,
@@ -812,6 +848,8 @@ impl<'a> NanoRun<'a> {
                 element_instance_key,
                 element_id,
             } => {
+                self.active_elements
+                    .retain(|(eik, _, _)| eik != element_instance_key);
                 vec![self.lifecycle(
                     "ELEMENT_COMPLETED",
                     element_id,
@@ -2388,9 +2426,15 @@ fn terminated_child_renders_its_termination_records() {
         1,
         "the child's ELEMENT_TERMINATED is rendered exactly once, labelled `child-b`: {step}"
     );
-    assert!(
-        terminating.is_empty(),
-        "no canceling listeners: the terminating phase is not emitted: {step}"
+    // Zeebe writes the child root's TERMINATING before its TERMINATED even
+    // without canceling listeners; the runner renders it exactly once.
+    assert_eq!(
+        terminating
+            .iter()
+            .filter(|r| r["elementId"] == "child-b")
+            .count(),
+        1,
+        "the child's ELEMENT_TERMINATING is rendered exactly once: {step}"
     );
     // The child's in-play job is CANCELED inside the CHILD's instance
     // (identity ties the cancellation to the child, not the parent).

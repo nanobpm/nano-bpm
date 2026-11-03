@@ -133,6 +133,12 @@ pub(super) struct NodeAcc {
     /// process's start form. `None` on other nodes and start events with no form.
     pub(super) start_form_id: Option<String>,
     /// True when this `intermediateThrowEvent`/`endEvent` carries a
+    /// `messageEventDefinition`. Together with a `zeebe:taskDefinition` it is a
+    /// Zeebe *job worker* message event: activation creates a job and the job's
+    /// completion completes the event, exactly like a send task
+    /// (`JobWorkerElementIncidentTest`). Built as a job-based task.
+    pub(super) is_message_throw: bool,
+    /// True when this `intermediateThrowEvent`/`endEvent` carries a
     /// `compensateEventDefinition`, making it a
     /// [`CompensationThrowEvent`](crate::model::ElementKind::CompensationThrowEvent).
     pub(super) is_compensation_throw: bool,
@@ -391,6 +397,7 @@ impl ProcessAcc {
             task_headers: std::collections::BTreeMap::new(),
             linked_resources: Vec::new(),
             start_form_id: None,
+            is_message_throw: false,
             is_compensation_throw: false,
             is_escalation_throw: false,
             escalation_throw_dup: false,
@@ -1359,7 +1366,17 @@ impl ProcessAcc {
             .iter()
             .map(|(node_id, _)| node_id.clone())
             .collect();
-        for node in self.nodes {
+        for mut node in self.nodes {
+            // A message throw/end event with a `zeebe:taskDefinition` is a job
+            // worker (Zeebe `JobWorkerElementIncidentTest`): it behaves exactly
+            // like a send task, so build it as one. Its BPMN tag (and thus its
+            // element type) is unchanged.
+            if matches!(node.kind, NodeKind::End | NodeKind::IntermediateThrow)
+                && node.is_message_throw
+                && node.job_type.is_some()
+            {
+                node.kind = NodeKind::Service;
+            }
             // Reject an `endEvent` / `intermediateThrowEvent` that carries more
             // than one throw/end event definition (#1173). Multiple definitions
             // set multiple independent node flags, and the build dispatch below

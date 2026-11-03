@@ -422,3 +422,25 @@ fn input_mapping_failure_parks_the_element_in_activating() {
     complete_one(&mut engine, "w");
     assert!(engine.is_completed(inst));
 }
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+/// `JobWorkerElementIncidentTest#shouldResolveIncidentIfTaskIsTerminated`:
+/// cancelling the instance terminates the incident's element, and Zeebe
+/// resolves the incident with it — it must not linger as an open incident on
+/// a terminated instance.
+#[test]
+fn should_resolve_incident_if_task_is_terminated() {
+    let (mut engine, inst) = start(job_type_process("=jobType"), "jt", HashMap::new());
+    let incident = extract_value_incident(&engine, "work");
+    let events = engine
+        .apply_command(Command::cancel_instance(inst))
+        .unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::IncidentResolved { incident_key, .. } if *incident_key == incident.key
+        )),
+        "cancel resolves the element's incident: {events:?}"
+    );
+    assert!(engine.active_incidents().is_empty());
+}

@@ -5458,3 +5458,34 @@ fn misplaced_agent_definition_names_the_enclosing_flow_node() {
         "expected InvalidAgentDefinition attributed to 'review', got {err:?}"
     );
 }
+
+/// A message end / intermediate throw event with a `zeebe:taskDefinition` is a
+/// Zeebe job worker (`JobWorkerElementIncidentTest[END_EVENT]` /
+/// `[INTERMEDIATE_THROW_EVENT]`): it must run a job of the declared type, not
+/// pass straight through.
+#[test]
+fn should_parse_message_throw_and_end_events_with_task_definition_as_job_workers() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <process id="p" isExecutable="true">
+    <startEvent id="s"/>
+    <intermediateThrowEvent id="throw">
+      <extensionElements><zeebe:taskDefinition type="notify" retries="5"/></extensionElements>
+      <messageEventDefinition/>
+    </intermediateThrowEvent>
+    <endEvent id="end">
+      <extensionElements><zeebe:taskDefinition type="=finalType"/></extensionElements>
+      <messageEventDefinition/>
+    </endEvent>
+    <sequenceFlow id="f1" sourceRef="s" targetRef="throw"/>
+    <sequenceFlow id="f2" sourceRef="throw" targetRef="end"/>
+  </process>
+</definitions>"#;
+    let def = &parse_bpmn(xml).unwrap()[0];
+    for (id, ty) in [("throw", "notify"), ("end", "=finalType")] {
+        match &def.element(id).unwrap().kind {
+            ElementKind::ServiceTask { job_type, .. } => assert_eq!(job_type, ty),
+            other => panic!("{id} must be a job worker, got {other:?}"),
+        }
+    }
+}

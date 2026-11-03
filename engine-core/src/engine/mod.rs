@@ -3886,6 +3886,33 @@ impl Engine {
                 for event in immediate_user_task_cancels {
                     self.emit(&mut log, event);
                 }
+                // Terminating the instance terminates every element carrying an
+                // open incident, and Zeebe resolves those incidents with their
+                // element (`JobWorkerElementIncidentTest#
+                // shouldResolveIncidentIfTaskIsTerminated`) — none may linger on
+                // a terminated instance.
+                let mut open_incidents: Vec<&state::Incident> = self
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| {
+                        i.instance_key == instance_key && i.state == state::IncidentState::Active
+                    })
+                    .collect();
+                open_incidents.sort_unstable_by_key(|i| i.key);
+                let incident_resolutions: Vec<Event> = open_incidents
+                    .into_iter()
+                    .map(|i| Event::IncidentResolved {
+                        incident_key: i.key,
+                        instance_key,
+                        job_key: i.job_key,
+                        resolved_at: self.now,
+                        operation_reference: None,
+                    })
+                    .collect();
+                for event in incident_resolutions {
+                    self.emit(&mut log, event);
+                }
                 if canceling_starts.is_empty() {
                     // No canceling listeners: terminate synchronously, exactly as
                     // the pre-task-listener engine did (byte-identical).
