@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { compare, parseRows, DEFAULT_KNOWN } from './compare.mjs';
+import { compare, citesDeclaredIssue, parseRows, DEFAULT_KNOWN } from './compare.mjs';
 
 const corpus = ['1\t\tok:num:1', '(1 + true)\t\terr', '(if 1 then 2 else 3)\tv0=null\tok:null'].join('\n');
 const agreeing = ['ok:num:1', 'err', 'ok:null'].join('\n');
@@ -55,6 +55,15 @@ test('every listed divergence must cite a declared #N issue', () => {
   assert.match(out, /undeclared issue/);
 });
 
+test('inherited / non-#N issue names are never a declared issue', () => {
+  const seeded = ['ok:num:1', 'ok:null', 'ok:null'].join('\n');
+  for (const issue of ['toString', '__proto__', 'constructor', 'hasOwnProperty', 42, null]) {
+    const known = { issues: {}, cases: [{ expr: '(1 + true)', context: '', nano: 'err', feelScala: 'ok:null', issue }] };
+    assert.match(compare(parseRows(corpus, seeded), known).failures.join('\n'), /undeclared issue/, String(issue));
+    assert.equal(citesDeclaredIssue({}, issue), false);
+  }
+});
+
 test('empty corpus and outcome-count mismatch are rejected', () => {
   assert.throws(() => parseRows('', ''), /empty corpus/);
   assert.throws(() => parseRows(corpus, 'ok:num:1'), /3 rows but feel-scala produced 1/);
@@ -64,7 +73,7 @@ test('committed known-divergences.json is well-formed', () => {
   const known = JSON.parse(readFileSync(DEFAULT_KNOWN, 'utf8'));
   const keys = new Set();
   for (const c of known.cases) {
-    assert.ok(known.issues[c.issue], `undeclared issue ${c.issue}`);
+    assert.ok(citesDeclaredIssue(known.issues, c.issue), `undeclared issue ${c.issue}`);
     assert.notEqual(c.nano, c.feelScala);
     const k = `${c.expr}\t${c.context}`;
     assert.ok(!keys.has(k), `duplicate ${k}`);

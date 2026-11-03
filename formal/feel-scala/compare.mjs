@@ -41,18 +41,28 @@ export function parseRows(corpusText, outcomesText) {
   });
 }
 
+const ISSUE_REF = /^#\d+$/;
+
+/**
+ * True iff `ref` is a well-formed `#N` string declared as an OWN property of
+ * `issues` (inherited names such as `toString` / `__proto__` never count).
+ */
+export function citesDeclaredIssue(issues, ref) {
+  return typeof ref === 'string' && ISSUE_REF.test(ref) && Object.hasOwn(issues, ref) && Boolean(issues[ref]);
+}
+
 /** Returns the list of failure messages (empty = pass). */
 export function compare(rows, known) {
   const failures = [];
   const issues = known.issues ?? {};
   for (const ref of Object.keys(issues)) {
-    if (!/^#\d+$/.test(ref)) failures.push(`issue key ${JSON.stringify(ref)} is not of the form #N`);
+    if (!ISSUE_REF.test(ref)) failures.push(`issue key ${JSON.stringify(ref)} is not of the form #N`);
   }
   const listed = new Map();
   for (const c of known.cases ?? []) {
     const k = key(c.expr, c.context);
     if (listed.has(k)) failures.push(`duplicate known divergence: ${c.expr} [${c.context}]`);
-    if (!issues[c.issue]) failures.push(`known divergence ${c.expr} [${c.context}] cites undeclared issue ${JSON.stringify(c.issue)}`);
+    if (!citesDeclaredIssue(issues, c.issue)) failures.push(`known divergence ${c.expr} [${c.context}] cites undeclared issue ${JSON.stringify(c.issue)}`);
     listed.set(k, { ...c, seen: false });
   }
   let divergent = 0;
