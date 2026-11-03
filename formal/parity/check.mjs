@@ -250,7 +250,6 @@ export function loadTouchedCells(fs, known, pinSha, normaliser) {
       errors.push(`${full} has no matching scenario script and golden trace: orphan cells file`);
       continue;
     }
-    if (allowed.has(scenario)) continue;
     const cells = traceCells(fs.read(full));
     if (cells === null) {
       errors.push(`unparseable touched-cells file: ${full}`);
@@ -258,7 +257,9 @@ export function loadTouchedCells(fs, known, pinSha, normaliser) {
     }
     for (const c of cells) {
       if (known && !known.has(c)) errors.push(`${full} lists a cell extract.mjs does not know: ${c}`);
-      touched.add(c);
+      // Grammar is validated for every cells file (allow-listed included), but
+      // only non-allow-listed scenarios are eligible parity evidence.
+      if (!allowed.has(scenario)) touched.add(c);
     }
   }
   // An intent cell is parity evidence only when the differential runner

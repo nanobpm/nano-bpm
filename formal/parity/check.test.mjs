@@ -524,3 +524,14 @@ test('an allow-listed scenario is never parity evidence', () => {
   assert.ok(!touched.has('element:Other'));
   assert.ok(touched.has('element:Task'));
 });
+
+test('an allow-listed scenario still has its cell grammar validated', () => {
+  const files = {
+    ...FILES,
+    [`${TRACES}allowlist.json`]: '{"entries":[{"scenario":"s2","issue":"#1","reason":"x"}]}',
+  };
+  const afs = { exists: (p) => p in files, read: (p) => files[p], list: (p) => DIRS[p] ?? [] };
+  const { touched, errors } = loadTouchedCells(afs, new Set(['element:Task']), 'abc');
+  assert.ok(!touched.has('element:Other'));
+  assert.ok(errors.some((e) => e.includes('does not know: element:Other')), errors.join('\n'));
+});
