@@ -18,7 +18,8 @@ import {
 } from "./nano-backend.mjs";
 import { CamundaBackend } from "./camunda-backend.mjs";
 import { runScenario } from "./driver.mjs";
-import { discoverScenarios } from "./run.mjs";
+import { discoverScenarios, installSignalCleanup } from "./run.mjs";
+import { EventEmitter } from "node:events";
 import {
   checkExpectations,
   diffObservations,
@@ -547,4 +548,34 @@ test("cleanup cancels a failed scenario's still-running Camunda instance", async
     server.close();
     await once(server, "close");
   }
+});
+
+test("SIGINT/SIGTERM run backend cleanup (unpin the cluster clock) before exiting", async () => {
+  // A killed run must not leave the cluster-global Camunda clock pinned at epoch
+  // 0, freezing timers for every other user of the cluster (#1260 review).
+  for (const sig of ["SIGINT", "SIGTERM"]) {
+    const proc = new EventEmitter();
+    const exits = [];
+    proc.exit = (code) => exits.push(code);
+    let cleaned = 0;
+    installSignalCleanup(async () => {
+      cleaned++;
+    }, proc);
+    proc.emit(sig);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(cleaned, 1, `${sig} ran cleanup`);
+    assert.deepEqual(exits, [sig === "SIGINT" ? 130 : 143]);
+  }
+});
+
+test("signal cleanup still exits non-zero when cleanup itself fails", async () => {
+  const proc = new EventEmitter();
+  const exits = [];
+  proc.exit = (code) => exits.push(code);
+  installSignalCleanup(async () => {
+    throw new Error("reset clock failed");
+  }, proc);
+  proc.emit("SIGTERM");
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(exits, [143]);
 });

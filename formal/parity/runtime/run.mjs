@@ -26,6 +26,30 @@ import { CamundaBackend } from "./camunda-backend.mjs";
 import { loadScenario, runScenario } from "./driver.mjs";
 import { checkExpectations, diffObservations } from "./observation.mjs";
 
+/**
+ * Run `cleanup` (backend close: aborts in-flight creates, cancels running
+ * instances, unpins the cluster-global Camunda clock) when the run is
+ * interrupted, then exit with the conventional 128+signal code. Without this a
+ * Ctrl-C or CI job timeout leaves the shared cluster clock pinned at epoch 0,
+ * freezing timers for every other user of the cluster (#1260 review). SIGKILL
+ * cannot be caught; the next parity run still self-heals because every
+ * scenario resets the backend first.
+ */
+export function installSignalCleanup(cleanup, proc = process) {
+  const codes = { SIGINT: 130, SIGTERM: 143 };
+  let started = false;
+  for (const [sig, code] of Object.entries(codes)) {
+    proc.on(sig, () => {
+      if (started) return;
+      started = true;
+      Promise.resolve()
+        .then(cleanup)
+        .catch((err) => console.error(`cleanup after ${sig} failed:`, err))
+        .finally(() => proc.exit(code));
+    });
+  }
+}
+
 function parseArgs(argv) {
   const args = { backend: "nano", corpus: null };
   for (let i = 0; i < argv.length; i++) {
@@ -106,6 +130,11 @@ async function main() {
       }
     }
   }
+
+  installSignalCleanup(async () => {
+    if (nano) await nano.close();
+    if (camunda) await camunda.close();
+  });
 
   let failures = 0;
   try {
