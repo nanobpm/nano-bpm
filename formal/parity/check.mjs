@@ -264,10 +264,15 @@ export function gapProblems(assignments, gaps) {
  *    which is a *covered* cell, not a base gap — so the refinement rule can
  *    never admit the very first `failure:` cells. They are allowed to appear
  *    only when the base baseline contains **no** `failure:` cells at all (the
- *    one-time introduction of the family); once any `failure:` cell is in the
- *    base, the family is shrink-only like everything else.
+ *    one-time introduction of the family); the seed is gated on the
+ *    target branch's **surface** (`baseSurfaceIds`, the cell ids of its
+ *    `zeebe-surface.json`) containing no `failure:` cell — not on the gap
+ *    baseline, because an empty `failure:` baseline also describes a family
+ *    that was introduced and then fully covered. Without the base surface the
+ *    seed is refused (fail-closed); once the family exists on the target
+ *    branch it is shrink-only like everything else.
  */
-export function baselineGrowth(base, head, basePin, headPin) {
+export function baselineGrowth(base, head, basePin, headPin, baseSurfaceIds) {
   if (!Array.isArray(base)) return ['base gaps.json must have a cells array'];
   const before = new Set(base);
   const added = head.filter((id) => !before.has(id));
@@ -275,11 +280,14 @@ export function baselineGrowth(base, head, basePin, headPin) {
   const removed = new Set(base.filter((id) => !new Set(head).has(id)));
   // Fail closed: without the base pin we cannot tell a refinement from a bump.
   const samePin = basePin != null && headPin != null && basePin.sha === headPin.sha;
-  const baseHasFailure = base.some((id) => id.startsWith('failure:'));
+  const familyIntroduced =
+    !Array.isArray(baseSurfaceIds) ||
+    baseSurfaceIds.some((id) => id.startsWith('failure:')) ||
+    base.some((id) => id.startsWith('failure:'));
   const errors = [];
   for (const id of added) {
     if (samePin) {
-      if (id.startsWith('failure:') && !baseHasFailure) continue; // one-time family seed
+      if (id.startsWith('failure:') && !familyIntroduced) continue; // one-time family seed
       // Refinement applies to rejection: cells only; failure: cells enter solely
       // through the one-time seed above, never via a removed coarse gap.
       const parent = id.startsWith('rejection:') ? coarseCellId(id) : null;
@@ -359,7 +367,16 @@ function main() {
       if (!pinPath) throw new Error('--base-pin needs a file path');
       basePin = JSON.parse(readFileSync(pinPath, 'utf8'));
     }
-    errors.push(...baselineGrowth(JSON.parse(readFileSync(basePath, 'utf8')).cells, gapsFile.cells, basePin, headPin));
+    const surfArg = process.argv.indexOf('--base-surface');
+    let baseSurfaceIds = null;
+    if (surfArg !== -1) {
+      const surfPath = process.argv[surfArg + 1];
+      if (!surfPath) throw new Error('--base-surface needs a file path');
+      const cells = JSON.parse(readFileSync(surfPath, 'utf8')).cells;
+      if (!Array.isArray(cells)) throw new Error('base zeebe-surface.json must have a cells array');
+      baseSurfaceIds = cells.map((c) => c.id);
+    }
+    errors.push(...baselineGrowth(JSON.parse(readFileSync(basePath, 'utf8')).cells, gapsFile.cells, basePin, headPin, baseSurfaceIds));
   }
   const report = markdownReport(tally(assignments), surface);
   process.stdout.write(report);

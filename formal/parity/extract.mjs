@@ -323,11 +323,9 @@ export function enclosingScope(src, index) {
         const classes = stack.filter((f) => f.kind === 'class');
         cls = classes.length ? classes[classes.length - 1].name : '';
         topClass = classes.length ? classes[0].name : '';
-        const methods = stack.filter((f) => f.kind === 'method');
-        method = methods.length ? methods[methods.length - 1].name : '';
+        method = innermostMethodInClass(stack);
       } else if (ctx?.kind === 'method') {
-        const methods = stack.filter((f) => f.kind === 'method');
-        method = methods.length ? methods[methods.length - 1].name : '';
+        method = innermostMethodInClass(stack);
       }
       i++;
       continue;
@@ -335,6 +333,19 @@ export function enclosingScope(src, index) {
     i++;
   }
   return { cls: topClass || cls, method };
+}
+
+/**
+ * The innermost method frame that lies inside the innermost remaining class
+ * frame — a method of an *outer* class never leaks across a class boundary
+ * (e.g. a local class's field initializer is not in the enclosing method).
+ */
+function innermostMethodInClass(stack) {
+  for (let k = stack.length - 1; k >= 0; k--) {
+    if (stack[k].kind === 'class') return '';
+    if (stack[k].kind === 'method') return stack[k].name;
+  }
+  return '';
 }
 
 /**

@@ -530,3 +530,15 @@ test('the committed surface is well-formed and extracted at the pin', () => {
   }
   assert.deepEqual(new Set(ids.map((i) => i.split(':')[0])), new Set(Object.keys(FAMILIES)));
 });
+
+test('enclosingScope does not restore an outer method across a local class boundary', () => {
+  const src = `class Outer {
+  void f() {
+    class Inner {
+      void g() {}
+      Object x = new Failure("siteL", ErrorType.UNKNOWN);
+    }
+  }
+}`;
+  assert.deepEqual(enclosingScope(src, src.indexOf('siteL')), { cls: 'Outer', method: '' });
+});

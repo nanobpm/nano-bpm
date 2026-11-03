@@ -688,7 +688,9 @@ jobs:
             # The ratchet is pin-aware: a same-pin grammar refinement may
             # re-baseline, a pin bump may not (check.mjs --base-pin).
             git show FETCH_HEAD:formal/parity/zeebe-pin.json > "$RUNNER_TEMP/base-pin.json"
-            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json" --base-pin "$RUNNER_TEMP/base-pin.json"
+            # The one-time failure: seed is gated on the base SURFACE (--base-surface).
+            git show FETCH_HEAD:formal/parity/zeebe-surface.json > "$RUNNER_TEMP/base-surface.json"
+            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json" --base-pin "$RUNNER_TEMP/base-pin.json" --base-surface "$RUNNER_TEMP/base-surface.json"
           else
             echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
             node formal/parity/check.mjs

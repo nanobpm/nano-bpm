@@ -241,8 +241,17 @@ test('the failure: family seeds once, then is shrink-only', () => {
   const PIN_A = { repository: 'r', ref: 'stable/x', sha: 'aaa' };
   const f1 = 'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR';
   const f2 = 'failure:BpmnJobBehavior.evalRetriesExp:EXTRACT_VALUE_ERROR';
-  // (e) Same pin, base has NO failure: cells -> the family may be seeded.
-  assert.deepEqual(baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A), []);
+  const SURF_NO_FAILURE = ['intent:Job:CREATED', 'incident:EXTRACT_VALUE_ERROR'];
+  // (e) Same pin, base SURFACE has no failure: cells -> the family may be seeded.
+  assert.deepEqual(baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A, SURF_NO_FAILURE), []);
+  // Without the base surface the seed is refused (fail-closed).
+  assert.equal(baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A).length, 1);
+  // A fully covered family (empty failure: baseline, but present in the base
+  // surface) must not reopen: regressing f1 back to a gap is rejected.
+  assert.match(
+    baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A, [...SURF_NO_FAILURE, f1])[0],
+    new RegExp(`adds ${f1.replace(/\./g, '\\.')}`),
+  );
   // Once any failure: cell is in the base, the family is shrink-only like the rest.
   assert.match(baselineGrowth([f1], [f1, f2], PIN_A, PIN_A)[0], new RegExp(`adds ${f2.replace(/\./g, '\\.')}`));
   // Removing a coarse incident: gap must not open a back door for new failure: cells.
