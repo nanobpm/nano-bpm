@@ -17843,7 +17843,7 @@ impl ServerImpl {
                                     .iter()
                                     .filter_map(|event| match event {
                                         Event::JobActivated { job_key, .. } => {
-                                            engine.engine().activated_job(*job_key)
+                                            engine.resident_activated_job(*job_key)
                                         }
                                         _ => None,
                                     })
@@ -17940,10 +17940,9 @@ impl ServerImpl {
         }
         let activated: Vec<ActivatedJobWithIdentity> = handle
             .with(move |journal| {
-                let engine = journal.engine();
                 let jobs = job_keys
                     .into_iter()
-                    .filter_map(|key| engine.activated_job(key))
+                    .filter_map(|key| journal.resident_activated_job(key))
                     .collect();
                 activated_jobs_with_identity(journal, jobs)
             })
