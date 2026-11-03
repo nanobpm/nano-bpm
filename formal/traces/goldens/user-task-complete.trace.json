@@ -1,185 +1,159 @@
 {
-  "scenario": "user-task-complete",
-  "steps": [
-    {
-      "op": "createInstance",
-      "records": [
-        {
-          "bpmnElementType": "PROCESS",
-          "elementId": "user-task",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "PROCESS",
-          "elementId": "user-task",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "START_EVENT",
-          "elementId": "start",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "START_EVENT",
-          "elementId": "start",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "START_EVENT",
-          "elementId": "start",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "START_EVENT",
-          "elementId": "start",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "SEQUENCE_FLOW",
-          "elementId": "f1",
-          "flowScopeKey": 1,
-          "intent": "SEQUENCE_FLOW_TAKEN",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "USER_TASK",
-          "elementId": "review",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "USER_TASK",
-          "elementId": "review",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "elementId": "review",
-          "elementInstanceKey": 2,
-          "intent": "CREATED",
-          "processInstanceKey": 1,
-          "valueType": "USER_TASK"
-        }
-      ],
-      "step": 0
-    },
-    {
-      "op": "completeUserTask",
-      "records": [
-        {
-          "bpmnElementType": "USER_TASK",
-          "elementId": "review",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "USER_TASK",
-          "elementId": "review",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "SEQUENCE_FLOW",
-          "elementId": "f2",
-          "flowScopeKey": 1,
-          "intent": "SEQUENCE_FLOW_TAKEN",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "END_EVENT",
-          "elementId": "end",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "END_EVENT",
-          "elementId": "end",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_ACTIVATED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "END_EVENT",
-          "elementId": "end",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "END_EVENT",
-          "elementId": "end",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "PROCESS",
-          "elementId": "user-task",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETING",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "bpmnElementType": "PROCESS",
-          "elementId": "user-task",
-          "flowScopeKey": 1,
-          "intent": "ELEMENT_COMPLETED",
-          "processInstanceKey": 1,
-          "valueType": "PROCESS_INSTANCE"
-        },
-        {
-          "elementId": "review",
-          "elementInstanceKey": 2,
-          "intent": "COMPLETED",
-          "processInstanceKey": 1,
-          "valueType": "USER_TASK"
-        },
-        {
-          "intent": "CREATED",
-          "name": "approved",
-          "processInstanceKey": 1,
-          "scopeElementId": "user-task",
-          "scopeKey": 1,
-          "value": true,
-          "valueType": "VARIABLE"
-        }
-      ],
-      "step": 1
-    }
-  ],
-  "zeebePin": "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf"
+  "scenario" : "user-task-complete",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "user-task",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "user-task",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f1",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "CREATED",
+      "elementId" : "review",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    } ]
+  }, {
+    "step" : 1,
+    "op" : "completeUserTask",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "review",
+      "bpmnElementType" : "USER_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f2",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "user-task",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "user-task",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "USER_TASK",
+      "intent" : "COMPLETED",
+      "elementId" : "review",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "approved",
+      "value" : true,
+      "scopeElementId" : "user-task",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  } ]
 }

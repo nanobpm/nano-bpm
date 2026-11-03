@@ -642,6 +642,7 @@ impl Inner {
                 instance_key,
                 element_instance_key,
                 element_id,
+                ..
             } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;

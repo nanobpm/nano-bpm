@@ -623,7 +623,8 @@ impl<'a> NanoRun<'a> {
                 "elementId": id,
                 "bpmnElementType": self.element_type_of(element_instance_key, id),
                 "processInstanceKey": instance,
-                "flowScopeKey": instance,
+                // Zeebe's process-root record has no flow scope: -1.
+                "flowScopeKey": if element_instance_key == instance { -1 } else { instance as i64 },
             }),
         )
     }
@@ -741,6 +742,7 @@ impl<'a> NanoRun<'a> {
                 instance_key,
                 element_instance_key,
                 element_id,
+                ..
             } => {
                 // The FIRST activation of an MI-enabled element id is its body:
                 // `activate_multi_instance_body` (engine/mod.rs) mints the body
@@ -1057,7 +1059,7 @@ impl<'a> NanoRun<'a> {
                     json!({
                         "targetElementId": element_id,
                         "processInstanceKey": instance_key,
-                        "targetElementInstanceKey": element_instance_key,
+                        "elementInstanceKey": element_instance_key,
                     }),
                 )]
             }
@@ -1076,7 +1078,7 @@ impl<'a> NanoRun<'a> {
                     json!({
                         "targetElementId": element_id,
                         "processInstanceKey": instance_key,
-                        "targetElementInstanceKey": element_instance_key,
+                        "elementInstanceKey": element_instance_key,
                     }),
                 )]
             }
@@ -1095,7 +1097,7 @@ impl<'a> NanoRun<'a> {
                     json!({
                         "targetElementId": element_id,
                         "processInstanceKey": instance_key,
-                        "targetElementInstanceKey": element_instance_key,
+                        "elementInstanceKey": element_instance_key,
                     }),
                 )]
             }

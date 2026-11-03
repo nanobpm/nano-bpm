@@ -4647,6 +4647,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             instance_key,
             element_instance_key,
             element_id,
+            ..
         } => {
             upsert_element_instance(
                 tx,
@@ -10291,6 +10292,7 @@ mod element_instance_tests {
                     instance_key: INST,
                     element_instance_key: TASK_EI,
                     element_id: "t".to_string(),
+                    scope: 0,
                 },
                 &Event::ElementActivated {
                     instance_key: INST,

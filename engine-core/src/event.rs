@@ -259,11 +259,22 @@ pub enum Event {
     /// completes or is terminated.
     VariableScopeDestroyed { instance_key: Key, scope_key: Key },
 
-    /// An element instance entered `ACTIVATING`.
+    /// An element instance entered `ACTIVATING`. It registers the element
+    /// instance as a live token (so a token parked in `ACTIVATING` on an
+    /// activation-time incident is still owned by its instance, Zeebe parity:
+    /// `JobWorkerTaskProcessor.onActivate` raises the incident before
+    /// `transitionToActivated`). `ElementActivated` follows once activation
+    /// succeeds.
     ElementActivating {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
+        /// The enclosing embedded sub-process element instance, `0` for the
+        /// root scope — as on [`Event::ElementActivated`]. `serde(default)`:
+        /// journals written before it existed always carry the matching
+        /// `ElementActivated`, which records the scope.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Key,
     },
     /// An element instance reached `ACTIVATED`.
     ElementActivated {
