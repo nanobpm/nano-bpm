@@ -395,6 +395,12 @@ test('enclosingScope handles multi-exception throws, anonymous classes and recor
   assert.deepEqual(enclosingScope(rec, rec.indexOf('siteD')), { cls: 'P', method: '' });
 });
 
+test('enclosingScope attributes a sibling top-level class to itself, not the first class', () => {
+  const src = stripComments('package p;\nclass First {\n  void f() { siteA(); }\n}\nclass Second {\n  void f() { siteB(); }\n}\n');
+  assert.deepEqual(enclosingScope(src, src.indexOf('siteA')), { cls: 'First', method: 'f' });
+  assert.deepEqual(enclosingScope(src, src.indexOf('siteB')), { cls: 'Second', method: 'f' });
+});
+
 test('failure family emits one cell per construction site, keyed by class.method and error type', () => {
   const errRel = 'zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record/value/ErrorType.java';
   const errEnum = 'public enum ErrorType { UNKNOWN, EXTRACT_VALUE_ERROR, FORM_NOT_FOUND; }';
@@ -462,6 +468,11 @@ test('failure family fails loud on an unrecognised error-type argument or unknow
   );
   assert.throws(() => run('failure', proc('computeType(), key')), /unrecognised Failure error-type argument/);
   assert.throws(() => run('failure', proc('ErrorType.NOPE, key')), /unknown ErrorType\.NOPE/);
+  // A conditional argument names two types; it must fail loud, never yield one.
+  assert.throws(
+    () => run('failure', proc('m ? ErrorType.EXTRACT_VALUE_ERROR : ErrorType.IO_MAPPING_ERROR, key')),
+    /unrecognised Failure error-type argument/,
+  );
 });
 
 test('rejection family attributes a lambda body to the enclosing named method', () => {

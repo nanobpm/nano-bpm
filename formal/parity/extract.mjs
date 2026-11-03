@@ -322,6 +322,7 @@ export function enclosingScope(src, index) {
         // Recompute enclosing class/method from the remaining stack.
         const classes = stack.filter((f) => f.kind === 'class');
         cls = classes.length ? classes[classes.length - 1].name : '';
+        topClass = classes.length ? classes[0].name : '';
         const methods = stack.filter((f) => f.kind === 'method');
         method = methods.length ? methods[methods.length - 1].name : '';
       } else if (ctx?.kind === 'method') {
@@ -914,7 +915,9 @@ function extractFailures(s, cells) {
       const args = callArgs(src, open);
       let errorType = '';
       if (args.length >= 2) {
-        const t = /\bErrorType\.([A-Z_]+)\b/.exec(args[1]);
+        // Anchored: the whole argument must be one constant, so a conditional
+        // or computed type fails loudly instead of yielding one alternative.
+        const t = /^ErrorType\.([A-Z_]+)$/.exec(args[1].trim());
         if (t) {
           if (!types.has(t[1])) fail(`${file}: unknown ErrorType.${t[1]}`);
           errorType = t[1];
