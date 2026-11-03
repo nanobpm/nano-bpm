@@ -16,6 +16,7 @@ final class Scenarios {
 
   private static final Pattern TAG_START = Pattern.compile("<(\\w+:)?(\\w+)[\\s/>]");
   private static final Pattern COMMENT = Pattern.compile("<!--.*?-->", Pattern.DOTALL);
+  private static final Pattern CDATA = Pattern.compile("<!\\[CDATA\\[.*?\\]\\]>", Pattern.DOTALL);
   private static final Pattern ATTR =
       Pattern.compile("([\\w:.-]+)\\s*=\\s*(\"([^\"]*)\"|'([^']*)')");
 
@@ -37,8 +38,10 @@ final class Scenarios {
    * be publishable as a golden.
    */
   static void requireDi(final String xml, final Path scenario) {
-    // Strip comments first: a commented-out tag is not DI coverage.
-    final String doc = COMMENT.matcher(xml).replaceAll("");
+    // Strip comments and CDATA sections first: a commented-out tag is not DI coverage, and a
+    // tag mentioned inside CDATA (e.g. documentation showing example XML) is character data,
+    // not a real element — the Rust loader's tokenizer treats both as text.
+    final String doc = CDATA.matcher(COMMENT.matcher(xml).replaceAll("")).replaceAll("");
     boolean plane = false;
     final Set<String> shapes = new TreeSet<>();
     final Set<String> edges = new TreeSet<>();

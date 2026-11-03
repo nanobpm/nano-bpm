@@ -92,4 +92,20 @@ public class ScenariosTest {
             IllegalArgumentException.class, () -> Scenarios.requireDi(commented, DIR));
     assertTrue(e.getMessage(), e.getMessage().contains("task"));
   }
+
+  @Test
+  public void aTagInsideCdataIsNotAFlowNode() {
+    // Documentation quoting example XML inside CDATA is character data, not a real element:
+    // the fictitious `example` task must not require a shape (the Rust tokenizer treats CDATA
+    // as text too).
+    final String documented =
+        MODEL.replace(
+            "<bpmn:startEvent id=\"start\" />",
+            """
+            <bpmn:startEvent id="start">
+              <bpmn:documentation><![CDATA[Example: <bpmn:serviceTask id="example"/>]]></bpmn:documentation>
+            </bpmn:startEvent>
+            """);
+    Scenarios.requireDi(documented, DIR);
+  }
 }

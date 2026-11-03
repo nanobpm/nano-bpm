@@ -1,41 +1,41 @@
 {
   "version": 1,
-  "doc": "THE single normaliser spec shared by the Zeebe capture harness (formal/traces/capture, Java) and the nano differential runner (engine-core/tests/zeebe_traces.rs, Rust). Both sides first produce RAW records shaped like Zeebe's record JSON ({recordType, valueType, intent, rejectionType, value:{...}}) and then apply exactly this spec: (1) a COMMAND_REJECTION record becomes {recordType, valueType, intent, rejectionType} in the trailing rejection lane; (2) an EVENT record whose valueType has a lane and whose intent is listed becomes {valueType, intent, <fields from value, absent -> null>}; (3) everything else (commands, unlisted value types/intents) is dropped; (4) the step's records are the lanes concatenated in the order below, each lane keeping its relative order (interleaving ACROSS lanes is not compared). See formal/traces/README.md.",
+  "doc": "THE single normaliser spec shared by the Zeebe capture harness (formal/traces/capture, Java) and the nano differential runner (engine-core/tests/zeebe_traces.rs, Rust). Both sides first produce RAW records shaped like Zeebe's record JSON ({recordType, valueType, intent, rejectionType, value:{...}}) and then apply exactly this spec: (1) a COMMAND_REJECTION record becomes {recordType, valueType, intent, rejectionType} in the trailing rejection lane; (2) an EVENT record whose valueType has a lane and whose intent is listed becomes {valueType, intent, <fields from value, absent -> null>}; (3) everything else (commands, unlisted value types/intents) is dropped; (4) the step's records are the lanes concatenated in the order below, each lane keeping its relative order (interleaving ACROSS lanes is not compared); (5) RUNTIME IDENTITY IS KEPT, CANONICALLY: after the projection, every field whose name ends in `Key` (record keys and the value's processInstanceKey / flowScopeKey / scopeKey / jobKey / ...) is rewritten to a canonical id — the first distinct raw key a step's kept records touch (in lane order) becomes 1, the next 2, and so on. Raw key VALUES are engine-specific, but the identity pattern is behavioural: completing a task in instance A must not read as completing it in instance B. See formal/traces/README.md.",
   "lanes": [
     {
       "valueType": "PROCESS_INSTANCE",
       "intents": ["ELEMENT_ACTIVATING", "ELEMENT_ACTIVATED", "ELEMENT_COMPLETING", "ELEMENT_COMPLETED", "ELEMENT_TERMINATING", "ELEMENT_TERMINATED", "SEQUENCE_FLOW_TAKEN"],
-      "fields": ["elementId", "bpmnElementType"]
+      "fields": ["elementId", "bpmnElementType", "processInstanceKey", "flowScopeKey"]
     },
     {
       "valueType": "JOB",
       "intents": ["CREATED", "COMPLETED", "FAILED", "ERROR_THROWN", "RETRIES_UPDATED", "CANCELED"],
-      "fields": ["elementId", "type", "retries"]
+      "fields": ["elementId", "type", "retries", "processInstanceKey", "elementInstanceKey"]
     },
     {
       "valueType": "USER_TASK",
       "intents": ["CREATED", "COMPLETED", "CANCELED"],
-      "fields": ["elementId"]
+      "fields": ["elementId", "processInstanceKey", "elementInstanceKey"]
     },
     {
       "valueType": "PROCESS_MESSAGE_SUBSCRIPTION",
       "intents": ["CREATED", "CORRELATED", "DELETED"],
-      "fields": ["elementId", "messageName"]
+      "fields": ["elementId", "messageName", "processInstanceKey", "elementInstanceKey"]
     },
     {
       "valueType": "TIMER",
       "intents": ["CREATED", "TRIGGERED", "CANCELED"],
-      "fields": ["targetElementId"]
+      "fields": ["targetElementId", "processInstanceKey", "targetElementInstanceKey"]
     },
     {
       "valueType": "INCIDENT",
       "intents": ["CREATED", "RESOLVED"],
-      "fields": ["elementId", "errorType"]
+      "fields": ["elementId", "errorType", "processInstanceKey", "elementInstanceKey"]
     },
     {
       "valueType": "VARIABLE",
       "intents": ["CREATED", "UPDATED"],
-      "fields": ["name", "value", "scopeElementId"]
+      "fields": ["name", "value", "scopeElementId", "processInstanceKey", "scopeKey"]
     }
   ],
   "rejection": {

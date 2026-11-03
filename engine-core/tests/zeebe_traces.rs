@@ -86,7 +86,38 @@ fn normalise(spec: &J, raw: &[J]) -> Vec<J> {
             out[i].push(J::Object(n));
         }
     }
-    out.into_iter().flatten().collect()
+    let kept: Vec<J> = out.into_iter().flatten().collect();
+    renumber_keys(kept)
+}
+
+/// Rewrite every `*Key` field of the kept records to a canonical id: the
+/// first distinct raw key a step's records touch (in lane order) becomes 1,
+/// the next 2, and so on (spec `doc` step 5). Raw key VALUES are
+/// engine-specific, but the identity pattern is behavioural: completing a
+/// task in instance A must not read as completing it in instance B.
+fn renumber_keys(records: Vec<J>) -> Vec<J> {
+    let mut ids: HashMap<u64, u64> = HashMap::new();
+    let mut renumber = |v: &mut J| {
+        let J::Object(o) = v else { return };
+        for (name, field) in o.iter_mut() {
+            // Only `*Key` fields carry runtime identity — a plain number
+            // (`retries`, a numeric variable `value`) is data, not a key.
+            if !name.ends_with("Key") {
+                continue;
+            }
+            let J::Number(n) = field else { continue };
+            let Some(raw) = n.as_u64() else { continue };
+            let next = ids.len() as u64 + 1;
+            *field = json!(*ids.entry(raw).or_insert(next));
+        }
+    };
+    records
+        .into_iter()
+        .map(|mut r| {
+            renumber(&mut r);
+            r
+        })
+        .collect()
 }
 
 // ───────────────────────────── scenario loading ──────────────────────────────
@@ -100,6 +131,10 @@ struct Scenario {
     element_types: HashMap<String, String>,
     /// (source, target) -> sequence-flow id.
     flows: HashMap<(String, String), String>,
+    /// Ids of activities carrying `multiInstanceLoopCharacteristics`: their
+    /// first activated element instance is the multi-instance BODY, rendered
+    /// `MULTI_INSTANCE_BODY` (Zeebe's type), not the activity's type.
+    multi_instance_elements: BTreeSet<String>,
 }
 
 /// One XML start/empty tag: local name + attributes.
@@ -189,11 +224,23 @@ fn load_scenario(dir: &Path) -> Result<Scenario, String> {
     let mut shapes = BTreeSet::new();
     let mut edges = BTreeSet::new();
     let mut plane = false;
+    // The id of the most recently opened flow node: a
+    // `multiInstanceLoopCharacteristics` child belongs to it (the tokenizer
+    // yields start tags in document order, and the MI element is always a
+    // direct child of its activity).
+    let mut last_flow_node: Option<String> = None;
+    let mut multi_instance_elements = BTreeSet::new();
     for t in &all {
         let id = t.attrs.get("id").cloned().unwrap_or_default();
         match t.name.as_str() {
             "process" => {
                 element_types.insert(id, "PROCESS".to_string());
+                last_flow_node = None;
+            }
+            "multiInstanceLoopCharacteristics" => {
+                if let Some(activity) = &last_flow_node {
+                    multi_instance_elements.insert(activity.clone());
+                }
             }
             "sequenceFlow" => {
                 let (Some(source), Some(target)) =
@@ -220,7 +267,8 @@ fn load_scenario(dir: &Path) -> Result<Scenario, String> {
             }
             tag if FLOW_NODE_TAGS.contains(&tag) => {
                 element_types.insert(id.clone(), zeebe_element_type(tag));
-                needs_shape.insert(id);
+                needs_shape.insert(id.clone());
+                last_flow_node = Some(id);
             }
             _ => {}
         }
@@ -242,6 +290,7 @@ fn load_scenario(dir: &Path) -> Result<Scenario, String> {
         script,
         element_types,
         flows,
+        multi_instance_elements,
     })
 }
 
@@ -344,25 +393,48 @@ struct NanoRun<'a> {
     sc: &'a Scenario,
     engine: Engine,
     now: u64,
-    /// The script's target instance: the instance the most recent explicit
-    /// `createInstance` step created. `updateVariables` aims at it, mirroring
-    /// the Java runner, which keeps the key its create command returned. A
-    /// call-activity child (`parent_process_instance_key.is_some()`) is NOT
-    /// adopted — it is spawned by the engine, not by a script step.
+    /// The script's target instance: the instance the most recent SUCCESSFUL
+    /// explicit `createInstance` step created (mirroring the Java runner's
+    /// `instanceKey = withVars.create()`, which only moves on success).
+    /// `updateVariables` aims at it. An engine-triggered root instance (a
+    /// message/timer start has no parent either) is NOT adopted: the Java
+    /// runner never sees its key, and adopting it would redirect a later
+    /// `updateVariables` to the triggered instance while Capture.java keeps
+    /// targeting the script-created one.
     instance: Key,
+    /// Every instance an explicit `createInstance` step created, in creation
+    /// order — Java's initial-target fallback (`if (instanceKey < 0)`) picks
+    /// the FIRST root instance the engine reports, which a message/timer
+    /// start can produce before any script step runs.
+    created: Vec<Key>,
     /// The process id of the script's target instance. Kept in sync with
     /// `instance`; completion/variable labels resolve through `element_ids`
     /// instead, so a spawned child never relabels the parent's records.
     process_id: String,
     element_ids: HashMap<Key, String>,
+    /// Element-instance keys of multi-instance BODIES (rendered
+    /// `MULTI_INSTANCE_BODY`): a body and its task children share the
+    /// activity's BPMN element id, so the type lookup alone cannot tell
+    /// them apart.
+    mi_bodies: HashMap<Key, Key>,
     jobs_by_type: HashMap<String, Key>,
     jobs: HashMap<Key, (String, String, i64)>,
+    /// job key -> (process-instance key, element-instance key).
+    job_scopes: HashMap<Key, (Key, Key)>,
     user_tasks: HashMap<String, Key>,
     user_task_elements: HashMap<Key, String>,
+    /// user-task key -> (process-instance key, element-instance key).
+    user_task_scopes: HashMap<Key, (Key, Key)>,
     incidents: HashMap<String, Key>,
     incident_info: HashMap<Key, (String, &'static str)>,
+    /// incident key -> (process-instance key, element-instance key).
+    incident_scopes: HashMap<Key, (Key, Key)>,
     timers: HashMap<Key, String>,
+    /// timer key -> (process-instance key, target element-instance key).
+    timer_scopes: HashMap<Key, (Key, Key)>,
     subscriptions: HashMap<Key, (String, String)>,
+    /// subscription key -> (process-instance key, element-instance key).
+    subscription_scopes: HashMap<Key, (Key, Key)>,
     /// variables known per runtime scope key (CREATED vs UPDATED). Keyed by the
     /// scope's element-INSTANCE key, not its BPMN element id: two instances of
     /// one process (or a re-entered scope) each get their own CREATED records.
@@ -385,16 +457,23 @@ impl<'a> NanoRun<'a> {
             engine,
             now: 0,
             instance: 0,
+            created: Vec::new(),
             process_id: String::new(),
             element_ids: HashMap::new(),
+            mi_bodies: HashMap::new(),
             jobs_by_type: HashMap::new(),
             jobs: HashMap::new(),
+            job_scopes: HashMap::new(),
             user_tasks: HashMap::new(),
             user_task_elements: HashMap::new(),
+            user_task_scopes: HashMap::new(),
             incidents: HashMap::new(),
             incident_info: HashMap::new(),
+            incident_scopes: HashMap::new(),
             timers: HashMap::new(),
+            timer_scopes: HashMap::new(),
             subscriptions: HashMap::new(),
+            subscription_scopes: HashMap::new(),
             known: BTreeMap::new(),
         }
     }
@@ -480,7 +559,29 @@ impl<'a> NanoRun<'a> {
             other => panic!("{}: unknown op `{other}`", self.sc.name),
         };
         match result {
-            Ok(events) => events.iter().flat_map(|e| self.render(e)).collect(),
+            Ok(events) => {
+                if op == "createInstance" {
+                    // The script's target moves ONLY on a successful explicit
+                    // creation (Java: `instanceKey = withVars.create()` — a
+                    // rejected create leaves it, and an engine-triggered
+                    // message/timer-start instance never reaches it).
+                    if let Some(key) = events.iter().find_map(|e| match e {
+                        Event::ProcessInstanceCreated {
+                            instance_key,
+                            parent_process_instance_key: None,
+                            ..
+                        } => Some(*instance_key),
+                        _ => None,
+                    }) {
+                        self.instance = key;
+                        self.created.push(key);
+                        if let Some(pid) = self.element_ids.get(&key).cloned() {
+                            self.process_id = pid;
+                        }
+                    }
+                }
+                events.iter().flat_map(|e| self.render(e)).collect()
+            }
             Err(err) => {
                 let (value_type, intent) = command_of(op);
                 vec![json!({
@@ -494,18 +595,32 @@ impl<'a> NanoRun<'a> {
         }
     }
 
-    fn element(&self, id: &str) -> J {
-        let ty = self
-            .sc
+    /// The Zeebe `BpmnElementType` of the element running as
+    /// `element_instance_key`. A multi-instance BODY shares its activity's
+    /// BPMN element id with the task children, so the id alone cannot label
+    /// it: keys recorded in `mi_bodies` render as `MULTI_INSTANCE_BODY`.
+    fn element_type_of(&self, element_instance_key: Key, id: &str) -> String {
+        if self.mi_bodies.contains_key(&element_instance_key) {
+            return "MULTI_INSTANCE_BODY".to_string();
+        }
+        self.sc
             .element_types
             .get(id)
             .cloned()
-            .unwrap_or_else(|| format!("?{id}"));
-        json!({"elementId": id, "bpmnElementType": ty})
+            .unwrap_or_else(|| format!("?{id}"))
     }
 
-    fn lifecycle(&self, intent: &str, id: &str) -> J {
-        event("PROCESS_INSTANCE", intent, self.element(id))
+    fn lifecycle(&self, intent: &str, id: &str, element_instance_key: Key, instance: Key) -> J {
+        event(
+            "PROCESS_INSTANCE",
+            intent,
+            json!({
+                "elementId": id,
+                "bpmnElementType": self.element_type_of(element_instance_key, id),
+                "processInstanceKey": instance,
+                "flowScopeKey": instance,
+            }),
+        )
     }
 
     /// VARIABLE records for one scope. `scope_key` decides CREATED vs UPDATED
@@ -516,6 +631,7 @@ impl<'a> NanoRun<'a> {
         scope_key: Key,
         scope_label: String,
         vars: &HashMap<String, Value>,
+        instance: Key,
     ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
         let known = self.known.entry(scope_key).or_default();
@@ -530,7 +646,13 @@ impl<'a> NanoRun<'a> {
                 event(
                     "VARIABLE",
                     intent,
-                    json!({"name": name, "value": to_json(v), "scopeElementId": scope_label}),
+                    json!({
+                        "name": name,
+                        "value": to_json(v),
+                        "scopeElementId": scope_label,
+                        "processInstanceKey": instance,
+                        "scopeKey": scope_key,
+                    }),
                 )
             })
             .collect()
@@ -538,7 +660,14 @@ impl<'a> NanoRun<'a> {
 
     fn job_value(&self, key: Key, retries: Option<i64>) -> J {
         let (el, ty, r) = self.jobs.get(&key).cloned().unwrap_or_default();
-        json!({"elementId": el, "type": ty, "retries": retries.unwrap_or(r)})
+        let (pik, eik) = self.job_scopes.get(&key).copied().unwrap_or_default();
+        json!({
+            "elementId": el,
+            "type": ty,
+            "retries": retries.unwrap_or(r),
+            "processInstanceKey": pik,
+            "elementInstanceKey": eik,
+        })
     }
 
     /// Render one nano event as zero or more RAW Zeebe-shaped records.
@@ -548,24 +677,29 @@ impl<'a> NanoRun<'a> {
                 instance_key,
                 process_id,
                 variables,
-                parent_process_instance_key,
                 ..
             } => {
-                // Only an explicit `createInstance` step moves the script's
-                // target. A call-activity child (has a parent) is spawned by
-                // the engine; adopting it would redirect a later
-                // `updateVariables` to the child while the Java runner keeps
-                // targeting the key its create command returned.
-                if parent_process_instance_key.is_none() {
-                    self.instance = *instance_key;
-                    self.process_id = process_id.clone();
-                }
                 self.element_ids.insert(*instance_key, process_id.clone());
                 let mut out = vec![
-                    self.lifecycle("ELEMENT_ACTIVATING", process_id),
-                    self.lifecycle("ELEMENT_ACTIVATED", process_id),
+                    self.lifecycle(
+                        "ELEMENT_ACTIVATING",
+                        process_id,
+                        *instance_key,
+                        *instance_key,
+                    ),
+                    self.lifecycle(
+                        "ELEMENT_ACTIVATED",
+                        process_id,
+                        *instance_key,
+                        *instance_key,
+                    ),
                 ];
-                out.extend(self.variable_records(*instance_key, process_id.clone(), variables));
+                out.extend(self.variable_records(
+                    *instance_key,
+                    process_id.clone(),
+                    variables,
+                    *instance_key,
+                ));
                 out
             }
             Event::ProcessInstanceCompleted { instance_key } => {
@@ -578,29 +712,107 @@ impl<'a> NanoRun<'a> {
                     .cloned()
                     .unwrap_or_else(|| format!("?{instance_key}"));
                 vec![
-                    self.lifecycle("ELEMENT_COMPLETING", &pid),
-                    self.lifecycle("ELEMENT_COMPLETED", &pid),
+                    self.lifecycle("ELEMENT_COMPLETING", &pid, *instance_key, *instance_key),
+                    self.lifecycle("ELEMENT_COMPLETED", &pid, *instance_key, *instance_key),
                 ]
             }
+            Event::ProcessInstanceTerminating { instance_key } => {
+                let pid = self
+                    .element_ids
+                    .get(instance_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{instance_key}"));
+                vec![self.lifecycle("ELEMENT_TERMINATING", &pid, *instance_key, *instance_key)]
+            }
+            Event::ProcessInstanceTerminated { instance_key } => {
+                let pid = self
+                    .element_ids
+                    .get(instance_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{instance_key}"));
+                vec![self.lifecycle("ELEMENT_TERMINATED", &pid, *instance_key, *instance_key)]
+            }
             Event::ElementActivating {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                // The FIRST activation of an MI-enabled element id is its body:
+                // `activate_multi_instance_body` (engine/mod.rs) mints the body
+                // key and emits the body's lifecycle before the fan-out's
+                // `MultiInstanceActivated` marker, and the body shares the
+                // activity's BPMN element id with its children. Record the body
+                // key here so its lifecycle renders `MULTI_INSTANCE_BODY`, not
+                // the activity's type.
+                if self.sc.multi_instance_elements.contains(element_id)
+                    && !self.element_ids.values().any(|known| known == element_id)
+                {
+                    self.mi_bodies.insert(*element_instance_key, *instance_key);
+                }
+                self.element_ids
+                    .insert(*element_instance_key, element_id.to_string());
+                vec![self.lifecycle(
+                    "ELEMENT_ACTIVATING",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
+            }
+            Event::ElementActivated {
+                instance_key,
                 element_instance_key,
                 element_id,
                 ..
             } => {
-                self.element_ids
-                    .insert(*element_instance_key, element_id.to_string());
-                vec![self.lifecycle("ELEMENT_ACTIVATING", element_id)]
+                vec![self.lifecycle(
+                    "ELEMENT_ACTIVATED",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
             }
-            Event::ElementActivated { element_id, .. } => {
-                vec![self.lifecycle("ELEMENT_ACTIVATED", element_id)]
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                vec![self.lifecycle(
+                    "ELEMENT_COMPLETING",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
             }
-            Event::ElementCompleting { element_id, .. } => {
-                vec![self.lifecycle("ELEMENT_COMPLETING", element_id)]
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                vec![self.lifecycle(
+                    "ELEMENT_COMPLETED",
+                    element_id,
+                    *element_instance_key,
+                    *instance_key,
+                )]
             }
-            Event::ElementCompleted { element_id, .. } => {
-                vec![self.lifecycle("ELEMENT_COMPLETED", element_id)]
+            Event::MultiInstanceActivated {
+                instance_key,
+                body_key,
+                ..
+            } => {
+                // The authoritative body key (its lifecycle events carry the
+                // ACTIVITY's element id, shared with the task children, so the
+                // type lookup alone cannot label it). Normally already recorded
+                // by the `ElementActivating` arm above; kept as the belt-and-
+                // braces record for a listener-deferred fan-out.
+                self.mi_bodies.insert(*body_key, *instance_key);
+                Vec::new()
             }
-            Event::SequenceFlowTaken { from, to, .. } => {
+            Event::SequenceFlowTaken {
+                instance_key,
+                from,
+                to,
+            } => {
                 let id = self
                     .sc
                     .flows
@@ -610,7 +822,12 @@ impl<'a> NanoRun<'a> {
                 vec![event(
                     "PROCESS_INSTANCE",
                     "SEQUENCE_FLOW_TAKEN",
-                    json!({"elementId": id, "bpmnElementType": "SEQUENCE_FLOW"}),
+                    json!({
+                        "elementId": id,
+                        "bpmnElementType": "SEQUENCE_FLOW",
+                        "processInstanceKey": instance_key,
+                        "flowScopeKey": instance_key,
+                    }),
                 )]
             }
             Event::VariablesUpdated {
@@ -627,9 +844,10 @@ impl<'a> NanoRun<'a> {
                     .get(instance_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{instance_key}"));
-                self.variable_records(*instance_key, pid, variables)
+                self.variable_records(*instance_key, pid, variables, *instance_key)
             }
             Event::ScopedVariablesUpdated {
+                instance_key,
                 scope_key,
                 variables,
                 ..
@@ -639,10 +857,12 @@ impl<'a> NanoRun<'a> {
                     .get(scope_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{scope_key}"));
-                self.variable_records(*scope_key, scope, variables)
+                self.variable_records(*scope_key, scope, variables, *instance_key)
             }
             Event::JobCreated {
                 job_key,
+                instance_key,
+                element_instance_key,
                 element_id,
                 job_type,
                 retries,
@@ -657,6 +877,8 @@ impl<'a> NanoRun<'a> {
                         i64::from(*retries),
                     ),
                 );
+                self.job_scopes
+                    .insert(*job_key, (*instance_key, *element_instance_key));
                 vec![event("JOB", "CREATED", self.job_value(*job_key, None))]
             }
             Event::JobCompleted { job_key, .. } => {
@@ -687,6 +909,8 @@ impl<'a> NanoRun<'a> {
             }
             Event::UserTaskCreated {
                 user_task_key,
+                instance_key,
+                element_instance_key,
                 element_id,
                 ..
             } => {
@@ -694,32 +918,74 @@ impl<'a> NanoRun<'a> {
                     .insert(element_id.to_string(), *user_task_key);
                 self.user_task_elements
                     .insert(*user_task_key, element_id.to_string());
+                self.user_task_scopes
+                    .insert(*user_task_key, (*instance_key, *element_instance_key));
+                let (pik, eik) = (*instance_key, *element_instance_key);
                 vec![event(
                     "USER_TASK",
                     "CREATED",
-                    json!({"elementId": element_id}),
+                    json!({
+                        "elementId": element_id,
+                        "processInstanceKey": pik,
+                        "elementInstanceKey": eik,
+                    }),
                 )]
             }
             Event::UserTaskCompleted { user_task_key, .. } => {
                 let el = self.user_task_elements.get(user_task_key).cloned();
-                vec![event("USER_TASK", "COMPLETED", json!({"elementId": el}))]
+                let (pik, eik) = self
+                    .user_task_scopes
+                    .get(user_task_key)
+                    .copied()
+                    .unwrap_or_default();
+                vec![event(
+                    "USER_TASK",
+                    "COMPLETED",
+                    json!({
+                        "elementId": el,
+                        "processInstanceKey": pik,
+                        "elementInstanceKey": eik,
+                    }),
+                )]
             }
             Event::UserTaskCanceled { user_task_key, .. } => {
                 let el = self.user_task_elements.get(user_task_key).cloned();
-                vec![event("USER_TASK", "CANCELED", json!({"elementId": el}))]
+                let (pik, eik) = self
+                    .user_task_scopes
+                    .get(user_task_key)
+                    .copied()
+                    .unwrap_or_default();
+                vec![event(
+                    "USER_TASK",
+                    "CANCELED",
+                    json!({
+                        "elementId": el,
+                        "processInstanceKey": pik,
+                        "elementInstanceKey": eik,
+                    }),
+                )]
             }
             Event::MessageSubscriptionCreated {
                 subscription_key,
+                instance_key,
+                element_instance_key,
                 element_id,
                 message_name,
                 ..
             } => {
                 let v = (element_id.to_string(), message_name.clone());
                 self.subscriptions.insert(*subscription_key, v.clone());
+                self.subscription_scopes
+                    .insert(*subscription_key, (*instance_key, *element_instance_key));
                 vec![event(
                     "PROCESS_MESSAGE_SUBSCRIPTION",
                     "CREATED",
-                    json!({"elementId": v.0, "messageName": v.1}),
+                    json!({
+                        "elementId": v.0,
+                        "messageName": v.1,
+                        "processInstanceKey": instance_key,
+                        "elementInstanceKey": element_instance_key,
+                    }),
                 )]
             }
             Event::MessageCorrelated {
@@ -730,10 +996,20 @@ impl<'a> NanoRun<'a> {
                     .get(subscription_key)
                     .cloned()
                     .unwrap_or_default();
+                let (pik, eik) = self
+                    .subscription_scopes
+                    .get(subscription_key)
+                    .copied()
+                    .unwrap_or_default();
                 vec![event(
                     "PROCESS_MESSAGE_SUBSCRIPTION",
                     "CORRELATED",
-                    json!({"elementId": el, "messageName": name}),
+                    json!({
+                        "elementId": el,
+                        "messageName": name,
+                        "processInstanceKey": pik,
+                        "elementInstanceKey": eik,
+                    }),
                 )]
             }
             Event::MessageSubscriptionCanceled {
@@ -744,40 +1020,84 @@ impl<'a> NanoRun<'a> {
                     .get(subscription_key)
                     .cloned()
                     .unwrap_or_default();
+                let (pik, eik) = self
+                    .subscription_scopes
+                    .get(subscription_key)
+                    .copied()
+                    .unwrap_or_default();
                 vec![event(
                     "PROCESS_MESSAGE_SUBSCRIPTION",
                     "DELETED",
-                    json!({"elementId": el, "messageName": name}),
+                    json!({
+                        "elementId": el,
+                        "messageName": name,
+                        "processInstanceKey": pik,
+                        "elementInstanceKey": eik,
+                    }),
                 )]
             }
             Event::TimerCreated {
                 timer_key,
+                instance_key,
+                element_instance_key,
                 element_id,
                 ..
             } => {
                 self.timers.insert(*timer_key, element_id.to_string());
+                self.timer_scopes
+                    .insert(*timer_key, (*instance_key, *element_instance_key));
                 vec![event(
                     "TIMER",
                     "CREATED",
-                    json!({"targetElementId": element_id}),
+                    json!({
+                        "targetElementId": element_id,
+                        "processInstanceKey": instance_key,
+                        "targetElementInstanceKey": element_instance_key,
+                    }),
                 )]
             }
-            Event::TimerTriggered { element_id, .. } => {
+            Event::TimerTriggered {
+                timer_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                ..
+            } => {
+                self.timer_scopes
+                    .insert(*timer_key, (*instance_key, *element_instance_key));
                 vec![event(
                     "TIMER",
                     "TRIGGERED",
-                    json!({"targetElementId": element_id}),
+                    json!({
+                        "targetElementId": element_id,
+                        "processInstanceKey": instance_key,
+                        "targetElementInstanceKey": element_instance_key,
+                    }),
                 )]
             }
-            Event::TimerCanceled { element_id, .. } => {
+            Event::TimerCanceled {
+                timer_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                ..
+            } => {
+                self.timer_scopes
+                    .insert(*timer_key, (*instance_key, *element_instance_key));
                 vec![event(
                     "TIMER",
                     "CANCELED",
-                    json!({"targetElementId": element_id}),
+                    json!({
+                        "targetElementId": element_id,
+                        "processInstanceKey": instance_key,
+                        "targetElementInstanceKey": element_instance_key,
+                    }),
                 )]
             }
             Event::IncidentRaised {
                 incident_key,
+                instance_key,
+                element_instance_key,
                 element_id,
                 kind,
                 ..
@@ -785,10 +1105,17 @@ impl<'a> NanoRun<'a> {
                 let info = (element_id.to_string(), zeebe_error_type(*kind));
                 self.incidents.insert(info.0.clone(), *incident_key);
                 self.incident_info.insert(*incident_key, info.clone());
+                self.incident_scopes
+                    .insert(*incident_key, (*instance_key, *element_instance_key));
                 vec![event(
                     "INCIDENT",
                     "CREATED",
-                    json!({"elementId": info.0, "errorType": info.1}),
+                    json!({
+                        "elementId": info.0,
+                        "errorType": info.1,
+                        "processInstanceKey": instance_key,
+                        "elementInstanceKey": element_instance_key,
+                    }),
                 )]
             }
             Event::IncidentResolved { incident_key, .. } => {
@@ -797,10 +1124,20 @@ impl<'a> NanoRun<'a> {
                     .get(incident_key)
                     .cloned()
                     .unwrap_or_default();
+                let (pik, eik) = self
+                    .incident_scopes
+                    .get(incident_key)
+                    .copied()
+                    .unwrap_or_default();
                 vec![event(
                     "INCIDENT",
                     "RESOLVED",
-                    json!({"elementId": el, "errorType": ty}),
+                    json!({
+                        "elementId": el,
+                        "errorType": ty,
+                        "processInstanceKey": pik,
+                        "elementInstanceKey": eik,
+                    }),
                 )]
             }
             // Everything else has no counterpart in the normaliser's lanes.
@@ -835,6 +1172,37 @@ fn diff(golden: &[J], nano: &[J]) -> Option<String> {
                 "step {i}:\n  zeebe: {}\n  nano:  {}",
                 g.map(J::to_string).unwrap_or_else(|| "<none>".into()),
                 n.map(J::to_string).unwrap_or_else(|| "<none>".into())
+            ));
+        }
+    }
+    None
+}
+
+/// A step whose `expectRejection` flag does not match the rejection outcome
+/// the golden itself recorded. Without this gate, editing a script's
+/// `expectRejection` without recapturing leaves command and trace unchanged,
+/// so the differential would pass a successful creation the script now
+/// requires to be rejected (the `expectRejection` divergence stays invisible).
+fn rejection_expectation_mismatch(sc: &Scenario, golden: &[J]) -> Option<String> {
+    for (i, step) in sc.script["steps"].as_array()?.iter().enumerate() {
+        let Some(expected) = step["expectRejection"].as_bool() else {
+            continue;
+        };
+        let Some(g) = golden.get(i) else { break };
+        let actual = g["records"]
+            .as_array()
+            .is_some_and(|rs| rs.iter().any(|r| r["recordType"] == "COMMAND_REJECTION"));
+        if expected != actual {
+            return Some(format!(
+                "step {i} ({}): script.json expects expectRejection={expected} but the golden \
+                 recorded {} — recapture the golden (formal/traces/capture.sh) after changing \
+                 the expectation",
+                step["op"].as_str().unwrap_or("?"),
+                if actual {
+                    "a rejection"
+                } else {
+                    "no rejection"
+                },
             ));
         }
     }
@@ -898,7 +1266,8 @@ fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
             let sc = load_scenario(dir).unwrap_or_else(|e| panic!("{e}"));
             let golden = read_json(&goldens.join(format!("{}.trace.json", sc.name)));
             let steps = golden["steps"].as_array().expect("golden steps").clone();
-            let d = diff(&steps, &nano_trace(spec, &sc));
+            let d = rejection_expectation_mismatch(&sc, &steps)
+                .or_else(|| diff(&steps, &nano_trace(spec, &sc)));
             (sc.name, d)
         })
         .collect()
@@ -908,9 +1277,19 @@ fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
 
 /// THE differential gate: every scenario's nano trace equals its Zeebe golden,
 /// modulo the issue-referenced allow-list (which must not be stale).
+///
+/// `NANO_TRACE_REGEN=1` rewrites the goldens from the nano runner instead —
+/// a LOCAL scaffold for spec changes that alter the normalised shape: the
+/// capture harness (`formal/traces/capture.sh`, offline against the pinned
+/// Zeebe) applies the same spec, so the regenerated golden equals what the
+/// next recapture produces. Never set this in CI.
 #[test]
 fn corpus_matches_zeebe_goldens() {
     let spec = load_spec();
+    if std::env::var_os("NANO_TRACE_REGEN").is_some() {
+        regen_goldens(&spec);
+        return;
+    }
     let outcomes = run_corpus(&spec);
     assert!(!outcomes.is_empty(), "the trace corpus is empty");
     let allowlist = read_json(&traces_dir().join("allowlist.json"));
@@ -919,6 +1298,31 @@ fn corpus_matches_zeebe_goldens() {
             "Zeebe differential traces failed:\n\n{}\n\nSee formal/traces/README.md.",
             errors.join("\n\n")
         );
+    }
+}
+
+/// Rewrite every golden from the nano runner (see `corpus_matches_zeebe_goldens`).
+fn regen_goldens(spec: &J) {
+    let pin = fs::read_to_string(traces_dir().join("goldens/PIN"))
+        .expect("goldens/PIN")
+        .trim()
+        .to_string();
+    for dir in scenario_dirs() {
+        let sc = load_scenario(&dir).unwrap_or_else(|e| panic!("{e}"));
+        let golden = json!({
+            "scenario": sc.name,
+            "zeebePin": pin,
+            "steps": nano_trace(spec, &sc),
+        });
+        let path = traces_dir()
+            .join("goldens")
+            .join(format!("{}.trace.json", sc.name));
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&golden).unwrap()),
+        )
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        eprintln!("regenerated {}", path.display());
     }
 }
 
@@ -1011,7 +1415,7 @@ fn normaliser_keeps_lane_order_selects_fields_and_drops_the_rest() {
         raw_event(
             "PROCESS_INSTANCE",
             "ELEMENT_ACTIVATED",
-            json!({"elementId": "t", "bpmnElementType": "SERVICE_TASK", "flowScopeKey": 9}),
+            json!({"elementId": "t", "bpmnElementType": "SERVICE_TASK", "processInstanceKey": 9}),
         ),
         json!({"recordType": "COMMAND", "valueType": "JOB", "intent": "COMPLETE", "value": {}}),
         raw_event("JOB", "TIMED_OUT", json!({})),
@@ -1020,18 +1424,70 @@ fn normaliser_keeps_lane_order_selects_fields_and_drops_the_rest() {
         raw_event(
             "PROCESS_INSTANCE",
             "ELEMENT_COMPLETED",
-            json!({"elementId": "t"}),
+            json!({"elementId": "t", "processInstanceKey": 9}),
         ),
     ];
     assert_eq!(
         normalise(&spec, &raw),
         vec![
-            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "t", "bpmnElementType": "SERVICE_TASK"}),
-            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_COMPLETED", "elementId": "t", "bpmnElementType": null}),
-            json!({"valueType": "JOB", "intent": "CREATED", "elementId": "t", "type": "w", "retries": 3}),
+            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "t", "bpmnElementType": "SERVICE_TASK", "processInstanceKey": 1, "flowScopeKey": null}),
+            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_COMPLETED", "elementId": "t", "bpmnElementType": null, "processInstanceKey": 1, "flowScopeKey": null}),
+            json!({"valueType": "JOB", "intent": "CREATED", "elementId": "t", "type": "w", "retries": 3, "processInstanceKey": null, "elementInstanceKey": null}),
             json!({"recordType": "COMMAND_REJECTION", "valueType": "JOB", "intent": "COMPLETE", "rejectionType": "NOT_FOUND"}),
         ]
     );
+}
+
+/// Runtime identity survives normalisation, canonically renumbered: raw key
+/// VALUES are engine-specific, but the identity pattern is behavioural — the
+/// first distinct key a step touches becomes 1, the next 2 (spec `doc` step
+/// 5). Two instances of one process must read as two distinct identities, and
+/// a record landing on instance A must not read as landing on instance B.
+#[test]
+fn normaliser_renumbers_runtime_keys_canonically() {
+    let spec = load_spec();
+    let raw = vec![
+        raw_event(
+            "PROCESS_INSTANCE",
+            "ELEMENT_ACTIVATED",
+            json!({"elementId": "p", "bpmnElementType": "PROCESS", "processInstanceKey": 2251799813685249_u64, "flowScopeKey": 2251799813685249_u64}),
+        ),
+        raw_event(
+            "PROCESS_INSTANCE",
+            "ELEMENT_ACTIVATED",
+            json!({"elementId": "p", "bpmnElementType": "PROCESS", "processInstanceKey": 2251799813685254_u64, "flowScopeKey": 2251799813685254_u64}),
+        ),
+        raw_event(
+            "JOB",
+            "COMPLETED",
+            json!({"elementId": "t", "type": "w", "retries": 3, "processInstanceKey": 2251799813685254_u64, "elementInstanceKey": 2251799813685260_u64}),
+        ),
+    ];
+    assert_eq!(
+        normalise(&spec, &raw),
+        vec![
+            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "p", "bpmnElementType": "PROCESS", "processInstanceKey": 1, "flowScopeKey": 1}),
+            json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "p", "bpmnElementType": "PROCESS", "processInstanceKey": 2, "flowScopeKey": 2}),
+            json!({"valueType": "JOB", "intent": "COMPLETED", "elementId": "t", "type": "w", "retries": 3, "processInstanceKey": 2, "elementInstanceKey": 3}),
+        ]
+    );
+    // Swapping the target instance swaps the canonical id: completing in the
+    // FIRST instance is observably different from completing in the SECOND.
+    let mut swapped = raw.clone();
+    swapped[2]["value"]["processInstanceKey"] = json!(2251799813685249_u64);
+    let out = normalise(&spec, &swapped);
+    assert_eq!(out[2]["processInstanceKey"], json!(1), "{out:?}");
+    assert_ne!(out, normalise(&spec, &raw), "the swap must be observable");
+    // A plain number is data, not a key: `retries` and a numeric variable
+    // `value` pass through unrenumbered.
+    let valued = vec![raw_event(
+        "VARIABLE",
+        "CREATED",
+        json!({"name": "n", "value": 2, "scopeElementId": "p", "processInstanceKey": 7, "scopeKey": 7}),
+    )];
+    let out = normalise(&spec, &valued);
+    assert_eq!(out[0]["value"], json!(2), "{out:?}");
+    assert_eq!(out[0]["scopeKey"], json!(1), "{out:?}");
 }
 
 #[test]
@@ -1108,6 +1564,32 @@ fn stale_allow_list_entry_fails_the_runner() {
     assert!(err[0].starts_with("STALE allow-list entry"), "{err:?}");
     let unknown = json!({"entries": [{"scenario": "no-such-scenario", "issue": "#1391"}]});
     assert!(verdict(&outcomes, &unknown).unwrap_err()[0].contains("no such scenario"));
+}
+
+/// Editing a script's `expectRejection` without recapturing must fail the
+/// gate: the golden itself records whether the step's command was rejected,
+/// so a stale golden cannot silently satisfy a changed expectation.
+#[test]
+fn expect_rejection_is_checked_against_the_golden() {
+    let (_spec, sc, golden) = first_scenario();
+    assert_eq!(
+        rejection_expectation_mismatch(&sc, &golden),
+        None,
+        "precondition: the committed script matches its golden"
+    );
+    // Flip the rejection step's expectation to `false`: the golden recorded a
+    // COMMAND_REJECTION, so the mismatch must be reported even though neither
+    // the nano command nor the comparable trace changed.
+    let mut flipped = sc.script.clone();
+    flipped["steps"][2]["expectRejection"] = json!(false);
+    let flipped_sc = Scenario {
+        script: flipped,
+        ..load_scenario(&traces_dir().join("scenarios/service-task-complete")).unwrap()
+    };
+    let m = rejection_expectation_mismatch(&flipped_sc, &golden)
+        .expect("a flipped expectation must be caught");
+    assert!(m.contains("step 2"), "{m}");
+    assert!(m.contains("expectRejection=false"), "{m}");
 }
 
 #[test]
@@ -1556,4 +2038,358 @@ fn variables_updated_uses_the_events_instance_key() {
         vars[0]["scopeElementId"], "msg-catch",
         "labelled with A's process: {step}"
     );
+    // ... and identity distinguishes the two instances: A's `paid` CREATED
+    // record carries A's canonical process-instance key, not B's.
+    let a_key = trace[0]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["valueType"] == "PROCESS_INSTANCE" && r["intent"] == "ELEMENT_ACTIVATED")
+        .map(|r| r["processInstanceKey"].clone())
+        .unwrap();
+    assert_eq!(
+        vars[0]["processInstanceKey"], a_key,
+        "the correlated update lands on instance A: {step}"
+    );
 }
+
+/// A multi-instance BODY shares its activity's BPMN element id with the task
+/// children, so the type lookup alone cannot label it: the body's lifecycle
+/// must render `MULTI_INSTANCE_BODY` (Zeebe's `BpmnElementType`), while the
+/// children render the activity's own type.
+#[test]
+fn multi_instance_body_renders_its_own_lifecycle_type() {
+    let trace = run_scratch(
+        "mibody",
+        MI_SERVICE_TASK_XML,
+        r#"{"description": "multi-instance body", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "mi", "variables": {"items": [1, 2, 3]}},
+            {"op": "completeJob", "jobType": "handle"},
+            {"op": "completeJob", "jobType": "handle"},
+            {"op": "completeJob", "jobType": "handle"}
+        ]}"#,
+    );
+    let step = &trace[0];
+    let activating = records_of(step, "PROCESS_INSTANCE", "ELEMENT_ACTIVATING");
+    let bodies: Vec<&J> = activating
+        .iter()
+        .copied()
+        .filter(|r| r["bpmnElementType"] == "MULTI_INSTANCE_BODY")
+        .collect();
+    assert_eq!(
+        bodies.len(),
+        1,
+        "exactly one MI body activation, rendered MULTI_INSTANCE_BODY: {step}"
+    );
+    assert_eq!(
+        bodies[0]["elementId"], "each",
+        "the body carries the activity's id: {step}"
+    );
+    let children: Vec<&J> = activating
+        .iter()
+        .copied()
+        .filter(|r| r["elementId"] == "each" && r["bpmnElementType"] == "SERVICE_TASK")
+        .collect();
+    assert_eq!(
+        children.len(),
+        3,
+        "the three children render the activity's own type: {step}"
+    );
+    // Identity distinguishes the body from its children: each child's job is
+    // created on its own element instance.
+    let jobs = records_of(step, "JOB", "CREATED");
+    assert_eq!(jobs.len(), 3, "one job per child: {step}");
+    let child_keys: BTreeSet<String> = jobs
+        .iter()
+        .map(|r| r["elementInstanceKey"].to_string())
+        .collect();
+    assert_eq!(
+        child_keys.len(),
+        3,
+        "each child is its own instance: {step}"
+    );
+}
+
+/// An engine-triggered root instance (a message start has no parent either)
+/// must NOT become the script's target: after explicitly creating A and then
+/// triggering B, `updateVariables` still targets A — Capture.java only ever
+/// learns the key its create command returned.
+#[test]
+fn message_start_instance_does_not_steal_the_script_target() {
+    let trace = run_scratch(
+        "msgstart",
+        MESSAGE_START_XML,
+        r#"{"description": "message start vs script target", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "plain", "variables": {"x": 1}},
+            {"op": "publishMessage", "name": "boot", "correlationKey": "c"},
+            {"op": "updateVariables", "variables": {"x": 2}}
+        ]}"#,
+    );
+    // The message start fired: a `started-by-message` instance activated.
+    let started = records_of(&trace[1], "PROCESS_INSTANCE", "ELEMENT_ACTIVATED");
+    assert!(
+        started
+            .iter()
+            .any(|r| r["elementId"] == "started-by-message"),
+        "the message start must have triggered an instance: {}",
+        trace[1]
+    );
+    // The update still lands on A (the explicitly created instance).
+    let step = &trace[2];
+    let vars = records_of(step, "VARIABLE", "UPDATED");
+    assert_eq!(vars.len(), 1, "A's x must be UPDATED: {step}");
+    assert_eq!(
+        vars[0]["scopeElementId"], "plain",
+        "the update targets the script-created instance A: {step}"
+    );
+    let a_key = trace[0]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["valueType"] == "PROCESS_INSTANCE" && r["intent"] == "ELEMENT_ACTIVATED")
+        .map(|r| r["processInstanceKey"].clone())
+        .unwrap();
+    assert_eq!(vars[0]["processInstanceKey"], a_key, "{step}");
+}
+
+/// The fallback used to drop `ProcessInstanceTerminating`/`Terminated`: an
+/// interrupting boundary message on a call activity terminates its child
+/// (engine/boundary.rs), and the child's termination records must appear in
+/// the nano trace — labelled with the CHILD's process, the terminating phase
+/// exactly once.
+#[test]
+fn terminated_child_renders_its_termination_records() {
+    let trace = run_scratch(
+        "terminate",
+        CALL_ACTIVITY_BOUNDARY_XML,
+        r#"{"description": "interrupting boundary on a call activity", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "caller-b"},
+            {"op": "publishMessage", "name": "stop", "correlationKey": "c"}
+        ]}"#,
+    );
+    let step = &trace[1];
+    let terminated = records_of(step, "PROCESS_INSTANCE", "ELEMENT_TERMINATED");
+    let terminating = records_of(step, "PROCESS_INSTANCE", "ELEMENT_TERMINATING");
+    let child: Vec<&&J> = terminated
+        .iter()
+        .filter(|r| r["elementId"] == "child-b")
+        .collect();
+    assert_eq!(
+        child.len(),
+        1,
+        "the child's ELEMENT_TERMINATED is rendered exactly once, labelled `child-b`: {step}"
+    );
+    assert!(
+        terminating.is_empty(),
+        "no canceling listeners: the terminating phase is not emitted: {step}"
+    );
+    // The child's in-play job is CANCELED inside the CHILD's instance
+    // (identity ties the cancellation to the child, not the parent).
+    let child_pi = child[0]["processInstanceKey"].clone();
+    let canceled = records_of(step, "JOB", "CANCELED");
+    assert_eq!(canceled.len(), 1, "the child's job is canceled: {step}");
+    assert_eq!(
+        canceled[0]["processInstanceKey"], child_pi,
+        "the cancellation lands in the CHILD instance: {step}"
+    );
+    // The parent then leaves via the boundary flow and COMPLETES.
+    let completed = records_of(step, "PROCESS_INSTANCE", "ELEMENT_COMPLETED");
+    assert!(
+        completed.iter().any(|r| r["elementId"] == "caller-b"),
+        "the parent completes after the interruption: {step}"
+    );
+}
+
+/// A service task with parallel multi-instance characteristics over `items`.
+const MI_SERVICE_TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_mi" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="mi" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="each">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="handle" retries="3" />
+      </bpmn:extensionElements>
+      <bpmn:multiInstanceLoopCharacteristics>
+        <bpmn:extensionElements>
+          <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+        </bpmn:extensionElements>
+      </bpmn:multiInstanceLoopCharacteristics>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="each" />
+    <bpmn:sequenceFlow id="f2" sourceRef="each" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="mi">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="each_di" bpmnElement="each">
+        <dc:Bounds x="250" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="412" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="250" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="350" y="118" />
+        <di:waypoint x="412" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
+
+/// A trivial none-start process (`plain`) deployed alongside a process whose
+/// start event is message-triggered (`started-by-message`, message `boot`).
+const MESSAGE_START_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_msgstart" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="plain" isExecutable="true">
+    <bpmn:startEvent id="pstart" />
+    <bpmn:endEvent id="pend" />
+    <bpmn:sequenceFlow id="pf1" sourceRef="pstart" targetRef="pend" />
+  </bpmn:process>
+  <bpmn:process id="started-by-message" isExecutable="true">
+    <bpmn:startEvent id="mstart">
+      <bpmn:messageEventDefinition messageRef="mb" />
+    </bpmn:startEvent>
+    <bpmn:endEvent id="mend" />
+    <bpmn:sequenceFlow id="mf1" sourceRef="mstart" targetRef="mend" />
+  </bpmn:process>
+  <bpmn:message id="mb" name="boot" />
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="plain">
+      <bpmndi:BPMNShape id="pstart_di" bpmnElement="pstart">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="pend_di" bpmnElement="pend">
+        <dc:Bounds x="412" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="pf1_di" bpmnElement="pf1">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="412" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+    <bpmndi:BPMNPlane id="BPMNPlane_2" bpmnElement="started-by-message">
+      <bpmndi:BPMNShape id="mstart_di" bpmnElement="mstart">
+        <dc:Bounds x="160" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="mend_di" bpmnElement="mend">
+        <dc:Bounds x="412" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="mf1_di" bpmnElement="mf1">
+        <di:waypoint x="196" y="318" />
+        <di:waypoint x="412" y="318" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
+
+/// A call activity (`caller-b` → `child-b`) with an interrupting message
+/// boundary event (`stop`, correlation `c`): correlating the message abandons
+/// the call activity and terminates the spawned child instance.
+const CALL_ACTIVITY_BOUNDARY_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_callb" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="caller-b" isExecutable="true">
+    <bpmn:startEvent id="pstart" />
+    <bpmn:callActivity id="call">
+      <bpmn:extensionElements>
+        <zeebe:calledElement processId="child-b" />
+      </bpmn:extensionElements>
+    </bpmn:callActivity>
+    <bpmn:boundaryEvent id="stop" attachedToRef="call" cancelActivity="true">
+      <bpmn:messageEventDefinition messageRef="ms" />
+    </bpmn:boundaryEvent>
+    <bpmn:endEvent id="pend" />
+    <bpmn:endEvent id="aborted" />
+    <bpmn:sequenceFlow id="pf1" sourceRef="pstart" targetRef="call" />
+    <bpmn:sequenceFlow id="pf2" sourceRef="call" targetRef="pend" />
+    <bpmn:sequenceFlow id="pf3" sourceRef="stop" targetRef="aborted" />
+  </bpmn:process>
+  <bpmn:process id="child-b" isExecutable="true">
+    <bpmn:startEvent id="cstart" />
+    <bpmn:serviceTask id="ctask">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="inner" retries="3" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="cend" />
+    <bpmn:sequenceFlow id="cf1" sourceRef="cstart" targetRef="ctask" />
+    <bpmn:sequenceFlow id="cf2" sourceRef="ctask" targetRef="cend" />
+  </bpmn:process>
+  <bpmn:message id="ms" name="stop">
+    <bpmn:extensionElements>
+      <zeebe:subscription correlationKey="=&quot;c&quot;" />
+    </bpmn:extensionElements>
+  </bpmn:message>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="caller-b">
+      <bpmndi:BPMNShape id="pstart_di" bpmnElement="pstart">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="call_di" bpmnElement="call">
+        <dc:Bounds x="250" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="stop_di" bpmnElement="stop">
+        <dc:Bounds x="318" y="140" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="pend_di" bpmnElement="pend">
+        <dc:Bounds x="412" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="aborted_di" bpmnElement="aborted">
+        <dc:Bounds x="412" y="220" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="pf1_di" bpmnElement="pf1">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="250" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="pf2_di" bpmnElement="pf2">
+        <di:waypoint x="350" y="118" />
+        <di:waypoint x="412" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="pf3_di" bpmnElement="pf3">
+        <di:waypoint x="336" y="176" />
+        <di:waypoint x="412" y="238" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+    <bpmndi:BPMNPlane id="BPMNPlane_2" bpmnElement="child-b">
+      <bpmndi:BPMNShape id="cstart_di" bpmnElement="cstart">
+        <dc:Bounds x="160" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="ctask_di" bpmnElement="ctask">
+        <dc:Bounds x="250" y="278" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="cend_di" bpmnElement="cend">
+        <dc:Bounds x="412" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="cf1_di" bpmnElement="cf1">
+        <di:waypoint x="196" y="318" />
+        <di:waypoint x="250" y="318" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="cf2_di" bpmnElement="cf2">
+        <di:waypoint x="350" y="318" />
+        <di:waypoint x="412" y="318" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#;
