@@ -8597,7 +8597,20 @@ impl Engine {
         // last outstanding tool drains, complete without cancelling; otherwise
         // latch the fulfilment and park — no new agent turn, no further
         // activation — so the container completes as its children drain.
-        if others == 0 {
+        //
+        // "Last outstanding tool" must ALSO require that no failed pre-creation
+        // tool's incident parks on the container (#1390): such a tool is
+        // outstanding work that never entered the active set, so `others == 0`
+        // can hold while its retry is still parked. Completing now would tear
+        // down the container state the retry needs — and, worse, the park in
+        // `complete_adhoc_container` would then DROP this completion request:
+        // the fulfilment is not yet latched, so if the recovered tool's output
+        // later makes the condition false, the container re-emits the agent job
+        // instead of completing. Take the latch-and-defer path instead: the
+        // fulfilment is recorded now, and the incident's resolution re-drives
+        // the tool whose completion then completes the container on the latched
+        // condition.
+        if others == 0 && !self.adhoc_container_blocked_by_incident(instance_key, container_key) {
             return AdHocPostTool::Complete { cancel: false };
         }
         let fulfilled_event = (!already_fulfilled).then(|| {
@@ -9158,16 +9171,23 @@ impl Engine {
     }
 
     /// The redrive seed for a failed ad-hoc tool activation
-    /// ([`state::IoMappingRedrive::AdHocToolJobType`]) overlaid with the
-    /// operator's corrections — the `SetVariables` written since the incident was
-    /// raised, which Zeebe propagation lands in the nearest scope defining each
-    /// name (the container scope, an ancestor, or the root). Without the overlay
-    /// a seed value that IS the failure (`=toolType` seeded `toolType = 42` by
-    /// the agent) shadows the corrected variable forever: the retry re-applies
-    /// the seed and fails again with no scope the operator could ever edit.
-    /// Writes that post-date the seed are the correction channel, so they win
-    /// over the frozen seed; the seed still supplies everything the operator did
-    /// not touch.
+    /// ([`state::IoMappingRedrive::AdHocToolJobType`]) corrected by the
+    /// operator's post-incident writes — the `SetVariables` written since the
+    /// incident was raised, which Zeebe propagation lands in the nearest scope
+    /// defining each name (the container scope, an ancestor, or the root).
+    /// Without the correction a seed value that IS the failure (`=toolType`
+    /// seeded `toolType = 42` by the agent) shadows the corrected variable
+    /// forever: the retry re-applies the seed and fails again with no scope the
+    /// operator could ever edit.
+    ///
+    /// The retry resolves against the container's CURRENT scope view, with the
+    /// scope chain's binding of a name winning over the frozen seed. The
+    /// activation view resolved a seed name to the seed (it shadowed every
+    /// scope), so any current chain binding of a seed name post-dates the seed
+    /// — it is the operator's correction channel, and it wins. A name the seed
+    /// does not carry fills in from the chain exactly as the original
+    /// activation's view resolved it. This mirrors Zeebe, where resolving an
+    /// incident re-evaluates the element against the current variables.
     fn adhoc_tool_redrive_seed(
         &self,
         instance_key: Key,
@@ -9177,7 +9197,9 @@ impl Engine {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return seed;
         };
-        let mut overlay: HashMap<String, Value> = HashMap::new();
+        // Collect the scope chain's bindings NEAREST scope first (the same
+        // resolution order the original activation's evaluation view used).
+        let mut chain: Vec<&HashMap<String, Value>> = Vec::new();
         let mut cur = self.variable_scope_of(instance, container_key);
         loop {
             let scope_vars = if cur == 0 || cur == instance.key {
@@ -9186,11 +9208,7 @@ impl Engine {
                 instance.scope_variables.get(&cur)
             };
             if let Some(vars) = scope_vars {
-                for (name, value) in vars {
-                    // Nearest scope wins; a name already taken from a nearer
-                    // scope is not overwritten by an ancestor.
-                    overlay.entry(name.clone()).or_insert_with(|| value.clone());
-                }
+                chain.push(vars);
             }
             if cur == 0 || cur == instance.key {
                 break;
@@ -9200,13 +9218,22 @@ impl Engine {
             // walk at the root, which the next iteration visits.
             cur = instance.scope_parents.get(&cur).copied().unwrap_or(0);
         }
-        // The frozen seed shadows the whole scope chain on a read, so a
-        // correction can only win by coming through this overlay: the scope
-        // chain's current values take precedence, and the seed fills in only
-        // what no scope holds.
-        let mut merged = overlay;
-        for (name, value) in seed {
-            merged.entry(name).or_insert(value);
+        // Merge, per name. The retry resolves against the container's CURRENT
+        // scope view overlaid with the frozen seed — except that a seed value
+        // which IS the failure (`=toolType` seeded `toolType = 42`) would
+        // shadow the operator's correction forever, so the overlay inverts that
+        // one precedence: the scope chain's current binding of a name wins over
+        // the seed. The activation view resolved a seed name to the seed (it
+        // shadowed every scope), so any current chain binding of a seed name
+        // post-dates the seed — it is the operator's correction channel, and it
+        // wins. A name the seed does not carry fills in from the chain exactly
+        // as the original activation's view resolved it. Nearest scope wins
+        // when several scopes hold the name.
+        let mut merged = seed;
+        for vars in chain.iter().rev() {
+            for (name, value) in *vars {
+                merged.insert(name.clone(), value.clone());
+            }
         }
         merged
     }
@@ -9309,6 +9336,14 @@ impl Engine {
                         *child,
                     ));
                 }
+                // Resolve any incident parked on the CONTAINER itself (a failed
+                // pre-creation tool activation, #1390) before its state is torn
+                // down: the sweep above only covers CREATED children, and
+                // `AdHocCompleted` touches no incident state, so the incident
+                // would otherwise stay active against the removed container —
+                // a later external resolve would re-drive a retry whose state
+                // is gone. No-op when the container carries no incident.
+                events.extend(self.resolve_incidents_on(instance_key, container_key));
             }
             // Drop the container's ad-hoc runtime record; its `outputCollection`
             // stays resident in the child scope for the MI `output_element` below.
@@ -9356,6 +9391,14 @@ impl Engine {
             for child in &active {
                 events.extend(self.cancel_adhoc_active_child(instance_key, container_key, *child));
             }
+            // Resolve any incident parked on the CONTAINER itself (a failed
+            // pre-creation tool activation, #1390) before its state is torn
+            // down: the sweep above only covers CREATED children, and
+            // `AdHocCompleted` touches no incident state, so the incident would
+            // otherwise stay active against the removed container — a later
+            // external resolve would re-drive a retry whose state is gone.
+            // No-op when the container carries no incident.
+            events.extend(self.resolve_incidents_on(instance_key, container_key));
         }
         // The output collection propagates OUT of the container to its enclosing
         // (flow) scope — for a top-level container that is the root, collapsing to

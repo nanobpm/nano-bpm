@@ -3336,3 +3336,330 @@ fn declarative_adhoc_tool_job_type_incident_blocks_container_completion_until_re
         "once the retried tool drains, the declarative container completes",
     );
 }
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_tool_job_type_redrive_resolves_against_current_scope_view() {
+    // #1390 review: the redrive must resolve the tool against the container's
+    // CURRENT scope view, not the frozen activation seed — otherwise a seed
+    // value that IS the failure (`toolType = 42`) can never be corrected. The
+    // scope chain's current binding of a name wins over the seed, so the
+    // operator's `SetVariables` corrections (here `toolType`, and a `counter`
+    // the root re-set while the incident parked) are what the retry sees. This
+    // mirrors Zeebe, where resolving an incident re-evaluates the element
+    // against the current variables.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=counter + 1" target="counter" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    // The root's `counter`, which the agent's seed will shadow at activation.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("counter".to_string(), Value::Int(1))]),
+        ))
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+
+    // The agent seeds `counter = 10` (shadowing the root) and a `toolType`
+    // whose non-string value fails the pre-creation gate.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element_with(
+                    "toolA",
+                    &[("toolType", Value::Int(42)), ("counter", Value::Int(10))],
+                )],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "the seed's non-string type fails");
+    let incident_key = active[0].key;
+
+    // The operator corrects the failing `toolType` (and, while the incident is
+    // parked, the root's `counter` is the current value the retry resolves
+    // against — the frozen seed's shadow does not survive the incident).
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "{:?}",
+        engine.active_incidents()
+    );
+    let jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].variables.get("counter"),
+        Some(&Value::Int(2)),
+        "the retry resolves against the current scope view: the root's counter (1) + 1",
+    );
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_cancel_remaining_resolves_container_tool_type_incident() {
+    // #1390 review: an agent's `cancelRemainingInstances=true` completion tears
+    // the container down, but a pre-creation tool-type failure's incident sits
+    // on the CONTAINER itself (not on any created child), so the child sweep
+    // misses it. The teardown must resolve it: an active incident must not
+    // outlive the container whose retry state it targets. A PARALLEL sibling
+    // token keeps the instance alive after the container completes, so the
+    // leak is observable (a whole-instance terminate would close the incident
+    // on its own).
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:serviceTask id="sibling">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="sibling-work" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e1" />
+          <bpmn:endEvent id="e2" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="agent" />
+          <bpmn:sequenceFlow id="f3" sourceRef="fork" targetRef="sibling" />
+          <bpmn:sequenceFlow id="f4" sourceRef="agent" targetRef="e1" />
+          <bpmn:sequenceFlow id="f5" sourceRef="sibling" targetRef="e2" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container_key = agent.element_instance_key;
+
+    // Turn 1: the agent activates toolA, whose type expression fails before its
+    // child is created — the incident parks on the CONTAINER.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.active_incidents().len(),
+        1,
+        "the pre-creation failure parked an incident on the container",
+    );
+
+    // Turn 2: with the incident live, the operator cancels the container via
+    // the external activate-activities command (`cancelRemainingInstances`).
+    // The teardown must resolve the container's own incident — not leave it
+    // active against the removed container's retry state.
+    engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: container_key,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .unwrap();
+
+    // The container is gone, but the instance lives on (the sibling token is
+    // still open), so the incident must have been resolved by the teardown.
+    assert!(
+        !engine.is_completed(inst),
+        "the sibling token keeps the instance alive",
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the cancel teardown resolved the container's own incident: {:?}",
+        engine.active_incidents()
+    );
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
+    // #1390 review: with `cancelRemainingInstances=false`, a fulfilled
+    // completion condition must LATCH when the last created sibling drains
+    // while another tool is parked on a pre-creation incident. Otherwise the
+    // fulfilment is lost: the incident guard drops the completion request, and
+    // if the recovered tool's output makes the condition false again, the
+    // container re-emits the agent job instead of completing.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent" cancelRemainingInstances="false">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:completionCondition>=done</bpmn:completionCondition>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="work-b" />
+                <zeebe:ioMapping>
+                  <zeebe:output source="=done" target="done" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+
+    // The agent activates toolA (type expression fails) and toolB (fine).
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(engine.active_incidents().len(), 1);
+    let incident_key = engine.active_incidents()[0].key;
+
+    // toolB completes setting `done = true`: the condition is fulfilled, but
+    // toolA's incident parks the completion. The fulfilment must LATCH now.
+    let tool_b = engine
+        .activate_jobs("work-b", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolB")
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job_with_result(
+            tool_b.key,
+            HashMap::from([("done".to_string(), Value::Bool(true))]),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert!(
+        !engine.is_completed(inst),
+        "the incident parks the container completion",
+    );
+    assert!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no new agent turn while the incident parks",
+    );
+
+    // The operator fixes the type and resolves. toolA re-activates and
+    // completes WITHOUT setting `done` — the container scope keeps `done =
+    // true`, so this cannot distinguish a latch from a re-evaluation by
+    // itself; what must NOT happen is a new agent turn (the lost-latch
+    // symptom: the guard dropped the request, the condition re-evaluates
+    // against the post-recovery scope, and the container continues instead of
+    // completing). Flip `done` false via the recovered tool's output to force
+    // the distinction: the latched fulfilment still completes the container.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("work-a".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let tool_a = engine
+        .activate_jobs("work-a", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("resolving re-activated toolA");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            tool_a.key,
+            HashMap::from([("done".to_string(), Value::Bool(false))]),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "the latched fulfilment completes the container even though the \
+         recovered tool's output flipped the condition false",
+    );
+}
