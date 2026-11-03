@@ -2496,6 +2496,63 @@ fn should_create_incident_if_job_type_expression_is_empty_string() {
 
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
+fn should_create_incident_if_job_type_expression_of_non_string_scalar_type() {
+    // Zeebe `…shouldCreateIncidentIfJobTypeExpressionOfInvalidType` covers the
+    // whole non-string class: a job type must BE a string, not merely be
+    // renderable as one. Numbers, booleans, lists and temporal values all raise
+    // EXTRACT_VALUE_ERROR and create no job — nano's `eval_string` used to
+    // coerce them to their FEEL text (`=42` created a job typed `"42"`).
+    for expr in [
+        "=42",
+        "=1.5",
+        "=true",
+        "=[1, 2]",
+        r#"=@"2024-01-01""#,
+        r#"=@"P1D""#,
+    ] {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(task_with_job_type_expr(expr)))
+            .unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "job-type-incident",
+                HashMap::new(),
+            ))
+            .unwrap();
+        let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        let active = engine.active_incidents();
+        assert_eq!(
+            active.len(),
+            1,
+            "expression {expr} raises exactly one incident"
+        );
+        assert_eq!(
+            active[0].kind,
+            state::IncidentKind::ExtractValueError,
+            "expression {expr} maps to the EXTRACT_VALUE_ERROR taxonomy"
+        );
+        assert_eq!(active[0].element_id, "task");
+        assert!(
+            active[0].reason.contains("must evaluate to a string"),
+            "the reason calls out the non-string result for {expr}: {}",
+            active[0].reason
+        );
+        assert_eq!(
+            engine.state().jobs.len(),
+            0,
+            "expression {expr} creates no job"
+        );
+        assert!(
+            !engine.is_completed(key),
+            "expression {expr} parks the token"
+        );
+    }
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
 fn should_create_incident_if_job_type_expression_exceeds_max_length() {
     // Zeebe `BpmnJobBehavior.evalTypeExp` (maxJobTypeLength, default 128): a
     // job-type expression whose result is longer than the cap raises
@@ -2656,4 +2713,183 @@ fn job_type_expression_resolves_against_updated_variables() {
             .len(),
         1
     );
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_tool_job_type_failure_parks_container_before_any_child_creation() {
+    // #1390 review: a tool whose job-type expression fails must be validated
+    // BEFORE any child-creation side effect. The incident parks on the
+    // CONTAINER with no inner instance, no tool child and no job; resolving it
+    // re-activates the tool with its original seed (`AdHocToolJobType`), a
+    // clean retry — never a resolve that clears the incident without
+    // recreating the job.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+
+    // The agent activates toolA while `toolType` is unbound: the job-type
+    // expression fails BEFORE the tool child exists.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "exactly one incident raised");
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert_eq!(
+        active[0].element_instance_key, container,
+        "the incident parks on the CONTAINER — the tool child was never created",
+    );
+    assert_eq!(active[0].element_id, "agent");
+    assert!(
+        matches!(
+            active[0].redrive,
+            Some(state::IoMappingRedrive::AdHocToolJobType { .. })
+        ),
+        "the redrive re-activates the tool with its preserved seed: {:?}",
+        active[0].redrive
+    );
+    assert_eq!(
+        engine.state().jobs.len(),
+        1,
+        "only the (already-completed) agent job exists — no tool job was minted",
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the container parks on the incident"
+    );
+    let incident_key = active[0].key;
+
+    // Fix the variable and resolve: the tool is re-activated cleanly and its
+    // job appears under the resolved type.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(engine.active_incidents().is_empty());
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(
+        tool_jobs.len(),
+        1,
+        "resolving re-activated the tool: its job exists under the resolved type",
+    );
+    assert_eq!(tool_jobs[0].element_id, "toolA");
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_tool_job_type_re_raise_after_resolve_keeps_container_parked() {
+    // Resolving WITHOUT fixing the variable re-activates the tool, which fails
+    // again at the same pre-creation gate: a fresh incident on the container,
+    // still no child and no job (Zeebe: the retried evaluation produces a new
+    // incident rather than silently swallowing the failure).
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let incident_key = engine.incidents()[0].key;
+
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the retried tool activation fails again: a fresh incident is raised",
+    );
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert_ne!(active[0].key, incident_key, "a new incident record");
+    assert_eq!(active[0].element_instance_key, container);
+    assert_eq!(
+        engine.state().jobs.len(),
+        1,
+        "only the (already-completed) agent job exists — the retry minted no job",
+    );
+    assert!(!engine.is_completed(inst));
 }

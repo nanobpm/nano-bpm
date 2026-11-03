@@ -494,16 +494,19 @@ impl Engine {
     ///
     /// A static type (`"payment"`) is returned verbatim. A FEEL expression (a
     /// leading `=`, e.g. `=jobType` or `="worker-" + region`) is evaluated
-    /// against the instance variables via [`crate::feel`], expecting a
-    /// string-like result.
+    /// against the instance variables via [`crate::feel`] and **must produce a
+    /// string** — matching Zeebe's `BpmnJobBehavior.evalTypeExp`, which requires
+    /// the result to be a string and never coerces.
     ///
-    /// A failure to evaluate (parse error, unresolved variable, a non-string or
-    /// null result), an **empty** result, or a result longer than
-    /// [`MAX_JOB_TYPE_LENGTH`] returns `Err(reason)` — the caller raises an
-    /// `EXTRACT_VALUE_ERROR` ([`crate::state::IncidentKind::ExtractValueError`])
-    /// incident on the element instance and creates **no** job, matching
-    /// Zeebe's `BpmnJobBehavior.evalTypeExp` (each of these is an
-    /// `EXTRACT_VALUE_ERROR` failure there). nano previously fell back to the
+    /// A failure to evaluate (parse error, unresolved variable, null result), a
+    /// **non-string** result (a number, boolean, list, context or temporal —
+    /// [`crate::feel::eval_strict_string`] rejects them on the evaluated FEEL
+    /// value, before any string coercion), an **empty** result, or a result
+    /// longer than [`MAX_JOB_TYPE_LENGTH`] returns `Err(reason)` — the caller
+    /// raises an `EXTRACT_VALUE_ERROR`
+    /// ([`crate::state::IncidentKind::ExtractValueError`]) incident on the
+    /// element instance and creates **no** job (each of these is an
+    /// `EXTRACT_VALUE_ERROR` failure in Zeebe). nano previously fell back to the
     /// literal expression text as the job type, so the token parked with no
     /// incident and no worker could ever subscribe (#1390).
     pub(crate) fn resolve_job_type(
@@ -515,8 +518,9 @@ impl Engine {
         let resolved = if !trimmed.starts_with('=') {
             job_type.to_string()
         } else {
-            crate::feel::eval_string(trimmed, vars)
-                .map_err(|e| format!("failed to evaluate job type expression '{trimmed}': {e}"))?
+            crate::feel::eval_strict_string(trimmed, vars).map_err(|e| {
+                format!("job type expression '{trimmed}' must evaluate to a string: {e}")
+            })?
         };
         if resolved.is_empty() {
             return Err(format!(

@@ -8136,6 +8136,81 @@ impl Engine {
             .as_deref()
             .map(adhoc_inner_instance_id)
             .unwrap_or_else(|| adhoc_inner_instance_id(&element_id));
+        // The tool's kind (and its job type / user-task props) comes from the
+        // container's ad-hoc catalog, not the flat element graph: the parser
+        // flattens an ad-hoc container to a single job activity and prunes its
+        // inner tools, keeping each tool's id + kind in `ProcessDefinition.adhoc`
+        // (so the executable element map — and the processos model round-trip —
+        // stays identical to a plain container). A JOB_WORKER-style service-task
+        // tool emits a job; a user-task tool creates a real user task and parks
+        // the child until it is completed (ADR 0023 v1 scopes tools =
+        // service/user tasks). Any other kind passes straight through to
+        // completion (feeding the loop). v1 targets single-activity tools; the
+        // catalog does not carry per-tool retries/priority for service tasks, so
+        // those default (a later refinement).
+        let tool_kind = container_element_id
+            .as_deref()
+            .and_then(|cid| self.adhoc_def_of(instance_key, cid))
+            .and_then(|def| {
+                def.tools
+                    .iter()
+                    .find(|t| t.element_id == element_id)
+                    .map(|t| t.kind.clone())
+            });
+
+        // Validate the tool's job-type expression BEFORE any child-creation side
+        // effect (#1390): a failing type parks the CONTAINER on an
+        // EXTRACT_VALUE_ERROR incident with no inner instance, no tool child and
+        // no nested-container state created, so resolving re-activates the tool
+        // from scratch (`AdHocToolJobType`, the same clean-retry shape as an
+        // input-mapping failure) instead of clearing the incident without
+        // recreating the job. A nested agentic container's job type lives on its
+        // catalog entry's `ServiceTask { job_type }` kind, so it is covered here
+        // too — before its `AdHocActivated`/`outputCollection` seed.
+        if let Some(crate::model::AdHocToolKind::ServiceTask { job_type }) = &tool_kind {
+            if let Err(reason) = self.resolve_job_type(&child_vars, job_type) {
+                let event = self.extract_value_incident(
+                    instance_key,
+                    container_key,
+                    container_element_id.clone().unwrap_or_default(),
+                    reason,
+                    Some(state::IoMappingRedrive::AdHocToolJobType {
+                        element_id: element_id.clone(),
+                        variables: local_variables.clone(),
+                    }),
+                );
+                return (vec![event], Vec::new());
+            }
+        }
+        // A nested AGENTIC container whose catalog entry is missing (or not a
+        // service-task kind) falls back to the element id as its job type (see
+        // the nested branch below); validate that fallback up front too, with
+        // the same nothing-created clean-retry shape.
+        let nested_agentic_fallback_type = if self.adhoc_def_of(instance_key, &element_id).is_some()
+            && !matches!(
+                tool_kind,
+                Some(crate::model::AdHocToolKind::ServiceTask { .. })
+            ) {
+            Some(element_id.clone())
+        } else {
+            None
+        };
+        if let Some(raw_type) = nested_agentic_fallback_type {
+            if let Err(reason) = self.resolve_job_type(&child_vars, &raw_type) {
+                let event = self.extract_value_incident(
+                    instance_key,
+                    container_key,
+                    container_element_id.clone().unwrap_or_default(),
+                    reason,
+                    Some(state::IoMappingRedrive::AdHocToolJobType {
+                        element_id: element_id.clone(),
+                        variables: local_variables.clone(),
+                    }),
+                );
+                return (vec![event], Vec::new());
+            }
+        }
+
         let mut events = vec![
             Event::ElementActivating {
                 instance_key,
@@ -8167,27 +8242,6 @@ impl Engine {
             },
         ];
         let mut followups = Vec::new();
-        // The tool's kind (and its job type / user-task props) comes from the
-        // container's ad-hoc catalog, not the flat element graph: the parser
-        // flattens an ad-hoc container to a single job activity and prunes its
-        // inner tools, keeping each tool's id + kind in `ProcessDefinition.adhoc`
-        // (so the executable element map — and the processos model round-trip —
-        // stays identical to a plain container). A JOB_WORKER-style service-task
-        // tool emits a job; a user-task tool creates a real user task and parks
-        // the child until it is completed (ADR 0023 v1 scopes tools =
-        // service/user tasks). Any other kind passes straight through to
-        // completion (feeding the loop). v1 targets single-activity tools; the
-        // catalog does not carry per-tool retries/priority for service tasks, so
-        // those default (a later refinement).
-        let tool_kind = container_element_id
-            .as_deref()
-            .and_then(|cid| self.adhoc_def_of(instance_key, cid))
-            .and_then(|def| {
-                def.tools
-                    .iter()
-                    .find(|t| t.element_id == element_id)
-                    .map(|t| t.kind.clone())
-            });
 
         // Nested ad-hoc sub-process tool (agent-of-agents, #631): the tool is
         // itself an `adHocSubProcess` — Zeebe's `isAdHocActivity` admits a nested
@@ -8269,7 +8323,10 @@ impl Engine {
                         // #1390: a failed nested-container job-type expression
                         // parks the tool child on an EXTRACT_VALUE_ERROR
                         // incident — no agent job; the parent container keeps
-                        // waiting for the child.
+                        // waiting for the child. Unreachable on a first pass (the
+                        // same expression was validated before any child-creation
+                        // side effect above); kept for the resolve-time retry,
+                        // where the operator may have introduced a new failure.
                         events.push(self.extract_value_incident(
                             instance_key,
                             child_key,
@@ -8304,7 +8361,10 @@ impl Engine {
                     Err(reason) => {
                         // #1390: a failed tool job-type expression parks the tool
                         // child on an EXTRACT_VALUE_ERROR incident — no job; the
-                        // container keeps waiting for the child.
+                        // container keeps waiting for the child. Unreachable on a
+                        // first pass (validated before any child-creation side
+                        // effect above); kept for the resolve-time retry, where
+                        // the operator may have introduced a new failure.
                         events.push(self.extract_value_incident(
                             instance_key,
                             child_key,
