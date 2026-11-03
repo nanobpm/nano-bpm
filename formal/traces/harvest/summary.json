@@ -1,0 +1,9 @@
+{
+  "tests" : 78,
+  "harvested" : 70,
+  "laidOutByProcessos" : 0,
+  "outOfScope" : 8,
+  "testsPerClass" : {
+    "JobWorkerElementIncidentTest" : 78
+  }
+}

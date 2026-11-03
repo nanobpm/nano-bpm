@@ -1,0 +1,8 @@
+{
+  "description" : "Harvested from Zeebe engine test JobWorkerElementIncidentTest#shouldCreateIncidentIfJobRetriesExpressionOfInvalidType[END_EVENT] (formal/traces/harvest).",
+  "harvestedFrom" : "JobWorkerElementIncidentTest#shouldCreateIncidentIfJobRetriesExpressionOfInvalidType[END_EVENT]",
+  "steps" : [ {
+    "op" : "createInstance",
+    "bpmnProcessId" : "process"
+  } ]
+}

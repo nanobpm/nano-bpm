@@ -1,0 +1,8 @@
+{
+  "description" : "Harvested from Zeebe engine test JobWorkerElementIncidentTest#shouldCreateIncidentIfJobRetriesExpressionEvaluationFailed[SERVICE_TASK] (formal/traces/harvest).",
+  "harvestedFrom" : "JobWorkerElementIncidentTest#shouldCreateIncidentIfJobRetriesExpressionEvaluationFailed[SERVICE_TASK]",
+  "steps" : [ {
+    "op" : "createInstance",
+    "bpmnProcessId" : "process"
+  } ]
+}

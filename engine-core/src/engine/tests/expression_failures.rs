@@ -306,3 +306,141 @@ fn multi_instance_child_job_property_resolve_does_not_reapply_inputs() {
         "input mapping applied exactly once"
     );
 }
+
+/// The lifecycle labels (`Activating`/`Activated`/…) emitted for `element_id`.
+fn lifecycle_of(events: &[Event], element_id: &str) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementActivating { element_id: id, .. } if id == element_id => {
+                Some("Activating")
+            }
+            Event::ElementActivated { element_id: id, .. } if id == element_id => Some("Activated"),
+            Event::ElementCompleting { element_id: id, .. } if id == element_id => {
+                Some("Completing")
+            }
+            Event::ElementCompleted { element_id: id, .. } if id == element_id => Some("Completed"),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Zeebe `JobWorkerTaskProcessor.onActivate` evaluates the job expressions
+/// BEFORE `transitionToActivated`: a failure leaves the element in
+/// `ELEMENT_ACTIVATING` with the incident, and only the successful retry on
+/// resolution writes `ELEMENT_ACTIVATED` (then the job). Found by the
+/// `job-type-expression-failure` Zeebe trace (formal/traces, #1391).
+#[test]
+fn job_type_expression_failure_parks_the_element_in_activating() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(job_type_process("=jobType")))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with("jt", HashMap::new()))
+        .unwrap();
+    assert_eq!(lifecycle_of(&created, "work"), vec!["Activating"]);
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let incident = extract_value_incident(&engine, "work");
+    // The parked token is still a live token of the instance.
+    assert!(!engine.is_completed(inst));
+
+    // A still-failing retry stays in ACTIVATING.
+    let again = engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+    assert!(lifecycle_of(&again, "work").is_empty(), "{again:?}");
+    let incident = extract_value_incident(&engine, "work");
+
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[("jobType", Value::Str("payment".into()))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+    assert_eq!(lifecycle_of(&resolved, "work"), vec!["Activated"]);
+    let activated = resolved
+        .iter()
+        .position(|e| matches!(e, Event::ElementActivated { .. }))
+        .unwrap();
+    let job = resolved
+        .iter()
+        .position(|e| matches!(e, Event::JobCreated { .. }))
+        .unwrap();
+    assert!(activated < job, "ACTIVATED precedes the job: {resolved:?}");
+    complete_one(&mut engine, "payment");
+    assert!(engine.is_completed(inst));
+}
+
+/// Same lifecycle for an input-mapping failure (Zeebe applies input mappings in
+/// `onActivate`, before `transitionToActivated`).
+#[test]
+fn input_mapping_failure_parks_the_element_in_activating() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="io" isExecutable="true">
+    <bpmn:startEvent id="start"/>
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="w"/>
+        <zeebe:ioMapping><zeebe:input source="=missing.x + 1" target="y"/></zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end"/>
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="work"/>
+    <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="end"/>
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with("io", HashMap::new()))
+        .unwrap();
+    assert_eq!(lifecycle_of(&created, "work"), vec!["Activating"]);
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let incident = engine.active_incidents()[0].clone();
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[(
+                "missing",
+                Value::Map(std::collections::BTreeMap::from([(
+                    "x".into(),
+                    Value::Int(1),
+                )])),
+            )]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+    assert_eq!(lifecycle_of(&resolved, "work"), vec!["Activated"]);
+    complete_one(&mut engine, "w");
+    assert!(engine.is_completed(inst));
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+/// `JobWorkerElementIncidentTest#shouldResolveIncidentIfTaskIsTerminated`:
+/// cancelling the instance terminates the incident's element, and Zeebe
+/// resolves the incident with it — it must not linger as an open incident on
+/// a terminated instance.
+#[test]
+fn should_resolve_incident_if_task_is_terminated() {
+    let (mut engine, inst) = start(job_type_process("=jobType"), "jt", HashMap::new());
+    let incident = extract_value_incident(&engine, "work");
+    let events = engine
+        .apply_command(Command::cancel_instance(inst))
+        .unwrap();
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::IncidentResolved { incident_key, .. } if *incident_key == incident.key
+        )),
+        "cancel resolves the element's incident: {events:?}"
+    );
+    assert!(engine.active_incidents().is_empty());
+}

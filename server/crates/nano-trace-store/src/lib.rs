@@ -642,11 +642,19 @@ impl Inner {
                 instance_key,
                 element_instance_key,
                 element_id,
+                scope,
             } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
                     let fresh = !t.by_eik.contains_key(element_instance_key);
-                    t.element_mut(*element_instance_key, element_id, now);
+                    let idx = t.element_mut(*element_instance_key, element_id, now);
+                    // A token parked in `ACTIVATING` on an activation-time
+                    // incident never emits `ElementActivated`; record its scope
+                    // here. `0` (root, or a legacy record without the field)
+                    // never overwrites an already-known scope.
+                    if *scope != 0 {
+                        t.elements[idx].scope = *scope;
+                    }
                     if fresh {
                         t.path.push(element_id.clone());
                     }
@@ -1842,6 +1850,41 @@ mod tests {
             dto.elements.iter().any(|e| e.element_id == "AI_Agent"),
             "the ad-hoc container is a read-model element instance"
         );
+    }
+
+    #[test]
+    fn activating_only_element_is_scoped_and_legacy_zero_keeps_known_scope() {
+        // A token parked in ACTIVATING on an activation-time incident never
+        // emits ElementActivated: its scope must come from ElementActivating.
+        let store = TraceStore::new(16);
+        store.ingest(&[&created(1, &[])], 1000);
+        store.ingest(
+            &[&Event::ElementActivating {
+                instance_key: 1,
+                element_instance_key: 3,
+                element_id: "task".into(),
+                scope: 2,
+            }],
+            1010,
+        );
+        // A re-delivered legacy (scope-less, default 0) record must not
+        // clobber the known scope.
+        store.ingest(
+            &[&Event::ElementActivating {
+                instance_key: 1,
+                element_instance_key: 3,
+                element_id: "task".into(),
+                scope: 0,
+            }],
+            1020,
+        );
+        let dto = store.get(1).unwrap();
+        let task = dto
+            .elements
+            .iter()
+            .find(|e| e.element_id == "task")
+            .unwrap();
+        assert_eq!(task.scope, "2");
     }
 
     #[test]

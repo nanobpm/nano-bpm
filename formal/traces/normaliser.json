@@ -25,7 +25,7 @@
     {
       "valueType": "TIMER",
       "intents": ["CREATED", "TRIGGERED", "CANCELED"],
-      "fields": ["targetElementId", "processInstanceKey", "targetElementInstanceKey"]
+      "fields": ["targetElementId", "processInstanceKey", "elementInstanceKey"]
     },
     {
       "valueType": "INCIDENT",

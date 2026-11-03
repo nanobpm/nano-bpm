@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:ns0="http://camunda.org/schema/zeebe/1.0" exporter="Zeebe BPMN Model" exporterVersion="8.10.0-SNAPSHOT" id="definitions_154b55e3-4a64-4c09-9879-d81cea314ab4" xmlns:modeler="http://camunda.org/schema/modeler/1.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.0-SNAPSHOT" targetNamespace="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <process id="process" isExecutable="true">
+    <startEvent id="startEvent_d885f5ab-1be8-4440-91f5-dcc6f7310b65">
+      <outgoing>sequenceFlow_2aac1d9b-cad2-4ee5-a2f9-184172cfcd84</outgoing>
+    </startEvent>
+    <serviceTask id="task">
+      <extensionElements>
+        <ns0:taskDefinition type="=jobTypeVar"/>
+      </extensionElements>
+      <incoming>sequenceFlow_2aac1d9b-cad2-4ee5-a2f9-184172cfcd84</incoming>
+    </serviceTask>
+    <sequenceFlow id="sequenceFlow_2aac1d9b-cad2-4ee5-a2f9-184172cfcd84" sourceRef="startEvent_d885f5ab-1be8-4440-91f5-dcc6f7310b65" targetRef="task"/>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_14d0100e-f0ca-44ac-b868-0dbd68f20a8a">
+    <bpmndi:BPMNPlane bpmnElement="process" id="BPMNPlane_80d0b2c6-358d-43b7-98d5-2978ad653aeb">
+      <bpmndi:BPMNShape bpmnElement="startEvent_d885f5ab-1be8-4440-91f5-dcc6f7310b65" id="BPMNShape_6e1dc2fe-8551-44a8-b884-1dd72cb4e940">
+        <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="task" id="BPMNShape_0ee85eb9-c02a-4390-aeee-d8270d852e4b">
+        <dc:Bounds height="80.0" width="100.0" x="186.0" y="78.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2aac1d9b-cad2-4ee5-a2f9-184172cfcd84" id="BPMNEdge_0d859c1b-ea0e-4556-9ffb-afcda54b1405">
+        <di:waypoint x="136.0" y="118.0"/>
+        <di:waypoint x="186.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>

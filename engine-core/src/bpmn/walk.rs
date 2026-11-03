@@ -707,6 +707,8 @@ pub(crate) fn parse_with_captures(
                                     boundary.message_ref = Some(message_ref);
                                 } else if let Some(idx) = cur_start {
                                     acc.nodes[idx].message_ref = Some(message_ref);
+                                } else if let Some(idx) = cur_throw.or(cur_end) {
+                                    acc.nodes[idx].is_message_throw = true;
                                 }
                             }
                             "signalEventDefinition" => {
@@ -797,7 +799,9 @@ pub(crate) fn parse_with_captures(
                             "taskDefinition" => {
                                 // zeebe:taskDefinition type="…" retries="…" inside
                                 // a service task.
-                                if let Some(idx) = cur_service_task {
+                                // Also on a message throw/end event, which then
+                                // becomes a job worker (see `is_message_throw`).
+                                if let Some(idx) = cur_service_task.or(cur_throw).or(cur_end) {
                                     if let Some(t) = attr(attrs, "type") {
                                         acc.nodes[idx].job_type = Some(t.to_string());
                                     }

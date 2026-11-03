@@ -1,0 +1,11 @@
+{
+  "description" : "Harvested from Zeebe engine test JobWorkerElementIncidentTest#shouldResolveIncidentAndCreateNewIncidentWhenContinuationFails[END_EVENT] (formal/traces/harvest).",
+  "harvestedFrom" : "JobWorkerElementIncidentTest#shouldResolveIncidentAndCreateNewIncidentWhenContinuationFails[END_EVENT]",
+  "steps" : [ {
+    "op" : "createInstance",
+    "bpmnProcessId" : "process"
+  }, {
+    "op" : "resolveIncident",
+    "elementId" : "task"
+  } ]
+}

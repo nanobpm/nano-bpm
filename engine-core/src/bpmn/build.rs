@@ -133,6 +133,12 @@ pub(super) struct NodeAcc {
     /// process's start form. `None` on other nodes and start events with no form.
     pub(super) start_form_id: Option<String>,
     /// True when this `intermediateThrowEvent`/`endEvent` carries a
+    /// `messageEventDefinition`. Together with a `zeebe:taskDefinition` it is a
+    /// Zeebe *job worker* message event: activation creates a job and the job's
+    /// completion completes the event, exactly like a send task
+    /// (`JobWorkerElementIncidentTest`). Built as a job-based task.
+    pub(super) is_message_throw: bool,
+    /// True when this `intermediateThrowEvent`/`endEvent` carries a
     /// `compensateEventDefinition`, making it a
     /// [`CompensationThrowEvent`](crate::model::ElementKind::CompensationThrowEvent).
     pub(super) is_compensation_throw: bool,
@@ -171,6 +177,18 @@ pub(super) struct NodeAcc {
     /// at build (`aiAgentTask` only on a `serviceTask`, `aiAgentSubProcess` only
     /// on an `adHocSubProcess`), mirroring Camunda's `AgentDefinitionValidator`.
     pub(super) agent_type: Option<crate::agent::AgentType>,
+}
+
+impl NodeAcc {
+    /// The single classification of a message `intermediateThrowEvent` /
+    /// `endEvent` carrying a `zeebe:taskDefinition` as a job worker. Shared by
+    /// the raw task-definition capture (so its attributes are validated like
+    /// any job task's) and the build rewrite, so the two cannot drift.
+    pub(super) fn is_job_worker_message_event(&self) -> bool {
+        matches!(self.kind, NodeKind::End | NodeKind::IntermediateThrow)
+            && self.is_message_throw
+            && self.job_type.is_some()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -391,6 +409,7 @@ impl ProcessAcc {
             task_headers: std::collections::BTreeMap::new(),
             linked_resources: Vec::new(),
             start_form_id: None,
+            is_message_throw: false,
             is_compensation_throw: false,
             is_escalation_throw: false,
             escalation_throw_dup: false,
@@ -520,7 +539,7 @@ impl ProcessAcc {
         let task_definitions = self
             .nodes
             .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Service))
+            .filter(|n| matches!(n.kind, NodeKind::Service) || n.is_job_worker_message_event())
             .map(|n| TaskDefCapture {
                 task_id: n.id.clone(),
                 job_type: n.job_type.clone(),
@@ -1359,7 +1378,8 @@ impl ProcessAcc {
             .iter()
             .map(|(node_id, _)| node_id.clone())
             .collect();
-        for node in self.nodes {
+        for mut node in self.nodes {
+            let job_worker = node.is_job_worker_message_event();
             // Reject an `endEvent` / `intermediateThrowEvent` that carries more
             // than one throw/end event definition (#1173). Multiple definitions
             // set multiple independent node flags, and the build dispatch below
@@ -1374,7 +1394,10 @@ impl ProcessAcc {
                     + node.is_compensation_throw as u32
                     + node.is_terminate as u32
                     + node.link_name.is_some() as u32
-                    + error_def_node_ids.contains(&node.id) as u32;
+                    + error_def_node_ids.contains(&node.id) as u32
+                    // A job-worker message event is rebuilt as a job task below,
+                    // which would silently drop any competing definition.
+                    + job_worker as u32;
                 // `defs > 1`: competing definitions of different kinds.
                 // `escalation_throw_dup`: two `escalationEventDefinition`s on the
                 // SAME throw/end — a last-wins overwrite of `escalation_ref` that
@@ -1410,6 +1433,23 @@ impl ProcessAcc {
                         },
                     });
                 }
+            }
+            // A message throw/end event with a `zeebe:taskDefinition` is a job
+            // worker (Zeebe `JobWorkerElementIncidentTest`): it behaves exactly
+            // like a send task, so build it as one. Its BPMN tag (and thus its
+            // element type) is unchanged. Validated as the end event it is
+            // BEFORE the rewrite: once it is a service task neither the
+            // `NodeKind::End` outgoing-flow guard below nor the model-level
+            // `end_events_have_no_outgoing` rule can see it.
+            if job_worker {
+                if matches!(node.kind, NodeKind::End) && flow_source_ids.contains(&node.id) {
+                    return Err(ParseError::InvalidEndEvent {
+                        process_id: self.id.clone(),
+                        element_id: node.id.clone(),
+                        reason: "an end event must have no outgoing sequence flow".to_string(),
+                    });
+                }
+                node.kind = NodeKind::Service;
             }
             let node_id = node.id.clone();
             let io_id = node.id.clone();

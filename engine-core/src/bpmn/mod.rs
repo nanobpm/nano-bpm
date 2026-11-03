@@ -18,7 +18,9 @@
 //!   `terminateEventDefinition` — a terminate end that kills the remaining
 //!   tokens in its enclosing scope), `task`/`manualTask` (abstract
 //!   pass-through), `serviceTask`, `sendTask` (a job-based service task — its
-//!   throwing cousin of `receiveTask`), `userTask`, `exclusiveGateway`,
+//!   throwing cousin of `receiveTask`; a message `intermediateThrowEvent` /
+//!   `endEvent` carrying a `zeebe:taskDefinition` is the same job worker),
+//!   `userTask`, `exclusiveGateway`,
 //!   `parallelGateway`, `inclusiveGateway`, `eventBasedGateway`.
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an

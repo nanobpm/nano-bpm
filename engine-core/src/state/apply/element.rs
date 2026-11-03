@@ -6,10 +6,18 @@ use crate::state::types::*;
 
 pub(super) fn apply_element(state: &mut State, event: &Event) {
     match event {
-        // ACTIVATING/COMPLETING are transient transitions with no state change.
-        Event::ElementActivating { .. } | Event::ElementCompleting { .. } => {}
+        // COMPLETING is a transient transition with no state change.
+        Event::ElementCompleting { .. } => {}
 
-        Event::ElementActivated {
+        // ACTIVATING registers the live token (an activation-time incident parks
+        // it here, before ACTIVATED); ACTIVATED re-registers it idempotently.
+        Event::ElementActivating {
+            instance_key,
+            element_instance_key,
+            element_id,
+            scope,
+        }
+        | Event::ElementActivated {
             instance_key,
             element_instance_key,
             element_id,

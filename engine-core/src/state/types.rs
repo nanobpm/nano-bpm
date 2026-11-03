@@ -844,6 +844,15 @@ pub enum IoMappingRedrive {
     /// (re-apply inputs, then re-enact its behaviour) without re-emitting its
     /// `ElementActivating`/`ElementActivated` (engine `Step::RetryActivation`).
     Activation,
+    /// Like [`Self::Activation`], but the failure happened BEFORE the element
+    /// reached `ACTIVATED` (an input mapping or job-property expression failing
+    /// in a fresh activation): the token is parked in `ACTIVATING`, as Zeebe's
+    /// `onActivate` raises the incident before `transitionToActivated`. The
+    /// redrive re-runs the activation body and emits `ElementActivated` only
+    /// once it succeeds (a repeat failure stays in `ACTIVATING`). Additive
+    /// brand-new variant — old journals (whose activation incidents always
+    /// followed an `ElementActivated`) carry [`Self::Activation`].
+    ActivationPending,
     /// **Output**-mapping failure that re-projects on completion: the mainstream
     /// leaf activity, a sub-process, a multi-instance child, an ad-hoc tool —
     /// anything parked in COMPLETING whose output re-projects via the element's

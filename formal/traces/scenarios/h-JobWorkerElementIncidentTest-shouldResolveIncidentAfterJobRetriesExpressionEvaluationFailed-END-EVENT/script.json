@@ -1,0 +1,17 @@
+{
+  "description" : "Harvested from Zeebe engine test JobWorkerElementIncidentTest#shouldResolveIncidentAfterJobRetriesExpressionEvaluationFailed[END_EVENT] (formal/traces/harvest).",
+  "harvestedFrom" : "JobWorkerElementIncidentTest#shouldResolveIncidentAfterJobRetriesExpressionEvaluationFailed[END_EVENT]",
+  "steps" : [ {
+    "op" : "createInstance",
+    "bpmnProcessId" : "process"
+  }, {
+    "op" : "updateVariables",
+    "scopeElementId" : "task",
+    "variables" : {
+      "x" : 3
+    }
+  }, {
+    "op" : "resolveIncident",
+    "elementId" : "task"
+  } ]
+}

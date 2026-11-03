@@ -539,7 +539,8 @@
     "ElementActivating": {
       "element_id": "start",
       "element_instance_key": 8,
-      "instance_key": 7
+      "instance_key": 7,
+      "scope": 0
     }
   },
   {
@@ -575,7 +576,8 @@
     "ElementActivating": {
       "element_id": "charge",
       "element_instance_key": 9,
-      "instance_key": 7
+      "instance_key": 7,
+      "scope": 0
     }
   },
   {
@@ -677,7 +679,8 @@
     "ElementActivating": {
       "element_id": "end",
       "element_instance_key": 11,
-      "instance_key": 7
+      "instance_key": 7,
+      "scope": 0
     }
   },
   {
@@ -729,7 +732,8 @@
     "ElementActivating": {
       "element_id": "start",
       "element_instance_key": 13,
-      "instance_key": 12
+      "instance_key": 12,
+      "scope": 0
     }
   },
   {
@@ -765,7 +769,8 @@
     "ElementActivating": {
       "element_id": "charge",
       "element_instance_key": 14,
-      "instance_key": 12
+      "instance_key": 12,
+      "scope": 0
     }
   },
   {
@@ -1079,7 +1084,8 @@
     "ElementActivating": {
       "element_id": "s",
       "element_instance_key": 21,
-      "instance_key": 20
+      "instance_key": 20,
+      "scope": 0
     }
   },
   {
@@ -1115,7 +1121,8 @@
     "ElementActivating": {
       "element_id": "fork",
       "element_instance_key": 22,
-      "instance_key": 20
+      "instance_key": 20,
+      "scope": 0
     }
   },
   {
@@ -1178,7 +1185,8 @@
     "ElementActivating": {
       "element_id": "join",
       "element_instance_key": 23,
-      "instance_key": 20
+      "instance_key": 20,
+      "scope": 0
     }
   },
   {
@@ -1220,7 +1228,8 @@
     "ElementActivating": {
       "element_id": "e",
       "element_instance_key": 24,
-      "instance_key": 20
+      "instance_key": 20,
+      "scope": 0
     }
   },
   {
@@ -1268,7 +1277,8 @@
     "ElementActivating": {
       "element_id": "s",
       "element_instance_key": 26,
-      "instance_key": 25
+      "instance_key": 25,
+      "scope": 0
     }
   },
   {
@@ -1304,7 +1314,8 @@
     "ElementActivating": {
       "element_id": "fork",
       "element_instance_key": 27,
-      "instance_key": 25
+      "instance_key": 25,
+      "scope": 0
     }
   },
   {
@@ -1357,7 +1368,8 @@
     "ElementActivating": {
       "element_id": "t",
       "element_instance_key": 28,
-      "instance_key": 25
+      "instance_key": 25,
+      "scope": 0
     }
   },
   {
@@ -1384,7 +1396,8 @@
     "ElementActivating": {
       "element_id": "join",
       "element_instance_key": 30,
-      "instance_key": 25
+      "instance_key": 25,
+      "scope": 0
     }
   },
   {
@@ -1623,7 +1636,8 @@
     "ElementActivating": {
       "element_id": "s",
       "element_instance_key": 38,
-      "instance_key": 37
+      "instance_key": 37,
+      "scope": 0
     }
   },
   {
@@ -1659,7 +1673,8 @@
     "ElementActivating": {
       "element_id": "brt",
       "element_instance_key": 39,
-      "instance_key": 37
+      "instance_key": 37,
+      "scope": 0
     }
   },
   {
@@ -1770,7 +1785,8 @@
     "ElementActivating": {
       "element_id": "e",
       "element_instance_key": 41,
-      "instance_key": 37
+      "instance_key": 37,
+      "scope": 0
     }
   },
   {
@@ -1822,7 +1838,8 @@
     "ElementActivating": {
       "element_id": "s",
       "element_instance_key": 43,
-      "instance_key": 42
+      "instance_key": 42,
+      "scope": 0
     }
   },
   {
@@ -1858,7 +1875,8 @@
     "ElementActivating": {
       "element_id": "brt",
       "element_instance_key": 44,
-      "instance_key": 42
+      "instance_key": 42,
+      "scope": 0
     }
   },
   {
@@ -2007,7 +2025,8 @@
     "ElementActivating": {
       "element_id": "start",
       "element_instance_key": 49,
-      "instance_key": 48
+      "instance_key": 48,
+      "scope": 0
     }
   },
   {
@@ -2043,7 +2062,8 @@
     "ElementActivating": {
       "element_id": "charge",
       "element_instance_key": 50,
-      "instance_key": 48
+      "instance_key": 48,
+      "scope": 0
     }
   },
   {

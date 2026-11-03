@@ -1,0 +1,72 @@
+{
+  "scenario" : "h-JobWorkerElementIncidentTest-shouldCreateIncidentIfJobTypeExpressionOfInvalidType-SCRIPT-TASK",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "process",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "process",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "startEvent_80eb8a62-3208-4673-b4b1-1aebed2b9dc7",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "startEvent_80eb8a62-3208-4673-b4b1-1aebed2b9dc7",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "startEvent_80eb8a62-3208-4673-b4b1-1aebed2b9dc7",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "startEvent_80eb8a62-3208-4673-b4b1-1aebed2b9dc7",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "sequenceFlow_5c19105c-a203-4d48-8258-1de8ed4eaeb9",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "task",
+      "bpmnElementType" : "SCRIPT_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "CREATED",
+      "elementId" : "task",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    } ]
+  } ]
+}

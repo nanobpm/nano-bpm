@@ -335,6 +335,10 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+        /// `true` when the element is still in `ACTIVATING` (the incident was
+        /// raised before `ElementActivated`, [`state::IoMappingRedrive::ActivationPending`]):
+        /// a successful re-run then emits `ElementActivated` first.
+        pending: bool,
     },
     /// Re-run the activation body of an already-active element whose input
     /// `zeebe:ioMapping` raised an `IoMapping` incident (#939). The element
@@ -346,6 +350,10 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+        /// `true` when the element is still in `ACTIVATING` (the incident was
+        /// raised before `ElementActivated`, [`state::IoMappingRedrive::ActivationPending`]):
+        /// a successful re-run then emits `ElementActivated` first.
+        pending: bool,
     },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
@@ -3040,6 +3048,7 @@ impl Engine {
                                 instance_key,
                                 element_instance_key,
                                 element_id,
+                                pending: false,
                             });
                         } else if matches!(
                             redrive,
@@ -3081,7 +3090,13 @@ impl Engine {
                                 element_instance_key,
                                 element_id,
                             });
-                        } else if matches!(redrive, Some(state::IoMappingRedrive::Activation)) {
+                        } else if matches!(
+                            redrive,
+                            Some(
+                                state::IoMappingRedrive::Activation
+                                    | state::IoMappingRedrive::ActivationPending
+                            )
+                        ) {
                             // An activation-time expression (job type/retries)
                             // failed in the activation body (#1390, Zeebe
                             // `JobWorkerTaskProcessor.onActivate`): the element is
@@ -3092,6 +3107,10 @@ impl Engine {
                                 instance_key,
                                 element_instance_key,
                                 element_id,
+                                pending: matches!(
+                                    redrive,
+                                    Some(state::IoMappingRedrive::ActivationPending)
+                                ),
                             });
                         } else if let Some(
                             state::IoMappingRedrive::MiChildActivation { body_key, index }
@@ -3194,6 +3213,17 @@ impl Engine {
                                     instance_key,
                                     element_instance_key,
                                     element_id,
+                                    pending: false,
+                                })
+                            }
+                            // The same, for a token still in ACTIVATING: the
+                            // successful re-run emits `ElementActivated`.
+                            Some(state::IoMappingRedrive::ActivationPending) => {
+                                Some(Step::RetryActivation {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    pending: true,
                                 })
                             }
                             // Output re-projection. A mainstream leaf element
@@ -3854,6 +3884,33 @@ impl Engine {
                     self.emit(&mut log, event);
                 }
                 for event in immediate_user_task_cancels {
+                    self.emit(&mut log, event);
+                }
+                // Terminating the instance terminates every element carrying an
+                // open incident, and Zeebe resolves those incidents with their
+                // element (`JobWorkerElementIncidentTest#
+                // shouldResolveIncidentIfTaskIsTerminated`) — none may linger on
+                // a terminated instance.
+                let mut open_incidents: Vec<&state::Incident> = self
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| {
+                        i.instance_key == instance_key && i.state == state::IncidentState::Active
+                    })
+                    .collect();
+                open_incidents.sort_unstable_by_key(|i| i.key);
+                let incident_resolutions: Vec<Event> = open_incidents
+                    .into_iter()
+                    .map(|i| Event::IncidentResolved {
+                        incident_key: i.key,
+                        instance_key,
+                        job_key: i.job_key,
+                        resolved_at: self.now,
+                        operation_reference: None,
+                    })
+                    .collect();
+                for event in incident_resolutions {
                     self.emit(&mut log, event);
                 }
                 if canceling_starts.is_empty() {
@@ -5484,6 +5541,7 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id,
+                pending,
             } => {
                 // The catch element instance is already ACTIVATED (its token is
                 // parked on the resolved incident); reconstruct its enclosing
@@ -5491,25 +5549,49 @@ impl Engine {
                 // activation body to re-open the subscription.
                 let scope = self.scope_of(instance_key, element_instance_key);
                 let vars = self.variables_for_element(instance_key, element_instance_key);
-                self.run_activation_body(
+                let activated = Event::ElementActivated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    scope,
+                };
+                let (events, followups) = self.run_activation_body(
                     instance_key,
                     element_id,
                     element_instance_key,
                     scope,
                     vars,
-                )
+                );
+                if pending {
+                    (gate_activated(events, activated, 0), followups)
+                } else {
+                    (events, followups)
+                }
             }
             Step::RetryActivation {
                 instance_key,
                 element_instance_key,
                 element_id,
+                pending,
             } => {
                 // The element instance is already ACTIVATED (parked on the
                 // resolved input-mapping incident); reconstruct its enclosing
                 // scope and re-run the activation body so the now-fixed input
                 // mappings are re-applied before the element's behaviour runs.
                 let scope = self.scope_of(instance_key, element_instance_key);
-                self.activate_body(instance_key, element_id, element_instance_key, scope)
+                let activated = Event::ElementActivated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    scope,
+                };
+                let (events, followups) =
+                    self.activate_body(instance_key, element_id, element_instance_key, scope);
+                if pending {
+                    (gate_activated(events, activated, 0), followups)
+                } else {
+                    (events, followups)
+                }
             }
             Step::ActivateMiChild {
                 instance_key,
@@ -5642,19 +5724,18 @@ impl Engine {
         }
 
         let element_instance_key = self.mint_key();
-        let mut events = vec![
-            Event::ElementActivating {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-            },
-            Event::ElementActivated {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-                scope,
-            },
-        ];
+        let activated = Event::ElementActivated {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+            scope,
+        };
+        let mut events = vec![Event::ElementActivating {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+            scope,
+        }];
         let mut followups = Vec::new();
 
         // A sub-process is itself a variable scope: it always registers its scope
@@ -5682,7 +5763,9 @@ impl Engine {
             self.activate_body(instance_key, element_id, element_instance_key, scope);
         events.extend(body_events);
         followups.extend(body_followups);
-        (events, followups)
+        // `ElementActivated` sits right after `ElementActivating` — unless the
+        // activation body parked the token on an activation-time incident.
+        (gate_activated(events, activated, 1), followups)
     }
 
     /// The element's activation body: everything between `ElementActivated` and
@@ -6471,6 +6554,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: body_key,
                 element_id: element_id.clone(),
+                scope,
             },
             Event::ElementActivated {
                 instance_key,
@@ -6836,6 +6920,7 @@ impl Engine {
                             instance_key,
                             element_instance_key: child_key,
                             element_id: element_id.clone(),
+                            scope: body_key,
                         },
                         Event::ElementActivated {
                             instance_key,
@@ -6869,6 +6954,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
+                scope: body_key,
             },
             Event::ElementActivated {
                 instance_key,
@@ -8172,6 +8258,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: inner_key,
                 element_id: inner_element_id.clone(),
+                scope: container_key,
             },
             Event::ElementActivated {
                 instance_key,
@@ -8183,6 +8270,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
+                scope: inner_key,
             },
             Event::ElementActivated {
                 instance_key,
@@ -11638,6 +11726,7 @@ impl Engine {
                     instance_key,
                     element_instance_key: eik,
                     element_id: element_id.clone(),
+                    scope,
                 });
                 events.push(Event::ElementActivated {
                     instance_key,
@@ -11774,6 +11863,7 @@ impl Engine {
             instance_key,
             element_instance_key: eik,
             element_id: element_id.to_string(),
+            scope,
         });
         events.push(Event::ElementActivated {
             instance_key,
@@ -13504,4 +13594,39 @@ pub fn check_business_id(business_id: Option<&str>) -> Result<(), EngineError> {
     } else {
         Err(EngineError::BusinessIdInvalid { chars })
     }
+}
+
+/// Zeebe parity for activation-time failures: `onActivate` (input mappings, job
+/// expressions) runs BEFORE `transitionToActivated`, so a failure leaves the
+/// element in `ACTIVATING`. If `events` raise an [`state::IoMappingRedrive::Activation`]
+/// incident on the activating element instance, that incident is re-tagged
+/// [`state::IoMappingRedrive::ActivationPending`] (so its resolution emits
+/// `ElementActivated` once the re-run succeeds) and `activated` is withheld;
+/// otherwise `activated` is inserted at `at`.
+fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Event> {
+    let eik = match &activated {
+        Event::ElementActivated {
+            element_instance_key,
+            ..
+        } => *element_instance_key,
+        _ => 0,
+    };
+    let mut parked = false;
+    for e in &mut events {
+        if let Event::IncidentRaised {
+            element_instance_key,
+            redrive: Some(redrive @ state::IoMappingRedrive::Activation),
+            ..
+        } = e
+        {
+            if *element_instance_key == eik {
+                *redrive = state::IoMappingRedrive::ActivationPending;
+                parked = true;
+            }
+        }
+    }
+    if !parked {
+        events.insert(at.min(events.len()), activated);
+    }
+    events
 }
