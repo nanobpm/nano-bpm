@@ -46,7 +46,7 @@ public final class Sites {
 
   /** A site observed while a type was raised. */
   public record Pending(String kind, String type, String message, String cls, String method,
-      int line) {
+      int line, long thread) {
     String cell() {
       return kind.equals("failure")
           ? CellIds.failure(cls, method, type)
@@ -73,7 +73,8 @@ public final class Sites {
         .transform(
             (builder, type, loader, module, domain) ->
                 builder.visit(Advice.to(FailureAdvice.class).on(isConstructor())))
-        .type(nameStartsWith("io.camunda.zeebe.engine.").and(not(isInterface())))
+        .type(nameStartsWith("io.camunda.zeebe.engine.").and(not(isInterface()))
+            .and(not(named(FAILURE))))
         .transform(
             (builder, type, loader, module, domain) ->
                 builder
@@ -117,7 +118,7 @@ public final class Sites {
     // [0]=Sites.caller, [1]=Sites.failure, [2]=Failure.<init> (advice inlined), [3]=the site.
     final StackWalker.StackFrame f = caller(3);
     add(new Pending("failure", errorType, message, f.getClassName(), f.getMethodName(),
-        f.getLineNumber()));
+        f.getLineNumber(), Thread.currentThread().threadId()));
   }
 
   /** Called from the inlined RejectionType-parameter advice on entry. */
@@ -141,7 +142,7 @@ public final class Sites {
     // [0]=Sites.caller, [1]=Sites.rejectionEnter, [2]=the instrumented method, [3]=its caller.
     final StackWalker.StackFrame f = caller(3);
     add(new Pending("rejection", type, message, f.getClassName(), f.getMethodName(),
-        f.getLineNumber()));
+        f.getLineNumber(), Thread.currentThread().threadId()));
   }
 
   public static void rejectionExit() {
@@ -149,37 +150,57 @@ public final class Sites {
   }
 
   /**
-   * Consume the earliest pending site of {@code kind} with this {@code type} whose message equals
-   * {@code message} (or, failing an exact message match, the earliest of that type). All later
-   * pending entries with the same type+message are dropped: they are the plumbing that forwarded
-   * the same rejection/failure, not separate raising sites.
+   * Consume the pending site of {@code kind} with this {@code type} whose message equals {@code
+   * message}, plus any LATER entries with the same type+message recorded on the SAME thread: those
+   * are the plumbing that forwarded the same rejection/failure (a processor records its site
+   * before the writer appends the record, so forwarding strictly follows the original site on that
+   * thread). Entries from another thread are kept: they were raised independently (e.g. the same
+   * invalid expression evaluated on two parallel branches) and must stay attributable to their own
+   * records.
+   *
+   * <p>When no entry carries the record's exact message, the record's message was rewritten by
+   * the plumbing. In that case the earliest entry of the type is consumed only when it is the
+   * ONLY pending entry of that type+kind; with several candidates there is no honest correlation
+   * and the record goes unattributed rather than stealing an independent site's attribution.
    */
   public static synchronized Optional<Pending> take(
       final String kind, final String type, final String message) {
-    Pending hit = null;
-    for (final Pending p : PENDING) {
+    int hit = -1;
+    for (int i = 0; i < PENDING.size(); i++) {
+      final Pending p = PENDING.get(i);
       if (p.kind().equals(kind) && p.type().equals(type) && java.util.Objects.equals(p.message(),
           message)) {
-        hit = p;
+        hit = i;
         break;
       }
     }
-    if (hit == null) {
-      for (final Pending p : PENDING) {
+    if (hit < 0) {
+      int candidate = -1;
+      int count = 0;
+      for (int i = 0; i < PENDING.size(); i++) {
+        final Pending p = PENDING.get(i);
         if (p.kind().equals(kind) && p.type().equals(type)) {
-          hit = p;
-          break;
+          if (count == 0) {
+            candidate = i;
+          }
+          count++;
         }
       }
+      if (count != 1) {
+        return Optional.empty();
+      }
+      hit = candidate;
     }
-    if (hit == null) {
-      return Optional.empty();
-    }
-    final Pending found = hit;
-    PENDING.removeIf(
-        p -> p == found
-            || (p.kind().equals(kind) && p.type().equals(type)
-                && java.util.Objects.equals(p.message(), found.message())));
+    final Pending found = PENDING.remove(hit);
+    // Forwarding plumbing follows the site that raised the record: drop later same-type+message
+    // entries — but only those recorded on THIS thread. An entry from another thread (a sibling
+    // branch evaluating the same invalid expression in parallel) is an independent raising site
+    // and must survive for its own record.
+    final long thread = found.thread();
+    PENDING.subList(hit, PENDING.size())
+        .removeIf(
+            p -> p.thread() == thread && p.kind().equals(kind) && p.type().equals(type)
+                && java.util.Objects.equals(p.message(), found.message()));
     return Optional.of(found);
   }
 

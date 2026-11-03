@@ -54,11 +54,19 @@ mkdir -p "$classes"
 # An @argfile with quoted paths: the repo checkout path may contain spaces.
 find "$here/capture/src/main/java" "$here/capture/src/test/java" -name '*.java' \
   | sed 's/.*/"&"/' > "$classes.sources"
-"$JAVA_HOME/bin/javac" -Xlint:none -nowarn -d "$classes" -cp "$cp" "@$classes.sources" 2>&1 | grep -v '^Note:' || true
-[ -f "$classes/io/nanobpm/traces/Capture.class" ] || { echo "capture.sh: compile failed" >&2; exit 1; }
+# javac must fail the script (no `|| true` swallowing it): `-Xstdout` routes its
+# non-diagnostic notes to a file so the diagnostics left on stderr stay visible.
+if ! "$JAVA_HOME/bin/javac" -Xlint:none -nowarn -Xstdout "$classes.javac.log" \
+  -d "$classes" -cp "$cp" "@$classes.sources"; then
+  echo "capture.sh: compile failed" >&2
+  exit 1
+fi
 
 if [ "${1:-}" = "test" ]; then
-  exec "$java" -cp "$classes:$cp" org.junit.runner.JUnitCore io.nanobpm.traces.CellIdsTest
+  # Every *Test class under capture/src/test/java is a harness unit test.
+  tests="$(cd "$here/capture/src/test/java" && find . -name '*Test.java' \
+    | sed -e 's|^\./||' -e 's|\.java$||' -e 's|/|.|g' | sort | tr '\n' ' ')"
+  exec "$java" -cp "$classes:$cp" org.junit.runner.JUnitCore $tests
 fi
 
 exec "$java" -XX:+EnableDynamicAgentLoading -Djdk.attach.allowAttachSelf=true \

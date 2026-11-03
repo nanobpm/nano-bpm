@@ -25,6 +25,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
+use nanobpmn_engine_core::xml::{local_name, tokenize, Token};
 use nanobpmn_engine_core::{Command, Engine, EngineError, Event, IncidentKind, Key, Value};
 use serde_json::{json, Map, Value as J};
 
@@ -105,36 +106,27 @@ struct Tag {
     attrs: HashMap<String, String>,
 }
 
-fn tags(xml: &str) -> Vec<Tag> {
+/// Every start/empty tag in the document, scanned by the engine's XML
+/// tokenizer (single- or double-quoted attributes, whitespace around `=`,
+/// comments and CDATA) — never an ad-hoc scanner that would accept a narrower
+/// dialect than the loader it feeds.
+fn tags(xml: &str) -> Result<Vec<Tag>, String> {
+    let tokens = tokenize(xml).map_err(|e| e.0)?;
     let mut out = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find('<') {
-        rest = &rest[start + 1..];
-        let end = rest.find('>').unwrap_or(rest.len());
-        let body = rest[..end].trim_end_matches('/');
-        rest = &rest[end..];
-        if body.starts_with(['/', '?', '!']) {
+    for token in tokens {
+        let Token::Start { name, attrs, .. } = token else {
             continue;
-        }
-        let mut parts = body.splitn(2, char::is_whitespace);
-        let qname = parts.next().unwrap_or_default();
+        };
         // Extension elements (`zeebe:userTask`, …) are not BPMN elements.
-        if qname.starts_with("zeebe:") {
+        if name.starts_with("zeebe:") {
             continue;
         }
-        let name = qname.rsplit(':').next().unwrap_or_default().to_string();
-        let mut attrs = HashMap::new();
-        let mut a = parts.next().unwrap_or_default();
-        while let Some(eq) = a.find("=\"") {
-            let key = a[..eq].trim().to_string();
-            let after = &a[eq + 2..];
-            let close = after.find('"').unwrap_or(after.len());
-            attrs.insert(key, after[..close].to_string());
-            a = &after[(close + 1).min(after.len())..];
-        }
-        out.push(Tag { name, attrs });
+        out.push(Tag {
+            name: local_name(&name).to_string(),
+            attrs: attrs.into_iter().collect(),
+        });
     }
-    out
+    Ok(out)
 }
 
 /// `serviceTask` -> `SERVICE_TASK` (Zeebe's `BpmnElementType` naming).
@@ -187,7 +179,7 @@ fn load_scenario(dir: &Path) -> Result<Scenario, String> {
     if !script["steps"].is_array() {
         return Err(format!("{name}: script.json has no `steps` array"));
     }
-    let all = tags(&xml);
+    let all = tags(&xml).map_err(|e| format!("{name}: process.bpmn: {e}"))?;
     let mut element_types = HashMap::new();
     let mut flows = HashMap::new();
     let mut needs_shape = BTreeSet::new();
@@ -202,7 +194,14 @@ fn load_scenario(dir: &Path) -> Result<Scenario, String> {
                 element_types.insert(id, "PROCESS".to_string());
             }
             "sequenceFlow" => {
-                let key = (t.attrs["sourceRef"].clone(), t.attrs["targetRef"].clone());
+                let (Some(source), Some(target)) =
+                    (t.attrs.get("sourceRef"), t.attrs.get("targetRef"))
+                else {
+                    return Err(format!(
+                        "{name}: sequenceFlow `{id}` lacks sourceRef/targetRef"
+                    ));
+                };
+                let key = (source.clone(), target.clone());
                 if flows.insert(key, id.clone()).is_some() {
                     return Err(format!(
                         "{name}: two sequence flows share source and target"
@@ -354,8 +353,10 @@ struct NanoRun<'a> {
     incident_info: HashMap<Key, (String, &'static str)>,
     timers: HashMap<Key, String>,
     subscriptions: HashMap<Key, (String, String)>,
-    /// variables known per scope element id (CREATED vs UPDATED).
-    known: BTreeMap<String, BTreeSet<String>>,
+    /// variables known per runtime scope key (CREATED vs UPDATED). Keyed by the
+    /// scope's element-INSTANCE key, not its BPMN element id: two instances of
+    /// one process (or a re-entered scope) each get their own CREATED records.
+    known: BTreeMap<Key, BTreeSet<String>>,
 }
 
 fn event(value_type: &str, intent: &str, value: J) -> J {
@@ -484,9 +485,17 @@ impl<'a> NanoRun<'a> {
         event("PROCESS_INSTANCE", intent, self.element(id))
     }
 
-    fn variable_records(&mut self, scope: String, vars: &HashMap<String, Value>) -> Vec<J> {
+    /// VARIABLE records for one scope. `scope_key` decides CREATED vs UPDATED
+    /// (per runtime scope); `scope_label` is the BPMN element id the golden
+    /// compares, mirroring how Zeebe's capture labels `scopeElementId`.
+    fn variable_records(
+        &mut self,
+        scope_key: Key,
+        scope_label: String,
+        vars: &HashMap<String, Value>,
+    ) -> Vec<J> {
         let sorted: BTreeMap<&String, &Value> = vars.iter().collect();
-        let known = self.known.entry(scope.clone()).or_default();
+        let known = self.known.entry(scope_key).or_default();
         sorted
             .into_iter()
             .map(|(name, v)| {
@@ -498,7 +507,7 @@ impl<'a> NanoRun<'a> {
                 event(
                     "VARIABLE",
                     intent,
-                    json!({"name": name, "value": to_json(v), "scopeElementId": scope}),
+                    json!({"name": name, "value": to_json(v), "scopeElementId": scope_label}),
                 )
             })
             .collect()
@@ -525,7 +534,7 @@ impl<'a> NanoRun<'a> {
                     self.lifecycle("ELEMENT_ACTIVATING", process_id),
                     self.lifecycle("ELEMENT_ACTIVATED", process_id),
                 ];
-                out.extend(self.variable_records(process_id.clone(), variables));
+                out.extend(self.variable_records(*instance_key, process_id.clone(), variables));
                 out
             }
             Event::ProcessInstanceCompleted { .. } => {
@@ -568,7 +577,7 @@ impl<'a> NanoRun<'a> {
             }
             Event::VariablesUpdated { variables, .. } => {
                 let pid = self.process_id.clone();
-                self.variable_records(pid, variables)
+                self.variable_records(self.instance, pid, variables)
             }
             Event::ScopedVariablesUpdated {
                 scope_key,
@@ -580,7 +589,7 @@ impl<'a> NanoRun<'a> {
                     .get(scope_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{scope_key}"));
-                self.variable_records(scope, variables)
+                self.variable_records(*scope_key, scope, variables)
             }
             Event::JobCreated {
                 job_key,
@@ -1094,6 +1103,66 @@ fn scenario_without_di_is_rejected() {
         .err()
         .expect("partial DI must be rejected");
     assert!(err.contains("\"task\""), "{err}");
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// The metadata pass over `process.bpmn` uses the engine's XML tokenizer, so
+/// single-quoted attributes and whitespace around `=` are recognised exactly
+/// as the loader recognises them (an ad-hoc `="..."` scanner used to drop
+/// those, losing `sourceRef`/`targetRef` and panicking the loader).
+#[test]
+fn scenario_attributes_accept_both_quote_styles_and_spacing() {
+    let src = traces_dir().join("scenarios/service-task-complete");
+    let tmp = std::env::temp_dir().join(format!("nano-trace-attrs-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+    let xml = fs::read_to_string(src.join("process.bpmn")).unwrap();
+    let styled = xml
+        .replace("sourceRef=\"start\"", "sourceRef = 'start'")
+        .replace("targetRef=\"task\"", "targetRef=  'task'")
+        .replace("bpmnElement=\"f1\"", "bpmnElement =\n                'f1'");
+    assert_ne!(styled, xml, "precondition: the rewrite changed the model");
+    fs::write(tmp.join("process.bpmn"), styled).unwrap();
+    fs::copy(src.join("script.json"), tmp.join("script.json")).unwrap();
+    let sc = load_scenario(&tmp).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        sc.flows.get(&("start".to_string(), "task".to_string())),
+        Some(&"f1".to_string())
+    );
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
+/// Variable existence is tracked per runtime scope key, not per BPMN element
+/// id: a second instance of the same process renders its initial variables as
+/// CREATED, not UPDATED.
+#[test]
+fn second_instance_variables_are_created_not_updated() {
+    let src = traces_dir().join("scenarios/service-task-complete");
+    let tmp = std::env::temp_dir().join(format!("nano-trace-vars-{}", std::process::id()));
+    fs::create_dir_all(&tmp).unwrap();
+    fs::copy(src.join("process.bpmn"), tmp.join("process.bpmn")).unwrap();
+    fs::write(
+        tmp.join("script.json"),
+        r#"{"description": "two instances", "steps": [
+            {"op": "createInstance", "bpmnProcessId": "service-task", "variables": {"x": 1}},
+            {"op": "createInstance", "bpmnProcessId": "service-task", "variables": {"x": 2}}
+        ]}"#,
+    )
+    .unwrap();
+    let sc = load_scenario(&tmp).unwrap_or_else(|e| panic!("{e}"));
+    let trace = nano_trace(&load_spec(), &sc);
+    for (i, step) in trace.iter().enumerate() {
+        let records = step["records"].as_array().unwrap();
+        let var = records
+            .iter()
+            .find(|r| r["valueType"] == "VARIABLE")
+            .unwrap_or_else(|| panic!("step {i}: no VARIABLE record"));
+        assert_eq!(
+            var["intent"],
+            "CREATED",
+            "step {i}: the variable of instance {} must be CREATED",
+            i + 1
+        );
+    }
     fs::remove_dir_all(&tmp).unwrap();
 }
 

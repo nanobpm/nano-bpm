@@ -118,13 +118,27 @@ public final class Capture {
       final byte[] xml = Files.readAllBytes(scenario.resolve("process.bpmn"));
       Scenarios.requireDi(new String(xml, StandardCharsets.UTF_8), scenario);
       engine.deployment().withXmlResource(xml, "process.bpmn").deploy();
-      settle(engine);
+      if (!settle(engine)) {
+        throw new IllegalStateException(
+            scenario.getFileName()
+                + ": the engine never became quiescent after deploy — refusing to write"
+                + " goldens from an incomplete record stream");
+      }
       seen = RecordingExporter.getRecords().size();
       Sites.clear();
       int index = 0;
       for (final JsonNode step : script.get("steps")) {
         apply(engine, step);
-        settle(engine);
+        if (!settle(engine)) {
+          throw new IllegalStateException(
+              scenario.getFileName()
+                  + " step "
+                  + index
+                  + " ("
+                  + step.get("op").asText()
+                  + "): the engine never became quiescent — refusing to write"
+                  + " goldens from an incomplete record stream");
+        }
         final List<Record<?>> all = new ArrayList<>(RecordingExporter.getRecords());
         final List<Record<?>> fresh = all.subList(seen, all.size());
         seen = all.size();
@@ -294,8 +308,13 @@ public final class Capture {
       return out;
     }
 
-    /** Wait until the engine has processed everything and no new record appears. */
-    private static void settle(final EngineRule engine) throws InterruptedException {
+    /**
+     * Wait until the engine has processed everything and no new record appears.
+     *
+     * @return false when the poll budget ran out before the engine became quiescent — the caller
+     *     must then fail the capture rather than treat a partial record stream as a complete step.
+     */
+    private static boolean settle(final EngineRule engine) throws InterruptedException {
       int last = -1;
       int stable = 0;
       for (int i = 0; i < 400 && stable < 3; i++) {
@@ -308,6 +327,7 @@ public final class Capture {
         }
         last = now;
       }
+      return stable >= 3;
     }
 
     ObjectNode trace(final String name, final String pin) {
