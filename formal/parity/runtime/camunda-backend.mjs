@@ -107,9 +107,15 @@ export class CamundaBackend {
     return h;
   }
 
-  // In-flight awaitCompletion creates, aborted by `reset()` so a scenario that
-  // fails before `observe()` cannot keep the process alive until the create's
-  // ~135 s deadline (#1260 review).
+  // Handles whose awaitCompletion create is still in flight. `reset()` aborts the
+  // create (so a scenario that fails before `observe()` cannot keep the process
+  // alive until the create's ~135 s deadline) and cancels every instance key the
+  // scenario learned from its activated jobs, so a still-running instance cannot
+  // leave jobs for a later run of the same job type (#1260 review). An instance
+  // that never yielded a job has no known key (the bare gateway exposes no
+  // instance search); it is parked before its first job, which the next run's
+  // first activation of that type would complete along with its own (the
+  // activation cap leaves room), so the residue is bounded and never silent.
   #inflight = new Set();
 
   async #json(method, path, body, what, { timeoutMs, signal } = {}) {
@@ -233,8 +239,8 @@ export class CamundaBackend {
     //     times out (DEFAULT_COMPLETION_TIMEOUT_MS) and THROWS — the run fails
     //     loudly instead of reporting a bogus match. Adding such a scenario is
     //     gated on wiring the query-API barrier above (#1260 review).
-    const abort = new AbortController();
-    this.#inflight.add(abort);
+    const handle = { processId, abort: new AbortController(), instanceKeys: new Set() };
+    this.#inflight.add(handle);
     const pending = this.#json(
       "POST",
       "/process-instances",
@@ -247,16 +253,17 @@ export class CamundaBackend {
       "create process instance",
       {
         timeoutMs: DEFAULT_COMPLETION_TIMEOUT_MS + REQUEST_TIMEOUT_MARGIN_MS,
-        signal: abort.signal,
+        signal: handle.abort.signal,
       },
-    ).finally(() => this.#inflight.delete(abort));
+    ).finally(() => this.#inflight.delete(handle));
     // Surface a create-time rejection eagerly rather than as an unhandled
     // rejection; the stored promise is still awaited in `observe`.
     pending.catch(() => {});
-    return { processId, pending };
+    handle.pending = pending;
+    return handle;
   }
 
-  async activateAndComplete(_handle, jobType, variables) {
+  async activateAndComplete(handle, jobType, variables) {
     const activated = await this.#json(
       "POST",
       "/jobs/activation",
@@ -278,6 +285,7 @@ export class CamundaBackend {
       );
     }
     for (const job of jobs) {
+      if (job.processInstanceKey != null) handle.instanceKeys.add(String(job.processInstanceKey));
       const jobKey = job.jobKey ?? job.key;
       await this.#json(
         "POST",
@@ -329,8 +337,25 @@ export class CamundaBackend {
   async reset() {
     // Abort any create still in flight (a scenario that failed before
     // `observe()`); otherwise it holds the process open until its deadline.
-    for (const abort of this.#inflight) abort.abort();
+    const unfinished = [...this.#inflight];
     this.#inflight.clear();
+    for (const handle of unfinished) {
+      handle.abort.abort();
+      for (const key of handle.instanceKeys) {
+        try {
+          await this.#json(
+            "POST",
+            `/process-instances/${key}/cancellation`,
+            {},
+            "cancel process instance",
+          );
+        } catch (err) {
+          // 404: the instance finished in the meantime — nothing left to cancel.
+          // Any other failure is loud, like the clock reset below.
+          if (!/HTTP 404/.test(String(err?.message))) throw err;
+        }
+      }
+    }
     // A clock reset is the correct — and sufficient — per-scenario reset for this
     // backend's execution model, NOT a papered-over engine wipe:
     //   * Scenarios are SERIALISED and run to completion-or-throw: `start` fires

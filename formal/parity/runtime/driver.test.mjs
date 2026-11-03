@@ -496,3 +496,55 @@ test("a failed scenario aborts the in-flight awaitCompletion create (no hang unt
     await once(server, "close");
   }
 });
+
+test("cleanup cancels a failed scenario's still-running Camunda instance", async () => {
+  // Aborting the awaitCompletion create only frees the client: the instance keeps
+  // running on the cluster, and its jobs could be taken by a later run that uses
+  // the same job type. Cleanup must cancel every instance the scenario learned
+  // the key of (from its activated jobs) (#1260 review).
+  const cancelled = [];
+  let activations = 0;
+  const server = createServer((req, res) => {
+    if (req.url.endsWith("/process-instances")) return; // never completes
+    const m = req.url.match(/\/process-instances\/(\d+)\/cancellation$/);
+    if (m) {
+      cancelled.push(m[1]);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.url.endsWith("/jobs/activation")) {
+      activations++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        activations === 1
+          ? '{"jobs":[{"jobKey":"11","processInstanceKey":"4242"}]}'
+          : '{"jobs":[]}',
+      );
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const scenario = {
+      xml: "<definitions/>",
+      processId: "p",
+      steps: [
+        { op: "activateAndComplete", jobType: "a" },
+        { op: "activateAndComplete", jobType: "b" },
+      ],
+    };
+    await assert.rejects(() => runScenario(backend, scenario));
+    await backend.close();
+    assert.deepEqual(cancelled, ["4242"]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});
