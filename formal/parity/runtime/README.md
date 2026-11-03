@@ -107,34 +107,46 @@ The `parity-runtime (two-backend)` job in `.github/workflows/ci.yml` is a
 `parityruntime` paths filter) and **non-required** — it is deliberately *not* in
 branch protection or `.mergify.yml`, so a skip or an absent Camunda runtime never
 blocks a sibling PR. It always runs the nano half and the oracle unit tests; the
-live Camunda 8 differential runs only when the `RUN_CAMUNDA_PARITY` repo variable
-is `true`.
+live Camunda 8 step runs only when the `RUN_CAMUNDA_PARITY` repo variable is
+`true`. The live differential itself runs daily in its own workflow (below).
 
-## Pending environment decision (maintainer action)
+## Live Camunda 8 differential (daily)
 
-Standing up a live Camunda 8 in CI is a real infrastructure decision that a
-maintainer must make — deliberately **not** faked or stubbed here. To enable the
-differential:
+The live differential runs **daily** (and on demand, and on PRs that touch its
+harness) in [`.github/workflows/parity-camunda-daily.yml`][wf] (#1408). It is a
+report on `main`, not a PR gate. Each run:
 
-1. Provision a Camunda 8 runtime reachable over v2 REST — a GitHub-hosted-runner
-   **service container** / Testcontainers, **c8run**, or a **self-hosted
-   runner**. A bare Zeebe gateway is enough for the `completed` + `variables`
-   differential (no Elasticsearch required, because `awaitCompletion` reads the
-   final state from the broker directly).
-   **The runtime must be dedicated to the parity runner.** Each run pins the
-   cluster-global clock and activates jobs by type, so any other client of the
-   same cluster would interfere (and be interfered with). A per-job service
-   container is isolated by construction; a shared runtime (c8run, self-hosted)
-   relies on the job's `concurrency` group, which serialises parity runs while
-   `RUN_CAMUNDA_PARITY` is on, and must not be shared with anything else.
-2. Set the repo variable `RUN_CAMUNDA_PARITY=true` and `CAMUNDA_REST_ADDRESS`
-   (and any auth secret) so the CI step points at it.
-3. To extend the differential to element-instance history / sequence flows /
-   incidents, add secondary storage (Elasticsearch + the exporter) and wire the
-   v2 query API into `camunda-backend.mjs`'s `provides` + `observe`.
+1. resolves the Camunda image **from the Zeebe pin**: `camunda-image.mjs` maps
+   `zeebe.ref` in `formal/parity/zeebe-surface.json` (e.g. `stable/8.10`) to the
+   highest released `camunda/camunda:8.10.N`, so the runtime we diff against
+   cannot drift from the sources the parity matrix was extracted from;
+2. starts a **dedicated, throwaway** container with `start-camunda.sh`
+   (controlled clock, H2 in-memory secondary storage, unprotected API) and
+   waits for a healthy partition leader;
+3. runs `run.mjs --backend both --require-camunda`. `--require-camunda` turns
+   the usual Camunda skip into a failure, so the job can never be a green run
+   that compared nothing.
 
-Until then the job runs nano-only and stays green, which is the intended
-skip-tolerant behaviour.
+Run it locally the same way:
+
+```bash
+formal/parity/runtime/start-camunda.sh "" 18080
+CAMUNDA_REST_ADDRESS=http://localhost:18080 \
+  node formal/parity/runtime/run.mjs --backend both --require-camunda
+docker rm -f parity-camunda
+```
+
+The per-PR `parity-runtime` job in `ci.yml` stays nano-only by default. Its
+optional `RUN_CAMUNDA_PARITY` step points at an externally provisioned runtime;
+that runtime **must be dedicated to the parity runner** (each run pins the
+cluster-global clock and activates jobs by type), and the job's `concurrency`
+group serialises parity runs while the step is on.
+
+To extend the differential to element-instance history / sequence flows /
+incidents, wire the v2 query API (the container already has H2 secondary
+storage) into `camunda-backend.mjs`'s `provides` + `observe`.
+
+[wf]: ../../../.github/workflows/parity-camunda-daily.yml
 
 [#1224]: https://github.com/nanobpm/nano-bpm/issues/1224
 [#1240]: https://github.com/nanobpm/nano-bpm/issues/1240
