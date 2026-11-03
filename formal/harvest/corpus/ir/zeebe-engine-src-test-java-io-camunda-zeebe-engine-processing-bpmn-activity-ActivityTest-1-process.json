@@ -1,0 +1,74 @@
+{
+  "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-1-process",
+  "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest.java",
+  "processId": "process",
+  "calls": [
+    {
+      "m": "startEvent",
+      "args": []
+    },
+    {
+      "m": "serviceTask",
+      "args": [
+        "task"
+      ]
+    },
+    {
+      "m": "zeebeJobType",
+      "args": [
+        "type"
+      ]
+    },
+    {
+      "m": "boundaryEvent",
+      "args": [
+        "timer1"
+      ]
+    },
+    {
+      "m": "timerWithDuration",
+      "args": [
+        "PT10S"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": []
+    },
+    {
+      "m": "moveToActivity",
+      "args": [
+        "task"
+      ]
+    },
+    {
+      "m": "boundaryEvent",
+      "args": [
+        "timer2"
+      ]
+    },
+    {
+      "m": "timerWithDuration",
+      "args": [
+        "PT20S"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": []
+    },
+    {
+      "m": "moveToActivity",
+      "args": [
+        "task"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": [
+        "taskEnd"
+      ]
+    }
+  ],
+  "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<definitions xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" xmlns:ns0=\"http://camunda.org/schema/zeebe/1.0\" exporter=\"Zeebe BPMN Model\" exporterVersion=\"8.10.8\" id=\"definitions_1\" xmlns:modeler=\"http://camunda.org/schema/modeler/1.0\" modeler:executionPlatform=\"Camunda Cloud\" modeler:executionPlatformVersion=\"8.10.8\" targetNamespace=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" xmlns=\"http://www.omg.org/spec/BPMN/20100524/MODEL\">\n  <process id=\"process\" isExecutable=\"true\">\n    <startEvent id=\"startEvent_1\">\n      <outgoing>sequenceFlow_1</outgoing>\n    </startEvent>\n    <serviceTask id=\"task\" name=\"task\">\n      <extensionElements>\n        <ns0:taskDefinition type=\"type\"/>\n      </extensionElements>\n      <incoming>sequenceFlow_1</incoming>\n      <outgoing>sequenceFlow_2</outgoing>\n    </serviceTask>\n    <sequenceFlow id=\"sequenceFlow_1\" sourceRef=\"startEvent_1\" targetRef=\"task\"/>\n    <boundaryEvent attachedToRef=\"task\" id=\"timer1\" name=\"timer1\">\n      <outgoing>sequenceFlow_3</outgoing>\n      <timerEventDefinition id=\"timerEventDefinition_1\">\n        <timeDuration id=\"timeDuration_1\">PT10S</timeDuration>\n      </timerEventDefinition>\n    </boundaryEvent>\n    <endEvent id=\"endEvent_1\">\n      <incoming>sequenceFlow_3</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_3\" sourceRef=\"timer1\" targetRef=\"endEvent_1\"/>\n    <boundaryEvent attachedToRef=\"task\" id=\"timer2\" name=\"timer2\">\n      <outgoing>sequenceFlow_4</outgoing>\n      <timerEventDefinition id=\"timerEventDefinition_2\">\n        <timeDuration id=\"timeDuration_2\">PT20S</timeDuration>\n      </timerEventDefinition>\n    </boundaryEvent>\n    <endEvent id=\"endEvent_2\">\n      <incoming>sequenceFlow_4</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_4\" sourceRef=\"timer2\" targetRef=\"endEvent_2\"/>\n    <endEvent id=\"taskEnd\" name=\"taskEnd\">\n      <incoming>sequenceFlow_2</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_2\" sourceRef=\"task\" targetRef=\"taskEnd\"/>\n  </process>\n  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n    <bpmndi:BPMNPlane bpmnElement=\"process\" id=\"BPMNPlane_1\">\n      <bpmndi:BPMNShape bpmnElement=\"startEvent_1\" id=\"BPMNShape_1\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"100.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"task\" id=\"BPMNShape_2\">\n        <dc:Bounds height=\"80.0\" width=\"100.0\" x=\"186.0\" y=\"78.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_1\" id=\"BPMNEdge_1\">\n        <di:waypoint x=\"136.0\" y=\"118.0\"/>\n        <di:waypoint x=\"186.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"timer1\" id=\"BPMNShape_3\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"218.0\" y=\"140.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"endEvent_1\" id=\"BPMNShape_4\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"266.5\" y=\"208.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_3\" id=\"BPMNEdge_2\">\n        <di:waypoint x=\"236.0\" y=\"176.0\"/>\n        <di:waypoint x=\"236.0\" y=\"226.0\"/>\n        <di:waypoint x=\"266.5\" y=\"226.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"timer2\" id=\"BPMNShape_5\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"254.0\" y=\"140.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"endEvent_2\" id=\"BPMNShape_6\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"302.5\" y=\"208.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_4\" id=\"BPMNEdge_3\">\n        <di:waypoint x=\"272.0\" y=\"176.0\"/>\n        <di:waypoint x=\"272.0\" y=\"226.0\"/>\n        <di:waypoint x=\"302.5\" y=\"226.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"taskEnd\" id=\"BPMNShape_7\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"336.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_2\" id=\"BPMNEdge_4\">\n        <di:waypoint x=\"286.0\" y=\"118.0\"/>\n        <di:waypoint x=\"336.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n    </bpmndi:BPMNPlane>\n  </bpmndi:BPMNDiagram>\n</definitions>\n"
+}

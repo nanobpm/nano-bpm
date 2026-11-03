@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" exporter="Zeebe BPMN Model" exporterVersion="8.10.8" id="definitions_1" xmlns:modeler="http://camunda.org/schema/modeler/1.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.8" targetNamespace="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <!-- zeebe-cells: element:EndEvent element:EventBasedGateway element:IntermediateCatchEvent element:StartEvent -->
+  <process id="PROCESS_WITH_CONDITIONAL" isExecutable="true">
+    <startEvent id="startEvent_1">
+      <outgoing>sequenceFlow_1</outgoing>
+    </startEvent>
+    <eventBasedGateway id="gateway">
+      <incoming>sequenceFlow_1</incoming>
+      <outgoing>sequenceFlow_2</outgoing>
+      <outgoing>sequenceFlow_3</outgoing>
+    </eventBasedGateway>
+    <sequenceFlow id="sequenceFlow_1" sourceRef="startEvent_1" targetRef="gateway"/>
+    <intermediateCatchEvent id="conditional" name="conditional">
+      <incoming>sequenceFlow_2</incoming>
+      <outgoing>to-end1</outgoing>
+      <conditionalEventDefinition id="conditionalEventDefinition_1">
+        <condition id="condition_1">=x &gt; 5</condition>
+      </conditionalEventDefinition>
+    </intermediateCatchEvent>
+    <sequenceFlow id="sequenceFlow_2" sourceRef="gateway" targetRef="conditional"/>
+    <sequenceFlow id="to-end1" sourceRef="conditional" targetRef="end1"/>
+    <endEvent id="end1" name="end1">
+      <incoming>to-end1</incoming>
+    </endEvent>
+    <intermediateCatchEvent id="timer" name="timer">
+      <incoming>sequenceFlow_3</incoming>
+      <outgoing>to-end2</outgoing>
+      <timerEventDefinition id="timerEventDefinition_1">
+        <timeDuration id="timeDuration_1">PT10S</timeDuration>
+      </timerEventDefinition>
+    </intermediateCatchEvent>
+    <sequenceFlow id="sequenceFlow_3" sourceRef="gateway" targetRef="timer"/>
+    <sequenceFlow id="to-end2" sourceRef="timer" targetRef="end2"/>
+    <endEvent id="end2" name="end2">
+      <incoming>to-end2</incoming>
+    </endEvent>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane bpmnElement="PROCESS_WITH_CONDITIONAL" id="BPMNPlane_1">
+      <bpmndi:BPMNShape bpmnElement="startEvent_1" id="BPMNShape_1">
+        <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="gateway" id="BPMNShape_2">
+        <dc:Bounds height="50.0" width="50.0" x="186.0" y="93.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_1" id="BPMNEdge_1">
+        <di:waypoint x="136.0" y="118.0"/>
+        <di:waypoint x="186.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="conditional" id="BPMNShape_3">
+        <dc:Bounds height="36.0" width="36.0" x="286.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_2">
+        <di:waypoint x="236.0" y="118.0"/>
+        <di:waypoint x="286.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="end1" id="BPMNShape_4">
+        <dc:Bounds height="36.0" width="36.0" x="372.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="to-end1" id="BPMNEdge_3">
+        <di:waypoint x="322.0" y="118.0"/>
+        <di:waypoint x="372.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="timer" id="BPMNShape_5">
+        <dc:Bounds height="36.0" width="36.0" x="286.0" y="186.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_4">
+        <di:waypoint x="211.0" y="143.0"/>
+        <di:waypoint x="211.0" y="204.0"/>
+        <di:waypoint x="286.0" y="204.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="end2" id="BPMNShape_6">
+        <dc:Bounds height="36.0" width="36.0" x="372.0" y="186.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="to-end2" id="BPMNEdge_5">
+        <di:waypoint x="322.0" y="204.0"/>
+        <di:waypoint x="372.0" y="204.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>

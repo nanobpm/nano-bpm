@@ -1,0 +1,18 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "wf-child",
+  "jobs": [
+    {
+      "element": "task",
+      "jobType": "test"
+    }
+  ],
+  "jobCompletionOrder": [
+    "task"
+  ],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": []
+}

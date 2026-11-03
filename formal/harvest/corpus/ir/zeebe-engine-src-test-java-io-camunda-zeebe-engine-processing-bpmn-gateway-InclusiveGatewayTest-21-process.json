@@ -1,0 +1,110 @@
+{
+  "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-21-process",
+  "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+  "processId": "process",
+  "calls": [
+    {
+      "m": "startEvent",
+      "args": [
+        "start"
+      ]
+    },
+    {
+      "m": "parallelGateway",
+      "args": [
+        "fork"
+      ]
+    },
+    {
+      "m": "task",
+      "args": [
+        "task-1"
+      ]
+    },
+    {
+      "m": "inclusiveGateway",
+      "args": [
+        "join"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": [
+        "end-1"
+      ]
+    },
+    {
+      "m": "moveToNode",
+      "args": [
+        "fork"
+      ]
+    },
+    {
+      "m": "task",
+      "args": [
+        "task-2"
+      ]
+    },
+    {
+      "m": "connectTo",
+      "args": [
+        "join"
+      ]
+    },
+    {
+      "m": "moveToNode",
+      "args": [
+        "fork"
+      ]
+    },
+    {
+      "m": "serviceTask",
+      "args": [
+        "task-3"
+      ]
+    },
+    {
+      "m": "zeebeJobType",
+      "args": [
+        "test"
+      ]
+    },
+    {
+      "m": "exclusiveGateway",
+      "args": [
+        "exclusive"
+      ]
+    },
+    {
+      "m": "conditionExpression",
+      "args": [
+        "a > 1"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": [
+        "end-2"
+      ]
+    },
+    {
+      "m": "moveToNode",
+      "args": [
+        "exclusive"
+      ]
+    },
+    {
+      "m": "conditionExpression",
+      "args": [
+        "a <= 1"
+      ]
+    },
+    {
+      "m": "connectTo",
+      "args": [
+        "task-3"
+      ]
+    }
+  ],
+  "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<definitions xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" xmlns:ns0=\"http://camunda.org/schema/zeebe/1.0\" exporter=\"Zeebe BPMN Model\" exporterVersion=\"8.10.8\" id=\"definitions_1\" xmlns:modeler=\"http://camunda.org/schema/modeler/1.0\" modeler:executionPlatform=\"Camunda Cloud\" modeler:executionPlatformVersion=\"8.10.8\" targetNamespace=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" xmlns=\"http://www.omg.org/spec/BPMN/20100524/MODEL\">\n  <process id=\"process\" isExecutable=\"true\">\n    <startEvent id=\"start\" name=\"start\">\n      <outgoing>sequenceFlow_1</outgoing>\n    </startEvent>\n    <parallelGateway id=\"fork\" name=\"fork\">\n      <incoming>sequenceFlow_1</incoming>\n      <outgoing>sequenceFlow_2</outgoing>\n      <outgoing>sequenceFlow_3</outgoing>\n      <outgoing>sequenceFlow_4</outgoing>\n    </parallelGateway>\n    <sequenceFlow id=\"sequenceFlow_1\" sourceRef=\"start\" targetRef=\"fork\"/>\n    <task id=\"task-1\" name=\"task-1\">\n      <incoming>sequenceFlow_2</incoming>\n      <outgoing>sequenceFlow_5</outgoing>\n    </task>\n    <sequenceFlow id=\"sequenceFlow_2\" sourceRef=\"fork\" targetRef=\"task-1\"/>\n    <inclusiveGateway id=\"join\" name=\"join\">\n      <incoming>sequenceFlow_5</incoming>\n      <incoming>sequenceFlow_6</incoming>\n      <outgoing>sequenceFlow_7</outgoing>\n    </inclusiveGateway>\n    <sequenceFlow id=\"sequenceFlow_5\" sourceRef=\"task-1\" targetRef=\"join\"/>\n    <endEvent id=\"end-1\" name=\"end-1\">\n      <incoming>sequenceFlow_7</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_7\" sourceRef=\"join\" targetRef=\"end-1\"/>\n    <task id=\"task-2\" name=\"task-2\">\n      <incoming>sequenceFlow_3</incoming>\n      <outgoing>sequenceFlow_6</outgoing>\n    </task>\n    <sequenceFlow id=\"sequenceFlow_3\" sourceRef=\"fork\" targetRef=\"task-2\"/>\n    <sequenceFlow id=\"sequenceFlow_6\" sourceRef=\"task-2\" targetRef=\"join\"/>\n    <serviceTask id=\"task-3\" name=\"task-3\">\n      <extensionElements>\n        <ns0:taskDefinition type=\"test\"/>\n      </extensionElements>\n      <incoming>sequenceFlow_4</incoming>\n      <incoming>sequenceFlow_8</incoming>\n      <outgoing>sequenceFlow_9</outgoing>\n    </serviceTask>\n    <sequenceFlow id=\"sequenceFlow_4\" sourceRef=\"fork\" targetRef=\"task-3\"/>\n    <exclusiveGateway id=\"exclusive\" name=\"exclusive\">\n      <incoming>sequenceFlow_9</incoming>\n      <outgoing>sequenceFlow_10</outgoing>\n      <outgoing>sequenceFlow_8</outgoing>\n    </exclusiveGateway>\n    <sequenceFlow id=\"sequenceFlow_9\" sourceRef=\"task-3\" targetRef=\"exclusive\"/>\n    <sequenceFlow id=\"sequenceFlow_10\" sourceRef=\"exclusive\" targetRef=\"end-2\">\n      <conditionExpression id=\"conditionExpression_1\">=a &gt; 1</conditionExpression>\n    </sequenceFlow>\n    <endEvent id=\"end-2\" name=\"end-2\">\n      <incoming>sequenceFlow_10</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_8\" sourceRef=\"exclusive\" targetRef=\"task-3\">\n      <conditionExpression id=\"conditionExpression_2\">=a &lt;= 1</conditionExpression>\n    </sequenceFlow>\n  </process>\n  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n    <bpmndi:BPMNPlane bpmnElement=\"process\" id=\"BPMNPlane_1\">\n      <bpmndi:BPMNShape bpmnElement=\"start\" id=\"BPMNShape_1\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"100.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"fork\" id=\"BPMNShape_2\">\n        <dc:Bounds height=\"50.0\" width=\"50.0\" x=\"186.0\" y=\"93.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_1\" id=\"BPMNEdge_1\">\n        <di:waypoint x=\"136.0\" y=\"118.0\"/>\n        <di:waypoint x=\"186.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"task-1\" id=\"BPMNShape_3\">\n        <dc:Bounds height=\"80.0\" width=\"100.0\" x=\"286.0\" y=\"78.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_2\" id=\"BPMNEdge_2\">\n        <di:waypoint x=\"236.0\" y=\"118.0\"/>\n        <di:waypoint x=\"286.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"join\" id=\"BPMNShape_4\">\n        <dc:Bounds height=\"50.0\" width=\"50.0\" x=\"436.0\" y=\"93.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_5\" id=\"BPMNEdge_3\">\n        <di:waypoint x=\"386.0\" y=\"118.0\"/>\n        <di:waypoint x=\"436.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"end-1\" id=\"BPMNShape_5\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"536.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_7\" id=\"BPMNEdge_4\">\n        <di:waypoint x=\"486.0\" y=\"118.0\"/>\n        <di:waypoint x=\"536.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"task-2\" id=\"BPMNShape_6\">\n        <dc:Bounds height=\"80.0\" width=\"100.0\" x=\"286.0\" y=\"208.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_3\" id=\"BPMNEdge_5\">\n        <di:waypoint x=\"211.0\" y=\"143.0\"/>\n        <di:waypoint x=\"211.0\" y=\"248.0\"/>\n        <di:waypoint x=\"286.0\" y=\"248.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_6\" id=\"BPMNEdge_6\">\n        <di:waypoint x=\"386.0\" y=\"248.0\"/>\n        <di:waypoint x=\"436.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"task-3\" id=\"BPMNShape_7\">\n        <dc:Bounds height=\"80.0\" width=\"100.0\" x=\"286.0\" y=\"338.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_4\" id=\"BPMNEdge_7\">\n        <di:waypoint x=\"211.0\" y=\"143.0\"/>\n        <di:waypoint x=\"211.0\" y=\"378.0\"/>\n        <di:waypoint x=\"286.0\" y=\"378.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"exclusive\" id=\"BPMNShape_8\" isMarkerVisible=\"true\">\n        <dc:Bounds height=\"50.0\" width=\"50.0\" x=\"436.0\" y=\"353.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_9\" id=\"BPMNEdge_8\">\n        <di:waypoint x=\"386.0\" y=\"378.0\"/>\n        <di:waypoint x=\"436.0\" y=\"378.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"end-2\" id=\"BPMNShape_9\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"536.0\" y=\"360.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_10\" id=\"BPMNEdge_9\">\n        <di:waypoint x=\"486.0\" y=\"378.0\"/>\n        <di:waypoint x=\"536.0\" y=\"378.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_8\" id=\"BPMNEdge_10\">\n        <di:waypoint x=\"461.0\" y=\"403.0\"/>\n        <di:waypoint x=\"461.0\" y=\"378.0\"/>\n        <di:waypoint x=\"286.0\" y=\"378.0\"/>\n      </bpmndi:BPMNEdge>\n    </bpmndi:BPMNPlane>\n  </bpmndi:BPMNDiagram>\n</definitions>\n"
+}
