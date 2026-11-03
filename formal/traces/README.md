@@ -138,6 +138,46 @@ reviewable golden diff. CI fails until this is done: the
 `goldens_match_the_zeebe_pin_and_the_scenarios` test compares `goldens/PIN`
 with the pin.
 
+## Harvesting Zeebe engine tests (#1391 step 2, #1249)
+
+```bash
+ZEEBE_TRACES_JAVA_HOME=/path/to/jdk21 formal/traces/capture.sh harvest [ClassName...]
+```
+
+The harvester (`Harvest.java`) is **dynamic**: it runs the pinned Zeebe engine
+tests themselves — the compiled `zeebe/engine` test classes of the packages
+listed in `harvest/harvest.json` (`processing/incident`, `processing/bpmn`,
+`processing/message`, `processing/timer`), exactly as Zeebe's CI runs them —
+and records, per passing test method, the process models it deployed and the
+client commands it issued, read back from the `RecordingExporter` record
+stream. That captures models built through helper methods, lambdas and
+parameterised builders (e.g. `JobWorkerElementIncidentTest`) which a static
+source parser cannot reproduce.
+
+Each harvested test whose deployment + commands map onto the scenario script
+vocabulary becomes `scenarios/h-<Class>-<method>/` (`process.bpmn` +
+`script.json`); the `h-` prefix marks harvested scenarios. **DI:** the
+`Bpmn.createExecutableProcess` builders emit no DI, so the harvester runs the
+harvested XML through processos' layout/DI emitter (`processos layout`, the
+`PROCESSOS_BIN` binary — built automatically when unset). A model that still
+has no complete DI is **not** committed: the test is counted out-of-scope with
+the reason in `harvest/out-of-scope.json`. Goldens are then captured by
+`Capture` from the SAME committed DI-bearing XML, so Zeebe and nano run
+identical models.
+
+`harvest/summary.json` carries the counts (tests seen, harvested, laid out by
+processos, out-of-scope, per class). The nano runner's `corpus_report` test
+prints them in CI —
+
+```
+Zeebe harvested corpus: harvested=N runnable=N diverging=N out-of-scope=N
+```
+
+— and fails if the committed `h-*` scenarios and `out-of-scope.json` disagree
+with the summary (a forgotten re-harvest). A harvested scenario that diverges
+on the nano runner needs an allow-list entry with an issue reference, exactly
+like a hand-written one.
+
 ## The nano runner (CI)
 
 ```bash
