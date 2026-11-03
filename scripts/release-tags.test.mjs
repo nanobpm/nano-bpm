@@ -20,7 +20,7 @@ import {
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const readRepo = (p) => readFileSync(join(root, p), "utf8");
 
-function fakeRepo({ gateway = "0.0.24", npm = "0.3.0", jvm = "0.3.0", wasm = "0.10.0", wasmBuilt = wasm } = {}) {
+function fakeRepo({ gateway = "0.0.24", npm = "0.3.0", jvm = "0.3.0", wasm = "0.10.0" } = {}) {
   const files = {
     "server/Cargo.toml": `[package]\nname = "x"\nversion = "${gateway}"\n\n[dependencies]\nfoo = { version = "9.9.9" }\n`,
     "clients/nano-bernd/package.json": JSON.stringify({ version: npm }),
@@ -28,7 +28,6 @@ function fakeRepo({ gateway = "0.0.24", npm = "0.3.0", jvm = "0.3.0", wasm = "0.
       `<project><parent><version>1.0.0</version></parent><artifactId>x</artifactId><version>${jvm}</version>` +
       `<dependencies><dependency><version>7.7.7</version></dependency></dependencies></project>`,
     "engine-wasm/pkg.package.json": JSON.stringify({ version: wasm }),
-    "engine-wasm/pkg/package.json": JSON.stringify({ version: wasmBuilt }),
   };
   return (p) => {
     if (!(p in files)) throw new Error(`unexpected read ${p}`);
@@ -102,8 +101,11 @@ test("nano-bernd npm and JVM versions must match", () => {
   assert.throws(() => planTags({ read: fakeRepo({ jvm: "0.2.9" }), existingTags: [] }), /must always release together/);
 });
 
-test("engine-wasm template and built package versions must match", () => {
-  assert.throws(() => planTags({ read: fakeRepo({ wasmBuilt: "0.9.3" }), existingTags: [] }), /make console-wasm/);
+test("engine-wasm version derives from the template alone, never the gitignored build output (#668)", () => {
+  // fakeRepo throws on any unlisted read, and engine-wasm/pkg/package.json is
+  // deliberately absent: it is a build output that no longer exists in a clone.
+  const plan = planTags({ read: fakeRepo({ wasm: "0.12.0" }), existingTags: [], only: ["engine-wasm"] });
+  assert.deepEqual(plan.map((t) => t.tag), ["bojtos-npm-v0.12.0"]);
 });
 
 test("version parsers ignore dependency and parent versions", () => {

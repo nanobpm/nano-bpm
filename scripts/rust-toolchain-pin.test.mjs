@@ -4,8 +4,8 @@
 // zig armv6 release link (`__aeabi_uread4`, v0.0.26) on the same day.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -56,13 +56,36 @@ test('pinned channel is an exact stable version, not a moving channel', () => {
   assert.match(channel, /^\d+\.\d+\.\d+$/);
 });
 
-test('every workflow installs the pinned toolchain', () => {
+/**
+ * Every workflow file, plus every composite action (`.github/actions/<name>/
+ * action.yml`): a toolchain install inside a composite action runs in the
+ * calling job just like an inline step, so it must not escape the pin.
+ */
+export function ciYamlFiles() {
+  const workflows = join(root, '.github', 'workflows');
+  const actions = join(root, '.github', 'actions');
+  return [
+    ...readdirSync(workflows)
+      .filter((f) => /\.ya?ml$/.test(f))
+      .map((f) => join(workflows, f)),
+    ...readdirSync(actions, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .flatMap((d) => ['action.yml', 'action.yaml'].map((f) => join(actions, d.name, f)))
+      .filter((f) => existsSync(f)),
+  ];
+}
+
+test('every workflow and composite action installs the pinned toolchain', () => {
   const channel = pinnedChannel(readFileSync(join(root, 'rust-toolchain.toml'), 'utf8'));
-  const dir = join(root, '.github', 'workflows');
-  const offenders = readdirSync(dir)
-    .filter((f) => /\.ya?ml$/.test(f))
-    .flatMap((f) => drift(readFileSync(join(dir, f), 'utf8'), channel).map((d) => `${f} ${d}`));
-  assert.deepEqual(offenders, [], `workflows must use dtolnay/rust-toolchain@${channel}`);
+  const offenders = ciYamlFiles().flatMap((f) =>
+    drift(readFileSync(f, 'utf8'), channel).map((d) => `${relative(root, f)} ${d}`),
+  );
+  assert.deepEqual(offenders, [], `workflows/actions must use dtolnay/rust-toolchain@${channel}`);
+});
+
+test('composite actions are in scope of the pin guard', () => {
+  const files = ciYamlFiles().map((f) => relative(root, f));
+  assert.ok(files.includes(join('.github', 'actions', 'engine-wasm-pkg', 'action.yml')), files.join('\n'));
 });
 
 test('drift detector rejects @stable and unpinned @master, allows a pinned nightly', () => {

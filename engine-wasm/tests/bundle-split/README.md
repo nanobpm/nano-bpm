@@ -5,6 +5,7 @@ following the static module graph emits **only** the wasm for the subpath that i
 actually imported.
 
 ```sh
+make -C ../../.. console-wasm   # builds ../../pkg (a gitignored build output)
 npm install   # resolves @nanobpm/engine-wasm from ../../pkg (file:) + esbuild
 npm test      # builds both entrypoints and asserts the emitted asset set
 ```

@@ -28,6 +28,10 @@ ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 CONSOLE_DIR := $(PROJECT_ROOT)/console
 PROCESSOS_DIR := $(PROJECT_ROOT)/processos
 WASM_DIR := $(PROJECT_ROOT)/engine-wasm
+# The ONE pinned wasm-pack version (`make install-wasm-pack`; CI and release
+# workflows install through that target). engine-wasm/pkg is not committed
+# (#668), so wasm-pack is required to build it.
+WASM_PACK_VERSION := 0.15.0
 READ_MODEL_DIR := $(PROJECT_ROOT)/read-model
 UV := uv
 
@@ -62,7 +66,7 @@ setup: check-deps git-merge-drivers ## Verify the toolchain, provision the Pytho
 	@echo "Setup complete. Build everything with: make all"
 
 .PHONY: git-merge-drivers
-git-merge-drivers: ## Register the `keep-ours` merge driver used by .gitattributes for checked-in derived artifacts (engine-wasm/pkg, processos/assets/ir.gbnf). Idempotent; no-op outside a git work tree.
+git-merge-drivers: ## Register the `keep-ours` merge driver used by .gitattributes for checked-in derived artifacts (processos/assets/ir.gbnf). Idempotent; no-op outside a git work tree.
 	@if [ "$$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then \
 	  git config merge.keep-ours.driver true && \
 	  git config merge.keep-ours.name "keep the current side (derived artifact; regenerate + drift-guard is the source of truth)" && \
@@ -87,7 +91,7 @@ check-deps: ## Check that the required toolchain is installed (rust, uv, java) a
 	echo "Optional (web console / wasm):"; \
 	chk node "node --version" "install Node.js to build the console SPA" optional; \
 	chk npm "npm --version" "bundled with Node.js" optional; \
-	chk wasm-pack "wasm-pack --version" "cargo install wasm-pack (else committed wasm artifacts are used)" optional; \
+	chk wasm-pack "wasm-pack --version" "make install-wasm-pack (needed by make console-wasm: engine-wasm/pkg is a build output, not committed)" optional; \
 	if [ "$$missing" -ne 0 ]; then \
 	  echo; echo "error: required tools are missing (see ✗ above). Install them and re-run 'make setup'."; \
 	  exit 1; \
@@ -300,7 +304,7 @@ console-frontend: console-wasm ## Build the web console SPA (console/ -> console
 	cd $(CONSOLE_DIR) && npm install && npm run build
 
 .PHONY: console-wasm
-console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Builds BOTH subpath variants: lean (pkg/lean) and read-model (pkg/readmodel). Needs wasm-pack; the read-model build also needs an LLVM clang with a wasm backend (see below). Falls back to the committed artifacts if wasm-pack is absent.
+console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Builds BOTH subpath variants: lean (pkg/lean) and read-model (pkg/readmodel). engine-wasm/pkg is a gitignored build output (#668), so this is the ONLY way to get it: needs wasm-pack and, for the read-model build, an LLVM clang with a wasm backend (see below). Fails if wasm-pack is absent.
 	@set -e; \
 	if command -v wasm-pack >/dev/null 2>&1; then \
 		echo "Regenerating engine-wasm/pkg (@nanobpm/engine-wasm) via wasm-pack (lean + read-model)..."; \
@@ -321,8 +325,21 @@ console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine
 		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/index.d.ts $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.d.ts; \
 		cp $(PROJECT_ROOT)/engine-wasm/readmodel-types/index.js $(PROJECT_ROOT)/engine-wasm/pkg/readmodel-types/index.js; \
 	else \
-		echo "wasm-pack not found; using the committed engine-wasm/pkg artifacts (run 'cargo install wasm-pack' to regenerate)."; \
+		echo "error: wasm-pack not found. engine-wasm/pkg is a build output (not committed, #668); install it with 'make install-wasm-pack' and re-run 'make console-wasm'." >&2; \
+		exit 1; \
 	fi
+
+.PHONY: install-wasm-pack
+install-wasm-pack: ## Install the pinned wasm-pack (WASM_PACK_VERSION) that `make console-wasm` needs. No-op when that version is already installed.
+	@if [ "$$(wasm-pack --version 2>/dev/null)" = "wasm-pack $(WASM_PACK_VERSION)" ]; then \
+		echo "wasm-pack $(WASM_PACK_VERSION) already installed"; \
+	else \
+		cargo install wasm-pack --version $(WASM_PACK_VERSION) --locked; \
+	fi
+
+.PHONY: print-wasm-pack-version
+print-wasm-pack-version: ## Print the pinned wasm-pack version (used by .github/actions/engine-wasm-pkg to key its cache)
+	@echo $(WASM_PACK_VERSION)
 
 # The read-model variant compiles a trimmed SQLite C amalgamation (via the `cc`
 # crate + read-model/build.rs) to wasm32, which needs an LLVM clang with a wasm
@@ -370,11 +387,11 @@ engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (need
 	node $(ENGINE_DIR)/scripts/verify-wasm-ffi.mjs
 
 .PHONY: engine-wasm-ffi-dist
-engine-wasm-ffi-dist: engine-wasm-ffi engine-wasm-agent-instance-e2e ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen). Also runs the AgentInstance/AgentHistory end-to-end probe against the committed engine-wasm/pkg (needs node).
+engine-wasm-ffi-dist: engine-wasm-ffi engine-wasm-agent-instance-e2e ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen). Also runs the AgentInstance/AgentHistory end-to-end probe against engine-wasm/pkg (built first by `make console-wasm`; needs node + wasm-pack).
 	node $(ENGINE_DIR)/scripts/emit-dist.mjs
 
 .PHONY: engine-wasm-agent-instance-e2e
-engine-wasm-agent-instance-e2e: ## Run the AgentInstance/AgentHistory end-to-end probe against the committed engine-wasm/pkg read-model TestEngine (needs node). Guards the AgentInstance driver + read methods on the exported wasm surface and their REST parity (status/producedAt/object shapes).
+engine-wasm-agent-instance-e2e: console-wasm ## Run the AgentInstance/AgentHistory end-to-end probe against the engine-wasm/pkg read-model TestEngine (built from source by console-wasm) (needs node). Guards the AgentInstance driver + read methods on the exported wasm surface and their REST parity (status/producedAt/object shapes).
 	cd $(WASM_DIR)/tests/agent-instance-e2e && npm install && npm test
 
 .PHONY: engine-wasm-check

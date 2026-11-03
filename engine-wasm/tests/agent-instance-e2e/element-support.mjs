@@ -2,8 +2,8 @@
 // `inclusiveGateway` support must actually work through the COMMITTED
 // `@nanobpm/engine-wasm` artifacts — the browser/console execution surface —
 // not merely the native Rust `Engine`. The native `parsed_inclusive_sendtask_exec.rs`
-// integration test can pass while a stale or un-regenerated committed `pkg`
-// wasm still rejects these element kinds; this probe deploys the same canonical
+// integration test can pass while a stale wasm build
+// still rejects these element kinds; this probe deploys the same canonical
 // diagrams (shared verbatim from `engine-core/tests/fixtures/`, so there is no
 // second copy to drift) and creates instances against BOTH shipped subpath
 // variants (lean + read-model), failing if either wasm cannot handle them.
@@ -33,7 +33,7 @@ for (const variant of ["lean", "readmodel"]) {
   // sendTask: deploy, start an instance, and confirm it activates a worker job
   // exactly like a service task (the advertised sendTask execution semantics),
   // then complete that job and assert the instance drives to `Completed` — a
-  // stale/broken committed wasm could activate the job yet fail the completion
+  // stale/broken wasm build could activate the job yet fail the completion
   // path, so the smoke test must exercise the full run, matching the native
   // `parsed_inclusive_sendtask_exec.rs` coverage.
   {
@@ -50,7 +50,7 @@ for (const variant of ["lean", "readmodel"]) {
   }
 
   // inclusiveGateway split/join: deploy and start an instance with the branch
-  // condition satisfied — the committed wasm must accept the gateway kind, route
+  // condition satisfied — the built wasm must accept the gateway kind, route
   // the conditional branch, and (critically) synchronise the join and complete
   // the instance once that branch's job finishes. Stopping at job activation
   // would let a broken join/completion path pass, so drive it to `Completed`.
@@ -68,13 +68,13 @@ for (const variant of ["lean", "readmodel"]) {
 
   console.log(`[${variant}] sendTask + inclusiveGateway deploy/createInstance OK`);
 
-  // escalation: the committed wasm must now *execute* escalation events (#1173),
+  // escalation: the built wasm must now *execute* escalation events (#1173),
   // not reject them. Deploy an embedded sub-process whose escalation throw is
   // caught by an interrupting escalation boundary routing to a `handle` service
   // task; creating an instance raises + catches the escalation, tears the
   // sub-process down, and arms the boundary handler job. Drive that job to
   // completion and assert the instance reaches `Completed` — a stale/broken
-  // committed wasm that still rejected the carrier (or demoted the throw to a
+  // wasm build that still rejected the carrier (or demoted the throw to a
   // none pass-through) would fail here through both shipped variants. Mirrors
   // the native `should_interrupt_a_subprocess_via_an_interrupting_escalation_boundary`.
   {

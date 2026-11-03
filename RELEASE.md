@@ -47,7 +47,7 @@ Do this from a clean `main` after all release-worthy PRs have merged.
 - **Gateway/ProcessOS**: bump the workspace/`server/Cargo.toml` (and `processos/Cargo.toml`) `version = "…"` fields.
 - **nano-bernd npm**: bump `clients/nano-bernd/package.json` `"version"`, then run `npm install` in that directory so `package-lock.json` stays in sync.
 - **nano-bernd JVM**: bump `clients/nano-bernd-jvm/pom.xml` `<version>`.
-- **engine-wasm**: bump `engine-wasm/pkg.package.json` `"version"`, then run `make console-wasm` so the committed `engine-wasm/pkg/` (wasm + `package.json`) is rebuilt at the new version.
+- **engine-wasm**: bump `engine-wasm/pkg.package.json` `"version"`, that template is the only version source (`engine-wasm/pkg/` is a gitignored build output; the release workflow builds it from the tag and checks the built version matches).
 
 If the FFI ABI changed on this train, also update `EXPECTED_ABI_VERSION` in `clients/nano-bernd/src/index.ts` and `EmbeddedEngine.EXPECTED_ABI_VERSION` in `clients/nano-bernd-jvm/src/main/java/io/github/jwulf/nano/bernd/EmbeddedEngine.java`, and bump `ABI_VERSION` in `engine-core/scripts/emit-dist.mjs` + `engine-core/scripts/verify-wasm-ffi.mjs`. CI enforces the match.
 

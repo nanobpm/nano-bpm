@@ -144,6 +144,15 @@ jobs:
               - '.github/workflows/ci.yml'
             dapadapter:
               - 'dap-adapter/**'
+              # The inputs of the engine-wasm/pkg build it tests (#668: the
+              # pkg is built from source per run, not committed), so an engine
+              # change re-runs it against the new wasm.
+              - 'engine-core/**'
+              - 'engine-wasm/**'
+              - 'read-model/**'
+              - 'Makefile'
+              - 'scripts/wasm-cc-env.sh'
+              - '.github/actions/engine-wasm-pkg/**'
               - '.github/workflows/ci.yml'
             # TLA+ models of engine semantics and the Zeebe parity coverage
             # matrix (formal/README.md). TLC needs only a JVM, and the whole suite
@@ -166,11 +175,19 @@ jobs:
             # or its corpus changes — a DISTINCT gate from `formal` above, and
             # deliberately NON-REQUIRED (not in branch protection / .mergify.yml),
             # so a skipped or absent-runtime run never blocks a sibling PR. The
-            # runner also consumes the committed engine-wasm read-model artifact,
-            # so a rebuild of that binary must re-run it.
+            # runner drives the engine-wasm read-model build, so a change to the
+            # sources it is built from must re-run it.
             parityruntime:
               - 'formal/parity/runtime/**'
-              - 'engine-wasm/pkg/readmodel/**'
+              # The inputs of the engine-wasm/pkg build it tests (#668: the
+              # pkg is built from source per run, not committed), so an engine
+              # change re-runs it against the new wasm.
+              - 'engine-core/**'
+              - 'engine-wasm/**'
+              - 'read-model/**'
+              - 'Makefile'
+              - 'scripts/wasm-cc-env.sh'
+              - '.github/actions/engine-wasm-pkg/**'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -319,7 +336,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: engine-core
+          workspaces: |
+            engine-core
+            engine-wasm
           # Cache-key rider so this job doesn't fight the engine-core job's cache
           # (they build the same crate for different targets).
           key: wasm32
@@ -340,6 +359,34 @@ jobs:
           # The ONE definition of the wasm32 C toolchain env, shared with the
           # Makefile's WASM_READ_MODEL_ENV and the clippy matrix (#1368).
           scripts/wasm-cc-env.sh --github-env --require
+      - name: Build engine-wasm/pkg from this PR's source (#668)
+        # engine-wasm/pkg is a gitignored build output, so every probe below (and
+        # the agent-instance e2e inside `make engine-wasm-ffi-dist`) runs against
+        # a wasm built from THIS commit, never a stale committed binary. Uploaded
+        # below as the `engine-wasm-pkg` artifact for the dap-adapter and
+        # parity-runtime jobs, so the wasm is built once per run.
+        uses: ./.github/actions/engine-wasm-pkg
+        with:
+          rust-cache: 'false'
+      - name: engine-wasm/pkg is never committed (#668)
+        # A tracked file under engine-wasm/pkg would be a stale second source of
+        # truth for the wasm (the class #668 removed); .gitignore keeps it out of
+        # `git add .`, this catches a forced add.
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files engine-wasm/pkg)
+          if [ -n "$tracked" ]; then
+            echo "::error::engine-wasm/pkg is a build output and must not be committed (#668); 'git rm -r --cached engine-wasm/pkg'. Tracked:"
+            echo "$tracked"
+            exit 1
+          fi
+      - name: Upload engine-wasm/pkg artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg/
+          if-no-files-found: error
+          retention-days: 7
       - name: Build + verify + emit dist
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
@@ -361,7 +408,7 @@ jobs:
         run: node scripts/clippy-matrix.mjs run --job engine-wasm-ffi-dist
       - name: Bundle-split test (each subpath emits only its own _bg.wasm)
         # Guards the dual-publish acceptance criterion (#825): bundles the lean
-        # (`.`) and `/readmodel` entrypoints of the committed engine-wasm/pkg and
+        # (`.`) and `/readmodel` entrypoints of the freshly built engine-wasm/pkg and
         # asserts each module graph reaches exactly one variant's glue directory.
         # Catches regressions in pkg.package.json's `exports` map / pkg layout
         # that wasm32 type-checks can't see.
@@ -377,7 +424,7 @@ jobs:
         working-directory: engine-wasm/tests/use-after-free
       - name: Test-Studio record loop (embedded-engine isolation example)
         # Worked example + guard (nanobpm/nano-bpm example): drives a
-        # Test-Studio-style recording session entirely through the committed
+        # Test-Studio-style recording session entirely through the freshly built
         # engine-wasm/pkg TestEngine, proving the embedded engine gives Camunda's
         # per-instance recording isolation (RESERVE_JOBS + stubCallActivities) for
         # free — jobs wait unraced and the debug stepper is the call-activity wait
@@ -628,7 +675,10 @@ jobs:
     # Change-gated: only run when the adapter (or this workflow) changes. A
     # skipped required check counts as success for branch protection (see the
     # `changes` job), so unrelated PRs don't pay for a Node install + wasm run.
-    needs: changes
+    # Needs the engine-wasm/pkg that engine-wasm-ffi-dist builds from this
+    # run's source (#668). The dapadapter filter is a subset of `code`, so
+    # whenever this job runs, that job runs too.
+    needs: [changes, engine-wasm-ffi-dist]
     if: ${{ github.event_name == 'merge_group' || needs.changes.outputs.dapadapter == 'true' }}
     defaults:
       run:
@@ -638,10 +688,14 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Download engine-wasm/pkg (built from this run's source)
+        uses: actions/download-artifact@v7
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg
       - name: Install (locked)
-        # The adapter depends on @nanobpm/engine-wasm via a committed file: path
-        # (engine-wasm/pkg), so no artifact download is needed — npm ci resolves
-        # it from the tree.
+        # The adapter depends on @nanobpm/engine-wasm via `file:../engine-wasm/pkg`,
+        # which npm ci resolves from the artifact downloaded above.
         run: npm ci
       - name: Typecheck (src + tests)
         run: npm run typecheck
@@ -745,7 +799,9 @@ jobs:
   parity-runtime:
     name: parity-runtime (two-backend)
     runs-on: ubuntu-24.04
-    needs: changes
+    # Needs the engine-wasm/pkg read-model build from engine-wasm-ffi-dist
+    # (#668). parityruntime is a subset of `code`, so that job always runs too.
+    needs: [changes, engine-wasm-ffi-dist]
     if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.parityruntime == 'true' }}
     # The live Camunda differential mutates cluster-global state (the pinned
     # clock, job activation by type), so two runs against one provisioned
@@ -759,6 +815,11 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Download engine-wasm/pkg (built from this run's source)
+        uses: actions/download-artifact@v7
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg
       - name: Runner + oracle unit tests
         run: node --test formal/parity/runtime/*.test.mjs
       - name: Nano backend — corpus vs. its expect oracle
@@ -1089,14 +1150,9 @@ jobs:
             echo "no bojtos-npm-v* tag yet — nothing to compare against"; exit 0
           fi
           last_ver=${last_tag#bojtos-npm-v}
-          tmpl_ver=$(node -p "require('./engine-wasm/pkg.package.json').version")
-          pkg_ver=$(node -p "require('./engine-wasm/pkg/package.json').version")
-
-          # The committed artifact version must track the template (source of truth).
-          if [ "$tmpl_ver" != "$pkg_ver" ]; then
-            echo "::error file=engine-wasm/pkg/package.json::engine-wasm/pkg.package.json is $tmpl_ver but engine-wasm/pkg/package.json is $pkg_ver — run 'make console-wasm' to resync the built artifact."
-            exit 1
-          fi
+          # The template is the only version source: engine-wasm/pkg/ is a
+          # gitignored build output (#668) that copies it at build time.
+          pkg_ver=$(node -p "require('./engine-wasm/pkg.package.json').version")
 
           # Has the wasm-relevant source moved since the last release? Cargo.toml
           # / Cargo.lock are inputs too: a dependency or feature change alters the
@@ -1109,7 +1165,7 @@ jobs:
           # It moved → require an unreleased bump: pkg_ver must be strictly > last_ver.
           if [ "$pkg_ver" = "$last_ver" ] || \
              [ "$(printf '%s\n%s\n' "$last_ver" "$pkg_ver" | sort -V | tail -1)" != "$pkg_ver" ]; then
-            echo "::error file=engine-wasm/pkg.package.json::engine-core/engine-wasm changed since $last_tag but @nanobpm/engine-wasm is still $pkg_ver. Bump engine-wasm/pkg.package.json (then 'make console-wasm') so a new release is pending; it publishes when you push bojtos-npm-v<version> ('make release-engine-wasm')."
+            echo "::error file=engine-wasm/pkg.package.json::engine-core/engine-wasm changed since $last_tag but @nanobpm/engine-wasm is still $pkg_ver. Bump engine-wasm/pkg.package.json so a new release is pending; it publishes when you push bojtos-npm-v<version> ('make release-engine-wasm')."
             exit 1
           fi
           echo "pending engine-wasm release $pkg_ver > last published $last_ver — ok"

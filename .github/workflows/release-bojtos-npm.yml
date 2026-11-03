@@ -47,43 +47,18 @@ jobs:
       - name: Upgrade npm (OIDC-capable)
         run: npm install -g npm@11.5.1
 
-      - uses: dtolnay/rust-toolchain@1.99.0
-        with:
-          targets: wasm32-unknown-unknown
-
       - name: Install binaryen (wasm-opt)
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
-      - name: Install wasm-pack
-        run: cargo install wasm-pack --version 0.15.0 --locked
-
-      - name: Install LLVM clang (wasm backend) + point cc at it
-        # `make console-wasm` builds BOTH subpath variants; the read-model one
-        # compiles a trimmed SQLite C amalgamation (cc crate + read-model/build.rs)
-        # to wasm32. GCC and Apple clang have no wasm backend; upstream LLVM clang
-        # does. The cc crate reads these per-target knobs to pick compiler + archiver.
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y llvm clang
-          cc_bin=""
-          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
-            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
-          done
-          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
-          if [ -z "$cc_bin" ]; then
-            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
-          fi
-          if [ -z "$ar_bin" ]; then
-            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
-          fi
-          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
-          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
-
       # Build the in-browser engine wasm from source so the published
-      # @nanobpm/engine-wasm tarball is provably built from the tag.
+      # @nanobpm/engine-wasm tarball is provably built from the tag. The same
+      # composite action CI uses (pinned toolchain, LLVM via
+      # scripts/wasm-cc-env.sh, pinned wasm-pack, `make console-wasm`).
       - name: Build engine-wasm (make console-wasm)
-        run: make console-wasm
+        uses: ./.github/actions/engine-wasm-pkg
+        with:
+          # A release build starts cold rather than from a PR-populated cache.
+          rust-cache: 'false'
 
       - name: Verify tag matches package version
         run: |
