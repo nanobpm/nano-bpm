@@ -1002,29 +1002,6 @@ fn should_resolve_feel_variable_reference_job_type_at_job_creation() {
 }
 
 #[test]
-fn should_fall_back_to_literal_when_job_type_variable_is_missing() {
-    // given the same process but no jobType variable provided
-    let def = ProcessBuilder::new("dynamic")
-        .start_event("start")
-        .service_task("work", "=jobType")
-        .end_event("end")
-        .connect("start", "work")
-        .connect("work", "end")
-        .build()
-        .unwrap();
-    let mut engine = Engine::new();
-    engine.apply_command(Command::DeployProcess(def)).unwrap();
-    engine
-        .apply_command(Command::create_instance("dynamic"))
-        .unwrap();
-
-    // then the unresolved expression falls back to the literal text (no panic)
-    let jobs = engine.pending_jobs();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].job_type, "=jobType");
-}
-
-#[test]
 fn should_reject_unknown_job() {
     let mut engine = Engine::new();
     let err = engine.apply_command(Command::complete_job(42)).unwrap_err();
