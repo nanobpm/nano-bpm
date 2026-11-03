@@ -121,6 +121,12 @@ differential:
    runner**. A bare Zeebe gateway is enough for the `completed` + `variables`
    differential (no Elasticsearch required, because `awaitCompletion` reads the
    final state from the broker directly).
+   **The runtime must be dedicated to the parity runner.** Each run pins the
+   cluster-global clock and activates jobs by type, so any other client of the
+   same cluster would interfere (and be interfered with). A per-job service
+   container is isolated by construction; a shared runtime (c8run, self-hosted)
+   relies on the job's `concurrency` group, which serialises parity runs while
+   `RUN_CAMUNDA_PARITY` is on, and must not be shared with anything else.
 2. Set the repo variable `RUN_CAMUNDA_PARITY=true` and `CAMUNDA_REST_ADDRESS`
    (and any auth secret) so the CI step points at it.
 3. To extend the differential to element-instance history / sequence flows /

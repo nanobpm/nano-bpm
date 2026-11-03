@@ -747,6 +747,13 @@ jobs:
     runs-on: ubuntu-24.04
     needs: changes
     if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.parityruntime == 'true' }}
+    # The live Camunda differential mutates cluster-global state (the pinned
+    # clock, job activation by type), so two runs against one provisioned
+    # runtime would interfere. Serialise the job while that step is enabled;
+    # nano-only runs (the default) keep a per-run group and never queue.
+    concurrency:
+      group: ${{ vars.RUN_CAMUNDA_PARITY == 'true' && 'parity-runtime-camunda' || format('parity-runtime-{0}', github.run_id) }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
