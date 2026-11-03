@@ -1,0 +1,127 @@
+{
+  "scenario" : "h-JobWorkerElementIncidentTest-shouldResolveIncidentWithMessageBoundaryEvent-BUSINESS-RULE-TASK",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "process",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "process",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "startEvent_3d098458-2377-4398-af61-24d60d7374e5",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "startEvent_3d098458-2377-4398-af61-24d60d7374e5",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "startEvent_3d098458-2377-4398-af61-24d60d7374e5",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "startEvent_3d098458-2377-4398-af61-24d60d7374e5",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "sequenceFlow_494d3bfe-5038-4623-8003-1ee2f5addb26",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "task",
+      "bpmnElementType" : "BUSINESS_RULE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "CREATED",
+      "elementId" : "task",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "invalid_job_type",
+      "value" : {
+        "x" : true
+      },
+      "scopeElementId" : "process",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 1,
+    "op" : "updateVariables",
+    "records" : [ {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "invalid_job_type",
+      "value" : "task",
+      "scopeElementId" : "process",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 2,
+    "op" : "resolveIncident",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "task",
+      "bpmnElementType" : "BUSINESS_RULE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "task",
+      "type" : "task",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "PROCESS_MESSAGE_SUBSCRIPTION",
+      "intent" : "CREATED",
+      "elementId" : "boundaryEvent_905d90fe-a777-4b13-ab1d-c96351c0a171",
+      "messageName" : "message",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "RESOLVED",
+      "elementId" : "task",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    } ]
+  } ]
+}

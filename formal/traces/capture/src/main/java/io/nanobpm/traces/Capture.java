@@ -278,11 +278,33 @@ public final class Capture {
           (reject ? c.expectRejection() : c).resolve();
         }
         case "updateVariables" -> {
-          final var c = engine.variables().ofScope(instanceKey).withDocument(vars);
+          final long scope =
+              step.has("scopeElementId")
+                  ? latestElementInstance(step.get("scopeElementId").asText())
+                  : instanceKey;
+          final var c = engine.variables().ofScope(scope).withDocument(vars);
           (reject ? c.expectRejection() : c).update();
+        }
+        case "cancelInstance" -> {
+          final var c = engine.processInstance().withInstanceKey(instanceKey);
+          if (reject) {
+            c.expectRejection().cancel();
+          } else {
+            c.cancel();
+          }
         }
         default -> throw new IllegalArgumentException("unknown op " + op + " in " + scenario);
       }
+    }
+
+    /** The newest element instance of a BPMN element (keys grow monotonically). */
+    private long latestElementInstance(final String elementId) {
+      return elementIds.entrySet().stream()
+          .filter(e -> e.getValue().equals(elementId))
+          .mapToLong(Map.Entry::getKey)
+          .max()
+          .orElseThrow(
+              () -> new IllegalStateException("no element instance of '" + elementId + "' yet"));
     }
 
     private long jobKey(final String type) {

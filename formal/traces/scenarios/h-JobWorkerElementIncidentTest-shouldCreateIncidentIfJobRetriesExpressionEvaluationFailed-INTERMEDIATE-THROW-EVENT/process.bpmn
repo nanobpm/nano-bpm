@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:ns0="http://camunda.org/schema/zeebe/1.0" exporter="Zeebe BPMN Model" exporterVersion="8.10.0-SNAPSHOT" id="definitions_58f820b3-ab75-474d-9ae1-fa388d869d1c" xmlns:modeler="http://camunda.org/schema/modeler/1.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.0-SNAPSHOT" targetNamespace="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <process id="process" isExecutable="true">
+    <startEvent id="startEvent_db4d9608-381b-4463-909f-8bcde3afe501">
+      <outgoing>sequenceFlow_1eac7eb4-b44c-4a9d-aa84-4a9c13f49033</outgoing>
+    </startEvent>
+    <intermediateThrowEvent id="task" name="message">
+      <extensionElements>
+        <ns0:taskDefinition retries="=x" type="test"/>
+      </extensionElements>
+      <incoming>sequenceFlow_1eac7eb4-b44c-4a9d-aa84-4a9c13f49033</incoming>
+      <messageEventDefinition id="messageEventDefinition_b03db68e-aab4-4e17-810c-584476da1efb"/>
+    </intermediateThrowEvent>
+    <sequenceFlow id="sequenceFlow_1eac7eb4-b44c-4a9d-aa84-4a9c13f49033" sourceRef="startEvent_db4d9608-381b-4463-909f-8bcde3afe501" targetRef="task"/>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_15a8fc90-786b-4683-a817-23f1860d9160">
+    <bpmndi:BPMNPlane bpmnElement="process" id="BPMNPlane_1d072d48-9438-48ff-96d5-e6cc42e804d4">
+      <bpmndi:BPMNShape bpmnElement="startEvent_db4d9608-381b-4463-909f-8bcde3afe501" id="BPMNShape_9d87f5a3-449c-4a8d-9005-e576c7462db6">
+        <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="task" id="BPMNShape_0c095793-12f0-4ec7-82b3-6cb4c28fd6d4">
+        <dc:Bounds height="36.0" width="36.0" x="186.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_1eac7eb4-b44c-4a9d-aa84-4a9c13f49033" id="BPMNEdge_ba1b5c81-fc99-4c9c-9be4-f584484e2f2f">
+        <di:waypoint x="136.0" y="118.0"/>
+        <di:waypoint x="186.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>

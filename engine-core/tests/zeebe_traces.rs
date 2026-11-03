@@ -27,7 +27,8 @@ use std::path::{Path, PathBuf};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::xml::{local_name, tokenize, Token};
 use nanobpmn_engine_core::{
-    Command, Engine, EngineError, Event, IncidentKind, JobActivationOptions, Key, Value,
+    Command, Engine, EngineError, Event, IncidentKind, JobActivationOptions, Key,
+    MessageSubscriptionKind, Value,
 };
 use serde_json::{json, Map, Value as J};
 
@@ -388,6 +389,7 @@ fn command_of(op: &str) -> (&'static str, &'static str) {
         "publishMessage" => ("MESSAGE", "PUBLISH"),
         "resolveIncident" => ("INCIDENT", "RESOLVE"),
         "updateVariables" => ("VARIABLE_DOCUMENT", "UPDATE"),
+        "cancelInstance" => ("PROCESS_INSTANCE", "CANCEL"),
         other => panic!("unknown op `{other}`"),
     }
 }
@@ -560,7 +562,22 @@ impl<'a> NanoRun<'a> {
                 let key = Self::key(&self.incidents, id, "incident");
                 self.apply(Command::resolve_incident(key))
             }
-            "updateVariables" => self.apply(Command::set_variables(self.instance, vars)),
+            "updateVariables" => {
+                // `scopeElementId` targets the newest instance of that element
+                // (Capture.java `latestElementInstance`); default: the instance.
+                let scope = match step["scopeElementId"].as_str() {
+                    Some(id) => self
+                        .element_ids
+                        .iter()
+                        .filter(|(_, e)| e.as_str() == id)
+                        .map(|(k, _)| *k)
+                        .max()
+                        .unwrap_or_else(|| panic!("no element instance of '{id}' yet")),
+                    None => self.instance,
+                };
+                self.apply(Command::set_variables(scope, vars))
+            }
+            "cancelInstance" => self.apply(Command::cancel_instance(self.instance)),
             other => panic!("{}: unknown op `{other}`", self.sc.name),
         };
         match result {
@@ -978,9 +995,22 @@ impl<'a> NanoRun<'a> {
                 element_instance_key,
                 element_id,
                 message_name,
+                kind,
                 ..
             } => {
-                let v = (element_id.to_string(), message_name.clone());
+                // Zeebe's PROCESS_MESSAGE_SUBSCRIPTION names the CATCHING
+                // element: for a boundary that is the boundary event, while
+                // nano keys the subscription by the attached activity.
+                let catching = match kind {
+                    MessageSubscriptionKind::InterruptingBoundary {
+                        boundary_element_id,
+                    }
+                    | MessageSubscriptionKind::NonInterruptingBoundary {
+                        boundary_element_id,
+                    } => boundary_element_id.to_string(),
+                    _ => element_id.to_string(),
+                };
+                let v = (catching, message_name.clone());
                 self.subscriptions.insert(*subscription_key, v.clone());
                 self.subscription_scopes
                     .insert(*subscription_key, (*instance_key, *element_instance_key));
@@ -1275,8 +1305,23 @@ fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
             let sc = load_scenario(dir).unwrap_or_else(|e| panic!("{e}"));
             let golden = read_json(&goldens.join(format!("{}.trace.json", sc.name)));
             let steps = golden["steps"].as_array().expect("golden steps").clone();
-            let d = rejection_expectation_mismatch(&sc, &steps)
-                .or_else(|| diff(&steps, &nano_trace(spec, &sc)));
+            let d = rejection_expectation_mismatch(&sc, &steps).or_else(|| {
+                // A script nano cannot even replay (e.g. it resolves an
+                // incident nano never raised) is a divergence, not a crash of
+                // the whole gate: report it per scenario.
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    nano_trace(spec, &sc)
+                })) {
+                    Ok(trace) => diff(&steps, &trace),
+                    Err(p) => Some(format!(
+                        "nano could not replay the script: {}",
+                        p.downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or_else(|| p.downcast_ref::<&str>().copied())
+                            .unwrap_or("panic")
+                    )),
+                }
+            });
             (sc.name, d)
         })
         .collect()
@@ -1308,6 +1353,90 @@ fn corpus_matches_zeebe_goldens() {
             errors.join("\n\n")
         );
     }
+}
+
+/// Harvested-corpus counts (#1391 step 2), printed in CI by the engine-core
+/// job's "Zeebe trace corpus report" step (`-- --nocapture`).
+///
+/// * harvested — Zeebe engine tests turned into `h-*` scenarios
+///   (`formal/traces/harvest`), each with DI and a captured golden;
+/// * runnable — harvested scenarios nano replays identically to Zeebe;
+/// * diverging — harvested scenarios on the allow-list (issue-referenced);
+/// * out-of-scope — harvested tests that could not become a scenario, with
+///   the reason in `harvest/out-of-scope.json`.
+#[derive(Debug, PartialEq)]
+struct HarvestCounts {
+    harvested: usize,
+    runnable: usize,
+    diverging: usize,
+    out_of_scope: usize,
+}
+
+fn harvest_counts(outcomes: &BTreeMap<String, Option<String>>, summary: &J) -> HarvestCounts {
+    let harvested: Vec<_> = outcomes
+        .iter()
+        .filter(|(n, _)| n.starts_with(HARVEST_PREFIX))
+        .collect();
+    let diverging = harvested.iter().filter(|(_, d)| d.is_some()).count();
+    HarvestCounts {
+        harvested: harvested.len(),
+        runnable: harvested.len() - diverging,
+        diverging,
+        out_of_scope: summary["outOfScope"].as_u64().expect("summary.outOfScope") as usize,
+    }
+}
+
+/// Prefix of harvested scenario directories (`Harvest.PREFIX` in the capture
+/// harness).
+const HARVEST_PREFIX: &str = "h-";
+
+#[test]
+fn corpus_report() {
+    let spec = load_spec();
+    let outcomes = run_corpus(&spec);
+    let summary = read_json(&traces_dir().join("harvest/summary.json"));
+    let c = harvest_counts(&outcomes, &summary);
+    let oos = read_json(&traces_dir().join("harvest/out-of-scope.json"));
+    assert_eq!(
+        oos.as_object().expect("out-of-scope.json").len(),
+        c.out_of_scope,
+        "harvest/summary.json and out-of-scope.json disagree — rerun capture.sh harvest"
+    );
+    assert_eq!(
+        summary["harvested"].as_u64(),
+        Some(c.harvested as u64),
+        "harvest/summary.json does not match the committed h-* scenarios — rerun capture.sh harvest"
+    );
+    println!(
+        "Zeebe harvested corpus: harvested={} runnable={} diverging={} out-of-scope={} \
+         (hand-written scenarios: {})",
+        c.harvested,
+        c.runnable,
+        c.diverging,
+        c.out_of_scope,
+        outcomes.len() - c.harvested
+    );
+}
+
+#[test]
+fn harvest_counts_split_runnable_and_diverging() {
+    let outcomes: BTreeMap<String, Option<String>> = [
+        ("h-A-ok".to_string(), None),
+        ("h-A-bad".to_string(), Some("diff".to_string())),
+        ("hand".to_string(), Some("diff".to_string())),
+    ]
+    .into_iter()
+    .collect();
+    let c = harvest_counts(&outcomes, &json!({"outOfScope": 4}));
+    assert_eq!(
+        c,
+        HarvestCounts {
+            harvested: 2,
+            runnable: 1,
+            diverging: 1,
+            out_of_scope: 4
+        }
+    );
 }
 
 /// Rewrite every golden from the nano runner (see `corpus_matches_zeebe_goldens`).

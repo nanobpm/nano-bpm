@@ -1,0 +1,10 @@
+{
+  "description" : "Harvested from Zeebe engine test JobWorkerElementIncidentTest#shouldResolveIncidentIfTaskIsTerminated[SEND_TASK] (formal/traces/harvest).",
+  "harvestedFrom" : "JobWorkerElementIncidentTest#shouldResolveIncidentIfTaskIsTerminated[SEND_TASK]",
+  "steps" : [ {
+    "op" : "createInstance",
+    "bpmnProcessId" : "process"
+  }, {
+    "op" : "cancelInstance"
+  } ]
+}

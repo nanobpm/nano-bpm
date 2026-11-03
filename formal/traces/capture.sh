@@ -69,6 +69,26 @@ if [ "${1:-}" = "test" ]; then
   exec "$java" -cp "$classes:$cp" org.junit.runner.JUnitCore $tests
 fi
 
+jvm_flags=(-XX:+EnableDynamicAgentLoading -Djdk.attach.allowAttachSelf=true
+  --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+  --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED --enable-native-access=ALL-UNNAMED)
+
+if [ "${1:-}" = "harvest" ]; then
+  # Dynamic harvest (#1391 step 2): run the pinned Zeebe engine tests of the
+  # packages in harvest/harvest.json and turn each passing test's deployment +
+  # client commands into scenarios/h-*/. processos lays out models whose
+  # builder output lacks DI.
+  shift
+  if [ -z "${PROCESSOS_BIN:-}" ]; then
+    (cd "$here/../../processos" && cargo build -q --bin processos)
+    export PROCESSOS_BIN="$here/../../processos/target/debug/processos"
+  fi
+  "$java" "${jvm_flags[@]}" -cp "$classes:$cp" io.nanobpm.traces.Harvest \
+    "$here" "$src/zeebe/engine/target/test-classes" "$@"
+  # Capture every scenario (hand-written + harvested) from the committed XML.
+  exec "$java" "${jvm_flags[@]}" -cp "$classes:$cp" io.nanobpm.traces.Capture "$here" "$sha"
+fi
+
 exec "$java" -XX:+EnableDynamicAgentLoading -Djdk.attach.allowAttachSelf=true \
   --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED \
   --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED --enable-native-access=ALL-UNNAMED \
