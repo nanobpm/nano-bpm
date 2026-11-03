@@ -363,6 +363,20 @@ test('the nano-tested ratchet: the baseline must match the assignments exactly',
   assert.deepEqual(shrinkNanoTested(assignments, ['element:Task', 'element:Gone']), ['element:Task']);
 });
 
+test('a nano-tested.json missing its cells array fails closed, never skips the ratchet', () => {
+  // main() passes `nanoTestedFile.cells` straight into evaluate; a baseline file
+  // without a `cells` property yields `undefined` there. The ratchet must report
+  // the malformed baseline (like gaps.json does), not skip the check and let the
+  // parity command succeed with nano-tested assignments that have no baseline.
+  const rules = [{ match: 'element:Task', ...tested }, { match: 'intent:*', ...gap }];
+  const ids = ['element:Task', 'intent:Job:CREATED'];
+  const errors = evaluate(surface(...ids), { reviewedAt: 'abc', rules: rulesOf(rules) }, fs, gapsOf(ALL(ids), rulesOf(rules)), PIN, undefined).errors;
+  assert.ok(
+    errors.includes('nano-tested.json must have a cells array'),
+    `expected a malformed-baseline error, got: ${JSON.stringify(errors)}`,
+  );
+});
+
 test('the nano-tested baseline may only shrink against the target branch (same pin)', () => {
   const PIN_A = { repository: 'r', ref: 'stable/x', sha: 'aaa' };
   const PIN_B = { ...PIN_A, sha: 'bbb' };

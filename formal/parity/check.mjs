@@ -395,7 +395,14 @@ export function evaluate(surface, coverage, fs, gaps, pin, nanoTested, normalise
     }
   });
   errors.push(...gapProblems(assignments, gaps));
-  if (nanoTested !== undefined) errors.push(...nanoTestedProblems(assignments, nanoTested));
+  // The nano-tested ratchet is validated whenever a baseline is supplied — and a
+  // supplied-but-malformed baseline (a nano-tested.json without a `cells` array,
+  // which reaches here as `undefined`) must fail closed, not skip the check and
+  // let nano-tested assignments pass with no baseline. Only the regeneration
+  // paths (`--update-gaps` / `--update-ratchet`) omit the argument entirely, and
+  // they pass no sixth argument at all; distinguish "not requested" (arguments
+  // length) from "malformed" (explicit undefined) so the former still regenerates.
+  if (arguments.length >= 6) errors.push(...nanoTestedProblems(assignments, nanoTested));
   return { errors, assignments };
 }
 
