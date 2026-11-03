@@ -147,13 +147,6 @@ const ALLOW: &[Allow] = &[
     },
     Allow {
         file: "mod.rs",
-        contains: "matches!(crate::feel::eval_bool(cond, &ctx), Ok(true))",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(T, "ad-hoc completionCondition error -> false"),
-    },
-    Allow {
-        file: "mod.rs",
         contains: "match crate::feel::eval(&expression, &vars)",
         rule: Rule::DirectFeel,
         count: 1,
@@ -298,6 +291,61 @@ fn has_direct_feel(line: &str) -> bool {
     })
 }
 
+/// The full expression starting at `lines[first][col..]`: delimiter nesting is
+/// tracked across lines (string / char literals skipped), so a multiline call
+/// whose arguments end in commas, followed by a `.unwrap_or_else(..)` chain on
+/// later lines, is collected whole (#1399 review). The statement ends at a
+/// depth-0 `;` / `,` / block-opening `{`, when an enclosing delimiter closes,
+/// or at a line end at depth 0 unless the next line continues the method chain
+/// (leading `.` or `?`).
+fn statement_from(lines: &[&str], first: usize, col: usize) -> String {
+    let mut stmt = String::new();
+    let mut depth: i64 = 0;
+    for (n, full) in lines.iter().enumerate().skip(first) {
+        let text = if n == first {
+            &full[col..]
+        } else {
+            full.trim()
+        };
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            stmt.push(c);
+            match c {
+                '"' => {
+                    while let Some(d) = chars.next() {
+                        stmt.push(d);
+                        if d == '\\' {
+                            if let Some(e) = chars.next() {
+                                stmt.push(e);
+                            }
+                        } else if d == '"' {
+                            break;
+                        }
+                    }
+                }
+                '(' | '[' => depth += 1,
+                '{' if depth == 0 => return stmt,
+                '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return stmt;
+                    }
+                }
+                ';' | ',' if depth == 0 => return stmt,
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            let next = lines.get(n + 1).map(|l| l.trim_start()).unwrap_or("");
+            if !(next.starts_with('.') || next.starts_with('?')) {
+                return stmt;
+            }
+        }
+    }
+    stmt
+}
+
 /// Scans one file's source. `file` is the path reported in violations.
 fn scan(file: &str, src: &str) -> Vec<Violation> {
     let lines: Vec<&str> = src.lines().collect();
@@ -320,17 +368,8 @@ fn scan(file: &str, src: &str) -> Vec<Violation> {
         if has_direct_feel(line) {
             out.push(violation(Rule::DirectFeel));
         }
-        if EVAL_CALLS.iter().any(|c| line.contains(c)) {
-            // The statement: this line plus continuation lines, up to the one
-            // that ends it (or opens a block / match arm).
-            let mut stmt = String::new();
-            for next in lines.iter().skip(i).take(6) {
-                let t = next.trim();
-                stmt.push_str(t);
-                if t.ends_with(';') || t.ends_with('{') || t.ends_with(',') || t.ends_with('}') {
-                    break;
-                }
-            }
+        if let Some(start) = EVAL_CALLS.iter().filter_map(|c| line.find(c)).min() {
+            let stmt = statement_from(&lines, i, raw.len() - raw.trim_start().len() + start);
             if FALLBACKS.iter().any(|f| stmt.contains(f)) {
                 out.push(violation(Rule::Fallback));
             }
@@ -447,6 +486,18 @@ fn assignee(vars: &HashMap<String, Value>) -> Option<String> {
         .ok();
     a
 }
+fn multiline(vars: &HashMap<String, Value>, raw: &str) -> String {
+    expression::evaluate_string(
+        raw,
+        vars,
+    )
+    .unwrap_or_else(|_| raw.to_string())
+}
+fn clean(vars: &HashMap<String, Value>, raw: &str) -> Result<String, Failure> {
+    let s = expression::evaluate_string(raw, vars)?;
+    let fallback = other.unwrap_or_default();
+    Ok(s)
+}
 "#;
     let violations = scan("seeded.rs", seeded);
     let rules: Vec<(usize, Rule)> = violations.iter().map(|v| (v.line, v.rule)).collect();
@@ -455,12 +506,13 @@ fn assignee(vars: &HashMap<String, Value>) -> Option<String> {
         vec![
             (3, Rule::DirectFeel),
             (3, Rule::Fallback),
-            (6, Rule::Fallback)
+            (6, Rule::Fallback),
+            (11, Rule::Fallback)
         ],
         "{violations:?}"
     );
     let problems = check(&violations, &[]);
-    assert_eq!(problems.len(), 3, "{problems:?}");
+    assert_eq!(problems.len(), 4, "{problems:?}");
     assert!(problems[0].contains("seeded.rs:3"), "{problems:?}");
 }
 

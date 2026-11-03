@@ -239,3 +239,70 @@ fn decision_id_expression_failure_raises_extract_value_incident() {
         incident.reason
     );
 }
+
+#[test]
+fn multi_instance_child_job_property_resolve_does_not_reapply_inputs() {
+    // #1399 review: a job-property failure on an MI child happens AFTER its
+    // per-child input mappings succeeded. Resolving it must re-run only the
+    // child's behaviour — re-applying a non-idempotent input mapping
+    // (`=item + 1 -> item`) would increment `item` once per resolution.
+    let def = ProcessBuilder::new("mi-jt-io")
+        .start_event("start")
+        .service_task("work", "=jobType")
+        .with_multi_instance(
+            "work",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: true,
+            },
+        )
+        .with_io(
+            "work",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=item + 1".to_string(),
+                    target: "item".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let (mut engine, inst) = start(
+        def,
+        "mi-jt-io",
+        vars(&[("items", Value::List(vec![Value::Int(1)]))]),
+    );
+    // Resolve twice with the job type still missing, then once fixed.
+    for _ in 0..2 {
+        let incident = extract_value_incident(&engine, "work");
+        engine
+            .apply_command(Command::resolve_incident(incident.key))
+            .unwrap();
+    }
+    let incident = extract_value_incident(&engine, "work");
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[("jobType", Value::Str("payment".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+    let jobs = engine.pending_jobs();
+    assert_eq!(jobs.len(), 1, "resolving creates the child's job");
+    let scope = engine.variables_for_element(inst, jobs[0].element_instance_key);
+    assert_eq!(
+        scope.get("item"),
+        Some(&Value::Int(2)),
+        "input mapping applied exactly once"
+    );
+}

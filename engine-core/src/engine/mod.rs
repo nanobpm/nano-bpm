@@ -428,6 +428,11 @@ enum Step {
         body_key: Key,
         child_key: Key,
         index: usize,
+        /// `false` when the incident was raised *after* the child's input
+        /// mappings succeeded (a job-property failure,
+        /// [`state::IoMappingRedrive::MiChildBehaviour`]): only the behaviour is
+        /// re-run, so non-idempotent inputs are not applied twice.
+        reapply_inputs: bool,
     },
     /// Re-drive a multi-instance **body**'s activation (fan-out) after its body
     /// input-mapping incident is resolved (#946): re-apply the body input
@@ -3088,18 +3093,25 @@ impl Engine {
                                 element_instance_key,
                                 element_id,
                             });
-                        } else if let Some(state::IoMappingRedrive::MiChildActivation {
-                            body_key,
-                            index,
-                        }) = redrive
+                        } else if let Some(
+                            state::IoMappingRedrive::MiChildActivation { body_key, index }
+                            | state::IoMappingRedrive::MiChildBehaviour { body_key, index },
+                        ) = redrive
                         {
-                            // Same, for a multi-instance child.
+                            // Same, for a multi-instance child. A job-property
+                            // failure (`MiChildBehaviour`) re-runs only the
+                            // behaviour: its inputs already applied.
+                            let reapply_inputs = matches!(
+                                redrive,
+                                Some(state::IoMappingRedrive::MiChildActivation { .. })
+                            );
                             queue.push_back(Step::RetryMiChildActivation {
                                 instance_key,
                                 element_id,
                                 body_key,
                                 child_key: element_instance_key,
                                 index,
+                                reapply_inputs,
                             });
                         } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
                             precomputed_output,
@@ -3223,7 +3235,21 @@ impl Engine {
                                 body_key,
                                 child_key: element_instance_key,
                                 index,
+                                reapply_inputs: true,
                             }),
+                            // Job-property failures surface as
+                            // `ExpressionEvaluation` (handled above); this arm keeps
+                            // the `IoMapping` match exhaustive.
+                            Some(state::IoMappingRedrive::MiChildBehaviour { body_key, index }) => {
+                                Some(Step::RetryMiChildActivation {
+                                    instance_key,
+                                    element_id,
+                                    body_key,
+                                    child_key: element_instance_key,
+                                    index,
+                                    reapply_inputs: false,
+                                })
+                            }
                             // MI body input/collection: re-run the body fan-out.
                             Some(state::IoMappingRedrive::MiBodyActivation) => {
                                 let scope = self.scope_of(instance_key, element_instance_key);
@@ -5543,9 +5569,15 @@ impl Engine {
                 body_key,
                 child_key,
                 index,
-            } => {
-                self.retry_mi_child_activation(instance_key, element_id, body_key, child_key, index)
-            }
+                reapply_inputs,
+            } => self.retry_mi_child_activation(
+                instance_key,
+                element_id,
+                body_key,
+                child_key,
+                index,
+                reapply_inputs,
+            ),
             Step::RetryMiBodyActivation {
                 instance_key,
                 element_id,
@@ -6971,7 +7003,7 @@ impl Engine {
                             child_key,
                             element_id,
                             failure,
-                            Some(state::IoMappingRedrive::MiChildActivation { body_key, index }),
+                            Some(state::IoMappingRedrive::MiChildBehaviour { body_key, index }),
                         );
                         return (vec![event], Vec::new());
                     }
@@ -7087,10 +7119,15 @@ impl Engine {
         body_key: Key,
         child_key: Key,
         index: usize,
+        reapply_inputs: bool,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut child_vars = (*self.variables_for_element(instance_key, child_key)).clone();
         let mut events = Vec::new();
-        let inputs = self.io_inputs(instance_key, &element_id);
+        let inputs = if reapply_inputs {
+            self.io_inputs(instance_key, &element_id)
+        } else {
+            Default::default()
+        };
         if !inputs.is_empty() {
             match self.eval_io_mappings_in(&child_vars, &inputs) {
                 Ok(mut mapped) => {

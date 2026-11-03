@@ -247,6 +247,7 @@ fn dead_scope_guard_rejects_mi_retries_after_the_body_is_torn_down() {
         body_key,
         child_key,
         index: 0,
+        reapply_inputs: true,
     };
     let body_retry = Step::RetryMiBodyActivation {
         instance_key: key,

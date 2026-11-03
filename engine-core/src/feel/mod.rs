@@ -55,6 +55,33 @@ pub fn eval(expr: &str, ctx: &HashMap<String, Value>) -> Result<Value, FeelError
     Ok(evaluate(expr, ctx)?.into_value())
 }
 
+/// Evaluates a FEEL expression, returning the [`Value`] **and** the Zeebe
+/// `ResultType` name of the *native* FEEL result. [`eval`] renders temporal
+/// values to strings at the API boundary, so a caller type-checking the result
+/// (e.g. "must be a STRING") must use this kind, not the rendered `Value`'s
+/// shape — otherwise `=date("2024-01-15")` would pass as a STRING (#1399).
+pub(crate) fn eval_typed(
+    expr: &str,
+    ctx: &HashMap<String, Value>,
+) -> Result<(Value, &'static str), FeelError> {
+    let v = evaluate(expr, ctx)?;
+    let kind = match &v {
+        value::FeelVal::Null => "NULL",
+        value::FeelVal::Bool(_) => "BOOLEAN",
+        value::FeelVal::Int(_) | value::FeelVal::Double(_) => "NUMBER",
+        value::FeelVal::Str(_) => "STRING",
+        value::FeelVal::List(_) => "ARRAY",
+        value::FeelVal::Context(_) => "OBJECT",
+        value::FeelVal::Date(_) => "DATE",
+        value::FeelVal::Time(_) => "TIME",
+        value::FeelVal::DateTime(_) => "DATE_TIME",
+        value::FeelVal::YmDur(_) => "PERIOD",
+        value::FeelVal::DtDur(_) => "DURATION",
+        value::FeelVal::Range(_) | value::FeelVal::Function(_) => "UNKNOWN",
+    };
+    Ok((v.into_value(), kind))
+}
+
 /// Evaluates a FEEL expression expecting a string result (job type, correlation
 /// key). Strings pass through; numbers/booleans/temporals use their natural FEEL
 /// rendering; `null` and structured values are an error.

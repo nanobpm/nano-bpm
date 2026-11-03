@@ -69,16 +69,15 @@ impl Failure {
 /// type by `BpmnJobBehavior.evalTypeExp`.
 pub(crate) const MAX_JOB_TYPE_LENGTH: usize = 32 * 1024;
 
-/// The Zeebe `ResultType` name of a value, used in type-check messages.
-fn result_type(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "NULL",
-        Value::Bool(_) => "BOOLEAN",
-        Value::Int(_) | Value::Double(_) => "NUMBER",
-        Value::Str(_) => "STRING",
-        Value::List(_) => "ARRAY",
-        Value::Map(_) => "OBJECT",
-    }
+/// A successfully evaluated expression: the engine [`Value`] plus the Zeebe
+/// `ResultType` name of the *native* FEEL result. The kind is authoritative
+/// for type checks: temporal FEEL results render to `Value::Str` at the API
+/// boundary but are `DATE`/`TIME`/`DATE_TIME`/`DURATION`/`PERIOD`, never
+/// `STRING` (#1399 review).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Evaluated {
+    pub(crate) value: Value,
+    pub(crate) kind: &'static str,
 }
 
 /// Whether `raw` is a FEEL expression (leading `=`) rather than a static value.
@@ -93,25 +92,30 @@ pub(crate) fn is_expression(raw: &str) -> bool {
 pub(crate) fn evaluate_or_failure(
     raw: &str,
     vars: &HashMap<String, Value>,
-) -> Result<Value, Failure> {
+) -> Result<Evaluated, Failure> {
     if !is_expression(raw) {
-        return Ok(Value::Str(raw.to_string()));
+        return Ok(Evaluated {
+            value: Value::Str(raw.to_string()),
+            kind: "STRING",
+        });
     }
-    crate::feel::eval(raw.trim(), vars).map_err(|e| {
-        Failure::extract_value(format!(
-            "Expected to evaluate expression '{}', but failed: {}",
-            raw.trim(),
-            e.0
-        ))
-    })
+    crate::feel::eval_typed(raw.trim(), vars)
+        .map(|(value, kind)| Evaluated { value, kind })
+        .map_err(|e| {
+            Failure::extract_value(format!(
+                "Expected to evaluate expression '{}', but failed: {}",
+                raw.trim(),
+                e.0
+            ))
+        })
 }
 
-fn type_failure(raw: &str, expected: &str, actual: &Value) -> Failure {
+fn type_failure(raw: &str, expected: &str, actual_kind: &str) -> Failure {
     Failure::extract_value(format!(
         "Expected result of the expression '{}' to be '{}', but was '{}'.",
         raw.trim(),
         expected,
-        result_type(actual)
+        actual_kind
     ))
 }
 
@@ -119,8 +123,11 @@ fn type_failure(raw: &str, expected: &str, actual: &Value) -> Failure {
 /// result is a failure).
 pub(crate) fn evaluate_string(raw: &str, vars: &HashMap<String, Value>) -> Result<String, Failure> {
     match evaluate_or_failure(raw, vars)? {
-        Value::Str(s) => Ok(s),
-        other => Err(type_failure(raw, "STRING", &other)),
+        Evaluated {
+            value: Value::Str(s),
+            kind: "STRING",
+        } => Ok(s),
+        other => Err(type_failure(raw, "STRING", other.kind)),
     }
 }
 
@@ -159,12 +166,18 @@ pub(crate) fn evaluate_long(raw: &str, vars: &HashMap<String, Value>) -> Result<
         return t
             .parse::<i64>()
             .or_else(|_| t.parse::<f64>().map(|d| d as i64))
-            .map_err(|_| type_failure(raw, "NUMBER", &Value::Str(t.to_string())));
+            .map_err(|_| type_failure(raw, "NUMBER", "STRING"));
     }
     match evaluate_or_failure(raw, vars)? {
-        Value::Int(i) => Ok(i),
-        Value::Double(d) => Ok(d as i64),
-        other => Err(type_failure(raw, "NUMBER", &other)),
+        Evaluated {
+            value: Value::Int(i),
+            ..
+        } => Ok(i),
+        Evaluated {
+            value: Value::Double(d),
+            ..
+        } => Ok(d as i64),
+        other => Err(type_failure(raw, "NUMBER", other.kind)),
     }
 }
 
@@ -203,6 +216,29 @@ mod tests {
             "null is not a STRING"
         );
         assert!(evaluate_string("=\"a\" +", &v).is_err(), "parse error");
+    }
+
+    #[test]
+    fn temporal_results_are_not_strings() {
+        // #1399 review: FEEL temporals render to `Value::Str` at the API
+        // boundary, but their native type is not STRING.
+        let v = HashMap::new();
+        for (expr, kind) in [
+            ("=date(\"2024-01-15\")", "DATE"),
+            ("=time(\"10:00:00\")", "TIME"),
+            ("=date and time(\"2024-01-15T10:00:00\")", "DATE_TIME"),
+            ("=duration(\"PT1H\")", "DURATION"),
+            ("=duration(\"P1Y\")", "PERIOD"),
+        ] {
+            let f = evaluate_string(expr, &v).unwrap_err();
+            assert!(
+                f.message
+                    .contains(&format!("to be 'STRING', but was '{kind}'")),
+                "{expr}: {}",
+                f.message
+            );
+            assert!(evaluate_long(expr, &v).is_err(), "{expr} is not a NUMBER");
+        }
     }
 
     #[test]
