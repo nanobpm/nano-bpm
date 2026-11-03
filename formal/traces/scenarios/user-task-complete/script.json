@@ -1,0 +1,16 @@
+{
+  "description": "A Camunda user task is created and completed with a variable.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "user-task"
+    },
+    {
+      "op": "completeUserTask",
+      "elementId": "review",
+      "variables": {
+        "approved": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="Definitions_exclusive-gateway-default" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="exclusive-gateway-default" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:exclusiveGateway id="split" default="toLow" />
+    <bpmn:endEvent id="high" />
+    <bpmn:endEvent id="low" />
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="split" />
+    <bpmn:sequenceFlow id="toHigh" sourceRef="split" targetRef="high">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">= amount &gt; 100</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="toLow" sourceRef="split" targetRef="low" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="exclusive-gateway-default">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="split_di" bpmnElement="split" isMarkerVisible="true">
+        <dc:Bounds x="245" y="93" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="high_di" bpmnElement="high">
+        <dc:Bounds x="360" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="low_di" bpmnElement="low">
+        <dc:Bounds x="360" y="210" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f0_di" bpmnElement="f0">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="245" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toHigh_di" bpmnElement="toHigh">
+        <di:waypoint x="295" y="118" />
+        <di:waypoint x="360" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toLow_di" bpmnElement="toLow">
+        <di:waypoint x="270" y="143" />
+        <di:waypoint x="270" y="228" />
+        <di:waypoint x="360" y="228" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

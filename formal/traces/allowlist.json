@@ -1,0 +1,4 @@
+{
+  "doc": "Known nano-vs-Zeebe trace divergences. Each entry: {scenario, issue: \"#N\", reason}. A listed scenario that no longer diverges is STALE and fails engine-core/tests/zeebe_traces.rs — delete it.",
+  "entries": []
+}
