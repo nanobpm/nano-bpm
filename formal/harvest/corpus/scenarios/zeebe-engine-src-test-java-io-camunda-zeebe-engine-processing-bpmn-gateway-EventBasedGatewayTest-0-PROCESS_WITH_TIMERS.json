@@ -1,0 +1,13 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "PROCESS_WITH_TIMERS",
+  "jobs": [],
+  "jobCompletionOrder": [],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": [
+    "event-based-gateway",
+    "catch-event",
+    "event-definition"
+  ]
+}

@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" exporter="Zeebe BPMN Model" exporterVersion="8.10.8" id="definitions_1" xmlns:modeler="http://camunda.org/schema/modeler/1.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.8" targetNamespace="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <!-- zeebe-cells: element:EndEvent element:EventBasedGateway element:IntermediateCatchEvent element:StartEvent -->
+  <process id="PROCESS_WITH_EQUAL_TIMERS" isExecutable="true">
+    <startEvent id="start" name="start">
+      <outgoing>sequenceFlow_1</outgoing>
+    </startEvent>
+    <eventBasedGateway id="gateway">
+      <incoming>sequenceFlow_1</incoming>
+      <outgoing>sequenceFlow_2</outgoing>
+      <outgoing>sequenceFlow_3</outgoing>
+    </eventBasedGateway>
+    <sequenceFlow id="sequenceFlow_1" sourceRef="start" targetRef="gateway"/>
+    <intermediateCatchEvent id="timer-1" name="timer-1">
+      <incoming>sequenceFlow_2</incoming>
+      <outgoing>to-end1</outgoing>
+      <timerEventDefinition id="timerEventDefinition_1">
+        <timeDuration id="timeDuration_1">PT2S</timeDuration>
+      </timerEventDefinition>
+    </intermediateCatchEvent>
+    <sequenceFlow id="sequenceFlow_2" sourceRef="gateway" targetRef="timer-1"/>
+    <sequenceFlow id="to-end1" sourceRef="timer-1" targetRef="end1"/>
+    <endEvent id="end1" name="end1">
+      <incoming>to-end1</incoming>
+    </endEvent>
+    <intermediateCatchEvent id="timer-2" name="timer-2">
+      <incoming>sequenceFlow_3</incoming>
+      <outgoing>to-end2</outgoing>
+      <timerEventDefinition id="timerEventDefinition_2">
+        <timeDuration id="timeDuration_2">PT2S</timeDuration>
+      </timerEventDefinition>
+    </intermediateCatchEvent>
+    <sequenceFlow id="sequenceFlow_3" sourceRef="gateway" targetRef="timer-2"/>
+    <sequenceFlow id="to-end2" sourceRef="timer-2" targetRef="end2"/>
+    <endEvent id="end2" name="end2">
+      <incoming>to-end2</incoming>
+    </endEvent>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane bpmnElement="PROCESS_WITH_EQUAL_TIMERS" id="BPMNPlane_1">
+      <bpmndi:BPMNShape bpmnElement="start" id="BPMNShape_1">
+        <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="gateway" id="BPMNShape_2">
+        <dc:Bounds height="50.0" width="50.0" x="186.0" y="93.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_1" id="BPMNEdge_1">
+        <di:waypoint x="136.0" y="118.0"/>
+        <di:waypoint x="186.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="timer-1" id="BPMNShape_3">
+        <dc:Bounds height="36.0" width="36.0" x="286.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_2">
+        <di:waypoint x="236.0" y="118.0"/>
+        <di:waypoint x="286.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="end1" id="BPMNShape_4">
+        <dc:Bounds height="36.0" width="36.0" x="372.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="to-end1" id="BPMNEdge_3">
+        <di:waypoint x="322.0" y="118.0"/>
+        <di:waypoint x="372.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="timer-2" id="BPMNShape_5">
+        <dc:Bounds height="36.0" width="36.0" x="286.0" y="186.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_4">
+        <di:waypoint x="211.0" y="143.0"/>
+        <di:waypoint x="211.0" y="204.0"/>
+        <di:waypoint x="286.0" y="204.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="end2" id="BPMNShape_6">
+        <dc:Bounds height="36.0" width="36.0" x="372.0" y="186.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="to-end2" id="BPMNEdge_5">
+        <di:waypoint x="322.0" y="204.0"/>
+        <di:waypoint x="372.0" y="204.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>

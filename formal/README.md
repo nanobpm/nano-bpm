@@ -528,3 +528,52 @@ tracked.
    set `reviewedAt` in `coverage.json` to the new commit.
 5. Review the `zeebe-surface.json` diff. Removed or renamed cells are Zeebe
    behaviour changes that Nano may need to follow.
+
+## Harvesting the Zeebe engine-test corpus (#1249)
+
+`zeebe/engine/src/test` builds thousands of processes with the fluent builder
+`Bpmn.createExecutableProcess(id).startEvent()...done()` and asserts on the
+record stream — Camunda's own edge-case catalogue. `formal/harvest/` reuses it:
+
+```
+formal/harvest/
+├── zeebe-test-pin.json     # the pinned Zeebe sha + the released zeebe-bpmn-model jar
+├── fetch-tests.sh          # sparse-fetches the pinned engine-test sources
+├── harvest.mjs             # scans for createExecutableProcess chains, parses each
+│                           #   into a call IR, serialises it through the REAL Zeebe
+│                           #   model API (tools/HarvestExtract.java vs the pinned jar)
+├── normalise.mjs           # BPMN -> corpus format: scenario script + coverage tags
+├── run.mjs                 # runs each scenario vs the engine-wasm TestEngine
+├── report.mjs              # harvested / runnable / diverging / out-of-scope counts
+├── harvest.sh              # the whole pipeline, pinned + reproducible
+└── corpus/                 # GENERATED: ir/, bpmn/ (with DI), scenarios/, report.json
+```
+
+A chain is harvested only when it is built **entirely** from statically
+resolvable builder calls (string/number/boolean literals, `static final`
+constants, and flat single-parameter config lambdas like
+`serviceTask("t", b -> b.zeebeJobType("x"))`). Each harvested chain is replayed
+through the pinned `zeebe-bpmn-model` jar so the BPMN XML is exactly what
+Zeebe's own builder emits, then canonicalised (the model API's random-UUID ids
+are rewritten to stable sequential ids) so the committed corpus is
+byte-reproducible. Anything else — a lambda that nests, a non-literal process
+id, an unsupported builder method — is recorded **out of scope** with its
+reason, never silently dropped.
+
+The differential run classifies each normalised model:
+
+| Status | Meaning |
+|---|---|
+| `runnable` | Nano deployed, ran, and completed the scenario cleanly |
+| `diverging` | Nano accepted and ran it but the observable outcome differs (did not complete, incident, stranded element) — a parity-issue candidate on Camunda's surface |
+| `out-of-scope` | Nano rejected the deploy (unimplemented surface), or the scenario needs a driver capability (variables / messages / timers) the deterministic empty-variable runner does not supply — a driver limitation, NOT a divergence |
+
+```bash
+formal/harvest/harvest.sh                # full pipeline -> corpus/ + report.json
+node --test formal/harvest/*.test.mjs    # parser / normaliser / classifier tests
+```
+
+CI (the `formal (tlc)` job) regenerates the corpus and report and
+`git diff --exit-code`s them, so a forgotten regeneration or a non-reproducible
+harvest fails the build. To bump the pin, update `zeebe-test-pin.json` (keep its
+`sha` equal to `formal/parity/zeebe-pin.json`'s) and re-run `harvest.sh`.

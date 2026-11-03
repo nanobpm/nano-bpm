@@ -1,0 +1,9 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "wf-child",
+  "jobs": [],
+  "jobCompletionOrder": [],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": []
+}

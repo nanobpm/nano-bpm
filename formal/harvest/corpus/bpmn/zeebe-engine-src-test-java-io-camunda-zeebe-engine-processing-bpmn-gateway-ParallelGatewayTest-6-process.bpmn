@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:ns0="http://camunda.org/schema/zeebe/1.0" exporter="Zeebe BPMN Model" exporterVersion="8.10.8" id="definitions_1" xmlns:modeler="http://camunda.org/schema/modeler/1.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.8" targetNamespace="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <!-- zeebe-cells: element:ParallelGateway element:ServiceTask element:StartEvent -->
+  <process id="process" isExecutable="true">
+    <startEvent id="start" name="start">
+      <outgoing>sequenceFlow_1</outgoing>
+    </startEvent>
+    <parallelGateway id="fork" name="fork">
+      <incoming>sequenceFlow_1</incoming>
+      <outgoing>sequenceFlow_2</outgoing>
+      <outgoing>sequenceFlow_3</outgoing>
+    </parallelGateway>
+    <sequenceFlow id="sequenceFlow_1" sourceRef="start" targetRef="fork"/>
+    <parallelGateway id="join-fork" name="join-fork">
+      <incoming>sequenceFlow_2</incoming>
+      <incoming>sequenceFlow_3</incoming>
+      <outgoing>sequenceFlow_4</outgoing>
+      <outgoing>sequenceFlow_5</outgoing>
+    </parallelGateway>
+    <sequenceFlow id="sequenceFlow_2" sourceRef="fork" targetRef="join-fork"/>
+    <sequenceFlow id="sequenceFlow_3" sourceRef="fork" targetRef="join-fork"/>
+    <serviceTask id="task1" name="task1">
+      <extensionElements>
+        <ns0:taskDefinition type="type1"/>
+      </extensionElements>
+      <incoming>sequenceFlow_4</incoming>
+    </serviceTask>
+    <sequenceFlow id="sequenceFlow_4" sourceRef="join-fork" targetRef="task1"/>
+    <serviceTask id="task2" name="task2">
+      <extensionElements>
+        <ns0:taskDefinition type="type2"/>
+      </extensionElements>
+      <incoming>sequenceFlow_5</incoming>
+    </serviceTask>
+    <sequenceFlow id="sequenceFlow_5" sourceRef="join-fork" targetRef="task2"/>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane bpmnElement="process" id="BPMNPlane_1">
+      <bpmndi:BPMNShape bpmnElement="start" id="BPMNShape_1">
+        <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="fork" id="BPMNShape_2">
+        <dc:Bounds height="50.0" width="50.0" x="186.0" y="93.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_1" id="BPMNEdge_1">
+        <di:waypoint x="136.0" y="118.0"/>
+        <di:waypoint x="186.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="join-fork" id="BPMNShape_3">
+        <dc:Bounds height="50.0" width="50.0" x="286.0" y="93.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_2">
+        <di:waypoint x="236.0" y="118.0"/>
+        <di:waypoint x="286.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_3">
+        <di:waypoint x="211.0" y="143.0"/>
+        <di:waypoint x="211.0" y="118.0"/>
+        <di:waypoint x="286.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="task1" id="BPMNShape_4">
+        <dc:Bounds height="80.0" width="100.0" x="386.0" y="78.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_4" id="BPMNEdge_4">
+        <di:waypoint x="336.0" y="118.0"/>
+        <di:waypoint x="386.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="task2" id="BPMNShape_5">
+        <dc:Bounds height="80.0" width="100.0" x="386.0" y="208.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_5" id="BPMNEdge_5">
+        <di:waypoint x="311.0" y="143.0"/>
+        <di:waypoint x="311.0" y="248.0"/>
+        <di:waypoint x="386.0" y="248.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>

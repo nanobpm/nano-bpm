@@ -1,0 +1,16 @@
+{
+  "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-3-grandchild-process",
+  "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityBusinessIdTest.java",
+  "processId": "grandchild-process",
+  "calls": [
+    {
+      "m": "startEvent",
+      "args": []
+    },
+    {
+      "m": "endEvent",
+      "args": []
+    }
+  ],
+  "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<definitions xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" exporter=\"Zeebe BPMN Model\" exporterVersion=\"8.10.8\" id=\"definitions_1\" xmlns:modeler=\"http://camunda.org/schema/modeler/1.0\" modeler:executionPlatform=\"Camunda Cloud\" modeler:executionPlatformVersion=\"8.10.8\" targetNamespace=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" xmlns=\"http://www.omg.org/spec/BPMN/20100524/MODEL\">\n  <process id=\"grandchild-process\" isExecutable=\"true\">\n    <startEvent id=\"startEvent_1\">\n      <outgoing>sequenceFlow_1</outgoing>\n    </startEvent>\n    <endEvent id=\"endEvent_1\">\n      <incoming>sequenceFlow_1</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_1\" sourceRef=\"startEvent_1\" targetRef=\"endEvent_1\"/>\n  </process>\n  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n    <bpmndi:BPMNPlane bpmnElement=\"grandchild-process\" id=\"BPMNPlane_1\">\n      <bpmndi:BPMNShape bpmnElement=\"startEvent_1\" id=\"BPMNShape_1\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"100.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"endEvent_1\" id=\"BPMNShape_2\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"186.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_1\" id=\"BPMNEdge_1\">\n        <di:waypoint x=\"136.0\" y=\"118.0\"/>\n        <di:waypoint x=\"186.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n    </bpmndi:BPMNPlane>\n  </bpmndi:BPMNDiagram>\n</definitions>\n"
+}

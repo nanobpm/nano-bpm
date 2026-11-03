@@ -1,0 +1,64 @@
+{
+  "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-13-process",
+  "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+  "processId": "process",
+  "calls": [
+    {
+      "m": "startEvent",
+      "args": []
+    },
+    {
+      "m": "parallelGateway",
+      "args": [
+        "fork"
+      ]
+    },
+    {
+      "m": "sequenceFlowId",
+      "args": [
+        "joinFlow1"
+      ]
+    },
+    {
+      "m": "inclusiveGateway",
+      "args": [
+        "join"
+      ]
+    },
+    {
+      "m": "moveToNode",
+      "args": [
+        "fork"
+      ]
+    },
+    {
+      "m": "serviceTask",
+      "args": [
+        "task"
+      ]
+    },
+    {
+      "m": "zeebeJobType",
+      "args": [
+        "type"
+      ]
+    },
+    {
+      "m": "sequenceFlowId",
+      "args": [
+        "joinFlow2"
+      ]
+    },
+    {
+      "m": "connectTo",
+      "args": [
+        "join"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": []
+    }
+  ],
+  "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<definitions xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" xmlns:ns0=\"http://camunda.org/schema/zeebe/1.0\" exporter=\"Zeebe BPMN Model\" exporterVersion=\"8.10.8\" id=\"definitions_1\" xmlns:modeler=\"http://camunda.org/schema/modeler/1.0\" modeler:executionPlatform=\"Camunda Cloud\" modeler:executionPlatformVersion=\"8.10.8\" targetNamespace=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" xmlns=\"http://www.omg.org/spec/BPMN/20100524/MODEL\">\n  <process id=\"process\" isExecutable=\"true\">\n    <startEvent id=\"startEvent_1\">\n      <outgoing>sequenceFlow_1</outgoing>\n    </startEvent>\n    <parallelGateway id=\"fork\" name=\"fork\">\n      <incoming>sequenceFlow_1</incoming>\n      <outgoing>joinFlow1</outgoing>\n      <outgoing>sequenceFlow_2</outgoing>\n    </parallelGateway>\n    <sequenceFlow id=\"sequenceFlow_1\" sourceRef=\"startEvent_1\" targetRef=\"fork\"/>\n    <sequenceFlow id=\"joinFlow1\" sourceRef=\"fork\" targetRef=\"join\"/>\n    <inclusiveGateway id=\"join\" name=\"join\">\n      <incoming>joinFlow1</incoming>\n      <incoming>joinFlow2</incoming>\n      <outgoing>sequenceFlow_3</outgoing>\n    </inclusiveGateway>\n    <serviceTask id=\"task\" name=\"task\">\n      <extensionElements>\n        <ns0:taskDefinition type=\"type\"/>\n      </extensionElements>\n      <incoming>sequenceFlow_2</incoming>\n      <outgoing>joinFlow2</outgoing>\n    </serviceTask>\n    <sequenceFlow id=\"sequenceFlow_2\" sourceRef=\"fork\" targetRef=\"task\"/>\n    <sequenceFlow id=\"joinFlow2\" sourceRef=\"task\" targetRef=\"join\"/>\n    <endEvent id=\"endEvent_1\">\n      <incoming>sequenceFlow_3</incoming>\n    </endEvent>\n    <sequenceFlow id=\"sequenceFlow_3\" sourceRef=\"join\" targetRef=\"endEvent_1\"/>\n  </process>\n  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n    <bpmndi:BPMNPlane bpmnElement=\"process\" id=\"BPMNPlane_1\">\n      <bpmndi:BPMNShape bpmnElement=\"startEvent_1\" id=\"BPMNShape_1\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"100.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"fork\" id=\"BPMNShape_2\">\n        <dc:Bounds height=\"50.0\" width=\"50.0\" x=\"186.0\" y=\"93.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_1\" id=\"BPMNEdge_1\">\n        <di:waypoint x=\"136.0\" y=\"118.0\"/>\n        <di:waypoint x=\"186.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"join\" id=\"BPMNShape_3\">\n        <dc:Bounds height=\"50.0\" width=\"50.0\" x=\"286.0\" y=\"93.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"joinFlow1\" id=\"BPMNEdge_2\">\n        <di:waypoint x=\"236.0\" y=\"118.0\"/>\n        <di:waypoint x=\"286.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"task\" id=\"BPMNShape_4\">\n        <dc:Bounds height=\"80.0\" width=\"100.0\" x=\"286.0\" y=\"193.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_2\" id=\"BPMNEdge_3\">\n        <di:waypoint x=\"211.0\" y=\"143.0\"/>\n        <di:waypoint x=\"211.0\" y=\"233.0\"/>\n        <di:waypoint x=\"286.0\" y=\"233.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNEdge bpmnElement=\"joinFlow2\" id=\"BPMNEdge_4\">\n        <di:waypoint x=\"386.0\" y=\"233.0\"/>\n        <di:waypoint x=\"286.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"endEvent_1\" id=\"BPMNShape_5\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"386.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_3\" id=\"BPMNEdge_5\">\n        <di:waypoint x=\"336.0\" y=\"118.0\"/>\n        <di:waypoint x=\"386.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n    </bpmndi:BPMNPlane>\n  </bpmndi:BPMNDiagram>\n</definitions>\n"
+}

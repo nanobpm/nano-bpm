@@ -691,6 +691,25 @@ jobs:
             node formal/parity/check.mjs
           fi
 
+      # Zeebe engine-test harvest (#1249): regenerates the harvested corpus
+      # (formal/harvest/corpus) and the report (formal/harvest/report.json) from
+      # the pinned Zeebe test sources and `git diff --exit-code`s them, so a
+      # forgotten regeneration — or a non-reproducible harvest — fails the build
+      # instead of shipping drift. The harvest serialises each model through the
+      # pinned zeebe-bpmn-model jar (needs the JDK set up above) and runs the
+      # scenarios differentially against the committed engine-wasm TestEngine.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nanobpm-harvest
+          key: zeebe-harvest-${{ hashFiles('formal/harvest/zeebe-test-pin.json') }}
+      - name: Harvest tests
+        run: node --test formal/harvest/*.test.mjs
+      - name: Harvested corpus is derived from the pinned Zeebe tests
+        run: |
+          git ls-files --error-unmatch formal/harvest/report.json
+          formal/harvest/harvest.sh
+          git diff --exit-code -- formal/harvest/corpus formal/harvest/report.json
+
       # Lean 4 formal layer (formal/lean): builds every Lean target and runs the
       # FEEL differential fuzz — the Lean reference semantics (formal/lean/Feel)
       # vs. the Rust evaluator (engine-core/src/feel). A divergence fails hard;

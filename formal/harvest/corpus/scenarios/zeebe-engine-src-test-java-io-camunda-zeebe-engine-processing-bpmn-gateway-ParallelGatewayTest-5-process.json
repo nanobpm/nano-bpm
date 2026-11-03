@@ -1,0 +1,16 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "process",
+  "jobs": [
+    {
+      "element": "waitState",
+      "jobType": "type"
+    }
+  ],
+  "jobCompletionOrder": [
+    "waitState"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": []
+}

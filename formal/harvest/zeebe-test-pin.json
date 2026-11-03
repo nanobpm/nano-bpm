@@ -1,0 +1,30 @@
+{
+  "$comment": "Pins the Zeebe revision the engine-test corpus is harvested from (#1249). `sha` is the camunda/camunda commit the test sources are read from; it MUST stay equal to formal/parity/zeebe-pin.json's sha so the harvested scenarios tag against the same extracted surface (check.mjs enforces this). `modelVersion` is the released io.camunda:zeebe-bpmn-model Maven artifact the extractor serialises models through — the released artifact closest to the pinned branch (stable/8.10 -> 8.10.x). `testPaths` are the engine-test roots scanned for Bpmn.createExecutableProcess models. fetch-tests.sh sparse-fetches them; harvest.mjs reads them.",
+  "repository": "https://github.com/camunda/camunda",
+  "ref": "stable/8.10",
+  "sha": "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "modelVersion": "8.10.8",
+  "modelArtifacts": [
+    {
+      "groupId": "io.camunda",
+      "artifactId": "zeebe-bpmn-model",
+      "version": "8.10.8",
+      "sha256": "4b1e33340ffc4eddd09bd0d7eda8580d0502ffed9eb565bf0c469de3d4b998e8"
+    },
+    {
+      "groupId": "org.camunda.bpm.model",
+      "artifactId": "camunda-xml-model",
+      "version": "7.24.0",
+      "sha256": "5662dfb995780898ccd5ce648768604c5d939aaa1bbf378232fc763d2aac5508"
+    },
+    {
+      "groupId": "org.slf4j",
+      "artifactId": "slf4j-api",
+      "version": "2.0.20",
+      "sha256": "7e1446499b359675d8aabe6af2de86b85e72ae8a2a932c0b40d0e5ba57097439"
+    }
+  ],
+  "testPaths": [
+    "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn"
+  ]
+}

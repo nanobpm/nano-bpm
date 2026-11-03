@@ -1,0 +1,16 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "level3",
+  "jobs": [
+    {
+      "element": "task-level3",
+      "jobType": "task-level3"
+    }
+  ],
+  "jobCompletionOrder": [
+    "task-level3"
+  ],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": []
+}
