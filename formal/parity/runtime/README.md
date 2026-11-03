@@ -62,9 +62,9 @@ human rendering).
 
 The seed corpus is a small MC-derived sample — a linear service task, an
 exclusive-gateway route, and a parallel diamond — enough to exercise the spine.
-It is wired to the **single-source corpus generator** ([#1258], built in
-parallel) once that lands: point `--corpus` at the generated directory; the
-scenario schema above is the contract.
+The **single-source corpus generator** ([#1258], `formal/corpus/`) has since
+landed; wiring this runner to its output (pointing `--corpus` at the generated
+directory) is a follow-up, with the scenario schema above as the contract.
 
 ## Observation vocabulary
 
