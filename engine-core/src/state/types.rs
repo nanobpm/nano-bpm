@@ -899,6 +899,20 @@ pub enum IoMappingRedrive {
     AdHocToolOutputCollection {
         precomputed_output: HashMap<String, Value>,
     },
+    /// A job-worker element's job properties (`zeebe:taskDefinition` type /
+    /// retries) failed to evaluate when its job was to be created (#1390, Zeebe
+    /// `BpmnJobBehavior.evaluateJobExpressions` -> `EXTRACT_VALUE_ERROR`). The
+    /// element instance stays activated with no job; resolution re-attempts the
+    /// job creation (engine `Step::CreateJob`) against the then-current
+    /// variables. Additive brand-new variant — old journals never carry it.
+    JobCreation,
+    /// A multi-instance **child**'s job properties (type / retries) failed to
+    /// evaluate after its per-child input mappings were already applied (#1390,
+    /// #1399 review): resolution re-runs only the child's behaviour against its
+    /// existing scope — it must **not** re-apply the (possibly non-idempotent,
+    /// e.g. `=item + 1 -> item`) input mappings that already succeeded. Additive
+    /// brand-new variant — old journals never carry it.
+    MiChildBehaviour { body_key: Key, index: usize },
     /// A call-activity **output**-mapping failure: re-project the captured child
     /// result through the call activity's output mappings and complete it. The
     /// child variables are captured here because the completed child instance

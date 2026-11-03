@@ -12,6 +12,7 @@ mod adhoc;
 mod boundary;
 mod call_activity;
 mod compensation_escalation;
+mod expression_failures;
 mod incidents;
 mod jobs;
 mod lifecycle;

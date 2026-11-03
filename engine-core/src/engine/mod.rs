@@ -23,6 +23,7 @@ mod api;
 mod boundary;
 mod call_activity;
 mod debug;
+mod expression;
 mod memory;
 mod resolve;
 
@@ -322,13 +323,15 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
-    /// Re-run the activation body of an already-active message intermediate
-    /// catch event to re-open its subscription. Used to retry a catch whose
-    /// correlation-key expression raised an `ExpressionEvaluation` incident at
-    /// open time: the element instance stays active throughout, so its
+    /// Re-run only the activation body (not input mappings / start listeners)
+    /// of an already-active element whose activation-time expression raised an
+    /// `ExpressionEvaluation` incident: a message intermediate catch whose
+    /// correlation key or name failed (re-opens its subscription), or a job
+    /// worker whose job type/retries failed (#1390, creates its job). The
+    /// element instance stays active throughout, so its
     /// `ElementActivating`/`ElementActivated` are not re-emitted — only the
-    /// subscription is re-derived once the referenced variables are corrected.
-    ReopenCatch {
+    /// behaviour is re-derived once the referenced variables are corrected.
+    RerunActivationBody {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
@@ -425,6 +428,11 @@ enum Step {
         body_key: Key,
         child_key: Key,
         index: usize,
+        /// `false` when the incident was raised *after* the child's input
+        /// mappings succeeded (a job-property failure,
+        /// [`state::IoMappingRedrive::MiChildBehaviour`]): only the behaviour is
+        /// re-run, so non-idempotent inputs are not applied twice.
+        reapply_inputs: bool,
     },
     /// Re-drive a multi-instance **body**'s activation (fan-out) after its body
     /// input-mapping incident is resolved (#946): re-apply the body input
@@ -3028,7 +3036,7 @@ impl Engine {
                             self.element_kind(instance_key, &element_id),
                             Some(ElementKind::MessageIntermediateCatchEvent { .. })
                         ) {
-                            queue.push_back(Step::ReopenCatch {
+                            queue.push_back(Step::RerunActivationBody {
                                 instance_key,
                                 element_instance_key,
                                 element_id,
@@ -3062,6 +3070,48 @@ impl Engine {
                                 element_instance_key,
                                 element_id,
                                 preserved_seed,
+                            });
+                        } else if matches!(redrive, Some(state::IoMappingRedrive::JobCreation)) {
+                            // A job-property expression (type/retries) failed when
+                            // a job was re-created for an already-running element
+                            // (`create_job_for`, #1390): re-attempt the job
+                            // creation; re-driving `Complete` would skip the work.
+                            queue.push_back(Step::CreateJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        } else if matches!(redrive, Some(state::IoMappingRedrive::Activation)) {
+                            // An activation-time expression (job type/retries)
+                            // failed in the activation body (#1390, Zeebe
+                            // `JobWorkerTaskProcessor.onActivate`): the element is
+                            // ACTIVATED with no job and no boundary subscriptions.
+                            // Re-run the activation body, as Zeebe retries
+                            // `onActivate` on resolve.
+                            queue.push_back(Step::RerunActivationBody {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        } else if let Some(
+                            state::IoMappingRedrive::MiChildActivation { body_key, index }
+                            | state::IoMappingRedrive::MiChildBehaviour { body_key, index },
+                        ) = redrive
+                        {
+                            // Same, for a multi-instance child. A job-property
+                            // failure (`MiChildBehaviour`) re-runs only the
+                            // behaviour: its inputs already applied.
+                            let reapply_inputs = matches!(
+                                redrive,
+                                Some(state::IoMappingRedrive::MiChildActivation { .. })
+                            );
+                            queue.push_back(Step::RetryMiChildActivation {
+                                instance_key,
+                                element_id,
+                                body_key,
+                                child_key: element_instance_key,
+                                index,
+                                reapply_inputs,
                             });
                         } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
                             precomputed_output,
@@ -3109,11 +3159,11 @@ impl Engine {
                     // re-projects the now-fixed output mapping without re-running
                     // the element's behaviour — the same lifecycle as a
                     // script/decision output failure. This must NOT take the
-                    // message-catch `ReopenCatch` branch above: an output-mapping
+                    // message-catch `RerunActivationBody` branch above: an output-mapping
                     // failure occurs *after* the message was already correlated and
                     // consumed, so reopening the subscription would strand the token
                     // waiting for a *second* message instead of retrying the mapping.
-                    // `ReopenCatch` is reserved for correlation-key (ACTIVATING)
+                    // `RerunActivationBody` is reserved for correlation-key (ACTIVATING)
                     // failures, which surface as `ExpressionEvaluation`.
                     // Uncaught business error: re-create a job for the still-active
                     // service task so a worker can attempt it again.
@@ -3185,7 +3235,21 @@ impl Engine {
                                 body_key,
                                 child_key: element_instance_key,
                                 index,
+                                reapply_inputs: true,
                             }),
+                            // Job-property failures surface as
+                            // `ExpressionEvaluation` (handled above); this arm keeps
+                            // the `IoMapping` match exhaustive.
+                            Some(state::IoMappingRedrive::MiChildBehaviour { body_key, index }) => {
+                                Some(Step::RetryMiChildActivation {
+                                    instance_key,
+                                    element_id,
+                                    body_key,
+                                    child_key: element_instance_key,
+                                    index,
+                                    reapply_inputs: false,
+                                })
+                            }
                             // MI body input/collection: re-run the body fan-out.
                             Some(state::IoMappingRedrive::MiBodyActivation) => {
                                 let scope = self.scope_of(instance_key, element_instance_key);
@@ -3270,6 +3334,14 @@ impl Engine {
                                 element_instance_key,
                                 element_id,
                                 child_variables,
+                            }),
+                            // Job-property expression failures surface as
+                            // `ExpressionEvaluation` (handled above); this arm keeps
+                            // the `IoMapping` match exhaustive.
+                            Some(state::IoMappingRedrive::JobCreation) => Some(Step::CreateJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
                             }),
                         };
                         if let Some(step) = step {
@@ -5168,7 +5240,7 @@ impl Engine {
                 element_instance_key,
                 ..
             }
-            | Step::ReopenCatch {
+            | Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
                 ..
@@ -5408,7 +5480,7 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.create_job_for(instance_key, element_instance_key, element_id),
-            Step::ReopenCatch {
+            Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
                 element_id,
@@ -5497,9 +5569,15 @@ impl Engine {
                 body_key,
                 child_key,
                 index,
-            } => {
-                self.retry_mi_child_activation(instance_key, element_id, body_key, child_key, index)
-            }
+                reapply_inputs,
+            } => self.retry_mi_child_activation(
+                instance_key,
+                element_id,
+                body_key,
+                child_key,
+                index,
+                reapply_inputs,
+            ),
             Step::RetryMiBodyActivation {
                 instance_key,
                 element_id,
@@ -5744,7 +5822,7 @@ impl Engine {
         );
         if let Some(first) = start_listeners.first() {
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&activation_vars, &first.job_type);
+            let job_type = self.resolve_job_type_lenient(&activation_vars, &first.job_type);
             let retries = self.resolve_retries(&activation_vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
@@ -5798,6 +5876,30 @@ impl Engine {
             kind: state::IncidentKind::IoMapping,
             redrive: Some(redrive),
             reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
+    }
+
+    /// Builds the incident for an expression [`expression::Failure`] (Zeebe
+    /// `BpmnIncidentBehavior.createIncident(failure, context)`): the failure's
+    /// error type selects the incident kind, its message is the reason.
+    fn expression_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        failure: expression::Failure,
+        redrive: Option<state::IoMappingRedrive>,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: failure.error_type.incident_kind(),
+            redrive,
+            reason: failure.message,
             job_key: None,
             created_at: self.now,
         }
@@ -5885,13 +5987,33 @@ impl Engine {
                     ));
                     return (events, followups);
                 }
+                // Zeebe `BpmnJobBehavior.evaluateJobExpressions`: a failed
+                // type/retries expression is an EXTRACT_VALUE_ERROR incident and
+                // no job (nor boundary subscription) is created (#1390).
+                let retries_raw = self.retries_of(instance_key, &element_id);
+                let props = self
+                    .resolve_job_type(&element_vars, &job_type)
+                    .and_then(|t| {
+                        Ok((
+                            t,
+                            self.resolve_job_retries(&element_vars, retries_raw.as_deref())?,
+                        ))
+                    });
+                let (job_type, retries) = match props {
+                    Ok(props) => props,
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            Some(state::IoMappingRedrive::Activation),
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                };
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(&element_vars, &job_type);
                 let priority = self.resolve_priority(&element_vars, priority.as_deref());
-                let retries = self.resolve_retries(
-                    &element_vars,
-                    self.retries_of(instance_key, &element_id).as_deref(),
-                );
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -6091,10 +6213,27 @@ impl Engine {
                 message_name,
                 correlation_key,
             }) => {
-                let subscription_key = self.mint_key();
                 // The message name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity).
-                let message_name = self.resolve_event_name(&element_vars, &message_name);
+                // activation against the instance variables (Zeebe parity). A
+                // failure is an EXTRACT_VALUE_ERROR incident (Zeebe
+                // `BpmnEventSubscriptionBehavior` -> `evaluateStringExpression`),
+                // never a subscription named after the expression text;
+                // resolving it re-opens the subscription.
+                let message_name =
+                    match self.resolve_event_name_checked(&element_vars, &message_name) {
+                        Ok(name) => name,
+                        Err(failure) => {
+                            let event = self.expression_incident(
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                failure,
+                                None,
+                            );
+                            return (vec![event], Vec::new());
+                        }
+                    };
+                let subscription_key = self.mint_key();
                 // A declared correlation-key expression that fails to evaluate
                 // (missing variable, `null`, or a type error like `str + null`)
                 // must NOT silently open a subscription with an empty key — that
@@ -6493,7 +6632,7 @@ impl Engine {
         );
         if let Some(first) = start_listeners.first() {
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&vars, &first.job_type);
+            let job_type = self.resolve_job_type_lenient(&vars, &first.job_type);
             let retries = self.resolve_retries(&vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
@@ -6767,7 +6906,7 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_id: String,
-        _body_key: Key,
+        body_key: Key,
         child_key: Key,
         child_vars: &HashMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
@@ -6840,13 +6979,40 @@ impl Engine {
                     }
                     return (events, followups);
                 }
+                // Zeebe `BpmnJobBehavior.evaluateJobExpressions` per child: a
+                // failed type/retries expression is an EXTRACT_VALUE_ERROR
+                // incident on the child, with no job (#1390).
+                let retries_raw = self.retries_of(instance_key, &element_id);
+                let props = self.resolve_job_type(child_vars, &job_type).and_then(|t| {
+                    Ok((
+                        t,
+                        self.resolve_job_retries(child_vars, retries_raw.as_deref())?,
+                    ))
+                });
+                let (job_type, retries) = match props {
+                    Ok(props) => props,
+                    Err(failure) => {
+                        // The engine-owned 1-based `loopCounter` local identifies
+                        // the child's index for the re-drive.
+                        let index = match child_vars.get("loopCounter") {
+                            Some(Value::Int(n)) => n
+                                .checked_sub(1)
+                                .and_then(|i| usize::try_from(i).ok())
+                                .unwrap_or(0),
+                            _ => 0,
+                        };
+                        let event = self.expression_incident(
+                            instance_key,
+                            child_key,
+                            element_id,
+                            failure,
+                            Some(state::IoMappingRedrive::MiChildBehaviour { body_key, index }),
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                };
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(child_vars, &job_type);
                 let priority = self.resolve_priority(child_vars, priority.as_deref());
-                let retries = self.resolve_retries(
-                    child_vars,
-                    self.retries_of(instance_key, &element_id).as_deref(),
-                );
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -6956,10 +7122,15 @@ impl Engine {
         body_key: Key,
         child_key: Key,
         index: usize,
+        reapply_inputs: bool,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut child_vars = (*self.variables_for_element(instance_key, child_key)).clone();
         let mut events = Vec::new();
-        let inputs = self.io_inputs(instance_key, &element_id);
+        let inputs = if reapply_inputs {
+            self.io_inputs(instance_key, &element_id)
+        } else {
+            Default::default()
+        };
         if !inputs.is_empty() {
             match self.eval_io_mappings_in(&child_vars, &inputs) {
                 Ok(mut mapped) => {
@@ -8124,7 +8295,7 @@ impl Engine {
                     _ => element_id.clone(),
                 };
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(&child_vars, &job_type);
+                let job_type = self.resolve_job_type_lenient(&child_vars, &job_type);
                 let priority = self.resolve_priority(&child_vars, None);
                 let retries = self.resolve_retries(&child_vars, None);
                 events.push(Event::JobCreated {
@@ -8144,7 +8315,7 @@ impl Engine {
         match tool_kind {
             Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => {
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(&child_vars, &job_type);
+                let job_type = self.resolve_job_type_lenient(&child_vars, &job_type);
                 let priority = self.resolve_priority(&child_vars, None);
                 let retries = self.resolve_retries(&child_vars, None);
                 events.push(Event::JobCreated {
@@ -8847,7 +9018,7 @@ impl Engine {
                 None => return Vec::new(),
             };
         let container_vars = self.variables_for_element(instance_key, container_key);
-        let job_type = self.resolve_job_type(&container_vars, &job_type);
+        let job_type = self.resolve_job_type_lenient(&container_vars, &job_type);
         let retries = self.resolve_retries(
             &container_vars,
             self.retries_of(instance_key, &container_element_id)
@@ -9347,7 +9518,26 @@ impl Engine {
         }) = self.element_kind(instance_key, &element_id)
         {
             let vars = self.variables(instance_key);
-            let resolved_id = self.resolve_job_type(&vars, &decision_id);
+            // Zeebe `BpmnDecisionBehavior.evaluateDecision`: the decision id is
+            // a string expression; a failure is an EXTRACT_VALUE_ERROR incident
+            // (re-driven like any completion-time expression incident).
+            let resolved_id = if expression::is_expression(&decision_id) {
+                match expression::evaluate_string(&decision_id, &vars) {
+                    Ok(id) => id,
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            None,
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                }
+            } else {
+                decision_id.clone()
+            };
             let Some(deployed) = self.state.decisions.get(&resolved_id).cloned() else {
                 let incident_key = self.mint_key();
                 return (
@@ -9573,7 +9763,7 @@ impl Engine {
                 listener_vars.extend(update.clone());
             }
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&listener_vars, &first.job_type);
+            let job_type = self.resolve_job_type_lenient(&listener_vars, &first.job_type);
             let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
@@ -9686,7 +9876,7 @@ impl Engine {
         );
         let first = end_listeners.first()?;
         let job_key = self.mint_key();
-        let job_type = self.resolve_job_type(vars, &first.job_type);
+        let job_type = self.resolve_job_type_lenient(vars, &first.job_type);
         let retries = self.resolve_retries(vars, first.retries.as_deref());
         Some(Event::ExecutionListenerJobCreated {
             job_key,
@@ -10352,7 +10542,7 @@ impl Engine {
             // attributes resolve against.
             let listener_vars = self.variables_for_element(instance_key, element_instance_key);
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&listener_vars, &next.job_type);
+            let job_type = self.resolve_job_type_lenient(&listener_vars, &next.job_type);
             let retries = self.resolve_retries(&listener_vars, next.retries.as_deref());
             return (
                 vec![Event::ExecutionListenerJobCreated {
@@ -10467,7 +10657,7 @@ impl Engine {
     ) -> Event {
         let listener_vars = self.variables_for_element(instance_key, element_instance_key);
         let job_key = self.mint_key();
-        let job_type = self.resolve_job_type(&listener_vars, &listener.job_type);
+        let job_type = self.resolve_job_type_lenient(&listener_vars, &listener.job_type);
         let retries = self.resolve_retries(&listener_vars, listener.retries.as_deref());
         Event::TaskListenerJobCreated {
             job_key,
@@ -10807,17 +10997,34 @@ impl Engine {
             Some(ElementKind::ServiceTask {
                 job_type, priority, ..
             }) => {
-                let job_key = self.mint_key();
                 // The element instance is already active (this is an incident
                 // retry), so resolve its FEEL attributes against its own applied
-                // scope view (input mappings + ancestors).
+                // scope view (input mappings + ancestors). A failed type/retries
+                // expression raises an EXTRACT_VALUE_ERROR incident whose
+                // resolution re-attempts this job creation (#1390).
                 let job_vars = self.variables_for_element(instance_key, element_instance_key);
-                let job_type = self.resolve_job_type(&job_vars, &job_type);
+                let retries_raw = self.retries_of(instance_key, &element_id);
+                let props = self.resolve_job_type(&job_vars, &job_type).and_then(|t| {
+                    Ok((
+                        t,
+                        self.resolve_job_retries(&job_vars, retries_raw.as_deref())?,
+                    ))
+                });
+                let (job_type, retries) = match props {
+                    Ok(props) => props,
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            Some(state::IoMappingRedrive::JobCreation),
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                };
+                let job_key = self.mint_key();
                 let priority = self.resolve_priority(&job_vars, priority.as_deref());
-                let retries = self.resolve_retries(
-                    &job_vars,
-                    self.retries_of(instance_key, &element_id).as_deref(),
-                );
                 (
                     vec![Event::JobCreated {
                         job_key,
