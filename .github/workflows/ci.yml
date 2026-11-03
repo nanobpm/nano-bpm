@@ -739,8 +739,8 @@ jobs:
   # runner's own paths. The nano half runs everywhere (in-process engine-wasm
   # TestEngine, no Docker); the live Camunda 8 differential is SKIP-TOLERANT and
   # runs only when a runtime is explicitly provisioned (the RUN_CAMUNDA_PARITY
-  # repo variable) — standing that runtime up is the pending environment
-  # decision tracked in formal/parity/runtime/README.md. NO retries anywhere: a
+  # repo variable). The scheduled live differential against a per-job Camunda
+  # container is parity-camunda-daily.yml (#1408). NO retries anywhere: a
   # nondeterministic scenario is a driver defect to root-cause.
   parity-runtime:
     name: parity-runtime (two-backend)

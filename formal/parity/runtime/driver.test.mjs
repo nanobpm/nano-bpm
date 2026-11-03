@@ -579,3 +579,31 @@ test("signal cleanup still exits non-zero when cleanup itself fails", async () =
   await new Promise((r) => setImmediate(r));
   assert.deepEqual(exits, [143]);
 });
+
+test("--require-camunda fails (never skips) when no Camunda runtime is reachable", async () => {
+  // The daily live-Camunda job exists only for the differential: a skip there
+  // would be a green run that compared nothing (#1408). Without the flag the
+  // runner stays skip-tolerant.
+  const { spawnSync } = await import("node:child_process");
+  const runner = fileURLToPath(new URL("./run.mjs", import.meta.url));
+  const env = { ...process.env };
+  delete env.CAMUNDA_REST_ADDRESS;
+  const run = (args, extraEnv = {}) =>
+    spawnSync(process.execPath, [runner, ...args], {
+      env: { ...env, ...extraEnv },
+      encoding: "utf8",
+    });
+
+  const unset = run(["--backend", "both", "--require-camunda"]);
+  assert.notEqual(unset.status, 0, "unset address must fail");
+  assert.match(unset.stderr, /Camunda backend required \(--require-camunda\)/);
+
+  const unreachable = run(["--backend", "camunda", "--require-camunda"], {
+    CAMUNDA_REST_ADDRESS: "http://127.0.0.1:9",
+  });
+  assert.notEqual(unreachable.status, 0, "unreachable runtime must fail");
+  assert.match(unreachable.stderr, /Camunda backend required \(--require-camunda\)/);
+
+  const tolerant = run(["--backend", "camunda"]);
+  assert.equal(tolerant.status, 0, "without the flag the skip stays tolerant");
+});

@@ -2,6 +2,7 @@
 // CLI entry point for the two-backend parity runner (#1260).
 //
 //   node formal/parity/runtime/run.mjs [--backend nano|camunda|both] [--corpus DIR]
+//                                      [--require-camunda]
 //
 // Behaviour:
 //   * `nano`   — run every scenario against the nano `TestEngine` and check each
@@ -14,6 +15,9 @@
 //   * `both`   — run each scenario against BOTH and assert the differential
 //     oracle finds no difference on the fields both backends provide. Also
 //     skip-tolerant on the Camunda side.
+//   * `--require-camunda` turns the Camunda skip into a FAILURE. The daily
+//     live-Camunda workflow (#1408) passes it, since a skip there would be a
+//     green run that compared nothing.
 //
 // Exit non-zero on any expectation mismatch or cross-backend difference. There
 // are NO retries: a nondeterministic scenario is a driver defect to root-cause.
@@ -56,12 +60,16 @@ function parseArgs(argv) {
     const a = argv[i];
     if (a === "--backend") args.backend = argv[++i];
     else if (a === "--corpus") args.corpus = argv[++i];
+    else if (a === "--require-camunda") args.requireCamunda = true;
     else if (a.startsWith("--backend=")) args.backend = a.slice("--backend=".length);
     else if (a.startsWith("--corpus=")) args.corpus = a.slice("--corpus=".length);
     else throw new Error(`unknown argument: ${a}`);
   }
   if (!["nano", "camunda", "both"].includes(args.backend)) {
     throw new Error(`--backend must be nano|camunda|both, got ${args.backend}`);
+  }
+  if (args.requireCamunda && args.backend === "nano") {
+    throw new Error("--require-camunda needs --backend camunda|both");
   }
   return args;
 }
@@ -105,10 +113,20 @@ async function main() {
 
   const nano = wantNano ? await new NanoBackend().init() : null;
 
+  // `--require-camunda` (the daily live-Camunda job, #1408): a skip would be a
+  // green run that compared nothing, so an absent/unreachable runtime FAILS.
+  const skipCamunda = (why) => {
+    if (args.requireCamunda) {
+      console.error(`Camunda backend required (--require-camunda), but ${why}.`);
+      process.exit(1);
+    }
+  };
+
   let camunda = null;
   if (wantCamunda) {
     camunda = camundaFromEnv();
     if (!camunda) {
+      skipCamunda("CAMUNDA_REST_ADDRESS is unset");
       console.log(
         "::notice::CAMUNDA_REST_ADDRESS unset — SKIPPING the Camunda 8 backend " +
           "(skip-tolerant). Provision a live Camunda 8 and set it to run the " +
@@ -119,6 +137,7 @@ async function main() {
         process.exit(0);
       }
     } else if (!(await camunda.ping())) {
+      skipCamunda(`${process.env.CAMUNDA_REST_ADDRESS} is unreachable`);
       console.log(
         `::notice::Camunda REST at ${process.env.CAMUNDA_REST_ADDRESS} unreachable — ` +
           "SKIPPING the Camunda 8 backend (skip-tolerant).",
