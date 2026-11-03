@@ -387,7 +387,7 @@ engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (need
 	node $(ENGINE_DIR)/scripts/verify-wasm-ffi.mjs
 
 .PHONY: engine-wasm-ffi-dist
-engine-wasm-ffi-dist: engine-wasm-ffi engine-wasm-agent-instance-e2e ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen). Also runs the AgentInstance/AgentHistory end-to-end probe against engine-wasm/pkg (built first by `make console-wasm`; needs node + wasm-pack).
+engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen). Deliberately independent of the browser package engine-wasm/pkg: the nano-bernd release workflows run this without wasm-pack (the browser-package probes, e.g. engine-wasm-agent-instance-e2e, run in CI against the package built once from the PR source).
 	node $(ENGINE_DIR)/scripts/emit-dist.mjs
 
 .PHONY: engine-wasm-agent-instance-e2e

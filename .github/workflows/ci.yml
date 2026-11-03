@@ -326,6 +326,11 @@ jobs:
         # which zig's compiler-rt lacks; every `cargo zigbuild` site must source
         # scripts/zig-arm-shim-env.sh or the armv6 release link fails.
         run: node --test scripts/zig-arm-shim.test.mjs
+      - name: FFI dist build stays independent of wasm-pack (#668)
+        # The nano-bernd release workflows run `make engine-wasm-ffi-dist` with
+        # no wasm-pack; a browser-package (engine-wasm/pkg) prerequisite would
+        # break both client releases.
+        run: node --test scripts/ffi-dist-independent.test.mjs
       - name: sccache wired fail-open (#1325)
         # A cache-backend outage must degrade to an uncached build, not fail the
         # job: sccache may only be wired through .github/actions/sccache.
@@ -360,11 +365,12 @@ jobs:
           # Makefile's WASM_READ_MODEL_ENV and the clippy matrix (#1368).
           scripts/wasm-cc-env.sh --github-env --require
       - name: Build engine-wasm/pkg from this PR's source (#668)
-        # engine-wasm/pkg is a gitignored build output, so every probe below (and
-        # the agent-instance e2e inside `make engine-wasm-ffi-dist`) runs against
-        # a wasm built from THIS commit, never a stale committed binary. Uploaded
-        # below as the `engine-wasm-pkg` artifact for the dap-adapter and
-        # parity-runtime jobs, so the wasm is built once per run.
+        # engine-wasm/pkg is a gitignored build output, so every probe below runs
+        # against a wasm built from THIS commit, never a stale committed binary.
+        # Built exactly once per run: the probes call `npm test` directly (not
+        # the make targets, whose console-wasm prerequisite would rebuild it),
+        # and the same tested output is uploaded as the `engine-wasm-pkg`
+        # artifact for the dap-adapter and parity-runtime jobs.
         uses: ./.github/actions/engine-wasm-pkg
         with:
           rust-cache: 'false'
@@ -380,13 +386,6 @@ jobs:
             echo "$tracked"
             exit 1
           fi
-      - name: Upload engine-wasm/pkg artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: engine-wasm-pkg
-          path: engine-wasm/pkg/
-          if-no-files-found: error
-          retention-days: 7
       - name: Build + verify + emit dist
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
@@ -418,10 +417,15 @@ jobs:
         # Freezes the DX contract (#968): a method call on a freed TestEngine
         # handle throws a self-describing "TestEngine used after free()" — not the
         # opaque wasm-bindgen "null pointer passed to rust" — for both the lean
-        # (`.`) and read-model (`/readmodel`) entrypoints of the committed
+        # (`.`) and read-model (`/readmodel`) entrypoints of the freshly built
         # engine-wasm/pkg. Guards the guard injected by scripts/inject-free-guard.mjs.
         run: npm install && npm test
         working-directory: engine-wasm/tests/use-after-free
+      - name: AgentInstance/AgentHistory + element-support e2e (read-model TestEngine)
+        # The probe behind `make engine-wasm-agent-instance-e2e`, run directly so
+        # it reuses the package built above instead of rebuilding it.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/agent-instance-e2e
       - name: Test-Studio record loop (embedded-engine isolation example)
         # Worked example + guard (nanobpm/nano-bpm example): drives a
         # Test-Studio-style recording session entirely through the freshly built
@@ -431,6 +435,13 @@ jobs:
         # state — on both the lean (`.`) and read-model (`/readmodel`) entrypoints.
         run: npm install && npm test
         working-directory: engine-wasm/tests/test-studio-record-loop
+      - name: Upload engine-wasm/pkg artifact (the output the probes above tested)
+        uses: actions/upload-artifact@v6
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg/
+          if-no-files-found: error
+          retention-days: 7
       - name: Read-model DTO types are derived, not hand-written (drift guard)
         # `@nanobpm/engine-wasm/readmodel-types` ships DTO types for the engine's
         # read-model query results (searchUserTasks, …). They are DERIVED from the

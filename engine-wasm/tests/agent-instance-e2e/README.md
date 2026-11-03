@@ -27,6 +27,6 @@ npm install
 npm test
 ```
 
-`make engine-wasm-agent-instance-e2e` does both. These tests are part of
-`make engine-wasm-ffi-dist`, which CI runs against a package built from the
+`make engine-wasm-agent-instance-e2e` does both. CI runs these tests in the
+`engine-wasm-ffi (dist + verify)` job against the package built once from the
 PR's own source.
