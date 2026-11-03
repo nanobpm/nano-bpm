@@ -455,3 +455,44 @@ test("job activation cap is shared, finite, and identical across backends", () =
   assert.equal(Number.isSafeInteger(MAX_JOBS_TO_ACTIVATE), true);
   assert.ok(MAX_JOBS_TO_ACTIVATE > 0 && MAX_JOBS_TO_ACTIVATE < Number.MAX_SAFE_INTEGER);
 });
+
+test("a failed scenario aborts the in-flight awaitCompletion create (no hang until its deadline)", async () => {
+  // If a step fails before `observe()`, the awaitCompletion create would stay in
+  // flight for its full ~135 s deadline, keeping the CLI/CI job alive. Cleanup
+  // (`reset`, which `runScenario` and `close` both reach) must abort it (#1260).
+  let createReq = null;
+  const server = createServer((req, res) => {
+    if (req.url.endsWith("/process-instances")) {
+      createReq = req; // never answered: the instance "never completes"
+      return;
+    }
+    if (req.url.endsWith("/jobs/activation")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end('{"jobs":[]}');
+      return;
+    }
+    res.writeHead(204);
+    res.end();
+  });
+  server.listen(0);
+  await once(server, "listening");
+  const { port } = server.address();
+  try {
+    const backend = new CamundaBackend({ address: `http://127.0.0.1:${port}` });
+    const scenario = {
+      xml: "<definitions/>",
+      processId: "p",
+      steps: [{ op: "activateAndComplete", jobType: "t" }],
+    };
+    await assert.rejects(() => runScenario(backend, scenario));
+    const started = Date.now();
+    await backend.close();
+    // The create must have been aborted client-side: the server sees the socket close.
+    if (!createReq.destroyed) await once(createReq, "close");
+    assert.ok(Date.now() - started < 2000, "create was not aborted by cleanup");
+  } finally {
+    server.closeAllConnections();
+    server.close();
+    await once(server, "close");
+  }
+});

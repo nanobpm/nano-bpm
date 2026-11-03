@@ -107,7 +107,12 @@ export class CamundaBackend {
     return h;
   }
 
-  async #json(method, path, body, what, { timeoutMs } = {}) {
+  // In-flight awaitCompletion creates, aborted by `reset()` so a scenario that
+  // fails before `observe()` cannot keep the process alive until the create's
+  // ~135 s deadline (#1260 review).
+  #inflight = new Set();
+
+  async #json(method, path, body, what, { timeoutMs, signal } = {}) {
     // Bound every REST call. A caller may override the deadline for a long-poll
     // (job activation, awaitCompletion create) whose server-side window exceeds
     // the ordinary request timeout; otherwise a wedged endpoint hangs CI (#1260).
@@ -115,7 +120,9 @@ export class CamundaBackend {
       method,
       headers: this.headers(),
       body: body === undefined ? undefined : JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs ?? this.requestTimeoutMs),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs ?? this.requestTimeoutMs)])
+        : AbortSignal.timeout(timeoutMs ?? this.requestTimeoutMs),
     });
     const text = await res.text();
     let parsed = text;
@@ -226,6 +233,8 @@ export class CamundaBackend {
     //     times out (DEFAULT_COMPLETION_TIMEOUT_MS) and THROWS — the run fails
     //     loudly instead of reporting a bogus match. Adding such a scenario is
     //     gated on wiring the query-API barrier above (#1260 review).
+    const abort = new AbortController();
+    this.#inflight.add(abort);
     const pending = this.#json(
       "POST",
       "/process-instances",
@@ -236,8 +245,11 @@ export class CamundaBackend {
         requestTimeout: DEFAULT_COMPLETION_TIMEOUT_MS,
       },
       "create process instance",
-      { timeoutMs: DEFAULT_COMPLETION_TIMEOUT_MS + REQUEST_TIMEOUT_MARGIN_MS },
-    );
+      {
+        timeoutMs: DEFAULT_COMPLETION_TIMEOUT_MS + REQUEST_TIMEOUT_MARGIN_MS,
+        signal: abort.signal,
+      },
+    ).finally(() => this.#inflight.delete(abort));
     // Surface a create-time rejection eagerly rather than as an unhandled
     // rejection; the stored promise is still awaited in `observe`.
     pending.catch(() => {});
@@ -315,6 +327,10 @@ export class CamundaBackend {
   }
 
   async reset() {
+    // Abort any create still in flight (a scenario that failed before
+    // `observe()`); otherwise it holds the process open until its deadline.
+    for (const abort of this.#inflight) abort.abort();
+    this.#inflight.clear();
     // A clock reset is the correct — and sufficient — per-scenario reset for this
     // backend's execution model, NOT a papered-over engine wipe:
     //   * Scenarios are SERIALISED and run to completion-or-throw: `start` fires
