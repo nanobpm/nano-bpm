@@ -6,12 +6,16 @@
 //
 //   parity       evidence: `traces:<scenario>` — a captured Zeebe trace
 //                (formal/traces/goldens/<scenario>.cells.json) whose recorded
-//                cells touch each claimed cell — or a conformance-corpus
-//                fixture carrying a captured Zeebe verdict (accept/reject — a
-//                `diverge` fixture is not parity) whose declared
-//                `<!-- zeebe-cells: … -->` are each touched by some captured
-//                trace. A cell may carry `parity` ONLY while a captured Zeebe
-//                trace touches it (#1391).
+//                cells touch each claimed cell — or, for `validation:` cells
+//                only, a conformance-corpus fixture carrying a captured Zeebe
+//                verdict (accept/reject — a `diverge` fixture is not parity):
+//                a deploy-time verdict never appears in a runtime trace, so
+//                the fixture's declared `<!-- zeebe-cells: … -->` stand in for
+//                the trace touch. Every non-`validation:` parity cell must be
+//                touched by a captured trace (#1391) — and only by records the
+//                normaliser KEEPS: an intent `formal/traces/normaliser.json`
+//                drops is never compared by the differential runner, so a raw
+//                trace touch is not parity evidence for it.
 //   nano-tested  evidence: `path::test_fn`, a `#[test]` in that file whose
 //                attribute block declares each claimed cell in
 //                `// zeebe-cells: …`. TRANSITIONAL and ratcheted
@@ -20,8 +24,11 @@
 //                CI fails when the set grows (`--base-nano-tested`).
 //   gap          issue: the tracking issue that closes the gap. Ratcheted:
 //                only cells frozen in `gaps.json` may be gaps, so a cell a pin
-//                bump adds cannot hide under a wildcard, and the baseline may
-//                only shrink (`--update-gaps` never adds to it)
+//                bump adds cannot hide under a wildcard, and CI keeps the
+//                baseline shrink-only across branches (`--base-gaps`);
+//                `--update-gaps` regenerates it from the current gap
+//                assignments (dropping promoted cells, admitting a cell that
+//                legitimately regresses to gap)
 //   out-of-scope issue + note: why the cell has no Nano meaning
 //
 // Fails on an unmapped cell, a dead rule (claims no cell), unverifiable
@@ -206,7 +213,7 @@ export function ruleProblems(rule, fs) {
  * captured at another Zeebe revision are stale: refresh them
  * (`formal/traces/capture.sh`) on a pin bump.
  */
-export function loadTouchedCells(fs, known, pinSha) {
+export function loadTouchedCells(fs, known, pinSha, normaliser) {
   const touched = new Set();
   const errors = [];
   const pinFile = `${TRACES}goldens/PIN`;
@@ -231,16 +238,56 @@ export function loadTouchedCells(fs, known, pinSha) {
       touched.add(c);
     }
   }
+  // An intent cell is parity evidence only when the differential runner
+  // actually COMPARES its records: `normaliser.json` (the one spec shared by
+  // the Java capture harness and the Rust runner) drops every EVENT record
+  // whose valueType/intent no lane lists, so a raw trace touch of a dropped
+  // intent proves nothing about Nano. Remove those ids from the eligible set.
+  if (normaliser !== undefined) {
+    const kept = keptIntents(normaliser);
+    if (kept === null) {
+      errors.push(`${TRACES}normaliser.json must have a lanes array`);
+    } else {
+      for (const c of [...touched]) {
+        if (c.startsWith('intent:') && !kept.has(c)) touched.delete(c);
+      }
+    }
+  }
   return { touched, errors };
+}
+
+/**
+ * The `intent:<Record>:<INTENT>` cells whose records `normaliser.json` keeps
+ * for comparison (lane valueType in PascalCase + listed intent), or null when
+ * the spec is malformed. The valueType->Record mapping is the identity
+ * transform both normaliser implementations share (PROCESS_INSTANCE ->
+ * ProcessInstance): the capture harness derives the same stem from the intent
+ * enum's class name (`CellIds.intentCell`).
+ */
+export function keptIntents(normaliser) {
+  if (!Array.isArray(normaliser?.lanes)) return null;
+  const kept = new Set();
+  for (const lane of normaliser.lanes) {
+    if (typeof lane?.valueType !== 'string' || !Array.isArray(lane?.intents)) return null;
+    const stem = lane.valueType
+      .split('_')
+      .filter(Boolean)
+      .map((p) => p.charAt(0) + p.slice(1).toLowerCase())
+      .join('');
+    for (const intent of lane.intents) kept.add(`intent:${stem}:${intent}`);
+  }
+  return kept;
 }
 
 /**
  * Check `coverage` against `surface`, the `gaps` baseline (`gaps.json`'s cell
  * list), the `nanoTested` baseline (`nano-tested.json`'s cell list) and, when
- * given, the `pin`. Returns `{ errors, assignments }`, where `assignments`
- * maps each cell id to the status of the first rule claiming it.
+ * given, the `pin`. `normaliser` is the parsed `formal/traces/normaliser.json`
+ * spec: intent cells its lanes drop are not eligible parity evidence. Returns
+ * `{ errors, assignments }`, where `assignments` maps each cell id to the
+ * status of the first rule claiming it.
  */
-export function evaluate(surface, coverage, fs, gaps, pin, nanoTested) {
+export function evaluate(surface, coverage, fs, gaps, pin, nanoTested, normaliser) {
   const errors = [];
   if (pin) {
     const id = (z) => `${z?.repository}@${z?.ref}(${z?.sha})`;
@@ -282,17 +329,22 @@ export function evaluate(surface, coverage, fs, gaps, pin, nanoTested) {
   // `parity` means "verified against a captured Zeebe trace" (#1391): load the
   // cells every committed trace touches, then require every parity-claimed
   // cell to be among them.
-  const { touched, errors: traceErrors } = loadTouchedCells(fs, known, pin?.sha);
+  const { touched, errors: traceErrors } = loadTouchedCells(fs, known, pin?.sha, normaliser);
   errors.push(...traceErrors);
   const parityTouched = new Set(touched);
   // A corpus fixture carries a captured Zeebe VERDICT (accept/reject), which is
-  // itself parity evidence for the validation cells it declares — as long as
-  // each declared cell is also touched by some captured trace.
+  // itself parity evidence for the DEPLOY-VALIDATION cells it declares: a
+  // deploy-time verdict never appears in a runtime trace, so `validation:` is
+  // the one family a fixture may vouch for without a trace touching the cell.
+  // Every other family stays strictly trace-touched — a fixture declaration
+  // must never stand in for a captured trace.
   for (const r of rules) {
     if (r?.status !== 'parity' || !Array.isArray(r.evidence)) continue;
     for (const ref of r.evidence) {
       if (typeof ref === 'string' && !ref.startsWith('traces:') && fs.exists(ref)) {
-        for (const c of fixtureCells(fs.read(ref))) parityTouched.add(c);
+        for (const c of fixtureCells(fs.read(ref))) {
+          if (c.startsWith('validation:')) parityTouched.add(c);
+        }
       }
     }
   }
@@ -393,11 +445,15 @@ export function shrinkNanoTested(assignments, nanoTested) {
  * Ids the head nano-tested baseline illegitimately adds over the target
  * branch's. `nano-tested` is transitional, so the ratchet is strict: the set
  * may only shrink. The one exception is a Zeebe **pin bump** (`basePin.sha`
- * differs from `headPin.sha`, or `basePin` absent — fail-closed): brand-new
- * cells the bump introduces may enter as `nano-tested` while their traces are
- * captured, but only if the base baseline does not already list them.
+ * differs from `headPin.sha`, or `basePin` absent — fail-closed), and even then
+ * only for **brand-new surface cells** — ids the bump introduced, i.e. absent
+ * from the base surface (`baseSurfaceIds`, the cell ids of the target branch's
+ * `zeebe-surface.json`). An id the base surface already lists must never
+ * (re-)enter the baseline: that is an existing cell regressing from `parity`
+ * to `nano-tested`, which a pin bump must not launder. Without the base
+ * surface no addition is exempt (fail-closed).
  */
-export function nanoTestedGrowth(base, head, basePin, headPin) {
+export function nanoTestedGrowth(base, head, basePin, headPin, baseSurfaceIds) {
   if (!Array.isArray(base)) {
     // The target branch predates the ratchet (no nano-tested.json there):
     // everything was effectively nano-tested, so any head set is a shrink.
@@ -408,11 +464,16 @@ export function nanoTestedGrowth(base, head, basePin, headPin) {
   const added = head.filter((id) => !before.has(id));
   if (added.length === 0) return [];
   const pinBump = basePin == null || headPin == null || basePin.sha !== headPin.sha;
-  if (pinBump) return [];
-  return added.map(
-    (id) =>
-      `nano-tested.json adds ${id}, which the target branch's baseline does not list: nano-tested is transitional and may only shrink — promote the cell to parity with a captured trace instead`,
-  );
+  const baseCells = Array.isArray(baseSurfaceIds) ? new Set(baseSurfaceIds) : null;
+  return added
+    .filter((id) => !pinBump || baseCells?.has(id) !== false)
+    .map(
+      (id) =>
+        `nano-tested.json adds ${id}, which the target branch's baseline does not list: nano-tested is transitional and may only shrink — promote the cell to parity with a captured trace instead` +
+        (pinBump && baseCells?.has(id)
+          ? ' (a pin bump exempts only brand-new surface cells, and the base surface already lists this one)'
+          : ''),
+    );
 }
 
 /**
@@ -472,10 +533,12 @@ export function baselineGrowth(base, head, basePin, headPin, baseSurfaceIds) {
   return errors;
 }
 
-/** The shrunk baseline: current gap cells that were already in it. */
+/** The shrunk baseline: current gap cells, plus any newly-gapped cell (a cell
+ * may regress to `gap` — e.g. evidence reclassified — and the baseline must
+ * then admit it; CI's `--base-gaps` comparison is what keeps the baseline
+ * shrink-only ACROSS branches). */
 export function shrinkGaps(assignments, gaps) {
-  const baseline = new Set(gaps);
-  return [...assignments].filter(([id, s]) => s === 'gap' && baseline.has(id)).map(([id]) => id).sort();
+  return [...assignments].filter(([, s]) => s === 'gap').map(([id]) => id).sort();
 }
 
 /** Per-family status counts: `{ family: { status: n } }`. */
@@ -536,34 +599,41 @@ function main() {
     return;
   }
   const headPin = load('zeebe-pin.json');
-  const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, headPin, nanoTestedFile.cells);
-  const baseArg = process.argv.indexOf('--base-gaps');
+  const normaliser = JSON.parse(readFileSync(join(root, TRACES, 'normaliser.json'), 'utf8'));
+  const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, headPin, nanoTestedFile.cells, normaliser);
+  // The base pin and base surface feed BOTH baseline ratchets, so parse them
+  // independently of `--base-gaps`: a standalone `--base-nano-tested` check
+  // must not silently treat a supplied pin as absent (absent reads as a pin
+  // bump, which exempts growth).
   let basePin = null;
+  const pinArg = process.argv.indexOf('--base-pin');
+  if (pinArg !== -1) {
+    const pinPath = process.argv[pinArg + 1];
+    if (!pinPath) throw new Error('--base-pin needs a file path');
+    basePin = JSON.parse(readFileSync(pinPath, 'utf8'));
+  }
+  let baseSurfaceIds = null;
+  const surfArg = process.argv.indexOf('--base-surface');
+  if (surfArg !== -1) {
+    const surfPath = process.argv[surfArg + 1];
+    if (!surfPath) throw new Error('--base-surface needs a file path');
+    const cells = JSON.parse(readFileSync(surfPath, 'utf8')).cells;
+    if (!Array.isArray(cells)) throw new Error('base zeebe-surface.json must have a cells array');
+    baseSurfaceIds = cells.map((c) => c.id);
+  }
+  const baseArg = process.argv.indexOf('--base-gaps');
   if (baseArg !== -1) {
     const basePath = process.argv[baseArg + 1];
     if (!basePath) throw new Error('--base-gaps needs a file path');
-    const pinArg = process.argv.indexOf('--base-pin');
-    if (pinArg !== -1) {
-      const pinPath = process.argv[pinArg + 1];
-      if (!pinPath) throw new Error('--base-pin needs a file path');
-      basePin = JSON.parse(readFileSync(pinPath, 'utf8'));
-    }
-    const surfArg = process.argv.indexOf('--base-surface');
-    let baseSurfaceIds = null;
-    if (surfArg !== -1) {
-      const surfPath = process.argv[surfArg + 1];
-      if (!surfPath) throw new Error('--base-surface needs a file path');
-      const cells = JSON.parse(readFileSync(surfPath, 'utf8')).cells;
-      if (!Array.isArray(cells)) throw new Error('base zeebe-surface.json must have a cells array');
-      baseSurfaceIds = cells.map((c) => c.id);
-    }
     errors.push(...baselineGrowth(JSON.parse(readFileSync(basePath, 'utf8')).cells, gapsFile.cells, basePin, headPin, baseSurfaceIds));
   }
   const ntArg = process.argv.indexOf('--base-nano-tested');
   if (ntArg !== -1) {
     const ntPath = process.argv[ntArg + 1];
     if (!ntPath) throw new Error('--base-nano-tested needs a file path');
-    errors.push(...nanoTestedGrowth(JSON.parse(readFileSync(ntPath, 'utf8')).cells, nanoTestedFile.cells, basePin, headPin));
+    errors.push(
+      ...nanoTestedGrowth(JSON.parse(readFileSync(ntPath, 'utf8')).cells, nanoTestedFile.cells, basePin, headPin, baseSurfaceIds),
+    );
   }
   const report = markdownReport(tally(assignments), surface);
   process.stdout.write(report);

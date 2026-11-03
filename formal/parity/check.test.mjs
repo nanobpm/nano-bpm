@@ -11,6 +11,7 @@ import {
   baselineGrowth,
   evaluate,
   globToRegExp,
+  keptIntents,
   loadTouchedCells,
   markdownReport,
   nanoTestedGrowth,
@@ -204,9 +205,15 @@ test('the gap ratchet: a new cell cannot hide under a wildcard gap, and the base
     ...['intent:Job:CREATED', 'validation:V:m', 'element:Other'].map((c) => `rule "*": no evidence declares ${c}`),
     'gaps.json must have a cells array',
   ]);
-  // --update-gaps shrinks the baseline but never grows it.
+  // --update-gaps regenerates the baseline from the current gap assignments:
+  // it shrinks away promoted/removed cells and admits newly-gapped ones (a cell
+  // may legitimately regress to gap; CI's --base-gaps check keeps the baseline
+  // shrink-only across branches).
   const { assignments } = evaluate(surface(...ids), { rules }, fs, []);
-  assert.deepEqual(shrinkGaps(assignments, ['element:Task', 'intent:Job:CREATED', 'intent:Job:GONE']), ['intent:Job:CREATED']);
+  assert.deepEqual(shrinkGaps(assignments, ['element:Task', 'intent:Job:CREATED', 'intent:Job:GONE']), [
+    'intent:Job:CREATED',
+    'intent:Job:NEW',
+  ]);
 });
 
 test('a wildcard rule can never claim a per-site failure:/rejection: cell', () => {
@@ -280,6 +287,50 @@ test('a parity cell must be touched by a captured Zeebe trace', () => {
   assert.ok(untouched.some((e) => /no evidence declares element:Other/.test(e)));
 });
 
+test('a fixture verdict vouches for validation: cells only — never for an untraced runtime cell', () => {
+  // A valid fixture (accept/reject verdict) declaring a known but untraced
+  // non-validation cell does NOT satisfy the trace requirement: only the
+  // deploy-validation family may rest on a verdict alone.
+  const fixture = `${CORPUS}reject-element.bpmn`;
+  const files = { ...FILES, [fixture]: '<!-- verdict: reject | category: X -->\n<!-- zeebe-cells: element:New -->\n<definitions/>' };
+  const fxs = { ...fs, exists: (p) => p in files, read: (p) => files[p] };
+  const ids = ['element:New', 'validation:V:m'];
+  const rules = [
+    { match: 'element:New', status: 'parity', evidence: [fixture] },
+    { match: 'validation:V:m', status: 'parity', evidence: [`${CORPUS}reject-x.bpmn`] },
+  ];
+  const errors = evaluate(surface(...ids), { reviewedAt: 'abc', rules: rulesOf(rules) }, fxs, gapsOf(ALL(ids), rulesOf(rules)), PIN, []).errors;
+  assert.deepEqual(errors, [
+    'parity cell element:New is not touched by any captured Zeebe trace (formal/traces/goldens/*.cells.json)',
+  ]);
+  // The same fixture's validation: claim passes without a trace touch…
+  assert.deepEqual(check(['validation:V:m'], [rules[1]]), []);
+  // …but a validation: cell no fixture declares is still rejected.
+  const undeclared = check(['validation:V:n'], [{ match: 'validation:V:n', status: 'parity', evidence: [`${CORPUS}reject-x.bpmn`] }]);
+  assert.ok(undeclared.some((e) => /no evidence declares validation:V:n/.test(e)));
+  assert.ok(undeclared.some((e) => /validation:V:n is not touched by any captured Zeebe trace/.test(e)));
+});
+
+test('an intent the normaliser drops is not parity evidence, even when a trace records it', () => {
+  // s1 touches intent:Job:CREATED; a normaliser whose JOB lane keeps only
+  // COMPLETED drops it before comparison, so the differential runner never
+  // checks it and the cell cannot be parity.
+  const norm = { lanes: [{ valueType: 'JOB', intents: ['COMPLETED'] }] };
+  const rules = [{ match: 'intent:Job:CREATED', status: 'parity', evidence: ['traces:s1'] }];
+  const gaps = gapsOf(ALL(['intent:Job:CREATED']), rulesOf(rules));
+  const run = (normaliser) =>
+    evaluate(surface('intent:Job:CREATED'), { reviewedAt: 'abc', rules: rulesOf(rules) }, fs, gaps, PIN, [], normaliser).errors;
+  assert.deepEqual(run(norm), [
+    'parity cell intent:Job:CREATED is not touched by any captured Zeebe trace (formal/traces/goldens/*.cells.json)',
+  ]);
+  // A lane that keeps it makes the same claim pass.
+  assert.deepEqual(run({ lanes: [{ valueType: 'JOB', intents: ['CREATED'] }] }), []);
+  // The lane valueType maps to the cell's record stem in PascalCase.
+  assert.deepEqual(keptIntents({ lanes: [{ valueType: 'PROCESS_MESSAGE_SUBSCRIPTION', intents: ['CREATED'] }] }), new Set(['intent:ProcessMessageSubscription:CREATED']));
+  // A malformed spec fails loudly rather than silently dropping every intent.
+  assert.ok(run({ lanes: [{ valueType: 'JOB' }] }).some((e) => /normaliser\.json must have a lanes array/.test(e)));
+});
+
 test('a cell id in a cells file that extract.mjs does not know fails (grammar drift)', () => {
   // s2's cells file lists element:Other; a surface without it drifts from the harness.
   const s = { zeebe: { ...PIN }, cells: ['element:Task', 'intent:Job:CREATED', 'validation:V:m'].map((id) => ({ id, sources: ['s'] })) };
@@ -320,9 +371,31 @@ test('the nano-tested baseline may only shrink against the target branch (same p
   // Same pin: growth fails — nano-tested is transitional, promote to parity instead.
   assert.match(nanoTestedGrowth(['a'], ['a', 'c'], PIN_A, PIN_A)[0], /nano-tested\.json adds c.*may only shrink/);
   // A pin bump may add cells (new surface cells start nano-tested while traces are captured).
-  assert.deepEqual(nanoTestedGrowth(['a'], ['a', 'c'], PIN_A, PIN_B), []);
-  // Fail-closed: no base pin reads as a bump.
-  assert.deepEqual(nanoTestedGrowth(['a'], ['a', 'c'], null, PIN_A), []);
+  assert.deepEqual(nanoTestedGrowth(['a'], ['a', 'c'], PIN_A, PIN_B, ['a', 'b']), []);
+  // Fail-closed: no base pin reads as a bump (and a bump without the base
+  // surface exempts nothing — see the next test).
+  assert.deepEqual(nanoTestedGrowth(['a'], ['a', 'c'], null, PIN_A, ['a', 'b']), []);
+});
+
+test('a pin bump exempts only brand-new surface cells from the nano-tested ratchet', () => {
+  const PIN_A = { repository: 'r', ref: 'stable/x', sha: 'aaa' };
+  const PIN_B = { ...PIN_A, sha: 'bbb' };
+  const BASE_SURFACE = ['element:ServiceTask', 'intent:Job:CREATED'];
+  // A cell the base surface already lists may NOT (re-)enter the baseline on a
+  // pin bump: that is an existing cell regressing from parity to nano-tested.
+  assert.match(
+    nanoTestedGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', 'element:ServiceTask'], PIN_A, PIN_B, BASE_SURFACE)[0],
+    /adds element:ServiceTask.*base surface already lists this one/,
+  );
+  // A brand-new cell the bump introduced (absent from the base surface) may.
+  assert.deepEqual(
+    nanoTestedGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', 'element:BrandNew'], PIN_A, PIN_B, BASE_SURFACE),
+    [],
+  );
+  // Without the base surface no addition is exempt (fail-closed).
+  assert.match(nanoTestedGrowth(['a'], ['a', 'c'], PIN_A, PIN_B)[0], /adds c/);
+  // Same pin keeps the strict check regardless of the base surface.
+  assert.match(nanoTestedGrowth(['a'], ['a', 'c'], PIN_A, PIN_A, ['x'])[0], /adds c/);
 });
 
 test('globs treat only * as a wildcard', () => {

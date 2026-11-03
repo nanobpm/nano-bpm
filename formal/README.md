@@ -483,7 +483,7 @@ one status:
 
 | Status | Required | Meaning |
 |---|---|---|
-| `parity` | `evidence`: `traces:<scenario>` refs and/or fixtures in `engine-core/tests/conformance/corpus/` | a **captured Zeebe trace** (`formal/traces/goldens/<scenario>.cells.json`) touches every claimed cell — `check.mjs` rejects a `parity` cell no committed trace touches (#1391). A corpus fixture additionally carries a captured Zeebe deploy verdict (`accept` or `reject`; a `diverge` fixture is not parity) and declares its cells in `<!-- zeebe-cells: … -->`; those cells must likewise be trace-touched |
+| `parity` | `evidence`: `traces:<scenario>` refs and/or fixtures in `engine-core/tests/conformance/corpus/` | a **captured Zeebe trace** (`formal/traces/goldens/<scenario>.cells.json`) touches every claimed cell — `check.mjs` rejects a `parity` cell no committed trace touches (#1391), and an `intent:` cell counts only when `formal/traces/normaliser.json` keeps its records (a dropped record is never compared). A corpus fixture carries a captured Zeebe deploy verdict (`accept` or `reject`; a `diverge` fixture is not parity) and declares its cells in `<!-- zeebe-cells: … -->`; that verdict vouches for `validation:` cells only — every other family must be trace-touched |
 | `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` (not `#[ignore]`d) exercises the behaviour, but not against a Zeebe oracle. Every claimed cell must be listed in a `// zeebe-cells: …` line among the comments and attributes directly above the test fn. **Transitional and ratcheted** (`nano-tested.json`): the set may only shrink — promote to `parity` once a captured trace covers the cell |
 | `gap` | `issue`, `note` | no evidence yet; the issue closes it. Only cells in the `gaps.json` baseline may be gaps (see below) |
 | `out-of-scope` | `issue`, `note` | the cell has no Nano meaning (for example, partition-internal records). Use sparingly |
@@ -513,11 +513,13 @@ one status:
 
 `gaps.json` is a ratchet. It freezes the cells that were gaps when the matrix
 landed, so a broad `gap` rule such as `intent:*` cannot absorb a cell that a
-Zeebe bump adds: that cell needs evidence or an `out-of-scope` rule. When cells
-gain evidence, `node formal/parity/check.mjs --update-gaps` drops them from the
-baseline. It only ever removes entries, and CI runs the guard with
-`--base-gaps` against the target branch's `gaps.json`, rejecting any id the PR
-adds, so the baseline shrinks toward empty.
+Zeebe bump adds: that cell needs evidence or an `out-of-scope` rule.
+`node formal/parity/check.mjs --update-gaps` regenerates the baseline from the
+current gap assignments — dropping cells that gained evidence and admitting a
+cell that legitimately regresses to `gap` (say its evidence was reclassified).
+CI runs the guard with `--base-gaps` against the target branch's `gaps.json`,
+rejecting any id the PR adds, so across branches the baseline shrinks toward
+empty.
 
 `nano-tested.json` is the same kind of ratchet for the transitional
 `nano-tested` status (#1391): it freezes the cells not yet covered by a
@@ -551,9 +553,9 @@ result differs from the committed file, or if the surface, `gaps.json` or
    while `goldens/PIN` lags the pin — then `node formal/parity/check.mjs`. Map
    every unmapped cell and every new gap cell it reports to evidence or
    `out-of-scope`, and delete any rule it reports as dead. Run `--update-gaps`
-   to drop cells the bump removed, and `--update-ratchet` to reconcile
-   `nano-tested.json`. Then set `reviewedAt` in `coverage.json` to the new
-   commit.
+   to reconcile `gaps.json` with the new gap assignments, and
+   `--update-ratchet` to reconcile `nano-tested.json`. Then set `reviewedAt`
+   in `coverage.json` to the new commit.
 5. Review the `zeebe-surface.json` diff. Removed or renamed cells are Zeebe
    behaviour changes that Nano may need to follow.
 

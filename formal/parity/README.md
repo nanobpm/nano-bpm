@@ -87,7 +87,7 @@ pin:
 
 ```bash
 node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"   # zeebe-surface.json
-node formal/parity/check.mjs --update-gaps                          # shrink gaps.json
+node formal/parity/check.mjs --update-gaps                          # regenerate gaps.json from the current gap cells
 node formal/parity/check.mjs --update-ratchet                       # shrink nano-tested.json
 node formal/parity/check.mjs                                        # guard + report
 ```
@@ -103,10 +103,16 @@ forms count:
 
 - **`traces:<scenario>`** — the scenario's own cells file. This is the primary
   form for runtime behaviour (element lifecycle, intents, incidents,
-  per-site `failure:`/`rejection:` cells).
+  per-site `failure:`/`rejection:` cells). An `intent:` cell qualifies only
+  when `formal/traces/normaliser.json` **keeps** its records: a record the
+  normaliser drops is never compared by the differential runner, so a raw
+  trace touch of a dropped intent is not parity evidence for it.
 - a **conformance-corpus fixture** with a captured Zeebe verdict
-  (accept/reject) whose declared `zeebe-cells` are each also touched by some
-  trace — the deploy-validation cells.
+  (accept/reject) — for `validation:` cells only. A deploy-time verdict never
+  appears in a runtime trace, so the fixture's declared `zeebe-cells` stand in
+  for the trace touch there. A fixture declaration must never vouch for any
+  other family: an untraced runtime cell is not parity, whatever a fixture
+  says.
 
 Because the capture harness (Java) and `extract.mjs` (JS) implement one shared
 cell-id grammar, `check.mjs` also rejects any id in a cells file that the
@@ -124,8 +130,11 @@ covers it yet" — a **transitional** status on the way to `parity`.
 - `check.mjs` fails when the assigned set and the baseline disagree (a new
   `nano-tested` cell, or one promoted/removed without regenerating).
 - CI (`--base-nano-tested`) fails when the set **grows** against the target
-  branch — same pin. On a pin bump, brand-new cells may enter as
-  `nano-tested` while their traces are captured.
+  branch — same pin. On a pin bump, only **brand-new surface cells** (ids the
+  target branch's `zeebe-surface.json` does not list — pass it with
+  `--base-surface`) may enter as `nano-tested` while their traces are
+  captured; an id the base surface already lists is an existing cell
+  regressing from `parity`, which a bump must not launder.
 - Promote a cell to `parity` (with `traces:<scenario>` evidence) as soon as a
   captured trace covers it, then run `check.mjs --update-ratchet` to shrink
   the baseline.

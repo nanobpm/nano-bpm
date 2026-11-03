@@ -60,24 +60,21 @@
     },
     {
       "match": "intent:AsyncRequest:PROCESSED",
-      "status": "parity",
-      "evidence": [
-        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:AsyncRequest:RECEIVED",
-      "status": "parity",
-      "evidence": [
-        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:ProcessInstance:CANCELING",
-      "status": "parity",
-      "evidence": [
-        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:ProcessInstance:ELEMENT_TERMINATED",
@@ -95,10 +92,9 @@
     },
     {
       "match": "intent:ProcessInstanceBatch:TERMINATED",
-      "status": "parity",
-      "evidence": [
-        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "incident:JOB_NO_RETRIES",
@@ -186,24 +182,21 @@
     },
     {
       "match": "intent:JobBatch:ACTIVATED",
-      "status": "parity",
-      "evidence": [
-        "traces:job-type-expression-failure"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:ProcessEvent:TRIGGERED",
-      "status": "parity",
-      "evidence": [
-        "traces:job-type-expression-failure"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:ProcessEvent:TRIGGERING",
-      "status": "parity",
-      "evidence": [
-        "traces:job-type-expression-failure"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:ProcessInstance:ELEMENT_ACTIVATED",
@@ -242,10 +235,9 @@
     },
     {
       "match": "intent:ProcessInstanceCreation:CREATED",
-      "status": "parity",
-      "evidence": [
-        "traces:job-type-expression-failure"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:Variable:CREATED",
@@ -263,10 +255,9 @@
     },
     {
       "match": "intent:VariableDocument:UPDATED",
-      "status": "parity",
-      "evidence": [
-        "traces:job-type-expression-failure"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "element:IntermediateCatchEvent",
@@ -277,38 +268,33 @@
     },
     {
       "match": "intent:Message:EXPIRED",
-      "status": "parity",
-      "evidence": [
-        "traces:message-catch"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:Message:PUBLISHED",
-      "status": "parity",
-      "evidence": [
-        "traces:message-catch"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:MessageSubscription:CORRELATED",
-      "status": "parity",
-      "evidence": [
-        "traces:message-catch"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:MessageSubscription:CORRELATING",
-      "status": "parity",
-      "evidence": [
-        "traces:message-catch"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:MessageSubscription:CREATED",
-      "status": "parity",
-      "evidence": [
-        "traces:message-catch"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:ProcessMessageSubscription:CORRELATED",
@@ -326,17 +312,15 @@
     },
     {
       "match": "intent:ProcessMessageSubscription:CREATING",
-      "status": "parity",
-      "evidence": [
-        "traces:message-catch"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:ProcessInstanceCreation:CREATE",
-      "status": "parity",
-      "evidence": [
-        "traces:service-task-complete"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "rejection:ProcessInstanceCreationHelper.getProcess:NOT_FOUND",
@@ -375,10 +359,9 @@
     },
     {
       "match": "intent:UserTask:COMPLETING",
-      "status": "parity",
-      "evidence": [
-        "traces:user-task-complete"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "intent:UserTask:CREATED",
@@ -389,10 +372,9 @@
     },
     {
       "match": "intent:UserTask:CREATING",
-      "status": "parity",
-      "evidence": [
-        "traces:user-task-complete"
-      ]
+      "status": "gap",
+      "issue": 1391,
+      "note": "The captured Zeebe trace records this intent, but formal/traces/normaliser.json drops the record before comparison, so the differential runner never checks it: extend the normaliser lanes and the Nano adapter (zeebe_traces.rs) to carry it, then re-promote with trace evidence."
     },
     {
       "match": "element:AdHocSubProcess",
