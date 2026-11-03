@@ -14,7 +14,8 @@
 #   * clock-controlled: the runner pins/advances the clock over /v2/clock.
 #   * H2 in-memory secondary storage: `none` fails to boot the 8.10 webapp
 #     beans; H2 is the lightest config that starts (as Camunda's own CI uses).
-#   * Unprotected API + no authorizations: a throwaway, per-job container.
+#   * Unprotected API + no authorizations: a throwaway, per-job container,
+#     published on 127.0.0.1 only.
 #   * 16 MB log segments, disk monitoring off: the default 1 GiB segment
 #     preallocation fails on small CI/dev disks.
 set -euo pipefail
@@ -25,7 +26,8 @@ port="${2:-8080}"
 name=parity-camunda
 
 docker rm -f "$name" >/dev/null 2>&1 || true
-docker run -d --name "$name" -p "$port:8080" \
+# Loopback only: the API is unauthenticated, so never publish it beyond this host.
+docker run -d --name "$name" -p "127.0.0.1:$port:8080" \
   -e CAMUNDA_SYSTEM_CLOCK_CONTROLLED=true \
   -e ZEEBE_BROKER_DATA_LOGSEGMENTSIZE=16MB \
   -e ZEEBE_BROKER_DATA_DISK_ENABLEMONITORING=false \

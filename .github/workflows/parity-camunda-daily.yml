@@ -19,9 +19,10 @@ on:
   pull_request:
     paths:
       - '.github/workflows/parity-camunda-daily.yml'
-      - 'formal/parity/runtime/start-camunda.sh'
-      - 'formal/parity/runtime/camunda-image.mjs'
-      - 'formal/parity/runtime/camunda-backend.mjs'
+      # Everything the differential consumes: the runner, driver, backends and
+      # corpus, the nano read-model wasm it runs, and the Zeebe pin.
+      - 'formal/parity/runtime/**'
+      - 'engine-wasm/pkg/readmodel/**'
       - 'formal/parity/zeebe-surface.json'
 
 permissions:
