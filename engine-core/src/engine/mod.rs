@@ -6995,7 +6995,10 @@ impl Engine {
                         // The engine-owned 1-based `loopCounter` local identifies
                         // the child's index for the re-drive.
                         let index = match child_vars.get("loopCounter") {
-                            Some(Value::Int(n)) => usize::try_from(n - 1).unwrap_or(0),
+                            Some(Value::Int(n)) => n
+                                .checked_sub(1)
+                                .and_then(|i| usize::try_from(i).ok())
+                                .unwrap_or(0),
                             _ => 0,
                         };
                         let event = self.expression_incident(

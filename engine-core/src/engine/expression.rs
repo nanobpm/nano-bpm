@@ -165,7 +165,14 @@ pub(crate) fn evaluate_long(raw: &str, vars: &HashMap<String, Value>) -> Result<
         let t = raw.trim();
         return t
             .parse::<i64>()
-            .or_else(|_| t.parse::<f64>().map(|d| d as i64))
+            .ok()
+            .or_else(|| {
+                t.parse::<f64>()
+                    .ok()
+                    .filter(|d| d.is_finite())
+                    .map(|d| d as i64)
+            })
+            .ok_or(())
             .map_err(|_| type_failure(raw, "NUMBER", "STRING"));
     }
     match evaluate_or_failure(raw, vars)? {
@@ -176,7 +183,7 @@ pub(crate) fn evaluate_long(raw: &str, vars: &HashMap<String, Value>) -> Result<
         Evaluated {
             value: Value::Double(d),
             ..
-        } => Ok(d as i64),
+        } if d.is_finite() => Ok(d as i64),
         other => Err(type_failure(raw, "NUMBER", other.kind)),
     }
 }
@@ -184,6 +191,15 @@ pub(crate) fn evaluate_long(raw: &str, vars: &HashMap<String, Value>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evaluate_long_rejects_non_finite_static_values() {
+        let v = HashMap::new();
+        for lit in ["NaN", "inf", "-inf", "infinity"] {
+            assert!(evaluate_long(lit, &v).is_err(), "{lit} must be rejected");
+        }
+        assert_eq!(evaluate_long("3.7", &v).unwrap(), 3);
+    }
 
     fn vars(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
         pairs
