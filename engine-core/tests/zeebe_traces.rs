@@ -44,8 +44,9 @@ fn read_json(path: &Path) -> J {
 
 /// Apply the shared normaliser spec to one step's RAW records. Mirrors
 /// `Normaliser.java` in the capture harness; both implement the algorithm
-/// written in the spec's `doc` field.
-fn normalise(spec: &J, raw: &[J]) -> Vec<J> {
+/// written in the spec's `doc` field. `ids` carries the scenario's
+/// canonical-key map ACROSS steps (spec `doc` step 5).
+fn normalise(spec: &J, raw: &[J], ids: &mut HashMap<u64, u64>) -> Vec<J> {
     assert_eq!(spec["version"], 1, "unsupported normaliser spec version");
     let lanes = spec["lanes"].as_array().expect("spec.lanes");
     let mut out: Vec<Vec<J>> = vec![Vec::new(); lanes.len() + 1];
@@ -87,16 +88,20 @@ fn normalise(spec: &J, raw: &[J]) -> Vec<J> {
         }
     }
     let kept: Vec<J> = out.into_iter().flatten().collect();
-    renumber_keys(kept)
+    renumber_keys(kept, ids)
 }
 
 /// Rewrite every `*Key` field of the kept records to a canonical id: the
-/// first distinct raw key a step's records touch (in lane order) becomes 1,
-/// the next 2, and so on (spec `doc` step 5). Raw key VALUES are
-/// engine-specific, but the identity pattern is behavioural: completing a
-/// task in instance A must not read as completing it in instance B.
-fn renumber_keys(records: Vec<J>) -> Vec<J> {
-    let mut ids: HashMap<u64, u64> = HashMap::new();
+/// first distinct raw key the scenario's records touch (in step order, then
+/// lane order) becomes 1, the next 2, and so on, with `ids` kept for the
+/// WHOLE scenario — a per-step reset would renumber either of two
+/// same-process instances to the same step-local ids, hiding a cross-step
+/// target swap (spec `doc` step 5). serde_json objects iterate in sorted
+/// field-name order, which the Java mirror matches explicitly, so both sides
+/// assign the same ids. Raw key VALUES are engine-specific, but the identity
+/// pattern is behavioural: completing a task in instance A must not read as
+/// completing it in instance B.
+fn renumber_keys(records: Vec<J>, ids: &mut HashMap<u64, u64>) -> Vec<J> {
     let mut renumber = |v: &mut J| {
         let J::Object(o) = v else { return };
         for (name, field) in o.iter_mut() {
@@ -1146,9 +1151,11 @@ impl<'a> NanoRun<'a> {
     }
 }
 
-/// Run a scenario on engine-core and normalise it: the comparable trace.
+/// Run a scenario on engine-core and normalise it: the comparable trace. The
+/// canonical-key map is kept across the scenario's steps (spec `doc` step 5).
 fn nano_trace(spec: &J, sc: &Scenario) -> Vec<J> {
     let mut run = NanoRun::new(sc);
+    let mut ids = HashMap::new();
     sc.script["steps"]
         .as_array()
         .expect("steps")
@@ -1156,7 +1163,7 @@ fn nano_trace(spec: &J, sc: &Scenario) -> Vec<J> {
         .enumerate()
         .map(|(i, step)| {
             let raw = run.step(step);
-            json!({"step": i, "op": step["op"], "records": normalise(spec, &raw)})
+            json!({"step": i, "op": step["op"], "records": normalise(spec, &raw, &mut ids)})
         })
         .collect()
 }
@@ -1427,8 +1434,9 @@ fn normaliser_keeps_lane_order_selects_fields_and_drops_the_rest() {
             json!({"elementId": "t", "processInstanceKey": 9}),
         ),
     ];
+    let mut ids = HashMap::new();
     assert_eq!(
-        normalise(&spec, &raw),
+        normalise(&spec, &raw, &mut ids),
         vec![
             json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "t", "bpmnElementType": "SERVICE_TASK", "processInstanceKey": 1, "flowScopeKey": null}),
             json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_COMPLETED", "elementId": "t", "bpmnElementType": null, "processInstanceKey": 1, "flowScopeKey": null}),
@@ -1440,9 +1448,9 @@ fn normaliser_keeps_lane_order_selects_fields_and_drops_the_rest() {
 
 /// Runtime identity survives normalisation, canonically renumbered: raw key
 /// VALUES are engine-specific, but the identity pattern is behavioural — the
-/// first distinct key a step touches becomes 1, the next 2 (spec `doc` step
-/// 5). Two instances of one process must read as two distinct identities, and
-/// a record landing on instance A must not read as landing on instance B.
+/// first distinct key the scenario touches becomes 1, the next 2 (spec `doc`
+/// step 5). Two instances of one process must read as two distinct identities,
+/// and a record landing on instance A must not read as landing on instance B.
 #[test]
 fn normaliser_renumbers_runtime_keys_canonically() {
     let spec = load_spec();
@@ -1463,8 +1471,9 @@ fn normaliser_renumbers_runtime_keys_canonically() {
             json!({"elementId": "t", "type": "w", "retries": 3, "processInstanceKey": 2251799813685254_u64, "elementInstanceKey": 2251799813685260_u64}),
         ),
     ];
+    let mut ids = HashMap::new();
     assert_eq!(
-        normalise(&spec, &raw),
+        normalise(&spec, &raw, &mut ids),
         vec![
             json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "p", "bpmnElementType": "PROCESS", "processInstanceKey": 1, "flowScopeKey": 1}),
             json!({"valueType": "PROCESS_INSTANCE", "intent": "ELEMENT_ACTIVATED", "elementId": "p", "bpmnElementType": "PROCESS", "processInstanceKey": 2, "flowScopeKey": 2}),
@@ -1475,9 +1484,13 @@ fn normaliser_renumbers_runtime_keys_canonically() {
     // FIRST instance is observably different from completing in the SECOND.
     let mut swapped = raw.clone();
     swapped[2]["value"]["processInstanceKey"] = json!(2251799813685249_u64);
-    let out = normalise(&spec, &swapped);
+    let out = normalise(&spec, &swapped, &mut HashMap::new());
     assert_eq!(out[2]["processInstanceKey"], json!(1), "{out:?}");
-    assert_ne!(out, normalise(&spec, &raw), "the swap must be observable");
+    assert_ne!(
+        out,
+        normalise(&spec, &raw, &mut HashMap::new()),
+        "the swap must be observable"
+    );
     // A plain number is data, not a key: `retries` and a numeric variable
     // `value` pass through unrenumbered.
     let valued = vec![raw_event(
@@ -1485,9 +1498,74 @@ fn normaliser_renumbers_runtime_keys_canonically() {
         "CREATED",
         json!({"name": "n", "value": 2, "scopeElementId": "p", "processInstanceKey": 7, "scopeKey": 7}),
     )];
-    let out = normalise(&spec, &valued);
+    let out = normalise(&spec, &valued, &mut HashMap::new());
     assert_eq!(out[0]["value"], json!(2), "{out:?}");
     assert_eq!(out[0]["scopeKey"], json!(1), "{out:?}");
+    // Canonical ids are assigned in SORTED field-name order (spec `doc` step
+    // 5), so both normalisers agree regardless of their JSON object iteration
+    // order. Here the instance and its flow scope are the SAME raw key, and
+    // the element instance another. The JOB lane lists processInstanceKey
+    // BEFORE elementInstanceKey, so an insertion-order visitor would assign
+    // processInstanceKey=1, elementInstanceKey=2 — but sorted order visits
+    // elementInstanceKey first, assigning elementInstanceKey=1,
+    // processInstanceKey=2. A recapture with the wrong order diverges without
+    // any engine behaviour change.
+    let shared = vec![raw_event(
+        "JOB",
+        "FAILED",
+        json!({"elementId": "t", "type": "w", "retries": 0, "processInstanceKey": 100_u64, "elementInstanceKey": 200_u64, "flowScopeKey": 100_u64}),
+    )];
+    let out = normalise(&spec, &shared, &mut HashMap::new());
+    assert_eq!(out[0]["flowScopeKey"], J::Null, "not a JOB lane field");
+    assert_eq!(out[0]["elementInstanceKey"], json!(1), "{out:?}");
+    assert_eq!(out[0]["processInstanceKey"], json!(2), "{out:?}");
+    let pi = vec![raw_event(
+        "PROCESS_INSTANCE",
+        "ELEMENT_ACTIVATING",
+        json!({"elementId": "t", "bpmnElementType": "SERVICE_TASK", "processInstanceKey": 100_u64, "flowScopeKey": 100_u64}),
+    )];
+    let out = normalise(&spec, &pi, &mut HashMap::new());
+    assert_eq!(out[0]["flowScopeKey"], json!(1), "{out:?}");
+    assert_eq!(out[0]["processInstanceKey"], json!(1), "{out:?}");
+}
+
+/// The canonical-key map is kept for the WHOLE scenario (spec `doc` step 5):
+/// a step re-touching an earlier step's instance renders its established
+/// canonical id. With a per-step reset, updating either of two same-process
+/// instances would renumber to the same step-local `{processInstanceKey: 1,
+/// scopeKey: 1}` and the target swap would be invisible.
+#[test]
+fn normaliser_keeps_canonical_keys_across_steps() {
+    let spec = load_spec();
+    let created = |key: u64| {
+        vec![raw_event(
+            "PROCESS_INSTANCE",
+            "ELEMENT_ACTIVATED",
+            json!({"elementId": "p", "bpmnElementType": "PROCESS", "processInstanceKey": key, "flowScopeKey": key}),
+        )]
+    };
+    let updated = |key: u64| {
+        vec![raw_event(
+            "VARIABLE",
+            "UPDATED",
+            json!({"name": "x", "value": 1, "scopeElementId": "p", "processInstanceKey": key, "scopeKey": key}),
+        )]
+    };
+    let (ka, kb) = (2251799813685249_u64, 2251799813685254_u64);
+    let mut ids = HashMap::new();
+    normalise(&spec, &created(ka), &mut ids);
+    normalise(&spec, &created(kb), &mut ids);
+    let update_b = normalise(&spec, &updated(kb), &mut ids);
+    assert_eq!(update_b[0]["processInstanceKey"], json!(2), "{update_b:?}");
+    assert_eq!(update_b[0]["scopeKey"], json!(2), "{update_b:?}");
+    // Updating A instead must read differently from updating B — the swap is
+    // observable only because the map survives the step boundary.
+    let mut ids = HashMap::new();
+    normalise(&spec, &created(ka), &mut ids);
+    normalise(&spec, &created(kb), &mut ids);
+    let update_a = normalise(&spec, &updated(ka), &mut ids);
+    assert_eq!(update_a[0]["processInstanceKey"], json!(1), "{update_a:?}");
+    assert_ne!(update_a, update_b, "the cross-step swap must be observable");
 }
 
 #[test]
@@ -1500,8 +1578,8 @@ fn normaliser_does_not_compare_interleaving_across_lanes() {
     );
     let job = raw_event("JOB", "CREATED", json!({"elementId": "a"}));
     assert_eq!(
-        normalise(&spec, &[pi.clone(), job.clone()]),
-        normalise(&spec, &[job, pi])
+        normalise(&spec, &[pi.clone(), job.clone()], &mut HashMap::new()),
+        normalise(&spec, &[job, pi], &mut HashMap::new())
     );
 }
 

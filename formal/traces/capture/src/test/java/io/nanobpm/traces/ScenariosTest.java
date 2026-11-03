@@ -108,4 +108,13 @@ public class ScenariosTest {
             """);
     Scenarios.requireDi(documented, DIR);
   }
+
+  @Test
+  public void aHyphenatedOrDottedNamespacePrefixIsRecognised() {
+    // Hyphens and dots are legal in XML namespace prefixes: renaming the DI prefix to
+    // `bpmn-di` must not make `<bpmn-di:BPMNPlane>` invisible to the scan (the Rust
+    // tokenizer's `local_name` splits on `:` regardless of the prefix's characters).
+    final String renamed = MODEL.replace("bpmndi", "bpmn-di");
+    Scenarios.requireDi(renamed, DIR);
+  }
 }

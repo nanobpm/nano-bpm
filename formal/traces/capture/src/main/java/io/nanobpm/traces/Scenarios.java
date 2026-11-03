@@ -14,7 +14,7 @@ import java.util.regex.Pattern;
 /** Scenario-format checks shared in intent with the Rust loader (both reject a model without DI). */
 final class Scenarios {
 
-  private static final Pattern TAG_START = Pattern.compile("<(\\w+:)?(\\w+)[\\s/>]");
+  private static final Pattern TAG_START = Pattern.compile("<([\\w.-]+:)?(\\w+)[\\s/>]");
   private static final Pattern COMMENT = Pattern.compile("<!--.*?-->", Pattern.DOTALL);
   private static final Pattern CDATA = Pattern.compile("<!\\[CDATA\\[.*?\\]\\]>", Pattern.DOTALL);
   private static final Pattern ATTR =

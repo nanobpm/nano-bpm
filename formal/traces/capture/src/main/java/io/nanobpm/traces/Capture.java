@@ -104,6 +104,8 @@ public final class Capture {
     private final Map<String, Long> jobs = new HashMap<>();
     private final Map<String, Long> userTasks = new HashMap<>();
     private final Map<String, Long> incidents = new HashMap<>();
+    /** Canonical-key map for the WHOLE scenario (spec doc step 5) — never reset between steps. */
+    private final Map<Long, Long> canonicalIds = new HashMap<>();
     private long instanceKey = -1;
     private int seen;
 
@@ -157,7 +159,7 @@ public final class Capture {
         final ObjectNode out = NODES.objectNode();
         out.put("step", index++);
         out.put("op", step.get("op").asText());
-        out.set("records", spec.normalise(raw));
+        out.set("records", spec.normalise(raw, canonicalIds));
         steps.add(out);
         Sites.clear();
       }

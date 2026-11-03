@@ -65,9 +65,12 @@ that same algorithm over raw Zeebe-shaped records.
 - **Runtime identity is kept, canonically:** every `*Key` field of a kept
   record (record keys and the value's `processInstanceKey` / `flowScopeKey` /
   `scopeKey` / …) is rewritten to a canonical id — the first distinct raw key
-  a step's records touch becomes 1, the next 2, and so on. Raw key values are
-  engine-specific, but the identity pattern is behavioural: completing a task
-  in instance A must not read as completing it in instance B.
+  the scenario's records touch (in step order, then lane order) becomes 1, the
+  next 2, and so on. The key map is kept for the **whole scenario** (a per-step
+  reset would hide a cross-step target swap), and within one record the fields
+  are visited in sorted name order so both normalisers assign the same ids.
+  Raw key values are engine-specific, but the identity pattern is behavioural:
+  completing a task in instance A must not read as completing it in instance B.
 - **Dropped:** everything else, including timestamps and positions.
 
 On the nano side, the runner renders engine events as raw Zeebe-shaped records.

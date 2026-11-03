@@ -29,6 +29,16 @@ final class Normaliser {
   }
 
   ArrayNode normalise(final ArrayNode raw) {
+    return normalise(raw, new HashMap<>());
+  }
+
+  /**
+   * Normalise one step's raw records, keeping canonical-key state in {@code ids} ACROSS the
+   * scenario's steps (spec {@code doc} step 5): a step that re-touches an earlier step's instance
+   * must render that instance's established canonical id, so a cross-step target swap changes the
+   * trace instead of renumbering both targets to the same step-local ids.
+   */
+  ArrayNode normalise(final ArrayNode raw, final Map<Long, Long> ids) {
     final JsonNode lanes = spec.get("lanes");
     final List<ArrayNode> out = new ArrayList<>();
     for (int i = 0; i <= lanes.size(); i++) {
@@ -72,18 +82,20 @@ final class Normaliser {
     }
     final ArrayNode all = NODES.arrayNode();
     out.forEach(all::addAll);
-    renumberKeys(all);
+    renumberKeys(all, ids);
     return all;
   }
 
   /**
    * Rewrite every {@code *Key} field of the kept records to a canonical id: the first distinct
-   * raw key a step's records touch (in lane order) becomes 1, the next 2, and so on (spec {@code
-   * doc} step 5). Raw key VALUES are engine-specific, but the identity pattern is behavioural:
-   * completing a task in instance A must not read as completing it in instance B.
+   * raw key the scenario's records touch (in step order, then lane order) becomes 1, the next 2,
+   * and so on, with {@code ids} kept for the whole scenario (spec {@code doc} step 5). Within one
+   * record the fields are visited in SORTED name order — the Rust mirror iterates a serde_json
+   * object (alphabetical), so both sides assign the same ids. Raw key VALUES are engine-specific,
+   * but the identity pattern is behavioural: completing a task in instance A must not read as
+   * completing it in instance B.
    */
-  private static void renumberKeys(final ArrayNode records) {
-    final Map<Long, Long> ids = new HashMap<>();
+  private static void renumberKeys(final ArrayNode records, final Map<Long, Long> ids) {
     for (final JsonNode r : records) {
       if (!r.isObject()) {
         continue;
@@ -91,6 +103,7 @@ final class Normaliser {
       final ObjectNode o = (ObjectNode) r;
       final List<String> names = new ArrayList<>();
       o.fieldNames().forEachRemaining(names::add);
+      names.sort(null);
       for (final String name : names) {
         // Only `*Key` fields carry runtime identity — a plain number (`retries`, a numeric
         // variable `value`) is data, not a key.

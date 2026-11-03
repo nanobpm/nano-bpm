@@ -93,19 +93,19 @@
       "records": [
         {
           "elementId": "task",
-          "elementInstanceKey": 1,
+          "elementInstanceKey": 2,
           "intent": "FAILED",
-          "processInstanceKey": 2,
+          "processInstanceKey": 1,
           "retries": 0,
           "type": "flaky",
           "valueType": "JOB"
         },
         {
           "elementId": "task",
-          "elementInstanceKey": 1,
+          "elementInstanceKey": 2,
           "errorType": "JOB_NO_RETRIES",
           "intent": "CREATED",
-          "processInstanceKey": 2,
+          "processInstanceKey": 1,
           "valueType": "INCIDENT"
         }
       ],
