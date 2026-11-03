@@ -8087,6 +8087,11 @@ impl Engine {
         // like a leaf activity's inputs — but sourced from the container catalog
         // because the tool element is pruned from the executable graph.
         let mut local_variables = variables;
+        // The incoming seed BEFORE this tool's input mappings run: a redrive
+        // must re-apply mappings to the original seed, never to their own
+        // output (a self-referential `counter := counter + 1` would otherwise
+        // double-apply on resolve).
+        let redrive_seed = local_variables.clone();
         // The tool's own input-mapping results, kept aside so a `callActivity`
         // tool can seed its spawned child with exactly them when
         // `propagateAllParentVariables=false` (issue #1159).
@@ -8167,7 +8172,15 @@ impl Engine {
         // recreating the job. A nested agentic container's job type lives on its
         // catalog entry's `ServiceTask { job_type }` kind, so it is covered here
         // too — before its `AdHocActivated`/`outputCollection` seed.
-        if let Some(crate::model::AdHocToolKind::ServiceTask { job_type }) = &tool_kind {
+        // A nested DECLARATIVE (BPMN_TASK) container creates no agent job, so
+        // its catalog job type (falling back to its element id) is never used
+        // and must not be validated.
+        let nested_is_declarative = self
+            .adhoc_def_of(instance_key, &element_id)
+            .is_some_and(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask);
+        if let (false, Some(crate::model::AdHocToolKind::ServiceTask { job_type })) =
+            (nested_is_declarative, &tool_kind)
+        {
             if let Err(reason) = self.resolve_job_type(&child_vars, job_type) {
                 let event = self.extract_value_incident(
                     instance_key,
@@ -8176,7 +8189,7 @@ impl Engine {
                     reason,
                     Some(state::IoMappingRedrive::AdHocToolJobType {
                         element_id: element_id.clone(),
-                        variables: local_variables.clone(),
+                        variables: redrive_seed.clone(),
                     }),
                 );
                 return (vec![event], Vec::new());
@@ -8187,6 +8200,7 @@ impl Engine {
         // the nested branch below); validate that fallback up front too, with
         // the same nothing-created clean-retry shape.
         let nested_agentic_fallback_type = if self.adhoc_def_of(instance_key, &element_id).is_some()
+            && !nested_is_declarative
             && !matches!(
                 tool_kind,
                 Some(crate::model::AdHocToolKind::ServiceTask { .. })
@@ -8204,7 +8218,7 @@ impl Engine {
                     reason,
                     Some(state::IoMappingRedrive::AdHocToolJobType {
                         element_id: element_id.clone(),
-                        variables: local_variables.clone(),
+                        variables: redrive_seed.clone(),
                     }),
                 );
                 return (vec![event], Vec::new());

@@ -2893,3 +2893,147 @@ fn adhoc_tool_job_type_re_raise_after_resolve_keeps_container_parked() {
     );
     assert!(!engine.is_completed(inst));
 }
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_tool_job_type_redrive_reapplies_input_mappings_to_original_seed() {
+    // #1390 review: the `AdHocToolJobType` redrive must carry the seed captured
+    // BEFORE the tool's input mappings ran; otherwise a self-referential
+    // mapping (`counter := counter + 1`) double-applies on resolve.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=counter + 1" target="counter" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            HashMap::from([("counter".to_string(), Value::Int(1))]),
+        ))
+        .unwrap();
+    let inst = engine.state().instances.keys().copied().next().unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let incident_key = engine.active_incidents()[0].key;
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].variables.get("counter"),
+        Some(&Value::Int(2)),
+        "input mapping applied once to the original seed, not to its own output",
+    );
+}
+
+#[test]
+fn nested_declarative_adhoc_with_long_id_is_not_job_type_validated() {
+    // #1390 review: a nested DECLARATIVE (BPMN_TASK) container creates no
+    // agent job, so its element-id fallback "job type" must not be validated —
+    // a valid 129-char id must activate its collection, not raise an incident.
+    let long_id = format!("n{}", "x".repeat(128));
+    let xml = format!(
+        r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+            </bpmn:extensionElements>
+            <bpmn:adHocSubProcess id="{long_id}">
+              <bpmn:extensionElements>
+                <zeebe:adHoc activeElementsCollection="=[&quot;inner&quot;]" />
+              </bpmn:extensionElements>
+              <bpmn:serviceTask id="inner">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="inner-work" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+            </bpmn:adHocSubProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#
+    );
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(&xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element(&long_id)],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(
+        engine.active_incidents().is_empty(),
+        "{:?}",
+        engine.active_incidents()
+    );
+    assert_eq!(
+        engine.activate_jobs("inner-work", "W", 10, 1_000, 0).len(),
+        1,
+        "the nested declarative container activated its collection",
+    );
+}
