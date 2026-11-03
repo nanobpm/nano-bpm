@@ -88,7 +88,7 @@ pin:
 ```bash
 node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"   # zeebe-surface.json
 node formal/parity/check.mjs --update-gaps                          # regenerate gaps.json from the current gap cells
-node formal/parity/check.mjs --update-ratchet                       # shrink nano-tested.json
+node formal/parity/check.mjs --update-ratchet                       # regenerate nano-tested.json (growth policed vs. target branch)
 node formal/parity/check.mjs                                        # guard + report
 ```
 

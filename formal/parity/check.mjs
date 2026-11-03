@@ -467,9 +467,13 @@ export function nanoTestedProblems(assignments, nanoTested) {
 }
 
 /** The current nano-tested cells that were already in the baseline (shrink-only). */
-export function shrinkNanoTested(assignments, nanoTested) {
-  const baseline = new Set(nanoTested);
-  return [...assignments].filter(([id, s]) => s === 'nano-tested' && baseline.has(id)).map(([id]) => id).sort();
+// Regenerates the baseline from the assignments (mirroring `shrinkGaps`): the
+// only legitimate additions are pin-bump cells, and whether an addition is
+// legitimate is decided by `nanoTestedGrowth` against the target branch — the
+// single policing point — not by the regen. `_nanoTested` is unused but kept
+// for call-site symmetry.
+export function shrinkNanoTested(assignments, _nanoTested) {
+  return [...assignments].filter(([, s]) => s === 'nano-tested').map(([id]) => id).sort();
 }
 
 /**

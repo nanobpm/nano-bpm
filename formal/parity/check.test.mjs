@@ -363,6 +363,15 @@ test('the nano-tested ratchet: the baseline must match the assignments exactly',
   assert.deepEqual(shrinkNanoTested(assignments, ['element:Task', 'element:Gone']), ['element:Task']);
 });
 
+test('--update-ratchet regenerates every nano-tested cell, so a pin-bump cell can enter the baseline', () => {
+  // Like --update-gaps, regeneration derives the set from the assignments; growth
+  // is policed by nanoTestedGrowth against the target branch, not by the regen.
+  const rules = [{ match: 'element:Task', ...tested }, { match: 'element:NewInBump', ...tested }, { match: '*', ...gap }];
+  const ids = ['element:Task', 'element:NewInBump'];
+  const { assignments } = evaluate(surface(...ids), { rules: rulesOf(rules) }, fs, gapsOf(ALL(ids), rulesOf(rules)), PIN);
+  assert.deepEqual(shrinkNanoTested(assignments, ['element:Task']), ['element:NewInBump', 'element:Task']);
+});
+
 test('a nano-tested.json missing its cells array fails closed, never skips the ratchet', () => {
   // main() passes `nanoTestedFile.cells` straight into evaluate; a baseline file
   // without a `cells` property yields `undefined` there. The ratchet must report
