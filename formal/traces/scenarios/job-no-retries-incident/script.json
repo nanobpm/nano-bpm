@@ -1,0 +1,15 @@
+{
+  "description": "Failing a job with no retries left raises a JOB_NO_RETRIES incident.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "job-incident"
+    },
+    {
+      "op": "failJob",
+      "jobType": "flaky",
+      "retries": 0,
+      "errorMessage": "boom"
+    }
+  ]
+}

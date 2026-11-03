@@ -1,0 +1,20 @@
+{
+  "description": "An intermediate message catch event is correlated by a published message, which carries a variable.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "message-catch",
+      "variables": {
+        "orderId": "order-1"
+      }
+    },
+    {
+      "op": "publishMessage",
+      "name": "ping",
+      "correlationKey": "order-1",
+      "variables": {
+        "paid": true
+      }
+    }
+  ]
+}

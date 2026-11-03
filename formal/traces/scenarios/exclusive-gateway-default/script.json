@@ -1,0 +1,12 @@
+{
+  "description": "An exclusive gateway takes its default flow when no condition matches.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "exclusive-gateway-default",
+      "variables": {
+        "amount": 5
+      }
+    }
+  ]
+}
