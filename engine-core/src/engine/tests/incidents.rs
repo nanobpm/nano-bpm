@@ -3663,3 +3663,174 @@ fn adhoc_completion_condition_latches_while_tool_incident_parks_completion() {
          recovered tool's output flipped the condition false",
     );
 }
+
+// zeebe-cells: incident:JOB_NO_RETRIES
+#[test]
+fn adhoc_cancel_remaining_cancels_failed_agent_job_before_resolving_incident() {
+    // #1390 review: an external cancel-remaining on a container whose own agent
+    // job failed (retries exhausted, `JobNoRetries` parked on the container)
+    // must cancel that job before resolving the incident. Resolving alone would
+    // resurrect the failed job to `Created` while the container is removed,
+    // leaving an orphaned, activatable agent job. A parallel sibling keeps the
+    // instance alive so the orphan is observable.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:parallelGateway id="fork" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:serviceTask id="sibling">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="sibling-work" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e1" />
+          <bpmn:endEvent id="e2" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="fork" />
+          <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="agent" />
+          <bpmn:sequenceFlow id="f3" sourceRef="fork" targetRef="sibling" />
+          <bpmn:sequenceFlow id="f4" sourceRef="agent" targetRef="e1" />
+          <bpmn:sequenceFlow id="f5" sourceRef="sibling" targetRef="e2" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    engine
+        .apply_command(Command::fail_job(agent.key, 0, "boom"))
+        .unwrap();
+    assert_eq!(engine.active_incidents().len(), 1, "JobNoRetries parked");
+
+    engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: agent.element_instance_key,
+            activate_elements: Vec::new(),
+            cancel_remaining: true,
+        })
+        .unwrap();
+
+    assert!(!engine.is_completed(inst), "the sibling keeps it alive");
+    assert!(
+        engine.active_incidents().is_empty(),
+        "{:?}",
+        engine.active_incidents()
+    );
+    assert!(
+        engine
+            .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+            .is_empty(),
+        "the failed agent job must be cancelled, not resurrected as an orphan",
+    );
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn adhoc_tool_redrive_keeps_unseeded_names_inherited() {
+    // #1390 review: the redrive must not copy inherited names the seed does
+    // not carry into the recovered tool's local scope. With root `result = 0`
+    // and an empty seed, completing the recovered tool with `result = 1`
+    // updates the enclosing scope; a stale local copy would make
+    // `outputElement="=result"` read `0`.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="=toolType" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([
+                ("result".to_string(), Value::Int(0)),
+                ("toolType".to_string(), Value::Int(42)),
+            ]),
+        ))
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    let incident_key = active[0].key;
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("toolType".to_string(), Value::Str("tool".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let tool = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool.len(), 1);
+    engine
+        .apply_command(Command::complete_job_with(
+            tool[0].key,
+            HashMap::from([("result".to_string(), Value::Int(1))]),
+        ))
+        .unwrap();
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent re-emitted after the tool drains");
+    assert_eq!(
+        agent2.variables.get("results"),
+        Some(&Value::List(vec![Value::Int(1)])),
+        "outputElement reads the tool's fresh result, not a stale local copy",
+    );
+}

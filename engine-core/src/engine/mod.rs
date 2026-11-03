@@ -9185,8 +9185,8 @@ impl Engine {
     /// activation view resolved a seed name to the seed (it shadowed every
     /// scope), so any current chain binding of a seed name post-dates the seed
     /// — it is the operator's correction channel, and it wins. A name the seed
-    /// does not carry fills in from the chain exactly as the original
-    /// activation's view resolved it. This mirrors Zeebe, where resolving an
+    /// does not carry is left inherited (never copied into the tool's local
+    /// scope), exactly as the original activation's view resolved it. This mirrors Zeebe, where resolving an
     /// incident re-evaluates the element against the current variables.
     fn adhoc_tool_redrive_seed(
         &self,
@@ -9226,16 +9226,46 @@ impl Engine {
         // the seed. The activation view resolved a seed name to the seed (it
         // shadowed every scope), so any current chain binding of a seed name
         // post-dates the seed — it is the operator's correction channel, and it
-        // wins. A name the seed does not carry fills in from the chain exactly
-        // as the original activation's view resolved it. Nearest scope wins
-        // when several scopes hold the name.
+        // wins. Nearest scope wins when several scopes hold the name.
+        // Only names the seed carries are overridden; names it does not carry
+        // stay INHERITED (not copied into the tool's local scope), otherwise a
+        // persisted local copy would shadow later writes to the enclosing scope
+        // and an `outputElement` would read the stale local value.
         let mut merged = seed;
-        for vars in chain.iter().rev() {
-            for (name, value) in *vars {
-                merged.insert(name.clone(), value.clone());
+        for (name, value) in merged.iter_mut() {
+            if let Some(current) = chain.iter().find_map(|vars| vars.get(name)) {
+                *value = current.clone();
             }
         }
         merged
+    }
+
+    /// `JobCanceled` for the container's own agent job when it sits `Failed`
+    /// (retries exhausted, a `JobNoRetries` incident parked on the container).
+    /// Emitted before [`Self::resolve_incidents_on`] on a cancel-remaining
+    /// teardown: resolving that incident would otherwise resurrect the failed
+    /// job to `Created` while the container is removed, leaving an orphaned,
+    /// activatable agent job. Only a `Failed` job is touched — a job completing
+    /// in this same step (the agent's own cancel-remaining turn) is not yet
+    /// reduced and must not be double-terminated.
+    fn cancel_failed_container_job(&self, instance_key: Key, container_key: Key) -> Vec<Event> {
+        let mut failed: Vec<Key> = self
+            .state
+            .jobs
+            .values()
+            .filter(|j| {
+                j.element_instance_key == container_key && j.state == state::JobState::Failed
+            })
+            .map(|j| j.key)
+            .collect();
+        failed.sort_unstable();
+        failed
+            .into_iter()
+            .map(|job_key| Event::JobCanceled {
+                job_key,
+                instance_key,
+            })
+            .collect()
     }
 
     /// `true` while an ACTIVE incident parks on this ad-hoc container element
@@ -9343,6 +9373,7 @@ impl Engine {
                 // would otherwise stay active against the removed container —
                 // a later external resolve would re-drive a retry whose state
                 // is gone. No-op when the container carries no incident.
+                events.extend(self.cancel_failed_container_job(instance_key, container_key));
                 events.extend(self.resolve_incidents_on(instance_key, container_key));
             }
             // Drop the container's ad-hoc runtime record; its `outputCollection`
@@ -9398,6 +9429,7 @@ impl Engine {
             // otherwise stay active against the removed container — a later
             // external resolve would re-drive a retry whose state is gone.
             // No-op when the container carries no incident.
+            events.extend(self.cancel_failed_container_job(instance_key, container_key));
             events.extend(self.resolve_incidents_on(instance_key, container_key));
         }
         // The output collection propagates OUT of the container to its enclosing
