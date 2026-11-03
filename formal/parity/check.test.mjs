@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { CORPUS, baselineGrowth, evaluate, globToRegExp, markdownReport, shrinkGaps, tally } from './check.mjs';
+import { coarseCellId } from './extract.mjs';
 
 const RS = 'engine-core/src/engine/tests/lifecycle.rs';
 const FILES = {
@@ -140,6 +141,39 @@ test('the gap ratchet: a new cell cannot hide under a wildcard gap, and the base
   assert.deepEqual(shrinkGaps(assignments, ['element:Task', 'intent:Job:CREATED', 'intent:Job:GONE']), ['intent:Job:CREATED']);
 });
 
+test('a wildcard rule can never claim a per-site failure:/rejection: cell', () => {
+  const ids = ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR', 'rejection:JobProcessor.processRecord:NOT_FOUND'];
+  // A family wildcard is rejected for both per-site families…
+  const errors = check(ids, [{ match: 'failure:*', ...gap }, { match: 'rejection:*', ...gap }], []);
+  assert.match(errors[0], /per-site cell failure:BpmnJobBehavior\.evalTypeExp:EXTRACT_VALUE_ERROR is claimed by wildcard rule "failure:\*"/);
+  assert.match(errors[1], /per-site cell rejection:JobProcessor\.processRecord:NOT_FOUND is claimed by wildcard rule "rejection:\*"/);
+  // …and so is a partial wildcard that still matches a per-site cell.
+  const partial = check(['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR'], [{ match: 'failure:BpmnJobBehavior.*', ...gap }], []);
+  assert.match(partial[0], /claimed by wildcard rule "failure:BpmnJobBehavior\.\*"/);
+  // An exact, wildcard-free rule claims it cleanly (a baseline gap).
+  assert.deepEqual(
+    check(ids, [
+      { match: 'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR', ...gap },
+      { match: 'rejection:JobProcessor.processRecord:NOT_FOUND', ...gap },
+    ]),
+    [],
+  );
+});
+
+test('a new per-site site appearing on a pin bump fails the drift guard', () => {
+  // The surface gained a site the committed baseline does not list. Even though
+  // an exact gap rule claims it, the ratchet rejects it: it is a NEW gap.
+  const ids = ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR', 'failure:BpmnJobBehavior.evalRetriesExp:EXTRACT_VALUE_ERROR'];
+  const rules = ids.map((id) => ({ match: id, ...gap }));
+  const errors = check(ids, rules, ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR']);
+  assert.deepEqual(errors, [
+    'new gap cell: failure:BpmnJobBehavior.evalRetriesExp:EXTRACT_VALUE_ERROR is not in the gaps.json baseline; give it evidence or an out-of-scope rule',
+  ]);
+  // And a wildcard cannot smuggle it past the ratchet either.
+  const smuggled = check(ids, [{ match: 'failure:*', ...gap }], ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR']);
+  assert.ok(smuggled.some((e) => /claimed by wildcard rule/.test(e)));
+});
+
 test('globs treat only * as a wildcard', () => {
   assert.ok(globToRegExp('validation:V:*').test('validation:V:a-b'));
   assert.ok(!globToRegExp('guard:a.b').test('guard:aXb'));
@@ -174,4 +208,67 @@ test('the baseline may only shrink against the target branch', () => {
     "gaps.json adds c, which the target branch's baseline does not list: the baseline may only shrink",
   ]);
   assert.deepEqual(baselineGrowth(undefined, ['a']), ['base gaps.json must have a cells array']);
+});
+
+// The pin-aware ratchet (decision A', #1396): a same-pin grammar *refinement* may
+// re-baseline, but a pin *bump* and any non-refinement growth still fail.
+test('the ratchet is pin-aware and permits only refinements', () => {
+  const PIN_A = { repository: 'r', ref: 'stable/x', sha: 'aaa' };
+  const PIN_B = { ...PIN_A, sha: 'bbb' }; // a bump
+  const coarse = 'rejection:JobProcessor:NOT_FOUND';
+  const refined = 'rejection:JobProcessor.processRecord:NOT_FOUND';
+  const unrelated = 'intent:Job:BRAND_NEW';
+
+  // (a) A pin bump keeps the strict shrink-only check: even a refinement fails.
+  assert.deepEqual(baselineGrowth([coarse], [refined], PIN_A, PIN_B), [
+    `gaps.json adds ${refined}, which the target branch's baseline does not list: the baseline may only shrink`,
+  ]);
+
+  // (b) Same pin: a refinement whose coarse parent was a base gap and is removed passes.
+  assert.deepEqual(baselineGrowth([coarse], [refined], PIN_A, PIN_A), []);
+
+  // (c) Same pin: a refinement whose parent is NOT removed (still a head gap) fails.
+  assert.match(baselineGrowth([coarse], [coarse, refined], PIN_A, PIN_A)[0], new RegExp(`adds ${refined.replace('.', '\\.')}`));
+
+  // (d) Same pin: an unrelated new cell (no coarse parent in the base) fails.
+  assert.match(baselineGrowth([coarse], [refined, unrelated], PIN_A, PIN_A)[0], /adds intent:Job:BRAND_NEW/);
+
+  // Fail-closed: no base pin means we cannot tell a refinement from a bump.
+  assert.match(baselineGrowth([coarse], [refined], null, PIN_A)[0], new RegExp(`adds ${refined.replace('.', '\\.')}`));
+});
+
+test('the failure: family seeds once, then is shrink-only', () => {
+  const PIN_A = { repository: 'r', ref: 'stable/x', sha: 'aaa' };
+  const f1 = 'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR';
+  const f2 = 'failure:BpmnJobBehavior.evalRetriesExp:EXTRACT_VALUE_ERROR';
+  const SURF_NO_FAILURE = ['intent:Job:CREATED', 'incident:EXTRACT_VALUE_ERROR'];
+  // (e) Same pin, base SURFACE has no failure: cells -> the family may be seeded.
+  assert.deepEqual(baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A, SURF_NO_FAILURE), []);
+  // Without the base surface the seed is refused (fail-closed).
+  assert.equal(baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A).length, 1);
+  // A fully covered family (empty failure: baseline, but present in the base
+  // surface) must not reopen: regressing f1 back to a gap is rejected.
+  assert.match(
+    baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A, [...SURF_NO_FAILURE, f1])[0],
+    new RegExp(`adds ${f1.replace(/\./g, '\\.')}`),
+  );
+  // Once any failure: cell is in the base, the family is shrink-only like the rest.
+  assert.match(baselineGrowth([f1], [f1, f2], PIN_A, PIN_A)[0], new RegExp(`adds ${f2.replace(/\./g, '\\.')}`));
+  // Removing a coarse incident: gap must not open a back door for new failure: cells.
+  const g = 'failure:P.g:FORM_NOT_FOUND';
+  assert.equal(
+    baselineGrowth(['failure:P.f:UNKNOWN', 'incident:FORM_NOT_FOUND'], ['failure:P.f:UNKNOWN', g], PIN_A, PIN_A).length,
+    1,
+  );
+});
+
+test('coarseCellId maps a per-site cell to its coarse parent, from the extractor grammar', () => {
+  assert.equal(coarseCellId('rejection:JobProcessor.processRecord:NOT_FOUND'), 'rejection:JobProcessor:NOT_FOUND');
+  assert.equal(coarseCellId('failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR'), 'incident:EXTRACT_VALUE_ERROR');
+  // A message-only failure (empty type) and a forwarded one have no incident: parent.
+  assert.equal(coarseCellId('failure:DeploymentTransformer.transform:'), null);
+  assert.equal(coarseCellId('failure:BpmnStreamProcessor.process:forwarded'), null);
+  // Coarse cells and non-per-site families are not refinements.
+  assert.equal(coarseCellId('rejection:JobProcessor:NOT_FOUND'), null);
+  assert.equal(coarseCellId('intent:Job:CREATED'), null);
 });

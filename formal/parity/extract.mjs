@@ -27,6 +27,39 @@ function fail(msg) {
   throw new ExtractError(msg);
 }
 
+/**
+ * `src` with the *contents* of every string literal, char literal and text
+ * block blanked to spaces (delimiters and newlines kept, so offsets and line
+ * numbers are preserved). Construction-site matching and scope parsing run on
+ * this mask, so code-like text inside a literal (`"new Failure(x)"`, an
+ * annotation's `regexp = "[)]"`) can neither invent a site nor unbalance a
+ * signature. Expects comments already stripped.
+ */
+export function maskLiterals(src) {
+  let out = '';
+  let i = 0;
+  const blank = (t) => t.replace(/[^\n]/g, ' ');
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '"' && src.startsWith('"""', i)) {
+      const end = src.indexOf('"""', i + 3);
+      const stop = end < 0 ? src.length : end;
+      out += '"""' + blank(src.slice(i + 3, stop)) + (end < 0 ? '' : '"""');
+      i = end < 0 ? src.length : end + 3;
+    } else if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== c && src[j] !== '\n') j += src[j] === '\\' ? 2 : 1;
+      j = Math.min(j, src.length);
+      out += c + blank(src.slice(i + 1, j)) + (j < src.length ? src[j] : '');
+      i = j + 1;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 /** Java source with comments blanked out (line numbers preserved). */
 export function stripComments(src) {
   let out = '';
@@ -268,6 +301,147 @@ export function enumConstants(src, name) {
   if (out.length === 0) fail(`enum ${name} has no constants`);
   return out;
 }
+
+/**
+ * The scope enclosing `index` in a Java source: the simple name of the
+ * top-level class and the name of the enclosing method. A construction inside
+ * a lambda is attributed to the enclosing *named* method (the lambda's own
+ * parameter list is not a method). A construction in a field initializer or
+ * `static {}` block has no enclosing method and yields the empty string.
+ *
+ * The scan is a single forward pass that tracks, at every `{`/`}`, which named
+ * class or method body it opens/closes. Anything that is not a class or method
+ * body (a lambda block, an `if`/`try`/`switch` block, an anonymous-class body)
+ * is transparent: the enclosing named method/class stays on the stack.
+ */
+export function enclosingScope(src, index) {
+  const stack = []; // open brace contexts: {kind:'class'|'method'|'other', name?}
+  let cls = ''; // innermost enclosing *named* class (top-level once we pass one)
+  let topClass = ''; // the outermost named class
+  let method = ''; // innermost enclosing *named* method
+  let i = 0;
+  const n = Math.min(index, src.length);
+  while (i < n) {
+    const c = src[i];
+    if (c === '"' || c === "'") {
+      // Skip string/char literals (and text blocks) so their braces don't count.
+      if (c === '"' && src.startsWith('"""', i)) {
+        const end = src.indexOf('"""', i + 3);
+        i = end < 0 ? n : end + 3;
+        continue;
+      }
+      i++;
+      while (i < n && src[i] !== c && src[i] !== '\n') i += src[i] === '\\' ? 2 : 1;
+      i++;
+      continue;
+    }
+    if (c === '{') {
+      const ctx = braceContext(src, i);
+      if (ctx.kind === 'class') {
+        if (!topClass) topClass = ctx.name;
+        cls = ctx.name;
+        // A class body resets the enclosing method.
+        method = '';
+      } else if (ctx.kind === 'method') {
+        method = ctx.name;
+      }
+      stack.push(ctx);
+      i++;
+      continue;
+    }
+    if (c === '}') {
+      const ctx = stack.pop();
+      if (ctx?.kind === 'class') {
+        // Recompute enclosing class/method from the remaining stack.
+        const classes = stack.filter((f) => f.kind === 'class');
+        cls = classes.length ? classes[classes.length - 1].name : '';
+        topClass = classes.length ? classes[0].name : '';
+        method = innermostMethodInClass(stack);
+      } else if (ctx?.kind === 'method') {
+        method = innermostMethodInClass(stack);
+      }
+      i++;
+      continue;
+    }
+    i++;
+  }
+  return { cls: topClass || cls, method };
+}
+
+/**
+ * The innermost method frame that lies inside the innermost remaining class
+ * frame — a method of an *outer* class never leaks across a class boundary
+ * (e.g. a local class's field initializer is not in the enclosing method).
+ */
+function innermostMethodInClass(stack) {
+  for (let k = stack.length - 1; k >= 0; k--) {
+    if (stack[k].kind === 'class') return '';
+    if (stack[k].kind === 'method') return stack[k].name;
+  }
+  return '';
+}
+
+/**
+ * Classify the brace at `open`: does it open a class body, a method body, or
+ * something else? A method/constructor body is recognised by finding the `)`
+ * that closes the parameter list immediately before the brace (skipping an
+ * optional `throws` clause), balance-matching it back to its `(`, and reading
+ * the identifier before that — robust to multi-line parameter lists and
+ * annotations. A class body is recognised from a `class/interface/enum/record`
+ * declaration. Anything else (a lambda block, a control-flow block, an
+ * anonymous-class body) is `other` and leaves the enclosing scope unchanged.
+ */
+function braceContext(src, open) {
+  // Find the nearest `)` before the brace. Between it and the brace there may be
+  // nothing, or an optional `throws T1, T2` clause — nothing else may intervene.
+  let i = open - 1;
+  while (i >= 0 && /\s/.test(src[i])) i--;
+  if (src[i] !== ')') {
+    // Try skipping a complete `throws T1, T2` clause (names may be qualified or
+    // generic, separated by commas with arbitrary whitespace/newlines).
+    const head = src.slice(Math.max(0, open - 2000), open);
+    const m = /\)\s*throws\s+[\w.<>?]+(?:\s*,\s*[\w.<>?]+)*\s*$/.exec(head);
+    if (m) i = open - head.length + m.index;
+  }
+  if (src[i] === ')') {
+    // Balance-match back to the opening `(` of the parameter list.
+    let depth = 0;
+    let j = i;
+    for (; j >= 0; j--) {
+      const c = src[j];
+      if (c === ')') depth++;
+      else if (c === '(') {
+        depth--;
+        if (depth === 0) break;
+      }
+    }
+    if (j >= 0) {
+      // The identifier immediately before `(` is the method/constructor name.
+      let k = j - 1;
+      while (k >= 0 && /\s/.test(src[k])) k--;
+      const end = k;
+      while (k >= 0 && /\w/.test(src[k])) k--;
+      const name = src.slice(k + 1, end + 1);
+      // The keyword before the name: `record P(...) {` is a class header and
+      // `new T(...) {` an anonymous-class body (transparent, like a lambda).
+      let w = k;
+      while (w >= 0 && /\s/.test(src[w])) w--;
+      let v = w;
+      while (v >= 0 && /\w/.test(src[v])) v--;
+      const prev = src.slice(v + 1, w + 1);
+      if (name && prev === 'record') return { kind: 'class', name };
+      if (name && prev === 'new') return { kind: 'other' };
+      if (name && !CONTROL.has(name)) return { kind: 'method', name };
+    }
+  }
+  // A class/interface/enum/record declaration: `class Name ... {`.
+  const before = src.slice(Math.max(0, open - 400), open);
+  const cls = /\b(?:class|interface|enum|record)\s+([A-Za-z_]\w*)[^(){}]*$/.exec(before);
+  if (cls) return { kind: 'class', name: cls[1] };
+  return { kind: 'other' };
+}
+
+const CONTROL = new Set(['if', 'for', 'while', 'switch', 'catch', 'synchronized', 'try', 'do', 'else', 'return', 'new', 'throw']);
 
 function listJava(dir) {
   const out = [];
@@ -765,10 +939,57 @@ function extractValidation(s, cells) {
 }
 
 /**
- * `rejection:<Class>:<RejectionType>` — every command rejection a class in the
- * processing layer produces: processors, and the validators/helpers that build
- * the rejection a processor then writes. A comparison against a type is a read
- * and yields no cell.
+ * `failure:<Class>.<method>:<ErrorType>` — one cell per `new Failure(...)`
+ * construction site in the processing layer. `<Class>` is the simple name of
+ * the enclosing top-level class, `<method>` the enclosing named method (a
+ * construction inside a lambda is attributed to the enclosing named method; a
+ * field initializer or `static {}` block has no method and yields an empty
+ * `<method>`). `<ErrorType>` is the `ErrorType` enum constant the constructor
+ * is given; a message-only `Failure(message)` (a deploy-time rejection, which
+ * never carries a type) yields an empty `<ErrorType>`, so the id ends in `:`.
+ */
+function extractFailures(s, cells) {
+  const rel = `${PROTOCOL}/value/ErrorType.java`;
+  const types = new Set(enumConstants(s.read(rel), 'ErrorType'));
+  let n = 0;
+  for (const file of s.list(PROCESSING)) {
+    const src = s.read(file);
+    const code = maskLiterals(src);
+    for (const m of code.matchAll(/\bnew\s+Failure\s*\(/g)) {
+      const open = m.index + m[0].length - 1;
+      const args = callArgs(src, open);
+      let errorType = '';
+      if (args.length >= 2) {
+        // Anchored: the whole argument must be one constant, so a conditional
+        // or computed type fails loudly instead of yielding one alternative.
+        const t = /^ErrorType\.([A-Z_]+)$/.exec(args[1].trim());
+        if (t) {
+          if (!types.has(t[1])) fail(`${file}: unknown ErrorType.${t[1]}`);
+          errorType = t[1];
+        } else if (/^\w+\.getErrorType\(\)\s*$/.test(args[1].trim())) {
+          // The site re-wraps another Failure and forwards its type unchanged,
+          // so it raises no type of its own: mark it `forwarded`.
+          errorType = 'forwarded';
+        } else {
+          fail(`${at(file, src, m.index)}: unrecognised Failure error-type argument ${JSON.stringify(args[1].trim())}`);
+        }
+      }
+      const { cls, method } = enclosingScope(code, m.index);
+      if (!cls) fail(`${at(file, src, m.index)}: Failure construction outside any class`);
+      cells.add(`failure:${cls}.${method}:${errorType}`, at(file, src, m.index));
+      n++;
+    }
+  }
+  if (n === 0) fail(`${PROCESSING}: no Failure constructions`);
+}
+
+/**
+ * `rejection:<Class>.<method>:<RejectionType>` — one cell per command
+ * rejection a class in the processing layer produces: processors, and the
+ * validators/helpers that build the rejection a processor then writes. The
+ * `<Class>.<method>` scope rules match `failure:` (enclosing top-level class
+ * and named method). A comparison against a type (`==`, `!=`, `.equals`) is a
+ * read and yields no cell, nor do SBE's `NULL_VAL`/`SBE_UNKNOWN` sentinels.
  */
 function extractRejections(s, cells) {
   // RejectionType is generated from the SBE schema, so read it from there.
@@ -781,15 +1002,17 @@ function extractRejections(s, cells) {
   let n = 0;
   for (const rel of s.list(PROCESSING)) {
     const src = s.read(rel);
-    const cls = basename(rel, '.java');
-    for (const m of src.matchAll(/\bRejectionType\.([A-Z_]+)\b/g)) {
+    const code = maskLiterals(src);
+    for (const m of code.matchAll(/\bRejectionType\.([A-Z_]+)\b/g)) {
       // SBE's generated sentinels mean "no rejection".
       if (m[1] === 'NULL_VAL' || m[1] === 'SBE_UNKNOWN') continue;
       const before = src.slice(Math.max(0, m.index - 4), m.index);
-      const after = src.slice(m.index + m[0].length, m.index + m[0].length + 4);
-      if (/[=!]=\s*$/.test(before) || /^\s*[=!]=/.test(after)) continue;
+      const after = src.slice(m.index + m[0].length, m.index + m[0].length + 12);
+      if (/[=!]=\s*$/.test(before) || /^\s*[=!]=/.test(after) || /^\s*\.equals\s*\(/.test(after)) continue;
       if (!types.has(m[1])) fail(`${rel}: unknown RejectionType.${m[1]}`);
-      cells.add(`rejection:${cls}:${m[1]}`, at(rel, src, m.index));
+      const { cls, method } = enclosingScope(code, m.index);
+      if (!cls) fail(`${at(rel, src, m.index)}: RejectionType use outside any class`);
+      cells.add(`rejection:${cls}.${method}:${m[1]}`, at(rel, src, m.index));
       n++;
     }
   }
@@ -804,8 +1027,43 @@ export const FAMILIES = {
   incident: extractIncidents,
   intent: extractIntents,
   validation: extractValidation,
+  failure: extractFailures,
   rejection: extractRejections,
 };
+
+/** The per-site families: cells keyed by one Zeebe source site (`<Class>.<method>`). */
+export const PER_SITE_FAMILIES = new Set(['failure', 'rejection']);
+
+/**
+ * The **coarse** (pre-per-site) cell id a per-site cell refines, per the cell-id
+ * grammar this extractor emits (formal/parity/README.md). This is the single
+ * source of truth for the refinement mapping — the gap ratchet in `check.mjs`
+ * derives a refinement's parent from it rather than re-parsing the id.
+ *
+ *   `rejection:<Class>.<method>:<CODE>` -> `rejection:<Class>:<CODE>`
+ *   `failure:<Class>.<method>:<TYPE>`   -> `incident:<TYPE>`
+ *     (`incident:<ErrorType>` is the coarse counterpart of `failure:`: it records
+ *     that an error type exists, while `failure:` records every site that raises
+ *     it). A `failure:` cell with an empty `<TYPE>` (a message-only deploy-time
+ *     rejection) or the `forwarded` marker has no `incident:` counterpart.
+ *
+ * Returns null for a cell that is not a per-site refinement (a coarse cell, or
+ * one whose key carries no `.method`).
+ */
+export function coarseCellId(id) {
+  const colon = id.indexOf(':');
+  if (colon < 0) return null;
+  const family = id.slice(0, colon);
+  if (!PER_SITE_FAMILIES.has(family)) return null;
+  const rest = id.slice(colon + 1);
+  const dot = rest.indexOf('.');
+  if (dot < 0) return null; // already coarse (`rejection:<Class>:<CODE>`)
+  const cls = rest.slice(0, dot);
+  const code = rest.slice(rest.indexOf(':') + 1);
+  if (family === 'rejection') return `rejection:${cls}:${code}`;
+  // failure: refines the incident:<ErrorType> cell for its type.
+  return code && code !== 'forwarded' ? `incident:${code}` : null;
+}
 
 export function extract(root, pin) {
   const s = new Source(root);

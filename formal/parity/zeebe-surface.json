@@ -320,6 +320,423 @@
       ]
     },
     {
+      "id": "failure:AdHocSubProcessOutputCollectionBehavior.appendToOutputCollection:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/AdHocSubProcessOutputCollectionBehavior.java:34"
+      ]
+    },
+    {
+      "id": "failure:AdHocSubProcessProcessor.beforeExecutionPathCompleted:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/AdHocSubProcessProcessor.java:373"
+      ]
+    },
+    {
+      "id": "failure:AdHocSubProcessProcessor.readActivateElementsCollection:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/AdHocSubProcessProcessor.java:207",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/AdHocSubProcessProcessor.java:216"
+      ]
+    },
+    {
+      "id": "failure:AdHocSubProcessProcessor.updateOutputCollection:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/AdHocSubProcessProcessor.java:293"
+      ]
+    },
+    {
+      "id": "failure:BpmnDecisionBehavior.evaluateDecision:CALLED_DECISION_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnDecisionBehavior.java:91"
+      ]
+    },
+    {
+      "id": "failure:BpmnDecisionBehavior.evaluateDecision:DECISION_EVALUATION_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnDecisionBehavior.java:109"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:581",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:590"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.findFormByIdAndVersionTag:FORM_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:390"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.findFormByIdInSameDeployment:FORM_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:367"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.findLatestFormById:FORM_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:380"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.findLatestResourceById:RESOURCE_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:322"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.findResourceByIdAndVersionTag:RESOURCE_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:336"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.findResourceByIdInSameDeployment:RESOURCE_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:309"
+      ]
+    },
+    {
+      "id": "failure:BpmnJobBehavior.priorityFailure:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnJobBehavior.java:636"
+      ]
+    },
+    {
+      "id": "failure:BpmnResourceTransformer.createMetadata:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/BpmnResourceTransformer.java:185"
+      ]
+    },
+    {
+      "id": "failure:BpmnResourceTransformer.readProcessDefinition:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/BpmnResourceTransformer.java:260"
+      ]
+    },
+    {
+      "id": "failure:BpmnStateBehavior.getDeploymentKey:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnStateBehavior.java:190"
+      ]
+    },
+    {
+      "id": "failure:BpmnStreamProcessor.tryHandleError:MESSAGE_SIZE_EXCEEDED",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnStreamProcessor.java:162"
+      ]
+    },
+    {
+      "id": "failure:BpmnUserTaskBehavior.evaluatePriorityExpression:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnUserTaskBehavior.java:424"
+      ]
+    },
+    {
+      "id": "failure:BpmnUserTaskBehavior.findFormByIdAndVersionTag:FORM_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnUserTaskBehavior.java:394"
+      ]
+    },
+    {
+      "id": "failure:BpmnUserTaskBehavior.findFormByIdInSameDeployment:FORM_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnUserTaskBehavior.java:354"
+      ]
+    },
+    {
+      "id": "failure:BpmnUserTaskBehavior.findLatestFormById:FORM_NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnUserTaskBehavior.java:375"
+      ]
+    },
+    {
+      "id": "failure:BpmnUserTaskBehavior.resolveCandidateGroupNamesToIds:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnUserTaskBehavior.java:276"
+      ]
+    },
+    {
+      "id": "failure:BpmnVariableMappingBehavior.mapLocalVariables:IO_MAPPING_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnVariableMappingBehavior.java:271"
+      ]
+    },
+    {
+      "id": "failure:BpmnVariableMappingBehavior.propagateVariables:IO_MAPPING_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnVariableMappingBehavior.java:246"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.checkProcessHasNoneStartEvent:CALLED_ELEMENT_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:457"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.getLatestProcessVersion:CALLED_ELEMENT_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:413"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.getLatestProcessVersionWithVersionTag:CALLED_ELEMENT_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:429"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.getProcessVersionInSameDeployment:CALLED_ELEMENT_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:393"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.nonStringBusinessIdFailure:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:349"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.rejectIfDraining:CALLED_ELEMENT_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:442"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.resolveNullBusinessId:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:325"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.validateBusinessId:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:340"
+      ]
+    },
+    {
+      "id": "failure:CallActivityProcessor.validateProcessDepth:CALLED_ELEMENT_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/CallActivityProcessor.java:229"
+      ]
+    },
+    {
+      "id": "failure:CatchEventBehavior.evaluateCorrelationKey:forwarded",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/CatchEventBehavior.java:325"
+      ]
+    },
+    {
+      "id": "failure:CatchEventBehavior.validateLength:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/CatchEventBehavior.java:332"
+      ]
+    },
+    {
+      "id": "failure:CatchEventTransformer.transformTimerEventDefinition:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/transformer/CatchEventTransformer.java:147"
+      ]
+    },
+    {
+      "id": "failure:DecisionBehavior.findDecisionByIdAndDeploymentKeyAndTenant:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/DecisionBehavior.java:74"
+      ]
+    },
+    {
+      "id": "failure:DecisionBehavior.findDecisionByIdAndVersionTagAndTenant:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/DecisionBehavior.java:90"
+      ]
+    },
+    {
+      "id": "failure:DecisionBehavior.findDecisionByKeyAndTenant:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/DecisionBehavior.java:101"
+      ]
+    },
+    {
+      "id": "failure:DecisionBehavior.findDrgByDecision:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/DecisionBehavior.java:204"
+      ]
+    },
+    {
+      "id": "failure:DecisionBehavior.findLatestDecisionByIdAndTenant:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/DecisionBehavior.java:64"
+      ]
+    },
+    {
+      "id": "failure:DecisionBehavior.formatDecisionLookupFailure:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/DecisionBehavior.java:120"
+      ]
+    },
+    {
+      "id": "failure:DeploymentErrorCollector.toEither:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/DeploymentErrorCollector.java:39",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/DeploymentErrorCollector.java:46"
+      ]
+    },
+    {
+      "id": "failure:DeploymentValidator.validateResources:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/DeploymentValidator.java:58"
+      ]
+    },
+    {
+      "id": "failure:DmnResourceTransformer.checkFieldLength:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/DmnResourceTransformer.java:305"
+      ]
+    },
+    {
+      "id": "failure:DmnResourceTransformer.createMetadata:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/DmnResourceTransformer.java:101"
+      ]
+    },
+    {
+      "id": "failure:ExclusiveGatewayProcessor.findSequenceFlowToTake:CONDITION_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ExclusiveGatewayProcessor.java:144"
+      ]
+    },
+    {
+      "id": "failure:ExpressionProcessor.createFailureMessage:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/ExpressionProcessor.java:661"
+      ]
+    },
+    {
+      "id": "failure:ExpressionProcessor.evaluateExpressionAsEither:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/ExpressionProcessor.java:618"
+      ]
+    },
+    {
+      "id": "failure:ExpressionProcessor.evaluateVariableMappingExpression:IO_MAPPING_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/ExpressionProcessor.java:501"
+      ]
+    },
+    {
+      "id": "failure:ExpressionTransformer.parseListOfCsv:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/transformer/ExpressionTransformer.java:48"
+      ]
+    },
+    {
+      "id": "failure:FormResourceTransformer.checkForFormIdLength:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/FormResourceTransformer.java:127"
+      ]
+    },
+    {
+      "id": "failure:FormResourceTransformer.parseForm:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/FormResourceTransformer.java:105",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/FormResourceTransformer.java:109"
+      ]
+    },
+    {
+      "id": "failure:FormResourceTransformer.validateForm:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/FormResourceTransformer.java:183",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/FormResourceTransformer.java:186"
+      ]
+    },
+    {
+      "id": "failure:InclusiveGatewayProcessor.findSequenceFlowsToTake:CONDITION_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayProcessor.java:149"
+      ]
+    },
+    {
+      "id": "failure:MultiInstanceBodyProcessor.onChildActivating:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/container/MultiInstanceBodyProcessor.java:178"
+      ]
+    },
+    {
+      "id": "failure:MultiInstanceOutputCollectionBehavior.updateOutputCollection:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/MultiInstanceOutputCollectionBehavior.java:93"
+      ]
+    },
+    {
+      "id": "failure:MultiInstanceOutputCollectionBehavior.validateIsCollectionAndHasAppropriateSIze:EXTRACT_VALUE_ERROR",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/MultiInstanceOutputCollectionBehavior.java:161",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/MultiInstanceOutputCollectionBehavior.java:171"
+      ]
+    },
+    {
+      "id": "failure:RpaTransformer.parseResourceInfo:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/RpaTransformer.java:52",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/RpaTransformer.java:56"
+      ]
+    },
+    {
+      "id": "failure:RpaTransformer.validateRpaResource:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/RpaTransformer.java:68",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/transform/RpaTransformer.java:71"
+      ]
+    },
+    {
+      "id": "failure:SendTaskProcessor.:UNKNOWN",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/task/SendTaskProcessor.java:24"
+      ]
+    },
+    {
+      "id": "failure:StraightThroughProcessingLoopValidator.hasStraightThroughProcessingLoop:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/StraightThroughProcessingLoopValidator.java:147"
+      ]
+    },
+    {
+      "id": "failure:StraightThroughProcessingLoopValidator.validate:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/StraightThroughProcessingLoopValidator.java:107",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/StraightThroughProcessingLoopValidator.java:116"
+      ]
+    },
+    {
+      "id": "failure:TimerCatchEventExpressionValidator.evaluateTimerExpression:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/TimerCatchEventExpressionValidator.java:102"
+      ]
+    },
+    {
+      "id": "failure:TimerCatchEventExpressionValidator.wrapFailure:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/TimerCatchEventExpressionValidator.java:122"
+      ]
+    },
+    {
+      "id": "failure:UnsupportedMultiTenantFeaturesValidator.hasUnsupportedElement:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/UnsupportedMultiTenantFeaturesValidator.java:89"
+      ]
+    },
+    {
+      "id": "failure:UnsupportedMultiTenantFeaturesValidator.validate:",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/model/validation/UnsupportedMultiTenantFeaturesValidator.java:67"
+      ]
+    },
+    {
       "id": "guard:canActivateDrainingDefinition:error-message-process-is-draining",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/ProcessInstanceStateTransitionGuard.java:243"
@@ -4407,56 +4824,57 @@
       }
     },
     {
-      "id": "rejection:AdHocSubProcessInstructionActivateProcessor:INVALID_STATE",
+      "id": "rejection:AdHocSubProcessInstructionActivateProcessor.authorize:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionActivateProcessor.java:221"
+      ]
+    },
+    {
+      "id": "rejection:AdHocSubProcessInstructionActivateProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionActivateProcessor.java:113",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionActivateProcessor.java:89"
       ]
     },
     {
-      "id": "rejection:AdHocSubProcessInstructionActivateProcessor:NOT_FOUND",
+      "id": "rejection:AdHocSubProcessInstructionActivateProcessor.processRecord:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionActivateProcessor.java:101",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionActivateProcessor.java:221",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionActivateProcessor.java:78"
       ]
     },
     {
-      "id": "rejection:AdHocSubProcessInstructionCompleteProcessor:INVALID_ARGUMENT",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionCompleteProcessor.java:110"
-      ]
-    },
-    {
-      "id": "rejection:AdHocSubProcessInstructionCompleteProcessor:INVALID_STATE",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionCompleteProcessor.java:123"
-      ]
-    },
-    {
-      "id": "rejection:AdHocSubProcessInstructionCompleteProcessor:NOT_FOUND",
+      "id": "rejection:AdHocSubProcessInstructionCompleteProcessor.validateAdHocSubProcessElementInstanceExists:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionCompleteProcessor.java:97"
       ]
     },
     {
-      "id": "rejection:AdHocSubProcessUtils:INVALID_ARGUMENT",
+      "id": "rejection:AdHocSubProcessInstructionCompleteProcessor.validateAdHocSubProcessIsActive:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessUtils.java:55"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionCompleteProcessor.java:123"
       ]
     },
     {
-      "id": "rejection:AdHocSubProcessUtils:NOT_FOUND",
+      "id": "rejection:AdHocSubProcessInstructionCompleteProcessor.validateElementInstanceIsAdHocSubProcess:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessInstructionCompleteProcessor.java:110"
+      ]
+    },
+    {
+      "id": "rejection:AdHocSubProcessUtils.validateActivateElementsExistInAdHocSubProcess:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessUtils.java:41"
       ]
     },
     {
-      "id": "rejection:AgentHistoryBatchBehavior:INVALID_ARGUMENT",
+      "id": "rejection:AdHocSubProcessUtils.validateThatCompletionConditionIsNotFulfilledWhenActivatingElements:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:135",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:141",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:168",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/adhocsubprocess/AdHocSubProcessUtils.java:55"
+      ]
+    },
+    {
+      "id": "rejection:AgentHistoryBatchBehavior.validateHistory:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:200",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:206",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:213",
@@ -4466,7 +4884,15 @@
       ]
     },
     {
-      "id": "rejection:AgentHistoryBatchBehavior:NOT_FOUND",
+      "id": "rejection:AgentHistoryBatchBehavior.validateJobContext:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:135",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:141",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:168"
+      ]
+    },
+    {
+      "id": "rejection:AgentHistoryBatchBehavior.validateJobContext:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:148",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentHistoryBatchBehavior.java:154",
@@ -4474,64 +4900,66 @@
       ]
     },
     {
-      "id": "rejection:AgentInstanceCompleteProcessor:NOT_FOUND",
+      "id": "rejection:AgentInstanceCompleteProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCompleteProcessor.java:64"
       ]
     },
     {
-      "id": "rejection:AgentInstanceCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:AgentInstanceCreateProcessor.processRecord:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:153"
       ]
     },
     {
-      "id": "rejection:AgentInstanceCreateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:AgentInstanceCreateProcessor.processRecord:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:171",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:184",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:320",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:328"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:184"
       ]
     },
     {
-      "id": "rejection:AgentInstanceCreateProcessor:INVALID_STATE",
+      "id": "rejection:AgentInstanceCreateProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:162"
       ]
     },
     {
-      "id": "rejection:AgentInstanceCreateProcessor:NOT_FOUND",
+      "id": "rejection:AgentInstanceCreateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:118",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:141"
       ]
     },
     {
-      "id": "rejection:AgentInstanceUpdateProcessor:ALREADY_EXISTS",
+      "id": "rejection:AgentInstanceCreateProcessor.validateCreateHistoryItems:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:320",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceCreateProcessor.java:328"
+      ]
+    },
+    {
+      "id": "rejection:AgentInstanceUpdateProcessor.processRecord:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:197"
       ]
     },
     {
-      "id": "rejection:AgentInstanceUpdateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:AgentInstanceUpdateProcessor.processRecord:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:146",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:172",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:184",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:327"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:184"
       ]
     },
     {
-      "id": "rejection:AgentInstanceUpdateProcessor:INVALID_STATE",
+      "id": "rejection:AgentInstanceUpdateProcessor.processRecord:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:163",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:310",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:338"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:163"
       ]
     },
     {
-      "id": "rejection:AgentInstanceUpdateProcessor:NOT_FOUND",
+      "id": "rejection:AgentInstanceUpdateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:114",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:135",
@@ -4539,24 +4967,31 @@
       ]
     },
     {
-      "id": "rejection:AuthorizationDeleteProcessor:INVALID_STATE",
+      "id": "rejection:AgentInstanceUpdateProcessor.validateRequestLevelChanges:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:327"
+      ]
+    },
+    {
+      "id": "rejection:AgentInstanceUpdateProcessor.validateRequestLevelChanges:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:338"
+      ]
+    },
+    {
+      "id": "rejection:AgentInstanceUpdateProcessor.validateSingleActiveWriter:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/agentinstance/AgentInstanceUpdateProcessor.java:310"
+      ]
+    },
+    {
+      "id": "rejection:AuthorizationDeleteProcessor.rejectIfProtectedRoleOwner:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationDeleteProcessor.java:130"
       ]
     },
     {
-      "id": "rejection:AuthorizationEntityValidator:INVALID_ARGUMENT",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:189",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:195",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:203",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:209",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:216",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:222"
-      ]
-    },
-    {
-      "id": "rejection:AuthorizationEntityValidator:NOT_FOUND",
+      "id": "rejection:AuthorizationEntityValidator.ownerAndResourceExists:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:107",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:121",
@@ -4569,30 +5004,51 @@
       ]
     },
     {
-      "id": "rejection:AuthorizationRejectionMapper:FORBIDDEN",
+      "id": "rejection:AuthorizationEntityValidator.validateResourceMatcher:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:33",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:37",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:40",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:45",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:70",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:189",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:195",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:203",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:209",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:216",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationEntityValidator.java:222"
+      ]
+    },
+    {
+      "id": "rejection:AuthorizationRejectionMapper.forbidden:FORBIDDEN",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:77"
       ]
     },
     {
-      "id": "rejection:BannedInstanceCommandCheck:INVALID_STATE",
+      "id": "rejection:AuthorizationRejectionMapper.noPrincipal:FORBIDDEN",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:70"
+      ]
+    },
+    {
+      "id": "rejection:AuthorizationRejectionMapper.toRejection:FORBIDDEN",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:33",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:37",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:40",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/AuthorizationRejectionMapper.java:45"
+      ]
+    },
+    {
+      "id": "rejection:BannedInstanceCommandCheck.check:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/common/BannedInstanceCommandCheck.java:48"
       ]
     },
     {
-      "id": "rejection:BatchOperationCreationCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:BatchOperationCreationCreateProcessor.processDistributedCommand:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationCreationCreateProcessor.java:165"
       ]
     },
     {
-      "id": "rejection:BatchOperationCreationCreateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:BatchOperationCreationCreateProcessor.processNewCommand:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationCreationCreateProcessor.java:100",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationCreationCreateProcessor.java:102",
@@ -4601,243 +5057,273 @@
       ]
     },
     {
-      "id": "rejection:BatchOperationExecutionExecuteProcessor:INVALID_STATE",
+      "id": "rejection:BatchOperationExecutionExecuteProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationExecutionExecuteProcessor.java:130"
       ]
     },
     {
-      "id": "rejection:BatchOperationExecutionExecuteProcessor:NOT_FOUND",
+      "id": "rejection:BatchOperationExecutionExecuteProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationExecutionExecuteProcessor.java:122"
       ]
     },
     {
-      "id": "rejection:BatchOperationLifecycleManagementCancelProcessor:NOT_FOUND",
+      "id": "rejection:BatchOperationLifecycleManagementCancelProcessor.processDistributedCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementCancelProcessor.java:120",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementCancelProcessor.java:124",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementCancelProcessor.java:138"
       ]
     },
     {
-      "id": "rejection:BatchOperationLifecycleManagementResumeProcessor:INVALID_STATE",
+      "id": "rejection:BatchOperationLifecycleManagementCancelProcessor.processNewCommand:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementCancelProcessor.java:120",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementCancelProcessor.java:124"
+      ]
+    },
+    {
+      "id": "rejection:BatchOperationLifecycleManagementResumeProcessor.rejectInvalidState:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementResumeProcessor.java:199",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementResumeProcessor.java:204"
       ]
     },
     {
-      "id": "rejection:BatchOperationLifecycleManagementResumeProcessor:NOT_FOUND",
+      "id": "rejection:BatchOperationLifecycleManagementResumeProcessor.rejectNotFound:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementResumeProcessor.java:219",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementResumeProcessor.java:223"
       ]
     },
     {
-      "id": "rejection:BatchOperationLifecycleManagementSuspendProcessor:INVALID_STATE",
+      "id": "rejection:BatchOperationLifecycleManagementSuspendProcessor.rejectInvalidState:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementSuspendProcessor.java:180",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementSuspendProcessor.java:185"
       ]
     },
     {
-      "id": "rejection:BatchOperationLifecycleManagementSuspendProcessor:NOT_FOUND",
+      "id": "rejection:BatchOperationLifecycleManagementSuspendProcessor.rejectNotFound:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementSuspendProcessor.java:200",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/batchoperation/BatchOperationLifecycleManagementSuspendProcessor.java:204"
       ]
     },
     {
-      "id": "rejection:BpmnStreamProcessor:INVALID_STATE",
+      "id": "rejection:BpmnStreamProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/BpmnStreamProcessor.java:138"
       ]
     },
     {
-      "id": "rejection:BpmnUserTaskBehavior:INVALID_STATE",
+      "id": "rejection:BpmnUserTaskBehavior.rejectOngoingRequestsForUserTaskBeforeCancellation:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnUserTaskBehavior.java:476",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/bpmn/behavior/BpmnUserTaskBehavior.java:490"
       ]
     },
     {
-      "id": "rejection:BufferedCommandDrainProcessor:INVALID_STATE",
+      "id": "rejection:BufferedCommandDrainProcessor.advanceOrWait:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/BufferedCommandDrainProcessor.java:113"
       ]
     },
     {
-      "id": "rejection:ClockPinProcessor:INVALID_ARGUMENT",
+      "id": "rejection:ClockPinProcessor.processNewCommand:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clock/ClockPinProcessor.java:87",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clock/ClockPinProcessor.java:89"
       ]
     },
     {
-      "id": "rejection:ClusterVariableCreateProcessor:FORBIDDEN",
+      "id": "rejection:ClusterVariableCreateProcessor.checkAuthorizationForTenantScope:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableCreateProcessor.java:165"
       ]
     },
     {
-      "id": "rejection:ClusterVariableCreateProcessor:UNAUTHORIZED",
+      "id": "rejection:ClusterVariableCreateProcessor.isAuthorized:UNAUTHORIZED",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableCreateProcessor.java:145"
       ]
     },
     {
-      "id": "rejection:ClusterVariableDeleteProcessor:NOT_FOUND",
+      "id": "rejection:ClusterVariableDeleteProcessor.checkAuthorizationForTenantScope:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableDeleteProcessor.java:134"
       ]
     },
     {
-      "id": "rejection:ClusterVariableDeleteProcessor:UNAUTHORIZED",
+      "id": "rejection:ClusterVariableDeleteProcessor.isAuthorized:UNAUTHORIZED",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableDeleteProcessor.java:114"
       ]
     },
     {
-      "id": "rejection:ClusterVariableRecordValidator:ALREADY_EXISTS",
+      "id": "rejection:ClusterVariableRecordValidator.ensureValidScope:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:68"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:140",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:149"
       ]
     },
     {
-      "id": "rejection:ClusterVariableRecordValidator:INVALID_ARGUMENT",
+      "id": "rejection:ClusterVariableRecordValidator.loadExisting:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:140",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:149",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:113"
+      ]
+    },
+    {
+      "id": "rejection:ClusterVariableRecordValidator.validateExistence:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:86"
+      ]
+    },
+    {
+      "id": "rejection:ClusterVariableRecordValidator.validateName:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:49",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:56"
       ]
     },
     {
-      "id": "rejection:ClusterVariableRecordValidator:INVALID_STATE",
+      "id": "rejection:ClusterVariableRecordValidator.validateName:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:42"
       ]
     },
     {
-      "id": "rejection:ClusterVariableRecordValidator:NOT_FOUND",
+      "id": "rejection:ClusterVariableRecordValidator.validateTenantExists:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:113",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:161",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:86"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:161"
       ]
     },
     {
-      "id": "rejection:ClusterVariableSecretReferenceScanner:INVALID_ARGUMENT",
+      "id": "rejection:ClusterVariableRecordValidator.validateUniqueness:ALREADY_EXISTS",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableRecordValidator.java:68"
+      ]
+    },
+    {
+      "id": "rejection:ClusterVariableSecretReferenceScanner.scan:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableSecretReferenceScanner.java:53"
       ]
     },
     {
-      "id": "rejection:ClusterVariableUpdateProcessor:NOT_FOUND",
+      "id": "rejection:ClusterVariableUpdateProcessor.checkAuthorizationForTenantScope:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableUpdateProcessor.java:166"
       ]
     },
     {
-      "id": "rejection:ClusterVariableUpdateProcessor:UNAUTHORIZED",
+      "id": "rejection:ClusterVariableUpdateProcessor.isAuthorized:UNAUTHORIZED",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/clustervariable/ClusterVariableUpdateProcessor.java:146"
       ]
     },
     {
-      "id": "rejection:CommandDistributionAcknowledgeProcessor:NOT_FOUND",
+      "id": "rejection:CommandDistributionAcknowledgeProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/distribution/CommandDistributionAcknowledgeProcessor.java:52"
       ]
     },
     {
-      "id": "rejection:ConditionalEvaluationEvaluateProcessor:FORBIDDEN",
+      "id": "rejection:ConditionalEvaluationEvaluateProcessor.processRecord:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/conditional/ConditionalEvaluationEvaluateProcessor.java:107"
       ]
     },
     {
-      "id": "rejection:ConditionalEvaluationEvaluateProcessor:NOT_FOUND",
+      "id": "rejection:ConditionalEvaluationEvaluateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/conditional/ConditionalEvaluationEvaluateProcessor.java:122",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/conditional/ConditionalEvaluationEvaluateProcessor.java:124"
       ]
     },
     {
-      "id": "rejection:ConditionalSubscriptionTriggerProcessor:INVALID_STATE",
+      "id": "rejection:ConditionalSubscriptionTriggerProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/conditional/ConditionalSubscriptionTriggerProcessor.java:93"
       ]
     },
     {
-      "id": "rejection:ConditionalSubscriptionTriggerProcessor:NOT_FOUND",
+      "id": "rejection:ConditionalSubscriptionTriggerProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/conditional/ConditionalSubscriptionTriggerProcessor.java:78"
       ]
     },
     {
-      "id": "rejection:DecisionEvaluationEvaluateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:DecisionEvaluationEvaluateProcessor.getDecision:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/dmn/DecisionEvaluationEvaluateProcessor.java:156"
       ]
     },
     {
-      "id": "rejection:DecisionEvaluationEvaluateProcessor:NOT_FOUND",
+      "id": "rejection:DecisionEvaluationEvaluateProcessor.getDecision:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/dmn/DecisionEvaluationEvaluateProcessor.java:147",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/dmn/DecisionEvaluationEvaluateProcessor.java:152"
+      ]
+    },
+    {
+      "id": "rejection:DecisionEvaluationEvaluateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/dmn/DecisionEvaluationEvaluateProcessor.java:108",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/dmn/DecisionEvaluationEvaluateProcessor.java:147",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/dmn/DecisionEvaluationEvaluateProcessor.java:152",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/dmn/DecisionEvaluationEvaluateProcessor.java:91"
       ]
     },
     {
-      "id": "rejection:DeploymentCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:DeploymentCreateProcessor.processDistributedCommand:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/DeploymentCreateProcessor.java:189"
       ]
     },
     {
-      "id": "rejection:DeploymentCreateProcessor:FORBIDDEN",
+      "id": "rejection:DeploymentCreateProcessor.processNewCommand:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/DeploymentCreateProcessor.java:170"
       ]
     },
     {
-      "id": "rejection:DeploymentCreateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:DeploymentCreateProcessor.tryHandleError:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/DeploymentCreateProcessor.java:207",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/DeploymentCreateProcessor.java:209"
       ]
     },
     {
-      "id": "rejection:DeploymentCreateProcessor:PROCESSING_ERROR",
+      "id": "rejection:DeploymentCreateProcessor.tryHandleError:PROCESSING_ERROR",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/DeploymentCreateProcessor.java:213",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/DeploymentCreateProcessor.java:215"
       ]
     },
     {
-      "id": "rejection:DeploymentDistributionCompleteProcessor:NOT_FOUND",
+      "id": "rejection:DeploymentDistributionCompleteProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/deployment/distribute/DeploymentDistributionCompleteProcessor.java:50"
       ]
     },
     {
-      "id": "rejection:ExpressionBehavior:PROCESSING_ERROR",
+      "id": "rejection:ExpressionBehavior.mapEvaluationFailure:PROCESSING_ERROR",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionBehavior.java:102",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionBehavior.java:102"
+      ]
+    },
+    {
+      "id": "rejection:ExpressionBehavior.rejectIfEvaluationFailed:PROCESSING_ERROR",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionBehavior.java:94"
       ]
     },
     {
-      "id": "rejection:ExpressionEvaluateProcessor:NOT_FOUND",
+      "id": "rejection:ExpressionEvaluateProcessor.checkTenantIfPresent:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionEvaluateProcessor.java:177"
       ]
     },
     {
-      "id": "rejection:ExpressionValidator:INVALID_ARGUMENT",
+      "id": "rejection:ExpressionValidator.parseValidExpression:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionValidator.java:83",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionValidator.java:86",
@@ -4845,55 +5331,75 @@
       ]
     },
     {
-      "id": "rejection:ExpressionValidator:NOT_FOUND",
+      "id": "rejection:ExpressionValidator.validateInstance:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionValidator.java:61",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/expression/ExpressionValidator.java:67"
       ]
     },
     {
-      "id": "rejection:ForbiddenException:FORBIDDEN",
+      "id": "rejection:ForbiddenException.getRejectionType:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/authorization/exception/ForbiddenException.java:29"
       ]
     },
     {
-      "id": "rejection:GlobalListenerBatchConfigureProcessor:ALREADY_EXISTS",
+      "id": "rejection:GlobalListenerBatchConfigureProcessor.processDistributedCommand:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerBatchConfigureProcessor.java:88"
       ]
     },
     {
-      "id": "rejection:GlobalListenerValidator:ALREADY_EXISTS",
+      "id": "rejection:GlobalListenerValidator.eventTypesProvided:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:82"
+      ]
+    },
+    {
+      "id": "rejection:GlobalListenerValidator.idProvided:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:63"
+      ]
+    },
+    {
+      "id": "rejection:GlobalListenerValidator.listenerDoesNotExist:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:55"
       ]
     },
     {
-      "id": "rejection:GlobalListenerValidator:INVALID_ARGUMENT",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:63",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:72",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:82",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:99"
-      ]
-    },
-    {
-      "id": "rejection:GlobalListenerValidator:NOT_FOUND",
+      "id": "rejection:GlobalListenerValidator.resolveExistingListener:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:41"
       ]
     },
     {
-      "id": "rejection:GroupAddEntityProcessor:ALREADY_EXISTS",
+      "id": "rejection:GlobalListenerValidator.typeProvided:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupAddEntityProcessor.java:118",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupAddEntityProcessor.java:120",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:72"
+      ]
+    },
+    {
+      "id": "rejection:GlobalListenerValidator.validEventTypes:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/globallistener/GlobalListenerValidator.java:99"
+      ]
+    },
+    {
+      "id": "rejection:GroupAddEntityProcessor.processDistributedCommand:ALREADY_EXISTS",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupAddEntityProcessor.java:143"
       ]
     },
     {
-      "id": "rejection:GroupAddEntityProcessor:NOT_FOUND",
+      "id": "rejection:GroupAddEntityProcessor.processNewCommand:ALREADY_EXISTS",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupAddEntityProcessor.java:118",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupAddEntityProcessor.java:120"
+      ]
+    },
+    {
+      "id": "rejection:GroupAddEntityProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupAddEntityProcessor.java:109",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupAddEntityProcessor.java:110",
@@ -4902,66 +5408,81 @@
       ]
     },
     {
-      "id": "rejection:GroupCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:GroupCreateProcessor.processDistributedCommand:ALREADY_EXISTS",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupCreateProcessor.java:100",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupCreateProcessor.java:100"
+      ]
+    },
+    {
+      "id": "rejection:GroupCreateProcessor.processNewCommand:ALREADY_EXISTS",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupCreateProcessor.java:73",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupCreateProcessor.java:75"
       ]
     },
     {
-      "id": "rejection:GroupDeleteProcessor:NOT_FOUND",
+      "id": "rejection:GroupDeleteProcessor.processDistributedCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupDeleteProcessor.java:119",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupDeleteProcessor.java:119"
+      ]
+    },
+    {
+      "id": "rejection:GroupDeleteProcessor.processNewCommand:NOT_FOUND",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupDeleteProcessor.java:84",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupDeleteProcessor.java:85"
       ]
     },
     {
-      "id": "rejection:GroupRemoveEntityProcessor:NOT_FOUND",
+      "id": "rejection:GroupRemoveEntityProcessor.processDistributedCommand:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:138"
+      ]
+    },
+    {
+      "id": "rejection:GroupRemoveEntityProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:101",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:102",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:109",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:110",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:138",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:90",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupRemoveEntityProcessor.java:91"
       ]
     },
     {
-      "id": "rejection:GroupUpdateProcessor:NOT_FOUND",
+      "id": "rejection:GroupUpdateProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupUpdateProcessor.java:74",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/GroupUpdateProcessor.java:75"
       ]
     },
     {
-      "id": "rejection:HistoryDeletionDeleteProcessor:INVALID_STATE",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/historydeletion/HistoryDeletionDeleteProcessor.java:147"
-      ]
-    },
-    {
-      "id": "rejection:HistoryDeletionDeleteProcessor:NOT_FOUND",
+      "id": "rejection:HistoryDeletionDeleteProcessor.validateAuthorization:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/historydeletion/HistoryDeletionDeleteProcessor.java:132"
       ]
     },
     {
-      "id": "rejection:IncidentResolveProcessor:INVALID_STATE",
+      "id": "rejection:HistoryDeletionDeleteProcessor.validateProcessInstanceDoesNotExist:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/historydeletion/HistoryDeletionDeleteProcessor.java:147"
+      ]
+    },
+    {
+      "id": "rejection:IncidentResolveProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/incident/IncidentResolveProcessor.java:147"
       ]
     },
     {
-      "id": "rejection:IncidentResolveProcessor:NOT_FOUND",
+      "id": "rejection:IncidentResolveProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/incident/IncidentResolveProcessor.java:108"
       ]
     },
     {
-      "id": "rejection:JobBatchActivateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:JobBatchActivateProcessor.validateCommandFields:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobBatchActivateProcessor.java:171",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobBatchActivateProcessor.java:178",
@@ -4969,68 +5490,98 @@
       ]
     },
     {
-      "id": "rejection:JobBatchActivateProcessor:UNAUTHORIZED",
+      "id": "rejection:JobBatchActivateProcessor.validateTenantAuthorization:UNAUTHORIZED",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobBatchActivateProcessor.java:162"
       ]
     },
     {
-      "id": "rejection:JobCancelProcessor:NOT_FOUND",
+      "id": "rejection:JobCancelProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCancelProcessor.java:80"
       ]
     },
     {
-      "id": "rejection:JobCommandPreconditionValidator:INVALID_STATE",
+      "id": "rejection:JobCommandPreconditionValidator.checkJobExists:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCommandPreconditionValidator.java:111"
+      ]
+    },
+    {
+      "id": "rejection:JobCommandPreconditionValidator.checkJobState:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCommandPreconditionValidator.java:94"
       ]
     },
     {
-      "id": "rejection:JobCommandPreconditionValidator:NOT_FOUND",
+      "id": "rejection:JobCommandPreconditionValidator.checkJobState:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCommandPreconditionValidator.java:111",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCommandPreconditionValidator.java:88"
       ]
     },
     {
-      "id": "rejection:JobCompleteProcessor:INVALID_ARGUMENT",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:497",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:523",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:545",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:573",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:601"
-      ]
-    },
-    {
-      "id": "rejection:JobCompleteProcessor:INVALID_STATE",
+      "id": "rejection:JobCompleteProcessor.checkAdHocSubprocessInstanceIsActive:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:481"
       ]
     },
     {
-      "id": "rejection:JobCompleteProcessor:NOT_FOUND",
+      "id": "rejection:JobCompleteProcessor.checkBusinessIdAssignment:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:298"
       ]
     },
     {
-      "id": "rejection:JobLeaseFencingCheck:INVALID_STATE",
+      "id": "rejection:JobCompleteProcessor.checkCreatingListenerJobForAssigneeCorrection:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:573"
+      ]
+    },
+    {
+      "id": "rejection:JobCompleteProcessor.checkTaskListenerJobForDenyingWithCorrections:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:545"
+      ]
+    },
+    {
+      "id": "rejection:JobCompleteProcessor.checkTaskListenerJobForProvidingVariables:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:497"
+      ]
+    },
+    {
+      "id": "rejection:JobCompleteProcessor.checkTaskListenerJobForSupportingDenying:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:523"
+      ]
+    },
+    {
+      "id": "rejection:JobCompleteProcessor.checkTaskListenerJobForUnknownPropertyCorrections:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobCompleteProcessor.java:601"
+      ]
+    },
+    {
+      "id": "rejection:JobLeaseFencingCheck.forLifecycleCommand:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobLeaseFencingCheck.java:61",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobLeaseFencingCheck.java:68",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobLeaseFencingCheck.java:68"
+      ]
+    },
+    {
+      "id": "rejection:JobLeaseFencingCheck.forUpdateCommand:INVALID_STATE",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobLeaseFencingCheck.java:94"
       ]
     },
     {
-      "id": "rejection:JobRecurAfterBackoffProcessor:NOT_FOUND",
+      "id": "rejection:JobRecurAfterBackoffProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobRecurAfterBackoffProcessor.java:87"
       ]
     },
     {
-      "id": "rejection:JobThrowErrorProcessor:INVALID_STATE",
+      "id": "rejection:JobThrowErrorProcessor.throwError:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobThrowErrorProcessor.java:170",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobThrowErrorProcessor.java:172",
@@ -5041,212 +5592,227 @@
       ]
     },
     {
-      "id": "rejection:JobTimeOutProcessor:NOT_FOUND",
+      "id": "rejection:JobTimeOutProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobTimeOutProcessor.java:95"
       ]
     },
     {
-      "id": "rejection:JobUpdateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:JobUpdateProcessor.handleRejection:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobUpdateProcessor.java:89",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobUpdateProcessor.java:91"
       ]
     },
     {
-      "id": "rejection:JobUpdateRetriesProcessor:INVALID_ARGUMENT",
+      "id": "rejection:JobUpdateRetriesProcessor.processRecord:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobUpdateRetriesProcessor.java:51",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobUpdateRetriesProcessor.java:53"
       ]
     },
     {
-      "id": "rejection:JobUpdateTimeoutProcessor:INVALID_STATE",
+      "id": "rejection:JobUpdateTimeoutProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobUpdateTimeoutProcessor.java:51",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/job/JobUpdateTimeoutProcessor.java:53"
       ]
     },
     {
-      "id": "rejection:MappingRuleCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:MappingRuleCreateProcessor.processDistributedCommand:ALREADY_EXISTS",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleCreateProcessor.java:137"
+      ]
+    },
+    {
+      "id": "rejection:MappingRuleCreateProcessor.processNewCommand:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleCreateProcessor.java:101",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleCreateProcessor.java:109",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleCreateProcessor.java:111",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleCreateProcessor.java:137",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleCreateProcessor.java:99"
       ]
     },
     {
-      "id": "rejection:MappingRuleDeleteProcessor:NOT_FOUND",
+      "id": "rejection:MappingRuleDeleteProcessor.processDistributedCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleDeleteProcessor.java:126",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleDeleteProcessor.java:126"
+      ]
+    },
+    {
+      "id": "rejection:MappingRuleDeleteProcessor.processNewCommand:NOT_FOUND",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleDeleteProcessor.java:92",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleDeleteProcessor.java:93"
       ]
     },
     {
-      "id": "rejection:MappingRuleUpdateProcessor:ALREADY_EXISTS",
+      "id": "rejection:MappingRuleUpdateProcessor.processNewCommand:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleUpdateProcessor.java:110",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleUpdateProcessor.java:112"
       ]
     },
     {
-      "id": "rejection:MappingRuleUpdateProcessor:NOT_FOUND",
+      "id": "rejection:MappingRuleUpdateProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleUpdateProcessor.java:88",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/MappingRuleUpdateProcessor.java:89"
       ]
     },
     {
-      "id": "rejection:MessageCorrelationCorrelateProcessor:FORBIDDEN",
+      "id": "rejection:MessageCorrelationCorrelateProcessor.processRecord:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageCorrelationCorrelateProcessor.java:137"
       ]
     },
     {
-      "id": "rejection:MessageCorrelationCorrelateProcessor:NOT_FOUND",
+      "id": "rejection:MessageCorrelationCorrelateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageCorrelationCorrelateProcessor.java:220",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageCorrelationCorrelateProcessor.java:221"
       ]
     },
     {
-      "id": "rejection:MessagePublishProcessor:ALREADY_EXISTS",
+      "id": "rejection:MessagePublishProcessor.processRecord:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessagePublishProcessor.java:175",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessagePublishProcessor.java:177"
       ]
     },
     {
-      "id": "rejection:MessagePublishProcessor:FORBIDDEN",
+      "id": "rejection:MessagePublishProcessor.processRecord:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessagePublishProcessor.java:136"
       ]
     },
     {
-      "id": "rejection:MessagePublishProcessor:INVALID_ARGUMENT",
+      "id": "rejection:MessagePublishProcessor.processRecord:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessagePublishProcessor.java:150",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessagePublishProcessor.java:152"
       ]
     },
     {
-      "id": "rejection:MessagePublishProcessor:INVALID_STATE",
+      "id": "rejection:MessagePublishProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessagePublishProcessor.java:160",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessagePublishProcessor.java:161"
       ]
     },
     {
-      "id": "rejection:MessageStartCorrelationKeyLockReleaseReleaseProcessor:INVALID_STATE",
+      "id": "rejection:MessageStartCorrelationKeyLockReleaseReleaseProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageStartCorrelationKeyLockReleaseReleaseProcessor.java:110"
       ]
     },
     {
-      "id": "rejection:MessageStartProcessInstanceRequestRejectNoSubscriptionProcessor:NOT_FOUND",
+      "id": "rejection:MessageStartProcessInstanceRequestRejectNoSubscriptionProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageStartProcessInstanceRequestRejectNoSubscriptionProcessor.java:91"
       ]
     },
     {
-      "id": "rejection:MessageStartProcessInstanceRequestRejectUniquenessProcessor:NOT_FOUND",
+      "id": "rejection:MessageStartProcessInstanceRequestRejectUniquenessProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageStartProcessInstanceRequestRejectUniquenessProcessor.java:91"
       ]
     },
     {
-      "id": "rejection:MessageSubscriptionCorrelateProcessor:INVALID_STATE",
+      "id": "rejection:MessageSubscriptionCorrelateProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionCorrelateProcessor.java:88",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionCorrelateProcessor.java:96"
       ]
     },
     {
-      "id": "rejection:MessageSubscriptionCorrelateProcessor:NOT_FOUND",
+      "id": "rejection:MessageSubscriptionCorrelateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionCorrelateProcessor.java:80"
       ]
     },
     {
-      "id": "rejection:MessageSubscriptionCreateProcessor:INVALID_STATE",
+      "id": "rejection:MessageSubscriptionCreateProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionCreateProcessor.java:79"
       ]
     },
     {
-      "id": "rejection:MessageSubscriptionDeleteProcessor:INVALID_STATE",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionDeleteProcessor.java:106"
-      ]
-    },
-    {
-      "id": "rejection:MessageSubscriptionDeleteProcessor:NOT_FOUND",
+      "id": "rejection:MessageSubscriptionDeleteProcessor.rejectCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionDeleteProcessor.java:90"
       ]
     },
     {
-      "id": "rejection:MessageSubscriptionMigrateProcessor:NOT_FOUND",
+      "id": "rejection:MessageSubscriptionDeleteProcessor.rejectStaleCommand:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionDeleteProcessor.java:106"
+      ]
+    },
+    {
+      "id": "rejection:MessageSubscriptionMigrateProcessor.migrateMessageSubscription:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionMigrateProcessor.java:64"
       ]
     },
     {
-      "id": "rejection:MessageSubscriptionRejectProcessor:NOT_FOUND",
+      "id": "rejection:MessageSubscriptionRejectProcessor.writeNotCorrelatedResponse:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/MessageSubscriptionRejectProcessor.java:156"
       ]
     },
     {
-      "id": "rejection:PermissionsBehavior:ALREADY_EXISTS",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/PermissionsBehavior.java:160"
-      ]
-    },
-    {
-      "id": "rejection:PermissionsBehavior:INVALID_ARGUMENT",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/PermissionsBehavior.java:193"
-      ]
-    },
-    {
-      "id": "rejection:PermissionsBehavior:NOT_FOUND",
+      "id": "rejection:PermissionsBehavior.authorizationExists:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/PermissionsBehavior.java:147"
       ]
     },
     {
-      "id": "rejection:ProcessDeleteCompleteProcessor:NOT_FOUND",
+      "id": "rejection:PermissionsBehavior.hasValidPermissionTypes:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/PermissionsBehavior.java:193"
+      ]
+    },
+    {
+      "id": "rejection:PermissionsBehavior.permissionsAlreadyExist:ALREADY_EXISTS",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/PermissionsBehavior.java:160"
+      ]
+    },
+    {
+      "id": "rejection:ProcessDeleteCompleteProcessor.recordPartitionDrained:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/resource/ProcessDeleteCompleteProcessor.java:86"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceBatchActivateProcessor:INVALID_STATE",
+      "id": "rejection:ProcessInstanceBatchActivateProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBatchActivateProcessor.java:66"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceBusinessIdAssignProcessor:NOT_FOUND",
+      "id": "rejection:ProcessInstanceBusinessIdAssignProcessor.isAuthorized:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignProcessor.java:128",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignProcessor.java:128"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceBusinessIdAssignProcessor.processRecord:NOT_FOUND",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignProcessor.java:75",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignProcessor.java:88"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceBusinessIdAssignmentBehavior:INVALID_ARGUMENT",
+      "id": "rejection:ProcessInstanceBusinessIdAssignmentBehavior.validate:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignmentBehavior.java:87",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignmentBehavior.java:94"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceBusinessIdAssignmentBehavior:INVALID_STATE",
+      "id": "rejection:ProcessInstanceBusinessIdAssignmentBehavior.validate:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignmentBehavior.java:105",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceBusinessIdAssignmentBehavior.java:70",
@@ -5255,7 +5821,7 @@
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCancelProcessor:INVALID_STATE",
+      "id": "rejection:ProcessInstanceCancelProcessor.validateCommand:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCancelProcessor.java:156",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCancelProcessor.java:160",
@@ -5264,7 +5830,7 @@
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCancelProcessor:NOT_FOUND",
+      "id": "rejection:ProcessInstanceCancelProcessor.validateCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCancelProcessor.java:112",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCancelProcessor.java:116",
@@ -5272,159 +5838,348 @@
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCompleteResumingProcessor:INVALID_STATE",
+      "id": "rejection:ProcessInstanceCompleteResumingProcessor.reject:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCompleteResumingProcessor.java:110"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCreationCreateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:ProcessInstanceCreationCreateProcessor.processRecord:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateProcessor.java:72",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateProcessor.java:72"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationCreateProcessor.tryHandleError:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateProcessor.java:84",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateProcessor.java:86"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCreationCreateWithAwaitingResultProcessor:INVALID_ARGUMENT",
+      "id": "rejection:ProcessInstanceCreationCreateWithAwaitingResultProcessor.processRecord:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateWithAwaitingResultProcessor.java:76",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateWithAwaitingResultProcessor.java:76"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationCreateWithAwaitingResultProcessor.tryHandleError:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateWithAwaitingResultProcessor.java:88",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationCreateWithAwaitingResultProcessor.java:90"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCreationHelper:ALREADY_EXISTS",
+      "id": "rejection:ProcessInstanceCreationHelper.findRelevantProcess:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:112"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.getProcess:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:163",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:177",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:192"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.isAuthorized:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:214"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.rejectIfDraining:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:125"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.validateBusinessIdFormat:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:463"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.validateBusinessIdUniqueness:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:480"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCreationHelper:INVALID_ARGUMENT",
+      "id": "rejection:ProcessInstanceCreationHelper.validateElementNotBelongingToEventBasedGateway:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:112",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:305",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:327",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:369",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:395",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:421",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:431",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:440",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:450",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:463"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:395"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCreationHelper:INVALID_STATE",
+      "id": "rejection:ProcessInstanceCreationHelper.validateElementsExist:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:125",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:305"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.validateElementsNotInsideMultiInstance:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:327"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.validateHasNoneStartEventOrStartInstructions:INVALID_STATE",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:289"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceCreationHelper:NOT_FOUND",
+      "id": "rejection:ProcessInstanceCreationHelper.validateRuntimeInstructionAfterElementsExist:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:163",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:177",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:192",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:214"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:421",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:431"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationCatchEventBehavior:INVALID_ARGUMENT",
+      "id": "rejection:ProcessInstanceCreationHelper.validateTags:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:440",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:450"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceCreationHelper.validateTargetsSupportedElementType:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceCreationHelper.java:369"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationCatchEventBehavior.getCompensableElementMappings:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationCatchEventBehavior.java:700"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationCatchEventBehavior.getCompensableTaskForBoundaryId:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationCatchEventBehavior.java:650"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationCatchEventBehavior:INVALID_STATE",
+      "id": "rejection:ProcessInstanceMigrationCatchEventBehavior.subscribeToAllCatchEvents:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationCatchEventBehavior.java:411",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationCatchEventBehavior.java:700"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationCatchEventBehavior.java:411"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationMigrateProcessor:NOT_FOUND",
+      "id": "rejection:ProcessInstanceMigrationMigrateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationMigrateProcessor.java:174"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationMigrateProcessor:PROCESSING_ERROR",
+      "id": "rejection:ProcessInstanceMigrationMigrateProcessor.tryHandleError:PROCESSING_ERROR",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationMigrateProcessor.java:246",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationMigrateProcessor.java:248"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationPreconditions:INVALID_ARGUMENT",
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireCompatibleAgentDefinition:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1189",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1205",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1221",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1342",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1399",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:374",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:662"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireMappedCatchEventsToStayAttachedToSameElement:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:981"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoBoundaryEvent:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:921"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoCatchEventMappingToChangeEventType:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1091"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoConcurrentCommand:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1126",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1138"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoConcurrentCommandForGateway:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1173"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoDuplicateTargetsInCatchEventMappings:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1037"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoEventSubprocess:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:489"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoIncidentForJobWorkerUserTaskConversion:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:791"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoMultipleActiveSequenceFlowsMappedToSameTarget:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1399"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoPendingMigrationDistribution:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1451"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoStartEventInstanceForTargetProcess:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:341"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNoSubscriptionForMessage:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1256"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNonDuplicateSourceElementIds:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:374"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNonNullProcessInstance:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:254"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNonNullTargetElementId:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:560"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNonNullTargetProcessDefinition:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:271"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireNonNullTargetSequenceFlowId:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1342"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireReferredElementsExist:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:402",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:411"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationPreconditions:INVALID_STATE",
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireSameElementType:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1037",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1091",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1126",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1138",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1173",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1256",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1311",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1451",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:289",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:341",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:489",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:612"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireSameMultiInstanceLoopCharacteristics:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1311"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireSupportedElementType:INVALID_STATE",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:513",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:526",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:541",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:560",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:612",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:662",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:762",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:791",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:846",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:921",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:981"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:541"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationPreconditions:NOT_FOUND",
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireSupportedUserTaskImplementation:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:254",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:271"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:762"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceMigrationUserTaskBehavior:INVALID_STATE",
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireTargetProcessDefinitionNotDraining:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:112",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:341",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:363",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:289"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireUnchangedFlowScope:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:846"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireValidGatewayMapping:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1189",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1205"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationPreconditions.requireValidTargetIncomingFlowCount:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationPreconditions.java:1221"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationUserTaskBehavior.mapUserTaskProperties:INVALID_STATE",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:394",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:404"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceModificationModifyProcessor:INVALID_ARGUMENT",
+      "id": "rejection:ProcessInstanceMigrationUserTaskBehavior.migrateForm:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1044",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1069",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1110",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1138",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1162",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1206",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1231",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1265",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1345",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:341",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:363"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceMigrationUserTaskBehavior.tryMigrateJobWorkerToCamundaUserTask:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceMigrationUserTaskBehavior.java:112"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.processRecord:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:244",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:245",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:266"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.tryHandleError:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:413",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:415",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:424",
@@ -5434,47 +6189,138 @@
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:441",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:443",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:451",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:453",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:708",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:737",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:780",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:806",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:836",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:864",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:916",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:951",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:453"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateAncestorBelongsToProcessInstance:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1069"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateAncestorExistsAndIsActive:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1044"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateAncestorIsFlowScopeOfElement:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1110"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateElementExists:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:916"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateElementInstanceExists:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1206"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateElementIsNotActivatedForTerminatedFlowScope:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1345"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateElementsDoNotBelongToEventBasedGateway:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:951"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateElementsHaveSupportedType:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:987"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceModificationModifyProcessor:NOT_FOUND",
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateHasMoveInstructions:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:244",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:245",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:266"
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:780"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceResumeJobsProcessor:INVALID_STATE",
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateHasTerminateInstructions:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:708"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateMoveSourceElementInstanceExists:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1138",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1162"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateNoAmbiguousAncestorScopeOptions:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:864"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateNoDuplicatedMoveInstructions:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:806"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateNoDuplicatedTerminateInstructions:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:737"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateNoMoveSourceWithBothIdAndInstanceKey:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:836"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateVariableScopeExists:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1231"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceModificationModifyProcessor.validateVariableScopeIsFlowScope:INVALID_ARGUMENT",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceModificationModifyProcessor.java:1265"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceResumeJobsProcessor.reject:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceResumeJobsProcessor.java:188"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceResumeProcessor:INVALID_STATE",
+      "id": "rejection:ProcessInstanceResumeProcessor.validateAuthorized:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceResumeProcessor.java:136"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceResumeProcessor.validateNotFound:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceResumeProcessor.java:112"
+      ]
+    },
+    {
+      "id": "rejection:ProcessInstanceResumeProcessor.validateSuspensionState:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceResumeProcessor.java:148"
       ]
     },
     {
-      "id": "rejection:ProcessInstanceResumeProcessor:NOT_FOUND",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceResumeProcessor.java:112",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceResumeProcessor.java:136"
-      ]
-    },
-    {
-      "id": "rejection:ProcessInstanceSuspendProcessor:INVALID_STATE",
+      "id": "rejection:ProcessInstanceSuspendProcessor.validateCommand:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceSuspendProcessor.java:169",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceSuspendProcessor.java:170",
@@ -5483,7 +6329,7 @@
       ]
     },
     {
-      "id": "rejection:ProcessInstanceSuspendProcessor:NOT_FOUND",
+      "id": "rejection:ProcessInstanceSuspendProcessor.validateCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceSuspendProcessor.java:130",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/processinstance/ProcessInstanceSuspendProcessor.java:131",
@@ -5491,7 +6337,7 @@
       ]
     },
     {
-      "id": "rejection:ProcessMessageSubscriptionCorrelateProcessor:INVALID_STATE",
+      "id": "rejection:ProcessMessageSubscriptionCorrelateProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCorrelateProcessor.java:119",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCorrelateProcessor.java:133",
@@ -5501,73 +6347,88 @@
       ]
     },
     {
-      "id": "rejection:ProcessMessageSubscriptionCorrelateProcessor:NOT_FOUND",
+      "id": "rejection:ProcessMessageSubscriptionCorrelateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCorrelateProcessor.java:115"
       ]
     },
     {
-      "id": "rejection:ProcessMessageSubscriptionCreateProcessor:INVALID_STATE",
+      "id": "rejection:ProcessMessageSubscriptionCreateProcessor.rejectCommand:INVALID_STATE",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCreateProcessor.java:194",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCreateProcessor.java:253"
       ]
     },
     {
-      "id": "rejection:ProcessMessageSubscriptionCreateProcessor:NOT_FOUND",
+      "id": "rejection:ProcessMessageSubscriptionCreateProcessor.rejectCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCreateProcessor.java:185",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCreateProcessor.java:248"
       ]
     },
     {
-      "id": "rejection:ProcessMessageSubscriptionDeleteProcessor:INVALID_STATE",
+      "id": "rejection:ProcessMessageSubscriptionCreateProcessor.reopenFromManifest:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCreateProcessor.java:194"
+      ]
+    },
+    {
+      "id": "rejection:ProcessMessageSubscriptionCreateProcessor.reopenFromManifest:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionCreateProcessor.java:185"
+      ]
+    },
+    {
+      "id": "rejection:ProcessMessageSubscriptionDeleteProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionDeleteProcessor.java:96"
       ]
     },
     {
-      "id": "rejection:ProcessMessageSubscriptionDeleteProcessor:NOT_FOUND",
+      "id": "rejection:ProcessMessageSubscriptionDeleteProcessor.rejectCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/message/ProcessMessageSubscriptionDeleteProcessor.java:188"
       ]
     },
     {
-      "id": "rejection:RejectionAggregator:FORBIDDEN",
+      "id": "rejection:RejectionAggregator.aggregateComposite:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/authorization/aggregator/RejectionAggregator.java:84"
       ]
     },
     {
-      "id": "rejection:ResourceDeletionDeleteProcessor:INVALID_STATE",
+      "id": "rejection:ResourceDeletionDeleteProcessor.tryHandleError:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/resource/ResourceDeletionDeleteProcessor.java:183",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/resource/ResourceDeletionDeleteProcessor.java:185"
       ]
     },
     {
-      "id": "rejection:ResourceDeletionDeleteProcessor:NOT_FOUND",
+      "id": "rejection:ResourceDeletionDeleteProcessor.tryHandleError:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/resource/ResourceDeletionDeleteProcessor.java:177",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/resource/ResourceDeletionDeleteProcessor.java:179"
       ]
     },
     {
-      "id": "rejection:ResourceFetchProcessor:NOT_FOUND",
+      "id": "rejection:ResourceFetchProcessor.tryHandleError:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/resource/ResourceFetchProcessor.java:80"
       ]
     },
     {
-      "id": "rejection:RoleAddEntityProcessor:ALREADY_EXISTS",
+      "id": "rejection:RoleAddEntityProcessor.processDistributedCommand:ALREADY_EXISTS",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleAddEntityProcessor.java:120",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleAddEntityProcessor.java:122",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleAddEntityProcessor.java:144"
       ]
     },
     {
-      "id": "rejection:RoleAddEntityProcessor:NOT_FOUND",
+      "id": "rejection:RoleAddEntityProcessor.processNewCommand:ALREADY_EXISTS",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleAddEntityProcessor.java:120",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleAddEntityProcessor.java:122"
+      ]
+    },
+    {
+      "id": "rejection:RoleAddEntityProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleAddEntityProcessor.java:102",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleAddEntityProcessor.java:103",
@@ -5576,82 +6437,97 @@
       ]
     },
     {
-      "id": "rejection:RoleCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:RoleCreateProcessor.processDistributedCommand:ALREADY_EXISTS",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleCreateProcessor.java:71",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleCreateProcessor.java:73",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleCreateProcessor.java:97"
       ]
     },
     {
-      "id": "rejection:RoleDeleteProcessor:INVALID_STATE",
+      "id": "rejection:RoleCreateProcessor.processNewCommand:ALREADY_EXISTS",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleCreateProcessor.java:71",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleCreateProcessor.java:73"
+      ]
+    },
+    {
+      "id": "rejection:RoleDeleteProcessor.processDistributedCommand:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleDeleteProcessor.java:132"
+      ]
+    },
+    {
+      "id": "rejection:RoleDeleteProcessor.processNewCommand:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleDeleteProcessor.java:87",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleDeleteProcessor.java:89"
       ]
     },
     {
-      "id": "rejection:RoleDeleteProcessor:NOT_FOUND",
+      "id": "rejection:RoleDeleteProcessor.processNewCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleDeleteProcessor.java:132",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleDeleteProcessor.java:96",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleDeleteProcessor.java:97"
       ]
     },
     {
-      "id": "rejection:RoleRemoveEntityProcessor:NOT_FOUND",
+      "id": "rejection:RoleRemoveEntityProcessor.processDistributedCommand:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:142"
+      ]
+    },
+    {
+      "id": "rejection:RoleRemoveEntityProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:106",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:107",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:114",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:115",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:142",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:96",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleRemoveEntityProcessor.java:97"
       ]
     },
     {
-      "id": "rejection:RoleUpdateProcessor:INVALID_STATE",
+      "id": "rejection:RoleUpdateProcessor.processNewCommand:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleUpdateProcessor.java:74",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleUpdateProcessor.java:76"
       ]
     },
     {
-      "id": "rejection:RoleUpdateProcessor:NOT_FOUND",
+      "id": "rejection:RoleUpdateProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleUpdateProcessor.java:83",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/identity/RoleUpdateProcessor.java:84"
       ]
     },
     {
-      "id": "rejection:ScaleMarkPartitionBootstrappedProcessor:INVALID_ARGUMENT",
+      "id": "rejection:ScaleMarkPartitionBootstrappedProcessor.validate:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleMarkPartitionBootstrappedProcessor.java:145",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleMarkPartitionBootstrappedProcessor.java:157"
       ]
     },
     {
-      "id": "rejection:ScaleMarkPartitionBootstrappedProcessor:INVALID_STATE",
+      "id": "rejection:ScaleMarkPartitionBootstrappedProcessor.validate:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleMarkPartitionBootstrappedProcessor.java:152"
       ]
     },
     {
-      "id": "rejection:ScaleScaleUpProcessor:ALREADY_EXISTS",
+      "id": "rejection:ScaleScaleUpProcessor.validateCommand:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleScaleUpProcessor.java:115"
       ]
     },
     {
-      "id": "rejection:ScaleScaleUpProcessor:INVALID_ARGUMENT",
+      "id": "rejection:ScaleScaleUpProcessor.validateCommand:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleScaleUpProcessor.java:100",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleScaleUpProcessor.java:106"
       ]
     },
     {
-      "id": "rejection:ScaleScaleUpProcessor:INVALID_STATE",
+      "id": "rejection:ScaleScaleUpProcessor.validateCommand:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleScaleUpProcessor.java:121",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleScaleUpProcessor.java:128",
@@ -5659,173 +6535,208 @@
       ]
     },
     {
-      "id": "rejection:ScaleStatusProcessor:INVALID_STATE",
+      "id": "rejection:ScaleStatusProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleStatusProcessor.java:48",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/scaling/ScaleStatusProcessor.java:51"
       ]
     },
     {
-      "id": "rejection:SecretReferenceResolutionCompleteProcessor:NOT_FOUND",
+      "id": "rejection:SecretReferenceResolutionCompleteProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/secretreference/SecretReferenceResolutionCompleteProcessor.java:61"
       ]
     },
     {
-      "id": "rejection:SecretReferenceResolutionFailProcessor:NOT_FOUND",
+      "id": "rejection:SecretReferenceResolutionFailProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/secretreference/SecretReferenceResolutionFailProcessor.java:62"
       ]
     },
     {
-      "id": "rejection:SignalBroadcastProcessor:FORBIDDEN",
+      "id": "rejection:SignalBroadcastProcessor.processNewCommand:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/signal/SignalBroadcastProcessor.java:115"
       ]
     },
     {
-      "id": "rejection:SignalBroadcastProcessor:INVALID_ARGUMENT",
+      "id": "rejection:SignalBroadcastProcessor.processNewCommand:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/signal/SignalBroadcastProcessor.java:132",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/signal/SignalBroadcastProcessor.java:134"
       ]
     },
     {
-      "id": "rejection:TenantAddEntityProcessor:ALREADY_EXISTS",
+      "id": "rejection:TenantAddEntityProcessor.createAlreadyAssignedRejectCommand:ALREADY_EXISTS",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantAddEntityProcessor.java:200"
       ]
     },
     {
-      "id": "rejection:TenantAddEntityProcessor:NOT_FOUND",
+      "id": "rejection:TenantAddEntityProcessor.createEntityNotExistRejectCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantAddEntityProcessor.java:100",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantAddEntityProcessor.java:189"
       ]
     },
     {
-      "id": "rejection:TenantCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:TenantAddEntityProcessor.processNewCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantCreateProcessor.java:65",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantAddEntityProcessor.java:100"
+      ]
+    },
+    {
+      "id": "rejection:TenantCreateProcessor.processDistributedCommand:ALREADY_EXISTS",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantCreateProcessor.java:82"
       ]
     },
     {
-      "id": "rejection:TenantDeleteProcessor:NOT_FOUND",
+      "id": "rejection:TenantCreateProcessor.processNewCommand:ALREADY_EXISTS",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantDeleteProcessor.java:133",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantCreateProcessor.java:65"
+      ]
+    },
+    {
+      "id": "rejection:TenantDeleteProcessor.processDistributedCommand:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantDeleteProcessor.java:133"
+      ]
+    },
+    {
+      "id": "rejection:TenantDeleteProcessor.processNewCommand:NOT_FOUND",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantDeleteProcessor.java:89"
       ]
     },
     {
-      "id": "rejection:TenantRemoveEntityProcessor:NOT_FOUND",
+      "id": "rejection:TenantRemoveEntityProcessor.createEntityNotExistRejectCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantRemoveEntityProcessor.java:162",
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantRemoveEntityProcessor.java:173",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantRemoveEntityProcessor.java:162"
+      ]
+    },
+    {
+      "id": "rejection:TenantRemoveEntityProcessor.createNotAssignedRejectCommand:NOT_FOUND",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantRemoveEntityProcessor.java:173"
+      ]
+    },
+    {
+      "id": "rejection:TenantRemoveEntityProcessor.processNewCommand:NOT_FOUND",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantRemoveEntityProcessor.java:90"
       ]
     },
     {
-      "id": "rejection:TenantUpdateProcessor:NOT_FOUND",
+      "id": "rejection:TenantUpdateProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/tenant/TenantUpdateProcessor.java:65"
       ]
     },
     {
-      "id": "rejection:TimerCancelProcessor:NOT_FOUND",
+      "id": "rejection:TimerCancelProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/timer/TimerCancelProcessor.java:49"
       ]
     },
     {
-      "id": "rejection:TimerTriggerProcessor:INVALID_STATE",
-      "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/timer/TimerTriggerProcessor.java:154"
-      ]
-    },
-    {
-      "id": "rejection:TimerTriggerProcessor:NOT_FOUND",
+      "id": "rejection:TimerTriggerProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/timer/TimerTriggerProcessor.java:108",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/timer/TimerTriggerProcessor.java:96"
       ]
     },
     {
-      "id": "rejection:UserCreateInitialAdminProcessor:FORBIDDEN",
+      "id": "rejection:TimerTriggerProcessor.rejectNoActiveTimer:INVALID_STATE",
+      "sources": [
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/timer/TimerTriggerProcessor.java:154"
+      ]
+    },
+    {
+      "id": "rejection:UserCreateInitialAdminProcessor.processRecord:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserCreateInitialAdminProcessor.java:97",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserCreateInitialAdminProcessor.java:99"
       ]
     },
     {
-      "id": "rejection:UserCreateProcessor:ALREADY_EXISTS",
+      "id": "rejection:UserCreateProcessor.processDistributedCommand:ALREADY_EXISTS",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserCreateProcessor.java:108",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserCreateProcessor.java:108"
+      ]
+    },
+    {
+      "id": "rejection:UserCreateProcessor.processNewCommand:ALREADY_EXISTS",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserCreateProcessor.java:80",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserCreateProcessor.java:81"
       ]
     },
     {
-      "id": "rejection:UserDeleteProcessor:NOT_FOUND",
+      "id": "rejection:UserDeleteProcessor.processDistributedCommand:NOT_FOUND",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserDeleteProcessor.java:129",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserDeleteProcessor.java:129"
+      ]
+    },
+    {
+      "id": "rejection:UserDeleteProcessor.processNewCommand:NOT_FOUND",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserDeleteProcessor.java:92",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserDeleteProcessor.java:94"
       ]
     },
     {
-      "id": "rejection:UserTaskAuthorizationCheck:FORBIDDEN",
+      "id": "rejection:UserTaskAuthorizationCheck.check:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/processors/UserTaskAuthorizationCheck.java:99"
       ]
     },
     {
-      "id": "rejection:UserTaskClaimProcessor:FORBIDDEN",
+      "id": "rejection:UserTaskClaimProcessor.checkClaim:FORBIDDEN",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/processors/UserTaskClaimProcessor.java:152"
       ]
     },
     {
-      "id": "rejection:UserTaskClaimProcessor:INVALID_STATE",
+      "id": "rejection:UserTaskClaimProcessor.checkClaim:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/processors/UserTaskClaimProcessor.java:144",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/processors/UserTaskClaimProcessor.java:165"
       ]
     },
     {
-      "id": "rejection:UserTaskCommandPreconditionValidator:INVALID_STATE",
+      "id": "rejection:UserTaskCommandPreconditionValidator.checkLifecycleState:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/processors/UserTaskCommandPreconditionValidator.java:87"
       ]
     },
     {
-      "id": "rejection:UserTaskCommandPreconditionValidator:NOT_FOUND",
+      "id": "rejection:UserTaskCommandPreconditionValidator.checkUserTaskExists:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/processors/UserTaskCommandPreconditionValidator.java:73"
       ]
     },
     {
-      "id": "rejection:UserTaskProcessor:INVALID_STATE",
+      "id": "rejection:UserTaskProcessor.writeRejectionForCommand:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/UserTaskProcessor.java:290",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/usertask/UserTaskProcessor.java:318"
       ]
     },
     {
-      "id": "rejection:UserUpdateProcessor:NOT_FOUND",
+      "id": "rejection:UserUpdateProcessor.processNewCommand:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserUpdateProcessor.java:64",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/user/UserUpdateProcessor.java:66"
       ]
     },
     {
-      "id": "rejection:VariableBehavior:INVALID_ARGUMENT",
+      "id": "rejection:VariableBehavior.validateVariables:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableBehavior.java:295"
       ]
     },
     {
-      "id": "rejection:VariableDocumentUpdateProcessor:INVALID_ARGUMENT",
+      "id": "rejection:VariableDocumentUpdateProcessor.processRecord:INVALID_ARGUMENT",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableDocumentUpdateProcessor.java:201",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableDocumentUpdateProcessor.java:204",
@@ -5836,14 +6747,14 @@
       ]
     },
     {
-      "id": "rejection:VariableDocumentUpdateProcessor:INVALID_STATE",
+      "id": "rejection:VariableDocumentUpdateProcessor.processRecord:INVALID_STATE",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableDocumentUpdateProcessor.java:156",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableDocumentUpdateProcessor.java:159"
       ]
     },
     {
-      "id": "rejection:VariableDocumentUpdateProcessor:NOT_FOUND",
+      "id": "rejection:VariableDocumentUpdateProcessor.processRecord:NOT_FOUND",
       "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableDocumentUpdateProcessor.java:105",
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableDocumentUpdateProcessor.java:106",
@@ -5851,9 +6762,14 @@
       ]
     },
     {
-      "id": "rejection:VariableNameLengthValidator:INVALID_ARGUMENT",
+      "id": "rejection:VariableNameLengthValidator.validateVariableNameLength:INVALID_ARGUMENT",
       "sources": [
-        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableNameLengthValidator.java:44",
+        "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableNameLengthValidator.java:44"
+      ]
+    },
+    {
+      "id": "rejection:VariableNameLengthValidator.variableNameTooLongError:INVALID_ARGUMENT",
+      "sources": [
         "zeebe/engine/src/main/java/io/camunda/zeebe/engine/processing/variable/VariableNameLengthValidator.java:68"
       ]
     },
