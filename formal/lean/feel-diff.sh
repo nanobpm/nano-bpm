@@ -46,3 +46,11 @@ fi
 
 echo "==> checking Rust engine-core/src/feel against the Lean reference"
 ( cd "$repo_root/engine-core" && cargo run --quiet --example feel_diff -- "$corpus" )
+
+# feel-scala reference (#1391 step 5): the same corpus through the feel-scala
+# version the pinned Zeebe embeds. nano == reference was just proven above, so
+# the reference column is nano's outcome; every nano≠feel-scala row must be a
+# known divergence with an issue reference (and every listed one must still
+# diverge). See formal/feel-scala/README.md.
+echo "==> checking the corpus against feel-scala (Zeebe's FEEL engine)"
+"$repo_root/formal/feel-scala/check.sh" "$corpus"
