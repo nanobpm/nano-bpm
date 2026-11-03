@@ -2374,3 +2374,286 @@ fn subprocess_input_mapping_failure_reenters_the_body_on_resolve() {
     );
     assert_eq!(jobs[0].variables.get("scoped"), Some(&Value::Int(5)));
 }
+
+// ---------------------------------------------------------------------------
+// #1390 — job-type FEEL expression failures raise EXTRACT_VALUE_ERROR
+// (Zeebe `JobWorkerElementIncidentTest` parity).
+// ---------------------------------------------------------------------------
+
+/// A linear process whose single service task's job type is the given raw
+/// `zeebe:taskDefinition type` text (a literal or a `=…` FEEL expression).
+fn task_with_job_type_expr(job_type: &str) -> ProcessDefinition {
+    ProcessBuilder::new("job-type-incident")
+        .start_event("start")
+        .service_task("task", job_type)
+        .end_event("end")
+        .connect("start", "task")
+        .connect("task", "end")
+        .build()
+        .unwrap()
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn should_create_incident_if_job_type_expression_evaluation_failed() {
+    // Zeebe `JobWorkerElementIncidentTest.shouldCreateIncidentIfJobTypeExpressionEvaluationFailed`:
+    // a job-type FEEL expression that cannot be evaluated (a missing variable
+    // without `is defined`, or — here — a type error such as concatenating a
+    // string with a number) raises an EXTRACT_VALUE_ERROR incident on the task
+    // and creates NO job. nano used to fall back to the literal expression text
+    // as the job type, parking the token with no incident and no subscribable
+    // worker (#1390).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_job_type_expr(
+            r#"= "senior:feature" + (if is defined(model) and model != null then "@" + model else "")"#,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            vars(&[("model", Value::Int(42))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "exactly one incident raised");
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::ExtractValueError,
+        "a failed job-type expression maps to the EXTRACT_VALUE_ERROR taxonomy",
+    );
+    assert_eq!(active[0].element_id, "task");
+    assert!(
+        active[0].reason.contains("job type expression"),
+        "the reason names the failed expression: {}",
+        active[0].reason
+    );
+    assert_eq!(
+        engine.state().jobs.len(),
+        0,
+        "no job is created — in particular none typed with the raw expression text",
+    );
+    assert!(!engine.is_completed(key), "the token parks on the incident");
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn should_create_incident_if_job_type_expression_of_invalid_type() {
+    // Zeebe `…shouldCreateIncidentIfJobTypeExpressionOfInvalidType`: a job-type
+    // expression that evaluates to a non-string (a context/map here) raises
+    // EXTRACT_VALUE_ERROR and creates no job.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_job_type_expr("= {a: 1}")))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            HashMap::new(),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert_eq!(active[0].element_id, "task");
+    assert_eq!(engine.state().jobs.len(), 0);
+    assert!(!engine.is_completed(key));
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn should_create_incident_if_job_type_expression_is_empty_string() {
+    // Zeebe `…shouldCreateIncidentIfJobTypeExpressionIsEmptyString`: a job-type
+    // expression that evaluates to the empty string raises EXTRACT_VALUE_ERROR
+    // and creates no job.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_job_type_expr(r#"= """#)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            HashMap::new(),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert!(
+        active[0].reason.contains("empty string"),
+        "the reason calls out the empty result: {}",
+        active[0].reason
+    );
+    assert_eq!(engine.state().jobs.len(), 0);
+    assert!(!engine.is_completed(key));
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn should_create_incident_if_job_type_expression_exceeds_max_length() {
+    // Zeebe `BpmnJobBehavior.evalTypeExp` (maxJobTypeLength, default 128): a
+    // job-type expression whose result is longer than the cap raises
+    // EXTRACT_VALUE_ERROR and creates no job.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_job_type_expr("=jobType")))
+        .unwrap();
+    let long = "x".repeat(MAX_JOB_TYPE_LENGTH + 1);
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            vars(&[("jobType", Value::Str(long))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert!(
+        active[0].reason.contains("maximum job type length"),
+        "the reason calls out the length cap: {}",
+        active[0].reason
+    );
+    assert_eq!(engine.state().jobs.len(), 0);
+    assert!(!engine.is_completed(key));
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn should_resolve_incident_after_job_type_expression_evaluation_failed() {
+    // Zeebe `…shouldResolveIncidentAfterJobTypeExpressionEvaluationFailed`: the
+    // incident is recoverable — after updating the variables the expression
+    // reads, resolving it retries the activation and the job is created with
+    // the now-resolved type.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_job_type_expr(
+            r#"= "senior:feature" + (if is defined(model) and model != null then "@" + model else "")"#,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            vars(&[("model", Value::Int(42))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let incident_key = engine.incidents()[0].key;
+
+    // Fix the variable so the expression evaluates, then resolve: activation is
+    // retried and the job appears under the resolved type.
+    engine
+        .apply_command(Command::set_variables(
+            key,
+            HashMap::from([("model".to_string(), Value::Str("kimi-k3".into()))]),
+        ))
+        .unwrap();
+    let resolve_events = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let _ = &resolve_events;
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the incident is resolved",
+    );
+    let jobs = engine.activate_jobs("senior:feature@kimi-k3", "w", 1, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "resolving retried the activation: the job exists under the resolved type",
+    );
+    assert_eq!(jobs[0].element_id, "task");
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn should_re_raise_incident_if_job_type_expression_still_fails_after_resolve() {
+    // Resolving WITHOUT fixing the variables retries the activation, which
+    // fails again and raises a fresh incident (Zeebe: the retried evaluation
+    // produces a new incident, it does not silently swallow the failure).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_job_type_expr(
+            "=jobType + suffix",
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            vars(&[("jobType", Value::Str("work".into()))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let incident_key = engine.incidents()[0].key;
+
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the retried activation fails again: a fresh incident is raised",
+    );
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert_ne!(
+        active[0].key, incident_key,
+        "the re-raised incident is a new record",
+    );
+    assert_eq!(engine.state().jobs.len(), 0);
+    assert!(!engine.is_completed(key));
+}
+
+#[test]
+fn job_type_expression_resolves_against_updated_variables() {
+    // The happy path from the #1390 repro: a valid model variable yields the
+    // concatenated type, and an absent/null model yields the bare type — both
+    // without an incident.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_job_type_expr(
+            r#"= "senior:feature" + (if is defined(model) and model != null then "@" + model else "")"#,
+        )))
+        .unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            vars(&[("model", Value::Str("kimi-k3".into()))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        engine
+            .activate_jobs("senior:feature@kimi-k3", "w", 1, 60_000, 0)
+            .len(),
+        1
+    );
+    engine
+        .apply_command(Command::CancelInstance { instance_key: key })
+        .unwrap();
+
+    // Absent `model` → the bare type.
+    engine
+        .apply_command(Command::create_instance_with(
+            "job-type-incident",
+            HashMap::new(),
+        ))
+        .unwrap();
+    assert!(engine.active_incidents().is_empty());
+    assert_eq!(
+        engine
+            .activate_jobs("senior:feature", "w", 1, 60_000, 0)
+            .len(),
+        1
+    );
+}

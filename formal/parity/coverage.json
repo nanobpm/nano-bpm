@@ -306,6 +306,10 @@
       "match": "incident:EXTRACT_VALUE_ERROR",
       "status": "nano-tested",
       "evidence": [
+        "engine-core/src/engine/tests/incidents.rs::should_create_incident_if_job_type_expression_evaluation_failed",
+        "engine-core/src/engine/tests/incidents.rs::should_create_incident_if_job_type_expression_is_empty_string",
+        "engine-core/src/engine/tests/incidents.rs::should_create_incident_if_job_type_expression_of_invalid_type",
+        "engine-core/src/engine/tests/incidents.rs::should_resolve_incident_after_job_type_expression_evaluation_failed",
         "engine-core/src/engine/tests/incidents.rs::adhoc_output_collection_non_array_target_raises_extract_value_incident"
       ]
     },

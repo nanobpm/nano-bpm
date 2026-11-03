@@ -3063,6 +3063,23 @@ impl Engine {
                                 element_id,
                                 preserved_seed,
                             });
+                        } else if let Some(state::IoMappingRedrive::AdHocToolJobType {
+                            element_id: tool_element_id,
+                            variables,
+                        }) = &redrive
+                        {
+                            // An ad-hoc tool whose job-type expression failed
+                            // (#1390): the tool child was never created, so
+                            // re-activate the tool with its original seed
+                            // variables — a clean retry. The incident sits on the
+                            // CONTAINER (activation happens before the child
+                            // exists), so `element_instance_key` is the container.
+                            queue.push_back(Step::ActivateAdHocTool {
+                                instance_key,
+                                container_key: element_instance_key,
+                                element_id: tool_element_id.clone(),
+                                variables: variables.clone(),
+                            });
                         } else if let Some(state::IoMappingRedrive::AdHocToolOutputCollection {
                             precomputed_output,
                         }) = &redrive
@@ -3125,15 +3142,17 @@ impl Engine {
                         });
                     }
                     // A `zeebe:ioMapping` failure (input or output, any element
-                    // type): recovery is **phase-driven** (#946). The re-drive is
-                    // chosen from the [`state::IoMappingRedrive`] recorded on the
-                    // incident — the element's lifecycle phase — rather than from
-                    // the incident *kind*, so a single `IoMapping` taxonomy covers
-                    // every ioMapping failure while each specialized path replays
+                    // type) or a job-type extraction failure (#1390, Zeebe
+                    // `EXTRACT_VALUE_ERROR` — no job was created): recovery is
+                    // **phase-driven** (#946). The re-drive is chosen from the
+                    // [`state::IoMappingRedrive`] recorded on the incident — the
+                    // element's lifecycle phase — rather than from the incident
+                    // *kind*, so a single taxonomy covers every ioMapping failure
+                    // (and the job-type site) while each specialized path replays
                     // its correct context-preserving step (Zeebe parity: ioMapping
                     // failures re-drive uniformly by lifecycle phase — `ACTIVATING`
                     // re-applies inputs, `COMPLETING` re-applies outputs).
-                    state::IncidentKind::IoMapping => {
+                    state::IncidentKind::IoMapping | state::IncidentKind::ExtractValueError => {
                         let step: Option<Step> = match redrive {
                             // Mainstream input: re-run the activation body so the
                             // now-fixed inputs are re-applied before the element's
@@ -3261,6 +3280,19 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                 })),
+                            // Ad-hoc tool job-type failure (#1390): re-activate the
+                            // tool with its preserved seed. (Surfaces as
+                            // `ExtractValueError`, handled above; this arm keeps the
+                            // `IoMapping` match exhaustive.)
+                            Some(state::IoMappingRedrive::AdHocToolJobType {
+                                element_id: tool_element_id,
+                                variables,
+                            }) => Some(Step::ActivateAdHocTool {
+                                instance_key,
+                                container_key: element_instance_key,
+                                element_id: tool_element_id,
+                                variables,
+                            }),
                             // Call-activity output: re-project the captured child
                             // result through the output mappings and complete.
                             Some(state::IoMappingRedrive::CallActivityCompletion {
@@ -5743,8 +5775,22 @@ impl Engine {
             crate::model::ListenerEventType::Start,
         );
         if let Some(first) = start_listeners.first() {
+            let job_type = match self.resolve_job_type(&activation_vars, &first.job_type) {
+                Ok(job_type) => job_type,
+                Err(reason) => {
+                    // #1390: a failed listener job-type expression parks the
+                    // element on an EXTRACT_VALUE_ERROR incident — no job.
+                    events.push(self.extract_value_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        reason,
+                        Some(state::IoMappingRedrive::Activation),
+                    ));
+                    return (events, followups);
+                }
+            };
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&activation_vars, &first.job_type);
             let retries = self.resolve_retries(&activation_vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
@@ -5798,6 +5844,33 @@ impl Engine {
             kind: state::IncidentKind::IoMapping,
             redrive: Some(redrive),
             reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
+    }
+
+    /// Builds an `EXTRACT_VALUE_ERROR` [`Event::IncidentRaised`] for a job-type
+    /// expression that failed to resolve to a usable string (#1390, Zeebe
+    /// `BpmnJobBehavior.evalTypeExp`): evaluation error, non-string/null result,
+    /// empty string, or a result over [`MAX_JOB_TYPE_LENGTH`]. No job is created
+    /// — the element parks on the incident and resolving it (after the variables
+    /// the expression reads are fixed) retries the failed work via `redrive`.
+    fn extract_value_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        reason: String,
+        redrive: Option<state::IoMappingRedrive>,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: state::IncidentKind::ExtractValueError,
+            redrive,
+            reason,
             job_key: None,
             created_at: self.now,
         }
@@ -5885,8 +5958,30 @@ impl Engine {
                     ));
                     return (events, followups);
                 }
+                let job_type = match self.resolve_job_type(&element_vars, &job_type) {
+                    Ok(job_type) => job_type,
+                    Err(reason) => {
+                        // #1390 (Zeebe `BpmnJobBehavior.evalTypeExp`): a failed
+                        // job-type expression raises an EXTRACT_VALUE_ERROR
+                        // incident on the task and NO job is created; resolving
+                        // the incident retries the activation.
+                        events.extend(self.arm_boundary_events(
+                            instance_key,
+                            element_instance_key,
+                            scope,
+                            &element_id,
+                        ));
+                        events.push(self.extract_value_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            reason,
+                            Some(state::IoMappingRedrive::Activation),
+                        ));
+                        return (events, followups);
+                    }
+                };
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(&element_vars, &job_type);
                 let priority = self.resolve_priority(&element_vars, priority.as_deref());
                 let retries = self.resolve_retries(
                     &element_vars,
@@ -6492,8 +6587,22 @@ impl Engine {
             crate::model::ListenerEventType::Start,
         );
         if let Some(first) = start_listeners.first() {
+            let job_type = match self.resolve_job_type(&vars, &first.job_type) {
+                Ok(job_type) => job_type,
+                Err(reason) => {
+                    // #1390: a failed listener job-type expression parks the MI
+                    // body on an EXTRACT_VALUE_ERROR incident — no job.
+                    events.push(self.extract_value_incident(
+                        instance_key,
+                        body_key,
+                        element_id,
+                        reason,
+                        Some(state::IoMappingRedrive::MiBodyActivation),
+                    ));
+                    return (events, Vec::new());
+                }
+            };
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&vars, &first.job_type);
             let retries = self.resolve_retries(&vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
@@ -6745,8 +6854,14 @@ impl Engine {
                 local_variables: locals,
             },
         ];
-        let (behaviour_events, followups) =
-            self.run_mi_child_behaviour(instance_key, element_id, body_key, child_key, &child_vars);
+        let (behaviour_events, followups) = self.run_mi_child_behaviour(
+            instance_key,
+            element_id,
+            body_key,
+            child_key,
+            index,
+            &child_vars,
+        );
         let mut events = events;
         events.extend(behaviour_events);
         (events, followups)
@@ -6767,8 +6882,9 @@ impl Engine {
         &mut self,
         instance_key: Key,
         element_id: String,
-        _body_key: Key,
+        body_key: Key,
         child_key: Key,
+        child_index: usize,
         child_vars: &HashMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut events = Vec::new();
@@ -6840,8 +6956,26 @@ impl Engine {
                     }
                     return (events, followups);
                 }
+                let job_type = match self.resolve_job_type(child_vars, &job_type) {
+                    Ok(job_type) => job_type,
+                    Err(reason) => {
+                        // #1390: a failed job-type expression parks the MI child
+                        // on an EXTRACT_VALUE_ERROR incident — no job; the body
+                        // keeps waiting for the child.
+                        events.push(self.extract_value_incident(
+                            instance_key,
+                            child_key,
+                            element_id,
+                            reason,
+                            Some(state::IoMappingRedrive::MiChildActivation {
+                                body_key,
+                                index: child_index,
+                            }),
+                        ));
+                        return (events, followups);
+                    }
+                };
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(child_vars, &job_type);
                 let priority = self.resolve_priority(child_vars, priority.as_deref());
                 let retries = self.resolve_retries(
                     child_vars,
@@ -6986,8 +7120,14 @@ impl Engine {
                 }
             }
         }
-        let (behaviour_events, followups) =
-            self.run_mi_child_behaviour(instance_key, element_id, body_key, child_key, &child_vars);
+        let (behaviour_events, followups) = self.run_mi_child_behaviour(
+            instance_key,
+            element_id,
+            body_key,
+            child_key,
+            index,
+            &child_vars,
+        );
         events.extend(behaviour_events);
         (events, followups)
     }
@@ -8123,8 +8263,24 @@ impl Engine {
                     Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => job_type.clone(),
                     _ => element_id.clone(),
                 };
+                let job_type = match self.resolve_job_type(&child_vars, &job_type) {
+                    Ok(job_type) => job_type,
+                    Err(reason) => {
+                        // #1390: a failed nested-container job-type expression
+                        // parks the tool child on an EXTRACT_VALUE_ERROR
+                        // incident — no agent job; the parent container keeps
+                        // waiting for the child.
+                        events.push(self.extract_value_incident(
+                            instance_key,
+                            child_key,
+                            element_id,
+                            reason,
+                            None,
+                        ));
+                        return (events, followups);
+                    }
+                };
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(&child_vars, &job_type);
                 let priority = self.resolve_priority(&child_vars, None);
                 let retries = self.resolve_retries(&child_vars, None);
                 events.push(Event::JobCreated {
@@ -8143,8 +8299,23 @@ impl Engine {
 
         match tool_kind {
             Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => {
+                let job_type = match self.resolve_job_type(&child_vars, &job_type) {
+                    Ok(job_type) => job_type,
+                    Err(reason) => {
+                        // #1390: a failed tool job-type expression parks the tool
+                        // child on an EXTRACT_VALUE_ERROR incident — no job; the
+                        // container keeps waiting for the child.
+                        events.push(self.extract_value_incident(
+                            instance_key,
+                            child_key,
+                            element_id,
+                            reason,
+                            None,
+                        ));
+                        return (events, followups);
+                    }
+                };
                 let job_key = self.mint_key();
-                let job_type = self.resolve_job_type(&child_vars, &job_type);
                 let priority = self.resolve_priority(&child_vars, None);
                 let retries = self.resolve_retries(&child_vars, None);
                 events.push(Event::JobCreated {
@@ -8847,7 +9018,23 @@ impl Engine {
                 None => return Vec::new(),
             };
         let container_vars = self.variables_for_element(instance_key, container_key);
-        let job_type = self.resolve_job_type(&container_vars, &job_type);
+        let job_type = match self.resolve_job_type(&container_vars, &job_type) {
+            Ok(job_type) => job_type,
+            Err(reason) => {
+                // #1390: a failed container job-type expression parks the
+                // container on an EXTRACT_VALUE_ERROR incident — no agent job.
+                // `redrive: None` resolves via `Step::Complete`, which routes a
+                // JOB_WORKER container back through `complete_adhoc_container`,
+                // whose turn loop re-mints the agent job via this function.
+                return vec![self.extract_value_incident(
+                    instance_key,
+                    container_key,
+                    container_element_id,
+                    reason,
+                    None,
+                )];
+            }
+        };
         let retries = self.resolve_retries(
             &container_vars,
             self.retries_of(instance_key, &container_element_id)
@@ -9347,7 +9534,42 @@ impl Engine {
         }) = self.element_kind(instance_key, &element_id)
         {
             let vars = self.variables(instance_key);
-            let resolved_id = self.resolve_job_type(&vars, &decision_id);
+            // The `decisionId` may be a FEEL expression (leading `=`). A failed
+            // evaluation is a decision-evaluation failure (Zeebe
+            // `DECISION_EVALUATION_ERROR` taxonomy — the task cannot evaluate
+            // its decision), NOT a job-type extraction failure, so it parks on
+            // a DecisionEvaluation incident with no resolved id (#1390: the
+            // previous code fell back to the raw `=…` text as the id).
+            let resolved_id = {
+                let trimmed = decision_id.trim();
+                if trimmed.starts_with('=') {
+                    match crate::feel::eval_string(trimmed, &vars) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            let incident_key = self.mint_key();
+                            return (
+                                vec![Event::IncidentRaised {
+                                    incident_key,
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    kind: state::IncidentKind::DecisionEvaluation,
+                                    redrive: None,
+                                    reason: format!(
+                                        "failed to evaluate decision id expression \
+                                         '{trimmed}' for business rule task: {e}"
+                                    ),
+                                    job_key: None,
+                                    created_at: self.now,
+                                }],
+                                Vec::new(),
+                            );
+                        }
+                    }
+                } else {
+                    decision_id.clone()
+                }
+            };
             let Some(deployed) = self.state.decisions.get(&resolved_id).cloned() else {
                 let incident_key = self.mint_key();
                 return (
@@ -9572,8 +9794,23 @@ impl Engine {
             if let Some(update) = &script_update {
                 listener_vars.extend(update.clone());
             }
+            let job_type = match self.resolve_job_type(&listener_vars, &first.job_type) {
+                Ok(job_type) => job_type,
+                Err(reason) => {
+                    // #1390: a failed end-listener job-type expression parks the
+                    // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
+                    // job; resolving re-drives completion.
+                    events.push(self.extract_value_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        reason,
+                        Some(state::IoMappingRedrive::Completion),
+                    ));
+                    return (events, Vec::new());
+                }
+            };
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&listener_vars, &first.job_type);
             let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
             events.push(Event::ExecutionListenerJobCreated {
                 job_key,
@@ -9685,8 +9922,22 @@ impl Engine {
             crate::model::ListenerEventType::End,
         );
         let first = end_listeners.first()?;
+        let job_type = match self.resolve_job_type(vars, &first.job_type) {
+            Ok(job_type) => job_type,
+            Err(reason) => {
+                // #1390: a failed end-listener job-type expression parks the
+                // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
+                // job; resolving re-drives completion.
+                return Some(self.extract_value_incident(
+                    instance_key,
+                    element_instance_key,
+                    element_id.to_string(),
+                    reason,
+                    Some(state::IoMappingRedrive::Completion),
+                ));
+            }
+        };
         let job_key = self.mint_key();
-        let job_type = self.resolve_job_type(vars, &first.job_type);
         let retries = self.resolve_retries(vars, first.retries.as_deref());
         Some(Event::ExecutionListenerJobCreated {
             job_key,
@@ -10351,8 +10602,32 @@ impl Engine {
             // preceding listener completions) is what the next listener's FEEL
             // attributes resolve against.
             let listener_vars = self.variables_for_element(instance_key, element_instance_key);
+            let job_type = match self.resolve_job_type(&listener_vars, &next.job_type) {
+                Ok(job_type) => job_type,
+                Err(reason) => {
+                    // #1390: a failed listener job-type expression parks the
+                    // element on an EXTRACT_VALUE_ERROR incident — no job. The
+                    // redrive phase matches the chain: a `start` chain gates
+                    // activation, an `end` chain gates completion.
+                    let redrive = match event_type {
+                        crate::model::ListenerEventType::Start => {
+                            state::IoMappingRedrive::Activation
+                        }
+                        crate::model::ListenerEventType::End => state::IoMappingRedrive::Completion,
+                    };
+                    return (
+                        vec![self.extract_value_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            reason,
+                            Some(redrive),
+                        )],
+                        Vec::new(),
+                    );
+                }
+            };
             let job_key = self.mint_key();
-            let job_type = self.resolve_job_type(&listener_vars, &next.job_type);
             let retries = self.resolve_retries(&listener_vars, next.retries.as_deref());
             return (
                 vec![Event::ExecutionListenerJobCreated {
@@ -10467,7 +10742,13 @@ impl Engine {
     ) -> Event {
         let listener_vars = self.variables_for_element(instance_key, element_instance_key);
         let job_key = self.mint_key();
-        let job_type = self.resolve_job_type(&listener_vars, &listener.job_type);
+        // A failed task-listener job-type expression falls back to the literal
+        // text for now: the task-listener paths mint jobs mid-transition with no
+        // incident seam yet (the user task's deferred transition cannot park on
+        // an incident from here). Tracked as part of the #1390 follow-ups.
+        let job_type = self
+            .resolve_job_type(&listener_vars, &listener.job_type)
+            .unwrap_or_else(|_| listener.job_type.clone());
         let retries = self.resolve_retries(&listener_vars, listener.retries.as_deref());
         Event::TaskListenerJobCreated {
             job_key,
@@ -10807,12 +11088,29 @@ impl Engine {
             Some(ElementKind::ServiceTask {
                 job_type, priority, ..
             }) => {
-                let job_key = self.mint_key();
                 // The element instance is already active (this is an incident
                 // retry), so resolve its FEEL attributes against its own applied
                 // scope view (input mappings + ancestors).
                 let job_vars = self.variables_for_element(instance_key, element_instance_key);
-                let job_type = self.resolve_job_type(&job_vars, &job_type);
+                let job_type = match self.resolve_job_type(&job_vars, &job_type) {
+                    Ok(job_type) => job_type,
+                    Err(reason) => {
+                        // #1390: the retried job-type expression still fails —
+                        // raise a fresh EXTRACT_VALUE_ERROR incident (no job);
+                        // resolving it retries the activation.
+                        return (
+                            vec![self.extract_value_incident(
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                reason,
+                                Some(state::IoMappingRedrive::Activation),
+                            )],
+                            Vec::new(),
+                        );
+                    }
+                };
+                let job_key = self.mint_key();
                 let priority = self.resolve_priority(&job_vars, priority.as_deref());
                 let retries = self.resolve_retries(
                     &job_vars,
@@ -13273,6 +13571,12 @@ pub const BUSINESS_ID_MAX_CHARS: usize = 256;
 /// Longest job error message (in characters) the engine records, matching
 /// Zeebe's `EngineConfiguration.DEFAULT_MAX_ERROR_MESSAGE_SIZE` (#1327).
 pub const MAX_ERROR_MESSAGE_LEN: usize = 10_000;
+
+/// Longest job type (in bytes) the engine accepts, matching Zeebe's
+/// `EngineConfiguration.DEFAULT_MAX_JOB_TYPE_LENGTH` (128). A `taskDefinition`
+/// `type` expression whose resolved value exceeds this raises an
+/// `EXTRACT_VALUE_ERROR` incident instead of creating the job (#1390).
+pub const MAX_JOB_TYPE_LENGTH: usize = 128;
 
 /// Limits a worker-reported job error message like Zeebe's
 /// `StringUtil.limitString(msg, DEFAULT_MAX_ERROR_MESSAGE_SIZE)`: a message
