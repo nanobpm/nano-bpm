@@ -542,3 +542,26 @@ test('enclosingScope does not restore an outer method across a local class bound
 }`;
   assert.deepEqual(enclosingScope(src, src.indexOf('siteL')), { cls: 'Outer', method: '' });
 });
+
+test('failure family ignores code-like text inside literals and annotated signatures', () => {
+  const errRel = 'zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record/value/ErrorType.java';
+  const tq = '"""';
+  const cells = run('failure', {
+    [errRel]: 'public enum ErrorType { EXTRACT_VALUE_ERROR; }',
+    [`${PROCESSING}/P.java`]:
+      'class P {\n' +
+      '  void s() { String a = "new Failure(message)"; char c = \'(\'; }\n' +
+      `  void t() { String b = ${tq}\n    new Failure("x", ErrorType.EXTRACT_VALUE_ERROR) {\n  ${tq}; }\n` +
+      '  Either<Failure, ?> u(@Pattern(regexp = "[)]") String x) {\n' +
+      '    return Either.left(new Failure("m", ErrorType.EXTRACT_VALUE_ERROR));\n' +
+      '  }\n' +
+      '  Either<Failure, ?> v(@Pattern(regexp = "[(]") String x) {\n' +
+      '    return Either.left(new Failure("n", ErrorType.EXTRACT_VALUE_ERROR, k));\n' +
+      '  }\n' +
+      '}\n',
+  });
+  assert.deepEqual(
+    cells.map((c) => c.id),
+    ['failure:P.u:EXTRACT_VALUE_ERROR', 'failure:P.v:EXTRACT_VALUE_ERROR'],
+  );
+});

@@ -27,6 +27,39 @@ function fail(msg) {
   throw new ExtractError(msg);
 }
 
+/**
+ * `src` with the *contents* of every string literal, char literal and text
+ * block blanked to spaces (delimiters and newlines kept, so offsets and line
+ * numbers are preserved). Construction-site matching and scope parsing run on
+ * this mask, so code-like text inside a literal (`"new Failure(x)"`, an
+ * annotation's `regexp = "[)]"`) can neither invent a site nor unbalance a
+ * signature. Expects comments already stripped.
+ */
+export function maskLiterals(src) {
+  let out = '';
+  let i = 0;
+  const blank = (t) => t.replace(/[^\n]/g, ' ');
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '"' && src.startsWith('"""', i)) {
+      const end = src.indexOf('"""', i + 3);
+      const stop = end < 0 ? src.length : end;
+      out += '"""' + blank(src.slice(i + 3, stop)) + (end < 0 ? '' : '"""');
+      i = end < 0 ? src.length : end + 3;
+    } else if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== c && src[j] !== '\n') j += src[j] === '\\' ? 2 : 1;
+      j = Math.min(j, src.length);
+      out += c + blank(src.slice(i + 1, j)) + (j < src.length ? src[j] : '');
+      i = j + 1;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 /** Java source with comments blanked out (line numbers preserved). */
 export function stripComments(src) {
   let out = '';
@@ -921,7 +954,8 @@ function extractFailures(s, cells) {
   let n = 0;
   for (const file of s.list(PROCESSING)) {
     const src = s.read(file);
-    for (const m of src.matchAll(/\bnew\s+Failure\s*\(/g)) {
+    const code = maskLiterals(src);
+    for (const m of code.matchAll(/\bnew\s+Failure\s*\(/g)) {
       const open = m.index + m[0].length - 1;
       const args = callArgs(src, open);
       let errorType = '';
@@ -940,7 +974,7 @@ function extractFailures(s, cells) {
           fail(`${at(file, src, m.index)}: unrecognised Failure error-type argument ${JSON.stringify(args[1].trim())}`);
         }
       }
-      const { cls, method } = enclosingScope(src, m.index);
+      const { cls, method } = enclosingScope(code, m.index);
       if (!cls) fail(`${at(file, src, m.index)}: Failure construction outside any class`);
       cells.add(`failure:${cls}.${method}:${errorType}`, at(file, src, m.index));
       n++;
@@ -968,14 +1002,15 @@ function extractRejections(s, cells) {
   let n = 0;
   for (const rel of s.list(PROCESSING)) {
     const src = s.read(rel);
-    for (const m of src.matchAll(/\bRejectionType\.([A-Z_]+)\b/g)) {
+    const code = maskLiterals(src);
+    for (const m of code.matchAll(/\bRejectionType\.([A-Z_]+)\b/g)) {
       // SBE's generated sentinels mean "no rejection".
       if (m[1] === 'NULL_VAL' || m[1] === 'SBE_UNKNOWN') continue;
       const before = src.slice(Math.max(0, m.index - 4), m.index);
       const after = src.slice(m.index + m[0].length, m.index + m[0].length + 12);
       if (/[=!]=\s*$/.test(before) || /^\s*[=!]=/.test(after) || /^\s*\.equals\s*\(/.test(after)) continue;
       if (!types.has(m[1])) fail(`${rel}: unknown RejectionType.${m[1]}`);
-      const { cls, method } = enclosingScope(src, m.index);
+      const { cls, method } = enclosingScope(code, m.index);
       if (!cls) fail(`${at(rel, src, m.index)}: RejectionType use outside any class`);
       cells.add(`rejection:${cls}.${method}:${m[1]}`, at(rel, src, m.index));
       n++;
