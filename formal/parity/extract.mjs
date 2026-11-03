@@ -979,6 +979,40 @@ export const FAMILIES = {
   rejection: extractRejections,
 };
 
+/** The per-site families: cells keyed by one Zeebe source site (`<Class>.<method>`). */
+export const PER_SITE_FAMILIES = new Set(['failure', 'rejection']);
+
+/**
+ * The **coarse** (pre-per-site) cell id a per-site cell refines, per the cell-id
+ * grammar this extractor emits (formal/parity/README.md). This is the single
+ * source of truth for the refinement mapping — the gap ratchet in `check.mjs`
+ * derives a refinement's parent from it rather than re-parsing the id.
+ *
+ *   `rejection:<Class>.<method>:<CODE>` -> `rejection:<Class>:<CODE>`
+ *   `failure:<Class>.<method>:<TYPE>`   -> `incident:<TYPE>`
+ *     (`incident:<ErrorType>` is the coarse counterpart of `failure:`: it records
+ *     that an error type exists, while `failure:` records every site that raises
+ *     it). A `failure:` cell with an empty `<TYPE>` (a message-only deploy-time
+ *     rejection) or the `forwarded` marker has no `incident:` counterpart.
+ *
+ * Returns null for a cell that is not a per-site refinement (a coarse cell, or
+ * one whose key carries no `.method`).
+ */
+export function coarseCellId(id) {
+  const colon = id.indexOf(':');
+  if (colon < 0) return null;
+  const family = id.slice(0, colon);
+  if (!PER_SITE_FAMILIES.has(family)) return null;
+  const rest = id.slice(colon + 1);
+  const dot = rest.indexOf('.');
+  if (dot < 0) return null; // already coarse (`rejection:<Class>:<CODE>`)
+  const cls = rest.slice(0, dot);
+  const code = rest.slice(rest.indexOf(':') + 1);
+  if (family === 'rejection') return `rejection:${cls}:${code}`;
+  // failure: refines the incident:<ErrorType> cell for its type.
+  return code && code !== 'forwarded' ? `incident:${code}` : null;
+}
+
 export function extract(root, pin) {
   const s = new Source(root);
   const cells = new Cells();

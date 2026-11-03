@@ -23,11 +23,13 @@
 // Prints per-family counts, and appends a Markdown table to
 // $GITHUB_STEP_SUMMARY when set.
 //
-// Usage: node formal/parity/check.mjs [--update-gaps | --base-gaps <target-branch gaps.json>]
+// Usage: node formal/parity/check.mjs [--update-gaps | --base-gaps <target-branch gaps.json> [--base-pin <target-branch zeebe-pin.json>]]
 
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { coarseCellId } from './extract.mjs';
 
 export const STATUSES = ['parity', 'nano-tested', 'gap', 'out-of-scope'];
 export const CORPUS = 'engine-core/tests/conformance/corpus/';
@@ -241,13 +243,51 @@ export function gapProblems(assignments, gaps) {
   return errors;
 }
 
-/** Ids the head baseline adds over the target branch's: the ratchet may only shrink. */
-export function baselineGrowth(base, head) {
+/**
+ * Ids the head baseline illegitimately adds over the target branch's: the
+ * ratchet may only shrink, with two narrow exceptions.
+ *
+ * The ratchet exists so a Zeebe **pin bump** cannot hide newly-uncovered cells
+ * under the baseline. So it is **pin-aware** (`basePin` is the target branch's
+ * `zeebe-pin.json`):
+ *
+ *  - **Pin bump** (`basePin.sha` differs from `headPin.sha`, or `basePin` is
+ *    absent — fail-closed): the baseline may only shrink. Any head id the base
+ *    does not list is rejected.
+ *  - **Same pin**: a head id the base does not list is allowed **only** as a
+ *    *refinement* — a per-site cell whose coarse parent (per `coarseCellId`,
+ *    the same grammar the extractor emits) was a base gap the head no longer
+ *    lists. E.g. `rejection:<Class>.<method>:<CODE>` may appear only when
+ *    `rejection:<Class>:<CODE>` was a base gap and is gone from head. Any other
+ *    same-pin growth still fails.
+ *  - **`failure:` seed**: a `failure:` cell's coarse parent is `incident:<TYPE>`,
+ *    which is a *covered* cell, not a base gap — so the refinement rule can
+ *    never admit the very first `failure:` cells. They are allowed to appear
+ *    only when the base baseline contains **no** `failure:` cells at all (the
+ *    one-time introduction of the family); once any `failure:` cell is in the
+ *    base, the family is shrink-only like everything else.
+ */
+export function baselineGrowth(base, head, basePin, headPin) {
   if (!Array.isArray(base)) return ['base gaps.json must have a cells array'];
   const before = new Set(base);
-  return head
-    .filter((id) => !before.has(id))
-    .map((id) => `gaps.json adds ${id}, which the target branch's baseline does not list: the baseline may only shrink`);
+  const added = head.filter((id) => !before.has(id));
+  if (added.length === 0) return [];
+  const removed = new Set(base.filter((id) => !new Set(head).has(id)));
+  // Fail closed: without the base pin we cannot tell a refinement from a bump.
+  const samePin = basePin != null && headPin != null && basePin.sha === headPin.sha;
+  const baseHasFailure = base.some((id) => id.startsWith('failure:'));
+  const errors = [];
+  for (const id of added) {
+    if (samePin) {
+      if (id.startsWith('failure:') && !baseHasFailure) continue; // one-time family seed
+      const parent = coarseCellId(id);
+      if (parent !== null && before.has(parent) && removed.has(parent)) continue; // a refinement
+    }
+    errors.push(
+      `gaps.json adds ${id}, which the target branch's baseline does not list: the baseline may only shrink`,
+    );
+  }
+  return errors;
 }
 
 /** The shrunk baseline: current gap cells that were already in it. */
@@ -304,12 +344,20 @@ function main() {
     console.log(`gaps.json: ${gapsFile.cells.length} -> ${cells.length} cells`);
     return;
   }
-  const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, load('zeebe-pin.json'));
+  const headPin = load('zeebe-pin.json');
+  const { errors, assignments } = evaluate(surface, coverage, fs, gapsFile.cells, headPin);
   const baseArg = process.argv.indexOf('--base-gaps');
   if (baseArg !== -1) {
     const basePath = process.argv[baseArg + 1];
     if (!basePath) throw new Error('--base-gaps needs a file path');
-    errors.push(...baselineGrowth(JSON.parse(readFileSync(basePath, 'utf8')).cells, gapsFile.cells));
+    const pinArg = process.argv.indexOf('--base-pin');
+    let basePin = null;
+    if (pinArg !== -1) {
+      const pinPath = process.argv[pinArg + 1];
+      if (!pinPath) throw new Error('--base-pin needs a file path');
+      basePin = JSON.parse(readFileSync(pinPath, 'utf8'));
+    }
+    errors.push(...baselineGrowth(JSON.parse(readFileSync(basePath, 'utf8')).cells, gapsFile.cells, basePin, headPin));
   }
   const report = markdownReport(tally(assignments), surface);
   process.stdout.write(report);

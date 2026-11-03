@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 import { CORPUS, baselineGrowth, evaluate, globToRegExp, markdownReport, shrinkGaps, tally } from './check.mjs';
+import { coarseCellId } from './extract.mjs';
 
 const RS = 'engine-core/src/engine/tests/lifecycle.rs';
 const FILES = {
@@ -207,4 +208,52 @@ test('the baseline may only shrink against the target branch', () => {
     "gaps.json adds c, which the target branch's baseline does not list: the baseline may only shrink",
   ]);
   assert.deepEqual(baselineGrowth(undefined, ['a']), ['base gaps.json must have a cells array']);
+});
+
+// The pin-aware ratchet (decision A', #1396): a same-pin grammar *refinement* may
+// re-baseline, but a pin *bump* and any non-refinement growth still fail.
+test('the ratchet is pin-aware and permits only refinements', () => {
+  const PIN_A = { repository: 'r', ref: 'stable/x', sha: 'aaa' };
+  const PIN_B = { ...PIN_A, sha: 'bbb' }; // a bump
+  const coarse = 'rejection:JobProcessor:NOT_FOUND';
+  const refined = 'rejection:JobProcessor.processRecord:NOT_FOUND';
+  const unrelated = 'intent:Job:BRAND_NEW';
+
+  // (a) A pin bump keeps the strict shrink-only check: even a refinement fails.
+  assert.deepEqual(baselineGrowth([coarse], [refined], PIN_A, PIN_B), [
+    `gaps.json adds ${refined}, which the target branch's baseline does not list: the baseline may only shrink`,
+  ]);
+
+  // (b) Same pin: a refinement whose coarse parent was a base gap and is removed passes.
+  assert.deepEqual(baselineGrowth([coarse], [refined], PIN_A, PIN_A), []);
+
+  // (c) Same pin: a refinement whose parent is NOT removed (still a head gap) fails.
+  assert.match(baselineGrowth([coarse], [coarse, refined], PIN_A, PIN_A)[0], new RegExp(`adds ${refined.replace('.', '\\.')}`));
+
+  // (d) Same pin: an unrelated new cell (no coarse parent in the base) fails.
+  assert.match(baselineGrowth([coarse], [refined, unrelated], PIN_A, PIN_A)[0], /adds intent:Job:BRAND_NEW/);
+
+  // Fail-closed: no base pin means we cannot tell a refinement from a bump.
+  assert.match(baselineGrowth([coarse], [refined], null, PIN_A)[0], new RegExp(`adds ${refined.replace('.', '\\.')}`));
+});
+
+test('the failure: family seeds once, then is shrink-only', () => {
+  const PIN_A = { repository: 'r', ref: 'stable/x', sha: 'aaa' };
+  const f1 = 'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR';
+  const f2 = 'failure:BpmnJobBehavior.evalRetriesExp:EXTRACT_VALUE_ERROR';
+  // (e) Same pin, base has NO failure: cells -> the family may be seeded.
+  assert.deepEqual(baselineGrowth(['intent:Job:CREATED'], ['intent:Job:CREATED', f1], PIN_A, PIN_A), []);
+  // Once any failure: cell is in the base, the family is shrink-only like the rest.
+  assert.match(baselineGrowth([f1], [f1, f2], PIN_A, PIN_A)[0], new RegExp(`adds ${f2.replace(/\./g, '\\.')}`));
+});
+
+test('coarseCellId maps a per-site cell to its coarse parent, from the extractor grammar', () => {
+  assert.equal(coarseCellId('rejection:JobProcessor.processRecord:NOT_FOUND'), 'rejection:JobProcessor:NOT_FOUND');
+  assert.equal(coarseCellId('failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR'), 'incident:EXTRACT_VALUE_ERROR');
+  // A message-only failure (empty type) and a forwarded one have no incident: parent.
+  assert.equal(coarseCellId('failure:DeploymentTransformer.transform:'), null);
+  assert.equal(coarseCellId('failure:BpmnStreamProcessor.process:forwarded'), null);
+  // Coarse cells and non-per-site families are not refinements.
+  assert.equal(coarseCellId('rejection:JobProcessor:NOT_FOUND'), null);
+  assert.equal(coarseCellId('intent:Job:CREATED'), null);
 });

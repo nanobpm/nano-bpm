@@ -685,7 +685,10 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE_REF"
           if git cat-file -e FETCH_HEAD:formal/parity/gaps.json 2>/dev/null; then
             git show FETCH_HEAD:formal/parity/gaps.json > "$RUNNER_TEMP/base-gaps.json"
-            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json"
+            # The ratchet is pin-aware: a same-pin grammar refinement may
+            # re-baseline, a pin bump may not (check.mjs --base-pin).
+            git show FETCH_HEAD:formal/parity/zeebe-pin.json > "$RUNNER_TEMP/base-pin.json"
+            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json" --base-pin "$RUNNER_TEMP/base-pin.json"
           else
             echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
             node formal/parity/check.mjs

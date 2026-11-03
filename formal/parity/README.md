@@ -89,3 +89,26 @@ node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"   # zeebe-surfa
 node formal/parity/check.mjs --update-gaps                          # shrink gaps.json
 node formal/parity/check.mjs                                        # guard + report
 ```
+
+## The gap ratchet is pin-aware and permits only refinements
+
+CI runs `check.mjs --base-gaps <target-branch gaps.json> --base-pin
+<target-branch zeebe-pin.json>` so the `gaps.json` baseline may only **shrink**.
+The ratchet exists to stop a Zeebe **pin bump** hiding newly-uncovered cells, so
+it keys on the pin:
+
+- **Pin bump** (the base pin's `sha` differs from the head's, or `--base-pin` is
+  absent — fail-closed): any head gap id the base does not list is rejected.
+- **Same pin** — a head gap id absent from the base is allowed **only** as a
+  *refinement*: a per-site cell whose coarse parent (per `coarseCellId` in
+  `extract.mjs`, the single source of truth for the grammar) was a base gap the
+  head no longer lists. So `rejection:<Class>.<method>:<CODE>` may appear only
+  when `rejection:<Class>:<CODE>` was a base gap and is gone from head. Any
+  other same-pin growth still fails.
+- **`failure:` seed** — a `failure:` cell's coarse parent is `incident:<TYPE>`,
+  a *covered* cell rather than a base gap, so the refinement rule can never
+  admit the first `failure:` cells. They may appear only when the base baseline
+  contains **no** `failure:` cells at all (the one-time introduction of the
+  family); once any `failure:` cell is in the base, the family is shrink-only
+  like everything else.
+
