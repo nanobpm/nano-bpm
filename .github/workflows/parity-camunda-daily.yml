@@ -1,0 +1,61 @@
+# Daily live Camunda 8 differential for the runtime parity runner (#1408).
+#
+# Starts a dedicated, throwaway Camunda 8 container on the runner — its version
+# derived from the Zeebe pin in formal/parity/zeebe-surface.json — and runs the
+# same scenario driver against nano and Camunda, failing on any difference in
+# the fields both expose. The container is per-job, so runs cannot interfere.
+#
+# Not a PR gate: a scheduled run reports on main's current state; a red run is
+# a parity defect (or a runner defect) to root-cause. No retries.
+
+name: Parity (live Camunda 8, daily)
+
+on:
+  schedule:
+    - cron: '41 3 * * *'
+  workflow_dispatch:
+  # Validate changes to this harness before they reach the nightly run.
+  # Non-required (not in branch protection / .mergify.yml).
+  pull_request:
+    paths:
+      - '.github/workflows/parity-camunda-daily.yml'
+      # Everything the differential consumes: the runner, driver, backends and
+      # corpus, the sources the nano read-model wasm is built from (#668: the
+      # wasm is built per run, not committed), and the Zeebe pin.
+      - 'formal/parity/runtime/**'
+      - 'engine-core/**'
+      - 'engine-wasm/**'
+      - 'read-model/**'
+      - 'Makefile'
+      - 'scripts/wasm-cc-env.sh'
+      - '.github/actions/engine-wasm-pkg/**'
+      - 'formal/parity/zeebe-surface.json'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: parity-camunda-daily-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  differential:
+    name: parity-runtime (nano vs live Camunda 8)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Build engine-wasm/pkg (the nano backend's read-model wasm)
+        uses: ./.github/actions/engine-wasm-pkg
+      - name: Start Camunda 8 (version derived from the Zeebe pin)
+        run: formal/parity/runtime/start-camunda.sh "" 8080
+      - name: Two-backend differential
+        env:
+          CAMUNDA_REST_ADDRESS: http://localhost:8080
+        run: node formal/parity/runtime/run.mjs --backend both --require-camunda
+      - name: Camunda logs
+        if: failure()
+        run: docker logs parity-camunda 2>&1 | tail -300

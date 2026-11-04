@@ -81,16 +81,10 @@ export const TRAINS = [
   {
     id: "engine-wasm",
     tagPrefix: "bojtos-npm-v",
-    version: (read) => {
-      const tmpl = packageJsonVersion(read("engine-wasm/pkg.package.json"));
-      const built = packageJsonVersion(read("engine-wasm/pkg/package.json"));
-      if (tmpl !== built) {
-        throw new Error(
-          `engine-wasm version mismatch: pkg.package.json=${tmpl} but pkg/package.json=${built} — run 'make console-wasm' first`,
-        );
-      }
-      return tmpl;
-    },
+    // The template is the only source of truth: engine-wasm/pkg/ is a build
+    // output (gitignored, #668), and release-bojtos-npm.yml builds it from the
+    // tagged source and checks the built version equals the tag.
+    version: (read) => packageJsonVersion(read("engine-wasm/pkg.package.json")),
     workflows: ["release-bojtos-npm.yml"],
   },
 ];

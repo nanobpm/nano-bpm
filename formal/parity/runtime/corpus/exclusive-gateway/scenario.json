@@ -1,0 +1,20 @@
+{
+  "name": "exclusive-gateway",
+  "bpmn": "process.bpmn",
+  "processId": "parity-exclusive",
+  "variables": { "route": "a" },
+  "steps": [
+    { "op": "activateAndComplete", "jobType": "left", "variables": { "branch": "left" } }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": { "route": "a", "branch": "left" },
+    "jobsCreated": { "left": 1 },
+    "completedElements": { "StartEvent_1": 1, "Gateway_1": 1, "Task_Left": 1, "EndEvent_L": 1 },
+    "sequenceFlows": {
+      "StartEvent_1->Gateway_1": 1,
+      "Gateway_1->Task_Left": 1,
+      "Task_Left->EndEvent_L": 1
+    }
+  }
+}

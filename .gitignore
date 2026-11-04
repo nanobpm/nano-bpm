@@ -10,6 +10,13 @@ target/
 # CI-generated artifact tree for the FFI wasm (regenerated with `make engine-wasm-ffi-dist`).
 dist/
 
+# The @nanobpm/engine-wasm package (wasm-pack output, both `lean` and `readmodel`
+# variants) — a build output, never committed (#668). Build it with
+# `make console-wasm`; CI builds it from the PR's own source via
+# .github/actions/engine-wasm-pkg. The hand-maintained manifest template
+# engine-wasm/pkg.package.json is a sibling file and stays tracked.
+/engine-wasm/pkg/
+
 # Generated stub trait implementations (produced by scripts/gen-stub-server.py).
 server/src/stub_impls.rs
 

@@ -34,7 +34,7 @@ fn extract_value_incident(engine: &Engine, element_id: &str) -> state::Incident 
     let incidents = engine.active_incidents();
     assert_eq!(incidents.len(), 1, "exactly one incident: {incidents:?}");
     let incident = incidents[0].clone();
-    assert_eq!(incident.kind, state::IncidentKind::ExpressionEvaluation);
+    assert_eq!(incident.kind, state::IncidentKind::ExtractValueError);
     assert_eq!(incident.element_id, element_id);
     incident
 }

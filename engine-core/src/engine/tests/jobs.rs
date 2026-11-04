@@ -1002,6 +1002,35 @@ fn should_resolve_feel_variable_reference_job_type_at_job_creation() {
 }
 
 #[test]
+fn should_raise_extract_value_incident_when_job_type_variable_is_missing() {
+    // #1390 (Zeebe `JobWorkerElementIncidentTest`): an unresolvable job-type
+    // expression no longer falls back to the literal text — it raises an
+    // EXTRACT_VALUE_ERROR incident and creates NO job. (This supersedes the old
+    // `should_fall_back_to_literal_when_job_type_variable_is_missing` test,
+    // which pinned the pre-#1390 fallback behaviour.)
+    let def = ProcessBuilder::new("dynamic")
+        .start_event("start")
+        .service_task("work", "=jobType + suffix")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("dynamic"))
+        .unwrap();
+
+    // No job is created; the task parks on an EXTRACT_VALUE_ERROR incident.
+    assert_eq!(engine.pending_jobs().len(), 0);
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert_eq!(active[0].element_id, "work");
+}
+
+#[test]
 fn should_reject_unknown_job() {
     let mut engine = Engine::new();
     let err = engine.apply_command(Command::complete_job(42)).unwrap_err();

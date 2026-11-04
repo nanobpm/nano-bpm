@@ -108,7 +108,7 @@ jobs:
         # permanently stuck on v0.13.1 (the project moved to wasm-bindgen/wasm-pack),
         # so installing a fixed version here keeps the build deterministic and
         # silences wasm-pack's "newer version available" self-update warning.
-        run: cargo install wasm-pack --version 0.15.0 --locked
+        run: make install-wasm-pack
 
       - name: Generate REST layer + stubs
         shell: bash
@@ -131,8 +131,7 @@ jobs:
 
       # Rebuild μ-nano (wasm-pack --release) BEFORE the SPA build so the fresh
       # wasm is bundled into console/dist. `make console-wasm` fails the job if
-      # wasm-pack is missing rather than silently falling back to the committed
-      # artifact, because here we always want a freshly built release wasm.
+      # wasm-pack is missing (engine-wasm/pkg is not committed, #668).
       - name: Rebuild μ-nano wasm (release)
         shell: bash
         run: |

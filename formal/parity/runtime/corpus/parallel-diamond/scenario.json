@@ -1,0 +1,23 @@
+{
+  "name": "parallel-diamond",
+  "bpmn": "process.bpmn",
+  "processId": "parity-parallel",
+  "variables": {},
+  "steps": [
+    { "op": "activateAndComplete", "jobType": "alpha", "variables": { "a": 1 } },
+    { "op": "activateAndComplete", "jobType": "beta", "variables": { "b": 2 } }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": { "a": 1, "b": 2 },
+    "jobsCreated": { "alpha": 1, "beta": 1 },
+    "completedElements": {
+      "StartEvent_1": 1,
+      "Split": 1,
+      "Task_A": 1,
+      "Task_B": 1,
+      "Join": 1,
+      "EndEvent_1": 1
+    }
+  }
+}

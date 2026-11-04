@@ -42,7 +42,7 @@ impl ErrorType {
     /// The engine incident kind this error type is raised as.
     pub(crate) fn incident_kind(self) -> state::IncidentKind {
         match self {
-            ErrorType::ExtractValueError => state::IncidentKind::ExpressionEvaluation,
+            ErrorType::ExtractValueError => state::IncidentKind::ExtractValueError,
         }
     }
 }
@@ -64,10 +64,7 @@ impl Failure {
     }
 }
 
-/// Zeebe's default `maxWorkerTypeLength` (`EngineConfiguration
-/// .DEFAULT_MAX_WORKER_TYPE_LENGTH = 32 * 1024`), enforced on an evaluated job
-/// type by `BpmnJobBehavior.evalTypeExp`.
-pub(crate) const MAX_JOB_TYPE_LENGTH: usize = 32 * 1024;
+pub(crate) use super::MAX_JOB_TYPE_LENGTH;
 
 /// A successfully evaluated expression: the engine [`Value`] plus the Zeebe
 /// `ResultType` name of the *native* FEEL result. The kind is authoritative
@@ -301,7 +298,7 @@ mod tests {
         );
         assert_eq!(
             f.error_type.incident_kind(),
-            state::IncidentKind::ExpressionEvaluation
+            state::IncidentKind::ExtractValueError
         );
     }
 }

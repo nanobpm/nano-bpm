@@ -236,6 +236,29 @@ impl ColdIndex {
         }
     }
 
+    /// Up to `limit` cold instances with an activatable job of `job_type`,
+    /// starting strictly after `after` and wrapping around (#1388), so a caller
+    /// can rotate past a row it could not read.
+    pub fn instances_for_job_type_rotated(
+        &self,
+        job_type: &str,
+        after: Option<Key>,
+        limit: usize,
+    ) -> Vec<Key> {
+        let Some(set) = self.by_job_type.get(job_type) else {
+            return Vec::new();
+        };
+        match after {
+            None => set.iter().take(limit).copied().collect(),
+            Some(after) => set
+                .range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+                .chain(set.range(..=after))
+                .take(limit)
+                .copied()
+                .collect(),
+        }
+    }
+
     /// Cold instances with an open subscription matching `(message_name,
     /// correlation_key)` — the ones a `CorrelateMessage` must rehydrate.
     pub fn instances_for_message(&self, message_name: &str, correlation_key: &str) -> Vec<Key> {
@@ -349,6 +372,28 @@ mod tests {
         assert_eq!(idx.instances_for_job_type("payment", 1), vec![100]);
         assert_eq!(idx.instances_for_job_type("payment", 10), vec![100, 200]);
         assert!(idx.instances_for_job_type("other", 10).is_empty());
+        // Rotation (#1388): start strictly after the cursor, wrapping around,
+        // so an unreadable oldest row cannot starve later instances.
+        assert_eq!(
+            idx.instances_for_job_type_rotated("payment", Some(100), 1),
+            vec![200]
+        );
+        assert_eq!(
+            idx.instances_for_job_type_rotated("payment", Some(100), 10),
+            vec![200, 100]
+        );
+        assert_eq!(
+            idx.instances_for_job_type_rotated("payment", Some(200), 1),
+            vec![100]
+        );
+        assert_eq!(
+            idx.instances_for_job_type_rotated("payment", None, 1),
+            vec![100]
+        );
+        assert!(
+            idx.instances_for_job_type_rotated("other", Some(1), 10)
+                .is_empty()
+        );
 
         idx.remove(100);
         assert_eq!(idx.instance_for_job(101), None);

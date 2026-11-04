@@ -351,7 +351,9 @@ fn zeebe_error_type(kind: IncidentKind) -> &'static str {
     match kind {
         IncidentKind::JobNoRetries => "JOB_NO_RETRIES",
         IncidentKind::NoMatchingSequenceFlow => "CONDITION_ERROR",
-        IncidentKind::ExpressionEvaluation => "EXTRACT_VALUE_ERROR",
+        IncidentKind::ExpressionEvaluation | IncidentKind::ExtractValueError => {
+            "EXTRACT_VALUE_ERROR"
+        }
         IncidentKind::UnhandledError => "UNHANDLED_ERROR_EVENT",
         IncidentKind::DecisionEvaluation => "DECISION_EVALUATION_ERROR",
         IncidentKind::CalledElementError => "CALLED_ELEMENT_ERROR",

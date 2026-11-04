@@ -61,8 +61,8 @@ jobs:
         # The ADR 0043 Bojtos in-browser demo, served at /demo/ (linked from the
         # marketing landing page at /). It consumes the published npm
         # `@nanobpm/bojtos-*` packages (extracted to the nanobpm/bojtos repo) and
-        # the in-repo `@nanobpm/engine-wasm` via a file: link to its committed
-        # `engine-wasm/pkg` artifacts (this job does not rebuild the wasm).
+        # the published npm `@nanobpm/engine-wasm` (website/demo/package.json),
+        # so this job does not build the wasm.
         working-directory: website/demo
         run: |
           npm ci

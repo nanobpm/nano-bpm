@@ -824,6 +824,14 @@ pub enum IncidentKind {
     /// that differs, and can only exist in an intermediate-version dev journal.
     #[cfg_attr(feature = "serde", serde(alias = "IoMappingOutput"))]
     IoMapping,
+    /// A value-extraction expression failed: a service-task / listener job
+    /// `type` expression that does not evaluate to a non-empty string within
+    /// [`crate::MAX_JOB_TYPE_LENGTH`] (Zeebe `EXTRACT_VALUE_ERROR`,
+    /// `BpmnJobBehavior.evalTypeExp`). No job is created; the element parks on
+    /// the incident, and resolving it (after fixing the variables the
+    /// expression reads) retries the activation. Additive brand-new variant —
+    /// old journals never carry it (#1390).
+    ExtractValueError,
 }
 
 /// The lifecycle re-drive an incident replays when it is resolved. Carried by
@@ -928,6 +936,14 @@ pub enum IoMappingRedrive {
     /// that produced them is gone by resolution time.
     CallActivityCompletion {
         child_variables: HashMap<String, Value>,
+    },
+    /// An ad-hoc **tool** job-type failure (#1390, `EXTRACT_VALUE_ERROR`): the
+    /// tool child was never created, so resolution re-activates the tool with
+    /// its original seed `variables` — the same clean-retry shape as
+    /// [`Self::AdHocToolActivation`]. Additive brand-new variant.
+    AdHocToolJobType {
+        element_id: ElementId,
+        variables: HashMap<String, Value>,
     },
 }
 

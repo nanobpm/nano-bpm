@@ -13,7 +13,7 @@
 #   * Rust (rustup)   — cargo/rustc toolchain for the gateway + generated crate
 #   * uv              — locked Python env (PyYAML) for the spec-preprocessing helpers
 #   * Node.js 20 + npm — builds the console SPA (console/ -> console/dist via Vite)
-#   * wasm-pack       — regenerates the in-browser engine (optional; committed artifacts otherwise)
+#   * wasm-pack       — builds the in-browser engine, engine-wasm/pkg (needed by `make console-wasm`)
 #
 # After this, `make setup && make release` (or scripts/build-tagged.sh) works from a clean clone.
 #
@@ -122,17 +122,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. wasm-pack (optional; committed engine-wasm/pkg artifacts are the fallback)
+# 6. wasm-pack (needed by `make console-wasm`; engine-wasm/pkg is not committed, #668)
 # ---------------------------------------------------------------------------
 if [ "$WANT_WASM_PACK" = 1 ]; then
   if have wasm-pack; then
     log "wasm-pack present: $(wasm-pack --version)"
   else
-    log "installing wasm-pack (cargo install)"
-    cargo install wasm-pack >/dev/null 2>&1 || echo "warning: wasm-pack install failed; committed engine-wasm/pkg artifacts will be used"
+    log "installing wasm-pack (make install-wasm-pack: the pinned WASM_PACK_VERSION)"
+    make -C "$(cd "$(dirname "$0")/.." && pwd)" install-wasm-pack >/dev/null 2>&1 || echo "warning: wasm-pack install failed; 'make console-wasm' (engine-wasm/pkg) will not build"
   fi
 else
-  log "skipping wasm-pack (--no-wasm-pack); committed engine-wasm/pkg artifacts will be used"
+  log "skipping wasm-pack (--no-wasm-pack); 'make console-wasm' (engine-wasm/pkg) will not build"
 fi
 
 # ---------------------------------------------------------------------------
@@ -145,5 +145,5 @@ printf '    java      %s\n' "$(java -version 2>&1 | head -1 || echo MISSING)"
 printf '    uv        %s\n' "$(uv --version 2>/dev/null || echo MISSING)"
 printf '    node      %s\n' "$(node --version 2>/dev/null || echo 'skipped/MISSING')"
 printf '    npm       %s\n' "$(npm --version 2>/dev/null || echo 'skipped/MISSING')"
-printf '    wasm-pack %s\n' "$(wasm-pack --version 2>/dev/null || echo 'skipped/committed-artifacts')"
+printf '    wasm-pack %s\n' "$(wasm-pack --version 2>/dev/null || echo 'skipped/MISSING')"
 log "build host ready. Next: make setup && make release  (or scripts/build-tagged.sh <ref>)"

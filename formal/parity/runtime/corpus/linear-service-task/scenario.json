@@ -1,0 +1,16 @@
+{
+  "name": "linear-service-task",
+  "bpmn": "process.bpmn",
+  "processId": "parity-linear",
+  "variables": {},
+  "steps": [
+    { "op": "activateAndComplete", "jobType": "work", "variables": { "result": "done" } }
+  ],
+  "expect": {
+    "completed": true,
+    "variables": { "result": "done" },
+    "jobsCreated": { "work": 1 },
+    "completedElements": { "StartEvent_1": 1, "Task_Work": 1, "EndEvent_1": 1 },
+    "sequenceFlows": { "StartEvent_1->Task_Work": 1, "Task_Work->EndEvent_1": 1 }
+  }
+}
