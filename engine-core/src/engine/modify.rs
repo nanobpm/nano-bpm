@@ -270,6 +270,10 @@ impl Engine {
             .collect();
         for (i, a) in planned_joins.iter().enumerate() {
             for b in &planned_joins[i + 1..] {
+                // Distinct joins keep separately keyed bookkeeping: no collision.
+                if a.element_id != b.element_id {
+                    continue;
+                }
                 let (ra, rb) = (&a.resolution, &b.resolution);
                 // Guaranteed same landing scope only when both create the same
                 // innermost scope under the same parent (the applier shares

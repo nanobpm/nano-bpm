@@ -1434,6 +1434,65 @@ fn rejects_planned_join_activations_conflicting_across_scopes() {
     }
 }
 
+/// `start -> fork -> {sub1[ s1 -> j1(parallel) -> e1 ], sub2[ s2 -> j2(parallel) -> e2 ]}`
+/// with each join awaiting a second (never-taken) branch so it stays waiting.
+fn two_joins_in_two_subs() -> ProcessDefinition {
+    let mut b = ProcessBuilder::new("two-joins")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .sub_process("sub1", "s1")
+        .start_event("s1")
+        .service_task("t1", "jt1")
+        .parallel_gateway("j1")
+        .end_event("e1")
+        .sub_process("sub2", "s2")
+        .start_event("s2")
+        .service_task("t2", "jt2")
+        .parallel_gateway("j2")
+        .end_event("e2")
+        .end_event("end1")
+        .end_event("end2");
+    for id in ["s1", "t1", "j1", "e1"] {
+        b = b.contained_in(id, "sub1");
+    }
+    for id in ["s2", "t2", "j2", "e2"] {
+        b = b.contained_in(id, "sub2");
+    }
+    b.connect("start", "fork")
+        .connect("fork", "sub1")
+        .connect("fork", "sub2")
+        .connect("s1", "t1")
+        .connect("s1", "j1")
+        .connect("t1", "j1")
+        .connect("j1", "e1")
+        .connect("s2", "t2")
+        .connect("s2", "j2")
+        .connect("t2", "j2")
+        .connect("j2", "e2")
+        .connect("sub1", "end1")
+        .connect("sub2", "end2")
+        .build()
+        .unwrap()
+}
+
+/// Distinct join elements keep separately keyed bookkeeping, so activating
+/// `j1` in one sub-process instance and `j2` in another must be accepted even
+/// though the two activations land in different flow scopes.
+#[test]
+fn allows_distinct_join_activations_in_different_scopes() {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, two_joins_in_two_subs(), HashMap::new());
+    let sub1 = eiks(&engine, inst, "sub1");
+    let sub2 = eiks(&engine, inst, "sub2");
+    assert_eq!((sub1.len(), sub2.len()), (1, 1));
+    engine
+        .apply_command(modify(
+            inst,
+            vec![under("j1", sub1[0]), under("j2", sub2[0])],
+        ))
+        .expect("distinct joins in different scopes must be accepted");
+}
+
 /// The allowed counterpart: two activations of the same join whose resolution
 /// shares the to-be-created flow-scope instance land together — the command
 /// opens ONE `sub` for both, and the two arrivals legitimately fire the join
