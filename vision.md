@@ -100,3 +100,14 @@ sides. We keep both sharp.
   build and defend it on purpose, for our users and for ourselves.
 - **Overmatch, don't match.** We measure ourselves against the best and aim to clear
   the bar with room to spare.
+
+## Design principles
+
+Any system that is powerful enough to be more than trivially useful is necessarily
+complex. Our job is to make that complexity serve the user, not burden them:
+
+- **Remove unnecessary complexity.**
+- **Progressively disclose necessary complexity.**
+- **Provide opinionated pathways with sensible defaults.** There are many ways to
+  accomplish a goal with the system; here is one that works out of the box.
+- **Provide discoverable affordances that leverage users' existing intuitions.**
