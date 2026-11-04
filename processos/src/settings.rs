@@ -426,14 +426,13 @@ pub fn default_models_dir() -> PathBuf {
         return PathBuf::from(d);
     }
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    #[cfg(target_os = "macos")]
-    {
+    // `cfg!` (not `#[cfg]`): both branches compile — and are therefore Clippy-
+    // linted by the Linux CI gate — on every target (#1368).
+    if cfg!(target_os = "macos") {
         if let Some(h) = home {
             return h.join("Library/Caches/llama.cpp");
         }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
+    } else {
         if let Some(x) = std::env::var_os("XDG_CACHE_HOME").filter(|s| !s.is_empty()) {
             return PathBuf::from(x).join("llama.cpp");
         }

@@ -1,0 +1,53 @@
+name: engine-wasm pkg (build from source)
+description: >-
+  Build the @nanobpm/engine-wasm package (engine-wasm/pkg: the `lean` and
+  `readmodel` wasm-pack variants, plus readmodel-types) from the checked-out
+  source with `make console-wasm`. engine-wasm/pkg is a gitignored build output
+  (#668), so every CI/release consumer gets it from here (or from the
+  `engine-wasm-pkg` artifact that the ci.yml `engine-wasm-ffi-dist` job uploads
+  after running this), never from a committed copy. This is the single place
+  CI installs the wasm-pack build toolchain. Requires Node on PATH (the
+  free-guard injection step of `make console-wasm` runs a .mjs script).
+inputs:
+  rust-cache:
+    description: >-
+      Cache engine-wasm/target with Swatinem/rust-cache. Set 'false' in a job
+      that already runs rust-cache itself (add `engine-wasm` to its workspaces).
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@1.99.0
+      with:
+        targets: wasm32-unknown-unknown
+    - if: inputs.rust-cache == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: engine-wasm
+        key: engine-wasm-pkg
+    - name: Install LLVM clang (wasm backend) + mold
+      # The read-model variant compiles a trimmed SQLite C amalgamation to
+      # wasm32 (GCC has no wasm backend; LLVM clang does). mold: host build
+      # scripts link with `-fuse-ld=mold` per .cargo/config.toml. The CC/AR env
+      # comes from the ONE definition, scripts/wasm-cc-env.sh (#1368).
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y llvm clang mold
+        scripts/wasm-cc-env.sh --github-env --require
+    - name: Resolve the pinned wasm-pack version (Makefile WASM_PACK_VERSION)
+      id: wasmpack
+      shell: bash
+      run: echo "version=$(make -s print-wasm-pack-version)" >> "$GITHUB_OUTPUT"
+    - name: Cache the wasm-pack binary
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/wasm-pack
+        key: wasm-pack-${{ runner.os }}-${{ steps.wasmpack.outputs.version }}
+    - name: Install wasm-pack
+      shell: bash
+      run: make install-wasm-pack
+    - name: Build engine-wasm/pkg (make console-wasm)
+      shell: bash
+      run: make console-wasm

@@ -354,6 +354,8 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         // in ONE place (the raft propose path and the direct local apply share
         // this mapping — no per-handler drift). #1306.
         E::InstanceNotFound { .. } => (404, e.to_string()),
+        // Off-heap state transiently unreadable (#1388): retryable, never 404.
+        E::InstanceUnavailable { .. } => (503, e.to_string()),
         // The suspend/resume contracts (spec/process-instances.yaml) define a
         // wrong-state transition as 409 Conflict, not 400: the instance exists
         // but its (terminal) state conflicts with the requested transition.

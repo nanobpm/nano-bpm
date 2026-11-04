@@ -1134,6 +1134,9 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         IncidentKind::DecisionEvaluation => 4,
         IncidentKind::CalledElementError => 5,
         IncidentKind::IoMapping => 6,
+        // A failed value-extraction expression (job type, #1390) — Zeebe
+        // `EXTRACT_VALUE_ERROR`.
+        IncidentKind::ExtractValueError => 8,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
@@ -1146,6 +1149,7 @@ fn incident_kind_from(code: i64) -> IncidentKind {
         // 6 and the legacy 7 (formerly `IoMappingOutput`, collapsed into the one
         // `IoMapping` kind in #946) both map to `IoMapping`.
         6 | 7 => IncidentKind::IoMapping,
+        8 => IncidentKind::ExtractValueError,
         _ => IncidentKind::JobNoRetries,
     }
 }

@@ -177,18 +177,22 @@ historical divergence is a filed parity issue; the first, the arrival-time
 inclusive-join guard, is #1241 (closed). With it landed, `RefinesZeebe` holds on
 the entire corpus, so there is no open divergence to file.
 
-The differential *runtime* half of #1240 builds on this static formal proof. Its
-first piece has landed: a **single-source corpus generator** (`formal/corpus/`,
-#1258) — one graph description per model produces its `MC*`/`ZMC*` `.tla`, its
-BPMN XML with a DI diagram, and its scenario script (job-completion order,
-message correlation, timer ticks), so the previously hand-maintained MC/ZMC
-twins are now generated from one source (see
-[Single-source corpus](corpus/README.md)). The remaining pieces — a
-Zeebe-exporter trace normaliser, the one-driver/two-backend scenario runner
-(Camunda v2 REST against Nano and a live Camunda 8), and the executable
-differential oracle + extension register — extend it to executable traces and
-land in their own follow-up slices (they need a Zeebe/Camunda-8 runtime this
-proof does not).
+The differential *runtime* half of #1240 builds on this static formal proof. Two
+pieces have landed. The first is a **single-source corpus generator**
+(`formal/corpus/`, #1258): one graph description per model produces its
+`MC*`/`ZMC*` `.tla`, its BPMN XML with a DI diagram, and its scenario script
+(job-completion order, message correlation, timer ticks), so the previously
+hand-maintained MC/ZMC twins are now generated from one source (see
+[Single-source corpus](corpus/README.md)). The second is the
+**one-driver/two-backend scenario runner** in
+[`parity/runtime`](parity/runtime/README.md) (#1260): a single scenario driver
+replayed against nano (the `engine-wasm` `TestEngine`) and, when a runtime is
+provisioned, a live Camunda 8 over v2 REST, with a change-gated, skip-tolerant,
+non-required CI job. Its seed corpus is still hand-authored; wiring it to the
+generator's output is a follow-up. The remaining pieces — a Zeebe-exporter trace
+normaliser and the executable differential oracle + extension register — land
+in their own follow-up slices (they need a Zeebe/Camunda-8 runtime this proof
+does not).
 
 ## Expected outcomes and known defects
 

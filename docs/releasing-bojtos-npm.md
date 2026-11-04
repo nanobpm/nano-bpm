@@ -40,14 +40,12 @@ After that, tagged releases publish automatically with no secret.
 ## Cutting a release
 
 1. Bump the version in `engine-wasm/pkg.package.json` (the source of truth for
-   `@nanobpm/engine-wasm`; `make console-wasm` copies it into
-   `engine-wasm/pkg/package.json`).
-2. `make console-wasm` — rebuilds the wasm so the committed artifact matches the
-   new version.
-3. Commit, open a PR, merge to `main`.
-4. Tag from `main` and push with the helper. It is a thin wrapper over the
+   `@nanobpm/engine-wasm`; `make console-wasm` copies it into the gitignored
+   build output `engine-wasm/pkg/package.json`, which is never committed).
+2. Commit, open a PR, merge to `main`.
+3. Tag from `main` and push with the helper. It is a thin wrapper over the
    canonical `scripts/release-tags.mjs` (see [`RELEASE.md`](../RELEASE.md)). It
-   checks that the template and built versions agree, that the tag is new on the
+   reads the version from the template, checks that the tag is new on the
    remote, and that `HEAD` is a clean `origin/main`. It then tags, pushes the tag
    on its own, and confirms `release-bojtos-npm` started:
    ```bash
@@ -56,9 +54,9 @@ After that, tagged releases publish automatically with no secret.
    When cutting several trains together, use `make release-tags PUSH=1` instead.
    Never push release tags in one batch: GitHub skips workflows for pushes of
    more than three tags.
-5. The `release-bojtos-npm` workflow builds the wasm from source, verifies the
+4. The `release-bojtos-npm` workflow builds the wasm from source, verifies the
    tag matches the package version, and publishes via OIDC.
-6. Verify on npmjs.com:
+5. Verify on npmjs.com:
    - <https://www.npmjs.com/package/@nanobpm/engine-wasm>
 
 ## Guardrails (so a stale engine-wasm can't ship silently)

@@ -2993,6 +2993,9 @@ fn incident_kind_tag(kind: &IncidentKind) -> &'static str {
         // the internal resolution re-drive is phase-driven off the incident's
         // `redrive`, not a distinct kind (#946).
         IncidentKind::IoMapping => "ioMapping",
+        // A failed value-extraction expression (job type, #1390) — REST
+        // `EXTRACT_VALUE_ERROR`.
+        IncidentKind::ExtractValueError => "extractValueError",
     }
 }
 

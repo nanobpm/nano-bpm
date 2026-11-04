@@ -1002,11 +1002,15 @@ fn should_resolve_feel_variable_reference_job_type_at_job_creation() {
 }
 
 #[test]
-fn should_fall_back_to_literal_when_job_type_variable_is_missing() {
-    // given the same process but no jobType variable provided
+fn should_raise_extract_value_incident_when_job_type_variable_is_missing() {
+    // #1390 (Zeebe `JobWorkerElementIncidentTest`): an unresolvable job-type
+    // expression no longer falls back to the literal text — it raises an
+    // EXTRACT_VALUE_ERROR incident and creates NO job. (This supersedes the old
+    // `should_fall_back_to_literal_when_job_type_variable_is_missing` test,
+    // which pinned the pre-#1390 fallback behaviour.)
     let def = ProcessBuilder::new("dynamic")
         .start_event("start")
-        .service_task("work", "=jobType")
+        .service_task("work", "=jobType + suffix")
         .end_event("end")
         .connect("start", "work")
         .connect("work", "end")
@@ -1018,10 +1022,12 @@ fn should_fall_back_to_literal_when_job_type_variable_is_missing() {
         .apply_command(Command::create_instance("dynamic"))
         .unwrap();
 
-    // then the unresolved expression falls back to the literal text (no panic)
-    let jobs = engine.pending_jobs();
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].job_type, "=jobType");
+    // No job is created; the task parks on an EXTRACT_VALUE_ERROR incident.
+    assert_eq!(engine.pending_jobs().len(), 0);
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
+    assert_eq!(active[0].element_id, "work");
 }
 
 #[test]

@@ -13,18 +13,20 @@ These probes exercise real `@nanobpm/engine-wasm` lean and read-model artifacts:
 - `external-routing.mjs`: external/aiAgentTask routing, expression and element-id
   fallback, priority/retries, headers, and linked prompt resources.
 - `element-support.mjs`: deploy + createInstance for `sendTask` and
-  `inclusiveGateway` (#1168) against both committed wasm variants, so the
-  advertised element support cannot regress on a stale/un-regenerated `pkg`
+  `inclusiveGateway` (#1168) against both wasm variants, so the
+  advertised element support cannot regress in the wasm build
   even while the native Rust tests pass. Uses the shared canonical diagrams in
   `engine-core/tests/fixtures/`.
 
-Run against freshly generated artifacts:
+Build the package first (`engine-wasm/pkg/` is a gitignored build output),
+then run:
 
 ```sh
+make -C ../../.. console-wasm
 npm install
 npm test
 ```
 
-The parent build owns `engine-wasm/pkg/`. These tests are part of
-`make engine-wasm-ffi-dist`; source-only changes are not verified by running them
-against an older package.
+`make engine-wasm-agent-instance-e2e` does both. CI runs these tests in the
+`engine-wasm-ffi (dist + verify)` job against the package built once from the
+PR's own source.

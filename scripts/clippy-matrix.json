@@ -1,0 +1,264 @@
+{
+  "$comment": "THE single source of truth for every Clippy (-D warnings) permutation that gates the #1357 unwrap_used/expect_used denies (#1368). Run locally with `make clippy-matrix` (or `node scripts/clippy-matrix.mjs run --job <job>|--id <id>`); ci.yml invokes the SAME runner per required job and contains no `cargo clippy` of its own. scripts/clippy-matrix.test.mjs (run in the required engine-wasm-ffi-dist job) fails when a production crate, a declared cargo feature, or a #[cfg]/#[cfg_attr] predicate (feature x target_arch x target_os, incl. not(...)) exists that no entry compiles, or when an entry's job is not a required check. `job` = the ci.yml job key; `target` = `host` (the ubuntu x86_64 CI runner) or a rustc triple; `scope` = `lib` (--lib) or `all-targets`; `wasmCc` = needs the LLVM wasm32 C toolchain env from scripts/wasm-cc-env.sh; `env` = extra env vars for the run. `unlintedCfg` is the explicit, count-ratcheted list of #[cfg] sites no permutation can compile (each with a reason / tracking issue); the guard fails on new sites, higher counts, or stale entries.",
+  "hostTriple": "x86_64-unknown-linux-gnu",
+  "hostCfg": {
+    "target_arch": "x86_64",
+    "target_os": "linux",
+    "target_family": "unix",
+    "unix": true,
+    "windows": false,
+    "target_env": "gnu",
+    "target_vendor": "unknown",
+    "target_pointer_width": "64",
+    "target_endian": "little",
+    "panic": "unwind"
+  },
+  "targets": {
+    "wasm32-unknown-unknown": {
+      "target_arch": "wasm32",
+      "target_os": "unknown",
+      "target_family": "wasm",
+      "unix": false,
+      "windows": false,
+      "target_env": "",
+      "target_vendor": "unknown",
+      "target_pointer_width": "32",
+      "target_endian": "little",
+      "panic": "abort"
+    }
+  },
+  "entries": [
+    {
+      "id": "engine-core",
+      "job": "engine-core",
+      "dir": "engine-core",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [
+        "serde",
+        "ffi"
+      ],
+      "why": "serde is REQUIRED (the golden_serde_drift guard #1069 only exists under it); ffi lints src/ffi.rs, which no other crate selects."
+    },
+    {
+      "id": "engine-wasm-wasm32",
+      "job": "engine-wasm-ffi-dist",
+      "dir": "engine-wasm",
+      "target": "wasm32-unknown-unknown",
+      "scope": "all-targets",
+      "features": [],
+      "why": "the lean console/Bojtos package surface (default features)."
+    },
+    {
+      "id": "engine-wasm-wasm32-read-model",
+      "job": "engine-wasm-ffi-dist",
+      "dir": "engine-wasm",
+      "target": "wasm32-unknown-unknown",
+      "scope": "lib",
+      "features": [
+        "read-model"
+      ],
+      "wasmCc": true,
+      "why": "all(feature = \"read-model\", target_arch = \"wasm32\") — the /readmodel package surface. --lib: the read-model test modules are host-only (they run in the engine-wasm-read-model job)."
+    },
+    {
+      "id": "engine-wasm-host-read-model",
+      "job": "engine-wasm-ffi-dist",
+      "dir": "engine-wasm",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [
+        "read-model"
+      ],
+      "why": "all(feature = \"read-model\", not(target_arch = \"wasm32\")) plus the read-model test modules."
+    },
+    {
+      "id": "read-model-native",
+      "job": "engine-wasm-ffi-dist",
+      "dir": "read-model",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [],
+      "why": "default `native` backend (the server's). Clippy never lints path deps, so read-model needs its own runs."
+    },
+    {
+      "id": "read-model-wasm",
+      "job": "engine-wasm-ffi-dist",
+      "dir": "read-model",
+      "target": "wasm32-unknown-unknown",
+      "scope": "lib",
+      "noDefaultFeatures": true,
+      "features": [
+        "wasm"
+      ],
+      "wasmCc": true,
+      "why": "all(feature = \"wasm\", not(feature = \"native\")) + wasm32-only paths. --lib: the #[cfg(test)] suites call native-only methods."
+    },
+    {
+      "id": "processos",
+      "job": "processos",
+      "dir": "processos",
+      "target": "host",
+      "scope": "all-targets",
+      "noDefaultFeatures": true,
+      "features": [],
+      "env": {
+        "DUCKDB_DOWNLOAD_LIB": "1"
+      },
+      "why": "links a prebuilt DuckDB; `duckdb-bundled` only forwards to duckdb/bundled (no cfg in processos source — see exemptFeatures)."
+    },
+    {
+      "id": "server-all-features",
+      "job": "server",
+      "dir": "server",
+      "workspace": true,
+      "target": "host",
+      "scope": "all-targets",
+      "features": [
+        "nanobpm-gateway-rest-server/console",
+        "nanobpm-gateway-rest-server/console-observe",
+        "nanobpm-gateway-rest-server/heapprof",
+        "nano-server-storage/test-hooks"
+      ],
+      "why": "every server workspace crate with every feature on (console, console-observe, heapprof, test-hooks). Needs `make generate` + a console/dist stub."
+    },
+    {
+      "id": "server-default",
+      "job": "server",
+      "dir": "server",
+      "workspace": true,
+      "target": "host",
+      "scope": "all-targets",
+      "features": [],
+      "why": "not(feature = \"console\") / not(feature = \"console-observe\") / not(feature = \"heapprof\") code — the headless gateway build."
+    },
+    {
+      "id": "server-runtime-isolated",
+      "job": "server",
+      "dir": "server/crates/nano-server-runtime",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [],
+      "why": "not(feature = \"console\") code in nano-server-runtime: in every workspace run nano-server-console's dependency forces `console` on (Cargo feature unification), so only an isolated package run compiles it off."
+    },
+    {
+      "id": "server-storage-isolated",
+      "job": "server",
+      "dir": "server/crates/nano-server-storage",
+      "target": "host",
+      "scope": "all-targets",
+      "features": [],
+      "why": "not(feature = \"console\") code in nano-server-storage: in every workspace run nano-server-console's dependency forces `console` on (Cargo feature unification), so only an isolated package run compiles it off."
+    }
+  ],
+  "excludedCrates": {
+    "load-testing/rust-worker": "load-test harness, not shipped; not in any production build.",
+    "third_party/openraft-0.9.24": "vendored upstream source (patched dependency), not our code.",
+    "third_party/proc-macro-error2-2.0.1": "vendored upstream source (patched dependency), not our code."
+  },
+  "exemptFeatures": {
+    "processos": {
+      "duckdb-bundled": "dependency forwarding only (duckdb/bundled); no #[cfg(feature)] in processos source, so it compiles no distinct processos code."
+    }
+  },
+  "unlintedCfg": [
+    {
+      "file": "read-model/src/backend/mod.rs",
+      "pred": "not(any(feature = \"native\", feature = \"wasm\"))",
+      "count": 1,
+      "reason": "guards a compile_error! (no backend selected); there is no code to lint and no valid build reaches it.",
+      "trackedIn": null
+    },
+    {
+      "file": "processos/src/main.rs",
+      "pred": "not(unix)",
+      "count": 2,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "processos/src/settings.rs",
+      "pred": "not(unix)",
+      "count": 1,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/src/main.rs",
+      "pred": "not(unix)",
+      "count": 2,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/tests/cluster_e2e.rs",
+      "pred": "not(unix)",
+      "count": 1,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/tests/falcon_e2e.rs",
+      "pred": "not(unix)",
+      "count": 1,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/tests/journal_replay_e2e.rs",
+      "pred": "not(unix)",
+      "count": 1,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-console/src/extensions.rs",
+      "pred": "windows",
+      "count": 1,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-console/src/projects.rs",
+      "pred": "not(unix)",
+      "count": 2,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-console/src/projects.rs",
+      "pred": "windows",
+      "count": 2,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-console/src/urban.rs",
+      "pred": "windows",
+      "count": 1,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-console/src/urban.rs",
+      "pred": "not(any(unix, windows))",
+      "count": 1,
+      "reason": "Windows-only code: every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-runtime/src/cmd_profile.rs",
+      "pred": "target_env = \"msvc\"",
+      "count": 1,
+      "reason": "Windows (MSVC)-only code: every required Clippy run is Linux x86_64 (gnu) or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-storage/src/memory.rs",
+      "pred": "target_env = \"msvc\"",
+      "count": 1,
+      "reason": "Windows (MSVC)-only code: every required Clippy run is Linux x86_64 (gnu) or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
+    }
+  ]
+}

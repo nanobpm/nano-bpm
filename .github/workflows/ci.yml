@@ -70,6 +70,7 @@ jobs:
       docs: ${{ steps.filter.outputs.docs }}
       dapadapter: ${{ steps.filter.outputs.dapadapter }}
       formal: ${{ steps.filter.outputs.formal }}
+      parityruntime: ${{ steps.filter.outputs.parityruntime }}
       code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v5
@@ -100,6 +101,9 @@ jobs:
               - 'rust-toolchain.toml'
               # The fail-open sccache wiring the processos job uses (#1325).
               - '.github/actions/sccache/**'
+              # The clippy matrix this job runs its Clippy step from (#1368).
+              - 'scripts/clippy-matrix.json'
+              - 'scripts/clippy-matrix.mjs'
               - '.github/workflows/ci.yml'
             console:
               - 'console/**'
@@ -140,6 +144,15 @@ jobs:
               - '.github/workflows/ci.yml'
             dapadapter:
               - 'dap-adapter/**'
+              # The inputs of the engine-wasm/pkg build it tests (#668: the
+              # pkg is built from source per run, not committed), so an engine
+              # change re-runs it against the new wasm.
+              - 'engine-core/**'
+              - 'engine-wasm/**'
+              - 'read-model/**'
+              - 'Makefile'
+              - 'scripts/wasm-cc-env.sh'
+              - '.github/actions/engine-wasm-pkg/**'
               - '.github/workflows/ci.yml'
             # TLA+ models of engine semantics and the Zeebe parity coverage
             # matrix (formal/README.md). TLC needs only a JVM, and the whole suite
@@ -154,6 +167,27 @@ jobs:
               - 'engine-core/Cargo.lock'
               # The pinned Rust toolchain compiles the FEEL differential harness.
               - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+            # The two-backend runtime parity runner (#1260, slice 5 of #1240):
+            # a single scenario driver replayed against nano (engine-wasm
+            # TestEngine) and, when a runtime is provisioned, a live Camunda 8
+            # (v2 REST). Scoped to its own paths so it runs ONLY when the runner
+            # or its corpus changes — a DISTINCT gate from `formal` above, and
+            # deliberately NON-REQUIRED (not in branch protection / .mergify.yml),
+            # so a skipped or absent-runtime run never blocks a sibling PR. The
+            # runner drives the engine-wasm read-model build, so a change to the
+            # sources it is built from must re-run it.
+            parityruntime:
+              - 'formal/parity/runtime/**'
+              # The inputs of the engine-wasm/pkg build it tests (#668: the
+              # pkg is built from source per run, not committed), so an engine
+              # change re-runs it against the new wasm.
+              - 'engine-core/**'
+              - 'engine-wasm/**'
+              - 'read-model/**'
+              - 'Makefile'
+              - 'scripts/wasm-cc-env.sh'
+              - '.github/actions/engine-wasm-pkg/**'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -239,8 +273,7 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: taiki-e/install-action@nextest
-      - name: Clippy
-        working-directory: engine-core
+      - name: Clippy (scripts/clippy-matrix.json, job engine-core)
         # `--features serde` is REQUIRED, not optional: the snapshot/event serde
         # derives (`cfg_attr(feature = "serde", ...)`) — and therefore the
         # `golden_serde_drift` CI drift guard (#1069) that fingerprints them — only
@@ -248,8 +281,10 @@ jobs:
         # and silently passes, letting an incompatible on-disk format ship
         # unnoticed (incident #1065). Linting `--all-targets --features serde` also
         # keeps the guard test itself under `-D warnings`. Downstream tasks
-        # (#1070/#1071) reuse this job; they do not re-add the flag.
-        run: cargo clippy --all-targets --features serde -- -D warnings
+        # (#1070/#1071) reuse this job; they do not re-add the flag. The exact
+        # permutations (serde + ffi) live in scripts/clippy-matrix.json, the
+        # single source of truth for every Clippy gate (#1368).
+        run: node scripts/clippy-matrix.mjs run --job engine-core
       - name: Test
         working-directory: engine-core
         # nextest for the unit/integration suite (process isolation,
@@ -291,6 +326,11 @@ jobs:
         # which zig's compiler-rt lacks; every `cargo zigbuild` site must source
         # scripts/zig-arm-shim-env.sh or the armv6 release link fails.
         run: node --test scripts/zig-arm-shim.test.mjs
+      - name: FFI dist build stays independent of wasm-pack (#668)
+        # The nano-bernd release workflows run `make engine-wasm-ffi-dist` with
+        # no wasm-pack; a browser-package (engine-wasm/pkg) prerequisite would
+        # break both client releases.
+        run: node --test scripts/ffi-dist-independent.test.mjs
       - name: sccache wired fail-open (#1325)
         # A cache-backend outage must degrade to an uncached build, not fail the
         # job: sccache may only be wired through .github/actions/sccache.
@@ -301,7 +341,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: engine-core
+          workspaces: |
+            engine-core
+            engine-wasm
           # Cache-key rider so this job doesn't fight the engine-core job's cache
           # (they build the same crate for different targets).
           key: wasm32
@@ -319,58 +361,53 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y binaryen mold llvm clang
-          cc_bin=""
-          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
-            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
-          done
-          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
-          if [ -z "$cc_bin" ]; then
-            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
+          # The ONE definition of the wasm32 C toolchain env, shared with the
+          # Makefile's WASM_READ_MODEL_ENV and the clippy matrix (#1368).
+          scripts/wasm-cc-env.sh --github-env --require
+      - name: Build engine-wasm/pkg from this PR's source (#668)
+        # engine-wasm/pkg is a gitignored build output, so every probe below runs
+        # against a wasm built from THIS commit, never a stale committed binary.
+        # Built exactly once per run: the probes call `npm test` directly (not
+        # the make targets, whose console-wasm prerequisite would rebuild it),
+        # and the same tested output is uploaded as the `engine-wasm-pkg`
+        # artifact for the dap-adapter and parity-runtime jobs.
+        uses: ./.github/actions/engine-wasm-pkg
+        with:
+          rust-cache: 'false'
+      - name: engine-wasm/pkg is never committed (#668)
+        # A tracked file under engine-wasm/pkg would be a stale second source of
+        # truth for the wasm (the class #668 removed); .gitignore keeps it out of
+        # `git add .`, this catches a forced add.
+        run: |
+          set -euo pipefail
+          tracked=$(git ls-files engine-wasm/pkg)
+          if [ -n "$tracked" ]; then
+            echo "::error::engine-wasm/pkg is a build output and must not be committed (#668); 'git rm -r --cached engine-wasm/pkg'. Tracked:"
+            echo "$tracked"
+            exit 1
           fi
-          if [ -z "$ar_bin" ]; then
-            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
-          fi
-          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
-          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
       - name: Build + verify + emit dist
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
         run: make engine-wasm-check
-      - name: Clippy engine-wasm (wasm32, default features)
-        # Enforces the crate's #1357 `unwrap_used`/`expect_used` denies:
-        # `cargo check` (engine-wasm-check) never runs lints, so without this a
-        # new production unwrap() in engine-wasm would pass CI.
-        run: make engine-wasm-clippy
-      - name: Clippy engine-wasm --features read-model + the read-model crate (host)
-        # Enforces the #1357 `unwrap_used`/`expect_used` denies on the
-        # feature-ON surface. Lives in THIS required job (not the
-        # `engine-wasm (read-model wasm32 type-check)` job, which is absent from
-        # the AGENTS.md / .mergify.yml required-check lists) so a new production
-        # unwrap() in read-model or engine-wasm's feature-enabled code actually
-        # blocks the merge gate. Two Clippy runs (see the Makefile target): the
-        # first lints engine-wasm's own `--features read-model` surface; the
-        # second lints the standalone read-model crate directly, because Clippy
-        # does NOT lint path dependencies outside the selected package — so
-        # compiling read-model through engine-wasm's feature does not enforce
-        # read-model's own denies (read-model is in no other clippy job's
-        # workspace). Host target: the read model links the bundled native
-        # SQLite there, so no wasm C toolchain is involved.
-        run: make engine-wasm-clippy-read-model
-      - name: Clippy the read-model crate's wasm backend (wasm32)
-        # Closes the last gap in the #1357 unwrap/expect gate: the host run above
-        # selects read-model's default `native` feature (excluding
-        # `src/backend/wasm.rs` and wasm32-only paths like `store.rs::now_ms`),
-        # and the wasm32 engine-wasm Clippy selects engine-wasm WITHOUT its
-        # `read-model` feature — so a production unwrap()/expect() in the wasm
-        # read-model backend would otherwise pass CI. This run lints read-model
-        # with `--no-default-features --features wasm --target
-        # wasm32-unknown-unknown`. Needs the LLVM clang/llvm-ar exported by the
-        # install step above (the build compiles a trimmed SQLite C amalgamation
-        # to wasm32). Lives in THIS required job so it actually gates the merge.
-        run: make read-model-clippy-wasm
+      - name: Clippy gate matrix covers every crate / feature / cfg (#1368)
+        # scripts/clippy-matrix.json is the single source of truth for every
+        # Clippy -D warnings permutation (the #1357 unwrap/expect denies). This
+        # guard fails when a production crate, cargo feature or #[cfg]
+        # predicate (feature x target_arch x target_os, incl. not(...)) is
+        # compiled by no entry, when an entry's job is not a required check,
+        # or when ci.yml runs `cargo clippy` outside the matrix runner.
+        run: make clippy-matrix-guard
+      - name: Clippy (scripts/clippy-matrix.json, job engine-wasm-ffi-dist)
+        # engine-wasm (wasm32 default, wasm32 + host `read-model`) and the
+        # standalone read-model crate (host `native`, wasm32 `wasm`) — Clippy
+        # never lints path deps, so each crate needs its own run. Lives in THIS
+        # required job so it gates the merge; the wasm32 read-model entries use
+        # the CC/AR env exported by the install step above.
+        run: node scripts/clippy-matrix.mjs run --job engine-wasm-ffi-dist
       - name: Bundle-split test (each subpath emits only its own _bg.wasm)
         # Guards the dual-publish acceptance criterion (#825): bundles the lean
-        # (`.`) and `/readmodel` entrypoints of the committed engine-wasm/pkg and
+        # (`.`) and `/readmodel` entrypoints of the freshly built engine-wasm/pkg and
         # asserts each module graph reaches exactly one variant's glue directory.
         # Catches regressions in pkg.package.json's `exports` map / pkg layout
         # that wasm32 type-checks can't see.
@@ -380,19 +417,31 @@ jobs:
         # Freezes the DX contract (#968): a method call on a freed TestEngine
         # handle throws a self-describing "TestEngine used after free()" — not the
         # opaque wasm-bindgen "null pointer passed to rust" — for both the lean
-        # (`.`) and read-model (`/readmodel`) entrypoints of the committed
+        # (`.`) and read-model (`/readmodel`) entrypoints of the freshly built
         # engine-wasm/pkg. Guards the guard injected by scripts/inject-free-guard.mjs.
         run: npm install && npm test
         working-directory: engine-wasm/tests/use-after-free
+      - name: AgentInstance/AgentHistory + element-support e2e (read-model TestEngine)
+        # The probe behind `make engine-wasm-agent-instance-e2e`, run directly so
+        # it reuses the package built above instead of rebuilding it.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/agent-instance-e2e
       - name: Test-Studio record loop (embedded-engine isolation example)
         # Worked example + guard (nanobpm/nano-bpm example): drives a
-        # Test-Studio-style recording session entirely through the committed
+        # Test-Studio-style recording session entirely through the freshly built
         # engine-wasm/pkg TestEngine, proving the embedded engine gives Camunda's
         # per-instance recording isolation (RESERVE_JOBS + stubCallActivities) for
         # free — jobs wait unraced and the debug stepper is the call-activity wait
         # state — on both the lean (`.`) and read-model (`/readmodel`) entrypoints.
         run: npm install && npm test
         working-directory: engine-wasm/tests/test-studio-record-loop
+      - name: Upload engine-wasm/pkg artifact (the output the probes above tested)
+        uses: actions/upload-artifact@v6
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg/
+          if-no-files-found: error
+          retention-days: 7
       - name: Read-model DTO types are derived, not hand-written (drift guard)
         # `@nanobpm/engine-wasm/readmodel-types` ships DTO types for the engine's
         # read-model query results (searchUserTasks, …). They are DERIVED from the
@@ -441,19 +490,8 @@ jobs:
           # (the wasm32 type-check escapes it only because `--target` keeps
           # target rustflags off host build scripts).
           sudo apt-get install -y llvm clang mold
-          cc_bin=""
-          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
-            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
-          done
-          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
-          if [ -z "$cc_bin" ]; then
-            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
-          fi
-          if [ -z "$ar_bin" ]; then
-            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
-          fi
-          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
-          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
+          # Same single definition as the dist/clippy builds (#1368).
+          scripts/wasm-cc-env.sh --github-env --require
       - name: Type-check engine-wasm --features read-model (wasm32)
         run: make engine-wasm-check-read-model
       - name: Test engine-wasm on the host (--features read-model)
@@ -648,7 +686,10 @@ jobs:
     # Change-gated: only run when the adapter (or this workflow) changes. A
     # skipped required check counts as success for branch protection (see the
     # `changes` job), so unrelated PRs don't pay for a Node install + wasm run.
-    needs: changes
+    # Needs the engine-wasm/pkg that engine-wasm-ffi-dist builds from this
+    # run's source (#668). The dapadapter filter is a subset of `code`, so
+    # whenever this job runs, that job runs too.
+    needs: [changes, engine-wasm-ffi-dist]
     if: ${{ github.event_name == 'merge_group' || needs.changes.outputs.dapadapter == 'true' }}
     defaults:
       run:
@@ -658,10 +699,14 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: '24'
+      - name: Download engine-wasm/pkg (built from this run's source)
+        uses: actions/download-artifact@v7
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg
       - name: Install (locked)
-        # The adapter depends on @nanobpm/engine-wasm via a committed file: path
-        # (engine-wasm/pkg), so no artifact download is needed — npm ci resolves
-        # it from the tree.
+        # The adapter depends on @nanobpm/engine-wasm via `file:../engine-wasm/pkg`,
+        # which npm ci resolves from the artifact downloaded above.
         run: npm ci
       - name: Typecheck (src + tests)
         run: npm run typecheck
@@ -752,6 +797,63 @@ jobs:
       - name: Lean build + FEEL differential fuzz
         run: formal/lean/feel-diff.sh
 
+  # Two-backend runtime parity runner (#1260, slice 5 of #1240). DISTINCT from
+  # the `formal` (tlc) job above and deliberately NON-REQUIRED: it is not in
+  # branch protection nor .mergify.yml, so a skip or a missing Camunda runtime
+  # never blocks a sibling PR (see AGENTS.md 'Merging PRs'). Change-gated to the
+  # runner's own paths. The nano half runs everywhere (in-process engine-wasm
+  # TestEngine, no Docker); the live Camunda 8 differential is SKIP-TOLERANT and
+  # runs only when a runtime is explicitly provisioned (the RUN_CAMUNDA_PARITY
+  # repo variable). The scheduled live differential against a per-job Camunda
+  # container is parity-camunda-daily.yml (#1408). NO retries anywhere: a
+  # nondeterministic scenario is a driver defect to root-cause.
+  parity-runtime:
+    name: parity-runtime (two-backend)
+    runs-on: ubuntu-24.04
+    # Needs the engine-wasm/pkg read-model build from engine-wasm-ffi-dist
+    # (#668). parityruntime is a subset of `code`, so that job always runs too.
+    needs: [changes, engine-wasm-ffi-dist]
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.changes.outputs.parityruntime == 'true' }}
+    # The live Camunda differential mutates cluster-global state (the pinned
+    # clock, job activation by type), so two runs against one provisioned
+    # runtime would interfere. Serialise the job while that step is enabled;
+    # nano-only runs (the default) keep a per-run group and never queue.
+    concurrency:
+      group: ${{ vars.RUN_CAMUNDA_PARITY == 'true' && 'parity-runtime-camunda' || format('parity-runtime-{0}', github.run_id) }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Download engine-wasm/pkg (built from this run's source)
+        uses: actions/download-artifact@v7
+        with:
+          name: engine-wasm-pkg
+          path: engine-wasm/pkg
+      - name: Runner + oracle unit tests
+        run: node --test formal/parity/runtime/*.test.mjs
+      - name: Nano backend — corpus vs. its expect oracle
+        run: node formal/parity/runtime/run.mjs --backend nano
+      # Live Camunda 8 differential. Off by default (skip-tolerant): the step is
+      # gated on the RUN_CAMUNDA_PARITY repo variable so the job stays green
+      # until a maintainer provisions a Camunda 8 runtime and turns it on. When
+      # enabled it stands up a real Camunda 8 (no stub) and runs the SAME driver
+      # against BOTH backends, asserting the differential oracle finds no
+      # difference on the fields both expose. Provisioning specifics live in
+      # formal/parity/runtime/README.md.
+      - name: Two-backend differential (live Camunda 8)
+        if: ${{ vars.RUN_CAMUNDA_PARITY == 'true' }}
+        env:
+          # Provided by the maintainer's provisioning (a service container,
+          # c8run, or a self-hosted runner). Absent ⇒ the runner self-skips the
+          # Camunda side, so this step degrades to a nano-only run rather than
+          # failing.
+          CAMUNDA_REST_ADDRESS: ${{ vars.CAMUNDA_REST_ADDRESS }}
+          CAMUNDA_AUTH_TOKEN: ${{ secrets.CAMUNDA_AUTH_TOKEN }}
+          CAMUNDA_BASIC_AUTH: ${{ secrets.CAMUNDA_BASIC_AUTH }}
+        run: node formal/parity/runtime/run.mjs --backend both
+
   processos:
     name: processos (clippy + test)
     runs-on: ubuntu-24.04
@@ -800,9 +902,9 @@ jobs:
       - name: Re-materialise the prebuilt DuckDB lib (rust-cache prunes it)
         working-directory: processos
         run: rm -rf target/*/.fingerprint/libduckdb-sys-* target/*/build/libduckdb-sys-*
-      - name: Clippy
-        working-directory: processos
-        run: cargo clippy --no-default-features --all-targets -- -D warnings
+      - name: Clippy (scripts/clippy-matrix.json, job processos)
+        # `--no-default-features` (prebuilt DuckDB) — see the matrix entry.
+        run: node scripts/clippy-matrix.mjs run --job processos
       - name: Test
         working-directory: processos
         # processos is a binary crate (no lib target) => no doctests, so nextest
@@ -854,13 +956,18 @@ jobs:
         # The `console` feature embeds ../console/dist via rust-embed, but that
         # built frontend is gitignored. A stub satisfies the proc-macro so the
         # gate can clippy/test the console code without a full npm build.
-        run: mkdir -p console/dist && printf '<!doctype html>\n' > console/dist/index.html
-      - name: Clippy
-        working-directory: server
-        # `--workspace` covers the extracted member crates (ADR 0064: e.g.
-        # crates/nano-server-storage); `console` is a feature of the bin
-        # package, so with `--workspace` it must be package-scoped.
-        run: cargo clippy --workspace --all-targets --features nanobpm-gateway-rest-server/console -- -D warnings
+        # `console-observe` (linted by the clippy matrix) embeds
+        # ../console/dist-observe instead, so stub both.
+        run: |
+          for d in console/dist console/dist-observe; do
+            mkdir -p "$d" && printf '<!doctype html>\n' > "$d/index.html"
+          done
+      - name: Clippy (scripts/clippy-matrix.json, job server)
+        # Two `--workspace` permutations (covering the ADR 0064 member crates):
+        # every feature on (console, console-observe, heapprof, test-hooks) and
+        # the default headless build (the not(feature = "console") code). The
+        # list lives in scripts/clippy-matrix.json (#1368), not here.
+        run: node scripts/clippy-matrix.mjs run --job server
       - name: Test
         working-directory: server
         # Run with nextest so the heavy, timing-sensitive integration tests
@@ -1054,14 +1161,9 @@ jobs:
             echo "no bojtos-npm-v* tag yet — nothing to compare against"; exit 0
           fi
           last_ver=${last_tag#bojtos-npm-v}
-          tmpl_ver=$(node -p "require('./engine-wasm/pkg.package.json').version")
-          pkg_ver=$(node -p "require('./engine-wasm/pkg/package.json').version")
-
-          # The committed artifact version must track the template (source of truth).
-          if [ "$tmpl_ver" != "$pkg_ver" ]; then
-            echo "::error file=engine-wasm/pkg/package.json::engine-wasm/pkg.package.json is $tmpl_ver but engine-wasm/pkg/package.json is $pkg_ver — run 'make console-wasm' to resync the built artifact."
-            exit 1
-          fi
+          # The template is the only version source: engine-wasm/pkg/ is a
+          # gitignored build output (#668) that copies it at build time.
+          pkg_ver=$(node -p "require('./engine-wasm/pkg.package.json').version")
 
           # Has the wasm-relevant source moved since the last release? Cargo.toml
           # / Cargo.lock are inputs too: a dependency or feature change alters the
@@ -1074,7 +1176,7 @@ jobs:
           # It moved → require an unreleased bump: pkg_ver must be strictly > last_ver.
           if [ "$pkg_ver" = "$last_ver" ] || \
              [ "$(printf '%s\n%s\n' "$last_ver" "$pkg_ver" | sort -V | tail -1)" != "$pkg_ver" ]; then
-            echo "::error file=engine-wasm/pkg.package.json::engine-core/engine-wasm changed since $last_tag but @nanobpm/engine-wasm is still $pkg_ver. Bump engine-wasm/pkg.package.json (then 'make console-wasm') so a new release is pending; it publishes when you push bojtos-npm-v<version> ('make release-engine-wasm')."
+            echo "::error file=engine-wasm/pkg.package.json::engine-core/engine-wasm changed since $last_tag but @nanobpm/engine-wasm is still $pkg_ver. Bump engine-wasm/pkg.package.json so a new release is pending; it publishes when you push bojtos-npm-v<version> ('make release-engine-wasm')."
             exit 1
           fi
           echo "pending engine-wasm release $pkg_ver > last published $last_ver — ok"

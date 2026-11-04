@@ -154,6 +154,16 @@ impl Commit {
     }
 }
 
+/// How a snapshot fold treats an off-heap row that is **definitively absent**
+/// from a wired, readable store (#1383). Unreadable stores always fail closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanPolicy {
+    /// Fail the capture (Raft: the snapshot is replicated and purges the log).
+    Strict,
+    /// Quarantine the orphan and proceed (local journal rotation only).
+    Quarantine,
+}
+
 /// The engine plus its durable event log.
 pub struct Journal {
     engine: Engine,
@@ -226,6 +236,42 @@ pub struct Journal {
     /// starts with an empty set and must be re-linked to the live host handle,
     /// exactly as `lenient_completion` is preserved across a snapshot load.
     cluster_variables: ClusterVariables,
+    /// Keys of instances already quarantined as **off-heap orphans** (#1383): a
+    /// spilled instance whose variable row, or a cold instance whose snapshot
+    /// row, is *definitively absent* from a readable store. Its payload is
+    /// irrecoverably lost, so the snapshot fold proceeds without it instead of
+    /// failing closed forever (which blocked every snapshot — and so all
+    /// compaction — for 23 days on merlin). Held only to log each orphan once
+    /// rather than on every snapshot tick.
+    quarantined: Mutex<HashSet<Key>>,
+    /// Count of off-heap rehydration reads that failed as **unreadable**
+    /// (SQLite/IO error or an undecodable row, #1388). The row and routing entry
+    /// are kept for a retry; this makes each such failure observable.
+    offheap_read_failures: AtomicU64,
+    /// Per-job-type rotation cursor for cold activation candidates (#1388): the
+    /// last key whose cold row was unreadable, so the next poll starts after it
+    /// and an unreadable oldest row cannot starve healthy later instances.
+    activation_cursor: HashMap<String, Key>,
+}
+
+/// Extra cold reads an activation poll may spend past `max_jobs` to skip
+/// unreadable rows (#1388).
+const ACTIVATION_EXTRA_READS: usize = 8;
+
+/// Outcome of [`Journal::rehydrate_cold`] (#1388). `Unreadable` is the
+/// transient case a command must fail closed on rather than run against state
+/// missing the instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+enum ColdRehydration {
+    /// Cold spill unset, or `key` is not cold — nothing to do.
+    NotCold,
+    /// The instance is resident again.
+    Restored,
+    /// The store is readable but has no row: lost, quarantined.
+    Absent,
+    /// The row could not be read; the instance stays cold and routable.
+    Unreadable,
 }
 
 /// Cold-spill state held by a [`Journal`]: the shared disk store, the resident
@@ -942,6 +988,9 @@ impl Journal {
             spill: None,
             cold: None,
             varstore: None,
+            quarantined: Mutex::default(),
+            offheap_read_failures: AtomicU64::new(0),
+            activation_cursor: HashMap::new(),
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -969,6 +1018,9 @@ impl Journal {
             spill: None,
             cold: None,
             varstore: None,
+            quarantined: Mutex::default(),
+            offheap_read_failures: AtomicU64::new(0),
+            activation_cursor: HashMap::new(),
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1094,6 +1146,9 @@ impl Journal {
             spill: None,
             cold: None,
             varstore: None,
+            quarantined: Mutex::default(),
+            offheap_read_failures: AtomicU64::new(0),
+            activation_cursor: HashMap::new(),
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         })
@@ -1125,6 +1180,9 @@ impl Journal {
             spill: None,
             cold: None,
             varstore: None,
+            quarantined: Mutex::default(),
+            offheap_read_failures: AtomicU64::new(0),
+            activation_cursor: HashMap::new(),
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         };
@@ -1161,6 +1219,9 @@ impl Journal {
             spill: None,
             cold: None,
             varstore: None,
+            quarantined: Mutex::default(),
+            offheap_read_failures: AtomicU64::new(0),
+            activation_cursor: HashMap::new(),
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1192,6 +1253,9 @@ impl Journal {
             spill: None,
             cold: None,
             varstore: None,
+            quarantined: Mutex::default(),
+            offheap_read_failures: AtomicU64::new(0),
+            activation_cursor: HashMap::new(),
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1369,27 +1433,65 @@ impl Journal {
         }
     }
 
-    /// Rehydrates the cold instance `key` back into hot state: takes its snapshot
-    /// from the store, restores it into the engine, and drops its routing-index
-    /// entries. A no-op (returns `false`) if cold spill is unset or `key` is not
-    /// cold. A store miss (snapshot lost) still clears the stale index entry so a
-    /// later event cannot loop trying to rehydrate a vanished instance — the
-    /// journal remains the durable source of truth.
-    fn rehydrate_cold(&mut self, key: Key) -> bool {
+    /// Rehydrates the cold instance `key` back into hot state. A no-op (returns
+    /// `false`) if cold spill is unset or `key` is not cold. Never destructive
+    /// before the instance is safe (#1388): the snapshot is read
+    /// non-destructively, restored into the engine, and only then is the routing
+    /// entry dropped and the row forgotten.
+    ///
+    /// - **Unreadable** (SQLite/IO error or undecodable row): logged at ERROR and
+    ///   counted ([`offheap_read_failures`](Journal::offheap_read_failures)); the
+    ///   index entry and the row are KEPT, so the instance stays routable and the
+    ///   next command/poll retries.
+    /// - **Definitively absent** (readable store, no row): the instance is
+    ///   already lost; quarantined via the #1383 orphan path (logged once,
+    ///   listed in [`quarantined_orphans`](Journal::quarantined_orphans)) and
+    ///   the stale index entry dropped so it cannot loop.
+    fn rehydrate_cold(&mut self, key: Key) -> ColdRehydration {
         let store = match self.cold.as_ref() {
             Some(cold) if cold.index.contains(key) => Arc::clone(&cold.store),
-            _ => return false,
+            _ => return ColdRehydration::NotCold,
         };
-        let snapshot = store.take_cold(key);
-        if let Some(cold) = self.cold.as_mut() {
-            cold.index.remove(key);
-        }
-        match snapshot {
-            Some(snapshot) => {
+        match store.try_get_cold(key) {
+            Ok(Some(snapshot)) => {
                 self.engine.rehydrate_instance(snapshot);
-                true
+                if let Some(cold) = self.cold.as_mut() {
+                    cold.index.remove(key);
+                }
+                // The instance is resident; the row is now dead. A failed delete
+                // is latched in the store's forget faults (never silent) and the
+                // row is reaped on a later forget/retire.
+                if let Err(err) = store.forget(&[key]) {
+                    tracing::error!(
+                        instance_key = key,
+                        error = %err,
+                        "cold rehydration: instance restored but its cold row could not \
+                         be forgotten (latched for retry)"
+                    );
+                }
+                ColdRehydration::Restored
             }
-            None => false,
+            Ok(None) => {
+                if let Some(cold) = self.cold.as_mut() {
+                    cold.index.remove(key);
+                }
+                self.note_orphan(
+                    key,
+                    "cold rehydration: cold instance has no row in the spill store; it is \
+                     lost — quarantined (routing entry dropped)",
+                );
+                ColdRehydration::Absent
+            }
+            Err(err) => {
+                self.offheap_read_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    instance_key = key,
+                    error = %err,
+                    "cold rehydration: cold instance's row could not be read; keeping it \
+                     cold and routable (will retry)"
+                );
+                ColdRehydration::Unreadable
+            }
         }
     }
 
@@ -1399,34 +1501,33 @@ impl Journal {
     /// keys / timer expressions read root variables; job activation (the only
     /// other restore path) is not part of either command, so without this the
     /// engine would evaluate against the empty spill placeholder.
-    fn ensure_variables_resident_for_command(&mut self, command: &Command) {
+    ///
+    /// Fails closed like the cold path (#1388): an unreadable variable row
+    /// rejects the command with the retryable
+    /// [`EngineError::InstanceUnavailable`] instead of running it against an
+    /// instance missing its variables.
+    fn ensure_variables_resident_for_command(
+        &mut self,
+        command: &Command,
+    ) -> Result<(), EngineError> {
         let instance_key = match command {
             Command::MigrateInstance { instance_key, .. }
             | Command::ModifyInstance { instance_key, .. } => *instance_key,
-            _ => return,
+            _ => return Ok(()),
         };
-        self.restore_spilled_variables(instance_key);
-    }
-
-    /// Rehydrates `key`'s spilled root variables from the spill store (lean
-    /// mode: non-destructive `get`; classic: `take`). No-op when not spilled.
-    fn restore_spilled_variables(&mut self, key: Key) {
-        if !self.engine.is_variables_spilled(key) {
-            return;
+        if !self.engine.is_variables_spilled(instance_key) {
+            return Ok(());
         }
-        let restored = if let Some(vstore) = self.varstore.as_ref() {
-            vstore.get(key)
-        } else {
-            self.spill.as_ref().and_then(|vs| vs.store.take(key))
-        };
-        match restored {
-            Some(vars) => self.engine.rehydrate_variables(key, Arc::new(vars)),
-            None => tracing::error!(
-                instance_key = key,
-                "spilled instance has no variable row in the spill store; the command \
-                 evaluates WITHOUT its process variables"
-            ),
-        }
+        self.restore_spilled_variables(instance_key, "command")
+            .map_err(|err| {
+                tracing::error!(
+                    instance_key,
+                    error = %err,
+                    "command: spilled instance's variable row could not be read; the \
+                     command is rejected as retryable (row kept)"
+                );
+                EngineError::InstanceUnavailable { instance_key }
+            })
     }
 
     /// Rehydrates any cold instance a command is about to target, so the engine
@@ -1436,10 +1537,16 @@ impl Journal {
     /// incident key, message name+correlation (`CorrelateMessage`), timer due-time
     /// (`TriggerTimers`), the instance key (`CancelInstance`), or an instance-root
     /// or element-instance scope key (`SetVariables`).
-    fn ensure_resident_for_command(&mut self, command: &Command) {
-        self.ensure_variables_resident_for_command(command);
+    ///
+    /// Fails closed (#1388): if any targeted cold instance's row is unreadable
+    /// the command is rejected with the retryable
+    /// [`EngineError::InstanceUnavailable`] BEFORE it reaches the engine, so it
+    /// can never run against state missing that instance (a misleading 404, or
+    /// a message correlated/buffered as if the cold subscriber did not exist).
+    fn ensure_resident_for_command(&mut self, command: &Command) -> Result<(), EngineError> {
+        self.ensure_variables_resident_for_command(command)?;
         let Some(cold) = self.cold.as_ref() else {
-            return;
+            return Ok(());
         };
         let mut targets: Vec<Key> = Vec::new();
         match command {
@@ -1451,10 +1558,16 @@ impl Journal {
             | Command::UpdateJob { job_key, .. } => {
                 targets.extend(cold.index.instance_for_job(*job_key));
             }
+            // Opportunistic batch commands (#1388): an unreadable candidate
+            // must not fail the whole poll/tick closed (that would let one bad
+            // row starve every healthy job or timer). Rehydrate best-effort —
+            // the unreadable instance stays cold and is retried next time.
             Command::ActivateJobs {
                 job_type, max_jobs, ..
             } => {
-                targets.extend(cold.index.instances_for_job_type(job_type, *max_jobs));
+                let (job_type, max_jobs) = (job_type.clone(), *max_jobs);
+                self.rehydrate_activation_candidates(&job_type, max_jobs);
+                return Ok(());
             }
             Command::ActivateJobsByKey { job_keys, .. } => {
                 targets.extend(
@@ -1506,12 +1619,23 @@ impl Journal {
                 );
             }
             Command::TriggerTimers { now } => {
-                targets.extend(cold.index.instances_due(*now));
+                for key in cold.index.instances_due(*now) {
+                    // An unreadable row stays cold and armed; next tick retries.
+                    let _ = self.rehydrate_cold(key);
+                }
+                return Ok(());
             }
             _ => {}
         }
+        let mut unavailable = None;
         for key in targets {
-            self.rehydrate_cold(key);
+            if self.rehydrate_cold(key) == ColdRehydration::Unreadable {
+                unavailable.get_or_insert(key);
+            }
+        }
+        match unavailable {
+            Some(instance_key) => Err(EngineError::InstanceUnavailable { instance_key }),
+            None => Ok(()),
         }
     }
 
@@ -1902,7 +2026,7 @@ impl Journal {
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
-        self.ensure_resident_for_command(&command);
+        self.ensure_resident_for_command(&command)?;
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
             .iter()
@@ -1935,7 +2059,7 @@ impl Journal {
         &mut self,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
-        self.ensure_resident_for_command(&command);
+        self.ensure_resident_for_command(&command)?;
         let events = Arc::new(self.engine.apply_command(command)?);
         let commit = self.persist(&events);
         self.maybe_spill();
@@ -2213,69 +2337,157 @@ impl Journal {
         // Rehydrate up to `max_jobs` cold instances holding an activatable job of
         // this type, so a worker poll can reach a parked-then-cold backlog. Only
         // pays a SQLite read when something of this type is actually cold.
-        if let Some(cold) = self.cold.as_ref() {
-            let candidates = cold.index.instances_for_job_type(job_type, max_jobs);
-            for key in candidates {
-                self.rehydrate_cold(key);
+        //
+        // Selection rotates past the last unreadable row (#1388) under a bounded
+        // read budget, so a permanently unreadable oldest row (kept cold and
+        // routable) cannot starve healthy later instances of the same type.
+        let Some(cold) = self.cold.as_ref() else {
+            return;
+        };
+        let budget = max_jobs.saturating_add(ACTIVATION_EXTRA_READS);
+        let after = self.activation_cursor.get(job_type).copied();
+        let candidates = cold
+            .index
+            .instances_for_job_type_rotated(job_type, after, budget);
+        let mut restored = 0usize;
+        for key in candidates {
+            if restored >= max_jobs {
+                break;
+            }
+            match self.rehydrate_cold(key) {
+                ColdRehydration::Restored => restored += 1,
+                // Unreadable rows stay cold; their jobs are simply not offered
+                // this poll, and the next poll starts after them.
+                ColdRehydration::Unreadable => {
+                    self.activation_cursor.insert(job_type.to_string(), key);
+                }
+                ColdRehydration::NotCold | ColdRehydration::Absent => {}
             }
         }
     }
 
-    fn rehydrate_activated_variables(&mut self, activated: &mut [ActivatedJob]) {
-        // Rehydrate any spilled variables the activated jobs need. In lean mode
-        // the authoritative store is read **non-destructively** (`get`) — the row
-        // must survive for the next recovery; the spilled flag is cleared so the
-        // instance is resident again and the next checkpoint keeps its (unchanged)
-        // row. Classic mode `take`s from the destructive spill cache.
-        if self.varstore.is_some() || self.spill.is_some() {
-            let varstore = self.varstore.clone();
-            let spill_store = self.spill.as_ref().map(|vs| Arc::clone(&vs.store));
-            // A single spilled instance can have *several* jobs activated in the
-            // same batch (parallel gateway / multi-instance). The first restore
-            // clears `variables_spilled`, so a later job for the same instance
-            // would skip the spilled-branch below. Rehydrate each unique instance
-            // exactly once, but refresh the variable projection for EVERY job of a
-            // rehydrated instance — otherwise the later jobs retain their empty
-            // placeholder projection and are handed to a worker without their
-            // process variables (#1331).
-            let mut rehydrated: HashSet<Key> = HashSet::new();
-            for job in activated.iter_mut() {
-                if self.engine.is_variables_spilled(job.instance_key) {
-                    let restored = if let Some(vstore) = varstore.as_ref() {
-                        vstore.get(job.instance_key)
-                    } else {
-                        spill_store.as_ref().and_then(|s| s.take(job.instance_key))
-                    };
-                    let Some(vars) = restored else {
-                        // #1331: never hand a worker the empty placeholder as if it
-                        // were the instance's variables without saying so.
-                        tracing::error!(
-                            instance_key = job.instance_key,
-                            job_key = job.key,
-                            "activation: spilled instance has no variable row in the spill \
-                             store; the job is activated WITHOUT its process variables"
-                        );
-                        continue;
-                    };
-                    let vars = Arc::new(vars);
-                    self.engine
-                        .rehydrate_variables(job.instance_key, Arc::clone(&vars));
-                    rehydrated.insert(job.instance_key);
-                }
-                if rehydrated.contains(&job.instance_key) {
-                    // Root is resident again; recompute the merged scoped view so a
-                    // job on a nested scope (sub-process / MI-child) regains its
-                    // scope-local bindings — those stayed resident through the spill,
-                    // but the worker's snapshot must fold the freshly restored root
-                    // back in. A flat instance yields the same root `Arc` back. This
-                    // runs for every activated job of the instance, not just the one
-                    // that triggered the (single) rehydrate.
-                    job.variables = self
-                        .engine
-                        .element_variables(job.instance_key, job.element_instance_key);
+    /// Rehydrates the spilled variables every activated job needs (#1331), and
+    /// drops from `activated` any job whose instance could not be rehydrated
+    /// (#1388) — a job is never handed out with the empty spill placeholder as
+    /// its variables. In lean mode the authoritative var store is read
+    /// non-destructively (the row must survive for the next recovery); classic
+    /// mode reads the spill cache non-destructively, restores, then forgets the
+    /// row.
+    ///
+    /// - **Unreadable**: logged at ERROR, counted, the row kept, the instance
+    ///   left spilled. The job stays activated in the engine (its lease expires
+    ///   and it becomes activatable again), so the activation is retried.
+    /// - **Definitively absent**: the payload is lost; the instance is
+    ///   quarantined via the #1383 orphan path (spilled flag cleared, surviving
+    ///   resident variables kept) and the job proceeds with those.
+    fn rehydrate_activated_variables(&mut self, activated: &mut Vec<ActivatedJob>) {
+        if self.varstore.is_none() && self.spill.is_none() {
+            return;
+        }
+        // A single spilled instance can have *several* jobs activated in the
+        // same batch (parallel gateway / multi-instance). Rehydrate each unique
+        // instance exactly once, but refresh the variable projection for EVERY
+        // job of a rehydrated instance (#1331).
+        // Pass 1: attempt restoration once per instance. Pass 2: refresh EVERY
+        // retained job's projection, so a job whose instance was restored by a
+        // later attempt in the batch never keeps the empty placeholder (#1388).
+        let mut attempted: HashSet<Key> = HashSet::new();
+        let mut rehydrated: HashSet<Key> = HashSet::new();
+        let targets: Vec<(Key, Key)> = activated.iter().map(|j| (j.instance_key, j.key)).collect();
+        for (instance_key, job_key) in targets {
+            if attempted.insert(instance_key) && self.engine.is_variables_spilled(instance_key) {
+                self.rehydrate_spilled_variables(instance_key, job_key);
+                if !self.engine.is_variables_spilled(instance_key) {
+                    rehydrated.insert(instance_key);
                 }
             }
         }
+        for job in activated.iter_mut() {
+            if rehydrated.contains(&job.instance_key) {
+                // Root is resident again; recompute the merged scoped view so a
+                // job on a nested scope regains its scope-local bindings.
+                job.variables = self
+                    .engine
+                    .element_variables(job.instance_key, job.element_instance_key);
+            }
+        }
+        activated.retain(|job| !self.engine.is_variables_spilled(job.instance_key));
+    }
+
+    /// Restores `instance_key`'s spilled variables into the engine (see
+    /// [`rehydrate_activated_variables`](Journal::rehydrate_activated_variables)).
+    /// On an unreadable row the instance is left spilled.
+    fn rehydrate_spilled_variables(&mut self, instance_key: Key, job_key: Key) {
+        if let Err(err) = self.restore_spilled_variables(instance_key, "activation") {
+            self.offheap_read_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                instance_key,
+                job_key,
+                error = %err,
+                "activation: spilled instance's variable row could not be read; the \
+                 job is withheld from the worker (row kept, retried when its lease \
+                 expires)"
+            );
+        }
+    }
+
+    /// The single spilled-variable restore (#1388/#1389): a non-destructive
+    /// legacy-aware read; on success the variables are rehydrated and (classic
+    /// mode) only then the dead cache row forgotten; a definitively absent row
+    /// is quarantined as an orphan (the instance keeps its surviving resident
+    /// variables). `Err` = the row is unreadable: nothing is changed, the caller
+    /// fails closed. `context` prefixes the log lines. No-op when no tier is
+    /// wired.
+    fn restore_spilled_variables(
+        &mut self,
+        instance_key: Key,
+        context: &str,
+    ) -> Result<(), String> {
+        let lean = self.varstore.is_some();
+        if !lean && self.spill.is_none() {
+            return Ok(());
+        }
+        // Legacy-aware (#1388): a lean miss is only "absent" once the legacy
+        // tier is wired and also has no row; otherwise it fails closed.
+        match self.peek_spilled_variables(instance_key)? {
+            Some(vars) => {
+                self.engine
+                    .rehydrate_variables(instance_key, Arc::new(vars));
+                if !lean {
+                    // Classic: the payload is resident again — only now is the
+                    // destructive cache row dead (#1388).
+                    if let Some(Err(err)) = self
+                        .spill
+                        .as_ref()
+                        .map(|vs| vs.store.forget(&[instance_key]))
+                    {
+                        tracing::error!(
+                            instance_key,
+                            error = %err,
+                            "{context}: variables restored but the spill row could \
+                             not be forgotten (latched for retry)"
+                        );
+                    }
+                }
+            }
+            None => {
+                self.note_orphan(
+                    instance_key,
+                    &format!(
+                        "{context}: spilled instance's variable row is definitively absent \
+                         from a readable store; its spilled variables are lost — quarantined \
+                         (continuing with its surviving resident variables)"
+                    ),
+                );
+                let resident = self
+                    .engine
+                    .instance(instance_key)
+                    .map(|i| Arc::clone(&i.variables))
+                    .unwrap_or_default();
+                self.engine.rehydrate_variables(instance_key, resident);
+            }
+        }
+        Ok(())
     }
 
     /// Fires every due timer at logical instant `now`, journaling the resulting
@@ -2288,7 +2500,8 @@ impl Journal {
         if let Some(cold) = self.cold.as_ref() {
             let due = cold.index.instances_due(now);
             for key in due {
-                self.rehydrate_cold(key);
+                // An unreadable row stays cold and armed; the next tick retries.
+                let _ = self.rehydrate_cold(key);
             }
         }
         let events = Arc::new(self.engine.trigger_timers(now));
@@ -2393,60 +2606,227 @@ impl Journal {
         let mut snap = self.engine.snapshot();
         // Best-effort (see the doc above): a failed fold is logged and left
         // as-is; durable recovery points use `try_engine_snapshot` instead.
-        let _ = self.fold_offheap_into(&mut snap);
+        let _ = self.fold_offheap_into(&mut snap, OrphanPolicy::Strict);
         snap
     }
 
     /// The fail-closed counterpart of [`engine_snapshot`](Journal::engine_snapshot):
     /// `Some(snapshot)` only when **every** indexed off-heap payload (each cold
     /// instance, each spilled variable map) folded in successfully, `None` if any
-    /// read failed or was absent. Snapshot rotation + compaction
+    /// read **failed** (an unreadable store/row). A *definitively absent* row is
+    /// not a failure: its payload is already lost, so the instance is quarantined
+    /// and the snapshot proceeds (#1383). Snapshot rotation + compaction
     /// ([`snapshot_and_rotate`](Journal::snapshot_and_rotate)) gates on this: an
     /// incomplete snapshot must never be sealed and written, or compacting the
     /// covered journal prefix would permanently discard the state the fold could
     /// not read (a transient SQLite/read/deserialization failure turned into
     /// durable data loss). Returning `None` aborts the rotation before the seal,
     /// so no segment becomes eligible for compaction and the next tick retries.
+    ///
+    /// **Strict** (Copilot review on #1387): a definitively absent row also
+    /// fails the capture here. This is the Raft snapshot builder's capture
+    /// (`get_snapshot_builder`): a Raft snapshot lets openraft purge the covered
+    /// log and is shipped to peers, so a replica-local cache miss must never be
+    /// turned into replicated state loss without a replicated transition
+    /// recording it. Only the local journal rotation tolerates orphans — see
+    /// [`try_engine_snapshot_quarantining`](Journal::try_engine_snapshot_quarantining).
     pub fn try_engine_snapshot(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
         let mut snap = self.engine.snapshot();
-        self.fold_offheap_into(&mut snap)?;
+        self.fold_offheap_into(&mut snap, OrphanPolicy::Strict)?;
+        Some(snap)
+    }
+
+    /// The local-journal-rotation capture (#1383): like
+    /// [`try_engine_snapshot`](Journal::try_engine_snapshot), fail-closed on an
+    /// *unreadable* store, but a row that is **definitively absent** from a
+    /// readable, wired store is quarantined (logged once, see `note_orphan`) so a
+    /// permanently lost payload cannot block local snapshots + compaction forever.
+    pub fn try_engine_snapshot_quarantining(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        let mut snap = self.engine.snapshot();
+        self.fold_offheap_into(&mut snap, OrphanPolicy::Quarantine)?;
         Some(snap)
     }
 
     /// Folds cold instances and spilled variable payloads into `snap` (see
     /// [`engine_snapshot`](Journal::engine_snapshot)). Fail-closed: returns `None`
     /// the moment any indexed payload cannot be folded in (a cold row that will
-    /// not read, or a spilled variable map with no row in the spill store), so a
+    /// not read, or a spilled variable map whose row will not read), so a
     /// caller that will go on to seal + compact can abort instead of persisting an
-    /// incomplete snapshot. The `engine_snapshot` wrapper ignores the `None` (a
+    /// incomplete snapshot. A row that is *definitively absent* from a readable
+    /// store is instead quarantined (#1383, see `note_orphan`). The `engine_snapshot` wrapper ignores the `None` (a
     /// payload that cannot be found is logged as an error and left as-is rather
     /// than silently serialized as an empty map); `try_engine_snapshot` honours it.
-    fn fold_offheap_into(&self, snap: &mut nanobpmn_engine_core::EngineSnapshot) -> Option<()> {
+    fn fold_offheap_into(
+        &self,
+        snap: &mut nanobpmn_engine_core::EngineSnapshot,
+        policy: OrphanPolicy,
+    ) -> Option<()> {
         // Cold rows carry their variables inline (a variable-spilled instance is
         // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
         // fold keeps them as-is; the loop below only resolves *resident*
         // variable-spilled instances.
-        self.fold_cold_into(&mut snap.state)?;
+        self.fold_cold_into(&mut snap.state, policy)?;
         for instance in snap.state.instances.values_mut() {
             if !instance.variables_spilled {
                 continue;
             }
             match self.peek_spilled_variables(instance.key) {
-                Some(vars) => {
+                Ok(Some(vars)) => {
                     instance.variables = Arc::new(vars);
                     instance.variables_spilled = false;
                 }
-                None => {
+                // Definitive absence (#1383): the store read fine and has no row,
+                // so retrying can never succeed. The variables are already lost;
+                // blocking the snapshot would only stall compaction for every
+                // other instance forever. Quarantine: clear the spilled flag and
+                // KEEP the resident map — a legacy spilled instance may already
+                // hold values merged in from journal-tail variable updates, and
+                // those survive (Copilot review on #1387). Strict captures (Raft)
+                // fail closed instead.
+                Ok(None) if policy == OrphanPolicy::Quarantine => {
+                    self.note_orphan(
+                        instance.key,
+                        "snapshot: spilled instance has no variable row in the spill store; \
+                         its spilled variables are lost — quarantined (snapshotted with its \
+                         surviving resident variables) so snapshots and compaction are not \
+                         blocked",
+                    );
+                    instance.variables_spilled = false;
+                }
+                Ok(None) => {
                     tracing::error!(
                         instance_key = instance.key,
-                        "snapshot: spilled instance has no variable row in the spill store; \
-                         its variables are lost"
+                        "snapshot (strict): spilled instance has no variable row; aborting \
+                         this snapshot"
+                    );
+                    return None;
+                }
+                // Unreadable (SQLite/IO/decode): possibly transient — fail closed
+                // so the rotation aborts before the seal and the next tick retries.
+                Err(err) => {
+                    tracing::error!(
+                        instance_key = instance.key,
+                        error = %err,
+                        "snapshot: spilled instance's variable row could not be read; \
+                         aborting this snapshot (will retry)"
                     );
                     return None;
                 }
             }
         }
         Some(())
+    }
+
+    /// Records `key` as a quarantined off-heap orphan, logging `msg` at ERROR
+    /// only the first time it is seen (#1383 — the fold runs every snapshot
+    /// tick, and an orphan is permanent).
+    fn note_orphan(&self, key: Key, msg: &str) {
+        let first = self
+            .quarantined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+        if first {
+            tracing::error!(instance_key = key, "{msg}");
+        }
+    }
+
+    /// Number of off-heap rehydration reads that failed as unreadable so far
+    /// (#1388) — the row was kept and the read will be retried.
+    pub fn offheap_read_failures(&self) -> u64 {
+        self.offheap_read_failures.load(Ordering::Relaxed)
+    }
+
+    /// The worker-facing [`ActivatedJob`] for `job_key` (#1388): `None` while the
+    /// owning instance's variables are still spilled off-heap, so a job is never
+    /// handed to a worker with the empty spill placeholder as its variables.
+    /// The instance is rehydrated at this boundary first: `apply_command_at`
+    /// may have re-spilled it right after activation (`maybe_spill`), and a
+    /// healthy activation must not be withheld for that.
+    pub fn resident_activated_job(&mut self, job_key: Key) -> Option<ActivatedJob> {
+        let mut job = self.engine.activated_job(job_key)?;
+        if self.engine.is_variables_spilled(job.instance_key)
+            && (self.varstore.is_some() || self.spill.is_some())
+        {
+            self.rehydrate_spilled_variables(job.instance_key, job_key);
+            if !self.engine.is_variables_spilled(job.instance_key) {
+                job.variables = self
+                    .engine
+                    .element_variables(job.instance_key, job.element_instance_key);
+            }
+        }
+        if self.engine.is_variables_spilled(job.instance_key) {
+            tracing::error!(
+                job_key,
+                instance_key = job.instance_key,
+                "activation: withholding job whose instance variables are still spilled"
+            );
+            return None;
+        }
+        Some(job)
+    }
+
+    /// Instance keys quarantined as off-heap orphans so far (#1383), sorted.
+    pub fn quarantined_orphans(&self) -> Vec<Key> {
+        let mut keys: Vec<Key> = self
+            .quarantined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    /// Boot-time reconciliation (#1383): checks every variable-spilled instance
+    /// in hot state against the off-heap stores and quarantines each one whose
+    /// row is **definitively absent** — clearing its spilled flag (it becomes
+    /// resident with an empty variable set; the payload was already lost, e.g.
+    /// state carried over from a pre-#1331 snapshot whose spill store was wiped).
+    /// Logs a single summary line and returns the quarantined keys. An
+    /// *unreadable* store is left alone (the snapshot fold fails closed on it and
+    /// retries). Run once after recovery, with the spill tiers wired.
+    pub fn reconcile_offheap_orphans(&mut self) -> Vec<Key> {
+        let spilled: Vec<Key> = self
+            .engine
+            .state()
+            .instances
+            .values()
+            .filter(|i| i.variables_spilled)
+            .map(|i| i.key)
+            .collect();
+        let mut orphans = Vec::new();
+        for key in spilled {
+            if matches!(self.peek_spilled_variables(key), Ok(None)) {
+                // Keep the resident map (it may hold journal-tail updates merged
+                // in after the legacy snapshot) — only the spilled flag clears.
+                let current = self
+                    .engine
+                    .state()
+                    .instances
+                    .get(&key)
+                    .map(|i| Arc::clone(&i.variables))
+                    .unwrap_or_default();
+                self.engine.rehydrate_variables(key, current);
+                self.quarantined
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key);
+                orphans.push(key);
+            }
+        }
+        if !orphans.is_empty() {
+            orphans.sort_unstable();
+            tracing::error!(
+                count = orphans.len(),
+                instance_keys = ?orphans,
+                "boot reconciliation: quarantined spilled instance(s) whose variable row \
+                 is missing from the spill store; their spilled variables are lost and \
+                 they keep only their surviving resident variables"
+            );
+        }
+        orphans
     }
 
     /// Folds every cold (wholly off-heap) instance's control state back into
@@ -2466,7 +2846,11 @@ impl Journal {
     /// variable-spilled instance is never cold-shed —
     /// [`Engine::snapshot_instance`] refuses it), so the returned payloads are
     /// authoritative.
-    fn fold_cold_into(&self, state: &mut nanobpmn_engine_core::State) -> Option<VarUpsertDelta> {
+    fn fold_cold_into(
+        &self,
+        state: &mut nanobpmn_engine_core::State,
+        policy: OrphanPolicy,
+    ) -> Option<VarUpsertDelta> {
         let mut folded = Vec::new();
         // No cold tier configured is not a failure — nothing to fold, so succeed
         // with an empty delta. Only an indexed cold row that will not read fails
@@ -2475,18 +2859,35 @@ impl Journal {
             return Some(folded);
         };
         for key in cold.index.keys() {
-            match cold.store.get_cold(key) {
-                Some(instance) => {
+            match cold.store.try_get_cold(key) {
+                Ok(Some(instance)) => {
                     nanobpmn_engine_core::restore_instance_snapshot(state, instance);
                     if let Some(inst) = state.instances.get(&key) {
                         folded.push((key, Arc::clone(&inst.variables)));
                     }
                 }
-                None => {
+                // Definitive absence (#1383): the whole instance is already lost
+                // and can never be folded in; quarantine it (log once) rather
+                // than block every future snapshot and all compaction.
+                Ok(None) if policy == OrphanPolicy::Quarantine => self.note_orphan(
+                    key,
+                    "snapshot: cold instance has no row in the spill store; it is lost \
+                     — quarantined (omitted) so snapshots and compaction are not blocked",
+                ),
+                Ok(None) => {
                     tracing::error!(
                         instance_key = key,
-                        "snapshot: cold instance has no row in the spill store; \
-                         it cannot be included in the snapshot"
+                        "snapshot (strict): cold instance has no row; aborting this snapshot"
+                    );
+                    return None;
+                }
+                // Unreadable: possibly transient — fail closed and retry.
+                Err(err) => {
+                    tracing::error!(
+                        instance_key = key,
+                        error = %err,
+                        "snapshot: cold instance's row could not be read; aborting this \
+                         snapshot (will retry)"
                     );
                     return None;
                 }
@@ -2497,15 +2898,45 @@ impl Journal {
 
     /// Reads a spilled instance's variables without consuming them: from the
     /// authoritative var store in lean mode, else from the spill cache.
-    fn peek_spilled_variables(&self, key: Key) -> Option<HashMap<String, Value>> {
-        if let Some(vstore) = self.varstore.as_ref() {
-            return vstore.get(key);
-        }
-        self.spill
+    ///
+    /// `Ok(None)` is a definitive absence — **only** a successful lookup in a
+    /// wired, readable store establishes it. `Err` covers an unreadable
+    /// store/row (#1383), **no store wired at all** (startup may continue
+    /// without the spill tier, so an unwired store proves nothing about the row
+    /// on disk), and a lean-mode miss whose legacy spill row still exists (a
+    /// lean-over-legacy transition that has not migrated it yet) — all of which
+    /// must fail closed rather than be quarantined (Copilot review on #1387).
+    fn peek_spilled_variables(&self, key: Key) -> Result<Option<HashMap<String, Value>>, String> {
+        let legacy = self
+            .spill
             .as_ref()
             .map(|vs| &vs.store)
-            .or(self.cold.as_ref().map(|c| &c.store))
-            .and_then(|store| store.get(key))
+            .or(self.cold.as_ref().map(|c| &c.store));
+        if let Some(vstore) = self.varstore.as_ref() {
+            return match vstore.try_get(key).map_err(|e| e.to_string())? {
+                Some(vars) => Ok(Some(vars)),
+                // Don't restore the (possibly stale) legacy row; just refuse to
+                // call the payload lost while it still exists.
+                None => match legacy {
+                    Some(store) => match store.try_get(key).map_err(|e| e.to_string())? {
+                        Some(_) => Err("var store has no row but a legacy spill row exists \
+                                        (unmigrated lean-over-legacy state)"
+                            .to_string()),
+                        None => Ok(None),
+                    },
+                    // No legacy tier to check: an empty var store cannot prove
+                    // a lean-over-legacy placeholder's payload is gone — fail
+                    // closed (Copilot review on #1387).
+                    None => Err("var store has no row and no legacy spill tier is wired \
+                                 to rule out an unmigrated legacy row"
+                        .to_string()),
+                },
+            };
+        }
+        match legacy {
+            Some(store) => store.try_get(key).map_err(|e| e.to_string()),
+            None => Err("no spill store wired; cannot establish row absence".to_string()),
+        }
     }
 
     /// Whether this journal is backed by a segmented (bounded-disk) log.
@@ -2543,7 +2974,7 @@ impl Journal {
         // off-heap payload could not be folded in, so an incomplete snapshot is
         // never sealed/written and its covered prefix never becomes eligible for
         // compaction — the caller skips this tick and retries.
-        let snap = self.try_engine_snapshot()?;
+        let snap = self.try_engine_snapshot_quarantining()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
             return None;
@@ -2624,7 +3055,7 @@ impl Journal {
         &self,
     ) -> Option<(nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta)> {
         let mut snap = self.engine.snapshot_control_only();
-        let cold_upserts = self.fold_cold_into(&mut snap.state)?;
+        let cold_upserts = self.fold_cold_into(&mut snap.state, OrphanPolicy::Quarantine)?;
         for (key, _) in &cold_upserts {
             if let Some(inst) = snap.state.instances.get_mut(key)
                 && !inst.variables.is_empty()
@@ -2949,7 +3380,7 @@ mod tests {
         assert_eq!(reaped, 1, "the cold instance below the mark is reaped");
         assert_eq!(journal.cold_count(), 0, "cold index entry dropped");
         assert!(
-            store.take_cold(key).is_none(),
+            store.try_get_cold(key).unwrap().is_none(),
             "cold disk row forgotten (no leak)"
         );
     }
@@ -2968,7 +3399,10 @@ mod tests {
 
         journal.retire_instances(&[key]);
         assert_eq!(journal.cold_count(), 0, "cold index entry dropped");
-        assert!(store.take_cold(key).is_none(), "cold disk row forgotten");
+        assert!(
+            store.try_get_cold(key).unwrap().is_none(),
+            "cold disk row forgotten"
+        );
     }
 
     #[test]
@@ -3063,11 +3497,11 @@ mod tests {
         journal.evict_instances(&[a]);
 
         assert!(
-            store.take(a).is_none(),
+            store.try_get(a).unwrap().is_none(),
             "evicted instance's spill row is gone"
         );
         assert!(
-            store.take(b).is_some(),
+            store.try_get(b).unwrap().is_some(),
             "a live instance's spill row is untouched"
         );
     }
@@ -3790,7 +4224,7 @@ mod tests {
         let mut rebooted = Journal::in_memory();
         rebooted.set_varstore(Arc::clone(&varstore));
         rebooted.restore_engine_from_snapshot(snap);
-        if let Some(stored) = varstore.get(key) {
+        if let Some(stored) = varstore.try_get(key).unwrap() {
             rebooted.engine.install_variables(key, stored);
         }
 
@@ -3807,55 +4241,382 @@ mod tests {
         );
     }
 
-    // Copilot review #1332 (fail-closed snapshot): a spilled instance whose
-    // variable row is missing from the spill store must NOT be baked into a
-    // compaction-gating snapshot as an empty placeholder — that would let
-    // compaction discard the journal prefix that still holds its variables,
-    // turning a transient read/lookup miss into permanent data loss.
-    // `try_engine_snapshot` must fail closed (return `None`) so the rotation
-    // aborts before the seal; the best-effort `engine_snapshot` still returns a
-    // value for the non-gating Raft catch-up path.
-    #[test]
-    fn try_engine_snapshot_fails_closed_on_missing_spill_row() {
-        let path = restart_store_path("fail-closed-spill");
-        let (journal, keys) = spilled_journal(&path, 2);
+    // ---- #1388: rehydration must never destroy an unreadable row nor drop an
+    // instance / hand out a job with empty variables. ----
 
-        // Corrupt the off-heap tier: delete one spilled instance's variable row
-        // while the live engine still flags it spilled. The fold now cannot
-        // resolve that instance's variables.
+    fn raw_row_count(path: &std::path::Path, table: &str, key: Key) -> i64 {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE key = ?1"),
+            [key as i64],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn corrupt_row(path: &std::path::Path, table: &str, col: &str, key: Key) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let n = conn
+            .execute(
+                &format!("UPDATE {table} SET {col} = 'not-json{{' WHERE key = ?1"),
+                [key as i64],
+            )
+            .unwrap();
+        assert_eq!(n, 1, "precondition: row to corrupt exists");
+    }
+
+    /// A journal whose single demo instance is cold-spilled to a file store.
+    fn cold_file_journal(path: &std::path::Path) -> (Journal, Key) {
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(path)).unwrap());
+        journal.set_cold_spill(store, 1, 0);
+        let key = deploy_and_create(&mut journal);
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(journal.instance(key).is_none());
+        (journal, key)
+    }
+
+    #[test]
+    fn corrupt_spill_row_withholds_activation_and_keeps_the_row() {
+        let path = restart_store_path("corrupt-spill-1388");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        corrupt_row(&path, "spill", "vars", keys[0]);
+
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert!(jobs.is_empty(), "no job handed out with empty variables");
+        assert_eq!(raw_row_count(&path, "spill", keys[0]), 1, "row survives");
+        assert!(
+            journal.engine.is_variables_spilled(keys[0]),
+            "still spilled"
+        );
+        assert!(journal.offheap_read_failures() >= 1, "failure observable");
+        assert!(journal.quarantined_orphans().is_empty(), "not an orphan");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn corrupt_spill_row_rejects_migration_as_retryable_and_keeps_the_row() {
+        // Migration/modification restore the spilled root before planning (#1374).
+        // An UNREADABLE row must fail closed exactly like activation (#1388):
+        // reject as retryable, never run against an instance missing its
+        // variables, never destroy the row.
+        let path = restart_store_path("corrupt-spill-migrate-1374");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        corrupt_row(&path, "spill", "vars", keys[0]);
+
+        let result = journal.apply_command(Command::migrate_instance(keys[0], 0, Vec::new()));
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::InstanceUnavailable { instance_key }) if instance_key == keys[0]
+            ),
+            "migration of an unreadable spilled instance is rejected as retryable"
+        );
+        assert_eq!(raw_row_count(&path, "spill", keys[0]), 1, "row survives");
+        assert!(
+            journal.engine.is_variables_spilled(keys[0]),
+            "still spilled"
+        );
+        assert!(journal.quarantined_orphans().is_empty(), "not an orphan");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn resident_activated_job_rehydrates_a_respilled_healthy_instance() {
+        // `apply_command_at` re-spills right after activation; the worker-facing
+        // guard must rehydrate rather than withhold a healthy job (#1388).
+        let path = restart_store_path("respill-guard-1388");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        let activated = journal.engine.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(activated.len(), 1, "precondition: activated while spilled");
+        assert!(journal.engine.is_variables_spilled(keys[0]));
+        let job = journal
+            .resident_activated_job(activated[0].key)
+            .expect("healthy re-spilled job is rehydrated, not withheld");
+        assert!(!journal.engine.is_variables_spilled(keys[0]));
+        assert!(
+            !job.variables.is_empty(),
+            "job carries its restored variables"
+        );
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unreadable_spill_store_withholds_activation() {
+        let path = restart_store_path("broken-spill-1388");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        break_store(&path);
+
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert!(jobs.is_empty(), "no job handed out with empty variables");
+        assert!(journal.engine.is_variables_spilled(keys[0]));
+        assert!(journal.offheap_read_failures() >= 1);
+        assert!(journal.quarantined_orphans().is_empty());
+        // Nothing handed out through the server-facing guard either.
+        let job_key = journal
+            .engine
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.instance_key == keys[0])
+            .map(|j| j.key)
+            .unwrap();
+        assert!(journal.resident_activated_job(job_key).is_none());
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn absent_spill_row_on_activation_is_quarantined() {
+        let path = restart_store_path("absent-spill-1388");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[keys[0]]).unwrap();
+
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(journal.quarantined_orphans(), vec![keys[0]]);
+        assert!(!journal.engine.is_variables_spilled(keys[0]));
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn corrupt_cold_row_keeps_instance_routable() {
+        let path = restart_store_path("corrupt-cold-1388");
+        let (mut journal, key) = cold_file_journal(&path);
+        corrupt_row(&path, "cold", "snapshot", key);
+
+        assert_eq!(
+            journal.apply_command(Command::cancel_instance(key)).err(),
+            Some(EngineError::InstanceUnavailable { instance_key: key }),
+            "unreadable cold row must fail the command closed, never NotFound"
+        );
+        assert_eq!(journal.cold_count(), 1, "cold index entry kept");
+        assert_eq!(raw_row_count(&path, "cold", key), 1, "cold row kept");
+        assert!(journal.offheap_read_failures() >= 1, "failure observable");
+        assert!(journal.quarantined_orphans().is_empty());
+        let mut live = std::collections::HashSet::new();
+        journal.collect_live_instance_keys(&mut live);
+        assert!(live.contains(&key), "instance not dropped");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unreadable_oldest_cold_row_does_not_starve_healthy_activation() {
+        // max_jobs = 1 with an unreadable OLDEST cold row: the poll must skip it
+        // (row + routing kept) and still reach the healthy later instance (#1388).
+        let path = restart_store_path("starve-cold-1388");
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
+        journal.set_cold_spill(store, 1, 0);
+        let bad = deploy_and_create(&mut journal);
+        let good = deploy_and_create(&mut journal);
+        assert!(bad < good, "precondition: bad row is the oldest");
+        assert_eq!(journal.force_cold_spill_all(), 2);
+        corrupt_row(&path, "cold", "snapshot", bad);
+
+        for _ in 0..2 {
+            let jobs = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+            if !jobs.is_empty() {
+                assert_eq!(jobs[0].instance_key, good);
+                assert_eq!(raw_row_count(&path, "cold", bad), 1, "bad row kept");
+                drop(journal);
+                let _ = std::fs::remove_dir_all(path.parent().unwrap());
+                return;
+            }
+        }
+        panic!("healthy cold instance starved behind an unreadable oldest row");
+    }
+
+    #[test]
+    fn unreadable_cold_store_keeps_instance_routable() {
+        let path = restart_store_path("broken-cold-1388");
+        let (mut journal, key) = cold_file_journal(&path);
+        break_store(&path);
+
+        let _ = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(
+            journal.apply_command(Command::cancel_instance(key)).err(),
+            Some(EngineError::InstanceUnavailable { instance_key: key }),
+            "unreadable store fails the command closed, never NotFound"
+        );
+        assert_eq!(journal.cold_count(), 1, "cold index entry kept");
+        assert!(journal.offheap_read_failures() >= 2);
+        assert!(journal.quarantined_orphans().is_empty());
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn rehydrated_cold_row_is_forgotten_only_after_restore() {
+        let path = restart_store_path("ok-cold-1388");
+        let (mut journal, key) = cold_file_journal(&path);
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(jobs.len(), 1);
+        assert!(journal.instance(key).is_some());
+        assert_eq!(raw_row_count(&path, "cold", key), 0, "row forgotten");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn absent_cold_row_is_quarantined() {
+        let path = restart_store_path("absent-cold-1388");
+        let (mut journal, key) = cold_file_journal(&path);
+        let store = crate::varspill::VarSpillStore::open(Some(&path)).unwrap();
+        store.forget(&[key]).unwrap();
+
+        let _ = journal.apply_command(Command::cancel_instance(key));
+        assert_eq!(journal.cold_count(), 0);
+        assert_eq!(journal.quarantined_orphans(), vec![key]);
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Breaks the store at `path` so every read errors (drops both tables) —
+    /// the *unreadable* (transient-class) failure, as opposed to an absent row.
+    fn break_store(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("DROP TABLE spill; DROP TABLE cold;")
+            .unwrap();
+    }
+
+    // #1383: a spilled instance whose variable row is DEFINITIVELY absent (the
+    // store reads fine, the row is gone) must not block snapshots forever — its
+    // variables are already lost, and failing closed only stalled compaction for
+    // every other instance (23 days, 5.5 GiB on merlin). The fold quarantines
+    // it: snapshotted resident with an empty variable set; every other spilled
+    // instance keeps its payload.
+    #[test]
+    fn try_engine_snapshot_quarantines_missing_spill_row() {
+        use nanobpmn_engine_core::Value;
+
+        let path = restart_store_path("orphan-spill");
+        let (journal, keys) = spilled_journal(&path, 2);
         let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
         store.forget(&[keys[0]]).unwrap();
 
         assert!(
             journal.try_engine_snapshot().is_none(),
-            "snapshot rotation must abort when a spilled payload cannot be folded in"
+            "the strict (Raft) capture must not publish a replica-local orphan"
         );
-        // The non-gating form stays total (best-effort) for the Raft catch-up
-        // path: it returns a value even with the fold incomplete.
+        assert!(journal.quarantined_orphans().is_empty());
+        let snap = journal
+            .try_engine_snapshot_quarantining()
+            .expect("a definitive orphan must not block the local rotation");
+        let orphan = &snap.state.instances[&keys[0]];
+        assert!(
+            !orphan.variables_spilled,
+            "orphan no longer flagged spilled"
+        );
+        assert!(
+            orphan.variables.is_empty(),
+            "orphan's lost variables stay empty"
+        );
+        let healthy = &snap.state.instances[&keys[1]];
+        assert_eq!(
+            healthy.variables.get("data"),
+            Some(&Value::Str("payload-1".to_string()))
+        );
+        assert_eq!(journal.quarantined_orphans(), vec![keys[0]]);
+        // Repeated ticks keep succeeding (no retry-forever).
+        assert!(journal.try_engine_snapshot_quarantining().is_some());
+
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review #1332 / #1383: an UNREADABLE spill store (SQLite error —
+    // possibly transient) must still fail closed so the rotation aborts before
+    // the seal and the next tick retries; only a definitive absence is
+    // quarantined.
+    #[test]
+    fn try_engine_snapshot_fails_closed_on_unreadable_spill_store() {
+        let path = restart_store_path("fail-closed-spill");
+        let (journal, _keys) = spilled_journal(&path, 2);
+        break_store(&path);
+
+        assert!(
+            journal.try_engine_snapshot().is_none(),
+            "snapshot rotation must abort when a spilled payload cannot be read"
+        );
+        assert!(journal.quarantined_orphans().is_empty());
         let _ = journal.engine_snapshot();
 
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
-    // Copilot review #1332 (fail-closed snapshot, cold tier): a cold instance
-    // whose row cannot be read from the spill store must abort the fold rather
-    // than be silently omitted from the snapshot (which would then gate
-    // compaction and permanently drop the live instance). Covers both the
-    // classic fold (`try_engine_snapshot`) and the lean checkpoint fold
-    // (`lean_snapshot_and_cold_upserts`).
+    // #1383 regression: a snapshot carried over from a pre-#1331 binary holds an
+    // instance with `variables_spilled = true` and its empty placeholder, while
+    // the spill store was wiped. Recovery must (a) reconcile it at boot —
+    // quarantining it with a cleared flag — and (b) snapshot successfully, both
+    // before and after reconciliation.
     #[test]
-    fn try_engine_snapshot_fails_closed_on_unreadable_cold_row() {
+    fn recovered_spilled_orphan_is_reconciled_and_does_not_block_snapshots() {
+        let old_path = restart_store_path("orphan-boot-old");
+        let (journal, keys) = spilled_journal(&old_path, 2);
+        // The raw (unfolded) engine snapshot is what a pre-#1331 build persisted.
+        let legacy = journal.engine.snapshot();
+        assert!(legacy.state.instances[&keys[0]].variables_spilled);
+        drop(journal);
+
+        // Boot over a fresh, empty spill store (pre-#1331 wiped it at boot).
+        let new_path = restart_store_path("orphan-boot-new");
+        let mut rebooted = reboot_from(&new_path, legacy);
+        assert!(
+            rebooted.try_engine_snapshot_quarantining().is_some(),
+            "orphans must not block the snapshot even before reconciliation"
+        );
+
+        let mut orphans = rebooted.reconcile_offheap_orphans();
+        orphans.sort_unstable();
+        let mut expected = keys.clone();
+        expected.sort_unstable();
+        assert_eq!(orphans, expected, "every spilled orphan is quarantined");
+        for key in &keys {
+            assert!(!rebooted.engine.is_variables_spilled(*key));
+        }
+        assert_eq!(rebooted.quarantined_orphans(), expected);
+        assert!(
+            rebooted.reconcile_offheap_orphans().is_empty(),
+            "reconciliation is idempotent"
+        );
+        assert!(rebooted.try_engine_snapshot().is_some());
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+    }
+
+    // #1383: reconciliation leaves a spilled instance whose row EXISTS alone.
+    #[test]
+    fn reconcile_keeps_healthy_spilled_instances() {
+        let path = restart_store_path("reconcile-healthy");
+        let (mut journal, keys) = spilled_journal(&path, 2);
+        assert!(journal.reconcile_offheap_orphans().is_empty());
+        for key in &keys {
+            assert!(journal.engine.is_variables_spilled(*key));
+        }
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1383 (cold tier): a cold instance whose row is definitively absent is
+    // quarantined (omitted) rather than blocking every classic and lean
+    // snapshot forever.
+    #[test]
+    fn snapshot_quarantines_missing_cold_row() {
         let mut journal = cold_journal();
         let key = deploy_and_create(&mut journal);
         assert!(
             journal.force_cold_spill_all() >= 1,
             "precondition: went cold"
         );
-        assert!(journal.instance(key).is_none(), "precondition: off-heap");
-
-        // Corrupt the cold tier: drop the cold row from the store while the
-        // in-RAM cold index still routes to it.
         journal
             .cold
             .as_ref()
@@ -3866,11 +4627,150 @@ mod tests {
 
         assert!(
             journal.try_engine_snapshot().is_none(),
-            "classic snapshot must abort when a cold instance cannot be folded in"
+            "the strict (Raft) capture must not omit a replica-local cold orphan"
+        );
+        let snap = journal
+            .try_engine_snapshot_quarantining()
+            .expect("classic snapshot proceeds past a definitive cold orphan");
+        assert!(!snap.state.instances.contains_key(&key));
+        assert!(
+            journal.lean_snapshot_and_cold_upserts().is_some(),
+            "lean checkpoint proceeds past a definitive cold orphan"
+        );
+        assert_eq!(journal.quarantined_orphans(), vec![key]);
+    }
+
+    // Copilot review #1332 / #1383 (cold tier): an UNREADABLE cold store still
+    // aborts both the classic fold and the lean checkpoint fold.
+    #[test]
+    fn try_engine_snapshot_fails_closed_on_unreadable_cold_store() {
+        let path = restart_store_path("fail-closed-cold");
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
+        journal.set_cold_spill(store, 1, 0);
+        let _key = deploy_and_create(&mut journal);
+        assert!(
+            journal.force_cold_spill_all() >= 1,
+            "precondition: went cold"
+        );
+        break_store(&path);
+
+        assert!(
+            journal.try_engine_snapshot().is_none(),
+            "classic snapshot must abort when a cold instance cannot be read"
         );
         assert!(
             journal.lean_snapshot_and_cold_upserts().is_none(),
-            "lean checkpoint must abort when a cold instance cannot be folded in"
+            "lean checkpoint must abort when a cold instance cannot be read"
         );
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review on #1387: a legacy spilled instance whose resident map
+    // already holds journal-tail variable updates must KEEP them when the
+    // orphan is quarantined — both in the rotation fold and at boot.
+    #[test]
+    fn quarantine_preserves_surviving_resident_variables() {
+        use nanobpmn_engine_core::Value;
+
+        let old_path = restart_store_path("orphan-tail-old");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let mut legacy = journal.engine.snapshot();
+        drop(journal);
+        let key = keys[0];
+        let inst = legacy.state.instances.get_mut(&key).unwrap();
+        assert!(inst.variables_spilled);
+        let mut tail = HashMap::new();
+        tail.insert("late".to_string(), Value::Str("tail-update".to_string()));
+        inst.variables = Arc::new(tail);
+
+        let new_path = restart_store_path("orphan-tail-new");
+        let mut rebooted = reboot_from(&new_path, legacy);
+        let snap = rebooted.try_engine_snapshot_quarantining().unwrap();
+        assert_eq!(
+            snap.state.instances[&key].variables.get("late"),
+            Some(&Value::Str("tail-update".to_string())),
+            "rotation fold keeps surviving resident variables"
+        );
+        assert_eq!(rebooted.reconcile_offheap_orphans(), vec![key]);
+        assert_eq!(
+            rebooted.engine.state().instances[&key]
+                .variables
+                .get("late"),
+            Some(&Value::Str("tail-update".to_string())),
+            "boot reconciliation keeps surviving resident variables"
+        );
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+    }
+
+    // Copilot review on #1387: with NO spill store wired, absence cannot be
+    // proven — neither the fold nor boot reconciliation may quarantine.
+    #[test]
+    fn unwired_spill_store_is_not_proof_of_absence() {
+        let path = restart_store_path("orphan-unwired");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let mut rebooted = Journal::in_memory();
+        rebooted.restore_engine_from_snapshot(legacy);
+
+        assert!(rebooted.try_engine_snapshot_quarantining().is_none());
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.engine.is_variables_spilled(keys[0]));
+        assert!(rebooted.quarantined_orphans().is_empty());
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review on #1387: lean mode enabled over a legacy spilled
+    // snapshot — the new var store misses but the legacy spill row survives.
+    // That is not an orphan: fail closed, never clear the flag.
+    #[test]
+    fn lean_over_legacy_spill_row_is_not_quarantined() {
+        let path = restart_store_path("orphan-lean-legacy");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let vpath = restart_store_path("orphan-lean-legacy-vs");
+        let mut rebooted = reboot_from(&path, legacy);
+        let varstore = Arc::new(crate::varstore::VarStore::open(Some(&vpath)).unwrap());
+        rebooted.set_varstore(varstore);
+
+        assert!(rebooted.try_engine_snapshot_quarantining().is_none());
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.engine.is_variables_spilled(keys[0]));
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(vpath.parent().unwrap());
+    }
+
+    // Copilot review on #1387: lean mode over a legacy placeholder snapshot
+    // with the legacy tier unwired — an empty var store proves nothing.
+    #[test]
+    fn lean_with_unwired_legacy_tier_is_not_quarantined() {
+        let path = restart_store_path("orphan-lean-unwired");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let vpath = restart_store_path("orphan-lean-unwired-vs");
+        let mut rebooted = Journal::in_memory();
+        rebooted.restore_engine_from_snapshot(legacy);
+        let varstore = Arc::new(crate::varstore::VarStore::open(Some(&vpath)).unwrap());
+        rebooted.set_varstore(varstore);
+
+        assert!(rebooted.try_engine_snapshot_quarantining().is_none());
+        assert!(rebooted.reconcile_offheap_orphans().is_empty());
+        assert!(rebooted.engine.is_variables_spilled(keys[0]));
+        assert!(rebooted.quarantined_orphans().is_empty());
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(vpath.parent().unwrap());
     }
 }
