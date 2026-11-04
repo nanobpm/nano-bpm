@@ -8,7 +8,7 @@
 #
 # Pinned to the Zeebe revision in zeebe-test-pin.json. Requires: node, a JDK
 # (javac/java) for the model-API serialisation, git, curl, sha256sum, and the
-# committed engine-wasm artifacts (make console-wasm) for the Nano run.
+# engine-wasm artifacts built by `make console-wasm` (gitignored, #668) for the Nano run.
 #
 # The committed corpus/ and report.json are a DERIVED artifact: CI regenerates
 # them and `git diff --exit-code`s the tree, so a forgotten regeneration fails

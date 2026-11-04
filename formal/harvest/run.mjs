@@ -39,7 +39,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 export class RunError extends Error {}
 
-/** Load the committed engine-wasm TestEngine (lean baseline build), initialising
+/** Load the locally built engine-wasm TestEngine (lean baseline build), initialising
  * the wasm module synchronously from the committed artifact. */
 export async function loadEngine(enginePath) {
   const pkgDir = enginePath ?? resolve(here, '..', '..', 'engine-wasm', 'pkg');
