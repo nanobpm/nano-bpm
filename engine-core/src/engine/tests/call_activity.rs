@@ -1182,3 +1182,54 @@ fn call_activity_output_mapping_failure_preserves_child_context_on_redrive() {
         other => panic!("expected CallActivityCompletion redrive, got {other:?}"),
     }
 }
+
+/// Cancelling a call-activity parent reaps a child an operator suspended:
+/// suspension pauses the child, it does not detach it from its parent.
+#[test]
+fn cancelling_a_call_activity_parent_cancels_its_suspended_child() {
+    let mut engine = deploy_native_call(Default::default(), phase_process("phase", "work"));
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    let child_key = engine.pending_jobs()[0].instance_key;
+    engine
+        .apply_command(Command::suspend_instance(child_key))
+        .unwrap();
+    engine
+        .apply_command(Command::cancel_instance(parent_key))
+        .unwrap();
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated,
+        "a suspended child must not outlive its cancelled parent"
+    );
+}
+
+/// Terminating a call activity by modification reaps its suspended child.
+#[test]
+fn terminating_a_call_activity_terminates_its_suspended_child() {
+    let mut engine = deploy_native_call(Default::default(), phase_process("phase", "work"));
+    let created = engine
+        .apply_command(Command::create_instance("orch"))
+        .unwrap();
+    let parent_key = parent_key_of(&created, "orch");
+    let child_key = engine.pending_jobs()[0].instance_key;
+    engine
+        .apply_command(Command::suspend_instance(child_key))
+        .unwrap();
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: parent_key,
+            activate_instructions: vec![],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec!["c1".into()],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        engine.instance(child_key).unwrap().state,
+        crate::state::ProcessInstanceState::Terminated,
+        "a suspended child must not outlive its terminated call activity"
+    );
+}

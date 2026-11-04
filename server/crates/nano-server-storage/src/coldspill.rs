@@ -41,6 +41,9 @@ struct ColdFacets {
     /// Active element-instance (token) scope keys, for `SetVariables` targeting a
     /// local scope rather than the instance root.
     scopes: Vec<Key>,
+    /// The calling parent instance (call-activity child), for instance-wide
+    /// teardown commands that must page in cold descendants.
+    parent: Option<Key>,
 }
 
 /// A resident index from routing keys to the cold instance that owns them.
@@ -57,6 +60,7 @@ pub struct ColdIndex {
     by_user_task: HashMap<Key, Key>,
     by_incident: HashMap<Key, Key>,
     by_scope: HashMap<Key, Key>,
+    by_parent: HashMap<Key, BTreeSet<Key>>,
 }
 
 impl ColdIndex {
@@ -103,6 +107,10 @@ impl ColdIndex {
             self.by_scope.insert(scope, key);
             facets.scopes.push(scope);
         }
+        if let Some(parent) = snapshot.instance.parent_process_instance_key {
+            self.by_parent.entry(parent).or_default().insert(key);
+            facets.parent = Some(parent);
+        }
 
         self.instances.insert(key, facets);
     }
@@ -148,6 +156,23 @@ impl ColdIndex {
         for scope in facets.scopes {
             self.by_scope.remove(&scope);
         }
+        if let Some(parent) = facets.parent
+            && let Some(set) = self.by_parent.get_mut(&parent)
+        {
+            set.remove(&key);
+            if set.is_empty() {
+                self.by_parent.remove(&parent);
+            }
+        }
+    }
+
+    /// Cold instances called by `parent` (direct call-activity children),
+    /// ascending.
+    pub fn children_of(&self, parent: Key) -> Vec<Key> {
+        self.by_parent
+            .get(&parent)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     /// Whether `key` is a cold instance.

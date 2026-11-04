@@ -5935,8 +5935,11 @@ fn agent_instance_update_with_conflicting_instance_is_rejected() {
             activate_instructions: vec![crate::command::ActivateElementInstruction {
                 element_id: "agent".into(),
                 variables: HashMap::new(),
+                ..Default::default()
             }],
             terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
         })
         .unwrap();
     let pi_b = events_b.iter().find_map(|e| e.instance_key()).unwrap();

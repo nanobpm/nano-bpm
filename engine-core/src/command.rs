@@ -475,10 +475,27 @@ pub enum Command {
     /// Only an active instance can be modified. Activation of an element id that
     /// is not in the process, or termination of a key that is not an active
     /// element instance of the instance, is rejected.
+    ///
+    /// The Zeebe-parity instruction surface (#1374) — `terminate_element_ids`,
+    /// `move_instructions`, per-activation `ancestor_element_instance_key` and
+    /// scoped `variable_instructions` — is carried here so every surface (REST,
+    /// Falcon, wasm, batch) shares one shape. Until the engine acts on a field
+    /// it rejects any non-empty use of it with
+    /// [`crate::EngineError::ModificationInstructionNotYetSupported`] (never a
+    /// silent ignore).
     ModifyInstance {
         instance_key: Key,
         activate_instructions: Vec<ActivateElementInstruction>,
         terminate_instructions: Vec<Key>,
+        /// Terminate every active instance of each listed element id (Zeebe's
+        /// terminate-by-`elementId` instruction). Empty for none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        terminate_element_ids: Vec<ElementId>,
+        /// Move instructions (Camunda 8.9 `moveInstructions`): terminate the
+        /// source element instance(s) and activate `target_element_id` in their
+        /// place. Empty for none.
+        #[cfg_attr(feature = "serde", serde(default))]
+        move_instructions: Vec<MoveInstruction>,
     },
     /// Create a start-triggered instance on this partition, routed by the host
     /// from the deploy partition's [`crate::Event::StartInstanceDispatched`] so
@@ -660,21 +677,13 @@ pub struct GenericResource {
     pub content: String,
 }
 
-/// One activation instruction of a [`Command::ModifyInstance`]: place a new
-/// token at `element_id`, first merging `variables` into the instance's root
-/// scope. (Zeebe's activate instruction also carries an ancestor-scope selector
-/// and per-scope variable instructions; this engine activates in the process
-/// root scope, which covers the common "start a token here" modeler use.)
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ActivateElementInstruction {
-    /// The BPMN element id to activate a token at.
-    pub element_id: String,
-    /// Variables merged into the instance's root scope before the token is
-    /// placed (Zeebe's global variable instructions). Empty for none.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub variables: HashMap<String, Value>,
-}
+/// The modification instruction shapes are persisted inside
+/// [`crate::event::Event::ProcessInstanceModified`], so they live in the event
+/// layer (L3) and are re-exported here for command construction.
+pub use crate::event::{
+    ActivateElementInstruction, AncestorScopeInstruction, MoveInstruction, MoveSource,
+    VariableInstruction,
+};
 
 /// The attributes that an [`Command::UpdateUserTask`] may change. Each field is
 /// `Some` only when the caller is changing that attribute; `None` leaves it
@@ -784,14 +793,39 @@ impl Command {
             Command::ModifyInstance {
                 activate_instructions,
                 terminate_instructions,
+                terminate_element_ids,
+                move_instructions,
                 ..
             } => {
+                let var_instrs = |vi: &[VariableInstruction]| -> u64 {
+                    vi.iter()
+                        .map(|v| {
+                            vars(&v.variables) + v.scope_id.as_ref().map_or(0, |s| s.len() as u64)
+                        })
+                        .sum()
+                };
                 let activate: u64 = activate_instructions
                     .iter()
-                    .map(|a| a.element_id.len() as u64 + vars(&a.variables))
+                    .map(|a| {
+                        a.element_id.len() as u64
+                            + vars(&a.variables)
+                            + var_instrs(&a.variable_instructions)
+                    })
                     .sum();
+                let moves: u64 = move_instructions
+                    .iter()
+                    .map(|m| {
+                        let src = match &m.source {
+                            MoveSource::ById(id) => id.len() as u64,
+                            MoveSource::ByKey(_) => 8,
+                        };
+                        src + m.target_element_id.len() as u64
+                            + var_instrs(&m.variable_instructions)
+                    })
+                    .sum();
+                let by_id: u64 = terminate_element_ids.iter().map(|e| e.len() as u64).sum();
                 // Each terminate instruction is an 8-byte element-instance key.
-                activate + (terminate_instructions.len() as u64 * 8)
+                activate + moves + by_id + (terminate_instructions.len() as u64 * 8)
             }
             Command::ActivateAdHocActivities {
                 activate_elements, ..
@@ -1297,6 +1331,8 @@ impl Command {
             instance_key,
             activate_instructions,
             terminate_instructions,
+            terminate_element_ids: Vec::new(),
+            move_instructions: Vec::new(),
         }
     }
 }

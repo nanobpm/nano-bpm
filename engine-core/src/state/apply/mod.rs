@@ -56,6 +56,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::ProcessInstanceResumed { .. }
         | Event::ProcessInstanceBusinessIdAssigned { .. }
         | Event::ProcessInstanceMigrated { .. }
+        | Event::ProcessInstanceModified { .. }
         | Event::ProcessInstanceTerminated { .. }
         | Event::StartInstanceDispatched { .. } => instance::apply_instance(state, event),
         Event::ElementActivating { .. }

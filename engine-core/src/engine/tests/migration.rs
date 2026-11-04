@@ -30,6 +30,7 @@ fn modify_terminates_one_element_and_activates_another() {
             vec![ActivateElementInstruction {
                 element_id: "b".into(),
                 variables: HashMap::new(),
+                ..Default::default()
             }],
             vec![a_eik],
         ))
@@ -126,6 +127,7 @@ fn modify_activating_an_element_merges_global_variables() {
             vec![ActivateElementInstruction {
                 element_id: "b".into(),
                 variables: vars,
+                ..Default::default()
             }],
             vec![a_eik],
         ))
@@ -170,6 +172,7 @@ fn modify_rejects_unknown_instance_and_element_ids() {
             vec![ActivateElementInstruction {
                 element_id: "nope".into(),
                 variables: HashMap::new(),
+                ..Default::default()
             }],
             vec![],
         )),
@@ -217,6 +220,7 @@ fn modify_survives_replay() {
                 vec![ActivateElementInstruction {
                     element_id: "b".into(),
                     variables: HashMap::new(),
+                    ..Default::default()
                 }],
                 vec![a_eik],
             ))
@@ -750,6 +754,7 @@ fn migration_rejects_inclusive_join_with_unidentified_arrival_and_different_arit
             vec![crate::command::ActivateElementInstruction {
                 element_id: "join".to_string(),
                 variables: Default::default(),
+                ..Default::default()
             }],
             vec![c_eik],
         ))
@@ -940,10 +945,10 @@ fn migration_rejects_type_change() {
 }
 
 #[test]
-fn migration_rejects_unsupported_boundary_event() {
-    // The active service task carries an armed interrupting timer boundary event.
-    // Boundary events are not migratable in this phase (Zeebe rejects several
-    // such cases as "not supported yet") → rejected.
+fn migration_deletes_the_armed_timer_of_an_unmapped_boundary_event() {
+    // Zeebe parity (#1374): an armed boundary event whose catch event is not
+    // mapped is not carried over — its timer is canceled before the migration
+    // fact, and the target (which has no boundary) arms nothing.
     let mut engine = Engine::new();
     deploy_for_migration(
         &mut engine,
@@ -962,31 +967,36 @@ fn migration_rejects_unsupported_boundary_event() {
     let target_key =
         deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
     let inst = create_instance_key(&mut engine, "source");
-    let err = engine
+    let log = engine
         .apply_command(Command::migrate_instance(
             inst,
             target_key,
             vec![("a".to_string(), "b".to_string())],
         ))
-        .unwrap_err();
+        .unwrap();
+    assert!(
+        matches!(log.first(), Some(Event::TimerCanceled { element_id, .. }) if element_id == "a")
+    );
     assert!(matches!(
-        err,
-        EngineError::UnsupportedMigration { element_id, .. } if element_id == "boundary"
+        log.get(1),
+        Some(Event::ProcessInstanceMigrated { .. })
     ));
+    assert_eq!(log.len(), 2);
+    assert!(engine
+        .state()
+        .timers
+        .values()
+        .all(|t| t.state != state::TimerState::Created));
 }
 
 #[test]
-fn unsupported_migration_reason_covers_every_reactive_boundary_kind() {
-    // Defect-class guard (#1173): every *reactive* boundary-event kind (one that
-    // can be armed on a still-active scope and fire during flow) must be rejected
-    // by the migration phase — "boundary events are not migratable yet". The
-    // escalation boundary was added to join reachability yet was initially
-    // omitted from `unsupported_migration_reason`; enumerate the whole class so a
-    // future boundary type cannot silently become "migratable" by omission.
-    // (`CompensationBoundaryEvent` is intentionally excluded — it is a passive
-    // marker that never fires reactively, so it is not in this guard.)
+fn unsupported_migration_reason_admits_every_boundary_kind_and_sub_process() {
+    // #1374: boundary events and embedded sub-processes are migratable (their
+    // runtime is planned in `engine/migration.rs`), so no boundary kind and no
+    // sub-process may be rejected by the element-class guard any more. Call
+    // activities and event-based gateways stay rejected until their slice lands.
     use crate::model::ElementKind;
-    let boundaries = [
+    let supported = [
         ElementKind::ErrorBoundaryEvent {
             attached_to: "host".to_string(),
             error_code: "E".to_string(),
@@ -1018,14 +1028,18 @@ fn unsupported_migration_reason_covers_every_reactive_boundary_kind() {
             escalation_code: "OVERLOAD".to_string(),
             interrupting: true,
         },
+        ElementKind::SubProcess {
+            start_event: "s".to_string(),
+        },
     ];
-    for kind in boundaries {
+    for kind in supported {
         assert_eq!(
             unsupported_migration_reason(&kind),
-            Some("boundary events are not migratable yet"),
-            "{kind:?} must be rejected by the migration phase"
+            None,
+            "{kind:?} is migratable"
         );
     }
+    assert!(unsupported_migration_reason(&ElementKind::EventBasedGateway).is_some());
 }
 
 #[test]
@@ -1091,10 +1105,8 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
     // scope. The applier re-points element ids but does NOT remap the scope
     // tree (`scopes` / `scope_parents` / `scope_variables`), so migrating such
     // an instance would leave its scope tree pointing at the source structure.
-    // Migration must be rejected as unsupported. (Here the enclosing sub-process
-    // is itself active and trips the sub-process guard first; the explicit
-    // flow-scope backstop guarantees the class stays rejected even if a future
-    // scope-owning element type is not caught by a more specific guard.)
+    // Since #1374 the scope tree is preserved and an inner token may migrate
+    // only together with its (mapped) enclosing sub-process.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
@@ -1121,6 +1133,7 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
         .unwrap();
     let target_key = deploy_for_migration(&mut engine, target);
 
+    // The active sub-process itself has no mapping → rejected (Zeebe).
     let err = engine
         .apply_command(Command::migrate_instance(
             inst,
@@ -1128,10 +1141,155 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
             vec![("inner".to_string(), "inner".to_string())],
         ))
         .unwrap_err();
+    assert_eq!(
+        err,
+        EngineError::UnmappedActiveElement {
+            instance_key: inst,
+            element_id: "sub".to_string(),
+        }
+    );
+    // Mapping the sub-process onto the flat target's task moves `inner` out of
+    // its flow scope → rejected by `requireUnchangedFlowScope`.
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("inner".to_string(), "inner".to_string()),
+                ("sub".to_string(), "inner".to_string()),
+            ],
+        ))
+        .unwrap_err();
     assert!(
-        matches!(err, EngineError::UnsupportedMigration { .. }),
-        "an instance with an active token in a nested flow scope must not migrate; got {err:?}"
+        matches!(err, EngineError::MappedElementTypeChanged { .. }),
+        "got {err:?}"
     );
     // The instance stays on its source definition — nothing was migrated.
     assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
+}
+
+/// #1374 scaffold: `move_instructions` (not acted on yet) are rejected explicitly (never silently ignored), atomically.
+#[test]
+fn modify_rejects_not_yet_supported_instruction_fields() {
+    use crate::command::{AncestorScopeInstruction, MoveInstruction, MoveSource};
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let a_eik = active_eik_of(&engine, inst, "a");
+
+    let modify = |activate: Vec<ActivateElementInstruction>,
+                  by_id: Vec<String>,
+                  moves: Vec<MoveInstruction>| Command::ModifyInstance {
+        instance_key: inst,
+        activate_instructions: activate,
+        terminate_instructions: vec![a_eik],
+        terminate_element_ids: by_id,
+        move_instructions: moves,
+    };
+    let cases = [(
+        modify(
+            vec![],
+            vec![],
+            vec![MoveInstruction {
+                source: MoveSource::ById("a".into()),
+                target_element_id: "b".into(),
+                ancestor_scope: AncestorScopeInstruction::SourceParent,
+                variable_instructions: vec![],
+            }],
+        ),
+        "move_instructions",
+    )];
+    for (command, instruction) in cases {
+        let err = engine.apply_command(command).unwrap_err();
+        assert_eq!(
+            err,
+            EngineError::ModificationInstructionNotYetSupported {
+                instance_key: inst,
+                instruction,
+            }
+        );
+        assert!(err.to_string().contains("not yet supported"), "{err}");
+        // Atomic: the bundled terminate of `a` did not happen.
+        assert_eq!(active_eik_of(&engine, inst, "a"), a_eik);
+    }
+}
+
+/// #1374 scaffold: a suspended instance exists but is in the wrong state for
+/// modification — `InstanceNotActive` (409), not `InstanceNotFound` (404).
+#[test]
+fn modify_of_suspended_instance_is_rejected_as_not_active() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    engine
+        .apply_command(Command::suspend_instance(inst))
+        .unwrap();
+    let err = engine
+        .apply_command(Command::modify_instance(inst, vec![], vec![]))
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::InstanceNotActive { instance_key, process_id, .. }
+            if *instance_key == inst && process_id == "two"),
+        "{err:?}"
+    );
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(999_999, vec![], vec![])),
+        Err(EngineError::InstanceNotFound {
+            instance_key: 999_999
+        })
+    );
+}
+
+#[test]
+fn migration_rejects_instance_with_compensation_runtime() {
+    // Copilot on #1418: `compensation_waits` (throw id + pending handler ids)
+    // and saved `compensable` entries are keyed by source element ids the
+    // applier does not remap, so a migrated in-flight compensation would never
+    // release its throw. Reject until supported (fail closed).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_compensation()))
+        .unwrap();
+    let mut target = process_with_compensation();
+    target.id = "trip-v2".to_string();
+    let target_key = deploy_for_migration(&mut engine, target);
+    let created = engine
+        .apply_command(Command::create_instance("trip"))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    engine.apply_command(Command::complete_job(book)).unwrap();
+    let mut mapping: Vec<(String, String)> = engine
+        .instance(inst)
+        .unwrap()
+        .active
+        .values()
+        .map(|e| (e.clone(), e.clone()))
+        .collect();
+    mapping.sort();
+    mapping.dedup();
+    let err = engine
+        .apply_command(Command::migrate_instance(inst, target_key, mapping))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::UnsupportedMigration { reason, .. } if reason.contains("compensation")
+        ),
+        "got {err:?}"
+    );
 }
