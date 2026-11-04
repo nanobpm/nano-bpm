@@ -4647,6 +4647,10 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        // Audit record only: the modification's element activations and
+        // terminations arrive as their own events and are projected there.
+        Event::ProcessInstanceModified { .. } => {}
+
         Event::ElementActivating {
             instance_key,
             element_instance_key,
@@ -6122,6 +6126,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             target_process_id,
             target_process_definition_key,
             element_mappings,
+            ..
         } => {
             // Re-home the read model onto the target definition, mirroring the
             // engine applier (`state::apply`): the instance's definition
@@ -10783,6 +10788,9 @@ mod element_instance_tests {
                 target_process_id: "p2".to_string(),
                 target_process_definition_key: target_key,
                 element_mappings: vec![("await".to_string(), "await2".to_string())],
+                migrated_flow_scopes: vec![],
+                subscriptions: vec![],
+                child_instances: vec![],
             }])
             .unwrap();
 
@@ -10878,6 +10886,9 @@ mod element_instance_tests {
                 target_process_id: "p2".to_string(),
                 target_process_definition_key: target_key,
                 element_mappings: vec![("t".to_string(), "t2".to_string())],
+                migrated_flow_scopes: vec![],
+                subscriptions: vec![],
+                child_instances: vec![],
             }])
             .unwrap();
 

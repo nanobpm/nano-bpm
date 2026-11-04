@@ -23,7 +23,10 @@ mod api;
 mod boundary;
 mod call_activity;
 mod debug;
+mod flow_scope;
 mod memory;
+mod migration;
+mod modify;
 mod resolve;
 
 pub use debug::{BreakCondition, DebugSession};
@@ -343,6 +346,29 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+    },
+    /// Run the activation body of an element a process-instance modification
+    /// already activated and seeded with element-local variables (Zeebe sets a
+    /// modification's element-scoped variables BEFORE the element activates).
+    /// Queued in instruction order; the body's input mappings, FEEL attributes
+    /// and start listeners evaluate against the element's own (seeded) scope.
+    ResumeSeededActivation {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
+    /// A process-instance modification's activation of a join (parallel /
+    /// inclusive gateway with several incoming flows) carrying element-local
+    /// variables. Queued in instruction order — so it runs after the command's
+    /// terminations, like every other modification activation — and handled by
+    /// [`Engine::activate_seeded_join`], which seeds the join instance the
+    /// activation will take over BEFORE the guarded activation evaluates and
+    /// completes it.
+    ActivateSeededJoin {
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+        locals: Vec<HashMap<String, Value>>,
     },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
@@ -3608,6 +3634,17 @@ impl Engine {
                     Some(state::MessageSubscriptionState::Opening)
                 ) && !self.instance_is_suspended(instance_key);
                 if advance {
+                    // The continuation metadata the canonical (message-partition)
+                    // record forwards can be stale: a migration re-points the
+                    // local `Opening` record's host and boundary ids but never the
+                    // remote copy. The local record is the source of truth for
+                    // where the token sits, so resolve the ids from it.
+                    let (element_id, kind) = self
+                        .state
+                        .message_subscriptions
+                        .get(&subscription_key)
+                        .map(|s| (s.element_id.clone(), s.kind.clone()))
+                        .unwrap_or((element_id, kind));
                     self.advance_correlated_token(
                         &mut log,
                         &mut queue,
@@ -3945,11 +3982,17 @@ impl Engine {
 
                 // The instance's current definition is the source of truth for its
                 // active elements' types (only the latest version is retained).
-                let source_def = self.state.processes.get(&source_process_id).ok_or(
-                    EngineError::ProcessNotFound {
+                // Resolved through the instance's pinned definition key, never
+                // the latest-by-id index: a same-process-id migration (v1 -> v2)
+                // must plan against the version the instance actually runs.
+                let source_def = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| self.state.definition_for(i))
+                    .ok_or(EngineError::ProcessNotFound {
                         process_id: source_process_id.clone(),
-                    },
-                )?;
+                    })?;
 
                 // 3. No duplicate source ids; every mapped source/target element
                 //    exists; each mapped pair keeps the same BPMN type (compared
@@ -3987,24 +4030,26 @@ impl Engine {
                     mapped.insert(src.clone(), tgt.clone());
                 }
 
-                // 4. Reject element classes this phase cannot remap safely.
-                //    Two sources of "unsupported":
-                //    (a) an active element instance whose own kind is a
-                //        sub-process, call activity, or event-based gateway (the
-                //        token rests directly on it, so it appears in `active`);
-                //    (b) an armed boundary event — its runtime (timer/subscription)
-                //        is stored against the *host* activity's element id with a
-                //        boundary `kind`, so the boundary element id lives inside
-                //        that kind rather than in `active`.
-                //    Zeebe rejects several of these as "not supported yet";
-                //    reproducing the rejection is parity.
+                // 4. Reject element classes Zeebe does not migrate yet: an
+                //    active element instance whose own kind is a call activity or
+                //    event-based gateway (`unsupported_migration_reason`).
+                //    Embedded sub-processes and boundary / intermediate catch
+                //    events are migrated (#1374): their flow scopes and
+                //    subscriptions are planned in `engine/migration.rs`.
                 #[allow(clippy::expect_used, reason = "instance existence checked above")]
                 let instance = self
                     .state
                     .instances
                     .get(&instance_key)
                     .expect("instance existence checked above");
-                let mut active_ids: Vec<String> = instance.active.values().cloned().collect();
+                let mut active_elements: Vec<(Key, String)> = instance
+                    .active
+                    .iter()
+                    .map(|(k, e)| (*k, e.clone()))
+                    .collect();
+                active_elements.sort();
+                let mut active_ids: Vec<String> =
+                    active_elements.iter().map(|(_, e)| e.clone()).collect();
                 active_ids.sort();
                 active_ids.dedup();
                 for eid in &active_ids {
@@ -4018,67 +4063,13 @@ impl Engine {
                         }
                     }
                 }
-                let boundary_reason = "boundary events are not migratable yet";
-                let mut armed_boundaries: Vec<String> = Vec::new();
-                for t in self.state.timers.values() {
-                    if t.instance_key == instance_key {
-                        match &t.kind {
-                            state::TimerKind::InterruptingBoundary {
-                                boundary_element_id,
-                            }
-                            | state::TimerKind::NonInterruptingBoundary {
-                                boundary_element_id,
-                            } => armed_boundaries.push(boundary_element_id.clone()),
-                            _ => {}
-                        }
-                    }
-                }
-                let boundary_kind = |kind: &state::MessageSubscriptionKind| match kind {
-                    state::MessageSubscriptionKind::InterruptingBoundary {
-                        boundary_element_id,
-                    }
-                    | state::MessageSubscriptionKind::NonInterruptingBoundary {
-                        boundary_element_id,
-                    } => Some(boundary_element_id.clone()),
-                    _ => None,
-                };
-                for s in self.state.message_subscriptions.values() {
-                    if s.instance_key == instance_key {
-                        if let Some(id) = boundary_kind(&s.kind) {
-                            armed_boundaries.push(id);
-                        }
-                    }
-                }
-                for s in self.state.signal_subscriptions.values() {
-                    if s.instance_key == instance_key {
-                        if let Some(id) = boundary_kind(&s.kind) {
-                            armed_boundaries.push(id);
-                        }
-                    }
-                }
-                for s in self.state.conditional_subscriptions.values() {
-                    if s.instance_key == instance_key {
-                        if let Some(id) = boundary_kind(&s.kind) {
-                            armed_boundaries.push(id);
-                        }
-                    }
-                }
-                if let Some(boundary_element_id) = armed_boundaries.into_iter().min() {
-                    return Err(EngineError::UnsupportedMigration {
-                        instance_key,
-                        element_id: boundary_element_id,
-                        reason: boundary_reason.to_string(),
-                    });
-                }
 
-                //    (c) an active multi-instance body or ad-hoc sub-process
-                //        container. Their per-element bookkeeping lives in
-                //        `ProcessInstance.multi_instances` / `adhoc_instances`,
-                //        which the applier (`state::apply`) does not remap, so
-                //        migrating one would leave that bookkeeping pointing at
-                //        the source element id and desync engine runtime. Zeebe
-                //        rejects these as "not supported yet"; reproducing the
-                //        rejection is parity.
+                //    An active multi-instance body or ad-hoc sub-process
+                //    container: their per-element bookkeeping lives in
+                //    `ProcessInstance.multi_instances` / `adhoc_instances`,
+                //    which the applier (`state::apply`) does not remap, so
+                //    migrating one would leave that bookkeeping pointing at
+                //    the source element id and desync engine runtime.
                 let mut unremappable: Vec<String> = instance
                     .multi_instances
                     .values()
@@ -4101,37 +4092,29 @@ impl Engine {
                     });
                 }
 
-                //    (d) Zeebe's "flow scope unchanged" precondition, enforced
-                //        categorically. The applier (`state::apply`) re-points
-                //        element ids but deliberately does NOT remap the scope
-                //        tree (`scopes` / `scope_parents` / `scope_variables`),
-                //        so an active element sitting inside a non-root flow
-                //        scope cannot be migrated without desyncing that tree.
-                //        Every element type that can own such a scope today is
-                //        already rejected above — an active embedded sub-process
-                //        appears in `active` (a), and multi-instance / ad-hoc
-                //        bodies via their bookkeeping maps (c) — so in the current
-                //        supported subset this is a defense-in-depth backstop.
-                //        Keeping it as an explicit precondition (rather than an
-                //        emergent property of those specific guards) prevents a
-                //        future scope-owning element type from silently slipping a
-                //        nested-scope token past them into the non-remapping
-                //        applier. `instance.scopes` keys are exactly the active
-                //        element instances that live in a non-root scope.
-                let mut scoped_active: Vec<String> = instance
-                    .scopes
-                    .keys()
-                    .filter_map(|element_instance_key| {
-                        instance.active.get(element_instance_key).cloned()
-                    })
+                //    Compensation runtime (`compensable` / `compensation_waits`)
+                //    is keyed by source element ids (activity, handler, throw)
+                //    the applier does not remap: a migrated in-flight throw
+                //    would never be released by its renamed handler. Fail
+                //    closed until supported.
+                let mut compensation_refs: Vec<String> = instance
+                    .compensable
+                    .iter()
+                    .map(|c| c.element_id.clone())
+                    .chain(
+                        instance
+                            .compensation_waits
+                            .values()
+                            .map(|w| w.throw_element_id.clone()),
+                    )
                     .collect();
-                scoped_active.sort();
-                scoped_active.dedup();
-                if let Some(element_id) = scoped_active.into_iter().next() {
+                compensation_refs.sort();
+                if let Some(element_id) = compensation_refs.into_iter().next() {
                     return Err(EngineError::UnsupportedMigration {
                         instance_key,
                         element_id,
-                        reason: "elements inside a nested flow scope are not migratable yet"
+                        reason: "instances with compensation subscriptions or an \
+                                 in-flight compensation are not migratable yet"
                             .to_string(),
                     });
                 }
@@ -4144,6 +4127,68 @@ impl Engine {
                             element_id: eid.clone(),
                         });
                     }
+                }
+
+                // 5a. Zeebe `requireUnchangedFlowScope`: the target element's
+                //     flow scope must be the mapped target of the source
+                //     element's flow scope (the process itself for a
+                //     process-level element). The applier re-points the scope
+                //     tree by the same mapping, so this keeps it consistent.
+                //     Then the catch-event preconditions: mapped boundaries stay
+                //     attached and are not merged.
+                for (_, eid) in &active_elements {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "step 5 guarantees every active element is mapped"
+                    )]
+                    let tgt = mapped.get(eid).expect("step 5 guarantees a mapping");
+                    // Loop-kind changes are rejected (plain <-> multi-instance
+                    // and parallel <-> sequential): the preserved scope carries
+                    // (or lacks) MI bookkeeping — e.g. N concurrent inner
+                    // instances — that the target's loop characteristics would
+                    // contradict. `None` = plain, `Some(sequential)` = MI.
+                    let source_mi = source_def
+                        .definition
+                        .element(eid)
+                        .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
+                    let target_mi = target
+                        .definition
+                        .element(tgt)
+                        .and_then(|e| e.multi_instance.as_ref().map(|m| m.sequential));
+                    if source_mi != target_mi {
+                        return Err(EngineError::MigrationMultiInstanceMismatch {
+                            instance_key,
+                            source_element_id: eid.clone(),
+                            target_element_id: tgt.clone(),
+                        });
+                    }
+                    let expected =
+                        match flow_scope::element_flow_scope_chain(&source_def.definition, eid)
+                            .first()
+                        {
+                            Some(scope) => mapped.get(scope).cloned(),
+                            None => Some(target_process_id.clone()),
+                        };
+                    let actual = flow_scope::element_flow_scope_chain(&target.definition, tgt)
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| target_process_id.clone());
+                    if expected.as_deref() != Some(actual.as_str()) {
+                        return Err(EngineError::MigrationFlowScopeChanged {
+                            instance_key,
+                            element_id: eid.clone(),
+                            source_flow_scope_id: expected,
+                            target_flow_scope_id: Some(actual),
+                        });
+                    }
+                    Self::check_migrated_catch_events(
+                        instance_key,
+                        &source_def.definition,
+                        &target.definition,
+                        &mapped,
+                        eid,
+                        tgt,
+                    )?;
                 }
 
                 // 5b. An already-*open* parallel-gateway join (a token has
@@ -4253,6 +4298,20 @@ impl Engine {
                 // 6. All preconditions hold: emit the migration fact. The applier
                 //    rewrites the instance's process id and re-points every active
                 //    element instance and its attached runtime.
+                //    Subscriptions whose trigger changed (or whose catch event is
+                //    unmapped) are disarmed first, under their source ids; new
+                //    ones are armed after, under the target ids.
+                let source_definition = source_def.definition.clone();
+                let target_definition = target.definition.clone();
+                let plan = self.plan_migration(
+                    instance_key,
+                    &source_definition,
+                    &target_definition,
+                    &mapped,
+                );
+                for event in plan.before {
+                    self.emit(&mut log, event);
+                }
                 self.emit(
                     &mut log,
                     Event::ProcessInstanceMigrated {
@@ -4260,100 +4319,51 @@ impl Engine {
                         target_process_id,
                         target_process_definition_key,
                         element_mappings: mapping_instructions,
+                        migrated_flow_scopes: plan.migrated_flow_scopes,
+                        subscriptions: plan.subscriptions,
+                        child_instances: Vec::new(),
                     },
                 );
+                for event in plan.after {
+                    self.emit(&mut log, event);
+                }
             }
 
             Command::ModifyInstance {
                 instance_key,
                 activate_instructions,
                 terminate_instructions,
+                terminate_element_ids,
+                move_instructions,
             } => {
-                // Only an active instance can be modified (Zeebe parity).
+                // Only an active instance can be modified (Zeebe parity): an
+                // unknown or finished instance is not found (404); a live but
+                // suspended one is in the wrong state (409).
                 match self.state.instances.get(&instance_key) {
                     Some(instance) if instance.state == ProcessInstanceState::Active => {}
+                    Some(instance) if instance.state == ProcessInstanceState::Suspended => {
+                        return Err(EngineError::InstanceNotActive {
+                            instance_key,
+                            process_id: instance.process_id.clone(),
+                            state: instance.state.as_str(),
+                        })
+                    }
                     _ => return Err(EngineError::InstanceNotFound { instance_key }),
                 }
 
-                // Validate up front so the command is all-or-nothing: every
-                // activate element id must exist in the process definition and
-                // every terminate key must be a currently-active element instance.
-                for a in &activate_instructions {
-                    let exists = self
-                        .process_of_instance(instance_key)
-                        .map(|p| p.element(&a.element_id).is_some())
-                        .unwrap_or(false);
-                    if !exists {
-                        return Err(EngineError::ElementNotFound {
-                            instance_key,
-                            element_id: a.element_id.clone(),
-                        });
-                    }
-                }
-                for &eik in &terminate_instructions {
-                    let active = self
-                        .state
-                        .instances
-                        .get(&instance_key)
-                        .map(|i| i.active.contains_key(&eik))
-                        .unwrap_or(false);
-                    if !active {
-                        return Err(EngineError::ElementInstanceNotFound {
-                            instance_key,
-                            element_instance_key: eik,
-                        });
-                    }
-                }
+                // Move instructions are not acted on yet: rejected explicitly —
+                // never silently ignored (#1374; `engine-modify-move` lands them).
+                Self::reject_unsupported_modification(instance_key, &move_instructions)?;
 
-                // Apply terminations first (deterministic key order), then merge
-                // any global variables and queue the activations at the process
-                // root scope.
-                let mut terminate: Vec<Key> = terminate_instructions;
-                terminate.sort_unstable();
-                terminate.dedup();
-                for eik in terminate {
-                    // The eik was validated against `instance.active` above, so
-                    // its element id must resolve. Skip defensively rather than
-                    // emitting a termination with an empty element_id, which
-                    // would corrupt downstream element aggregates.
-                    let Some(element_id) = self.element_id_of_instance(instance_key, eik) else {
-                        continue;
-                    };
-                    self.terminate_element_instance(&mut log, instance_key, eik, &element_id);
-                }
-
-                for a in &activate_instructions {
-                    if !a.variables.is_empty() {
-                        for event in self.propagated_updates(
-                            instance_key,
-                            instance_key,
-                            a.variables.clone(),
-                            false,
-                        ) {
-                            self.emit(&mut log, event);
-                        }
-                    }
-                    queue.push_back(Step::Activate {
-                        instance_key,
-                        element_id: a.element_id.clone(),
-                        scope: 0,
-                        via: None,
-                    });
-                }
-
-                // If the terminations drained the last token and nothing was
-                // activated to replace it, the instance is terminated (Zeebe
-                // modify semantics) rather than being auto-completed by
-                // `complete_finished_instances`.
-                let drained = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .map(|i| i.active.is_empty())
-                    .unwrap_or(true);
-                if drained && activate_instructions.is_empty() {
-                    self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
-                }
+                // Validate everything up front so the command is all-or-nothing,
+                // then apply (see `modify.rs`).
+                let plan = self.plan_modification(
+                    instance_key,
+                    &activate_instructions,
+                    &terminate_instructions,
+                    &terminate_element_ids,
+                )?;
+                self.apply_modification(&mut log, &mut queue, instance_key, plan);
             }
 
             Command::DispatchStartInstance {
@@ -4526,6 +4536,29 @@ impl Engine {
     ) -> Option<Paused> {
         loop {
             while let Some(step) = queue.pop_front() {
+                // A seeded join interleaves state-dependent writes with its
+                // guarded activation, so it emits directly into the log.
+                if let Step::ActivateSeededJoin {
+                    instance_key,
+                    element_id,
+                    scope,
+                    locals,
+                } = step
+                {
+                    let emitted_from = log.len();
+                    self.activate_seeded_join(
+                        log,
+                        &mut queue,
+                        instance_key,
+                        element_id,
+                        scope,
+                        locals,
+                    );
+                    if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
+                        return Some(Paused { queue, cursor });
+                    }
+                    continue;
+                }
                 let (events, followups) = self.process_step(step, &queue);
                 let emitted_from = log.len();
                 for event in events {
@@ -5199,6 +5232,11 @@ impl Engine {
                 instance_key,
                 scope,
                 ..
+            }
+            | Step::ActivateSeededJoin {
+                instance_key,
+                scope,
+                ..
             } => (*instance_key, Some(*scope), None, None),
             Step::Complete {
                 instance_key,
@@ -5221,6 +5259,11 @@ impl Engine {
                 ..
             }
             | Step::RetryActivation {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::ResumeSeededActivation {
                 instance_key,
                 element_instance_key,
                 ..
@@ -5484,7 +5527,48 @@ impl Engine {
                 // scope and re-run the activation body so the now-fixed input
                 // mappings are re-applied before the element's behaviour runs.
                 let scope = self.scope_of(instance_key, element_instance_key);
-                self.activate_body(instance_key, element_id, element_instance_key, scope)
+                // Re-evaluate in the same view as the first attempt: an element
+                // whose own scope is already registered (a modification seeded
+                // element-local variables, or a sub-process scope that holds no
+                // locals yet) evaluates in that scope; otherwise the enclosing
+                // scope.
+                let registered = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.scope_parents.contains_key(&element_instance_key))
+                    .unwrap_or(false);
+                let view = if registered {
+                    element_instance_key
+                } else {
+                    scope
+                };
+                self.activate_body_in(instance_key, element_id, element_instance_key, scope, view)
+            }
+            Step::ResumeSeededActivation {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.activate_body_in(
+                    instance_key,
+                    element_id,
+                    element_instance_key,
+                    scope,
+                    element_instance_key,
+                )
+            }
+            // Handled in `run_with` (it needs the log between its writes); this
+            // arm is unreachable — degrade to the plain guarded activation.
+            Step::ActivateSeededJoin {
+                instance_key,
+                element_id,
+                scope,
+                ..
+            } => {
+                debug_assert!(false, "ActivateSeededJoin is dispatched by run_with");
+                self.activate(instance_key, element_id, scope, None, pending)
             }
             Step::ActivateMiChild {
                 instance_key,
@@ -5675,6 +5759,20 @@ impl Engine {
         element_instance_key: Key,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        self.activate_body_in(instance_key, element_id, element_instance_key, scope, scope)
+    }
+
+    /// [`activate_body`] evaluating against the variable view of `view_scope`
+    /// (the enclosing `scope` normally; the element's own seeded scope for a
+    /// [`Step::ResumeSeededActivation`]).
+    fn activate_body_in(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+        view_scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         // Input mappings (zeebe:input): evaluate against the variables visible to
         // the activating element and create the mapped values LOCAL to the
         // element's own scope (Zeebe semantics) — visible to the element's job or
@@ -5688,7 +5786,15 @@ impl Engine {
         // The element's own scope is registered by `activate` for a
         // sub-process/ad-hoc container (before this body runs); a leaf activity
         // registers it lazily below, only if its inputs produce values.
-        let scope_registered = is_sub_process || is_adhoc_container;
+        // A modification may have registered it already (seeded locals).
+        let scope_registered = is_sub_process
+            || is_adhoc_container
+            || self
+                .state
+                .instances
+                .get(&instance_key)
+                .map(|i| i.scope_parents.contains_key(&element_instance_key))
+                .unwrap_or(false);
         // A call activity's input mappings seed only its isolated child process
         // scope (applied in `spawn_call_activity_child`) — never the call
         // activity's own element scope — so they are NOT projected here. Routing
@@ -5712,7 +5818,7 @@ impl Engine {
         // variable resolves correctly (Zeebe parity). A sub-process's own inputs
         // are evaluated here against its *parent* scope and then applied local to
         // the new sub-process scope.
-        let element_vars = self.variables_for_element(instance_key, scope);
+        let element_vars = self.variables_for_element(instance_key, view_scope);
 
         let mut events: Vec<Event> = Vec::new();
         let followups: Vec<Step> = Vec::new();
@@ -6175,104 +6281,28 @@ impl Engine {
                     &element_id,
                 ));
             }
-            // A timer intermediate catch event arms a timer and parks the token;
-            // a clock tick (TriggerTimers) releases it once the timer is due.
-            Some(ElementKind::TimerIntermediateCatchEvent { duration_millis }) => {
-                let timer_key = self.mint_key();
-                let timer_def = self.timer_def_of(instance_key, &element_id);
-                let (due_at, _) = self.resolve_timer(
-                    &element_vars,
-                    timer_def.as_ref(),
-                    self.now,
-                    duration_millis,
-                );
-                events.push(Event::TimerCreated {
-                    timer_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    due_at,
-                    kind: state::TimerKind::IntermediateCatch,
-                });
-            }
-            // A message intermediate catch event opens a subscription and parks
-            // the token; a matching CorrelateMessage releases it.
-            Some(ElementKind::MessageIntermediateCatchEvent {
-                message_name,
-                correlation_key,
-            }) => {
-                let subscription_key = self.mint_key();
-                // The message name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity).
-                let message_name = self.resolve_event_name(&element_vars, &message_name);
-                // A declared correlation-key expression that fails to evaluate
-                // (missing variable, `null`, or a type error like `str + null`)
-                // must NOT silently open a subscription with an empty key — that
-                // key can never be matched by a published message, so the token
-                // would park forever with no error. Raise an ExpressionEvaluation
-                // incident instead (Zeebe parity); resolving it re-opens the
-                // subscription (see the `ResolveIncident` re-drive).
-                match self.resolve_correlation_value_checked(&element_vars, &correlation_key) {
-                    Err(reason) => {
-                        events.push(Event::IncidentRaised {
-                            incident_key: subscription_key,
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            kind: state::IncidentKind::ExpressionEvaluation,
-                            redrive: None,
-                            reason,
-                            job_key: None,
-                            created_at: self.now,
-                        });
-                    }
-                    Ok(correlation_value) => {
-                        let kind = state::MessageSubscriptionKind::IntermediateCatch;
-                        // Zeebe-style placement: the canonical subscription lives on the
-                        // partition owning `hash(correlation_key)`. When that is this
-                        // partition (always so single-partition), open it locally; else
-                        // park the token on an `Opening` record and let the host route an
-                        // `OpenMessageSubscription` to the message partition.
-                        if self.subscription_partition(&correlation_value) == self.partition_id {
-                            events.push(Event::MessageSubscriptionCreated {
-                                subscription_key,
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                message_name,
-                                correlation_key: correlation_value,
-                                kind,
-                            });
-                        } else {
-                            events.push(Event::MessageSubscriptionOpening {
-                                subscription_key,
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                message_name,
-                                correlation_key: correlation_value,
-                                kind,
-                            });
-                        }
-                    }
+            // A timer / message / signal intermediate catch event arms its
+            // trigger (timer or subscription) and parks the token; the clock
+            // tick, a matching CorrelateMessage or BroadcastSignal releases it.
+            // The arming itself is shared with migration (#1374) via
+            // `arm_catch_event`.
+            Some(
+                ElementKind::TimerIntermediateCatchEvent { .. }
+                | ElementKind::MessageIntermediateCatchEvent { .. }
+                | ElementKind::SignalIntermediateCatchEvent { .. },
+            ) => {
+                if let Some(element) = self
+                    .process_of_instance(instance_key)
+                    .and_then(|p| p.element(&element_id))
+                    .cloned()
+                {
+                    events.extend(self.arm_catch_event(
+                        instance_key,
+                        element_instance_key,
+                        &element_vars,
+                        &element,
+                    ));
                 }
-            }
-            // A signal intermediate catch event opens a signal subscription
-            // (name-only, no correlation key) and parks the token; a matching
-            // BroadcastSignal releases it.
-            Some(ElementKind::SignalIntermediateCatchEvent { signal_name }) => {
-                let subscription_key = self.mint_key();
-                // The signal name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity).
-                let signal_name = self.resolve_event_name(&element_vars, &signal_name);
-                events.push(Event::SignalSubscriptionCreated {
-                    subscription_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    signal_name,
-                    kind: state::MessageSubscriptionKind::IntermediateCatch,
-                });
             }
             // A conditional intermediate catch event evaluates its FEEL condition
             // on arrival: if already `true` the token passes straight through;
@@ -6290,18 +6320,17 @@ impl Engine {
                         element_instance_key,
                         element_id,
                     });
-                } else {
-                    let subscription_key = self.mint_key();
-                    let referenced_vars = sorted_referenced_vars(&condition);
-                    events.push(Event::ConditionalSubscriptionCreated {
-                        subscription_key,
+                } else if let Some(element) = self
+                    .process_of_instance(instance_key)
+                    .and_then(|p| p.element(&element_id))
+                    .cloned()
+                {
+                    events.extend(self.arm_catch_event(
                         instance_key,
                         element_instance_key,
-                        element_id,
-                        condition,
-                        referenced_vars,
-                        kind: state::MessageSubscriptionKind::IntermediateCatch,
-                    });
+                        &element_vars,
+                        &element,
+                    ));
                 }
             }
             // An embedded sub-process opens a token scope: it activates its inner
@@ -6494,7 +6523,24 @@ impl Engine {
         // expressions are evaluated against the body's *enclosing* scope view, so
         // a multi-instance activity nested in a sub-process can read that
         // sub-process's locals.
-        let enclosing_vars = self.variables_for_element(instance_key, scope);
+        //
+        // A body whose scope is already registered (a re-drive, or a body a
+        // process-instance modification opened and seeded with element-scoped
+        // variables) evaluates in its own scope view, so those seeded locals are
+        // visible; on a first activation the body scope is not registered yet
+        // and holds no locals, so this is the enclosing view.
+        let view_scope = if self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| i.scope_parents.contains_key(&body_key))
+            .unwrap_or(false)
+        {
+            body_key
+        } else {
+            scope
+        };
+        let enclosing_vars = self.variables_for_element(instance_key, view_scope);
         // A CALL ACTIVITY's `zeebe:input` mappings seed only its isolated child
         // PROCESS scope — they are applied once in `spawn_call_activity_child` per
         // child, never local to the MI body scope. Applying them here would leak
@@ -9153,12 +9199,12 @@ impl Engine {
         }
         // Nested container: walk the element-instance tree (inner instance →
         // parent container) and read this tool's job type off the parent catalog.
-        let inner = self.scope_of(instance_key, container_key);
-        let parent = if inner != 0 {
-            self.scope_of(instance_key, inner)
-        } else {
-            0
-        };
+        // Ancestors innermost-first: [inner instance, parent container, …].
+        let parent = self
+            .ancestor_element_instances(instance_key, container_key)
+            .get(1)
+            .copied()
+            .unwrap_or(0);
         let parent_element_id = self.element_id_of_instance(instance_key, parent)?;
         self.adhoc_def_of(instance_key, &parent_element_id)?
             .tools
@@ -9723,7 +9769,7 @@ impl Engine {
             result_variable,
         }) = self.element_kind(instance_key, &element_id)
         {
-            let vars = self.variables(instance_key);
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             match crate::feel::eval(&expression, &vars) {
                 Ok(value) => {
                     let mut update = HashMap::new();
@@ -9769,7 +9815,7 @@ impl Engine {
             result_variable,
         }) = self.element_kind(instance_key, &element_id)
         {
-            let vars = self.variables(instance_key);
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             // The `decisionId` may be a FEEL expression (leading `=`). A failed
             // evaluation is a decision-evaluation failure (Zeebe
             // `DECISION_EVALUATION_ERROR` taxonomy — the task cannot evaluate
@@ -11384,9 +11430,10 @@ impl Engine {
     fn select_exclusive_flow(
         &self,
         instance_key: Key,
+        element_instance_key: Key,
         element_id: &str,
     ) -> Result<Option<usize>, String> {
-        let variables = self.variables(instance_key);
+        let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         for (index, flow) in self
             .outgoing(instance_key, element_id)
@@ -11424,26 +11471,27 @@ impl Engine {
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected = match self.select_exclusive_flow(instance_key, &element_id) {
-            Ok(sel) => sel,
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                return (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                );
-            }
-        };
+        let selected =
+            match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
+                Ok(sel) => sel,
+                Err(reason) => {
+                    let incident_key = self.mint_key();
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
+                }
+            };
 
         match selected {
             Some(flow_index) => {
@@ -11456,7 +11504,7 @@ impl Engine {
                 // End-listener gate (ADR 0037): the gateway rests in COMPLETING
                 // while its end chain runs; `finalize_exclusive_gateway` re-selects
                 // the flow and emits the deferred completion once it drains.
-                let vars = self.variables(instance_key);
+                let vars = self.variables_for_element(instance_key, element_instance_key);
                 if let Some(job) = self.begin_end_listener_chain(
                     instance_key,
                     element_instance_key,
@@ -11513,7 +11561,7 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        match self.select_exclusive_flow(instance_key, &element_id) {
+        match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
             Ok(Some(flow_index)) => {
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
                 let mut events = vec![Event::ElementCompleted {
@@ -11575,9 +11623,10 @@ impl Engine {
     fn select_inclusive_flows(
         &self,
         instance_key: Key,
+        element_instance_key: Key,
         element_id: &str,
     ) -> Result<Vec<usize>, String> {
-        let variables = self.variables(instance_key);
+        let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         let mut selected = Vec::new();
         for (index, flow) in self
@@ -11651,26 +11700,27 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected = match self.select_inclusive_flows(instance_key, &element_id) {
-            Ok(sel) => sel,
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                return (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                );
-            }
-        };
+        let selected =
+            match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
+                Ok(sel) => sel,
+                Err(reason) => {
+                    let incident_key = self.mint_key();
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            redrive: None,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
+                }
+            };
         if selected.is_empty() {
             let incident_key = self.mint_key();
             return (
@@ -11695,7 +11745,7 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         }];
-        let vars = self.variables(instance_key);
+        let vars = self.variables_for_element(instance_key, element_instance_key);
         if let Some(job) = self.begin_end_listener_chain(
             instance_key,
             element_instance_key,
@@ -11741,7 +11791,7 @@ impl Engine {
             scope,
             &mut events,
         );
-        match self.select_inclusive_flows(instance_key, &element_id) {
+        match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
             Ok(selected) if !selected.is_empty() => {
                 events.push(Event::ElementCompleted {
                     instance_key,
@@ -12475,10 +12525,14 @@ impl Engine {
                     // child whose own cancel deferred on a user-task canceling
                     // listener) — otherwise the parent's termination orphans
                     // them. `discard_and_terminate_instance` force-completes
-                    // that deferred drain.
+                    // that deferred drain — and children an operator
+                    // `Suspended`: suspension pauses progress, it does not
+                    // detach the child from its ending parent.
                     matches!(
                         i.state,
-                        ProcessInstanceState::Active | ProcessInstanceState::Terminating
+                        ProcessInstanceState::Active
+                            | ProcessInstanceState::Terminating
+                            | ProcessInstanceState::Suspended
                     ) && i
                         .parent_process_instance_key
                         .map(|p| ended.contains(&p))
@@ -13271,6 +13325,99 @@ pub enum EngineError {
         element_id: String,
         reason: String,
     },
+    // ---- Process-instance modification / migration rejection surface (#1374).
+    // Shape-only scaffold: later slices construct these; the REST status class
+    // of each is mapped once in `engine_error_status` (nano-server-raft).
+    /// A `ModifyInstance` carried an instruction (field) the engine does not act
+    /// on yet. Rejected explicitly rather than silently ignored. HTTP 400.
+    ModificationInstructionNotYetSupported {
+        instance_key: Key,
+        /// The command field, e.g. `move_instructions`.
+        instruction: &'static str,
+    },
+    /// A `ModifyInstance` instruction is malformed (e.g. a move with neither
+    /// source nor target, or duplicate move sources). HTTP 400. Zeebe
+    /// INVALID_ARGUMENT.
+    ModificationInstructionInvalid {
+        instance_key: Key,
+        process_id: String,
+        reason: String,
+    },
+    /// The instance exists but is not in a modifiable/migratable state (e.g.
+    /// suspended). HTTP 409. Zeebe INVALID_STATE.
+    InstanceNotActive {
+        instance_key: Key,
+        process_id: String,
+        state: &'static str,
+    },
+    /// An activate instruction's element has a flow scope with more than one
+    /// active instance and no ancestor was selected. HTTP 400.
+    AmbiguousFlowScope {
+        instance_key: Key,
+        process_id: String,
+        element_id: String,
+    },
+    /// An activate instruction's `ancestor_element_instance_key` does not exist
+    /// or is not active in the instance. HTTP 400.
+    AncestorScopeNotFound {
+        instance_key: Key,
+        process_id: String,
+        ancestor_element_instance_key: Key,
+    },
+    /// An activate instruction's `ancestor_element_instance_key` is not an
+    /// ancestor (flow-scope instance) of the element to activate. HTTP 400.
+    AncestorNotAnAncestor {
+        instance_key: Key,
+        process_id: String,
+        element_id: String,
+        ancestor_element_instance_key: Key,
+    },
+    /// An activate/move target cannot be activated by modification (a start
+    /// event inside a sub-process, a boundary event, an element inside a
+    /// multi-instance body, …). HTTP 400.
+    ElementNotActivatable {
+        instance_key: Key,
+        process_id: String,
+        element_id: String,
+        reason: String,
+    },
+    /// A migration mapping would change the flow scope of an active element.
+    /// HTTP 409. Zeebe `ERROR_MESSAGE_ELEMENT_FLOW_SCOPE_CHANGED`. (An
+    /// unsupported element class in migration is [`EngineError::UnsupportedMigration`].)
+    MigrationFlowScopeChanged {
+        instance_key: Key,
+        element_id: String,
+        source_flow_scope_id: Option<String>,
+        target_flow_scope_id: Option<String>,
+    },
+    /// A migration mapped a multi-instance element onto a non-multi-instance
+    /// one or vice versa, or a parallel multi-instance element onto a
+    /// sequential one or vice versa. HTTP 409.
+    MigrationMultiInstanceMismatch {
+        instance_key: Key,
+        source_element_id: String,
+        target_element_id: String,
+    },
+    /// A migration mapped a catch event attached to an active element (a
+    /// boundary event) onto a catch event that is not attached to that
+    /// element's mapped target. HTTP 409. Zeebe
+    /// `ERROR_CATCH_EVENT_DETACHED_FROM_ELEMENT`.
+    MigrationCatchEventDetached {
+        instance_key: Key,
+        element_id: String,
+        target_element_id: String,
+        catch_event_id: String,
+        target_catch_event_id: String,
+    },
+    /// Several catch events of one active element are mapped onto the same
+    /// target catch event. HTTP 409. Zeebe
+    /// `requireNoDuplicateTargetsInCatchEventMappings`.
+    MigrationCatchEventsMerged {
+        instance_key: Key,
+        element_id: String,
+        target_catch_event_id: String,
+        source_catch_event_ids: Vec<String>,
+    },
     /// An AgentInstance command referenced an `agent_instance_key` that does not
     /// identify a known agent instance.
     AgentInstanceNotFound { agent_instance_key: Key },
@@ -13343,6 +13490,28 @@ pub enum EngineError {
     InstanceUnavailable { instance_key: Key },
 }
 
+impl Engine {
+    /// Rejects the [`Command::ModifyInstance`] instruction fields the engine
+    /// does not act on yet with
+    /// [`EngineError::ModificationInstructionNotYetSupported`], in a fixed
+    /// field order so the rejection is deterministic.
+    fn reject_unsupported_modification(
+        instance_key: Key,
+        move_instructions: &[crate::command::MoveInstruction],
+    ) -> Result<(), EngineError> {
+        let unsupported = |instruction| {
+            Err(EngineError::ModificationInstructionNotYetSupported {
+                instance_key,
+                instruction,
+            })
+        };
+        if !move_instructions.is_empty() {
+            return unsupported("move_instructions");
+        }
+        Ok(())
+    }
+}
+
 /// Element classes this migration phase does not remap yet, mirroring Zeebe's
 /// "not supported yet" migration rejections. Returns `Some(reason)` when a
 /// migration touching an active element (or armed boundary runtime) of this kind
@@ -13350,16 +13519,7 @@ pub enum EngineError {
 fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'static str> {
     use crate::model::ElementKind;
     match kind {
-        ElementKind::ErrorBoundaryEvent { .. }
-        | ElementKind::TimerBoundaryEvent { .. }
-        | ElementKind::MessageBoundaryEvent { .. }
-        | ElementKind::SignalBoundaryEvent { .. }
-        | ElementKind::ConditionalBoundaryEvent { .. }
-        | ElementKind::EscalationBoundaryEvent { .. } => {
-            Some("boundary events are not migratable yet")
-        }
         ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),
-        ElementKind::SubProcess { .. } => Some("embedded sub-processes are not migratable yet"),
         ElementKind::EventBasedGateway => Some("event-based gateways are not migratable yet"),
         _ => None,
     }
@@ -13373,6 +13533,53 @@ impl std::fmt::Display for EngineError {
             EngineError::AgentInstanceAlreadyExists { element_instance_key, agent_instance_key } => write!(f, "element instance {element_instance_key} is already associated with agent instance {agent_instance_key}"),
             EngineError::AgentInstanceActiveWriter { agent_instance_key, element_instance_key } => write!(f, "agent instance {agent_instance_key} still has an active writer on element instance {element_instance_key}"),
             EngineError::AgentHistoryInvalid { reason } => write!(f, "invalid agent history: {reason}"),
+            EngineError::ModificationInstructionNotYetSupported { instance_key, instruction } => write!(
+                f,
+                "Expected to modify process instance '{instance_key}' but it contains '{instruction}', which is not yet supported"
+            ),
+            EngineError::ModificationInstructionInvalid { process_id, reason, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains an invalid instruction: {reason}"
+            ),
+            EngineError::InstanceNotActive { instance_key, process_id, state } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but process instance '{instance_key}' is {state}"
+            ),
+            EngineError::AmbiguousFlowScope { process_id, element_id, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions for an element that has a flow scope with more than one active instance: '{element_id}'. Can't decide in which instance of the flow scope the element should be activated. Please specify an ancestor element instance key for this activate instruction."
+            ),
+            EngineError::AncestorScopeNotFound { process_id, ancestor_element_instance_key, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions with an ancestor scope key that does not exist, or is not in an active state: '{ancestor_element_instance_key}'"
+            ),
+            EngineError::AncestorNotAnAncestor { process_id, element_id, ancestor_element_instance_key, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions with an ancestor scope key that is not an ancestor of the element to activate: '{ancestor_element_instance_key}' is not an ancestor of '{element_id}'"
+            ),
+            EngineError::ElementNotActivatable { process_id, element_id, reason, .. } => write!(
+                f,
+                "Expected to modify instance of process '{process_id}' but it contains one or more activate instructions for elements that are unsupported: '{element_id}'. {reason}."
+            ),
+            EngineError::MigrationFlowScopeChanged { instance_key, element_id, source_flow_scope_id, target_flow_scope_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but the flow scope of active element with id '{element_id}' is changed. The flow scope of the active element is expected to be '{}' but was '{}'. The flow scope of an element cannot be changed during migration yet.",
+                source_flow_scope_id.as_deref().unwrap_or("<process>"),
+                target_flow_scope_id.as_deref().unwrap_or("<process>")
+            ),
+            EngineError::MigrationMultiInstanceMismatch { instance_key, source_element_id, target_element_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{source_element_id}' is mapped to element with id '{target_element_id}' which changes multi-instance characteristics. Changing between multi-instance and non-multi-instance elements, or between parallel and sequential multi-instance, is not supported."
+            ),
+            EngineError::MigrationCatchEventDetached { instance_key, element_id, target_element_id, catch_event_id, target_catch_event_id } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' is mapped to an element with id '{target_element_id}' and has a catch event with id '{catch_event_id}' that is mapped to a catch event with id '{target_catch_event_id}'. These mappings detach the catch event from the element in the target process. Catch events must stay attached to the same element instance."
+            ),
+            EngineError::MigrationCatchEventsMerged { instance_key, element_id, target_catch_event_id, source_catch_event_ids } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' has a catch event attached that is mapped to a catch event with id '{target_catch_event_id}'. There are multiple mapping instructions that target this catch event: '{}'. Catch events cannot be merged by process instance migration. Please ensure the mapping instructions target a catch event only once.",
+                source_catch_event_ids.join("', '")
+            ),
             EngineError::ProcessNotFound { process_id } => {
                 write!(f, "no deployed process with id {process_id}")
             }

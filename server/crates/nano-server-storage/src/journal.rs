@@ -252,6 +252,12 @@ pub struct Journal {
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
     activation_cursor: HashMap<String, Key>,
+    /// Test-only instrumentation: how many times the cold-descendant traversal
+    /// scanned the resident instance set per visited descendant (the O(N × D)
+    /// shape Copilot flagged on #1418). The indexed traversal never scans, so a
+    /// regression test pins this at zero.
+    #[cfg(test)]
+    resident_child_scans: usize,
 }
 
 /// Extra cold reads an activation poll may spend past `max_jobs` to skip
@@ -991,6 +997,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1021,6 +1029,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1149,6 +1159,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         })
@@ -1183,6 +1195,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         };
@@ -1222,6 +1236,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1256,6 +1272,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1495,6 +1513,53 @@ impl Journal {
         }
     }
 
+    /// Restores spilled root variables of the instance an instance-addressed
+    /// command is about to evaluate expressions against. Migration and
+    /// modification may arm new boundary/catch subscriptions whose correlation
+    /// keys / timer expressions read root variables; job activation (the only
+    /// other restore path) is not part of either command, so without this the
+    /// engine would evaluate against the empty spill placeholder.
+    ///
+    /// Fails closed like the cold path (#1388): an unreadable variable row
+    /// rejects the command with the retryable
+    /// [`EngineError::InstanceUnavailable`] instead of running it against an
+    /// instance missing its variables.
+    fn ensure_variables_resident_for_command(
+        &mut self,
+        command: &Command,
+    ) -> Result<(), EngineError> {
+        let instance_key = match command {
+            Command::MigrateInstance { instance_key, .. }
+            | Command::ModifyInstance { instance_key, .. } => *instance_key,
+            _ => return Ok(()),
+        };
+        if !self.engine.is_variables_spilled(instance_key) {
+            return Ok(());
+        }
+        self.restore_spilled_variables(instance_key, "command")
+            .map_err(|err| {
+                tracing::error!(
+                    instance_key,
+                    error = %err,
+                    "command: spilled instance's variable row could not be read; the \
+                     command is rejected as retryable (row kept)"
+                );
+                EngineError::InstanceUnavailable { instance_key }
+            })?;
+        // Post-condition, not just the restore's verdict: the restore is a
+        // no-op when no spill tier is wired, which would otherwise let the
+        // command evaluate against the empty placeholder (Copilot on #1418).
+        if self.engine.is_variables_spilled(instance_key) {
+            tracing::error!(
+                instance_key,
+                "command: spilled instance's variables are still not resident (no \
+                 spill tier wired?); the command is rejected as retryable"
+            );
+            return Err(EngineError::InstanceUnavailable { instance_key });
+        }
+        Ok(())
+    }
+
     /// Rehydrates any cold instance a command is about to target, so the engine
     /// processes the command against complete hot state. Cheap when cold spill is
     /// unset or nothing relevant is cold (a few index lookups). Routing mirrors
@@ -1509,6 +1574,7 @@ impl Journal {
     /// can never run against state missing that instance (a misleading 404, or
     /// a message correlated/buffered as if the cold subscriber did not exist).
     fn ensure_resident_for_command(&mut self, command: &Command) -> Result<(), EngineError> {
+        self.ensure_variables_resident_for_command(command)?;
         let Some(cold) = self.cold.as_ref() else {
             return Ok(());
         };
@@ -1564,8 +1630,9 @@ impl Journal {
                     targets.push(*instance_key);
                 }
             }
-            Command::ModifyInstance { instance_key, .. } => {
-                // Modify addresses a single instance (activating/terminating its
+            Command::ModifyInstance { instance_key, .. }
+            | Command::MigrateInstance { instance_key, .. } => {
+                // Modify/migrate address a single instance (activating/terminating its
                 // element instances); page it in before the command applies.
                 if cold.index.contains(*instance_key) {
                     targets.push(*instance_key);
@@ -1596,10 +1663,72 @@ impl Journal {
                 unavailable.get_or_insert(key);
             }
         }
+        // Instance-wide teardown/restructuring commands also reach the
+        // instance's call-activity descendants (terminating a call activity
+        // terminates its child): page every cold descendant in too, or the
+        // engine's resident-only child lookup misses it and the child later
+        // resumes orphaned work (Copilot on #1418).
+        if let Command::ModifyInstance { instance_key, .. }
+        | Command::MigrateInstance { instance_key, .. }
+        | Command::CancelInstance { instance_key } = command
+            && let Some(key) = self.rehydrate_cold_descendants(*instance_key)
+        {
+            unavailable.get_or_insert(key);
+        }
         match unavailable {
             Some(instance_key) => Err(EngineError::InstanceUnavailable { instance_key }),
             None => Ok(()),
         }
+    }
+
+    /// Rehydrates every cold call-activity descendant of `root` (through
+    /// resident and cold intermediates alike). Returns the first descendant
+    /// whose row is unreadable, if any (it stays cold; the caller fails
+    /// closed).
+    fn rehydrate_cold_descendants(&mut self, root: Key) -> Option<Key> {
+        // Resident parent → children, built ONCE: scanning `instances` per
+        // visited descendant is O(N × D) on the partition command path (Copilot
+        // on #1418). A rehydrated child is pushed onto the frontier itself, so
+        // its own children are looked up under its key — the map needs no
+        // re-keying as instances page back in.
+        let mut resident_children: HashMap<Key, Vec<Key>> = HashMap::new();
+        for instance in self.engine.state().instances.values() {
+            if let Some(parent) = instance.parent_process_instance_key {
+                resident_children
+                    .entry(parent)
+                    .or_default()
+                    .push(instance.key);
+            }
+        }
+        let mut unavailable = None;
+        let mut frontier = vec![root];
+        let mut seen: HashSet<Key> = HashSet::new();
+        while let Some(parent) = frontier.pop() {
+            if !seen.insert(parent) {
+                continue;
+            }
+            let cold_children = self
+                .cold
+                .as_ref()
+                .map(|cold| cold.index.children_of(parent))
+                .unwrap_or_default();
+            for child in cold_children {
+                match self.rehydrate_cold(child) {
+                    ColdRehydration::Unreadable => {
+                        unavailable.get_or_insert(child);
+                    }
+                    _ => frontier.push(child),
+                }
+            }
+            frontier.extend(
+                resident_children
+                    .get(&parent)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+        unavailable
     }
 
     /// Sheds dormant instances to disk when hot RAM crosses the high-water mark.
@@ -2381,15 +2510,39 @@ impl Journal {
     /// [`rehydrate_activated_variables`](Journal::rehydrate_activated_variables)).
     /// On an unreadable row the instance is left spilled.
     fn rehydrate_spilled_variables(&mut self, instance_key: Key, job_key: Key) {
+        if let Err(err) = self.restore_spilled_variables(instance_key, "activation") {
+            self.offheap_read_failures.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                instance_key,
+                job_key,
+                error = %err,
+                "activation: spilled instance's variable row could not be read; the \
+                 job is withheld from the worker (row kept, retried when its lease \
+                 expires)"
+            );
+        }
+    }
+
+    /// The single spilled-variable restore (#1388/#1389): a non-destructive
+    /// legacy-aware read; on success the variables are rehydrated and (classic
+    /// mode) only then the dead cache row forgotten; a definitively absent row
+    /// is quarantined as an orphan (the instance keeps its surviving resident
+    /// variables). `Err` = the row is unreadable: nothing is changed, the caller
+    /// fails closed. `context` prefixes the log lines. No-op when no tier is
+    /// wired.
+    fn restore_spilled_variables(
+        &mut self,
+        instance_key: Key,
+        context: &str,
+    ) -> Result<(), String> {
         let lean = self.varstore.is_some();
         if !lean && self.spill.is_none() {
-            return;
+            return Ok(());
         }
         // Legacy-aware (#1388): a lean miss is only "absent" once the legacy
         // tier is wired and also has no row; otherwise it fails closed.
-        let read = self.peek_spilled_variables(instance_key);
-        match read {
-            Ok(Some(vars)) => {
+        match self.peek_spilled_variables(instance_key)? {
+            Some(vars) => {
                 self.engine
                     .rehydrate_variables(instance_key, Arc::new(vars));
                 if !lean {
@@ -2403,18 +2556,20 @@ impl Journal {
                         tracing::error!(
                             instance_key,
                             error = %err,
-                            "activation: variables restored but the spill row could \
+                            "{context}: variables restored but the spill row could \
                              not be forgotten (latched for retry)"
                         );
                     }
                 }
             }
-            Ok(None) => {
+            None => {
                 self.note_orphan(
                     instance_key,
-                    "activation: spilled instance's variable row is definitively absent \
-                     from a readable store; its spilled variables are lost — quarantined \
-                     (activated with its surviving resident variables)",
+                    &format!(
+                        "{context}: spilled instance's variable row is definitively absent \
+                         from a readable store; its spilled variables are lost — quarantined \
+                         (continuing with its surviving resident variables)"
+                    ),
                 );
                 let resident = self
                     .engine
@@ -2423,18 +2578,8 @@ impl Journal {
                     .unwrap_or_default();
                 self.engine.rehydrate_variables(instance_key, resident);
             }
-            Err(err) => {
-                self.offheap_read_failures.fetch_add(1, Ordering::Relaxed);
-                tracing::error!(
-                    instance_key,
-                    job_key,
-                    error = %err,
-                    "activation: spilled instance's variable row could not be read; the \
-                     job is withheld from the worker (row kept, retried when its lease \
-                     expires)"
-                );
-            }
         }
+        Ok(())
     }
 
     /// Fires every due timer at logical instant `now`, journaling the resulting
@@ -2667,7 +2812,7 @@ impl Journal {
     /// Records `key` as a quarantined off-heap orphan, logging `msg` at ERROR
     /// only the first time it is seen (#1383 — the fold runs every snapshot
     /// tick, and an orphan is permanent).
-    fn note_orphan(&self, key: Key, msg: &'static str) {
+    fn note_orphan(&self, key: Key, msg: &str) {
         let first = self
             .quarantined
             .lock()
@@ -3225,6 +3370,150 @@ mod tests {
             .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
     }
 
+    // Copilot on #1418: modification/migration/cancel of a parent must page in
+    // its cold-spilled call-activity children, or tearing down the call
+    // activity misses the (non-resident) child, which later resumes orphaned.
+    #[test]
+    fn terminating_a_call_activity_rehydrates_and_terminates_its_cold_child() {
+        let mut journal = cold_journal();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let parent = ProcessBuilder::new("caller")
+            .start_event("s")
+            .call_activity("call", "demo")
+            .end_event("e")
+            .connect("s", "call")
+            .connect("call", "e")
+            .build()
+            .unwrap();
+        let _ = journal
+            .apply_command(Command::DeployProcess(parent))
+            .unwrap();
+        let (events, _) = journal
+            .apply_command(Command::create_instance("caller"))
+            .unwrap();
+        let parent_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let child_key = journal
+            .state()
+            .instances
+            .values()
+            .find(|i| i.parent_process_instance_key == Some(parent_key))
+            .map(|i| i.key)
+            .expect("child instance");
+        assert_eq!(
+            journal.force_cold_spill_all(),
+            2,
+            "parent and child spilled"
+        );
+
+        let (events, _) = journal
+            .apply_command(Command::ModifyInstance {
+                instance_key: parent_key,
+                activate_instructions: vec![],
+                terminate_instructions: vec![],
+                terminate_element_ids: vec!["call".to_string()],
+                move_instructions: vec![],
+            })
+            .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+            )),
+            "cold child is terminated with its call activity"
+        );
+        assert_eq!(journal.cold_count(), 0, "no cold child left behind");
+        // Nothing for a worker to resume.
+        assert!(
+            journal
+                .activate_jobs("demo-work", "w", 1, 1_000, 0)
+                .is_empty()
+        );
+    }
+
+    // Copilot on #1418: the cold-descendant traversal must not re-scan the whole
+    // resident instance set per visited descendant (O(N × D) on the partition
+    // command path). The resident parent→children index is built once, so the
+    // traversal performs zero resident scans — while still walking through
+    // resident intermediates to reach a cold grandchild.
+    #[test]
+    fn cold_descendant_traversal_indexes_resident_children_once() {
+        let mut journal = cold_journal();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        for (id, called) in [("top", "mid"), ("mid", "leaf"), ("leaf", "demo")] {
+            let process = ProcessBuilder::new(id)
+                .start_event("s")
+                .call_activity("call", called)
+                .end_event("e")
+                .connect("s", "call")
+                .connect("call", "e")
+                .build()
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::DeployProcess(process))
+                .unwrap();
+        }
+        let (events, _) = journal
+            .apply_command(Command::create_instance("top"))
+            .unwrap();
+        let top_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let mid_key = journal
+            .state()
+            .instances
+            .values()
+            .find(|i| i.parent_process_instance_key == Some(top_key))
+            .map(|i| i.key)
+            .expect("mid instance");
+        let leaf_key = journal
+            .state()
+            .instances
+            .values()
+            .find(|i| i.parent_process_instance_key == Some(mid_key))
+            .map(|i| i.key)
+            .expect("leaf instance");
+        // Park the leaf on its demo-work job (activated but never completed), so
+        // it stays active and spillable. Spill only it: the mid instance stays
+        // resident, so the traversal must reach the cold leaf THROUGH a resident
+        // intermediate.
+        let leaf_jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
+        assert_eq!(leaf_jobs.len(), 1, "leaf parked on its job");
+        let leaf_snapshot = journal
+            .engine
+            .snapshot_instance(leaf_key)
+            .expect("leaf is active and spillable");
+        let cold = journal.cold.as_mut().expect("cold spill configured");
+        cold.store
+            .put_cold(leaf_key, &leaf_snapshot)
+            .expect("cold row written");
+        cold.index.insert(&leaf_snapshot);
+        assert!(journal.instance(leaf_key).is_none(), "leaf is cold");
+        assert!(journal.instance(mid_key).is_some(), "mid stays resident");
+
+        let _ = journal
+            .apply_command(Command::ModifyInstance {
+                instance_key: top_key,
+                activate_instructions: vec![],
+                terminate_instructions: vec![],
+                terminate_element_ids: vec!["call".to_string()],
+                move_instructions: vec![],
+            })
+            .unwrap();
+
+        assert_eq!(
+            journal.resident_child_scans, 0,
+            "descendant traversal uses the resident index built once, not a \
+             per-descendant scan of every resident instance"
+        );
+        assert_eq!(
+            journal.cold_count(),
+            0,
+            "the cold leaf was rehydrated through its resident parent"
+        );
+    }
+
     #[test]
     fn durable_activation_rehydrates_cold_jobs() {
         let mut journal = cold_journal();
@@ -3565,6 +3854,81 @@ mod tests {
             "sub-process scope-local variable folded back into the worker's view"
         );
         assert!(!journal.engine.is_variables_spilled(key), "rehydrated");
+    }
+
+    #[test]
+    fn migration_of_a_spilled_instance_arms_boundaries_with_restored_variables() {
+        use nanobpmn_engine_core::{Event, ProcessBuilder, Value};
+
+        // A job-parked instance whose root variables are spilled is migrated onto
+        // a target that adds a message boundary correlated on `=key`. Migration
+        // performs no job activation, so the journal must restore the spilled
+        // root BEFORE planning, or the new subscription gets an empty key.
+        fn def(id: &str, with_boundary: bool) -> nanobpmn_engine_core::ProcessDefinition {
+            let mut b = ProcessBuilder::new(id)
+                .start_event("start")
+                .service_task("task", "work")
+                .end_event("end")
+                .connect("start", "task")
+                .connect("task", "end");
+            if with_boundary {
+                b = b
+                    .message_boundary_event("mb", "task", "cancel", "=key")
+                    .end_event("cancelled")
+                    .connect("mb", "cancelled");
+            }
+            b.build().expect("valid")
+        }
+        let deployed_key = |events: &[Event]| {
+            events
+                .iter()
+                .find_map(|e| match e {
+                    Event::ProcessDeployed {
+                        process_definition_key,
+                        ..
+                    } => Some(*process_definition_key),
+                    _ => None,
+                })
+                .expect("deployed")
+        };
+
+        let mut journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        journal.set_spill(Arc::clone(&store), 0);
+        let _ = journal
+            .apply_command(Command::DeployProcess(def("source", false)))
+            .unwrap();
+        let (events, _) = journal
+            .apply_command(Command::DeployProcess(def("target", true)))
+            .unwrap();
+        let target_key = deployed_key(&events);
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("key".to_string(), Value::Str("k1".into()));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("source", vars))
+            .unwrap();
+        let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+        journal.force_spill_scan();
+        assert!(journal.engine.is_variables_spilled(inst), "spilled");
+
+        let (events, _) = journal
+            .apply_command(Command::migrate_instance(
+                inst,
+                target_key,
+                vec![("task".into(), "task".into())],
+            ))
+            .unwrap();
+        let key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::MessageSubscriptionCreated {
+                    correlation_key, ..
+                } => Some(correlation_key.clone()),
+                _ => None,
+            })
+            .expect("new boundary subscription opened");
+        assert_eq!(key, "k1", "correlation key evaluated against restored root");
+        assert!(!journal.engine.is_variables_spilled(inst), "rehydrated");
     }
 
     #[test]
@@ -4168,6 +4532,34 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_spill_row_rejects_migration_as_retryable_and_keeps_the_row() {
+        // Migration/modification restore the spilled root before planning (#1374).
+        // An UNREADABLE row must fail closed exactly like activation (#1388):
+        // reject as retryable, never run against an instance missing its
+        // variables, never destroy the row.
+        let path = restart_store_path("corrupt-spill-migrate-1374");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        corrupt_row(&path, "spill", "vars", keys[0]);
+
+        let result = journal.apply_command(Command::migrate_instance(keys[0], 0, Vec::new()));
+        assert!(
+            matches!(
+                result,
+                Err(EngineError::InstanceUnavailable { instance_key }) if instance_key == keys[0]
+            ),
+            "migration of an unreadable spilled instance is rejected as retryable"
+        );
+        assert_eq!(raw_row_count(&path, "spill", keys[0]), 1, "row survives");
+        assert!(
+            journal.engine.is_variables_spilled(keys[0]),
+            "still spilled"
+        );
+        assert!(journal.quarantined_orphans().is_empty(), "not an orphan");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn resident_activated_job_rehydrates_a_respilled_healthy_instance() {
         // `apply_command_at` re-spills right after activation; the worker-facing
         // guard must rehydrate rather than withhold a healthy job (#1388).
@@ -4566,6 +4958,41 @@ mod tests {
         assert!(rebooted.reconcile_offheap_orphans().is_empty());
         assert!(rebooted.engine.is_variables_spilled(keys[0]));
         assert!(rebooted.quarantined_orphans().is_empty());
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review on #1418: with NO spill store wired the restore is a
+    // no-op, so modify/migrate would evaluate against the empty placeholder.
+    // Both must fail closed as retryable instead.
+    #[test]
+    fn unwired_spill_store_rejects_modify_and_migrate_as_retryable() {
+        let path = restart_store_path("unwired-modify-migrate-1418");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let mut rebooted = Journal::in_memory();
+        rebooted.restore_engine_from_snapshot(legacy);
+
+        for command in [
+            Command::migrate_instance(keys[0], 0, Vec::new()),
+            Command::modify_instance(keys[0], Vec::new(), Vec::new()),
+        ] {
+            let result = rebooted.apply_command(command);
+            assert!(
+                matches!(
+                    result,
+                    Err(EngineError::InstanceUnavailable { instance_key }) if instance_key == keys[0]
+                ),
+                "unwired spill store must reject as retryable, got {:?}",
+                result.as_ref().err()
+            );
+            assert!(
+                rebooted.engine.is_variables_spilled(keys[0]),
+                "still spilled"
+            );
+        }
 
         drop(rebooted);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
