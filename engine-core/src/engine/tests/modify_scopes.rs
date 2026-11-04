@@ -501,6 +501,53 @@ fn rejects_invalid_variable_scopes() {
     assert!(eiks(&engine, inst, "b").is_empty(), "atomic");
 }
 
+/// Root-scope aliases — an absent scope, an empty scope id and the process id
+/// all name the process root — are applied in REQUEST order, so a later
+/// instruction overwrites an earlier one whichever alias it uses (Zeebe
+/// `ModifyProcessInstanceVariablesTest` overwrite semantics). The REST mapper
+/// relies on this: it passes variable instructions through verbatim.
+#[test]
+fn mixed_root_scope_variable_aliases_apply_in_request_order() {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, task_then_sub(), HashMap::new());
+    let vi = |scope: Option<&str>, value: i64| VariableInstruction {
+        variables: vars(&[("x", Value::Int(value))]),
+        scope_id: scope.map(str::to_string),
+    };
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variable_instructions: vec![vi(Some("task-sub"), 1), vi(None, 2), vi(Some(""), 3)],
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.instance(inst).unwrap().variables.get("x"),
+        Some(&Value::Int(3)),
+        "the last root-scope instruction wins"
+    );
+
+    // And the reverse order: the explicit process-id alias wins when last.
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variable_instructions: vec![vi(None, 4), vi(Some("task-sub"), 5)],
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.instance(inst).unwrap().variables.get("x"),
+        Some(&Value::Int(5)),
+        "request order, not alias kind, decides"
+    );
+}
+
 // ---- Terminate by element id / flow-scope cascade --------------------------
 
 /// Zeebe `shouldTerminateAllElementInstancesForGivenElementId` (multi-instance).
@@ -1339,4 +1386,105 @@ fn rejects_join_activation_in_a_different_flow_scope_than_its_waiting_instance()
             "locals={locals}"
         );
     }
+}
+
+/// With no join waiting, two activations of the same join under DIFFERENT
+/// sub-process instances both pass the waiting-instance check — but the
+/// process-wide join bookkeeping would then combine arrivals from unrelated
+/// scopes and fire the join incorrectly. Both the plain and the
+/// element-local-variable (seeded) activation paths must fail closed.
+#[test]
+fn rejects_planned_join_activations_conflicting_across_scopes() {
+    for locals in [false, true] {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, join_in_sub(), HashMap::new());
+        // A second `sub` instance, created by activating `a` from the root.
+        engine
+            .apply_command(modify(inst, vec![under("a", inst)]))
+            .unwrap();
+        let subs = eiks(&engine, inst, "sub");
+        assert_eq!(subs.len(), 2, "two sub instances");
+        assert!(eiks(&engine, inst, "join").is_empty(), "no join waiting");
+        let activate = |ancestor: Key| {
+            let mut instruction = under("join", ancestor);
+            if locals {
+                instruction.variable_instructions = vec![VariableInstruction {
+                    variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                    scope_id: Some("join".into()),
+                }];
+            }
+            instruction
+        };
+        let err = engine
+            .apply_command(modify(inst, vec![activate(subs[0]), activate(subs[1])]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("different flow scopes"),
+            "locals={locals}: {err}"
+        );
+        assert!(
+            eiks(&engine, inst, "join").is_empty(),
+            "locals={locals}: atomic — no join activated"
+        );
+        assert_eq!(
+            engine.instance(inst).unwrap().join_flows_taken("join"),
+            0,
+            "locals={locals}: no arrival recorded"
+        );
+    }
+}
+
+/// The allowed counterpart: two activations of the same join whose resolution
+/// shares the to-be-created flow-scope instance land together — the command
+/// opens ONE `sub` for both, and the two arrivals legitimately fire the join
+/// (both tokens genuinely arrived in that one scope).
+#[test]
+fn allows_planned_join_activations_sharing_a_created_scope() {
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, join_in_sub(), HashMap::new());
+    let events = engine
+        .apply_command(modify(
+            inst,
+            vec![
+                under("join", inst),
+                ActivateElementInstruction {
+                    element_id: "join".into(),
+                    ancestor_element_instance_key: Some(inst),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                        scope_id: Some("join".into()),
+                    }],
+                    ..Default::default()
+                },
+            ],
+        ))
+        .unwrap();
+    assert_eq!(
+        activated(&events, "sub"),
+        1,
+        "one shared created scope: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::ParallelJoinFired { .. }))
+            .count(),
+        1,
+        "two arrivals in one shared scope fire the join once: {events:?}"
+    );
+    assert_eq!(
+        activated(&events, "se"),
+        1,
+        "the fired join routes onward: {events:?}"
+    );
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Active,
+        "the original branch's tasks are still active"
+    );
+    assert_eq!(
+        activated(&events, "end"),
+        1,
+        "the created sub-process drains to the process end: {events:?}"
+    );
 }

@@ -255,6 +255,48 @@ impl Engine {
             }
         }
 
+        // The same id-keyed bookkeeping also forces every activation of one
+        // join element in a single command to land in ONE flow-scope instance:
+        // with no join waiting, two activations under different scope instances
+        // would still share the join's arrivals and could combine tokens from
+        // unrelated scopes into a firing. Zeebe activates both (its joins are
+        // per-scope); this engine keys joins per process instance, so it fails
+        // closed instead. Activations sharing the to-be-created scope instance
+        // (same existing parent, same innermost created scope — the applier
+        // reuses one created instance for both) land together and are fine.
+        let planned_joins: Vec<&PlannedActivation> = activations
+            .iter()
+            .filter(|p| self.join_kind(instance_key, &p.element_id).is_some())
+            .collect();
+        for (i, a) in planned_joins.iter().enumerate() {
+            for b in &planned_joins[i + 1..] {
+                let (ra, rb) = (&a.resolution, &b.resolution);
+                // Guaranteed same landing scope only when both create the same
+                // innermost scope under the same parent (the applier shares
+                // that one created instance), or both reuse the same existing
+                // instance and create nothing. Everything else can land the
+                // two activations in different scope instances.
+                let shared_created = ra.existing == rb.existing
+                    && !ra.to_create.is_empty()
+                    && ra.to_create.last() == rb.to_create.last();
+                let same_existing = ra.existing == rb.existing
+                    && ra.to_create.is_empty()
+                    && rb.to_create.is_empty();
+                if !(shared_created || same_existing) {
+                    return Err(invalid(
+                        instance_key,
+                        &process_id,
+                        format!(
+                            "multiple activate instructions for join element '{}' in different \
+                             flow scopes of one modification: join arrivals are kept per \
+                             process instance, so the activations would share one join",
+                            a.element_id
+                        ),
+                    ));
+                }
+            }
+        }
+
         Ok(ModificationPlan {
             activations,
             terminations,

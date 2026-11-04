@@ -23204,37 +23204,34 @@ fn parse_modification_key(field: &str, raw: &str) -> Result<u64, String> {
         .map_err(|_| format!("{field} '{raw}' is not a valid key."))
 }
 
-/// Splits REST variable instructions into the engine's root-scope variables
-/// (an absent or empty `scopeId`) and scoped [`VariableInstruction`]s (a
-/// non-empty `scopeId`).
-fn split_variable_instructions(
+/// Carries REST variable instructions into the engine verbatim, in request
+/// order: an absent or empty `scopeId` maps to `None` (the process root
+/// scope), any other `scopeId` is passed through untouched. The engine
+/// resolves the root-scope aliases (absent / empty / the process id) and
+/// applies the instructions in order, so a later instruction overwrites an
+/// earlier one whichever alias it uses — merging the root-scoped entries into
+/// one map here would reverse that precedence.
+fn variable_instructions_from_rest(
     instructions: Option<&Vec<models::ModifyProcessInstanceVariableInstruction>>,
-) -> (
-    std::collections::HashMap<String, Value>,
-    Vec<nanobpmn_engine_core::VariableInstruction>,
-) {
-    let mut root = std::collections::HashMap::new();
-    let mut scoped = Vec::new();
-    for vi in instructions.into_iter().flatten() {
-        let variables = from_object_map(&vi.variables);
-        match vi.scope_id.as_deref().filter(|s| !s.is_empty()) {
-            None => root.extend(variables),
-            Some(scope) => scoped.push(nanobpmn_engine_core::VariableInstruction {
-                variables,
-                scope_id: Some(scope.to_string()),
-            }),
-        }
-    }
-    (root, scoped)
+) -> Vec<nanobpmn_engine_core::VariableInstruction> {
+    instructions
+        .into_iter()
+        .flatten()
+        .map(|vi| nanobpmn_engine_core::VariableInstruction {
+            variables: from_object_map(&vi.variables),
+            scope_id: vi.scope_id.clone().filter(|s| !s.is_empty()),
+        })
+        .collect()
 }
 
 /// Maps the full `ProcessInstanceModificationInstruction` request
 /// (spec/process-instances.yaml) onto the engine's `Command::ModifyInstance`
-/// fields: activate instructions (root + scoped variables,
-/// `ancestorElementInstanceKey` with `-1` = none), terminate by key and by id,
-/// and move instructions. Fields the engine does not yet act on are passed
-/// through faithfully so the engine — not this mapper — rejects them (400 with
-/// the engine's message). Only a malformed key is rejected here (400).
+/// fields: activate instructions (variable instructions verbatim, in request
+/// order; `ancestorElementInstanceKey` with `-1` = none), terminate by key and
+/// by id, and move instructions. Fields the engine does not yet act on are
+/// passed through faithfully so the engine — not this mapper — rejects them
+/// (400 with the engine's message). Only a malformed key is rejected here
+/// (400).
 fn modify_instructions_from_rest(
     body: &models::ProcessInstanceModificationInstruction,
 ) -> Result<falcon::ModifyInstanceInstructions, String> {
@@ -23250,13 +23247,13 @@ fn modify_instructions_from_rest(
             Some(k) if k.0 == "-1" => None,
             Some(k) => Some(parse_modification_key("ancestorElementInstanceKey", &k.0)?),
         };
-        let (variables, variable_instructions) =
-            split_variable_instructions(a.variable_instructions.as_ref());
         out.activate_instructions.push(ActivateElementInstruction {
             element_id: a.element_id.clone(),
-            variables,
+            variables: std::collections::HashMap::new(),
             ancestor_element_instance_key,
-            variable_instructions,
+            variable_instructions: variable_instructions_from_rest(
+                a.variable_instructions.as_ref(),
+            ),
         });
     }
 
@@ -23309,15 +23306,8 @@ fn modify_instructions_from_rest(
         };
         // Move instructions carry every variable instruction verbatim (an
         // empty `scopeId` = the process root scope), in request order.
-        let variable_instructions = m
-            .variable_instructions
-            .iter()
-            .flatten()
-            .map(|vi| nanobpmn_engine_core::VariableInstruction {
-                variables: from_object_map(&vi.variables),
-                scope_id: vi.scope_id.clone().filter(|s| !s.is_empty()),
-            })
-            .collect();
+        let variable_instructions =
+            variable_instructions_from_rest(m.variable_instructions.as_ref());
         out.move_instructions.push(MoveInstruction {
             source,
             target_element_id: m.target_element_id.clone(),
@@ -32028,7 +32018,10 @@ mod clustered_startup_tests {
     }
 
     /// The REST → engine mapper carries the full request shape: ancestor key
-    /// (`-1` = none), scoped variables, terminate by id, and move instructions.
+    /// (`-1` = none), variable instructions verbatim and in request order
+    /// (root-scope aliases — absent/empty `scopeId` or the process id — stay
+    /// in `variable_instructions` for the engine to resolve), terminate by id,
+    /// and move instructions.
     #[test]
     fn modify_instructions_map_full_request_shape() {
         use nanobpmn_engine_core::{AncestorScopeInstruction, MoveSource};
@@ -32073,9 +32066,17 @@ mod clustered_startup_tests {
         );
         let b = &i.activate_instructions[1];
         assert_eq!(b.ancestor_element_instance_key, Some(7));
-        assert!(b.variables.contains_key("r"));
-        assert_eq!(b.variable_instructions.len(), 1);
-        assert_eq!(b.variable_instructions[0].scope_id.as_deref(), Some("sub"));
+        assert!(
+            b.variables.is_empty(),
+            "root-scope instructions are not merged into `variables`"
+        );
+        // Every variable instruction is passed through in request order; the
+        // empty `scopeId` normalises to `None` (process root).
+        assert_eq!(b.variable_instructions.len(), 2);
+        assert_eq!(b.variable_instructions[0].scope_id, None);
+        assert!(b.variable_instructions[0].variables.contains_key("r"));
+        assert_eq!(b.variable_instructions[1].scope_id.as_deref(), Some("sub"));
+        assert!(b.variable_instructions[1].variables.contains_key("s"));
         assert_eq!(i.terminate_instructions, vec![11]);
         assert_eq!(i.terminate_element_ids, vec!["c".to_string()]);
         assert_eq!(i.move_instructions.len(), 2);
@@ -32093,6 +32094,41 @@ mod clustered_startup_tests {
         assert_eq!(
             i.move_instructions[1].variable_instructions[0].scope_id,
             None
+        );
+    }
+
+    /// Mixed root-scope aliases keep their request order through the mapper
+    /// (the engine applies them in order, last write wins): an explicit
+    /// `scopeId` naming the process followed by an unscoped instruction of the
+    /// same variable must stay in that exact order.
+    #[test]
+    fn modify_instructions_preserve_mixed_root_scope_alias_order() {
+        let body: models::ProcessInstanceModificationInstruction =
+            serde_json::from_value(serde_json::json!({
+                "activateInstructions": [
+                    {
+                        "elementId": "b",
+                        "variableInstructions": [
+                            { "variables": { "x": 1 }, "scopeId": "order-process" },
+                            { "variables": { "x": 2 } }
+                        ]
+                    }
+                ]
+            }))
+            .expect("well-formed body");
+        let i = modify_instructions_from_rest(&body).expect("maps");
+
+        let vis = &i.activate_instructions[0].variable_instructions;
+        assert_eq!(vis.len(), 2, "no merging, no reordering");
+        assert_eq!(vis[0].scope_id.as_deref(), Some("order-process"));
+        assert_eq!(
+            vis[0].variables.get("x"),
+            Some(&nanobpmn_engine_core::Value::Int(1))
+        );
+        assert_eq!(vis[1].scope_id, None);
+        assert_eq!(
+            vis[1].variables.get("x"),
+            Some(&nanobpmn_engine_core::Value::Int(2))
         );
     }
 
