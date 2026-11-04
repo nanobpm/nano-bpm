@@ -55,6 +55,33 @@ pub fn eval(expr: &str, ctx: &HashMap<String, Value>) -> Result<Value, FeelError
     Ok(evaluate(expr, ctx)?.into_value())
 }
 
+/// Evaluates a FEEL expression, returning the [`Value`] **and** the Zeebe
+/// `ResultType` name of the *native* FEEL result. [`eval`] renders temporal
+/// values to strings at the API boundary, so a caller type-checking the result
+/// (e.g. "must be a STRING") must use this kind, not the rendered `Value`'s
+/// shape — otherwise `=date("2024-01-15")` would pass as a STRING (#1399).
+pub(crate) fn eval_typed(
+    expr: &str,
+    ctx: &HashMap<String, Value>,
+) -> Result<(Value, &'static str), FeelError> {
+    let v = evaluate(expr, ctx)?;
+    let kind = match &v {
+        value::FeelVal::Null => "NULL",
+        value::FeelVal::Bool(_) => "BOOLEAN",
+        value::FeelVal::Int(_) | value::FeelVal::Double(_) => "NUMBER",
+        value::FeelVal::Str(_) => "STRING",
+        value::FeelVal::List(_) => "ARRAY",
+        value::FeelVal::Context(_) => "OBJECT",
+        value::FeelVal::Date(_) => "DATE",
+        value::FeelVal::Time(_) => "TIME",
+        value::FeelVal::DateTime(_) => "DATE_TIME",
+        value::FeelVal::YmDur(_) => "PERIOD",
+        value::FeelVal::DtDur(_) => "DURATION",
+        value::FeelVal::Range(_) | value::FeelVal::Function(_) => "UNKNOWN",
+    };
+    Ok((v.into_value(), kind))
+}
+
 /// Evaluates a FEEL expression expecting a string result (job type, correlation
 /// key). Strings pass through; numbers/booleans/temporals use their natural FEEL
 /// rendering; `null` and structured values are an error.
@@ -71,25 +98,6 @@ pub fn eval_string(expr: &str, ctx: &HashMap<String, Value>) -> Result<String, F
             v.type_name()
         ))
     })
-}
-
-/// Evaluates a FEEL expression that must produce a **string**, with no
-/// coercion — the strict form of [`eval_string`] for contexts where Zeebe
-/// requires the result to BE a string (a `zeebe:taskDefinition` job type:
-/// `BpmnJobBehavior.evalTypeExp` raises `EXTRACT_VALUE_ERROR` on a non-string
-/// result rather than rendering it). Unlike [`eval_string`], which renders
-/// numbers, booleans, lists and temporal values to their FEEL text, this
-/// accepts only a genuine string result; anything else — including the
-/// temporals that [`value::FeelVal::into_value`] would convert to a string at
-/// the API boundary — is an error naming the actual result type.
-pub fn eval_strict_string(expr: &str, ctx: &HashMap<String, Value>) -> Result<String, FeelError> {
-    match evaluate(expr, ctx)? {
-        value::FeelVal::Str(s) => Ok(s),
-        other => Err(FeelError(format!(
-            "expected a string result, got {}",
-            other.type_name()
-        ))),
-    }
 }
 
 /// Evaluates a FEEL expression expecting a boolean result (a sequence-flow

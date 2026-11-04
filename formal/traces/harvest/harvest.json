@@ -1,0 +1,8 @@
+{
+  "packages": [
+    "io.camunda.zeebe.engine.processing.incident",
+    "io.camunda.zeebe.engine.processing.bpmn",
+    "io.camunda.zeebe.engine.processing.message",
+    "io.camunda.zeebe.engine.processing.timer"
+  ]
+}

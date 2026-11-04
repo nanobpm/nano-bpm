@@ -456,6 +456,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: key,
                 element_id: element_id.clone(),
+                scope: parent,
             },
             Event::ElementActivated {
                 instance_key,
@@ -528,6 +529,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: eik,
                 element_id: element_id.clone(),
+                scope,
             },
             Event::ElementActivated {
                 instance_key,

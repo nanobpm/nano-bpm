@@ -1,0 +1,9 @@
+{
+  "description": "#1390: the job-type FEEL expression fails to evaluate (the variable is missing, so the result is null, not a string) -> EXTRACT_VALUE_ERROR incident, no job; setting the variable and resolving the incident creates the job.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "job-type-expr-null" },
+    { "op": "updateVariables", "variables": { "missingVar": { "foo": "work" } } },
+    { "op": "resolveIncident", "elementId": "task" },
+    { "op": "completeJob", "jobType": "work" }
+  ]
+}

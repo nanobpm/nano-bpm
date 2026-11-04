@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<definitions xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:ns0="http://camunda.org/schema/zeebe/1.0" exporter="Zeebe BPMN Model" exporterVersion="8.10.8" id="definitions_1" xmlns:modeler="http://camunda.org/schema/modeler/1.0" modeler:executionPlatform="Camunda Cloud" modeler:executionPlatformVersion="8.10.8" targetNamespace="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <!-- zeebe-cells: element:EndEvent element:InclusiveGateway element:ParallelGateway element:ServiceTask element:StartEvent -->
+  <process id="process" isExecutable="true">
+    <startEvent id="startEvent_1">
+      <outgoing>sequenceFlow_1</outgoing>
+    </startEvent>
+    <parallelGateway id="fork" name="fork">
+      <incoming>sequenceFlow_1</incoming>
+      <outgoing>joinFlow1</outgoing>
+      <outgoing>sequenceFlow_2</outgoing>
+    </parallelGateway>
+    <sequenceFlow id="sequenceFlow_1" sourceRef="startEvent_1" targetRef="fork"/>
+    <sequenceFlow id="joinFlow1" sourceRef="fork" targetRef="join"/>
+    <inclusiveGateway id="join" name="join">
+      <incoming>joinFlow1</incoming>
+      <incoming>joinFlow2</incoming>
+      <outgoing>sequenceFlow_3</outgoing>
+    </inclusiveGateway>
+    <serviceTask id="task" name="task">
+      <extensionElements>
+        <ns0:taskDefinition type="type"/>
+      </extensionElements>
+      <incoming>sequenceFlow_2</incoming>
+      <outgoing>joinFlow2</outgoing>
+    </serviceTask>
+    <sequenceFlow id="sequenceFlow_2" sourceRef="fork" targetRef="task"/>
+    <sequenceFlow id="joinFlow2" sourceRef="task" targetRef="join"/>
+    <endEvent id="endEvent_1">
+      <incoming>sequenceFlow_3</incoming>
+    </endEvent>
+    <sequenceFlow id="sequenceFlow_3" sourceRef="join" targetRef="endEvent_1"/>
+  </process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane bpmnElement="process" id="BPMNPlane_1">
+      <bpmndi:BPMNShape bpmnElement="startEvent_1" id="BPMNShape_1">
+        <dc:Bounds height="36.0" width="36.0" x="100.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape bpmnElement="fork" id="BPMNShape_2">
+        <dc:Bounds height="50.0" width="50.0" x="186.0" y="93.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_1" id="BPMNEdge_1">
+        <di:waypoint x="136.0" y="118.0"/>
+        <di:waypoint x="186.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="join" id="BPMNShape_3">
+        <dc:Bounds height="50.0" width="50.0" x="286.0" y="93.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="joinFlow1" id="BPMNEdge_2">
+        <di:waypoint x="236.0" y="118.0"/>
+        <di:waypoint x="286.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="task" id="BPMNShape_4">
+        <dc:Bounds height="80.0" width="100.0" x="286.0" y="193.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_2" id="BPMNEdge_3">
+        <di:waypoint x="211.0" y="143.0"/>
+        <di:waypoint x="211.0" y="233.0"/>
+        <di:waypoint x="286.0" y="233.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge bpmnElement="joinFlow2" id="BPMNEdge_4">
+        <di:waypoint x="386.0" y="233.0"/>
+        <di:waypoint x="286.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNShape bpmnElement="endEvent_1" id="BPMNShape_5">
+        <dc:Bounds height="36.0" width="36.0" x="386.0" y="100.0"/>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge bpmnElement="sequenceFlow_3" id="BPMNEdge_5">
+        <di:waypoint x="336.0" y="118.0"/>
+        <di:waypoint x="386.0" y="118.0"/>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</definitions>

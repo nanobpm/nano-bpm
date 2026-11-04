@@ -1,0 +1,10 @@
+{
+  "JobWorkerElementIncidentTest#shouldRejectDeploymentIfStaticJobTypeExceedsMaxLength[BUSINESS_RULE_TASK]" : "deployment rejected (deploy-time validation test)",
+  "JobWorkerElementIncidentTest#shouldRejectDeploymentIfStaticJobTypeExceedsMaxLength[END_EVENT]" : "deployment rejected (deploy-time validation test)",
+  "JobWorkerElementIncidentTest#shouldRejectDeploymentIfStaticJobTypeExceedsMaxLength[INTERMEDIATE_THROW_EVENT]" : "deployment rejected (deploy-time validation test)",
+  "JobWorkerElementIncidentTest#shouldRejectDeploymentIfStaticJobTypeExceedsMaxLength[SCRIPT_TASK]" : "deployment rejected (deploy-time validation test)",
+  "JobWorkerElementIncidentTest#shouldRejectDeploymentIfStaticJobTypeExceedsMaxLength[SEND_TASK]" : "deployment rejected (deploy-time validation test)",
+  "JobWorkerElementIncidentTest#shouldRejectDeploymentIfStaticJobTypeExceedsMaxLength[SERVICE_TASK]" : "deployment rejected (deploy-time validation test)",
+  "JobWorkerElementIncidentTest#shouldResolveIncidentWithMessageBoundaryEvent[END_EVENT]" : "zeebe test did not pass in the harvest run: assumption was not met due to: [Only activities can have boundary events, this test is not relevant to job worker events] \nExpecting actual:\n  END_EVENT\nto be i…",
+  "JobWorkerElementIncidentTest#shouldResolveIncidentWithMessageBoundaryEvent[INTERMEDIATE_THROW_EVENT]" : "zeebe test did not pass in the harvest run: assumption was not met due to: [Only activities can have boundary events, this test is not relevant to job worker events] \nExpecting actual:\n  INTERMEDIATE_THRO…"
+}

@@ -1,0 +1,21 @@
+{
+  "description" : "Harvested from Zeebe engine test JobWorkerElementIncidentTest#shouldResolveIncidentWithMessageBoundaryEvent[SERVICE_TASK] (formal/traces/harvest).",
+  "harvestedFrom" : "JobWorkerElementIncidentTest#shouldResolveIncidentWithMessageBoundaryEvent[SERVICE_TASK]",
+  "steps" : [ {
+    "op" : "createInstance",
+    "bpmnProcessId" : "process",
+    "variables" : {
+      "invalid_job_type" : {
+        "x" : true
+      }
+    }
+  }, {
+    "op" : "updateVariables",
+    "variables" : {
+      "invalid_job_type" : "task"
+    }
+  }, {
+    "op" : "resolveIncident",
+    "elementId" : "task"
+  } ]
+}

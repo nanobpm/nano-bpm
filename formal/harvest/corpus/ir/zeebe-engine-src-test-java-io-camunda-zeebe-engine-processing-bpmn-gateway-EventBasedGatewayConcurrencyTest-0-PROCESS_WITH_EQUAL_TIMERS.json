@@ -1,0 +1,76 @@
+{
+  "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayConcurrencyTest-0-PROCESS_WITH_EQUAL_TIMERS",
+  "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayConcurrencyTest.java",
+  "processId": "PROCESS_WITH_EQUAL_TIMERS",
+  "calls": [
+    {
+      "m": "startEvent",
+      "args": [
+        "start"
+      ]
+    },
+    {
+      "m": "eventBasedGateway",
+      "args": []
+    },
+    {
+      "m": "id",
+      "args": [
+        "gateway"
+      ]
+    },
+    {
+      "m": "intermediateCatchEvent",
+      "args": [
+        "timer-1"
+      ]
+    },
+    {
+      "m": "timerWithDuration",
+      "args": [
+        "PT2S"
+      ]
+    },
+    {
+      "m": "sequenceFlowId",
+      "args": [
+        "to-end1"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": [
+        "end1"
+      ]
+    },
+    {
+      "m": "moveToLastGateway",
+      "args": []
+    },
+    {
+      "m": "intermediateCatchEvent",
+      "args": [
+        "timer-2"
+      ]
+    },
+    {
+      "m": "timerWithDuration",
+      "args": [
+        "PT2S"
+      ]
+    },
+    {
+      "m": "sequenceFlowId",
+      "args": [
+        "to-end2"
+      ]
+    },
+    {
+      "m": "endEvent",
+      "args": [
+        "end2"
+      ]
+    }
+  ],
+  "xml": "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<definitions xmlns:bpmndi=\"http://www.omg.org/spec/BPMN/20100524/DI\" xmlns:dc=\"http://www.omg.org/spec/DD/20100524/DC\" xmlns:di=\"http://www.omg.org/spec/DD/20100524/DI\" exporter=\"Zeebe BPMN Model\" exporterVersion=\"8.10.8\" id=\"definitions_1\" xmlns:modeler=\"http://camunda.org/schema/modeler/1.0\" modeler:executionPlatform=\"Camunda Cloud\" modeler:executionPlatformVersion=\"8.10.8\" targetNamespace=\"http://www.omg.org/spec/BPMN/20100524/MODEL\" xmlns=\"http://www.omg.org/spec/BPMN/20100524/MODEL\">\n  <process id=\"PROCESS_WITH_EQUAL_TIMERS\" isExecutable=\"true\">\n    <startEvent id=\"start\" name=\"start\">\n      <outgoing>sequenceFlow_1</outgoing>\n    </startEvent>\n    <eventBasedGateway id=\"gateway\">\n      <incoming>sequenceFlow_1</incoming>\n      <outgoing>sequenceFlow_2</outgoing>\n      <outgoing>sequenceFlow_3</outgoing>\n    </eventBasedGateway>\n    <sequenceFlow id=\"sequenceFlow_1\" sourceRef=\"start\" targetRef=\"gateway\"/>\n    <intermediateCatchEvent id=\"timer-1\" name=\"timer-1\">\n      <incoming>sequenceFlow_2</incoming>\n      <outgoing>to-end1</outgoing>\n      <timerEventDefinition id=\"timerEventDefinition_1\">\n        <timeDuration id=\"timeDuration_1\">PT2S</timeDuration>\n      </timerEventDefinition>\n    </intermediateCatchEvent>\n    <sequenceFlow id=\"sequenceFlow_2\" sourceRef=\"gateway\" targetRef=\"timer-1\"/>\n    <sequenceFlow id=\"to-end1\" sourceRef=\"timer-1\" targetRef=\"end1\"/>\n    <endEvent id=\"end1\" name=\"end1\">\n      <incoming>to-end1</incoming>\n    </endEvent>\n    <intermediateCatchEvent id=\"timer-2\" name=\"timer-2\">\n      <incoming>sequenceFlow_3</incoming>\n      <outgoing>to-end2</outgoing>\n      <timerEventDefinition id=\"timerEventDefinition_2\">\n        <timeDuration id=\"timeDuration_2\">PT2S</timeDuration>\n      </timerEventDefinition>\n    </intermediateCatchEvent>\n    <sequenceFlow id=\"sequenceFlow_3\" sourceRef=\"gateway\" targetRef=\"timer-2\"/>\n    <sequenceFlow id=\"to-end2\" sourceRef=\"timer-2\" targetRef=\"end2\"/>\n    <endEvent id=\"end2\" name=\"end2\">\n      <incoming>to-end2</incoming>\n    </endEvent>\n  </process>\n  <bpmndi:BPMNDiagram id=\"BPMNDiagram_1\">\n    <bpmndi:BPMNPlane bpmnElement=\"PROCESS_WITH_EQUAL_TIMERS\" id=\"BPMNPlane_1\">\n      <bpmndi:BPMNShape bpmnElement=\"start\" id=\"BPMNShape_1\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"100.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNShape bpmnElement=\"gateway\" id=\"BPMNShape_2\">\n        <dc:Bounds height=\"50.0\" width=\"50.0\" x=\"186.0\" y=\"93.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_1\" id=\"BPMNEdge_1\">\n        <di:waypoint x=\"136.0\" y=\"118.0\"/>\n        <di:waypoint x=\"186.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"timer-1\" id=\"BPMNShape_3\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"286.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_2\" id=\"BPMNEdge_2\">\n        <di:waypoint x=\"236.0\" y=\"118.0\"/>\n        <di:waypoint x=\"286.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"end1\" id=\"BPMNShape_4\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"372.0\" y=\"100.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"to-end1\" id=\"BPMNEdge_3\">\n        <di:waypoint x=\"322.0\" y=\"118.0\"/>\n        <di:waypoint x=\"372.0\" y=\"118.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"timer-2\" id=\"BPMNShape_5\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"286.0\" y=\"186.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"sequenceFlow_3\" id=\"BPMNEdge_4\">\n        <di:waypoint x=\"211.0\" y=\"143.0\"/>\n        <di:waypoint x=\"211.0\" y=\"204.0\"/>\n        <di:waypoint x=\"286.0\" y=\"204.0\"/>\n      </bpmndi:BPMNEdge>\n      <bpmndi:BPMNShape bpmnElement=\"end2\" id=\"BPMNShape_6\">\n        <dc:Bounds height=\"36.0\" width=\"36.0\" x=\"372.0\" y=\"186.0\"/>\n      </bpmndi:BPMNShape>\n      <bpmndi:BPMNEdge bpmnElement=\"to-end2\" id=\"BPMNEdge_5\">\n        <di:waypoint x=\"322.0\" y=\"204.0\"/>\n        <di:waypoint x=\"372.0\" y=\"204.0\"/>\n      </bpmndi:BPMNEdge>\n    </bpmndi:BPMNPlane>\n  </bpmndi:BPMNDiagram>\n</definitions>\n"
+}

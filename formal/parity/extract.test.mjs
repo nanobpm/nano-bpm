@@ -14,6 +14,7 @@ import {
   FAMILIES,
   HOOK_TRANSITIONS,
   Source,
+  enclosingScope,
   enumConstants,
   interfaceMethods,
   interfaceParents,
@@ -342,11 +343,178 @@ test('rejection family validates against the SBE enum and skips its sentinels', 
       'class JobProcessor { void f() { reject(RejectionType.NOT_FOUND); if (t == RejectionType.NULL_VAL) {} } }',
     [`${PROCESSING}/Aggregator.java`]: 'class Aggregator { boolean f(R r) { return r.type() == RejectionType.NOT_FOUND; } }',
   });
-  assert.deepEqual(cells.map((c) => c.id), ['rejection:JobProcessor:NOT_FOUND']);
+  assert.deepEqual(cells.map((c) => c.id), ['rejection:JobProcessor.f:NOT_FOUND']);
   assert.throws(
     () => run('rejection', { [schema]: xml, [`${PROCESSING}/P.java`]: 'class P { Object r = RejectionType.GONE; }' }),
     ExtractError,
   );
+});
+
+test('enclosingScope attributes a construction to its top-level class and named method', () => {
+  const src = stripComments(
+    'package p;\n' +
+      'public class Outer {\n' +
+      '  void alpha() {\n' +
+      '    if (x) {\n' +
+      '      list.forEach(item -> {\n' +
+      '        helperOne();\n' +
+      '      });\n' +
+      '    }\n' +
+      '  }\n' +
+      '  static Either<Failure, ?> beta(final A a,\n' +
+      '      final B b) throws IOException {\n' +
+      '    return helperTwo();\n' +
+      '  }\n' +
+      '  class Inner {\n' +
+      '    void gamma() { helperThree(); }\n' +
+      '  }\n' +
+      '}\n',
+  );
+  const at = (needle) => src.indexOf(needle);
+  // A lambda block is transparent: the site belongs to the named method alpha.
+  assert.deepEqual(enclosingScope(src, at('helperOne')), { cls: 'Outer', method: 'alpha' });
+  // A multi-line signature with a throws clause still resolves to beta.
+  assert.deepEqual(enclosingScope(src, at('helperTwo')), { cls: 'Outer', method: 'beta' });
+  // An inner class's method reports the *top-level* class.
+  assert.deepEqual(enclosingScope(src, at('helperThree')), { cls: 'Outer', method: 'gamma' });
+});
+
+test('enclosingScope handles multi-exception throws, anonymous classes and records', () => {
+  const src = stripComments(
+    'package p;\n' +
+      'public class Outer {\n' +
+      '  void f() throws IOException,\n      RuntimeException {\n    siteA();\n  }\n' +
+      '  void g() {\n    Runnable r = new Runnable() {\n      { siteB(); }\n    };\n  }\n' +
+      '}\n',
+  );
+  const at = (needle) => src.indexOf(needle);
+  const rec = stripComments('package p;\nrecord P(int x) {\n  void h() { siteC(); }\n  { siteD(); }\n}\n');
+  assert.deepEqual(enclosingScope(src, at('siteA')), { cls: 'Outer', method: 'f' });
+  assert.deepEqual(enclosingScope(src, at('siteB')), { cls: 'Outer', method: 'g' });
+  assert.deepEqual(enclosingScope(rec, rec.indexOf('siteC')), { cls: 'P', method: 'h' });
+  assert.deepEqual(enclosingScope(rec, rec.indexOf('siteD')), { cls: 'P', method: '' });
+});
+
+test('enclosingScope attributes a sibling top-level class to itself, not the first class', () => {
+  const src = stripComments('package p;\nclass First {\n  void f() { siteA(); }\n}\nclass Second {\n  void f() { siteB(); }\n}\n');
+  assert.deepEqual(enclosingScope(src, src.indexOf('siteA')), { cls: 'First', method: 'f' });
+  assert.deepEqual(enclosingScope(src, src.indexOf('siteB')), { cls: 'Second', method: 'f' });
+});
+
+test('failure family emits one cell per construction site, keyed by class.method and error type', () => {
+  const errRel = 'zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record/value/ErrorType.java';
+  const errEnum = 'public enum ErrorType { UNKNOWN, EXTRACT_VALUE_ERROR, FORM_NOT_FOUND; }';
+  const cells = run('failure', {
+    [errRel]: errEnum,
+    [`${PROCESSING}/bpmn/behavior/BpmnJobBehavior.java`]:
+      'public class BpmnJobBehavior {\n' +
+      '  private Either<Failure, String> evalTypeExp(final Expression type, final long scopeKey) {\n' +
+      '    return expressionBehavior.evaluateStringExpression(type, scopeKey)\n' +
+      '        .flatMap(result -> {\n' +
+      '          if (Strings.isNullOrEmpty(result)) {\n' +
+      '            return Either.left(new Failure("empty", ErrorType.EXTRACT_VALUE_ERROR, scopeKey));\n' +
+      '          }\n' +
+      '          return Either.right(result);\n' +
+      '        });\n' +
+      '  }\n' +
+      '  private Either<Failure, Form> findForm(final long key) {\n' +
+      '    return Either.left(new Failure("no form", ErrorType.FORM_NOT_FOUND));\n' +
+      '  }\n' +
+      '}\n',
+    // A message-only Failure (deploy-time rejection) carries no error type.
+    [`${PROCESSING}/deployment/transform/RpaTransformer.java`]:
+      'class RpaTransformer { Either<Failure, R> parse(final R r) { return Either.left(new Failure("bad")); } }',
+  });
+  assert.deepEqual(
+    cells.map((c) => c.id),
+    [
+      'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR',
+      'failure:BpmnJobBehavior.findForm:FORM_NOT_FOUND',
+      'failure:RpaTransformer.parse:',
+    ],
+  );
+});
+
+test('failure family attributes a lambda body to the enclosing named method', () => {
+  const errRel = 'zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record/value/ErrorType.java';
+  const cells = run('failure', {
+    [errRel]: 'public enum ErrorType { EXTRACT_VALUE_ERROR; }',
+    [`${PROCESSING}/bpmn/behavior/BpmnJobBehavior.java`]:
+      'public class BpmnJobBehavior {\n' +
+      '  private Either<Failure, String> evalTypeExp(final Expression type) {\n' +
+      '    return evaluate(type).flatMap(result -> {\n' +
+      '      if (empty(result)) {\n' +
+      '        return Either.left(new Failure("empty", ErrorType.EXTRACT_VALUE_ERROR, key));\n' +
+      '      }\n' +
+      '      return Either.right(result);\n' +
+      '    });\n' +
+      '  }\n' +
+      '}\n',
+  });
+  assert.deepEqual(cells.map((c) => c.id), ['failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR']);
+});
+
+test('failure family fails loud on an unrecognised error-type argument or unknown constant', () => {
+  const errRel = 'zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record/value/ErrorType.java';
+  const errEnum = 'public enum ErrorType { EXTRACT_VALUE_ERROR; }';
+  const proc = (arg) => ({
+    [errRel]: errEnum,
+    [`${PROCESSING}/P.java`]: `class P { Either<Failure, ?> f() { return Either.left(new Failure("m", ${arg})); } }`,
+  });
+  // A forwarded type (re-wrapping another Failure) is marked `forwarded`.
+  assert.deepEqual(
+    run('failure', proc('other.getErrorType(), key')).map((c) => c.id),
+    ['failure:P.f:forwarded'],
+  );
+  assert.throws(() => run('failure', proc('computeType(), key')), /unrecognised Failure error-type argument/);
+  assert.throws(() => run('failure', proc('ErrorType.NOPE, key')), /unknown ErrorType\.NOPE/);
+  // A conditional argument names two types; it must fail loud, never yield one.
+  assert.throws(
+    () => run('failure', proc('m ? ErrorType.EXTRACT_VALUE_ERROR : ErrorType.IO_MAPPING_ERROR, key')),
+    /unrecognised Failure error-type argument/,
+  );
+});
+
+test('rejection family attributes a lambda body to the enclosing named method', () => {
+  const schema = 'zeebe/protocol/src/main/resources/protocol.xml';
+  const xml = '<enum name="RejectionType" encodingType="uint8"><validValue name="INVALID_STATE">1</validValue></enum>';
+  const cells = run('rejection', {
+    [schema]: xml,
+    [`${PROCESSING}/P.java`]:
+      'class P {\n' +
+      '  void migrate() {\n' +
+      '    result.ifRightOrLeft(ok -> ok(), failure -> {\n' +
+      '      throw new PreconditionFailed(msg, RejectionType.INVALID_STATE);\n' +
+      '    });\n' +
+      '  }\n' +
+      '}\n',
+  });
+  assert.deepEqual(cells.map((c) => c.id), ['rejection:P.migrate:INVALID_STATE']);
+});
+
+test('rejection family skips comparisons but keeps constructions', () => {
+  const schema = 'zeebe/protocol/src/main/resources/protocol.xml';
+  const xml = '<enum name="RejectionType" encodingType="uint8"><validValue name="NOT_FOUND">1</validValue></enum>';
+  const cells = run('rejection', {
+    [schema]: xml,
+    [`${PROCESSING}/P.java`]:
+      'class P {\n' +
+      '  void f() {\n' +
+      '    if (RejectionType.NOT_FOUND.equals(r.type())) {}\n' + // a read: no cell
+      '    reject(command, RejectionType.NOT_FOUND, msg);\n' + // a construction
+      '  }\n' +
+      '}\n',
+  });
+  assert.deepEqual(cells.map((c) => c.id), ['rejection:P.f:NOT_FOUND']);
+});
+
+test('the committed surface contains the shared-contract example failure cell', () => {
+  // The trace harness (formal/traces) emits this same id from captured traces;
+  // the grammar is a shared contract (#1391), so pin the canonical example.
+  const surface = JSON.parse(readFileSync(join(here, 'zeebe-surface.json'), 'utf8'));
+  const cell = surface.cells.find((c) => c.id === 'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR');
+  assert.ok(cell, 'failure:BpmnJobBehavior.evalTypeExp:EXTRACT_VALUE_ERROR must be extracted');
+  assert.ok(cell.sources.length > 0);
 });
 
 test('the committed surface is well-formed and extracted at the pin', () => {
@@ -361,4 +529,39 @@ test('the committed surface is well-formed and extracted at the pin', () => {
     assert.ok(c.sources.length > 0, c.id);
   }
   assert.deepEqual(new Set(ids.map((i) => i.split(':')[0])), new Set(Object.keys(FAMILIES)));
+});
+
+test('enclosingScope does not restore an outer method across a local class boundary', () => {
+  const src = `class Outer {
+  void f() {
+    class Inner {
+      void g() {}
+      Object x = new Failure("siteL", ErrorType.UNKNOWN);
+    }
+  }
+}`;
+  assert.deepEqual(enclosingScope(src, src.indexOf('siteL')), { cls: 'Outer', method: '' });
+});
+
+test('failure family ignores code-like text inside literals and annotated signatures', () => {
+  const errRel = 'zeebe/protocol/src/main/java/io/camunda/zeebe/protocol/record/value/ErrorType.java';
+  const tq = '"""';
+  const cells = run('failure', {
+    [errRel]: 'public enum ErrorType { EXTRACT_VALUE_ERROR; }',
+    [`${PROCESSING}/P.java`]:
+      'class P {\n' +
+      '  void s() { String a = "new Failure(message)"; char c = \'(\'; }\n' +
+      `  void t() { String b = ${tq}\n    new Failure("x", ErrorType.EXTRACT_VALUE_ERROR) {\n  ${tq}; }\n` +
+      '  Either<Failure, ?> u(@Pattern(regexp = "[)]") String x) {\n' +
+      '    return Either.left(new Failure("m", ErrorType.EXTRACT_VALUE_ERROR));\n' +
+      '  }\n' +
+      '  Either<Failure, ?> v(@Pattern(regexp = "[(]") String x) {\n' +
+      '    return Either.left(new Failure("n", ErrorType.EXTRACT_VALUE_ERROR, k));\n' +
+      '  }\n' +
+      '}\n',
+  });
+  assert.deepEqual(
+    cells.map((c) => c.id),
+    ['failure:P.u:EXTRACT_VALUE_ERROR', 'failure:P.v:EXTRACT_VALUE_ERROR'],
+  );
 });

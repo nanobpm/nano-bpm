@@ -2426,7 +2426,7 @@ fn should_create_incident_if_job_type_expression_evaluation_failed() {
     );
     assert_eq!(active[0].element_id, "task");
     assert!(
-        active[0].reason.contains("job type expression"),
+        active[0].reason.contains("Expected to evaluate expression"),
         "the reason names the failed expression: {}",
         active[0].reason
     );
@@ -2535,7 +2535,7 @@ fn should_create_incident_if_job_type_expression_of_non_string_scalar_type() {
         );
         assert_eq!(active[0].element_id, "task");
         assert!(
-            active[0].reason.contains("must evaluate to a string"),
+            active[0].reason.contains("to be 'STRING'"),
             "the reason calls out the non-string result for {expr}: {}",
             active[0].reason
         );
@@ -2554,7 +2554,7 @@ fn should_create_incident_if_job_type_expression_of_non_string_scalar_type() {
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
 fn should_create_incident_if_job_type_expression_exceeds_max_length() {
-    // Zeebe `BpmnJobBehavior.evalTypeExp` (maxJobTypeLength, default 128): a
+    // Zeebe `BpmnJobBehavior.evalTypeExp` (maxWorkerTypeLength, default 32 * 1024): a
     // job-type expression whose result is longer than the cap raises
     // EXTRACT_VALUE_ERROR and creates no job.
     let mut engine = Engine::new();
@@ -2574,7 +2574,7 @@ fn should_create_incident_if_job_type_expression_exceeds_max_length() {
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].kind, state::IncidentKind::ExtractValueError);
     assert!(
-        active[0].reason.contains("maximum job type length"),
+        active[0].reason.contains("maximum length of"),
         "the reason calls out the length cap: {}",
         active[0].reason
     );

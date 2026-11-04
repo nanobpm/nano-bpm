@@ -1,0 +1,9 @@
+{
+  "description": "#1390: the job-type FEEL expression evaluates to an empty string -> BpmnJobBehavior.evalTypeExp raises an EXTRACT_VALUE_ERROR incident and no job is created; after the variable is fixed and the incident resolved, the job is created and completes.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "job-type-expr", "variables": { "jobType": "" } },
+    { "op": "updateVariables", "variables": { "jobType": "work" } },
+    { "op": "resolveIncident", "elementId": "task" },
+    { "op": "completeJob", "jobType": "work" }
+  ]
+}

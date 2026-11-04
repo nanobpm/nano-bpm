@@ -1,0 +1,6 @@
+{
+  "scenario" : "job-no-retries-incident",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "cells" : [ "element:SequenceFlow", "element:ServiceTask", "element:StartEvent", "incident:JOB_NO_RETRIES", "intent:Incident:CREATED", "intent:Job:CREATED", "intent:Job:FAILED", "intent:JobBatch:ACTIVATED", "intent:ProcessInstance:ELEMENT_ACTIVATED", "intent:ProcessInstance:ELEMENT_ACTIVATING", "intent:ProcessInstance:ELEMENT_COMPLETED", "intent:ProcessInstance:ELEMENT_COMPLETING", "intent:ProcessInstance:SEQUENCE_FLOW_TAKEN", "intent:ProcessInstanceCreation:CREATED" ],
+  "sites" : { }
+}

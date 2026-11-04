@@ -7,10 +7,10 @@ impl Engine {
     /// evaluating the stored `correlation_key` FEEL expression against the
     /// instance variables (a bare name like `orderId` is just a variable
     /// reference; `order.id` reads a context member). A missing variable, an
-    /// empty key, or an evaluation error yields the empty string (matching the
-    /// REST default `correlationKey` of `""`). Callers that must distinguish a
-    /// declared-but-unevaluable key from a legitimately empty one (to raise an
-    /// incident) use [`Self::resolve_correlation_value_checked`] instead.
+    /// empty key, or an evaluation error yields the empty string. That silent
+    /// fallback is a known Zeebe divergence (Zeebe raises an incident), tracked
+    /// in #1398; callers that can raise the incident use
+    /// [`Self::resolve_correlation_value_checked`] instead.
     pub(crate) fn resolve_correlation_value(
         &self,
         vars: &HashMap<String, Value>,
@@ -44,52 +44,43 @@ impl Engine {
         })
     }
 
-    /// Resolves a message or signal event `name` at subscription-open time.
-    ///
-    /// A static value (`"order canceled"`) is returned verbatim. A FEEL
-    /// expression (a leading `=`, e.g. `="order " + awaitingAction`) is
-    /// evaluated to a string against `vars` (the scoped view the subscribing
-    /// element sees), falling back to the literal text when it cannot be
-    /// evaluated (parse error, unresolved variable, non-string result) — matching
-    /// the error-tolerant behaviour of the other `resolve_*` helpers, which have
-    /// no incident path.
-    ///
-    /// A message-start-event name is evaluated by Zeebe at deploy time against an
-    /// empty context, so its caller passes an empty `vars`; the catch/boundary
-    /// cases pass the activating element's scoped view.
-    pub(crate) fn resolve_event_name(&self, vars: &HashMap<String, Value>, raw: &str) -> String {
-        let trimmed = raw.trim();
-        if !trimmed.starts_with('=') {
-            return raw.to_string();
-        }
-        crate::feel::eval_string(trimmed, vars).unwrap_or_else(|_| raw.to_string())
+    /// Resolves a message or signal event `name` at subscription-open time
+    /// (Zeebe `evaluateStringExpression` on the message/signal name). A static
+    /// value (`"order canceled"`) is returned verbatim; a FEEL expression (a
+    /// leading `=`, e.g. `="order " + awaitingAction`) must evaluate to a
+    /// `STRING` against `vars` (the scoped view the subscribing element sees),
+    /// else an `EXTRACT_VALUE_ERROR` [`expression::Failure`] the caller raises
+    /// as an incident — never a subscription named after the expression text.
+    pub(crate) fn resolve_event_name_checked(
+        &self,
+        vars: &HashMap<String, Value>,
+        raw: &str,
+    ) -> Result<String, expression::Failure> {
+        expression::evaluate_string(raw, vars)
     }
 
-    /// Resolves a job's initial retry count from the `zeebe:taskDefinition`
-    /// `retries` expression declared on the element. A literal integer (`"5"`)
-    /// is used directly; a FEEL expression (leading `=`, e.g. `=maxRetries`) is
-    /// evaluated to a number against `vars` (the element's scoped view). `None`
-    /// (no declaration) or an unresolvable expression defaults to
-    /// [`crate::state::DEFAULT_JOB_RETRIES`]. The result is floored at 0.
+    /// The **lenient** event-name resolution still used by subscription sites
+    /// with no incident path yet (boundary events, message start events, signal
+    /// catches): on failure it falls back to the literal text. A known Zeebe
+    /// divergence tracked in #1398 (allow-listed in `tests/feel_fallback_lint.rs`);
+    /// a message intermediate catch uses [`Self::resolve_event_name_checked`].
+    ///
+    /// A message-start-event name is evaluated by Zeebe at deploy time against an
+    /// empty context, so its caller passes an empty `vars`.
+    pub(crate) fn resolve_event_name(&self, vars: &HashMap<String, Value>, raw: &str) -> String {
+        self.resolve_event_name_checked(vars, raw)
+            .unwrap_or_else(|_| raw.to_string())
+    }
+
+    /// The **lenient** retry-count resolution still used by job-creation sites
+    /// with no incident path yet (listener / ad-hoc jobs): an unresolvable
+    /// expression falls back to [`crate::state::DEFAULT_JOB_RETRIES`]. A known
+    /// Zeebe divergence tracked in #1398 (allow-listed in
+    /// `tests/feel_fallback_lint.rs`); element jobs use
+    /// [`Self::resolve_job_retries`], which fails instead.
     pub(crate) fn resolve_retries(&self, vars: &HashMap<String, Value>, raw: Option<&str>) -> i32 {
-        let default = crate::state::DEFAULT_JOB_RETRIES;
-        let Some(raw) = raw else {
-            return default;
-        };
-        let trimmed = raw.trim();
-        let value = if let Some(expr) = trimmed.strip_prefix('=') {
-            match crate::feel::eval(expr, vars) {
-                Ok(Value::Int(i)) => i as i32,
-                Ok(Value::Double(d)) => d as i32,
-                _ => return default,
-            }
-        } else {
-            match trimmed.parse::<i32>() {
-                Ok(i) => i,
-                Err(_) => return default,
-            }
-        };
-        value.max(0)
+        self.resolve_job_retries(vars, raw)
+            .unwrap_or(crate::state::DEFAULT_JOB_RETRIES)
     }
 
     /// The raw `retries` expression declared on `element_id` (if any).
@@ -490,51 +481,54 @@ impl Engine {
         }
     }
 
-    /// Resolves a service task's (or listener's) job type at job-creation time.
-    ///
-    /// A static type (`"payment"`) is returned verbatim. A FEEL expression (a
-    /// leading `=`, e.g. `=jobType` or `="worker-" + region`) is evaluated
-    /// against the instance variables via [`crate::feel`] and **must produce a
-    /// string** — matching Zeebe's `BpmnJobBehavior.evalTypeExp`, which requires
-    /// the result to be a string and never coerces.
-    ///
-    /// A failure to evaluate (parse error, unresolved variable, null result), a
-    /// **non-string** result (a number, boolean, list, context or temporal —
-    /// [`crate::feel::eval_strict_string`] rejects them on the evaluated FEEL
-    /// value, before any string coercion), an **empty** result, or a result
-    /// longer than [`MAX_JOB_TYPE_LENGTH`] returns `Err(reason)` — the caller
-    /// raises an `EXTRACT_VALUE_ERROR`
-    /// ([`crate::state::IncidentKind::ExtractValueError`]) incident on the
-    /// element instance and creates **no** job (each of these is an
-    /// `EXTRACT_VALUE_ERROR` failure in Zeebe). nano previously fell back to the
-    /// literal expression text as the job type, so the token parked with no
-    /// incident and no worker could ever subscribe (#1390).
+    /// Resolves a job's type at job-creation time (Zeebe
+    /// `BpmnJobBehavior.evalTypeExp`). A static type is returned verbatim. A
+    /// FEEL expression (a leading `=`, e.g. `=jobType` or `="worker-" + region`)
+    /// must evaluate to a non-empty `STRING` of at most
+    /// [`expression::MAX_JOB_TYPE_LENGTH`] characters; anything else (evaluation
+    /// error, `null`, wrong type, empty, too long) is an `EXTRACT_VALUE_ERROR`
+    /// [`expression::Failure`] that the caller raises as an incident with no job
+    /// created (#1390).
     pub(crate) fn resolve_job_type(
         &self,
         vars: &HashMap<String, Value>,
         job_type: &str,
-    ) -> Result<String, String> {
-        let trimmed = job_type.trim();
-        let resolved = if !trimmed.starts_with('=') {
-            job_type.to_string()
-        } else {
-            crate::feel::eval_strict_string(trimmed, vars).map_err(|e| {
-                format!("job type expression '{trimmed}' must evaluate to a string: {e}")
-            })?
+    ) -> Result<String, expression::Failure> {
+        if !expression::is_expression(job_type) {
+            return Ok(job_type.to_string());
+        }
+        expression::evaluate_non_empty_string(job_type, vars, expression::MAX_JOB_TYPE_LENGTH)
+    }
+
+    /// Resolves a job's retry count at job-creation time (Zeebe
+    /// `BpmnJobBehavior.evalRetriesExp` -> `evaluateLongExpression`). `None` (no
+    /// declaration) is [`crate::state::DEFAULT_JOB_RETRIES`]; a literal or FEEL
+    /// value must be a `NUMBER` (floored at 0), else an `EXTRACT_VALUE_ERROR`.
+    pub(crate) fn resolve_job_retries(
+        &self,
+        vars: &HashMap<String, Value>,
+        raw: Option<&str>,
+    ) -> Result<i32, expression::Failure> {
+        let Some(raw) = raw else {
+            return Ok(crate::state::DEFAULT_JOB_RETRIES);
         };
-        if resolved.is_empty() {
-            return Err(format!(
-                "job type expression '{trimmed}' evaluated to an empty string"
-            ));
-        }
-        if resolved.len() > MAX_JOB_TYPE_LENGTH {
-            return Err(format!(
-                "job type expression '{trimmed}' evaluated to a {}-character string, \
-                 exceeding the maximum job type length of {MAX_JOB_TYPE_LENGTH}",
-                resolved.len()
-            ));
-        }
-        Ok(resolved)
+        let n = expression::evaluate_long(raw, vars)?;
+        Ok(n.clamp(0, i64::from(i32::MAX)) as i32)
+    }
+
+    /// The **lenient** job-type resolution still used by job-creation sites that
+    /// have no incident path yet (execution/task listener jobs, ad-hoc tool and
+    /// agent jobs): on failure it falls back to the literal text. This is a
+    /// known Zeebe divergence (Zeebe raises `EXTRACT_VALUE_ERROR` there too),
+    /// tracked in #1398 and allow-listed in `tests/feel_fallback_lint.rs` — do
+    /// not add new callers.
+    pub(crate) fn resolve_job_type_lenient(
+        &self,
+        vars: &HashMap<String, Value>,
+        job_type: &str,
+    ) -> String {
+        self.resolve_job_type(vars, job_type)
+            .unwrap_or_else(|_| job_type.to_string())
     }
 
     /// Resolves a user-task string attribute (assignee, due/follow-up date)
@@ -687,7 +681,9 @@ impl Engine {
 
         // A `=`-prefixed expression is FEEL, evaluated against the scoped view (or
         // an empty context at deploy); a bare value (only for a literal timeDate)
-        // is used directly.
+        // is used directly. An evaluation failure falls back to the static
+        // timer — a known Zeebe divergence (Zeebe raises EXTRACT_VALUE_ERROR),
+        // tracked in #1398.
         let evaluated: Option<String> = if def.expr.trim_start().starts_with('=') {
             crate::feel::eval_string(&def.expr, vars).ok()
         } else {

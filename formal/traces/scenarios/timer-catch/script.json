@@ -1,0 +1,13 @@
+{
+  "description": "An intermediate timer catch event (PT1M) fires once the clock advances past its due date.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "timer-catch"
+    },
+    {
+      "op": "advanceClock",
+      "millis": 60000
+    }
+  ]
+}

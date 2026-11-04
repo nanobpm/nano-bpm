@@ -1,0 +1,12 @@
+{
+  "description": "An exclusive gateway takes the matching conditional flow (amount > 100).",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "exclusive-gateway",
+      "variables": {
+        "amount": 150
+      }
+    }
+  ]
+}

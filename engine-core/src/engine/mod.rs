@@ -23,6 +23,7 @@ mod api;
 mod boundary;
 mod call_activity;
 mod debug;
+mod expression;
 mod flow_scope;
 mod memory;
 mod migration;
@@ -325,16 +326,22 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
-    /// Re-run the activation body of an already-active message intermediate
-    /// catch event to re-open its subscription. Used to retry a catch whose
-    /// correlation-key expression raised an `ExpressionEvaluation` incident at
-    /// open time: the element instance stays active throughout, so its
+    /// Re-run only the activation body (not input mappings / start listeners)
+    /// of an already-active element whose activation-time expression raised an
+    /// `ExpressionEvaluation` incident: a message intermediate catch whose
+    /// correlation key or name failed (re-opens its subscription), or a job
+    /// worker whose job type/retries failed (#1390, creates its job). The
+    /// element instance stays active throughout, so its
     /// `ElementActivating`/`ElementActivated` are not re-emitted — only the
-    /// subscription is re-derived once the referenced variables are corrected.
-    ReopenCatch {
+    /// behaviour is re-derived once the referenced variables are corrected.
+    RerunActivationBody {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+        /// `true` when the element is still in `ACTIVATING` (the incident was
+        /// raised before `ElementActivated`, [`state::IoMappingRedrive::ActivationPending`]):
+        /// a successful re-run then emits `ElementActivated` first.
+        pending: bool,
     },
     /// Re-run the activation body of an already-active element whose input
     /// `zeebe:ioMapping` raised an `IoMapping` incident (#939). The element
@@ -346,6 +353,10 @@ enum Step {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
+        /// `true` when the element is still in `ACTIVATING` (the incident was
+        /// raised before `ElementActivated`, [`state::IoMappingRedrive::ActivationPending`]):
+        /// a successful re-run then emits `ElementActivated` first.
+        pending: bool,
     },
     /// Run the activation body of an element a process-instance modification
     /// already activated and seeded with element-local variables (Zeebe sets a
@@ -451,6 +462,11 @@ enum Step {
         body_key: Key,
         child_key: Key,
         index: usize,
+        /// `false` when the incident was raised *after* the child's input
+        /// mappings succeeded (a job-property failure,
+        /// [`state::IoMappingRedrive::MiChildBehaviour`]): only the behaviour is
+        /// re-run, so non-idempotent inputs are not applied twice.
+        reapply_inputs: bool,
     },
     /// Re-drive a multi-instance **body**'s activation (fan-out) after its body
     /// input-mapping incident is resolved (#946): re-apply the body input
@@ -3054,10 +3070,11 @@ impl Engine {
                             self.element_kind(instance_key, &element_id),
                             Some(ElementKind::MessageIntermediateCatchEvent { .. })
                         ) {
-                            queue.push_back(Step::ReopenCatch {
+                            queue.push_back(Step::RerunActivationBody {
                                 instance_key,
                                 element_instance_key,
                                 element_id,
+                                pending: false,
                             });
                         } else if matches!(
                             redrive,
@@ -3088,6 +3105,58 @@ impl Engine {
                                 element_instance_key,
                                 element_id,
                                 preserved_seed,
+                            });
+                        } else if matches!(redrive, Some(state::IoMappingRedrive::JobCreation)) {
+                            // A job-property expression (type/retries) failed when
+                            // a job was re-created for an already-running element
+                            // (`create_job_for`, #1390): re-attempt the job
+                            // creation; re-driving `Complete` would skip the work.
+                            queue.push_back(Step::CreateJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        } else if matches!(
+                            redrive,
+                            Some(
+                                state::IoMappingRedrive::Activation
+                                    | state::IoMappingRedrive::ActivationPending
+                            )
+                        ) {
+                            // An activation-time expression (job type/retries)
+                            // failed in the activation body (#1390, Zeebe
+                            // `JobWorkerTaskProcessor.onActivate`): the element is
+                            // ACTIVATED with no job and no boundary subscriptions.
+                            // Re-run the activation body, as Zeebe retries
+                            // `onActivate` on resolve.
+                            queue.push_back(Step::RerunActivationBody {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                pending: matches!(
+                                    redrive,
+                                    Some(state::IoMappingRedrive::ActivationPending)
+                                ),
+                            });
+                        } else if let Some(
+                            state::IoMappingRedrive::MiChildActivation { body_key, index }
+                            | state::IoMappingRedrive::MiChildBehaviour { body_key, index },
+                        ) = redrive
+                        {
+                            // Same, for a multi-instance child. A job-property
+                            // failure (`MiChildBehaviour`) re-runs only the
+                            // behaviour: its inputs already applied.
+                            let reapply_inputs = matches!(
+                                redrive,
+                                Some(state::IoMappingRedrive::MiChildActivation { .. })
+                            );
+                            queue.push_back(Step::RetryMiChildActivation {
+                                instance_key,
+                                element_id,
+                                body_key,
+                                child_key: element_instance_key,
+                                index,
+                                reapply_inputs,
                             });
                         } else if let Some(state::IoMappingRedrive::AdHocToolJobType {
                             element_id: tool_element_id,
@@ -3161,11 +3230,11 @@ impl Engine {
                     // re-projects the now-fixed output mapping without re-running
                     // the element's behaviour — the same lifecycle as a
                     // script/decision output failure. This must NOT take the
-                    // message-catch `ReopenCatch` branch above: an output-mapping
+                    // message-catch `RerunActivationBody` branch above: an output-mapping
                     // failure occurs *after* the message was already correlated and
                     // consumed, so reopening the subscription would strand the token
                     // waiting for a *second* message instead of retrying the mapping.
-                    // `ReopenCatch` is reserved for correlation-key (ACTIVATING)
+                    // `RerunActivationBody` is reserved for correlation-key (ACTIVATING)
                     // failures, which surface as `ExpressionEvaluation`.
                     // Uncaught business error: re-create a job for the still-active
                     // service task so a worker can attempt it again.
@@ -3198,6 +3267,17 @@ impl Engine {
                                     instance_key,
                                     element_instance_key,
                                     element_id,
+                                    pending: false,
+                                })
+                            }
+                            // The same, for a token still in ACTIVATING: the
+                            // successful re-run emits `ElementActivated`.
+                            Some(state::IoMappingRedrive::ActivationPending) => {
+                                Some(Step::RetryActivation {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    pending: true,
                                 })
                             }
                             // Output re-projection. A mainstream leaf element
@@ -3239,7 +3319,21 @@ impl Engine {
                                 body_key,
                                 child_key: element_instance_key,
                                 index,
+                                reapply_inputs: true,
                             }),
+                            // Job-property failures surface as
+                            // `ExpressionEvaluation` (handled above); this arm keeps
+                            // the `IoMapping` match exhaustive.
+                            Some(state::IoMappingRedrive::MiChildBehaviour { body_key, index }) => {
+                                Some(Step::RetryMiChildActivation {
+                                    instance_key,
+                                    element_id,
+                                    body_key,
+                                    child_key: element_instance_key,
+                                    index,
+                                    reapply_inputs: false,
+                                })
+                            }
                             // MI body input/collection: re-run the body fan-out.
                             Some(state::IoMappingRedrive::MiBodyActivation) => {
                                 let scope = self.scope_of(instance_key, element_instance_key);
@@ -3343,6 +3437,14 @@ impl Engine {
                                 element_instance_key,
                                 element_id,
                                 child_variables,
+                            }),
+                            // Job-property expression failures surface as
+                            // `ExpressionEvaluation` (handled above); this arm keeps
+                            // the `IoMapping` match exhaustive.
+                            Some(state::IoMappingRedrive::JobCreation) => Some(Step::CreateJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
                             }),
                         };
                         if let Some(step) = step {
@@ -3866,6 +3968,33 @@ impl Engine {
                     self.emit(&mut log, event);
                 }
                 for event in immediate_user_task_cancels {
+                    self.emit(&mut log, event);
+                }
+                // Terminating the instance terminates every element carrying an
+                // open incident, and Zeebe resolves those incidents with their
+                // element (`JobWorkerElementIncidentTest#
+                // shouldResolveIncidentIfTaskIsTerminated`) — none may linger on
+                // a terminated instance.
+                let mut open_incidents: Vec<&state::Incident> = self
+                    .state
+                    .incidents
+                    .values()
+                    .filter(|i| {
+                        i.instance_key == instance_key && i.state == state::IncidentState::Active
+                    })
+                    .collect();
+                open_incidents.sort_unstable_by_key(|i| i.key);
+                let incident_resolutions: Vec<Event> = open_incidents
+                    .into_iter()
+                    .map(|i| Event::IncidentResolved {
+                        incident_key: i.key,
+                        instance_key,
+                        job_key: i.job_key,
+                        resolved_at: self.now,
+                        operation_reference: None,
+                    })
+                    .collect();
+                for event in incident_resolutions {
                     self.emit(&mut log, event);
                 }
                 if canceling_starts.is_empty() {
@@ -5253,7 +5382,7 @@ impl Engine {
                 element_instance_key,
                 ..
             }
-            | Step::ReopenCatch {
+            | Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
                 ..
@@ -5498,10 +5627,11 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.create_job_for(instance_key, element_instance_key, element_id),
-            Step::ReopenCatch {
+            Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
                 element_id,
+                pending,
             } => {
                 // The catch element instance is already ACTIVATED (its token is
                 // parked on the resolved incident); reconstruct its enclosing
@@ -5509,18 +5639,30 @@ impl Engine {
                 // activation body to re-open the subscription.
                 let scope = self.scope_of(instance_key, element_instance_key);
                 let vars = self.variables_for_element(instance_key, element_instance_key);
-                self.run_activation_body(
+                let activated = Event::ElementActivated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    scope,
+                };
+                let (events, followups) = self.run_activation_body(
                     instance_key,
                     element_id,
                     element_instance_key,
                     scope,
                     vars,
-                )
+                );
+                if pending {
+                    (gate_activated(events, activated, 0), followups)
+                } else {
+                    (events, followups)
+                }
             }
             Step::RetryActivation {
                 instance_key,
                 element_instance_key,
                 element_id,
+                pending,
             } => {
                 // The element instance is already ACTIVATED (parked on the
                 // resolved input-mapping incident); reconstruct its enclosing
@@ -5543,7 +5685,24 @@ impl Engine {
                 } else {
                     scope
                 };
-                self.activate_body_in(instance_key, element_id, element_instance_key, scope, view)
+                let activated = Event::ElementActivated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    scope,
+                };
+                let (events, followups) = self.activate_body_in(
+                    instance_key,
+                    element_id,
+                    element_instance_key,
+                    scope,
+                    view,
+                );
+                if pending {
+                    (gate_activated(events, activated, 0), followups)
+                } else {
+                    (events, followups)
+                }
             }
             Step::ResumeSeededActivation {
                 instance_key,
@@ -5628,9 +5787,15 @@ impl Engine {
                 body_key,
                 child_key,
                 index,
-            } => {
-                self.retry_mi_child_activation(instance_key, element_id, body_key, child_key, index)
-            }
+                reapply_inputs,
+            } => self.retry_mi_child_activation(
+                instance_key,
+                element_id,
+                body_key,
+                child_key,
+                index,
+                reapply_inputs,
+            ),
             Step::RetryMiBodyActivation {
                 instance_key,
                 element_id,
@@ -5695,19 +5860,18 @@ impl Engine {
         }
 
         let element_instance_key = self.mint_key();
-        let mut events = vec![
-            Event::ElementActivating {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-            },
-            Event::ElementActivated {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-                scope,
-            },
-        ];
+        let activated = Event::ElementActivated {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+            scope,
+        };
+        let mut events = vec![Event::ElementActivating {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+            scope,
+        }];
         let mut followups = Vec::new();
 
         // A sub-process is itself a variable scope: it always registers its scope
@@ -5735,7 +5899,9 @@ impl Engine {
             self.activate_body(instance_key, element_id, element_instance_key, scope);
         events.extend(body_events);
         followups.extend(body_followups);
-        (events, followups)
+        // `ElementActivated` sits right after `ElementActivating` — unless the
+        // activation body parked the token on an activation-time incident.
+        (gate_activated(events, activated, 1), followups)
     }
 
     /// The element's activation body: everything between `ElementActivated` and
@@ -5901,7 +6067,7 @@ impl Engine {
                 Err(reason) => {
                     // #1390: a failed listener job-type expression parks the
                     // element on an EXTRACT_VALUE_ERROR incident — no job.
-                    events.push(self.extract_value_incident(
+                    events.push(self.expression_incident(
                         instance_key,
                         element_instance_key,
                         element_id,
@@ -5970,18 +6136,15 @@ impl Engine {
         }
     }
 
-    /// Builds an `EXTRACT_VALUE_ERROR` [`Event::IncidentRaised`] for a job-type
-    /// expression that failed to resolve to a usable string (#1390, Zeebe
-    /// `BpmnJobBehavior.evalTypeExp`): evaluation error, non-string/null result,
-    /// empty string, or a result over [`MAX_JOB_TYPE_LENGTH`]. No job is created
-    /// — the element parks on the incident and resolving it (after the variables
-    /// the expression reads are fixed) retries the failed work via `redrive`.
-    fn extract_value_incident(
+    /// Builds the incident for an expression [`expression::Failure`] (Zeebe
+    /// `BpmnIncidentBehavior.createIncident(failure, context)`): the failure's
+    /// error type selects the incident kind, its message is the reason.
+    fn expression_incident(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
-        reason: String,
+        failure: expression::Failure,
         redrive: Option<state::IoMappingRedrive>,
     ) -> Event {
         Event::IncidentRaised {
@@ -5989,9 +6152,9 @@ impl Engine {
             instance_key,
             element_instance_key,
             element_id,
-            kind: state::IncidentKind::ExtractValueError,
+            kind: failure.error_type.incident_kind(),
             redrive,
-            reason,
+            reason: failure.message,
             job_key: None,
             created_at: self.now,
         }
@@ -6079,35 +6242,33 @@ impl Engine {
                     ));
                     return (events, followups);
                 }
-                let job_type = match self.resolve_job_type(&element_vars, &job_type) {
-                    Ok(job_type) => job_type,
-                    Err(reason) => {
-                        // #1390 (Zeebe `BpmnJobBehavior.evalTypeExp`): a failed
-                        // job-type expression raises an EXTRACT_VALUE_ERROR
-                        // incident on the task and NO job is created; resolving
-                        // the incident retries the activation.
-                        events.extend(self.arm_boundary_events(
-                            instance_key,
-                            element_instance_key,
-                            scope,
-                            &element_id,
-                        ));
-                        events.push(self.extract_value_incident(
+                // Zeebe `BpmnJobBehavior.evaluateJobExpressions`: a failed
+                // type/retries expression is an EXTRACT_VALUE_ERROR incident and
+                // no job (nor boundary subscription) is created (#1390).
+                let retries_raw = self.retries_of(instance_key, &element_id);
+                let props = self
+                    .resolve_job_type(&element_vars, &job_type)
+                    .and_then(|t| {
+                        Ok((
+                            t,
+                            self.resolve_job_retries(&element_vars, retries_raw.as_deref())?,
+                        ))
+                    });
+                let (job_type, retries) = match props {
+                    Ok(props) => props,
+                    Err(failure) => {
+                        let event = self.expression_incident(
                             instance_key,
                             element_instance_key,
                             element_id,
-                            reason,
+                            failure,
                             Some(state::IoMappingRedrive::Activation),
-                        ));
-                        return (events, followups);
+                        );
+                        return (vec![event], Vec::new());
                     }
                 };
                 let job_key = self.mint_key();
                 let priority = self.resolve_priority(&element_vars, priority.as_deref());
-                let retries = self.resolve_retries(
-                    &element_vars,
-                    self.retries_of(instance_key, &element_id).as_deref(),
-                );
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -6471,6 +6632,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: body_key,
                 element_id: element_id.clone(),
+                scope,
             },
             Event::ElementActivated {
                 instance_key,
@@ -6653,7 +6815,7 @@ impl Engine {
                 Err(reason) => {
                     // #1390: a failed listener job-type expression parks the MI
                     // body on an EXTRACT_VALUE_ERROR incident — no job.
-                    events.push(self.extract_value_incident(
+                    events.push(self.expression_incident(
                         instance_key,
                         body_key,
                         element_id,
@@ -6867,6 +7029,7 @@ impl Engine {
                             instance_key,
                             element_instance_key: child_key,
                             element_id: element_id.clone(),
+                            scope: body_key,
                         },
                         Event::ElementActivated {
                             instance_key,
@@ -6900,6 +7063,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
+                scope: body_key,
             },
             Event::ElementActivated {
                 instance_key,
@@ -7017,31 +7181,34 @@ impl Engine {
                     }
                     return (events, followups);
                 }
-                let job_type = match self.resolve_job_type(child_vars, &job_type) {
-                    Ok(job_type) => job_type,
-                    Err(reason) => {
-                        // #1390: a failed job-type expression parks the MI child
-                        // on an EXTRACT_VALUE_ERROR incident — no job; the body
-                        // keeps waiting for the child.
-                        events.push(self.extract_value_incident(
+                // Zeebe `BpmnJobBehavior.evaluateJobExpressions` per child: a
+                // failed type/retries expression is an EXTRACT_VALUE_ERROR
+                // incident on the child, with no job (#1390).
+                let retries_raw = self.retries_of(instance_key, &element_id);
+                let props = self.resolve_job_type(child_vars, &job_type).and_then(|t| {
+                    Ok((
+                        t,
+                        self.resolve_job_retries(child_vars, retries_raw.as_deref())?,
+                    ))
+                });
+                let (job_type, retries) = match props {
+                    Ok(props) => props,
+                    Err(failure) => {
+                        let event = self.expression_incident(
                             instance_key,
                             child_key,
                             element_id,
-                            reason,
-                            Some(state::IoMappingRedrive::MiChildActivation {
+                            failure,
+                            Some(state::IoMappingRedrive::MiChildBehaviour {
                                 body_key,
                                 index: child_index,
                             }),
-                        ));
-                        return (events, followups);
+                        );
+                        return (vec![event], Vec::new());
                     }
                 };
                 let job_key = self.mint_key();
                 let priority = self.resolve_priority(child_vars, priority.as_deref());
-                let retries = self.resolve_retries(
-                    child_vars,
-                    self.retries_of(instance_key, &element_id).as_deref(),
-                );
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -7151,10 +7318,15 @@ impl Engine {
         body_key: Key,
         child_key: Key,
         index: usize,
+        reapply_inputs: bool,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut child_vars = (*self.variables_for_element(instance_key, child_key)).clone();
         let mut events = Vec::new();
-        let inputs = self.io_inputs(instance_key, &element_id);
+        let inputs = if reapply_inputs {
+            self.io_inputs(instance_key, &element_id)
+        } else {
+            Default::default()
+        };
         if !inputs.is_empty() {
             match self.eval_io_mappings_in(&child_vars, &inputs) {
                 Ok(mut mapped) => {
@@ -8266,7 +8438,7 @@ impl Engine {
                 Some(raw_type) => match self.resolve_job_type(&child_vars, &raw_type) {
                     Ok(resolved) => Some(resolved),
                     Err(reason) => {
-                        let event = self.extract_value_incident(
+                        let event = self.expression_incident(
                             instance_key,
                             container_key,
                             container_element_id.clone().unwrap_or_default(),
@@ -8288,6 +8460,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: inner_key,
                 element_id: inner_element_id.clone(),
+                scope: container_key,
             },
             Event::ElementActivated {
                 instance_key,
@@ -8299,6 +8472,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
+                scope: inner_key,
             },
             Event::ElementActivated {
                 instance_key,
@@ -9151,7 +9325,7 @@ impl Engine {
                 // `redrive: None` resolves via `Step::Complete`, which routes a
                 // JOB_WORKER container back through `complete_adhoc_container`,
                 // whose turn loop re-mints the agent job via this function.
-                return vec![self.extract_value_incident(
+                return vec![self.expression_incident(
                     instance_key,
                     container_key,
                     container_element_id,
@@ -9816,41 +9990,25 @@ impl Engine {
         }) = self.element_kind(instance_key, &element_id)
         {
             let vars = self.variables_for_element(instance_key, element_instance_key);
-            // The `decisionId` may be a FEEL expression (leading `=`). A failed
-            // evaluation is a decision-evaluation failure (Zeebe
-            // `DECISION_EVALUATION_ERROR` taxonomy — the task cannot evaluate
-            // its decision), NOT a job-type extraction failure, so it parks on
-            // a DecisionEvaluation incident with no resolved id (#1390: the
-            // previous code fell back to the raw `=…` text as the id).
-            let resolved_id = {
-                let trimmed = decision_id.trim();
-                if trimmed.starts_with('=') {
-                    match crate::feel::eval_string(trimmed, &vars) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            let incident_key = self.mint_key();
-                            return (
-                                vec![Event::IncidentRaised {
-                                    incident_key,
-                                    instance_key,
-                                    element_instance_key,
-                                    element_id,
-                                    kind: state::IncidentKind::DecisionEvaluation,
-                                    redrive: None,
-                                    reason: format!(
-                                        "failed to evaluate decision id expression \
-                                         '{trimmed}' for business rule task: {e}"
-                                    ),
-                                    job_key: None,
-                                    created_at: self.now,
-                                }],
-                                Vec::new(),
-                            );
-                        }
+            // Zeebe `BpmnDecisionBehavior.evaluateDecision`: the decision id is
+            // a string expression; a failure is an EXTRACT_VALUE_ERROR incident
+            // (re-driven like any completion-time expression incident).
+            let resolved_id = if expression::is_expression(&decision_id) {
+                match expression::evaluate_string(&decision_id, &vars) {
+                    Ok(id) => id,
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            None,
+                        );
+                        return (vec![event], Vec::new());
                     }
-                } else {
-                    decision_id.clone()
                 }
+            } else {
+                decision_id.clone()
             };
             let Some(deployed) = self.state.decisions.get(&resolved_id).cloned() else {
                 let incident_key = self.mint_key();
@@ -10082,7 +10240,7 @@ impl Engine {
                     // #1390: a failed end-listener job-type expression parks the
                     // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
                     // job; resolving re-drives completion.
-                    events.push(self.extract_value_incident(
+                    events.push(self.expression_incident(
                         instance_key,
                         element_instance_key,
                         element_id,
@@ -10210,7 +10368,7 @@ impl Engine {
                 // #1390: a failed end-listener job-type expression parks the
                 // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
                 // job; resolving re-drives completion.
-                return Some(self.extract_value_incident(
+                return Some(self.expression_incident(
                     instance_key,
                     element_instance_key,
                     element_id.to_string(),
@@ -10898,7 +11056,7 @@ impl Engine {
                         crate::model::ListenerEventType::End => state::IoMappingRedrive::Completion,
                     };
                     return (
-                        vec![self.extract_value_incident(
+                        vec![self.expression_incident(
                             instance_key,
                             element_instance_key,
                             element_id,
@@ -11024,13 +11182,7 @@ impl Engine {
     ) -> Event {
         let listener_vars = self.variables_for_element(instance_key, element_instance_key);
         let job_key = self.mint_key();
-        // A failed task-listener job-type expression falls back to the literal
-        // text for now: the task-listener paths mint jobs mid-transition with no
-        // incident seam yet (the user task's deferred transition cannot park on
-        // an incident from here). Tracked as part of the #1390 follow-ups.
-        let job_type = self
-            .resolve_job_type(&listener_vars, &listener.job_type)
-            .unwrap_or_else(|_| listener.job_type.clone());
+        let job_type = self.resolve_job_type_lenient(&listener_vars, &listener.job_type);
         let retries = self.resolve_retries(&listener_vars, listener.retries.as_deref());
         Event::TaskListenerJobCreated {
             job_key,
@@ -11372,32 +11524,32 @@ impl Engine {
             }) => {
                 // The element instance is already active (this is an incident
                 // retry), so resolve its FEEL attributes against its own applied
-                // scope view (input mappings + ancestors).
+                // scope view (input mappings + ancestors). A failed type/retries
+                // expression raises an EXTRACT_VALUE_ERROR incident whose
+                // resolution re-attempts this job creation (#1390).
                 let job_vars = self.variables_for_element(instance_key, element_instance_key);
-                let job_type = match self.resolve_job_type(&job_vars, &job_type) {
-                    Ok(job_type) => job_type,
-                    Err(reason) => {
-                        // #1390: the retried job-type expression still fails —
-                        // raise a fresh EXTRACT_VALUE_ERROR incident (no job);
-                        // resolving it retries the activation.
-                        return (
-                            vec![self.extract_value_incident(
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                reason,
-                                Some(state::IoMappingRedrive::Activation),
-                            )],
-                            Vec::new(),
+                let retries_raw = self.retries_of(instance_key, &element_id);
+                let props = self.resolve_job_type(&job_vars, &job_type).and_then(|t| {
+                    Ok((
+                        t,
+                        self.resolve_job_retries(&job_vars, retries_raw.as_deref())?,
+                    ))
+                });
+                let (job_type, retries) = match props {
+                    Ok(props) => props,
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            Some(state::IoMappingRedrive::JobCreation),
                         );
+                        return (vec![event], Vec::new());
                     }
                 };
                 let job_key = self.mint_key();
                 let priority = self.resolve_priority(&job_vars, priority.as_deref());
-                let retries = self.resolve_retries(
-                    &job_vars,
-                    self.retries_of(instance_key, &element_id).as_deref(),
-                );
                 (
                     vec![Event::JobCreated {
                         job_key,
@@ -12015,6 +12167,7 @@ impl Engine {
                     instance_key,
                     element_instance_key: eik,
                     element_id: element_id.clone(),
+                    scope,
                 });
                 events.push(Event::ElementActivated {
                     instance_key,
@@ -12151,6 +12304,7 @@ impl Engine {
             instance_key,
             element_instance_key: eik,
             element_id: element_id.to_string(),
+            scope,
         });
         events.push(Event::ElementActivated {
             instance_key,
@@ -14015,11 +14169,13 @@ pub const BUSINESS_ID_MAX_CHARS: usize = 256;
 /// Zeebe's `EngineConfiguration.DEFAULT_MAX_ERROR_MESSAGE_SIZE` (#1327).
 pub const MAX_ERROR_MESSAGE_LEN: usize = 10_000;
 
-/// Longest job type (in bytes) the engine accepts, matching Zeebe's
-/// `EngineConfiguration.DEFAULT_MAX_JOB_TYPE_LENGTH` (128). A `taskDefinition`
+/// Longest evaluated job type the engine accepts: Zeebe's default
+/// `maxWorkerTypeLength` (`EngineConfiguration.DEFAULT_MAX_WORKER_TYPE_LENGTH =
+/// 32 * 1024`), enforced by `BpmnJobBehavior.evalTypeExp`. A `taskDefinition`
 /// `type` expression whose resolved value exceeds this raises an
-/// `EXTRACT_VALUE_ERROR` incident instead of creating the job (#1390).
-pub const MAX_JOB_TYPE_LENGTH: usize = 128;
+/// `EXTRACT_VALUE_ERROR` incident instead of creating the job (#1390). The single
+/// source of truth — [`expression`] re-uses it.
+pub const MAX_JOB_TYPE_LENGTH: usize = 32 * 1024;
 
 /// Limits a worker-reported job error message like Zeebe's
 /// `StringUtil.limitString(msg, DEFAULT_MAX_ERROR_MESSAGE_SIZE)`: a message
@@ -14055,4 +14211,39 @@ pub fn check_business_id(business_id: Option<&str>) -> Result<(), EngineError> {
     } else {
         Err(EngineError::BusinessIdInvalid { chars })
     }
+}
+
+/// Zeebe parity for activation-time failures: `onActivate` (input mappings, job
+/// expressions) runs BEFORE `transitionToActivated`, so a failure leaves the
+/// element in `ACTIVATING`. If `events` raise an [`state::IoMappingRedrive::Activation`]
+/// incident on the activating element instance, that incident is re-tagged
+/// [`state::IoMappingRedrive::ActivationPending`] (so its resolution emits
+/// `ElementActivated` once the re-run succeeds) and `activated` is withheld;
+/// otherwise `activated` is inserted at `at`.
+fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Event> {
+    let eik = match &activated {
+        Event::ElementActivated {
+            element_instance_key,
+            ..
+        } => *element_instance_key,
+        _ => 0,
+    };
+    let mut parked = false;
+    for e in &mut events {
+        if let Event::IncidentRaised {
+            element_instance_key,
+            redrive: Some(redrive @ state::IoMappingRedrive::Activation),
+            ..
+        } = e
+        {
+            if *element_instance_key == eik {
+                *redrive = state::IoMappingRedrive::ActivationPending;
+                parked = true;
+            }
+        }
+    }
+    if !parked {
+        events.insert(at.min(events.len()), activated);
+    }
+    events
 }

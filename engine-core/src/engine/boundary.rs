@@ -825,10 +825,25 @@ impl Engine {
                 message_name,
                 correlation_key,
             } => {
-                let subscription_key = self.mint_key();
                 // The message name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity).
-                let message_name = self.resolve_event_name(vars, message_name);
+                // activation against the instance variables (Zeebe parity). A
+                // failure is an EXTRACT_VALUE_ERROR incident (Zeebe
+                // `BpmnEventSubscriptionBehavior` -> `evaluateStringExpression`),
+                // never a subscription named after the expression text;
+                // resolving it re-opens the subscription.
+                let message_name = match self.resolve_event_name_checked(vars, message_name) {
+                    Ok(name) => name,
+                    Err(failure) => {
+                        return vec![self.expression_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            None,
+                        )];
+                    }
+                };
+                let subscription_key = self.mint_key();
                 // A declared correlation-key expression that fails to evaluate
                 // (missing variable, `null`, or a type error like `str + null`)
                 // must NOT silently open a subscription with an empty key — that

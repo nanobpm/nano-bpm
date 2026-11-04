@@ -44,6 +44,7 @@ formal/
     ├── extract.mjs           # Zeebe sources -> zeebe-surface.json (derived, never hand-edited)
     ├── coverage.json         # maps every cell to Nano evidence, a gap, or out-of-scope
     ├── gaps.json             # the gap ratchet baseline: the only cells a gap rule may claim
+    ├── nano-tested.json      # the nano-tested ratchet baseline (#1391): transitional cells, shrink-only
     └── check.mjs             # the CI guard + coverage report
 ```
 
@@ -455,7 +456,14 @@ Zeebe declares, one **cell** per behaviour, in `zeebe-surface.json`:
 | `incident:<ErrorType>` | incident type | `ErrorType` |
 | `intent:<Record>:<INTENT>` | record intent | every `*Intent` enum in `protocol/record/intent` |
 | `validation:<Validator>:<message>` | deploy-time rejection message | `addError` calls in the bpmn-model and engine deployment validators |
-| `rejection:<Class>:<RejectionType>` | command rejection a processing-layer class produces: a processor, or a validator/helper that builds the rejection a processor writes | `RejectionType.X` uses under `engine/processing` (comparisons excluded), checked against the SBE schema |
+| `failure:<Class>.<method>:<ErrorType>` | each `new Failure(...)` construction site | `new Failure(` under `engine/processing`; `<Class>.<method>` is the enclosing top-level class and named method (a lambda is attributed to its enclosing named method); the `ErrorType` constant, empty for a message-only `Failure`, `forwarded` for a re-wrap |
+| `rejection:<Class>.<method>:<RejectionType>` | each command-rejection site | `RejectionType.X` uses under `engine/processing` (comparisons and SBE sentinels excluded), checked against the SBE schema; same `<Class>.<method>` scope rules as `failure:` |
+
+The `failure:` and `rejection:` families name a single Zeebe **source site** and
+are a shared contract with the trace harness in `formal/traces/` (#1391); the
+full grammar is specified in `formal/parity/README.md`. Unlike the coarser
+families, a per-site cell may only be claimed by an exact, wildcard-free
+coverage rule — `check.mjs` rejects a wildcard that matches one.
 
 Each cell records the source lines it was read from. The extractor fails
 loudly when an anchor it relies on moves or changes shape. It also fails when
@@ -472,19 +480,22 @@ have no cells yet.
 ### Mapping cells to evidence
 
 `coverage.json` holds ordered rules. The first rule whose `match` fits a cell
-claims it, and `*` in a `match` matches any run of characters. Each rule has
+claims it, and `*` in a `match` matches any run of characters — except that a
+per-site `failure:`/`rejection:` cell may only be claimed by an exact,
+wildcard-free `match` (see the family table above). Each rule has
 one status:
 
 | Status | Required | Meaning |
 |---|---|---|
-| `parity` | `evidence`: fixtures in `engine-core/tests/conformance/corpus/` | Nano's verdict is asserted equal to a Zeebe verdict captured in the fixture (`accept` or `reject`; a `diverge` fixture is not parity). Every claimed cell must be listed in one of the fixtures' `<!-- zeebe-cells: … -->` comment |
-| `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` (not `#[ignore]`d) exercises the behaviour, but not against a Zeebe oracle. Every claimed cell must be listed in a `// zeebe-cells: …` line among the comments and attributes directly above the test fn |
+| `parity` | `evidence`: `traces:<scenario>` refs and/or fixtures in `engine-core/tests/conformance/corpus/` | a **captured Zeebe trace** (`formal/traces/goldens/<scenario>.cells.json`) touches every claimed cell — `check.mjs` rejects a `parity` cell no committed trace touches (#1391), and an `intent:` cell counts only when `formal/traces/normaliser.json` keeps its records (a dropped record is never compared). A corpus fixture carries a captured Zeebe deploy verdict (`accept` or `reject`; a `diverge` fixture is not parity) and declares its cells in `<!-- zeebe-cells: … -->`; that verdict vouches for `validation:` cells only — every other family must be trace-touched |
+| `nano-tested` | `evidence`: `path::test_fn` | a Nano `#[test]` (not `#[ignore]`d) exercises the behaviour, but not against a Zeebe oracle. Every claimed cell must be listed in a `// zeebe-cells: …` line among the comments and attributes directly above the test fn. **Transitional and ratcheted** (`nano-tested.json`): the set may only shrink — promote to `parity` once a captured trace covers the cell |
 | `gap` | `issue`, `note` | no evidence yet; the issue closes it. Only cells in the `gaps.json` baseline may be gaps (see below) |
 | `out-of-scope` | `issue`, `note` | the cell has no Nano meaning (for example, partition-internal records). Use sparingly |
 
 `check.mjs` fails on any of these:
 
 - an unmapped cell, including new cells from a Zeebe bump
+- a per-site `failure:`/`rejection:` cell claimed by a wildcard rule
 - a rule that claims no cell
 - evidence that does not resolve (a renamed test, a missing fixture, a
   fixture or test that does not declare the cell, or one that declares a cell
@@ -496,14 +507,30 @@ one status:
 - a gap cell that is not in the `gaps.json` baseline, a baseline entry that is
   no longer a gap (it gained evidence or left the surface), or an unsorted
   baseline
+- a `parity` cell no captured Zeebe trace touches, or a trace cells file
+  listing a cell id `extract.mjs` does not know (grammar drift between the
+  capture harness and the extractor), or goldens captured at a different
+  commit than the pin
+- a `nano-tested` cell that is not in the `nano-tested.json` baseline, a
+  baseline entry no longer `nano-tested`, or growth of that baseline against
+  the target branch at the same pin (`--base-nano-tested`)
 
 `gaps.json` is a ratchet. It freezes the cells that were gaps when the matrix
 landed, so a broad `gap` rule such as `intent:*` cannot absorb a cell that a
-Zeebe bump adds: that cell needs evidence or an `out-of-scope` rule. When cells
-gain evidence, `node formal/parity/check.mjs --update-gaps` drops them from the
-baseline. It only ever removes entries, and CI runs the guard with
-`--base-gaps` against the target branch's `gaps.json`, rejecting any id the PR
-adds, so the baseline shrinks toward empty.
+Zeebe bump adds: that cell needs evidence or an `out-of-scope` rule.
+`node formal/parity/check.mjs --update-gaps` regenerates the baseline from the
+current gap assignments — dropping cells that gained evidence and admitting a
+cell that legitimately regresses to `gap` (say its evidence was reclassified).
+CI runs the guard with `--base-gaps` against the target branch's `gaps.json`,
+rejecting any id the PR adds, so across branches the baseline shrinks toward
+empty.
+
+`nano-tested.json` is the same kind of ratchet for the transitional
+`nano-tested` status (#1391): it freezes the cells not yet covered by a
+captured trace, `node formal/parity/check.mjs --update-ratchet` shrinks it as
+cells are promoted to `parity`, and CI runs the guard with
+`--base-nano-tested` against the target branch's copy, rejecting any growth at
+the same pin.
 
 It prints the per-family counts and, in CI, adds them to the job summary.
 Moving cells up the ladder, from `gap` to `nano-tested` to `parity`, is the
@@ -515,8 +542,8 @@ node --test formal/parity/*.test.mjs         # extractor and guard tests
 ```
 
 CI regenerates `zeebe-surface.json` from the pinned sources and fails if the
-result differs from the committed file, or if the surface or `gaps.json` is not
-tracked.
+result differs from the committed file, or if the surface, `gaps.json` or
+`nano-tested.json` is not tracked.
 
 ### Bumping the Zeebe pin
 
@@ -526,9 +553,72 @@ tracked.
    extractor refuses to run on a checkout that is not at the pinned commit.
 3. If extraction fails, a Zeebe refactor moved an anchor. Update
    `extract.mjs` and its tests.
-4. `node formal/parity/check.mjs`. Map every unmapped cell and every new gap
-   cell it reports to evidence or `out-of-scope`, and delete any rule it
-   reports as dead. Run `--update-gaps` to drop cells the bump removed. Then
-   set `reviewedAt` in `coverage.json` to the new commit.
+4. Refresh the trace goldens (`formal/traces/capture.sh`) — the guard fails
+   while `goldens/PIN` lags the pin — then `node formal/parity/check.mjs`. Map
+   every unmapped cell and every new gap cell it reports to evidence or
+   `out-of-scope`, and delete any rule it reports as dead. Run `--update-gaps`
+   to reconcile `gaps.json` with the new gap assignments, and
+   `--update-ratchet` to reconcile `nano-tested.json`. Then set `reviewedAt`
+   in `coverage.json` to the new commit.
 5. Review the `zeebe-surface.json` diff. Removed or renamed cells are Zeebe
    behaviour changes that Nano may need to follow.
+
+## Harvesting the Zeebe engine-test corpus (#1249)
+
+`zeebe/engine/src/test` builds thousands of processes with the fluent builder
+`Bpmn.createExecutableProcess(id).startEvent()...done()` and asserts on the
+record stream — Camunda's own edge-case catalogue. `formal/harvest/` reuses it:
+
+```
+formal/harvest/
+├── zeebe-test-pin.json     # the pinned Zeebe sha + the released zeebe-bpmn-model jar
+├── fetch-tests.sh          # sparse-fetches the pinned engine-test sources
+├── harvest.mjs             # scans for createExecutableProcess chains, parses each
+│                           #   into a call IR, serialises it through the REAL Zeebe
+│                           #   model API (tools/HarvestExtract.java vs the pinned jar)
+├── normalise.mjs           # BPMN -> corpus format: scenario script + coverage tags
+├── run.mjs                 # runs each scenario vs the engine-wasm TestEngine
+├── report.mjs              # harvested / runnable / unverified / out-of-scope counts
+├── harvest.sh              # the whole pipeline, pinned + reproducible
+└── corpus/                 # GENERATED: ir/, bpmn/ (with DI), scenarios/, report.json
+```
+
+A chain is harvested only when it is built **entirely** from statically
+resolvable builder calls (string/number/boolean literals, `static final`
+constants, and flat single-parameter config lambdas like
+`serviceTask("t", b -> b.zeebeJobType("x"))`). Each harvested chain is replayed
+through the pinned `zeebe-bpmn-model` jar so the BPMN XML is exactly what
+Zeebe's own builder emits, then canonicalised (the model API's random-UUID ids
+are rewritten to stable sequential ids) so the committed corpus is
+byte-reproducible. Anything else — a lambda that nests, a non-literal process
+id, an unsupported builder method — is recorded **out of scope** with its
+reason, never silently dropped.
+
+The normaliser derives the scenario script from the BPMN graph. Only genuinely
+job-producing elements — `serviceTask`, `sendTask`, `businessRuleTask`,
+`scriptTask` (the tags engine-core models as `NodeKind::Service`) — become
+scenario jobs. A `userTask` becomes a `userTasks` step (completed via
+`completeUserTask`, never present in `snap.jobs`); an abstract `task`,
+`manualTask`, or `receiveTask` is a pass-through (no job); a `callActivity`
+tags the scenario `needs: ["call-activity"]` (this slice's runner deploys only
+the harvested model, so the callee is never present).
+
+The Nano run classifies each normalised model:
+
+| Status | Meaning |
+|---|---|
+| `runnable` | Nano deployed, ran, and completed the scenario cleanly |
+| `unverified` | Nano accepted and ran it but the instance did not complete cleanly (no completion, incident, stranded element/job). This slice harvests **no Zeebe oracle** — the engine tests assert on Zeebe's record stream, which the static harvest does not reproduce — so a non-clean Nano outcome is *unverified*: it may be a genuine Nano gap, the expected Zeebe outcome, or a driver limitation. It is never presented as a parity divergence |
+| `out-of-scope` | Nano rejected the deploy (unimplemented surface), or the scenario needs a driver capability (variables / messages / timers / call-activity) the deterministic empty-variable runner does not supply — a driver limitation, NOT a divergence |
+
+```bash
+formal/harvest/harvest.sh                # full pipeline -> corpus/ + report.json
+node --test formal/harvest/*.test.mjs    # parser / normaliser / classifier tests
+```
+
+CI (the `formal (tlc)` job) regenerates the corpus and report and
+`git diff --exit-code`s them — plus a `git status --porcelain` untracked check
+and a tracked-ness guard over every committed corpus file — so a forgotten
+regeneration, a non-reproducible harvest, or a stale/untracked generated
+artifact fails the build. To bump the pin, update `zeebe-test-pin.json` (keep
+its `sha` equal to `formal/parity/zeebe-pin.json`'s) and re-run `harvest.sh`.

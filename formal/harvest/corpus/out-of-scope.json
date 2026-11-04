@@ -1,0 +1,30 @@
+[
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-20-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "reason": "cyclic-or-unreachable",
+    "cells": [
+      "element:EndEvent",
+      "element:ExclusiveGateway",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent",
+      "element:Task"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-21-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "reason": "cyclic-or-unreachable",
+    "cells": [
+      "element:EndEvent",
+      "element:ExclusiveGateway",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent",
+      "element:Task"
+    ]
+  }
+]

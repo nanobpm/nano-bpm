@@ -294,6 +294,12 @@ jobs:
         # serde-gated snapshot round-trip tests; see the Clippy step above for why
         # it must not be dropped.
         run: cargo nextest run --features serde
+      - name: Zeebe trace corpus report
+        working-directory: engine-core
+        # Prints the harvested-corpus counts (#1391 step 2) into the CI log —
+        # harvested / runnable / diverging / out-of-scope — and re-asserts that
+        # the committed h-* scenarios agree with harvest/summary.json.
+        run: cargo nextest run --features serde --test zeebe_traces corpus_report -- --nocapture
       - name: Doctests
         working-directory: engine-core
         run: cargo test --doc --features serde
@@ -748,7 +754,7 @@ jobs:
         run: |
           # The derived artifacts must be committed: extraction would recreate a
           # deleted surface as an untracked file, which `git diff` cannot see.
-          git ls-files --error-unmatch formal/parity/zeebe-surface.json formal/parity/gaps.json
+          git ls-files --error-unmatch formal/parity/zeebe-surface.json formal/parity/gaps.json formal/parity/nano-tested.json
           node formal/parity/extract.mjs "$(formal/parity/fetch-zeebe.sh)"
           git diff --exit-code -- formal/parity/zeebe-surface.json
       - name: Parity matrix tests
@@ -764,10 +770,59 @@ jobs:
           git fetch --no-tags --depth=1 origin "$BASE_REF"
           if git cat-file -e FETCH_HEAD:formal/parity/gaps.json 2>/dev/null; then
             git show FETCH_HEAD:formal/parity/gaps.json > "$RUNNER_TEMP/base-gaps.json"
-            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json"
+            # The ratchet is pin-aware: a same-pin grammar refinement may
+            # re-baseline, a pin bump may not (check.mjs --base-pin).
+            git show FETCH_HEAD:formal/parity/zeebe-pin.json > "$RUNNER_TEMP/base-pin.json"
+            # The one-time failure: seed is gated on the base SURFACE (--base-surface).
+            git show FETCH_HEAD:formal/parity/zeebe-surface.json > "$RUNNER_TEMP/base-surface.json"
+            # nano-tested is transitional (#1391): its baseline may only shrink.
+            # Absent on the base (pre-ratchet) reads as "everything was
+            # nano-tested", so any head cell is a shrink and passes.
+            if git cat-file -e FETCH_HEAD:formal/parity/nano-tested.json 2>/dev/null; then
+              git show FETCH_HEAD:formal/parity/nano-tested.json > "$RUNNER_TEMP/base-nano-tested.json"
+            else
+              echo '{"cells": null}' > "$RUNNER_TEMP/base-nano-tested.json"  # null = pre-ratchet base: any head is a shrink
+            fi
+            node formal/parity/check.mjs --base-gaps "$RUNNER_TEMP/base-gaps.json" --base-pin "$RUNNER_TEMP/base-pin.json" --base-surface "$RUNNER_TEMP/base-surface.json" --base-nano-tested "$RUNNER_TEMP/base-nano-tested.json"
           else
             echo "::notice::no formal/parity/gaps.json on $BASE_REF yet; baseline growth not checked"
             node formal/parity/check.mjs
+          fi
+
+      # Zeebe engine-test harvest (#1249): regenerates the harvested corpus
+      # (formal/harvest/corpus) and the report (formal/harvest/report.json) from
+      # the pinned Zeebe test sources and `git diff --exit-code`s them, so a
+      # forgotten regeneration — or a non-reproducible harvest — fails the build
+      # instead of shipping drift. The harvest serialises each model through the
+      # pinned zeebe-bpmn-model jar (needs the JDK set up above) and runs the
+      # scenarios against the engine-wasm TestEngine, built from source here
+      # (engine-wasm/pkg is a gitignored build output since #668).
+      - name: Build engine-wasm/pkg (harvest scenarios run on its TestEngine)
+        uses: ./.github/actions/engine-wasm-pkg
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nanobpm-harvest
+          key: zeebe-harvest-${{ hashFiles('formal/harvest/zeebe-test-pin.json') }}
+      - name: Harvest tests
+        run: node --test formal/harvest/*.test.mjs
+      - name: Harvested corpus is derived from the pinned Zeebe tests
+        run: |
+          # The derived artifacts must all be committed: regenerating a deleted
+          # file recreates it as UNTRACKED, which `git diff` cannot see — so
+          # guard tracked-ness first (the same discipline as the parity step
+          # above), then check for untracked leftovers, then diff.
+          git ls-files --error-unmatch formal/harvest/report.json \
+            $(git ls-files formal/harvest/corpus)
+          formal/harvest/harvest.sh
+          git diff --exit-code -- formal/harvest/corpus formal/harvest/report.json
+          # A regeneration that produces an artifact the commit forgot to add
+          # (or leaves one a pin bump made obsolete) must fail the build, not
+          # pass silently: `git diff` is blind to untracked files.
+          untracked="$(git status --porcelain -- formal/harvest/corpus formal/harvest/report.json)"
+          if [ -n "$untracked" ]; then
+            echo "::error::harvest regeneration left untracked/modified artifacts:"
+            echo "$untracked"
+            exit 1
           fi
 
       # Lean 4 formal layer (formal/lean): builds every Lean target and runs the
@@ -794,7 +849,15 @@ jobs:
             formal/lean/.lake
           key: lean-${{ hashFiles('formal/lean/lean-toolchain', 'formal/lean/lakefile.lean', 'formal/lean/lake-manifest.json') }}
       - uses: dtolnay/rust-toolchain@1.99.0
-      - name: Lean build + FEEL differential fuzz
+      - uses: actions/cache@v4
+        with:
+          # feel-scala jar (formal/feel-scala/fetch-feel-scala.sh): its version is
+          # derived from the Zeebe pin, so the pin's hash is the cache key.
+          path: ~/.cache/nanobpm-feel-scala
+          key: feel-scala-${{ hashFiles('formal/parity/zeebe-pin.json') }}
+      - name: Feel-scala gate tests
+        run: node --test formal/feel-scala/*.test.mjs
+      - name: Lean build + FEEL differential fuzz (Lean, Rust, feel-scala)
         run: formal/lean/feel-diff.sh
 
   # Two-backend runtime parity runner (#1260, slice 5 of #1240). DISTINCT from

@@ -1,0 +1,15 @@
+{
+  "generated": "formal/harvest/normalise.mjs",
+  "process": "PROCESS_WITH_CONDITIONAL",
+  "jobs": [],
+  "jobCompletionOrder": [],
+  "userTasks": [],
+  "userTaskCompletionOrder": [],
+  "messageCorrelation": [],
+  "timerTicks": [],
+  "needs": [
+    "event-based-gateway",
+    "catch-event",
+    "event-definition"
+  ]
+}

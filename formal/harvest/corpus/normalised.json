@@ -1,0 +1,526 @@
+[
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-ActivityTest-1-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/ActivityTest.java",
+    "processId": "process",
+    "cells": [
+      "element:BoundaryEvent",
+      "element:EndEvent",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-1-child-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityBusinessIdTest.java",
+    "processId": "child-process",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityBusinessIdTest-3-grandchild-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityBusinessIdTest.java",
+    "processId": "grandchild-process",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-11-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-12-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-13-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-15-root",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "root",
+    "cells": [
+      "element:CallActivity",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-19-level3",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "level3",
+    "cells": [
+      "element:EndEvent",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-2-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-3-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-4-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-5-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-6-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-CallActivityTest-7-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/CallActivityTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-JobPriorityTest-0-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/JobPriorityTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-activity-SendTaskTest-2-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/activity/SendTaskTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:SendTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-boundary-BoundaryEventElementTest-1-process2",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/boundary/BoundaryEventElementTest.java",
+    "processId": "process2",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent",
+      "element:UserTask"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventCompatibilityTest-0-child-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventCompatibilityTest.java",
+    "processId": "child-process",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-21-child-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventExecutionTest.java",
+    "processId": "child-process",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-23-child-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventExecutionTest.java",
+    "processId": "child-process",
+    "cells": [
+      "element:EndEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-compensation-CompensationEventExecutionTest-25-child-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/compensation/CompensationEventExecutionTest.java",
+    "processId": "child-process",
+    "cells": [
+      "element:EndEvent",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorEventTest-5-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/error/ErrorEventTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-error-ErrorEventTest-7-wf-child",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/error/ErrorEventTest.java",
+    "processId": "wf-child",
+    "cells": [
+      "element:EndEvent",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayConcurrencyTest-0-PROCESS_WITH_EQUAL_TIMERS",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayConcurrencyTest.java",
+    "processId": "PROCESS_WITH_EQUAL_TIMERS",
+    "cells": [
+      "element:EndEvent",
+      "element:EventBasedGateway",
+      "element:IntermediateCatchEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-0-PROCESS_WITH_TIMERS",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_TIMERS",
+    "cells": [
+      "element:EndEvent",
+      "element:EventBasedGateway",
+      "element:IntermediateCatchEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-1-PROCESS_WITH_EQUAL_TIMERS",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_EQUAL_TIMERS",
+    "cells": [
+      "element:EndEvent",
+      "element:EventBasedGateway",
+      "element:IntermediateCatchEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-4-PROCESS_WITH_CONDITIONAL",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_CONDITIONAL",
+    "cells": [
+      "element:EndEvent",
+      "element:EventBasedGateway",
+      "element:IntermediateCatchEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-EventBasedGatewayTest-5-PROCESS_WITH_CONDITIONAL_FALSE",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/EventBasedGatewayTest.java",
+    "processId": "PROCESS_WITH_CONDITIONAL_FALSE",
+    "cells": [
+      "element:EndEvent",
+      "element:EventBasedGateway",
+      "element:IntermediateCatchEvent",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-10-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-11-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-12-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-13-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-14-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:BoundaryEvent",
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-15-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-16-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:ExclusiveGateway",
+      "element:InclusiveGateway",
+      "element:StartEvent",
+      "element:Task"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-17-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:ExclusiveGateway",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent",
+      "element:Task"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-18-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:ExclusiveGateway",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-19-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ExclusiveGateway",
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:StartEvent",
+      "element:Task"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-23-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:IntermediateThrowEvent",
+      "element:ParallelGateway",
+      "element:StartEvent",
+      "element:Task"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-24-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:InclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-3-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-InclusiveGatewayTest-4-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/InclusiveGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:InclusiveGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-0-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-1-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ParallelGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-2-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ExclusiveGateway",
+      "element:ParallelGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-3-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ParallelGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-4-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:ParallelGateway",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-5-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ExclusiveGateway",
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-6-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:ParallelGateway",
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-7-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:ServiceTask",
+      "element:StartEvent"
+    ]
+  },
+  {
+    "id": "zeebe-engine-src-test-java-io-camunda-zeebe-engine-processing-bpmn-gateway-ParallelGatewayTest-8-process",
+    "source": "zeebe/engine/src/test/java/io/camunda/zeebe/engine/processing/bpmn/gateway/ParallelGatewayTest.java",
+    "processId": "process",
+    "cells": [
+      "element:EndEvent",
+      "element:ExclusiveGateway",
+      "element:ParallelGateway",
+      "element:StartEvent"
+    ]
+  }
+]
