@@ -4092,6 +4092,33 @@ impl Engine {
                     });
                 }
 
+                //    Compensation runtime (`compensable` / `compensation_waits`)
+                //    is keyed by source element ids (activity, handler, throw)
+                //    the applier does not remap: a migrated in-flight throw
+                //    would never be released by its renamed handler. Fail
+                //    closed until supported.
+                let mut compensation_refs: Vec<String> = instance
+                    .compensable
+                    .iter()
+                    .map(|c| c.element_id.clone())
+                    .chain(
+                        instance
+                            .compensation_waits
+                            .values()
+                            .map(|w| w.throw_element_id.clone()),
+                    )
+                    .collect();
+                compensation_refs.sort();
+                if let Some(element_id) = compensation_refs.into_iter().next() {
+                    return Err(EngineError::UnsupportedMigration {
+                        instance_key,
+                        element_id,
+                        reason: "instances with compensation subscriptions or an \
+                                 in-flight compensation are not migratable yet"
+                            .to_string(),
+                    });
+                }
+
                 // 5. Every active element instance must have a mapping.
                 for eid in &active_ids {
                     if !mapped.contains_key(eid) {

@@ -1547,3 +1547,69 @@ fn allows_planned_join_activations_sharing_a_created_scope() {
         "the created sub-process drains to the process end: {events:?}"
     );
 }
+
+/// `pre` → ad-hoc container `agent` whose tools are a service task and an
+/// embedded sub-process tool `toolSub` (containing `inner`).
+fn pre_then_adhoc() -> ProcessDefinition {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="adhoc-mod">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="pre">
+            <bpmn:extensionElements><zeebe:taskDefinition type="pre" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:subProcess id="toolSub">
+              <bpmn:startEvent id="ss" />
+              <bpmn:serviceTask id="inner">
+                <bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="se" />
+              <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="inner" />
+              <bpmn:sequenceFlow id="sf2" sourceRef="inner" targetRef="se" />
+            </bpmn:subProcess>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="pre" />
+          <bpmn:sequenceFlow id="f2" sourceRef="pre" targetRef="agent" />
+          <bpmn:sequenceFlow id="f3" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn rejects_activation_that_would_open_an_inactive_adhoc_container() {
+    // Copilot on #1418: opening an ad-hoc container through the generic
+    // flow-scope path skips its ad-hoc lifecycle (`AdHocActivated`, tool
+    // ownership), stranding the container once the inner flow completes.
+    // Fail closed for every element nested in an inactive container.
+    for element in ["inner", "toolSub"] {
+        let mut engine = Engine::new();
+        let inst = start(&mut engine, pre_then_adhoc(), HashMap::new());
+        let err = engine
+            .apply_command(modify(
+                inst,
+                vec![ActivateElementInstruction {
+                    element_id: element.into(),
+                    ..Default::default()
+                }],
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                EngineError::ElementNotActivatable { reason, .. } if reason.contains("ad-hoc")
+            ),
+            "{element}: got {err:?}"
+        );
+        assert!(eiks(&engine, inst, "agent").is_empty(), "nothing opened");
+    }
+}

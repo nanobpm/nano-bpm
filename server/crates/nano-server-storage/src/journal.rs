@@ -1527,7 +1527,19 @@ impl Journal {
                      command is rejected as retryable (row kept)"
                 );
                 EngineError::InstanceUnavailable { instance_key }
-            })
+            })?;
+        // Post-condition, not just the restore's verdict: the restore is a
+        // no-op when no spill tier is wired, which would otherwise let the
+        // command evaluate against the empty placeholder (Copilot on #1418).
+        if self.engine.is_variables_spilled(instance_key) {
+            tracing::error!(
+                instance_key,
+                "command: spilled instance's variables are still not resident (no \
+                 spill tier wired?); the command is rejected as retryable"
+            );
+            return Err(EngineError::InstanceUnavailable { instance_key });
+        }
+        Ok(())
     }
 
     /// Rehydrates any cold instance a command is about to target, so the engine
@@ -1633,10 +1645,59 @@ impl Journal {
                 unavailable.get_or_insert(key);
             }
         }
+        // Instance-wide teardown/restructuring commands also reach the
+        // instance's call-activity descendants (terminating a call activity
+        // terminates its child): page every cold descendant in too, or the
+        // engine's resident-only child lookup misses it and the child later
+        // resumes orphaned work (Copilot on #1418).
+        if let Command::ModifyInstance { instance_key, .. }
+        | Command::MigrateInstance { instance_key, .. }
+        | Command::CancelInstance { instance_key } = command
+            && let Some(key) = self.rehydrate_cold_descendants(*instance_key)
+        {
+            unavailable.get_or_insert(key);
+        }
         match unavailable {
             Some(instance_key) => Err(EngineError::InstanceUnavailable { instance_key }),
             None => Ok(()),
         }
+    }
+
+    /// Rehydrates every cold call-activity descendant of `root` (through
+    /// resident and cold intermediates alike). Returns the first descendant
+    /// whose row is unreadable, if any (it stays cold; the caller fails
+    /// closed).
+    fn rehydrate_cold_descendants(&mut self, root: Key) -> Option<Key> {
+        let mut unavailable = None;
+        let mut frontier = vec![root];
+        let mut seen: HashSet<Key> = HashSet::new();
+        while let Some(parent) = frontier.pop() {
+            if !seen.insert(parent) {
+                continue;
+            }
+            let cold_children = self
+                .cold
+                .as_ref()
+                .map(|cold| cold.index.children_of(parent))
+                .unwrap_or_default();
+            for child in cold_children {
+                match self.rehydrate_cold(child) {
+                    ColdRehydration::Unreadable => {
+                        unavailable.get_or_insert(child);
+                    }
+                    _ => frontier.push(child),
+                }
+            }
+            frontier.extend(
+                self.engine
+                    .state()
+                    .instances
+                    .values()
+                    .filter(|i| i.parent_process_instance_key == Some(parent))
+                    .map(|i| i.key),
+            );
+        }
+        unavailable
     }
 
     /// Sheds dormant instances to disk when hot RAM crosses the high-water mark.
@@ -3278,6 +3339,68 @@ mod tests {
             .any(|e| matches!(e, Event::ProcessInstanceCompleted { instance_key } if *instance_key == key)));
     }
 
+    // Copilot on #1418: modification/migration/cancel of a parent must page in
+    // its cold-spilled call-activity children, or tearing down the call
+    // activity misses the (non-resident) child, which later resumes orphaned.
+    #[test]
+    fn terminating_a_call_activity_rehydrates_and_terminates_its_cold_child() {
+        let mut journal = cold_journal();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let parent = ProcessBuilder::new("caller")
+            .start_event("s")
+            .call_activity("call", "demo")
+            .end_event("e")
+            .connect("s", "call")
+            .connect("call", "e")
+            .build()
+            .unwrap();
+        let _ = journal
+            .apply_command(Command::DeployProcess(parent))
+            .unwrap();
+        let (events, _) = journal
+            .apply_command(Command::create_instance("caller"))
+            .unwrap();
+        let parent_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let child_key = journal
+            .state()
+            .instances
+            .values()
+            .find(|i| i.parent_process_instance_key == Some(parent_key))
+            .map(|i| i.key)
+            .expect("child instance");
+        assert_eq!(
+            journal.force_cold_spill_all(),
+            2,
+            "parent and child spilled"
+        );
+
+        let (events, _) = journal
+            .apply_command(Command::ModifyInstance {
+                instance_key: parent_key,
+                activate_instructions: vec![],
+                terminate_instructions: vec![],
+                terminate_element_ids: vec!["call".to_string()],
+                move_instructions: vec![],
+            })
+            .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                Event::ProcessInstanceTerminated { instance_key } if *instance_key == child_key
+            )),
+            "cold child is terminated with its call activity"
+        );
+        assert_eq!(journal.cold_count(), 0, "no cold child left behind");
+        // Nothing for a worker to resume.
+        assert!(
+            journal
+                .activate_jobs("demo-work", "w", 1, 1_000, 0)
+                .is_empty()
+        );
+    }
+
     #[test]
     fn durable_activation_rehydrates_cold_jobs() {
         let mut journal = cold_journal();
@@ -4722,6 +4845,41 @@ mod tests {
         assert!(rebooted.reconcile_offheap_orphans().is_empty());
         assert!(rebooted.engine.is_variables_spilled(keys[0]));
         assert!(rebooted.quarantined_orphans().is_empty());
+
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // Copilot review on #1418: with NO spill store wired the restore is a
+    // no-op, so modify/migrate would evaluate against the empty placeholder.
+    // Both must fail closed as retryable instead.
+    #[test]
+    fn unwired_spill_store_rejects_modify_and_migrate_as_retryable() {
+        let path = restart_store_path("unwired-modify-migrate-1418");
+        let (journal, keys) = spilled_journal(&path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let mut rebooted = Journal::in_memory();
+        rebooted.restore_engine_from_snapshot(legacy);
+
+        for command in [
+            Command::migrate_instance(keys[0], 0, Vec::new()),
+            Command::modify_instance(keys[0], Vec::new(), Vec::new()),
+        ] {
+            let result = rebooted.apply_command(command);
+            assert!(
+                matches!(
+                    result,
+                    Err(EngineError::InstanceUnavailable { instance_key }) if instance_key == keys[0]
+                ),
+                "unwired spill store must reject as retryable, got {:?}",
+                result.as_ref().err()
+            );
+            assert!(
+                rebooted.engine.is_variables_spilled(keys[0]),
+                "still spilled"
+            );
+        }
 
         drop(rebooted);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());

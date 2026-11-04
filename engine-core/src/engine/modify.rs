@@ -115,6 +115,21 @@ impl Engine {
                 )));
             }
 
+            // An ad-hoc container has its own lifecycle (`AdHocActivated`,
+            // tool ownership, completion); opening one through the generic
+            // flow-scope path would skip it and strand the container once the
+            // inner flow completes. Fail closed until supported.
+            if let Some(container) = resolution
+                .to_create
+                .iter()
+                .find(|s| def.adhoc.iter().any(|ad| &ad.container_id == *s))
+            {
+                return Err(not_activatable(format!(
+                    "The activation of elements inside an ad-hoc sub-process '{container}' \
+                     that has no active instance is not supported"
+                )));
+            }
+
             let chain = element_flow_scope_chain(def, &a.element_id);
             let mut global = Vec::new();
             if !a.variables.is_empty() {

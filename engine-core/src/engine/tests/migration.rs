@@ -1253,3 +1253,43 @@ fn modify_of_suspended_instance_is_rejected_as_not_active() {
         })
     );
 }
+
+#[test]
+fn migration_rejects_instance_with_compensation_runtime() {
+    // Copilot on #1418: `compensation_waits` (throw id + pending handler ids)
+    // and saved `compensable` entries are keyed by source element ids the
+    // applier does not remap, so a migrated in-flight compensation would never
+    // release its throw. Reject until supported (fail closed).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_compensation()))
+        .unwrap();
+    let mut target = process_with_compensation();
+    target.id = "trip-v2".to_string();
+    let target_key = deploy_for_migration(&mut engine, target);
+    let created = engine
+        .apply_command(Command::create_instance("trip"))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    engine.apply_command(Command::complete_job(book)).unwrap();
+    let mut mapping: Vec<(String, String)> = engine
+        .instance(inst)
+        .unwrap()
+        .active
+        .values()
+        .map(|e| (e.clone(), e.clone()))
+        .collect();
+    mapping.sort();
+    mapping.dedup();
+    let err = engine
+        .apply_command(Command::migrate_instance(inst, target_key, mapping))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::UnsupportedMigration { reason, .. } if reason.contains("compensation")
+        ),
+        "got {err:?}"
+    );
+}
