@@ -252,6 +252,12 @@ pub struct Journal {
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
     activation_cursor: HashMap<String, Key>,
+    /// Test-only instrumentation: how many times the cold-descendant traversal
+    /// scanned the resident instance set per visited descendant (the O(N × D)
+    /// shape Copilot flagged on #1418). The indexed traversal never scans, so a
+    /// regression test pins this at zero.
+    #[cfg(test)]
+    resident_child_scans: usize,
 }
 
 /// Extra cold reads an activation poll may spend past `max_jobs` to skip
@@ -991,6 +997,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1021,6 +1029,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1149,6 +1159,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         })
@@ -1183,6 +1195,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         };
@@ -1222,6 +1236,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1256,6 +1272,8 @@ impl Journal {
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
             activation_cursor: HashMap::new(),
+            #[cfg(test)]
+            resident_child_scans: 0,
             spill_check_skip: 0,
             cluster_variables: ClusterVariables::default(),
         }
@@ -1668,6 +1686,20 @@ impl Journal {
     /// whose row is unreadable, if any (it stays cold; the caller fails
     /// closed).
     fn rehydrate_cold_descendants(&mut self, root: Key) -> Option<Key> {
+        // Resident parent → children, built ONCE: scanning `instances` per
+        // visited descendant is O(N × D) on the partition command path (Copilot
+        // on #1418). A rehydrated child is pushed onto the frontier itself, so
+        // its own children are looked up under its key — the map needs no
+        // re-keying as instances page back in.
+        let mut resident_children: HashMap<Key, Vec<Key>> = HashMap::new();
+        for instance in self.engine.state().instances.values() {
+            if let Some(parent) = instance.parent_process_instance_key {
+                resident_children
+                    .entry(parent)
+                    .or_default()
+                    .push(instance.key);
+            }
+        }
         let mut unavailable = None;
         let mut frontier = vec![root];
         let mut seen: HashSet<Key> = HashSet::new();
@@ -1689,12 +1721,11 @@ impl Journal {
                 }
             }
             frontier.extend(
-                self.engine
-                    .state()
-                    .instances
-                    .values()
-                    .filter(|i| i.parent_process_instance_key == Some(parent))
-                    .map(|i| i.key),
+                resident_children
+                    .get(&parent)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
             );
         }
         unavailable
@@ -3398,6 +3429,88 @@ mod tests {
             journal
                 .activate_jobs("demo-work", "w", 1, 1_000, 0)
                 .is_empty()
+        );
+    }
+
+    // Copilot on #1418: the cold-descendant traversal must not re-scan the whole
+    // resident instance set per visited descendant (O(N × D) on the partition
+    // command path). The resident parent→children index is built once, so the
+    // traversal performs zero resident scans — while still walking through
+    // resident intermediates to reach a cold grandchild.
+    #[test]
+    fn cold_descendant_traversal_indexes_resident_children_once() {
+        let mut journal = cold_journal();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        for (id, called) in [("top", "mid"), ("mid", "leaf"), ("leaf", "demo")] {
+            let process = ProcessBuilder::new(id)
+                .start_event("s")
+                .call_activity("call", called)
+                .end_event("e")
+                .connect("s", "call")
+                .connect("call", "e")
+                .build()
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::DeployProcess(process))
+                .unwrap();
+        }
+        let (events, _) = journal
+            .apply_command(Command::create_instance("top"))
+            .unwrap();
+        let top_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let mid_key = journal
+            .state()
+            .instances
+            .values()
+            .find(|i| i.parent_process_instance_key == Some(top_key))
+            .map(|i| i.key)
+            .expect("mid instance");
+        let leaf_key = journal
+            .state()
+            .instances
+            .values()
+            .find(|i| i.parent_process_instance_key == Some(mid_key))
+            .map(|i| i.key)
+            .expect("leaf instance");
+        // Park the leaf on its demo-work job (activated but never completed), so
+        // it stays active and spillable. Spill only it: the mid instance stays
+        // resident, so the traversal must reach the cold leaf THROUGH a resident
+        // intermediate.
+        let leaf_jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
+        assert_eq!(leaf_jobs.len(), 1, "leaf parked on its job");
+        let leaf_snapshot = journal
+            .engine
+            .snapshot_instance(leaf_key)
+            .expect("leaf is active and spillable");
+        let cold = journal.cold.as_mut().expect("cold spill configured");
+        cold.store
+            .put_cold(leaf_key, &leaf_snapshot)
+            .expect("cold row written");
+        cold.index.insert(&leaf_snapshot);
+        assert!(journal.instance(leaf_key).is_none(), "leaf is cold");
+        assert!(journal.instance(mid_key).is_some(), "mid stays resident");
+
+        let _ = journal
+            .apply_command(Command::ModifyInstance {
+                instance_key: top_key,
+                activate_instructions: vec![],
+                terminate_instructions: vec![],
+                terminate_element_ids: vec!["call".to_string()],
+                move_instructions: vec![],
+            })
+            .unwrap();
+
+        assert_eq!(
+            journal.resident_child_scans, 0,
+            "descendant traversal uses the resident index built once, not a \
+             per-descendant scan of every resident instance"
+        );
+        assert_eq!(
+            journal.cold_count(),
+            0,
+            "the cold leaf was rehydrated through its resident parent"
         );
     }
 
