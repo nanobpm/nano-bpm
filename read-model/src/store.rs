@@ -4929,6 +4929,42 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        // A message correlated to a process-level message start event (#1300).
+        // There is no open instance-scoped row to settle; the event carries the
+        // message name / correlation key itself. The start event has not been
+        // activated yet, so its element instance key is unknown (0). The
+        // business id is snapshotted from the instance the message created
+        // (projected by the preceding `ProcessInstanceCreated`).
+        Event::MessageStartEventCorrelated {
+            message_key,
+            subscription_key,
+            instance_key,
+            element_id,
+            message_name,
+            correlation_key,
+            ..
+        } => {
+            tx.cexecute(
+                "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
+                 instance_key, element_instance_key, element_id, message_name, correlation_key, \
+                 correlation_time_ms, partition_id, business_id) \
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6, ?7, ?8, (SELECT business_id FROM process_instances WHERE key = ?3)) \
+                 ON CONFLICT(message_key, subscription_key) DO NOTHING",
+                params![
+                    *message_key as i64,
+                    *subscription_key as i64,
+                    *instance_key as i64,
+                    element_id,
+                    message_name,
+                    correlation_key,
+                    now_ms as i64,
+                    // The partition that minted (and correlated into) the
+                    // instance, 1-based like the instance-scoped rows.
+                    (partition_of(*instance_key) + 1) as i64,
+                ],
+            )?;
+        }
+
         // A cancelled subscription is no longer waiting and did not correlate: drop
         // the open row without recording a correlation.
         Event::MessageSubscriptionCanceled {
@@ -12447,6 +12483,55 @@ mod element_instance_tests {
         assert!(store.message_subscriptions().is_empty());
         // History survives the cancel.
         assert_eq!(store.correlated_message_subscriptions().len(), 2);
+    }
+
+    #[test]
+    fn message_start_correlation_is_recorded_with_business_id() {
+        // #1300: a message that starts an instance via a message start event is
+        // a correlated message subscription (Zeebe parity); it has no open
+        // subscription row, so the start-correlation record itself carries
+        // name / correlation key, and the instance's businessId is snapshotted.
+        let store = ReadStore::open(None).unwrap();
+        let created = Event::ProcessInstanceCreated {
+            instance_key: 7001,
+            process_id: "p".into(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: Some("biz-7".into()),
+            process_definition_key: 900,
+            version: 1,
+            parent_process_instance_key: None,
+            parent_element_instance_key: None,
+        };
+        store
+            .export(&[
+                &created,
+                &Event::MessageStartEventCorrelated {
+                    message_key: 55,
+                    subscription_key: 900,
+                    process_definition_key: 900,
+                    process_id: "p".into(),
+                    instance_key: 7001,
+                    element_id: "start".into(),
+                    message_name: "order-placed".into(),
+                    correlation_key: "c-1".into(),
+                },
+            ])
+            .unwrap();
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        let row = &corr[0];
+        assert_eq!(
+            (row.message_key, row.subscription_key, row.instance_key),
+            (55, 900, 7001)
+        );
+        assert_eq!(row.element_instance_key, 0, "start event not yet activated");
+        assert_eq!(row.element_id, "start");
+        assert_eq!(row.message_name, "order-placed");
+        assert_eq!(row.correlation_key, "c-1");
+        assert_eq!(row.business_id.as_deref(), Some("biz-7"));
+        assert!(store.message_subscriptions().is_empty());
     }
 
     #[test]

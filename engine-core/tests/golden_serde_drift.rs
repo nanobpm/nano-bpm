@@ -64,9 +64,10 @@ use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
-    IoMapping, Mapping, MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
-    MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder, ProcessDefinition,
-    SubscriptionMigrationAction, Value, VariableInstruction, SNAPSHOT_FORMAT_VERSION,
+    IoMapping, Mapping, MessageStartCorrelation, MigratedChildInstance, MigratedElementInstance,
+    MigratedSubscription, MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder,
+    ProcessDefinition, SubscriptionMigrationAction, Value, VariableInstruction,
+    SNAPSHOT_FORMAT_VERSION,
 };
 
 /// Directory holding the checked-in golden corpus, relative to the crate root.
@@ -636,6 +637,32 @@ fn build_event_witnesses() -> Vec<Event> {
         scope_id: Some("sub".to_string()),
     };
     vec![
+        // The #1300 message-start correlation record, and the cross-partition
+        // dispatch carrying the triggering message.
+        Event::MessageStartEventCorrelated {
+            message_key: 20,
+            subscription_key: 21,
+            process_definition_key: 21,
+            process_id: "p".to_string(),
+            instance_key: 22,
+            element_id: "start".to_string(),
+            message_name: "m".to_string(),
+            correlation_key: "c".to_string(),
+        },
+        Event::StartInstanceDispatched {
+            process_id: "p".to_string(),
+            start_element_id: "start".to_string(),
+            variables: HashMap::new(),
+            tags: vec![],
+            business_id: Some("b".to_string()),
+            target_partition: 1,
+            message_start: Some(MessageStartCorrelation {
+                message_key: 20,
+                process_definition_key: 21,
+                message_name: "m".to_string(),
+                correlation_key: "c".to_string(),
+            }),
+        },
         // The #1402 carried-selection frame: a split gateway journals the
         // outgoing-flow indices it picked while ACTIVATING so completion takes
         // exactly those flows. The executed corpus completes its gateways in
@@ -748,6 +775,21 @@ fn event_witnesses_shape_is_pinned_to_version() {
         let decoded = nanobpmn_engine_core::decode_event_json(&json).expect("decode witness");
         assert_eq!(&decoded, event);
     }
+}
+
+/// The #1300 additive `message_start` field defaults when absent: a pre-#1300
+/// `StartInstanceDispatched` record still decodes (no format bump).
+#[test]
+fn pre_1300_start_instance_dispatched_decodes_with_defaults() {
+    let old = r#"{"StartInstanceDispatched":{"process_id":"p","start_element_id":"s","variables":{},"target_partition":1}}"#;
+    let decoded = nanobpmn_engine_core::decode_event_json(old).expect("decode old record");
+    assert!(matches!(
+        decoded,
+        Event::StartInstanceDispatched {
+            message_start: None,
+            ..
+        }
+    ));
 }
 
 /// The #1374 additive fields default when absent: a pre-#1374

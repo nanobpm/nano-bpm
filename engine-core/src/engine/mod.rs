@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::command::Command;
-use crate::event::Event;
+use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
@@ -1490,24 +1490,17 @@ impl Engine {
         variables: HashMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
+        message_start: Option<MessageStartCorrelation>,
     ) {
-        if self.num_partitions <= 1 {
-            self.start_instance(
-                log,
-                queue,
-                process_id,
-                start_event,
-                variables,
-                tags,
-                business_id,
-                0,
-            );
-            return;
-        }
-        let target = self.start_dispatch_rr % self.num_partitions;
-        self.start_dispatch_rr = self.start_dispatch_rr.wrapping_add(1);
+        let target = if self.num_partitions <= 1 {
+            self.partition_id
+        } else {
+            let target = self.start_dispatch_rr % self.num_partitions;
+            self.start_dispatch_rr = self.start_dispatch_rr.wrapping_add(1);
+            target
+        };
         if target == self.partition_id {
-            self.start_instance(
+            self.start_message_or_plain_instance(
                 log,
                 queue,
                 process_id,
@@ -1515,7 +1508,7 @@ impl Engine {
                 variables,
                 tags,
                 business_id,
-                0,
+                message_start,
             );
         } else {
             self.emit(
@@ -1527,6 +1520,55 @@ impl Engine {
                     tags,
                     business_id,
                     target_partition: target,
+                    message_start,
+                },
+            );
+        }
+    }
+
+    /// Creates a start-triggered instance locally and, when a message start
+    /// event triggered it, records the correlation (#1300) right after the
+    /// instance exists. The single creation path for message-start instances
+    /// (inline and cross-partition dispatch), so no path can skip the record.
+    #[allow(clippy::too_many_arguments)]
+    fn start_message_or_plain_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        process_id: String,
+        start_event: ElementId,
+        variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        message_start: Option<MessageStartCorrelation>,
+    ) {
+        let instance_key = self.start_instance(
+            log,
+            queue,
+            process_id.clone(),
+            start_event.clone(),
+            variables,
+            tags,
+            business_id,
+            // A message start pins the definition whose subscription correlated
+            // the message, so a redeploy between dispatch and delivery cannot
+            // run a different version than the correlation record names.
+            message_start
+                .as_ref()
+                .map_or(0, |m| m.process_definition_key),
+        );
+        if let Some(m) = message_start {
+            self.emit(
+                log,
+                Event::MessageStartEventCorrelated {
+                    message_key: m.message_key,
+                    subscription_key: m.process_definition_key,
+                    process_definition_key: m.process_definition_key,
+                    process_id,
+                    instance_key,
+                    element_id: start_event,
+                    message_name: m.message_name,
+                    correlation_key: m.correlation_key,
                 },
             );
         }
@@ -2906,6 +2948,7 @@ impl Engine {
                         HashMap::new(),
                         Vec::new(),
                         None,
+                        None,
                     );
                 }
             }
@@ -3977,18 +4020,24 @@ impl Engine {
                 // for the same publish (Zeebe parity, issue #1156).
                 // Deterministic by process-definition key.
                 // The message's variables seed the new instance.
-                let mut started: Vec<(String, ElementId)> = if correlated_to_subscription {
+                let mut started: Vec<(String, ElementId, Key)> = if correlated_to_subscription {
                     Vec::new()
                 } else {
                     self.state
                         .message_start_subscriptions
                         .values()
                         .filter(|s| s.message_name == message_name)
-                        .map(|s| (s.process_id.clone(), s.start_element_id.clone()))
+                        .map(|s| {
+                            (
+                                s.process_id.clone(),
+                                s.start_element_id.clone(),
+                                s.process_definition_key,
+                            )
+                        })
                         .collect()
                 };
                 started.sort_unstable();
-                for (process_id, start_element_id) in started {
+                for (process_id, start_element_id, process_definition_key) in started {
                     self.start_or_dispatch_instance(
                         &mut log,
                         &mut queue,
@@ -3997,6 +4046,12 @@ impl Engine {
                         variables.clone(),
                         Vec::new(),
                         business_id.clone(),
+                        Some(MessageStartCorrelation {
+                            message_key,
+                            process_definition_key,
+                            message_name: message_name.clone(),
+                            correlation_key: correlation_key.clone(),
+                        }),
                     );
                 }
             }
@@ -4978,12 +5033,13 @@ impl Engine {
                 variables,
                 tags,
                 business_id,
+                message_start,
             } => {
                 check_business_id(business_id.as_deref())?;
                 // Routed from the deploy partition's StartInstanceDispatched: mint
                 // the start-triggered instance here, in this partition's namespace,
                 // so start-triggered load spreads across the cluster.
-                self.start_instance(
+                self.start_message_or_plain_instance(
                     &mut log,
                     &mut queue,
                     process_id,
@@ -4991,7 +5047,7 @@ impl Engine {
                     variables,
                     tags,
                     business_id,
-                    0,
+                    message_start,
                 );
             }
 
