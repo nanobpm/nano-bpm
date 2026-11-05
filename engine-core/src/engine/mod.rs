@@ -5903,7 +5903,18 @@ impl Engine {
                 .unwrap_or(false);
         if !is_mi_child {
             if let Some(mi) = self.multi_instance_of(instance_key, &element_id) {
-                return self.activate_multi_instance_body(instance_key, element_id, scope, mi);
+                // A multi-instance activity runs as a body instance keyed by the
+                // caller-minted `element_instance_key` — for a compensation
+                // handler this is the exact key the throw journaled in
+                // `handler_instance_keys` (#897), so the body's completion can
+                // route back to that throw.
+                return self.activate_multi_instance_body(
+                    instance_key,
+                    element_id,
+                    scope,
+                    mi,
+                    element_instance_key,
+                );
             }
         }
 
@@ -6673,14 +6684,21 @@ impl Engine {
     /// choice mirroring the conditional-event error semantics. Children run in the
     /// body's scope; parallel bodies spawn every child at once, sequential bodies
     /// spawn the first and chain the rest at each child's completion.
+    /// Opens a multi-instance body under `body_key`. Callers that mint the
+    /// element-instance key BEFORE activation pass it through (the
+    /// compensation-throw path mints its handler keys before emitting
+    /// `CompensationTriggered`, so the journaled `handler_instance_keys` binding
+    /// (#897) names the body instance the activation actually opens — otherwise
+    /// the persisted wait would bind a key no handler activation ever uses and
+    /// the body's completion could never retire that wait).
     fn activate_multi_instance_body(
         &mut self,
         instance_key: Key,
         element_id: String,
         scope: Key,
         mi: crate::model::MultiInstance,
+        body_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let body_key = self.mint_key();
         let mut events = vec![
             Event::ElementActivating {
                 instance_key,
@@ -7820,6 +7838,21 @@ impl Engine {
         if !output_updates.is_empty() {
             events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
         }
+        // A multi-instance COMPENSATION HANDLER body completes back to the throw
+        // event waiting on it, not along (non-existent) outgoing flows — a
+        // handler has no incoming sequence flow, so it is only ever activated by
+        // compensation (#897). The match is by the body's element-INSTANCE key
+        // (the key the throw journaled in `handler_instance_keys`), with the
+        // element-id lookup only for waits replayed from pre-#897 journals.
+        if let Some(throw_eik) = self
+            .pending_compensation_handler_by_instance(instance_key, body_key)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
+        {
+            let (resume_events, resume_followups) =
+                self.resume_compensation_throw(instance_key, &element_id, throw_eik, body_key);
+            events.extend(resume_events);
+            return (events, resume_followups);
+        }
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -7859,6 +7892,20 @@ impl Engine {
                 body_key,
             },
         ];
+        // A multi-instance COMPENSATION HANDLER body completes back to the throw
+        // event waiting on it, not along (non-existent) outgoing flows (#897) —
+        // mirrors the listener-free tail in `complete_multi_instance_body`. The
+        // match is by the body's element-INSTANCE key, with the element-id
+        // lookup only for waits replayed from pre-#897 journals.
+        if let Some(throw_eik) = self
+            .pending_compensation_handler_by_instance(instance_key, body_key)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
+        {
+            let (resume_events, resume_followups) =
+                self.resume_compensation_throw(instance_key, &element_id, throw_eik, body_key);
+            events.extend(resume_events);
+            return (events, resume_followups);
+        }
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);

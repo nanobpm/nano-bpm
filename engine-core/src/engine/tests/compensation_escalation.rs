@@ -1172,13 +1172,11 @@ fn single_throw_with_two_keyed_handlers_completes_in_reverse_order() {
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
     )));
-    assert!(
-        engine
-            .instance(instance_key)
-            .unwrap()
-            .compensation_waits
-            .is_empty()
-    );
+    assert!(engine
+        .instance(instance_key)
+        .unwrap()
+        .compensation_waits
+        .is_empty());
     assert!(engine.is_completed(instance_key));
 }
 
@@ -1212,14 +1210,12 @@ fn modify_rejects_terminating_a_handler_a_throw_is_waiting_on() {
     engine.apply_command(Command::complete_job(book)).unwrap();
     let handler = engine.activate_jobs("cancel-job", "w", 1, 60_000, 0)[0].clone();
     let handler_eik = handler.element_instance_key;
-    assert!(
-        engine
-            .instance(instance_key)
-            .unwrap()
-            .compensation_waits
-            .values()
-            .any(|w| w.pending_handler_keys == vec![handler_eik])
-    );
+    assert!(engine
+        .instance(instance_key)
+        .unwrap()
+        .compensation_waits
+        .values()
+        .any(|w| w.pending_handler_keys == vec![handler_eik]));
 
     // The replacement attempt: terminate the waiting handler and activate a
     // fresh one in its place. Rejected — the throw's binding would dangle.
@@ -1270,12 +1266,123 @@ fn modify_rejects_terminating_a_handler_a_throw_is_waiting_on() {
     engine
         .apply_command(Command::complete_job(handler.key))
         .unwrap();
+    assert!(engine
+        .instance(instance_key)
+        .unwrap()
+        .compensation_waits
+        .is_empty());
+    assert!(engine.is_completed(instance_key));
+}
+
+/// Defect class (#897, multi-instance variant): a compensation handler activity
+/// that carries multi-instance loop characteristics runs as an MI *body*, not a
+/// single activity. The throw mints the handler's element-instance key BEFORE
+/// activation and journals it in `CompensationTriggered::handler_instance_keys`;
+/// if the MI activation then mints a DIFFERENT body key, the persisted wait binds
+/// a key no handler activation ever uses, and the body's completion (which takes
+/// the activity's outgoing flows) never routes back to the throw — the throw
+/// waits forever and the instance hangs Active.
+///
+/// The fix carries the pre-minted key through as the MI body key and routes the
+/// body's completion back to the waiting throw (by that instance key).
+///
+/// Topology: start -> book(svc, comp-boundary -> cancel(svc, MI over `items`))
+///                  -> throw -> done
+#[test]
+fn multi_instance_compensation_handler_completion_retires_the_throw_wait() {
+    let def = ProcessBuilder::new("mi-comp")
+        .start_event("s")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("book-comp", "book", "cancel")
+        .service_task("cancel", "cancel-job")
+        .with_multi_instance(
+            "cancel",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("s", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-comp",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Complete the compensable activity: the throw fires and activates the
+    // multi-instance handler (its body fans out one `cancel-job` child per item).
+    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    let events = engine.apply_command(Command::complete_job(book)).unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationTriggered { throw_element_id, .. } if throw_element_id == "throw"
+    )));
+    // The throw is resting on its handler; nothing routed onward yet.
+    assert!(!engine.is_completed(instance_key));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done")));
+    // The wait binds the handler instance the throw activated — the MI body.
+    {
+        let inst = engine.instance(instance_key).unwrap();
+        assert_eq!(inst.compensation_waits.len(), 1);
+        let wait = inst.compensation_waits.values().next().unwrap();
+        assert_eq!(wait.pending_handlers, vec!["cancel".to_string()]);
+        assert_eq!(wait.pending_handler_keys.len(), 1);
+    }
+
+    // Run both MI children to completion. Each completes back into the loop; the
+    // LAST one completes the body, which must retire the throw's wait and route
+    // the throw onward to `done`. Activate BOTH child jobs up front (a parallel
+    // body fans all children out at once).
+    let cancels = engine.activate_jobs("cancel-job", "w", 10, 60_000, 0);
+    assert_eq!(
+        cancels.len(),
+        2,
+        "parallel body fans out one child per item"
+    );
+    engine
+        .apply_command(Command::complete_job(cancels[0].key))
+        .unwrap();
+    assert!(
+        !engine.is_completed(instance_key),
+        "one of two handler children done: the throw must still be waiting"
+    );
+    let events = engine
+        .apply_command(Command::complete_job(cancels[1].key))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationHandlerCompleted { handler_element_id, .. }
+            if handler_element_id == "cancel"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
+    )));
     assert!(
         engine
             .instance(instance_key)
             .unwrap()
             .compensation_waits
-            .is_empty()
+            .is_empty(),
+        "the handler body's completion must retire the throw's wait"
     );
     assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
 }
