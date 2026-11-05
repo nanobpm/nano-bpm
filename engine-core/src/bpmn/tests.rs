@@ -2751,55 +2751,6 @@ fn should_parse_terminate_end_event() {
 }
 
 #[test]
-fn end_execution_listener_on_terminate_end_is_rejected() {
-    // Completing a terminate end drives a scope-wide teardown
-    // (`complete_terminate_end`) that emits `ElementCompleting`/`ElementCompleted`
-    // directly, off the normal end-event completion path — so it never runs the
-    // end-listener chain and an `end` listener on it could never create a job.
-    // Reject it at deploy rather than silently accept a dead listener — the
-    // reject-don't-drop contract (#1197). A `start` listener on the same element
-    // IS supported (it fires through the generic activation start-listener gate),
-    // so it must NOT be rejected.
-    let base = |listener: &str| {
-        format!(
-            r#"
-          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
-            <bpmn:process id="p">
-              <bpmn:startEvent id="s"><bpmn:outgoing>f1</bpmn:outgoing></bpmn:startEvent>
-              <bpmn:endEvent id="stop">
-                <bpmn:extensionElements>
-                  <zeebe:executionListeners>
-                    <zeebe:executionListener eventType="{listener}" type="ping" />
-                  </zeebe:executionListeners>
-                </bpmn:extensionElements>
-                <bpmn:incoming>f1</bpmn:incoming>
-                <bpmn:terminateEventDefinition />
-              </bpmn:endEvent>
-              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
-            </bpmn:process>
-          </bpmn:definitions>"#
-        )
-    };
-
-    // an `end` listener is rejected — it can never fire
-    match parse_bpmn(&base("end")) {
-            Err(ParseError::UnsupportedExecutionListener { element_id, .. }) => {
-                assert_eq!(element_id, "stop");
-            }
-            other => panic!(
-                "expected UnsupportedExecutionListener for an `end` listener on a terminate end, got {other:?}"
-            ),
-        }
-
-    // a `start` listener is accepted — it fires through the activation gate
-    let def = &parse_bpmn(&base("start")).unwrap()[0];
-    let stop = def.element("stop").unwrap();
-    assert_eq!(stop.kind, crate::model::ElementKind::TerminateEndEvent);
-    assert_eq!(stop.start_listeners.len(), 1);
-    assert!(stop.end_listeners.is_empty());
-}
-
-#[test]
 fn should_parse_multiple_processes_in_one_file() {
     // given
     let xml = r#"
@@ -5543,4 +5494,123 @@ fn job_worker_message_events_validate_task_definition_attributes() {
             "{tag} {attrs}: got {err:?}"
         );
     }
+}
+
+/// One process body hosting `def` on a node of `placement` — the probe shape
+/// for the #985 event-definition placement matrix below.
+fn event_definition_placement_xml(placement: &str, def: &str) -> String {
+    let body = match placement {
+        "intermediateCatchEvent" | "intermediateThrowEvent" => format!(
+            r#"<bpmn:startEvent id="s" />
+               <bpmn:{placement} id="Probe">{def}</bpmn:{placement}>
+               <bpmn:endEvent id="e" />
+               <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Probe" />
+               <bpmn:sequenceFlow id="f2" sourceRef="Probe" targetRef="e" />"#
+        ),
+        "boundaryEvent" => format!(
+            r#"<bpmn:startEvent id="s" />
+               <bpmn:serviceTask id="t">
+                 <bpmn:extensionElements><zeebe:taskDefinition type="t" /></bpmn:extensionElements>
+               </bpmn:serviceTask>
+               <bpmn:boundaryEvent id="Probe" attachedToRef="t">{def}</bpmn:boundaryEvent>
+               <bpmn:endEvent id="e" />
+               <bpmn:endEvent id="e2" />
+               <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+               <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+               <bpmn:sequenceFlow id="f3" sourceRef="Probe" targetRef="e2" />"#
+        ),
+        "startEvent" => format!(
+            r#"<bpmn:startEvent id="Probe">{def}</bpmn:startEvent>
+               <bpmn:endEvent id="e" />
+               <bpmn:sequenceFlow id="f1" sourceRef="Probe" targetRef="e" />"#
+        ),
+        other => panic!("unknown placement {other}"),
+    };
+    format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+             <bpmn:process id="p" isExecutable="true">{body}</bpmn:process>
+           </bpmn:definitions>"#
+    )
+}
+
+// zeebe-cells: event:end:terminate
+#[test]
+fn terminate_event_definition_placement_matches_zeebe_deploy_validation() {
+    // #985 — the defect class: a `terminateEventDefinition` outside an
+    // `endEvent` used to be silently ignored on EVERY placement. The pinned
+    // Zeebe (probed against `EngineRule` deploy) answers per placement:
+    //
+    // - intermediateCatchEvent → REJECTED ("Event definition must be one of:
+    //   message, timer, signal, link or conditional")
+    // - boundaryEvent → REJECTED ("Boundary events must be one of: timer,
+    //   message, error, signal, escalation, conditional")
+    // - intermediateThrowEvent / startEvent → ACCEPTED, and the event runs as
+    //   an inert none event (pinned at runtime by the
+    //   `terminate-definition-on-{throw,start}-event` Zeebe traces).
+    //
+    // A silent drop on a placement Zeebe rejects deploys a model Zeebe would
+    // refuse; it must reject naming the element instead (reject-don't-drop).
+    let terminate = "<bpmn:terminateEventDefinition />";
+    for placement in ["intermediateCatchEvent", "boundaryEvent"] {
+        let xml = event_definition_placement_xml(placement, terminate);
+        let err = parse_bpmn(&xml).expect_err(&format!(
+            "a terminateEventDefinition on a {placement} must be rejected at deploy (Zeebe rejects it)"
+        ));
+        assert!(
+            format!("{err:?}").contains("terminateEventDefinition")
+                && format!("{err:?}").contains("Probe"),
+            "{placement}: the rejection must name the definition and the element, got {err:?}"
+        );
+    }
+    for placement in ["intermediateThrowEvent", "startEvent"] {
+        let xml = event_definition_placement_xml(placement, terminate);
+        let defs = parse_bpmn(&xml).unwrap_or_else(|e| {
+            panic!("a terminateEventDefinition on a {placement} deploys in Zeebe: {e:?}")
+        });
+        let probe = defs[0]
+            .elements
+            .values()
+            .find(|el| el.id.as_str() == "Probe")
+            .expect("the probe element is built");
+        assert!(
+            !matches!(probe.kind, ElementKind::TerminateEndEvent),
+            "{placement}: the stray definition must NOT make it a terminate end, got {:?}",
+            probe.kind
+        );
+    }
+}
+
+#[test]
+fn terminate_end_event_accepts_end_execution_listeners() {
+    // #985 — Zeebe's `TerminateEndEventBehavior` completes the terminate end
+    // through the normal completion path (its `end` execution listener runs)
+    // BEFORE terminating the siblings, and `ExecutionListenersValidator`
+    // accepts both phases on it. Rejecting the `end` listener at deploy
+    // refused a model Zeebe deploys and runs.
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+      <bpmn:process id="p" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="Kill">
+          <bpmn:extensionElements>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="start" type="killStart" />
+              <zeebe:executionListener eventType="end" type="killEnd" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="Kill" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let defs = parse_bpmn(xml).expect("a terminate end with start+end listeners deploys");
+    let kill = defs[0]
+        .elements
+        .values()
+        .find(|el| el.id.as_str() == "Kill")
+        .expect("Kill is built");
+    assert!(matches!(kill.kind, ElementKind::TerminateEndEvent));
+    assert_eq!(kill.start_listeners.len(), 1, "{:?}", kill.start_listeners);
+    assert_eq!(kill.end_listeners.len(), 1, "{:?}", kill.end_listeners);
 }

@@ -671,28 +671,6 @@ impl ProcessAcc {
                     });
                 }
             }
-            // A **terminate end event** completes off the normal end-event path:
-            // `complete_terminate_end` drives a scope-wide teardown and emits
-            // `ElementCompleting`/`ElementCompleted` directly, never running the
-            // end-listener chain — so an `end` listener on it could never create a
-            // job. Reject `end` alone (reject-don't-drop, #1197). Its `start`
-            // listener IS supported: it fires through the generic activation
-            // start-listener gate before the terminate behaviour runs, exactly like
-            // the inclusive-join case where only the dead phase is rejected.
-            for node in &self.nodes {
-                if node.is_terminate && !node.end_listeners.is_empty() {
-                    return Err(ParseError::UnsupportedExecutionListener {
-                        process_id: self.id.clone(),
-                        element_id: node.id.clone(),
-                        reason: "an `end` execution listener on a terminate end event would \
-                                 never fire: completing a terminate end drives a scope-wide \
-                                 teardown that emits completion directly, bypassing the \
-                                 end-listener chain (its `start` listener IS supported — it \
-                                 fires through the activation start-listener gate)"
-                            .to_string(),
-                    });
-                }
-            }
             // A **`zeebe:taskListener`** (ADR 0037 §6) only runs on a user task —
             // task-listener jobs are created solely on the user-task runtime path.
             // The lenient parser attaches a `zeebe:taskListeners` declaration to

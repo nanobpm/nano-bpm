@@ -522,7 +522,10 @@
       "match": "event:end:terminate",
       "status": "nano-tested",
       "evidence": [
-        "engine-core/src/engine/tests/call_activity.rs::subprocess_terminate_end_terminates_a_call_activity_child_in_its_scope"
+        "engine-core/src/engine/tests/call_activity.rs::subprocess_terminate_end_terminates_a_call_activity_child_in_its_scope",
+        "engine-core/src/engine/tests/lifecycle.rs::top_level_terminate_end_runs_its_end_listener_before_terminating_siblings",
+        "engine-core/src/engine/tests/lifecycle.rs::subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope",
+        "engine-core/src/bpmn/tests.rs::terminate_event_definition_placement_matches_zeebe_deploy_validation"
       ]
     },
     {

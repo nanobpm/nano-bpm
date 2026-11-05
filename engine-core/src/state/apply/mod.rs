@@ -128,6 +128,9 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::MessageStartSubscriptionCreated { .. } => {
             subscription::apply_subscription(state, event)
         }
+        // A history-only record (#1300): the instance it names was already
+        // created by the preceding `ProcessInstanceCreated`.
+        Event::MessageStartEventCorrelated { .. } => {}
     }
 }
 

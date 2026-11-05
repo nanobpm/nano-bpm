@@ -124,7 +124,7 @@ pub use event::decode_event_json;
 pub use event::Event;
 pub use event::EventDecodeError;
 pub use event::{
-    MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
+    MessageStartCorrelation, MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
     MigratedSubscriptionTrigger, SubscriptionMigrationAction,
 };
 pub use feel::FeelError;

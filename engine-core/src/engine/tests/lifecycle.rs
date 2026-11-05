@@ -2736,6 +2736,7 @@ fn dispatch_start_instance_mints_the_instance_locally() {
             variables: vars(&[("amount", Value::Int(9))]),
             tags: Vec::new(),
             business_id: None,
+            message_start: None,
         })
         .unwrap();
 
@@ -6789,4 +6790,973 @@ fn scoped_terminate_drops_a_join_arrival_whose_activation_was_still_queued() {
             instance.join_instances
         );
     }
+}
+
+/// A terminate end event carrying an `end` execution listener (#985).
+/// `inner` wraps the fork in an embedded sub-process when true (scoped
+/// terminate), else the fork sits at the process root (top-level terminate).
+fn terminate_end_with_end_listener_xml(scoped: bool) -> String {
+    let fork = r#"
+        <bpmn:parallelGateway id="fork" />
+        <bpmn:serviceTask id="work">
+          <bpmn:extensionElements><zeebe:taskDefinition type="work-job" /></bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="stop-end" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="work" />
+        <bpmn:sequenceFlow id="f3" sourceRef="fork" targetRef="stop" />"#;
+    let body = if scoped {
+        format!(
+            r#"<bpmn:startEvent id="s" />
+            <bpmn:subProcess id="sub">
+              <bpmn:startEvent id="s2" />
+              {fork}
+              <bpmn:sequenceFlow id="f1" sourceRef="s2" targetRef="fork" />
+            </bpmn:subProcess>
+            <bpmn:serviceTask id="after">
+              <bpmn:extensionElements><zeebe:taskDefinition type="after-job" /></bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:endEvent id="e" />
+            <bpmn:sequenceFlow id="g1" sourceRef="s" targetRef="sub" />
+            <bpmn:sequenceFlow id="g2" sourceRef="sub" targetRef="after" />
+            <bpmn:sequenceFlow id="g3" sourceRef="after" targetRef="e" />"#
+        )
+    } else {
+        format!(
+            r#"<bpmn:startEvent id="s" />
+            {fork}
+            <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="fork" />"#
+        )
+    };
+    format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+           <bpmn:process id="term-el" isExecutable="true">{body}</bpmn:process>
+         </bpmn:definitions>"#
+    )
+}
+
+/// Deploys the #985 fixture and starts an instance, returning its key.
+fn start_terminate_end_with_end_listener(engine: &mut Engine, scoped: bool) -> Key {
+    let def = crate::bpmn::parse_bpmn(&terminate_end_with_end_listener_xml(scoped))
+        .expect("Zeebe accepts an end execution listener on a terminate end (#985)")
+        .remove(0);
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el"))
+        .unwrap();
+    created.iter().find_map(|e| e.instance_key()).unwrap()
+}
+
+// zeebe-cells: event:end:terminate lifecycle:END_EVENT:complete-execution-listener
+#[test]
+fn top_level_terminate_end_runs_its_end_listener_before_terminating_siblings() {
+    // Zeebe `TerminateEndEventBehavior` (#985): the terminate end completes
+    // through the normal completion path — it rests in COMPLETING while its
+    // `end` listener job runs, and the sibling teardown + process completion
+    // happen only once that chain drains. Previously the listener was rejected
+    // at deploy because the inline teardown bypassed the chain.
+    let mut engine = Engine::new();
+    let instance_key = start_terminate_end_with_end_listener(&mut engine, false);
+
+    // The terminate end is parked behind its end listener; the sibling `work`
+    // token is still alive and the instance has not completed.
+    let mut types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    types.sort();
+    assert_eq!(types, vec!["stop-end".to_string(), "work-job".to_string()]);
+    assert!(!engine.is_completed(instance_key));
+    let work_job = engine.activate_jobs("work-job", "w", 1, 60_000, 0)[0].key;
+
+    // Draining the listener chain completes the terminate end, kills the
+    // sibling (its job cancelled) and COMPLETES the instance.
+    let events = complete_one(&mut engine, "stop-end");
+    let completed_at = events
+        .iter()
+        .position(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "stop"))
+        .expect("the terminate end records ElementCompleted once its end listener drains");
+    let canceled_at = events
+        .iter()
+        .position(|e| {
+            *e == Event::JobCanceled {
+                job_key: work_job,
+                instance_key,
+            }
+        })
+        .expect("the sibling job is cancelled");
+    assert!(
+        completed_at < canceled_at,
+        "Zeebe: COMPLETED, then siblings terminate"
+    );
+    assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    // Exactly one COMPLETING for the terminate end across the whole journal.
+    assert!(!events.iter().any(
+        |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+    ));
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().active.is_empty());
+}
+
+// zeebe-cells: event:end:terminate lifecycle:END_EVENT:complete-execution-listener
+#[test]
+fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope() {
+    // The scoped variant (#985): the end listener runs first, then only the
+    // sub-process's tokens die and the parent continues on its outgoing flow.
+    let mut engine = Engine::new();
+    let instance_key = start_terminate_end_with_end_listener(&mut engine, true);
+    assert!(engine
+        .activate_jobs("after-job", "w", 1, 60_000, 0)
+        .is_empty());
+    let work_job = engine.activate_jobs("work-job", "w", 1, 60_000, 0)[0].key;
+
+    let events = complete_one(&mut engine, "stop-end");
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: work_job,
+        instance_key
+    }));
+    // Zeebe's `TerminateEndEventBehavior` ordering: the terminate end's own
+    // COMPLETED is recorded BEFORE any sibling teardown — a sibling with a
+    // smaller element-instance key must not be canceled/completed first.
+    let completed_at = events
+        .iter()
+        .position(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "stop"))
+        .expect("the terminate end records ElementCompleted once its end listener drains");
+    let canceled_at = events
+        .iter()
+        .position(|e| {
+            *e == Event::JobCanceled {
+                job_key: work_job,
+                instance_key,
+            }
+        })
+        .expect("the sibling job is cancelled");
+    assert!(
+        completed_at < canceled_at,
+        "Zeebe: the terminate end completes BEFORE its siblings are torn down"
+    );
+    let sibling_completed_at = events
+        .iter()
+        .position(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "work"))
+        .expect("the sibling token is completed by the teardown");
+    assert!(
+        completed_at < sibling_completed_at,
+        "the terminate end completes before the sibling's teardown records"
+    );
+    // The terminate end was already COMPLETING (before its listener ran): the
+    // scope teardown must not record a second COMPLETING for it.
+    assert!(!events.iter().any(
+        |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "stop"))
+            .count(),
+        1
+    );
+    // The parent continues past the completed sub-process.
+    assert!(!engine.is_completed(instance_key));
+    complete_one(&mut engine, "after-job");
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `="killEnd"` → `listenerType`,
+/// `end` listener `type="=listenerType"`)
+///
+/// ADR 0037 pins `end` listeners AFTER `zeebe:output` mappings, with the
+/// listener job's own FEEL attributes resolving against the output-mapped
+/// view — a terminate end is no exception. Before the fix, the terminate
+/// path bypassed output mappings, so `=listenerType` raised
+/// EXTRACT_VALUE_ERROR instead of creating the `killEnd` job.
+#[test]
+fn terminate_end_listener_attributes_resolve_against_output_mappings() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-out" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=&#34;killEnd&#34;" target="listenerType" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-out"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The output mapping projected `listenerType = "killEnd"` into the scope
+    // BEFORE the chain opened, so the listener's `=listenerType` type resolves
+    // and its job is created — no EXTRACT_VALUE_ERROR incident.
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the listener type resolves against the output-mapped view"
+    );
+    let jobs = engine.pending_jobs();
+    assert_eq!(jobs.len(), 1, "one end-listener job");
+    assert_eq!(jobs[0].job_type, "killEnd");
+    assert_eq!(
+        io_var(&engine, instance_key, "listenerType"),
+        Some(Value::Str("killEnd".into())),
+        "the output mapping was applied before the listener chain opened"
+    );
+
+    // Draining the chain completes the terminate end and the instance.
+    let events = complete_one(&mut engine, "killEnd");
+    assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, end listeners `l0` then `=missingType`)
+///
+/// #1390 end-side: listener 0 completes, listener 1's job-type expression
+/// fails and parks the terminate end on an EXTRACT_VALUE_ERROR incident.
+/// Resolving the incident must RESUME the chain at listener 1 — never
+/// re-mint listener 0's job (repeating its side effects).
+#[test]
+fn terminate_end_listener_incident_resolution_resumes_the_chain() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-resume" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="l0" />
+              <zeebe:executionListener eventType="end" type="=missingType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-resume"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Listener 0 completes; listener 1's `=missingType` fails — the terminate
+    // end parks on an EXTRACT_VALUE_ERROR incident mid-chain.
+    complete_one(&mut engine, "l0");
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "the failing second listener parks");
+    assert_eq!(
+        incidents[0].redrive,
+        Some(state::IoMappingRedrive::TerminateEndCompletion {
+            outputs_applied: true
+        }),
+        "an end-chain listener failure is a terminate-end completion incident"
+    );
+    let incident_key = incidents[0].key;
+    assert!(
+        engine.pending_jobs().is_empty(),
+        "the failing listener mints no job"
+    );
+
+    // Resolve with the variable now bound: the chain RESUMES at listener 1.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let minted: Vec<&str> = resolved
+        .iter()
+        .filter_map(|e| match e {
+            Event::ExecutionListenerJobCreated {
+                job_type,
+                listener_index,
+                ..
+            } => Some((job_type.as_str(), listener_index)),
+            _ => None,
+        })
+        .map(|(t, _)| t)
+        .collect();
+    assert_eq!(
+        minted,
+        vec!["l1"],
+        "resolution resumes at listener 1 — listener 0's job is NOT re-minted: {resolved:?}"
+    );
+    let indices: Vec<usize> = resolved
+        .iter()
+        .filter_map(|e| match e {
+            Event::ExecutionListenerJobCreated { listener_index, .. } => Some(*listener_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(indices, vec![1], "the resumed job is listener index 1");
+    // Exactly one COMPLETING for the terminate end across the whole run: the
+    // resume re-enters completion but must not repeat the record.
+    assert!(
+        !resolved.iter().any(
+            |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+        ),
+        "the parked terminate end already rests in COMPLETING: {resolved:?}"
+    );
+
+    // Draining the resumed chain completes the terminate end and the instance.
+    let drained = complete_one(&mut engine, "l1");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.active_incidents().is_empty());
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `=missingVar * 2` → `x`,
+/// `end` listener `l0`)
+///
+/// A failing output mapping on a terminate end halts it in COMPLETING on an
+/// IO_MAPPING_ERROR incident (#939 lifecycle, redrive `Completion`) — the
+/// listener chain never opens. Resolving with the source now bound re-projects
+/// the mapping and opens the chain, without repeating `ElementCompleting`.
+#[test]
+fn terminate_end_output_mapping_failure_parks_and_redrives() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-outfail" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=assert(missingVar, missingVar instance of number) + 1" target="x" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="l0" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-outfail"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The output mapping fails (`missingVar` unbound): the terminate end halts
+    // in COMPLETING on an IO_MAPPING_ERROR incident; no listener job exists.
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "the failing output mapping parks");
+    assert_eq!(incidents[0].kind, state::IncidentKind::IoMapping);
+    assert_eq!(
+        incidents[0].redrive,
+        Some(state::IoMappingRedrive::TerminateEndCompletion {
+            outputs_applied: false
+        })
+    );
+    let incident_key = incidents[0].key;
+    assert!(
+        engine.pending_jobs().is_empty(),
+        "the listener chain never opened"
+    );
+
+    // Resolve with the source bound: the mapping re-projects, the chain opens
+    // at listener 0, and `ElementCompleting` is NOT repeated.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingVar".to_string(), Value::Int(21))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    let completing_count = resolved
+        .iter()
+        .filter(
+            |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop"),
+        )
+        .count();
+    assert!(
+        completing_count <= 1,
+        "the parked terminate end already rests in COMPLETING: {resolved:?}"
+    );
+    assert!(
+        resolved.iter().any(|e| matches!(
+            e,
+            Event::ExecutionListenerJobCreated { job_type, listener_index: 0, .. }
+                if job_type == "l0"
+        )),
+        "the re-projected completion opens the listener chain: {resolved:?}"
+    );
+    assert_eq!(
+        io_var(&engine, instance_key, "x"),
+        Some(Value::Int(22)),
+        "the re-driven output mapping projected"
+    );
+
+    let drained = complete_one(&mut engine, "l0");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `=x + 1` → `x`, `end` listeners
+/// `=missingType` then `l1`), with `x = 0` seeded.
+///
+/// #1430 review: listener 0's job-type expression fails BEFORE any job is minted,
+/// so the resume index is `None` and cannot tell the recovery re-drive from the
+/// first pass. Recovery must NOT re-apply the (non-idempotent) output mapping —
+/// `x` must stay at the 1 the first pass projected, not double to 2 — and must
+/// NOT emit a second `ElementCompleting`.
+#[test]
+fn terminate_end_recovery_does_not_reapply_output_mappings_or_completing() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-nonidem" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=x + 1" target="x" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=missingType" />
+              <zeebe:executionListener eventType="end" type="l1" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-nonidem"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // Seed x = 0 so the non-idempotent `=x + 1 -> x` output mapping is observable.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("x".to_string(), Value::Int(0))]),
+        ))
+        .unwrap();
+
+    // First pass: the output projection is staged (the listener vars see it) but
+    // NOT applied to state until a listener job completes — so x is still 0.
+    // Listener 0's `=missingType` fails before any job is minted, so the resume
+    // index is `None` and cannot tell this recovery from the first pass.
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "listener 0's failing job type parks");
+    assert_eq!(incidents[0].kind, state::IncidentKind::ExtractValueError);
+    let incident_key = incidents[0].key;
+    assert!(
+        engine.pending_jobs().is_empty(),
+        "listener 0 minted no job — the resume index is None"
+    );
+    assert_eq!(
+        io_var(&engine, instance_key, "x"),
+        Some(Value::Int(0)),
+        "the output projection is staged, not yet applied to state"
+    );
+
+    // Resolve with the listener-0 type now bound: the chain opens at listener 0.
+    // The recovery must NOT re-propagate the output projection (a second
+    // `VariablesUpdated` for `x`) nor repeat `ElementCompleting`.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingType".to_string(), Value::Str("l0".into()))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(
+        !resolved.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { variables, .. } | Event::ScopedVariablesUpdated { variables, .. }
+                if variables.contains_key("x")
+        )),
+        "recovery must not re-propagate the staged output projection: {resolved:?}"
+    );
+    assert!(
+        !resolved.iter().any(
+            |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+        ),
+        "recovery must not repeat ElementCompleting: {resolved:?}"
+    );
+    assert!(
+        resolved.iter().any(|e| matches!(
+            e,
+            Event::ExecutionListenerJobCreated { job_type, listener_index: 0, .. }
+                if job_type == "l0"
+        )),
+        "the chain opens at listener 0: {resolved:?}"
+    );
+
+    // Drain the chain: listener 0 then listener 1 complete the terminate end. The
+    // recovery added no second `ElementCompleting` and no duplicate projection.
+    complete_one(&mut engine, "l0");
+    let drained = complete_one(&mut engine, "l1");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `=x + 1` → `x`, `end` listeners `l0`
+/// then `=missingType`), with `x = 0` seeded.
+///
+/// #1430 review, later-listener variant: listener 0 completes (its job minted, so
+/// the resume index is `Some(1)`), then listener 1's job type fails. Recovery
+/// resumes at listener 1 — and must still NOT re-apply the output mapping nor
+/// repeat `ElementCompleting`.
+#[test]
+fn terminate_end_mid_chain_recovery_does_not_reapply_output_mappings() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-nonidem-mid" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=x + 1" target="x" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="l0" />
+              <zeebe:executionListener eventType="end" type="=missingType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-nonidem-mid"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("x".to_string(), Value::Int(0))]),
+        ))
+        .unwrap();
+
+    // Listener 0 completes; listener 1's `=missingType` fails mid-chain. The
+    // resume index is now `Some(1)` (listener 0's job was minted).
+    complete_one(&mut engine, "l0");
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "listener 1's failing job type parks");
+    let incident_key = incidents[0].key;
+
+    // Resolve: resume at listener 1 without re-propagating the output projection
+    // (a second `VariablesUpdated` for `x`) or repeating `ElementCompleting`.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(
+        !resolved.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { variables, .. } | Event::ScopedVariablesUpdated { variables, .. }
+                if variables.contains_key("x")
+        )),
+        "mid-chain recovery must not re-propagate the staged output projection: {resolved:?}"
+    );
+    assert!(
+        !resolved.iter().any(
+            |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+        ),
+        "mid-chain recovery must not repeat ElementCompleting: {resolved:?}"
+    );
+    let minted: Vec<usize> = resolved
+        .iter()
+        .filter_map(|e| match e {
+            Event::ExecutionListenerJobCreated { listener_index, .. } => Some(*listener_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(minted, vec![1], "the chain resumes at listener 1");
+
+    let drained = complete_one(&mut engine, "l1");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `=assert(missingVar, ...) + 1` → `x`,
+/// `end` listener `l0`).
+///
+/// #1430 review, unsuccessful-retry variant: a failing output mapping parks the
+/// terminate end in COMPLETING. Resolving while the source is STILL unbound
+/// re-raises the incident — and must NOT emit a second `ElementCompleting` on
+/// either the failed retry or the eventual successful one.
+#[test]
+fn terminate_end_output_mapping_failed_retry_does_not_repeat_completing() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-retryfail" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=assert(missingVar, missingVar instance of number) + 1" target="x" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="l0" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-retryfail"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let completing = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+            })
+            .count()
+    };
+
+    // First pass: the output mapping fails and parks. Exactly one ElementCompleting.
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1);
+    let first_key = incidents[0].key;
+
+    // Resolve with the source STILL unbound: the retry re-raises the incident and
+    // emits NO additional ElementCompleting.
+    let retry = engine
+        .apply_command(Command::resolve_incident(first_key))
+        .unwrap();
+    assert_eq!(
+        completing(&retry),
+        0,
+        "an unsuccessful retry must not repeat ElementCompleting: {retry:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "the failed retry re-parks");
+    let second_key = incidents[0].key;
+
+    // Resolve again with the source now bound: the mapping projects, the chain
+    // opens, and still NO additional ElementCompleting.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingVar".to_string(), Value::Int(21))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(second_key))
+        .unwrap();
+    assert_eq!(
+        completing(&resolved),
+        0,
+        "the successful recovery must not repeat ElementCompleting: {resolved:?}"
+    );
+    assert_eq!(io_var(&engine, instance_key, "x"), Some(Value::Int(22)));
+
+    let drained = complete_one(&mut engine, "l0");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// #985 / #1430: an output mapping onto a name an input mapping made local must
+/// not be SHADOWED by the stale local for later end listeners (Copilot review).
+#[test]
+fn terminate_end_output_mapping_is_not_shadowed_by_input_local_for_later_listeners() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-shadow" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:input source="=&quot;old&quot;" target="listenerType" />
+              <zeebe:output source="=&quot;new&quot;" target="listenerType" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).expect("parses").remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("term-el-shadow"))
+        .unwrap();
+    let types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["new".to_string()],
+        "listener 0 sees the output view"
+    );
+    complete_one(&mut engine, "new");
+    let types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["new".to_string()],
+        "listener 1 must read the output-mapped value, not the stale input local"
+    );
+}
+
+/// #1430 review: a listener's completion variables must also reach the mirrored
+/// element-local view, or the stale local shadows them for the next listener.
+#[test]
+fn terminate_end_listener_completion_variables_are_not_shadowed_for_later_listeners() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-shadow2" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:input source="=&quot;old&quot;" target="listenerType" />
+              <zeebe:output source="=&quot;new&quot;" target="listenerType" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).expect("parses").remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("term-el-shadow2"))
+        .unwrap();
+    let job = engine
+        .activate_jobs("new", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("listener 0 job");
+    let mut vars = HashMap::new();
+    vars.insert("listenerType".to_string(), Value::Str("next".into()));
+    engine
+        .apply_command(Command::complete_job_with(job.key, vars))
+        .unwrap();
+    let types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["next".to_string()],
+        "listener 1 must read listener 0's returned value, not the stale mirrored local"
+    );
+}
+
+/// #1300: a message that starts an instance via a message start event is a
+/// correlation (Zeebe records it as a correlated message subscription). The
+/// engine must emit a durable [`Event::MessageStartEventCorrelated`] tying the
+/// message to the created instance, after the instance is created.
+#[test]
+fn message_start_correlation_is_recorded() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let def_key = engine.state().processes["order-flow"].key;
+    let events = engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "order-placed".into(),
+            correlation_key: "c-1".into(),
+            variables: HashMap::new(),
+            business_id: Some("biz-1".into()),
+        })
+        .unwrap();
+    let message_key = events
+        .iter()
+        .find_map(|e| match e {
+            Event::MessagePublished { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .expect("published");
+    let created_at = events
+        .iter()
+        .position(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+        .expect("instance created");
+    let instance = match &events[created_at] {
+        Event::ProcessInstanceCreated { instance_key, .. } => *instance_key,
+        _ => unreachable!(),
+    };
+    let correlated: Vec<(usize, &Event)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, Event::MessageStartEventCorrelated { .. }))
+        .collect();
+    assert_eq!(correlated.len(), 1, "exactly one start correlation");
+    let (pos, ev) = correlated[0];
+    assert!(pos > created_at, "recorded after the instance exists");
+    assert_eq!(
+        ev,
+        &Event::MessageStartEventCorrelated {
+            message_key,
+            subscription_key: def_key,
+            process_definition_key: def_key,
+            process_id: "order-flow".into(),
+            instance_key: instance,
+            element_id: "start".into(),
+            message_name: "order-placed".into(),
+            correlation_key: "c-1".into(),
+        }
+    );
+}
+
+/// #1300 (multi-partition): a dispatched message-start instance records the
+/// correlation on the partition that mints the instance.
+#[test]
+fn dispatched_message_start_records_the_correlation_on_the_target() {
+    let mut target = Engine::with_partition(2);
+    target.set_num_partitions(4);
+    target
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let fired = target
+        .apply_command(Command::DispatchStartInstance {
+            process_id: "order-flow".into(),
+            start_element_id: "start".into(),
+            variables: HashMap::new(),
+            tags: Vec::new(),
+            business_id: None,
+            message_start: Some(crate::MessageStartCorrelation {
+                message_key: 42,
+                process_definition_key: 7,
+                message_name: "order-placed".into(),
+                correlation_key: "c".into(),
+            }),
+        })
+        .unwrap();
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::MessageStartEventCorrelated {
+            message_key: 42,
+            subscription_key: 7,
+            ..
+        }
+    )));
+}
+
+/// #1300: a message-start dispatch that lands on the target after a newer
+/// version was deployed must still create the instance from the definition
+/// whose subscription correlated the message — otherwise the correlation
+/// record names v1 while the instance runs v2.
+#[test]
+fn dispatched_message_start_pins_the_correlated_definition_across_redeploy() {
+    let mut target = Engine::with_partition(2);
+    target.set_num_partitions(4);
+    let deployed = target
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let v1 = deployed
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .unwrap();
+    let mut v2_def = process_with_message_start();
+    v2_def.name = Some("v2".into());
+    target
+        .apply_command(Command::DeployProcess(v2_def))
+        .unwrap();
+    let fired = target
+        .apply_command(Command::DispatchStartInstance {
+            process_id: "order-flow".into(),
+            start_element_id: "start".into(),
+            variables: HashMap::new(),
+            tags: Vec::new(),
+            business_id: None,
+            message_start: Some(crate::MessageStartCorrelation {
+                message_key: 42,
+                process_definition_key: v1,
+                message_name: "order-placed".into(),
+                correlation_key: "c".into(),
+            }),
+        })
+        .unwrap();
+    let created = fired
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(created, v1);
 }

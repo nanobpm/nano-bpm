@@ -508,6 +508,10 @@ pub enum Command {
         variables: HashMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
+        /// The triggering message when a message start event fired (#1300):
+        /// the instance's partition records the correlation.
+        #[cfg_attr(feature = "serde", serde(default))]
+        message_start: Option<crate::MessageStartCorrelation>,
     },
     /// External "activate ad-hoc activities" command (#614 gap 3, Zeebe
     /// `AdHocSubProcessInstructionActivateProcessor` — REST

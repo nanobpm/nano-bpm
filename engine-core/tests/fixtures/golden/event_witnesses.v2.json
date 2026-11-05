@@ -7,6 +7,34 @@
     }
   },
   {
+    "MessageStartEventCorrelated": {
+      "correlation_key": "c",
+      "element_id": "start",
+      "instance_key": 22,
+      "message_key": 20,
+      "message_name": "m",
+      "process_definition_key": 21,
+      "process_id": "p",
+      "subscription_key": 21
+    }
+  },
+  {
+    "StartInstanceDispatched": {
+      "business_id": "b",
+      "message_start": {
+        "correlation_key": "c",
+        "message_key": 20,
+        "message_name": "m",
+        "process_definition_key": 21
+      },
+      "process_id": "p",
+      "start_element_id": "start",
+      "tags": [],
+      "target_partition": 1,
+      "variables": {}
+    }
+  },
+  {
     "GatewayRouteSelected": {
       "element_id": "g",
       "element_instance_key": 2,

@@ -185,6 +185,21 @@ pub struct MigratedChildInstance {
     pub target_element_id: ElementId,
 }
 
+/// The message that triggered a **message start event** (#1300), carried on a
+/// cross-partition [`Event::StartInstanceDispatched`] /
+/// [`crate::Command::DispatchStartInstance`] so the partition that mints the
+/// instance can record the [`Event::MessageStartEventCorrelated`] (it is the
+/// only partition that knows the new instance key).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct MessageStartCorrelation {
+    pub message_key: Key,
+    /// The message start subscription (keyed by its process definition).
+    pub process_definition_key: Key,
+    pub message_name: String,
+    pub correlation_key: String,
+}
+
 /// A fact emitted by the engine. The ordering of a command's returned events is
 /// the order in which they occurred.
 ///
@@ -1121,6 +1136,23 @@ pub enum Event {
         kind: MessageSubscriptionKind,
         variables: HashMap<String, Value>,
     },
+    /// A published message correlated to a process-level **message start
+    /// event** and created instance `instance_key` (#1300; Zeebe records this as
+    /// a correlated message subscription). Emitted right after the instance's
+    /// [`Event::ProcessInstanceCreated`], on the partition that minted it.
+    /// `subscription_key` is the start subscription's key — nano keys message
+    /// start subscriptions by their `process_definition_key`. Purely a history
+    /// record: it changes no engine state.
+    MessageStartEventCorrelated {
+        message_key: Key,
+        subscription_key: Key,
+        process_definition_key: Key,
+        process_id: String,
+        instance_key: Key,
+        element_id: ElementId,
+        message_name: String,
+        correlation_key: String,
+    },
     /// An open message subscription was cancelled before correlating because the
     /// element it guarded left the flow first (e.g. a boundary subscription whose
     /// activity completed normally, or a sibling boundary subscription when
@@ -1518,6 +1550,10 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         business_id: Option<String>,
         target_partition: u64,
+        /// Set when a message start event fired (#1300): the target records the
+        /// correlation once it mints the instance. `None` for timer starts.
+        #[cfg_attr(feature = "serde", serde(default))]
+        message_start: Option<MessageStartCorrelation>,
     },
 
     /// An engine-native AgentInstance was created (Camunda `AgentInstanceIntent.CREATED`,
@@ -1675,6 +1711,7 @@ impl Event {
             | Event::MessageSubscriptionCreated { instance_key, .. }
             | Event::MessageSubscriptionOpening { instance_key, .. }
             | Event::MessageCorrelated { instance_key, .. }
+            | Event::MessageStartEventCorrelated { instance_key, .. }
             | Event::RemoteMessageCorrelation { instance_key, .. }
             | Event::MessageSubscriptionCanceled { instance_key, .. }
             | Event::SignalSubscriptionCreated { instance_key, .. }
@@ -2085,6 +2122,11 @@ impl Event {
                 process_definition_key,
                 ..
             } => m = m.max(*process_definition_key),
+            Event::MessageStartEventCorrelated {
+                message_key,
+                instance_key,
+                ..
+            } => m = m.max(*message_key).max(*instance_key),
             Event::ProcessStartTimerArmed {
                 timer_key,
                 process_definition_key,

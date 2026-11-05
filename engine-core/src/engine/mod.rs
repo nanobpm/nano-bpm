@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::command::Command;
-use crate::event::Event;
+use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
 
@@ -1490,24 +1490,17 @@ impl Engine {
         variables: HashMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
+        message_start: Option<MessageStartCorrelation>,
     ) {
-        if self.num_partitions <= 1 {
-            self.start_instance(
-                log,
-                queue,
-                process_id,
-                start_event,
-                variables,
-                tags,
-                business_id,
-                0,
-            );
-            return;
-        }
-        let target = self.start_dispatch_rr % self.num_partitions;
-        self.start_dispatch_rr = self.start_dispatch_rr.wrapping_add(1);
+        let target = if self.num_partitions <= 1 {
+            self.partition_id
+        } else {
+            let target = self.start_dispatch_rr % self.num_partitions;
+            self.start_dispatch_rr = self.start_dispatch_rr.wrapping_add(1);
+            target
+        };
         if target == self.partition_id {
-            self.start_instance(
+            self.start_message_or_plain_instance(
                 log,
                 queue,
                 process_id,
@@ -1515,7 +1508,7 @@ impl Engine {
                 variables,
                 tags,
                 business_id,
-                0,
+                message_start,
             );
         } else {
             self.emit(
@@ -1527,6 +1520,55 @@ impl Engine {
                     tags,
                     business_id,
                     target_partition: target,
+                    message_start,
+                },
+            );
+        }
+    }
+
+    /// Creates a start-triggered instance locally and, when a message start
+    /// event triggered it, records the correlation (#1300) right after the
+    /// instance exists. The single creation path for message-start instances
+    /// (inline and cross-partition dispatch), so no path can skip the record.
+    #[allow(clippy::too_many_arguments)]
+    fn start_message_or_plain_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        queue: &mut VecDeque<Step>,
+        process_id: String,
+        start_event: ElementId,
+        variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        message_start: Option<MessageStartCorrelation>,
+    ) {
+        let instance_key = self.start_instance(
+            log,
+            queue,
+            process_id.clone(),
+            start_event.clone(),
+            variables,
+            tags,
+            business_id,
+            // A message start pins the definition whose subscription correlated
+            // the message, so a redeploy between dispatch and delivery cannot
+            // run a different version than the correlation record names.
+            message_start
+                .as_ref()
+                .map_or(0, |m| m.process_definition_key),
+        );
+        if let Some(m) = message_start {
+            self.emit(
+                log,
+                Event::MessageStartEventCorrelated {
+                    message_key: m.message_key,
+                    subscription_key: m.process_definition_key,
+                    process_definition_key: m.process_definition_key,
+                    process_id,
+                    instance_key,
+                    element_id: start_event,
+                    message_name: m.message_name,
+                    correlation_key: m.correlation_key,
                 },
             );
         }
@@ -2266,6 +2308,46 @@ impl Engine {
                     },
                 );
                 if !variables.is_empty() {
+                    // #985 / #1430: a terminate end's end chain mirrors its output
+                    // projection onto shadowing element locals so later listeners
+                    // read it. A listener's own result must be mirrored the same
+                    // way, or the stale local shadows it for listeners 1..n and an
+                    // incident resume (the propagation below starts at the flow
+                    // scope and never touches the element's own scope).
+                    if matches!(
+                        job_kind,
+                        state::JobKind::ExecutionListener {
+                            event_type: crate::model::ListenerEventType::End,
+                            ..
+                        }
+                    ) && matches!(
+                        self.element_kind(instance_key, &element_id),
+                        Some(ElementKind::TerminateEndEvent)
+                    ) {
+                        let shadowed: HashMap<String, Value> = self
+                            .state
+                            .instances
+                            .get(&instance_key)
+                            .and_then(|i| i.scope_variables.get(&element_instance_key))
+                            .map(|local| {
+                                variables
+                                    .iter()
+                                    .filter(|(k, _)| local.contains_key(*k))
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !shadowed.is_empty() {
+                            self.emit(
+                                &mut log,
+                                Event::ScopedVariablesUpdated {
+                                    instance_key,
+                                    scope_key: element_instance_key,
+                                    variables: shadowed,
+                                },
+                            );
+                        }
+                    }
                     // Job result variables propagate from the task's enclosing
                     // (flow) scope upward — each name updates the nearest ancestor
                     // scope that defines it, defaulting to root. For a root-only
@@ -2865,6 +2947,7 @@ impl Engine {
                         start_element_id,
                         HashMap::new(),
                         Vec::new(),
+                        None,
                         None,
                     );
                 }
@@ -3612,6 +3695,19 @@ impl Engine {
                                     })
                                 }
                             }
+                            // A terminate end's end-listener chain parked on an
+                            // incident (#985, #1430): re-drive its completion. The
+                            // terminate path reads the retained incident's
+                            // `outputs_applied` marker to decide whether to
+                            // re-project its single-pass output mappings and to
+                            // suppress a duplicate `ElementCompleting`.
+                            Some(state::IoMappingRedrive::TerminateEndCompletion { .. }) => {
+                                Some(Step::Complete {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                })
+                            }
                             // MI child input: re-apply the child's inputs and
                             // re-enact its behaviour for the same child instance.
                             Some(state::IoMappingRedrive::MiChildActivation {
@@ -3924,18 +4020,24 @@ impl Engine {
                 // for the same publish (Zeebe parity, issue #1156).
                 // Deterministic by process-definition key.
                 // The message's variables seed the new instance.
-                let mut started: Vec<(String, ElementId)> = if correlated_to_subscription {
+                let mut started: Vec<(String, ElementId, Key)> = if correlated_to_subscription {
                     Vec::new()
                 } else {
                     self.state
                         .message_start_subscriptions
                         .values()
                         .filter(|s| s.message_name == message_name)
-                        .map(|s| (s.process_id.clone(), s.start_element_id.clone()))
+                        .map(|s| {
+                            (
+                                s.process_id.clone(),
+                                s.start_element_id.clone(),
+                                s.process_definition_key,
+                            )
+                        })
                         .collect()
                 };
                 started.sort_unstable();
-                for (process_id, start_element_id) in started {
+                for (process_id, start_element_id, process_definition_key) in started {
                     self.start_or_dispatch_instance(
                         &mut log,
                         &mut queue,
@@ -3944,6 +4046,12 @@ impl Engine {
                         variables.clone(),
                         Vec::new(),
                         business_id.clone(),
+                        Some(MessageStartCorrelation {
+                            message_key,
+                            process_definition_key,
+                            message_name: message_name.clone(),
+                            correlation_key: correlation_key.clone(),
+                        }),
                     );
                 }
             }
@@ -4925,12 +5033,13 @@ impl Engine {
                 variables,
                 tags,
                 business_id,
+                message_start,
             } => {
                 check_business_id(business_id.as_deref())?;
                 // Routed from the deploy partition's StartInstanceDispatched: mint
                 // the start-triggered instance here, in this partition's namespace,
                 // so start-triggered load spreads across the cluster.
-                self.start_instance(
+                self.start_message_or_plain_instance(
                     &mut log,
                     &mut queue,
                     process_id,
@@ -4938,7 +5047,7 @@ impl Engine {
                     variables,
                     tags,
                     business_id,
-                    0,
+                    message_start,
                 );
             }
 
@@ -11768,10 +11877,26 @@ impl Engine {
         vars: &HashMap<String, Value>,
     ) -> Event {
         let listeners = self.listeners_of(instance_key, element_id, event_type);
-        let redrive = state::IoMappingRedrive::ExecutionListenerJob {
-            event_type,
-            listener_index: index,
-            scope,
+        // #1398: a failed listener job re-mints ONLY that listener on resume
+        // (`ExecutionListenerJob`), not the whole phase. The single exception is
+        // a terminate end's `end` chain (#985, #1430): its single-pass output
+        // projection already ran before the chain opened, so the resume must
+        // carry `outputs_applied: true` and not re-apply it or repeat
+        // `ElementCompleting`.
+        let redrive = if event_type == crate::model::ListenerEventType::End
+            && matches!(
+                self.element_kind(instance_key, element_id),
+                Some(ElementKind::TerminateEndEvent)
+            ) {
+            state::IoMappingRedrive::TerminateEndCompletion {
+                outputs_applied: true,
+            }
+        } else {
+            state::IoMappingRedrive::ExecutionListenerJob {
+                event_type,
+                listener_index: index,
+                scope,
+            }
         };
         let props = match listeners.get(index) {
             Some(listener) => {
@@ -11899,6 +12024,9 @@ impl Engine {
             ),
             Some(ElementKind::SubProcess { .. }) => {
                 self.finalize_subprocess(instance_key, element_instance_key, element_id, scope)
+            }
+            Some(ElementKind::TerminateEndEvent) => {
+                self.finalize_terminate_end(instance_key, element_instance_key, element_id, scope)
             }
             _ => self.finalize_completion(instance_key, element_instance_key, element_id, scope),
         }
@@ -12494,6 +12622,265 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        // End execution listeners (#985). Zeebe's `TerminateEndEventBehavior`
+        // completes the terminate end through the NORMAL completion path — the
+        // element enters COMPLETING, its `end` listener chain runs, and only
+        // `finalizeCompletion` (after the chain drains) records COMPLETED and
+        // terminates the sibling instances. So when the element declares `end`
+        // listeners, rest it in COMPLETING behind the first listener job and
+        // defer the scope-wide teardown to `finalize_terminate_end`, dispatched
+        // by `finalize_end_transition` once the chain drains. A listener-free
+        // terminate end keeps its byte-identical inline journal.
+        let has_end_listeners = !self
+            .listeners_of(
+                instance_key,
+                &element_id,
+                crate::model::ListenerEventType::End,
+            )
+            .is_empty();
+        if has_end_listeners {
+            // Replay-safe recovery progress. `ElementCompleting` is a transient
+            // transition with no state footprint, and the resume index
+            // (`end_listener_resume_index`) is `None` whenever the failure preceded
+            // the chain — the output projection, or listener 0's own job type — so
+            // neither can tell a first completion pass from a re-drive after such
+            // a failure. The retained terminate-end incident can: every re-drive
+            // follows a resolved `TerminateEndCompletion` incident on this element
+            // instance (incidents are kept as `Resolved` for audit, so the marker
+            // survives the resolution that triggered the re-drive, and replays
+            // identically from the journal). Its `outputs_applied` flag records
+            // whether the single-pass output projection already succeeded, so the
+            // re-drive re-applies it only when the failed pass never did.
+            let prior = self
+                .state
+                .incidents
+                .values()
+                .filter(|i| i.element_instance_key == element_instance_key)
+                .filter_map(|i| {
+                    if let Some(state::IoMappingRedrive::TerminateEndCompletion {
+                        outputs_applied,
+                    }) = i.redrive
+                    {
+                        Some((i.key, outputs_applied))
+                    } else {
+                        None
+                    }
+                })
+                // The most recent terminate-end completion incident is the
+                // authoritative progress marker (monotone keys = creation order).
+                .max_by_key(|(key, _)| *key)
+                .map(|(_, outputs_applied)| outputs_applied);
+            let completing_already_open = prior.is_some();
+            let outputs_applied = prior.unwrap_or(false);
+            // ADR 0037 (ordering pinned against Zeebe's `BpmnStreamProcessor`):
+            // `end` listeners run AFTER the element's `zeebe:output` mappings,
+            // and the listener job's own FEEL attributes resolve against the
+            // output-mapped view. A terminate end is no exception: project its
+            // output mappings into the flow scope before opening the chain.
+            // (The listener-free path keeps its byte-identical journal, so the
+            // projection lives behind this gate.)
+            //
+            // The projection is single-pass (#1171): re-applying a non-idempotent
+            // mapping (`=x + 1 -> x`) on a re-drive would double-apply it and
+            // overwrite completed listeners' writes. Skip it once it has been
+            // applied — a listener-chain failure parks with `outputs_applied =
+            // true`, so its re-drive resumes against the already-projected view.
+            let outputs = self.io_outputs(instance_key, &element_id);
+            let mut output_updates = HashMap::new();
+            if !outputs.is_empty() && !outputs_applied {
+                let visible = self.variables_for_element(instance_key, element_instance_key);
+                match self.eval_io_mappings_in(&visible, &outputs) {
+                    Ok(updates) => output_updates = updates,
+                    Err(failure) => {
+                        // Same lifecycle as a mainstream output-mapping failure
+                        // (#939): the element halts in COMPLETING on an
+                        // IO_MAPPING_ERROR incident, re-driven by `Complete` on
+                        // resolution. The chain never opened, so the re-drive
+                        // re-projects the (now-fixed) mappings before minting
+                        // listener 0 — no listener side effect is repeated.
+                        // `ElementCompleting` is written once per element
+                        // instance: a re-drive after resolution re-enters here
+                        // with the element already resting in COMPLETING (the
+                        // retained `TerminateEndCompletion` marker is the signal).
+                        // The output projection failed, so the redrive carries
+                        // `outputs_applied: false` and re-projects on resolution.
+                        let mut events = Vec::new();
+                        if !completing_already_open {
+                            events.push(Event::ElementCompleting {
+                                instance_key,
+                                element_instance_key,
+                                element_id: element_id.clone(),
+                            });
+                        }
+                        events.extend(
+                            self.cancel_all_conditional_subscriptions_on(element_instance_key),
+                        );
+                        events.push(self.io_mapping_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            state::IoMappingRedrive::TerminateEndCompletion {
+                                outputs_applied: false,
+                            },
+                        ));
+                        return (events, Vec::new());
+                    }
+                }
+            }
+            // The listener job's `type`/`retries` resolve against the
+            // completion-time view INCLUDING the output projection (not yet
+            // applied to state), exactly like the mainstream path overlays a
+            // staged script result.
+            let mut listener_vars =
+                (*self.variables_for_element(instance_key, element_instance_key)).clone();
+            listener_vars.extend(output_updates.clone());
+            // A mid-chain listener's job-type failure (#1390) parks the element
+            // on an EXTRACT_VALUE_ERROR incident with redrive `Completion`; the
+            // resolution re-enters HERE via `Step::Complete`. Resume the chain
+            // one past the highest-index listener job already minted (the same
+            // replay-safe progress signal the `start` side uses) so resolving
+            // never repeats a completed listener's side effects. `None` means
+            // no listener job exists yet — the failure preceded the chain (the
+            // output projection above, or listener 0's own type), so the chain
+            // opens at listener 0.
+            let resume_at = self
+                .end_listener_resume_index(instance_key, element_instance_key, &element_id)
+                .unwrap_or(0);
+            let end_listeners = self.listeners_of(
+                instance_key,
+                &element_id,
+                crate::model::ListenerEventType::End,
+            );
+            // `ElementCompleting` is written once per element instance: on the
+            // first completion pass. A re-drive after an incident resolution
+            // re-enters here with the element already resting in COMPLETING —
+            // repeating the record would double it on the journal (Zeebe has
+            // exactly one). The already-open marker (the retained completion-phase
+            // incident history) is the replay-safe signal: it covers a mid-chain
+            // failure AND a failure that preceded the chain (the output projection
+            // or listener 0's job type), where the resume index is still `None`.
+            let mut events = Vec::new();
+            if !completing_already_open {
+                events.push(Event::ElementCompleting {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                });
+            }
+            if !output_updates.is_empty() {
+                // An input-mapped local of the same name would otherwise SHADOW
+                // the projected value for every later (and resumed) end listener:
+                // the outward propagation below never touches the element's own
+                // scope. Mirror the projected value onto any such shadowing local
+                // ONCE, here (the single projection pass), so listeners 1..n and
+                // an incident resume read the output-mapped view without
+                // re-evaluating outputs; later listener writes still land after.
+                let shadowed: HashMap<String, Value> = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.scope_variables.get(&element_instance_key))
+                    .map(|local| {
+                        output_updates
+                            .iter()
+                            .filter(|(k, _)| local.contains_key(*k))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !shadowed.is_empty() {
+                    events.push(Event::ScopedVariablesUpdated {
+                        instance_key,
+                        scope_key: element_instance_key,
+                        variables: shadowed,
+                    });
+                }
+                // Merge the projection into the enclosing (flow) scope and
+                // upward — the element's own scope is torn down by its
+                // completion, so propagating from the parent avoids writing
+                // into the dying scope (mirrors the mainstream path).
+                let flow_scope = self.scope_of(instance_key, element_instance_key);
+                events.extend(self.propagated_updates(
+                    instance_key,
+                    flow_scope,
+                    output_updates,
+                    false,
+                ));
+            }
+            if resume_at >= end_listeners.len() {
+                // Every listener job was already minted (the chain drained
+                // without the deferred completion running — only reachable by a
+                // re-drive after the last listener's completion): run the
+                // deferred completion tail directly.
+                let (tail, steps) = self.finalize_terminate_end(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    scope,
+                );
+                events.extend(tail);
+                return (events, steps);
+            }
+            if resume_at == 0 {
+                // The output projection already succeeded this pass (it runs
+                // before the chain opens), so a listener-0 job-type failure parks
+                // with `outputs_applied: true` — the resume must not re-apply the
+                // (single-pass) mappings.
+                if let Some(first) = self.begin_end_listener_chain(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    scope,
+                    &listener_vars,
+                ) {
+                    events.push(first);
+                }
+            } else {
+                // Resume mid-chain: mint the failed listener's job (its
+                // type/retries resolved against the output-mapped view), or —
+                // when its expression still fails — re-raise the incident.
+                // `execution_listener_job_event` resolves strictly (#1398) and
+                // carries the terminate end's `TerminateEndCompletion` redrive
+                // (`outputs_applied: true` — the single-pass projection already
+                // ran before the chain opened), so the resume neither re-applies
+                // the mappings nor repeats `ElementCompleting` (#1430).
+                events.push(self.execution_listener_job_event(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    crate::model::ListenerEventType::End,
+                    resume_at,
+                    scope,
+                    &listener_vars,
+                ));
+            }
+            return (events, Vec::new());
+        }
+        let mut events = vec![Event::ElementCompleting {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        let (tail, steps) =
+            self.finalize_terminate_end(instance_key, element_instance_key, element_id, scope);
+        events.extend(tail);
+        (events, steps)
+    }
+
+    /// The COMPLETED tail of a terminate end event (#985): records the terminate
+    /// end's own `ElementCompleted`, then kills every other token in its scope
+    /// and completes that scope (see [`complete_terminate_end`]). Runs inline for
+    /// a listener-free terminate end, or from [`finalize_end_transition`] once
+    /// its `end` execution-listener chain has drained — the element then already
+    /// rests in COMPLETING, so this emits no second `ElementCompleting`.
+    fn finalize_terminate_end(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         if scope == 0 {
             // Top-level terminate end: complete the terminate-end itself, then
             // discard every remaining token and COMPLETE the whole instance.
@@ -12507,18 +12894,11 @@ impl Engine {
             // while the child's variables and the parent's call-activity token
             // are still live — the events below are decided, not yet applied.
             let release_parent = self.call_activity_completion_step(instance_key);
-            let mut events = vec![
-                Event::ElementCompleting {
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                },
-                Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                },
-            ];
+            let mut events = vec![Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id,
+            }];
             events.extend(self.discard_instance_token_events(instance_key));
             // Resolve every incident still open on the instance before the
             // terminal record. The `ProcessInstanceTerminated` reducer used to
@@ -12545,8 +12925,36 @@ impl Engine {
         // token inside the dead scope (which would keep the sub-process from ever
         // draining) — the sub-process token stays active until the sweep, so the
         // dead-scope guard needs this marker, not just the `active` map.
+        //
+        // The terminate end is itself a descendant of `scope`, so the teardown
+        // sweep would record its completion too — but the sweep visits
+        // descendants in key order, so a sibling with a smaller
+        // element-instance key would be canceled/completed BEFORE the terminate
+        // end's own record. Zeebe's ordering is completion-before-teardown: the
+        // terminate end's `ElementCompleted` is emitted FIRST here, and both of
+        // its lifecycle records are filtered from the sweep (it already rests
+        // in COMPLETING — the caller wrote that record, before any `end`
+        // listener chain — so its duplicate `ElementCompleting` is dropped and
+        // only one COMPLETING per element instance remains, as in Zeebe).
         self.torn_down_scopes.insert(scope);
-        (self.scope_teardown_events(instance_key, scope), Vec::new())
+        let mut events = vec![Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            element_id,
+        }];
+        events.extend(
+            self.scope_teardown_events(instance_key, scope)
+                .into_iter()
+                .filter(|event| {
+                    !matches!(
+                        event,
+                        Event::ElementCompleting { element_instance_key: eik, .. }
+                        | Event::ElementCompleted { element_instance_key: eik, .. }
+                            if *eik == element_instance_key
+                    )
+                }),
+        );
+        (events, Vec::new())
     }
 
     /// The `start` execution-listener index a resolved mid-chain job-type
@@ -12562,6 +12970,44 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
     ) -> Option<usize> {
+        self.listener_resume_index_for(
+            instance_key,
+            element_instance_key,
+            element_id,
+            crate::model::ListenerEventType::Start,
+        )
+    }
+
+    /// The `end` execution-listener index a resolved mid-chain job-type failure
+    /// (#1390) resumes at: one past the highest-index `end` listener job the
+    /// element already minted, or `None` when no `end` listener job exists (the
+    /// failure preceded the chain — the output projection or the first
+    /// listener's job type — so the chain opens at listener 0). Same
+    /// minted-not-completed counting as [`listener_resume_index`].
+    fn end_listener_resume_index(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) -> Option<usize> {
+        self.listener_resume_index_for(
+            instance_key,
+            element_instance_key,
+            element_id,
+            crate::model::ListenerEventType::End,
+        )
+    }
+
+    /// Shared resume-index computation behind [`listener_resume_index`] and
+    /// [`end_listener_resume_index`]: one past the highest-index listener job
+    /// of `event_type` minted for this element instance.
+    fn listener_resume_index_for(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        event_type: crate::model::ListenerEventType,
+    ) -> Option<usize> {
         self.state
             .jobs
             .values()
@@ -12572,10 +13018,10 @@ impl Engine {
             })
             .filter_map(|j| match j.kind {
                 state::JobKind::ExecutionListener {
-                    event_type: crate::model::ListenerEventType::Start,
+                    event_type: kind,
                     index,
                     ..
-                } => Some(index),
+                } if kind == event_type => Some(index),
                 _ => None,
             })
             .max()
@@ -12602,7 +13048,11 @@ impl Engine {
             // The element's applied scope view (input mappings for a start chain,
             // completion-time state for an end chain, plus any variables merged by
             // preceding listener completions) is what the next listener's FEEL
-            // attributes resolve against.
+            // attributes resolve against. `execution_listener_job_event` resolves
+            // the listener's job props strictly (#1398) and, on failure, parks the
+            // element with the chain-appropriate redrive — `ExecutionListenerJob`
+            // to re-mint only this listener, or a terminate end's
+            // `TerminateEndCompletion` (#985, #1430).
             let listener_vars = self.variables_for_element(instance_key, element_instance_key);
             return (
                 vec![self.execution_listener_job_event(
