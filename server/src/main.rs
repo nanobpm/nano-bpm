@@ -12498,9 +12498,13 @@ impl ServerImpl {
                             Some(e.correlation_time_ms as i64),
                         )
                         && query::match_string(&f.element_id, &e.element_id)
-                        && query::match_element_instance_key(
+                        // A message-start row (#1300) has no element
+                        // instance (0 sentinel): absent to `$exists`.
+                        && query::match_element_instance_key_opt(
                             &f.element_instance_key,
-                            &e.element_instance_key.to_string(),
+                            (e.element_instance_key != 0)
+                                .then(|| e.element_instance_key.to_string())
+                                .as_deref(),
                         )
                         && query::match_basic_string(&f.message_key, &e.message_key.to_string())
                         && query::match_string(&f.message_name, &e.message_name)
@@ -28381,6 +28385,23 @@ mod clustered_startup_tests {
             item.business_id,
             nullable_business_id(Some("biz-9".to_string()))
         );
+
+        // The null elementInstanceKey must be absent to existence filters.
+        for (exists, expected) in [(false, 1usize), (true, 0usize)] {
+            let query: models::CorrelatedMessageSubscriptionSearchQuery =
+                serde_json::from_value(serde_json::json!({"filter": {
+                    "businessId": "biz-9",
+                    "elementInstanceKey": {"$exists": exists}}}))
+                .expect("valid query");
+            let Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) = server
+                .search_correlated_message_subscriptions_impl(&Some(query))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a search result");
+            };
+            assert_eq!(r.items.len(), expected, "$exists: {exists}");
+        }
     }
 
     /// `ProcessDefinitionFilter.state` (upstream #1291 re-sync): Nano never

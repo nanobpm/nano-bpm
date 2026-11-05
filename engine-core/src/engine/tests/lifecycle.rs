@@ -7706,3 +7706,57 @@ fn dispatched_message_start_records_the_correlation_on_the_target() {
         }
     )));
 }
+
+/// #1300: a message-start dispatch that lands on the target after a newer
+/// version was deployed must still create the instance from the definition
+/// whose subscription correlated the message — otherwise the correlation
+/// record names v1 while the instance runs v2.
+#[test]
+fn dispatched_message_start_pins_the_correlated_definition_across_redeploy() {
+    let mut target = Engine::with_partition(2);
+    target.set_num_partitions(4);
+    let deployed = target
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let v1 = deployed
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .unwrap();
+    let mut v2_def = process_with_message_start();
+    v2_def.name = Some("v2".into());
+    target
+        .apply_command(Command::DeployProcess(v2_def))
+        .unwrap();
+    let fired = target
+        .apply_command(Command::DispatchStartInstance {
+            process_id: "order-flow".into(),
+            start_element_id: "start".into(),
+            variables: HashMap::new(),
+            tags: Vec::new(),
+            business_id: None,
+            message_start: Some(crate::MessageStartCorrelation {
+                message_key: 42,
+                process_definition_key: v1,
+                message_name: "order-placed".into(),
+                correlation_key: "c".into(),
+            }),
+        })
+        .unwrap();
+    let created = fired
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessInstanceCreated {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(created, v1);
+}

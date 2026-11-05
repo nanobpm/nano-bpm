@@ -1550,7 +1550,12 @@ impl Engine {
             variables,
             tags,
             business_id,
-            0,
+            // A message start pins the definition whose subscription correlated
+            // the message, so a redeploy between dispatch and delivery cannot
+            // run a different version than the correlation record names.
+            message_start
+                .as_ref()
+                .map_or(0, |m| m.process_definition_key),
         );
         if let Some(m) = message_start {
             self.emit(
