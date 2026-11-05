@@ -6170,6 +6170,31 @@ impl Engine {
     /// Builds the incident for an expression [`expression::Failure`] (Zeebe
     /// `BpmnIncidentBehavior.createIncident(failure, context)`): the failure's
     /// error type selects the incident kind, its message is the reason.
+    /// The single construction site for a gateway routing incident (Zeebe
+    /// `CONDITION_ERROR`): every exclusive/inclusive selection failure — at
+    /// activation, completion, or after an `end` listener chain — raises it
+    /// through here, so kind and reason cannot drift between paths.
+    fn routing_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        failure: RoutingFailure,
+        redrive: Option<state::IoMappingRedrive>,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: failure.kind,
+            redrive,
+            reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
+    }
+
     fn expression_incident(
         &mut self,
         instance_key: Key,
@@ -6629,8 +6654,42 @@ impl Engine {
             // and immediately completes (no job). Its FEEL expression is
             // evaluated at completion (see `complete`), where a failure raises
             // an ExpressionEvaluation incident that re-evaluates on resolution.
-            // Pass-through elements (events, exclusive gateway, parallel split)
-            // complete immediately; routing happens at completion.
+            // A split gateway (exclusive; inclusive fork — a join is routed by
+            // `activate_join`) selects its outgoing flow(s) in Zeebe's
+            // `onActivate`, BEFORE `transitionToActivated`
+            // (`ExclusiveGatewayProcessor.findSequenceFlowToTake`,
+            // `InclusiveGatewayProcessor.findSequenceFlowsToTake`). A routing
+            // failure therefore raises its incident while the gateway is still
+            // ACTIVATING (#1402): the `Activation` redrive is re-tagged
+            // `ActivationPending` by `gate_activated`, so resolution re-runs
+            // this body and emits `ElementActivated` only once a flow matches.
+            // On success it completes and routes (the selection is pure over
+            // the same variables, so `complete` re-selects the same flow).
+            Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway) => {
+                let selection = if matches!(kind, Some(ElementKind::ExclusiveGateway)) {
+                    self.select_exclusive_flow(instance_key, element_instance_key, &element_id)
+                        .map(|_| ())
+                } else {
+                    self.select_inclusive_flows(instance_key, element_instance_key, &element_id)
+                        .map(|_| ())
+                };
+                match selection {
+                    Ok(()) => followups.push(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    }),
+                    Err(failure) => events.push(self.routing_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        Some(state::IoMappingRedrive::Activation),
+                    )),
+                }
+            }
+            // Pass-through elements (events, parallel split) complete
+            // immediately; routing happens at completion.
             Some(_) => {
                 followups.push(Step::Complete {
                     instance_key,
@@ -11615,9 +11674,9 @@ impl Engine {
     /// Selects the outgoing flow an exclusive gateway takes, evaluating each
     /// conditional flow in document order against the instance variables and
     /// falling back to the explicit `default` flow when none matches. Returns the
-    /// chosen flow's index in the outgoing list (`Ok(Some)`), `Ok(None)` when nothing matches and
-    /// there is no default (the caller raises a no-matching-flow incident), or
-    /// `Err(reason)` when a condition failed to evaluate (an expression incident).
+    /// chosen flow's index in the outgoing list, or the [`RoutingFailure`] (no
+    /// match and no default, or a condition that failed to evaluate) the caller
+    /// raises as an incident via [`Engine::routing_incident`].
     /// Pure over the current variables, so the end-listener gate can re-select at
     /// [`finalize_exclusive_gateway`] time without captured state.
     fn select_exclusive_flow(
@@ -11625,7 +11684,7 @@ impl Engine {
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-    ) -> Result<Option<usize>, String> {
+    ) -> Result<usize, RoutingFailure> {
         let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         for (index, flow) in self
@@ -11641,21 +11700,22 @@ impl Engine {
                 continue;
             }
             match &flow.condition {
-                None => return Ok(Some(index)),
+                None => return Ok(index),
                 Some(condition) => match condition.eval(&variables) {
-                    Ok(true) => return Ok(Some(index)),
+                    Ok(true) => return Ok(index),
                     Ok(false) => continue,
                     Err(err) => {
-                        return Err(format!(
-                            "failed to evaluate condition '{}' at exclusive gateway \
-                             '{element_id}': {}",
-                            condition.expression, err.0
+                        return Err(RoutingFailure::condition(
+                            "exclusive",
+                            element_id,
+                            &condition.expression,
+                            &err.0,
                         ));
                     }
                 },
             }
         }
-        Ok(default_flow)
+        default_flow.ok_or_else(|| RoutingFailure::no_match("exclusive", element_id))
     }
 
     fn complete_exclusive_gateway(
@@ -11664,30 +11724,8 @@ impl Engine {
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected =
-            match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
-                Ok(sel) => sel,
-                Err(reason) => {
-                    let incident_key = self.mint_key();
-                    return (
-                        vec![Event::IncidentRaised {
-                            incident_key,
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            kind: state::IncidentKind::ExpressionEvaluation,
-                            redrive: None,
-                            reason,
-                            job_key: None,
-                            created_at: self.now,
-                        }],
-                        Vec::new(),
-                    );
-                }
-            };
-
-        match selected {
-            Some(flow_index) => {
+        match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
+            Ok(flow_index) => {
                 let scope = self.scope_of(instance_key, element_instance_key);
                 let mut events = vec![Event::ElementCompleting {
                     instance_key,
@@ -11717,25 +11755,20 @@ impl Engine {
                 events.extend(taken);
                 (events, vec![step])
             }
-            None => {
-                // The token stays active (parked on the incident) so the instance
-                // does not falsely complete.
-                let incident_key = self.mint_key();
-                let events = vec![Event::IncidentRaised {
-                    incident_key,
+            // Normally unreachable: the selection already succeeded while the
+            // gateway was ACTIVATING (`run_activation_body`, #1402). Kept total:
+            // the token stays parked on the incident so the instance does not
+            // falsely complete.
+            Err(failure) => (
+                vec![self.routing_incident(
                     instance_key,
                     element_instance_key,
-                    element_id: element_id.clone(),
-                    kind: state::IncidentKind::NoMatchingSequenceFlow,
-                    redrive: None,
-                    reason: format!(
-                        "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
-                    ),
-                    job_key: None,
-                    created_at: self.now,
-                }];
-                (events, Vec::new())
-            }
+                    element_id,
+                    failure,
+                    None,
+                )],
+                Vec::new(),
+            ),
         }
     }
 
@@ -11755,7 +11788,7 @@ impl Engine {
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
         match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
-            Ok(Some(flow_index)) => {
+            Ok(flow_index) => {
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
                 let mut events = vec![Event::ElementCompleted {
                     instance_key,
@@ -11765,60 +11798,35 @@ impl Engine {
                 events.extend(taken);
                 (events, vec![step])
             }
-            Ok(None) => {
-                // No flow matches now (and no default). Keep the token parked on
-                // an incident — do not complete — mirroring the non-listener path.
-                let incident_key = self.mint_key();
-                (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        kind: state::IncidentKind::NoMatchingSequenceFlow,
-                        redrive: None,
-                        reason: format!(
-                            "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
-                        ),
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                )
-            }
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                )
-            }
+            // No flow matches now (a listener rewrote a condition variable), or
+            // a condition fails: keep the token parked on an incident — do not
+            // complete — mirroring the non-listener path.
+            Err(failure) => (
+                vec![self.routing_incident(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    failure,
+                    None,
+                )],
+                Vec::new(),
+            ),
         }
     }
 
     /// Inclusive gateway: selects **every** outgoing flow whose condition holds
     /// (an unconditional non-default flow is always taken), falling back to the
     /// explicit `default` flow only when no conditional flow matches. Returns the
-    /// chosen flows' indices in the outgoing list (`Ok(vec)`; an empty vec means nothing matched and there is
-    /// no default — the caller raises a no-matching-flow incident), or
-    /// `Err(reason)` when a condition failed to evaluate. Pure over the current
+    /// chosen flows' indices in the outgoing list (never empty), or the
+    /// [`RoutingFailure`] (no match and no default, or a condition that failed
+    /// to evaluate) the caller raises as an incident. Pure over the current
     /// variables so the end-listener gate can re-select without captured state.
     fn select_inclusive_flows(
         &self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-    ) -> Result<Vec<usize>, String> {
+    ) -> Result<Vec<usize>, RoutingFailure> {
         let variables = self.variables_for_element(instance_key, element_instance_key);
         let mut default_flow = None;
         let mut selected = Vec::new();
@@ -11837,18 +11845,20 @@ impl Engine {
                     Ok(true) => selected.push(index),
                     Ok(false) => continue,
                     Err(err) => {
-                        return Err(format!(
-                            "failed to evaluate condition '{}' at inclusive gateway \
-                             '{element_id}': {}",
-                            condition.expression, err.0
+                        return Err(RoutingFailure::condition(
+                            "inclusive",
+                            element_id,
+                            &condition.expression,
+                            &err.0,
                         ));
                     }
                 },
             }
         }
         if selected.is_empty() {
-            if let Some(d) = default_flow {
-                selected.push(d);
+            match default_flow {
+                Some(d) => selected.push(d),
+                None => return Err(RoutingFailure::no_match("inclusive", element_id)),
             }
         }
         Ok(selected)
@@ -11896,43 +11906,19 @@ impl Engine {
         let selected =
             match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
                 Ok(sel) => sel,
-                Err(reason) => {
-                    let incident_key = self.mint_key();
+                Err(failure) => {
                     return (
-                        vec![Event::IncidentRaised {
-                            incident_key,
+                        vec![self.routing_incident(
                             instance_key,
                             element_instance_key,
                             element_id,
-                            kind: state::IncidentKind::ExpressionEvaluation,
-                            redrive: None,
-                            reason,
-                            job_key: None,
-                            created_at: self.now,
-                        }],
+                            failure,
+                            None,
+                        )],
                         Vec::new(),
                     );
                 }
             };
-        if selected.is_empty() {
-            let incident_key = self.mint_key();
-            return (
-                vec![Event::IncidentRaised {
-                    incident_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    kind: state::IncidentKind::NoMatchingSequenceFlow,
-                    redrive: None,
-                    reason: format!(
-                        "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
-                    ),
-                    job_key: None,
-                    created_at: self.now,
-                }],
-                Vec::new(),
-            );
-        }
         let mut events = vec![Event::ElementCompleting {
             instance_key,
             element_instance_key,
@@ -11985,7 +11971,7 @@ impl Engine {
             &mut events,
         );
         match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
-            Ok(selected) if !selected.is_empty() => {
+            Ok(selected) => {
                 events.push(Event::ElementCompleted {
                     instance_key,
                     element_instance_key,
@@ -12000,36 +11986,14 @@ impl Engine {
                 }
                 (events, followups)
             }
-            Ok(_) => {
-                let incident_key = self.mint_key();
-                events.push(Event::IncidentRaised {
-                    incident_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    kind: state::IncidentKind::NoMatchingSequenceFlow,
-                    redrive: None,
-                    reason: format!(
-                        "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
-                    ),
-                    job_key: None,
-                    created_at: self.now,
-                });
-                (events, Vec::new())
-            }
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                events.push(Event::IncidentRaised {
-                    incident_key,
+            Err(failure) => {
+                events.push(self.routing_incident(
                     instance_key,
                     element_instance_key,
                     element_id,
-                    kind: state::IncidentKind::ExpressionEvaluation,
-                    redrive: None,
-                    reason,
-                    job_key: None,
-                    created_at: self.now,
-                });
+                    failure,
+                    None,
+                ));
                 (events, Vec::new())
             }
         }
@@ -14251,6 +14215,37 @@ pub fn check_business_id(business_id: Option<&str>) -> Result<(), EngineError> {
         Ok(())
     } else {
         Err(EngineError::BusinessIdInvalid { chars })
+    }
+}
+
+/// Why a split gateway could not select an outgoing flow (Zeebe
+/// `CONDITION_ERROR`): a condition failed to evaluate
+/// ([`state::IncidentKind::ExpressionEvaluation`]) or nothing matched and there
+/// is no default ([`state::IncidentKind::NoMatchingSequenceFlow`]).
+#[derive(Debug)]
+struct RoutingFailure {
+    kind: state::IncidentKind,
+    reason: String,
+}
+
+impl RoutingFailure {
+    fn condition(gateway: &str, element_id: &str, expression: &str, err: &str) -> Self {
+        RoutingFailure {
+            kind: state::IncidentKind::ExpressionEvaluation,
+            reason: format!(
+                "failed to evaluate condition '{expression}' at {gateway} gateway \
+                 '{element_id}': {err}"
+            ),
+        }
+    }
+
+    fn no_match(gateway: &str, element_id: &str) -> Self {
+        RoutingFailure {
+            kind: state::IncidentKind::NoMatchingSequenceFlow,
+            reason: format!(
+                "no matching outgoing sequence flow at {gateway} gateway '{element_id}'"
+            ),
+        }
     }
 }
 

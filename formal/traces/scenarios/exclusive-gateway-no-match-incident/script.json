@@ -1,0 +1,8 @@
+{
+  "description": "#1402: an exclusive gateway whose only (conditional) flow does not match and has no default raises CONDITION_ERROR while still ACTIVATING; after the variable is fixed, resolving the incident activates, completes and routes it.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "exclusive-gateway-no-match-incident", "variables": { "amount": 5 } },
+    { "op": "updateVariables", "variables": { "amount": 500 } },
+    { "op": "resolveIncident", "elementId": "split" }
+  ]
+}

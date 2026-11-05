@@ -594,9 +594,10 @@
     },
     {
       "match": "incident:CONDITION_ERROR",
-      "status": "nano-tested",
+      "status": "parity",
       "evidence": [
-        "engine-core/src/engine/tests/incidents.rs::should_raise_incident_when_no_exclusive_flow_matches"
+        "traces:exclusive-gateway-no-match-incident",
+        "traces:inclusive-gateway-no-match-incident"
       ]
     },
     {
@@ -1027,9 +1028,10 @@
     },
     {
       "match": "failure:ExclusiveGatewayProcessor.findSequenceFlowToTake:CONDITION_ERROR",
-      "status": "gap",
-      "issue": 1249,
-      "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
+      "status": "parity",
+      "evidence": [
+        "traces:exclusive-gateway-no-match-incident"
+      ]
     },
     {
       "match": "failure:ExpressionProcessor.evaluateExpressionAsEither:EXTRACT_VALUE_ERROR",
@@ -1063,9 +1065,10 @@
     },
     {
       "match": "failure:InclusiveGatewayProcessor.findSequenceFlowsToTake:CONDITION_ERROR",
-      "status": "gap",
-      "issue": 1249,
-      "note": "Per-site Zeebe Failure construction; needs differential scenario evidence against Zeebe."
+      "status": "parity",
+      "evidence": [
+        "traces:inclusive-gateway-no-match-incident"
+      ]
     },
     {
       "match": "failure:MultiInstanceBodyProcessor.onChildActivating:EXTRACT_VALUE_ERROR",

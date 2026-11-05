@@ -444,3 +444,137 @@ fn should_resolve_incident_if_task_is_terminated() {
     );
     assert!(engine.active_incidents().is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// #1402: a split gateway (exclusive, inclusive fork) selects its outgoing flows
+// in Zeebe's `onActivate` (`ExclusiveGatewayProcessor.findSequenceFlowToTake`,
+// `InclusiveGatewayProcessor.findSequenceFlowsToTake`) — BEFORE
+// `transitionToActivated`. A routing failure (no matching flow, or a condition
+// that fails to evaluate) therefore raises its CONDITION_ERROR incident while
+// the gateway is still ACTIVATING; resolving re-runs the selection and only
+// then emits ACTIVATED → COMPLETING → COMPLETED. Guarded for the whole class:
+// both split-gateway kinds × both failure modes.
+// ---------------------------------------------------------------------------
+
+/// Which split gateway the routing-failure fixture uses.
+#[derive(Clone, Copy, Debug)]
+enum SplitGateway {
+    Exclusive,
+    Inclusive,
+}
+
+/// `start → g (split) → end`, single conditional flow `condition`, no default.
+fn split_gateway_process(gateway: SplitGateway, condition: &str) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("split").start_event("s");
+    let builder = match gateway {
+        SplitGateway::Exclusive => builder.exclusive_gateway("g"),
+        SplitGateway::Inclusive => builder.inclusive_gateway("g"),
+    };
+    builder
+        .end_event("e")
+        .connect("s", "g")
+        .connect_when("g", "e", condition)
+        .build()
+        .unwrap()
+}
+
+/// Drives one routing failure end to end and asserts the Zeebe lifecycle:
+/// the incident is raised with `g` only ACTIVATING, and resolution (after the
+/// variables are fixed) activates, completes and routes it.
+fn assert_routing_failure_parks_activating(
+    gateway: SplitGateway,
+    bad: Value,
+    expected_kind: state::IncidentKind,
+) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(split_gateway_process(
+            gateway,
+            "amount > 100",
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "split",
+            HashMap::from([("amount".to_string(), bad)]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert_eq!(
+        lifecycle_of(&created, "g"),
+        vec!["Activating"],
+        "{gateway:?}: the routing incident is raised while ACTIVATING: {created:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{gateway:?}: {incidents:?}");
+    assert_eq!(incidents[0].kind, expected_kind, "{gateway:?}");
+    assert_eq!(incidents[0].element_id, "g");
+    let incident_key = incidents[0].key;
+    let raised_at = created
+        .iter()
+        .position(|e| matches!(e, Event::IncidentRaised { .. }))
+        .unwrap();
+    assert!(
+        !created[..raised_at]
+            .iter()
+            .any(|e| matches!(e, Event::ElementActivated { element_id, .. } if element_id == "g")),
+        "{gateway:?}: no ELEMENT_ACTIVATED before the incident"
+    );
+
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&resolved, "g"),
+        vec!["Activated", "Completing", "Completed"],
+        "{gateway:?}: resolution activates then completes: {resolved:?}"
+    );
+    assert!(engine.active_incidents().is_empty());
+    assert!(
+        engine.is_completed(inst),
+        "{gateway:?}: token routed to the end"
+    );
+}
+
+#[test]
+fn exclusive_gateway_no_matching_flow_raises_incident_while_activating() {
+    assert_routing_failure_parks_activating(
+        SplitGateway::Exclusive,
+        Value::Int(5),
+        state::IncidentKind::NoMatchingSequenceFlow,
+    );
+}
+
+#[test]
+fn exclusive_gateway_condition_failure_raises_incident_while_activating() {
+    assert_routing_failure_parks_activating(
+        SplitGateway::Exclusive,
+        Value::Str("five".into()),
+        state::IncidentKind::ExpressionEvaluation,
+    );
+}
+
+#[test]
+fn inclusive_split_no_matching_flow_raises_incident_while_activating() {
+    assert_routing_failure_parks_activating(
+        SplitGateway::Inclusive,
+        Value::Int(5),
+        state::IncidentKind::NoMatchingSequenceFlow,
+    );
+}
+
+#[test]
+fn inclusive_split_condition_failure_raises_incident_while_activating() {
+    assert_routing_failure_parks_activating(
+        SplitGateway::Inclusive,
+        Value::Str("five".into()),
+        state::IncidentKind::ExpressionEvaluation,
+    );
+}
