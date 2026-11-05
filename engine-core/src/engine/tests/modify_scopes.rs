@@ -2118,3 +2118,75 @@ fn created_scope_local_shadows_existing_ancestor_local_in_preflight() {
     assert_eq!(eiks(&engine, inst, "middle").len(), 1, "middle is shared");
     assert_eq!(inner_subscription_keys(&engine, inst), vec!["ready"]);
 }
+
+/// Two activations in one command sharing a sub-process the command creates:
+/// application creates (and arms) the scope once, on the first activation, so
+/// the boundary preflight runs only there. A later instruction that changes the
+/// variable the boundary reads must not re-check (and reject) the already
+/// captured subscription (#1398 review).
+#[test]
+fn shared_created_scope_boundary_is_checked_only_on_first_creation() {
+    let def = ProcessBuilder::new("boundary-shared-scope")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .parallel_gateway("fork")
+        .contained_in("fork", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .service_task("c", "jobC")
+        .contained_in("c", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .end_event("se2")
+        .contained_in("se2", "sub")
+        .message_boundary_event("mb", "sub", "cancel", "=k")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "fork")
+        .connect("fork", "b")
+        .connect("fork", "c")
+        .connect("b", "se")
+        .connect("c", "se2")
+        .connect("sub", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![
+                ActivateElementInstruction {
+                    element_id: "b".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("k", Value::Str("ready".into()))]),
+                        scope_id: None,
+                    }],
+                    ..Default::default()
+                },
+                ActivateElementInstruction {
+                    element_id: "c".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("k", Value::Null)]),
+                        scope_id: None,
+                    }],
+                    ..Default::default()
+                },
+            ],
+        ))
+        .expect("the shared scope armed once, with k = \"ready\"");
+    let keys: Vec<&str> = engine
+        .state()
+        .message_subscriptions
+        .values()
+        .filter(|s| s.instance_key == inst && s.element_id == "sub")
+        .map(|s| s.correlation_key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["ready"]);
+}

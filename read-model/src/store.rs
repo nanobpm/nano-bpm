@@ -6409,6 +6409,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }
+        | Event::MultiInstanceCompletionConditionFulfilled { .. }
         | Event::MultiInstanceChildActivated { .. }
         | Event::MultiInstanceChildCompleted { .. }
         | Event::MultiInstanceCompleted { .. }

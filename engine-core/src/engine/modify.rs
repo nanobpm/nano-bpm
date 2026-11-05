@@ -471,6 +471,12 @@ impl Engine {
         // an incident AFTER earlier instructions already emitted — breaking
         // all-or-nothing (#1398 review).
         let mut staged = StagedWrites::default();
+        // Scopes an earlier instruction already creates: application reuses
+        // them (keyed by parent instance + scope id) and arms their boundaries
+        // only once, on creation — so only the FIRST creation is checked; a
+        // later activation sharing the scope keeps the captured subscription.
+        let mut created: std::collections::HashSet<CreatedScopePath> =
+            std::collections::HashSet::new();
         for planned in &activations {
             if planned.resolution.to_create.is_empty() {
                 self.stage_writes(instance_key, planned, &mut staged);
@@ -483,15 +489,19 @@ impl Engine {
                 // flow scope): the scope's own locals are layered on only
                 // AFTER its boundaries are checked, so they are visible to
                 // nested scopes but never to the scope's own boundaries.
-                let checked = self.check_boundary_arming(instance_key, scope_id, &host_vars);
-                // The scope's locals, layered in lexical order while
-                // descending: earlier instructions' writes to this same
-                // created scope instance (shared with this activation), then
-                // this instruction's own.
                 let path = (
                     planned.resolution.existing,
                     planned.resolution.to_create[..=depth].to_vec(),
                 );
+                let checked = if created.insert(path.clone()) {
+                    self.check_boundary_arming(instance_key, scope_id, &host_vars)
+                } else {
+                    Ok(())
+                };
+                // The scope's locals, layered in lexical order while
+                // descending: earlier instructions' writes to this same
+                // created scope instance (shared with this activation), then
+                // this instruction's own.
                 for variables in staged.created_scope_writes(&path) {
                     host_vars.extend(variables.clone());
                 }
