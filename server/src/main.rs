@@ -31316,13 +31316,13 @@ mod clustered_startup_tests {
     async fn operator_fix_and_retry_loop_via_shared_core() {
         let server = ServerImpl::default();
 
-        // A script `=n + 1` raises an ExpressionEvaluation incident when `n` is a
+        // A script `=assert(n, n instance of number) + 1` raises an ExpressionEvaluation incident when `n` is a
         // string; fixing `n` and resolving re-evaluates it (no job retries needed,
         // unlike a job-exhaustion incident) — the exact data-fix loop the console
         // targets.
         let proc = ProcessBuilder::new("scripted-fail")
             .start_event("s")
-            .script_task("calc", "=n + 1", "next")
+            .script_task("calc", "=assert(n, n instance of number) + 1", "next")
             .end_event("e")
             .connect("s", "calc")
             .connect("calc", "e")
