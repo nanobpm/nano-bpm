@@ -675,24 +675,62 @@ impl Engine {
         // /signal names, correlation keys) evaluate against — its flow scope, so a
         // boundary on an activity nested in a sub-process sees the enclosing
         // scope's locals. Root-scope hosts get the shared root Arc (unchanged).
+        match self.arm_boundaries_from(instance_key, element_instance_key, scope, element_id, None)
+        {
+            (events, None) => Ok(events),
+            (_, Some((_, failure))) => Err(failure),
+        }
+    }
+
+    /// Arms `element_id`'s boundary events in their deterministic arming order
+    /// ([`Self::armable_boundaries`]), starting at boundary `from` (inclusive;
+    /// `None` = the first). Stops at the first expression failure and returns
+    /// the events armed BEFORE it together with the failing boundary's id and
+    /// failure (minted keys of the failed arming are rewound). Because the order
+    /// is deterministic, a caller that keeps the partial events can later resume
+    /// exactly the un-armed suffix by passing the failing id as `from` — the
+    /// single arming loop shared by activation and the boundary-timer retry, so
+    /// a resolved incident restores ALL of the host's remaining boundaries, not
+    /// only the one that failed (#1398 review). An unknown `from` (the boundary
+    /// vanished in a migration) arms nothing.
+    pub(crate) fn arm_boundaries_from(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        scope: Key,
+        element_id: &str,
+        from: Option<&str>,
+    ) -> (Vec<Event>, Option<(String, expression::Failure)>) {
         let host_vars = self.variables_for_element(instance_key, scope);
         let boundaries = self
             .process_of_instance(instance_key)
             .map(|p| Self::armable_boundaries(p, element_id))
             .unwrap_or_default();
+        let start = match from {
+            None => 0,
+            Some(id) => match boundaries.iter().position(|b| b.id == id) {
+                Some(i) => i,
+                None => return (Vec::new(), None),
+            },
+        };
         let mut events = Vec::new();
-        for b in &boundaries {
-            if let Some(event) = self.arm_boundary(
+        for b in &boundaries[start..] {
+            let mark = self.next_local;
+            match self.arm_boundary(
                 instance_key,
                 element_instance_key,
                 element_id,
                 &host_vars,
                 b,
-            )? {
-                events.push(event);
+            ) {
+                Ok(event) => events.extend(event),
+                Err(failure) => {
+                    self.next_local = mark;
+                    return (events, Some((b.id.clone(), failure)));
+                }
             }
         }
-        Ok(events)
+        (events, None)
     }
 
     /// Dry-runs the arming of `element_id`'s boundary events against

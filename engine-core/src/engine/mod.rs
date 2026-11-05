@@ -375,11 +375,13 @@ enum Step {
         /// re-drives the full activation body.
         resume_listener_at: Option<usize>,
     },
-    /// Re-arm ONLY the timer of one boundary event whose expression failed while
-    /// its host was activating ([`state::IoMappingRedrive::BoundaryTimer`],
-    /// #1398 review): the host's job and its other boundary subscriptions stay
-    /// live, so a full activation re-drive would duplicate them. The boundary's
-    /// expression re-evaluates against the host's flow-scope view.
+    /// Resume arming a host's boundary events at the one whose timer expression
+    /// failed while the host was activating
+    /// ([`state::IoMappingRedrive::BoundaryTimer`], #1398 review): that boundary
+    /// and every sibling after it in the deterministic arming order are armed;
+    /// the host's job and the siblings armed before it stayed live, so a full
+    /// activation re-drive would duplicate them. Expressions re-evaluate against
+    /// the host's flow-scope view.
     RetryBoundaryTimer {
         instance_key: Key,
         element_instance_key: Key,
@@ -6146,48 +6148,32 @@ impl Engine {
                 boundary_element_id,
                 base,
             } => {
-                // Re-arm ONLY the failed boundary's timer: the host's job and
-                // its other boundary subscriptions stayed live while the
-                // incident was parked, so nothing else is re-derived. Evaluate
-                // against the host's flow-scope view, exactly as the failed
-                // arming did.
-                let host_vars = self.variables_for_element(instance_key, base);
-                let boundary = self
-                    .process_of_instance(instance_key)
-                    .and_then(|p| p.element(&boundary_element_id))
-                    .cloned();
-                match boundary {
-                    Some(boundary) => {
-                        let key_mark = self.next_local;
-                        match self.arm_boundary(
-                            instance_key,
-                            element_instance_key,
-                            &element_id,
-                            &host_vars,
-                            &boundary,
-                        ) {
-                            Ok(event) => (event.into_iter().collect(), Vec::new()),
-                            Err(failure) => {
-                                self.next_local = key_mark;
-                                let event = self.expression_incident(
-                                    instance_key,
-                                    element_instance_key,
-                                    element_id,
-                                    failure,
-                                    Some(state::IoMappingRedrive::BoundaryTimer {
-                                        boundary_element_id,
-                                        base,
-                                    }),
-                                );
-                                (vec![event], Vec::new())
-                            }
-                        }
-                    }
-                    // The boundary vanished from the definition (a migration
-                    // swapped the process while the incident was parked): nothing
-                    // left to arm.
-                    None => (Vec::new(), Vec::new()),
+                // Resume arming at the failed boundary: it and every boundary
+                // after it in the deterministic arming order were left un-armed
+                // when the incident was raised (the ones before it, and the
+                // host's job, stayed live), so re-arm exactly that suffix —
+                // nothing is duplicated and no sibling is lost. Evaluate against
+                // the host's flow-scope view, exactly as the failed arming did.
+                let (mut events, failed) = self.arm_boundaries_from(
+                    instance_key,
+                    element_instance_key,
+                    base,
+                    &element_id,
+                    Some(&boundary_element_id),
+                );
+                if let Some((boundary_element_id, failure)) = failed {
+                    events.push(self.expression_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        Some(state::IoMappingRedrive::BoundaryTimer {
+                            boundary_element_id,
+                            base,
+                        }),
+                    ));
                 }
+                (events, Vec::new())
             }
             Step::RetryMiChildCompletion {
                 instance_key,
@@ -6976,28 +6962,30 @@ impl Engine {
         scope: Key,
         element_id: &str,
     ) -> Result<(), expression::Failure> {
-        match self.arm_boundary_events(instance_key, element_instance_key, scope, element_id) {
-            Ok(armed) => {
+        let (armed, failed) =
+            self.arm_boundaries_from(instance_key, element_instance_key, scope, element_id, None);
+        match failed {
+            None => {
                 events.extend(armed);
                 Ok(())
             }
-            Err(failure) => {
-                if let Some(boundary_element_id) = failure.boundary_timer.clone() {
-                    events.push(self.expression_incident(
-                        instance_key,
-                        element_instance_key,
-                        element_id.to_string(),
-                        failure,
-                        Some(state::IoMappingRedrive::BoundaryTimer {
-                            boundary_element_id,
-                            base: scope,
-                        }),
-                    ));
-                    Ok(())
-                } else {
-                    Err(failure)
-                }
+            Some((boundary_element_id, failure)) if failure.boundary_timer.is_some() => {
+                // Keep the boundaries armed before the failing timer; the
+                // redrive resumes the un-armed suffix from the failing one.
+                events.extend(armed);
+                events.push(self.expression_incident(
+                    instance_key,
+                    element_instance_key,
+                    element_id.to_string(),
+                    failure,
+                    Some(state::IoMappingRedrive::BoundaryTimer {
+                        boundary_element_id,
+                        base: scope,
+                    }),
+                ));
+                Ok(())
             }
+            Some((_, failure)) => Err(failure),
         }
     }
 

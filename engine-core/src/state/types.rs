@@ -1046,7 +1046,9 @@ pub enum IoMappingRedrive {
     /// subscriptions were being armed (#1398 review): the host's job and any
     /// already-armed boundaries stay live, so a full activation re-drive would
     /// duplicate the host job and re-arm unrelated boundaries. Resolution
-    /// re-arms ONLY this boundary's timer, re-evaluating its expression against
+    /// resumes arming AT this boundary — it and every sibling after it in the
+    /// deterministic arming order (`Engine::armable_boundaries`), which were
+    /// left un-armed — re-evaluating their expressions against
     /// the host's scope with `base` as the scheduling base (the host's flow
     /// scope — the same view `Engine::arm_boundary_events` evaluates against).
     /// Additive brand-new variant — old journals never carry it.

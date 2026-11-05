@@ -1125,6 +1125,68 @@ fn resolved_boundary_timer_failure_preserves_user_task_host() {
 }
 
 #[test]
+fn resolved_boundary_timer_failure_rearms_every_sibling_boundary() {
+    // A failing timer between two armable siblings: the boundary armed before it
+    // stays live, and resolution re-arms the failed timer AND every sibling
+    // after it (timer + message) — the host never ends up missing boundaries
+    // (#1398 review, mixed static/failing boundaries).
+    let def = parse(
+        r#"<bpmn:message id="msg" name="poke"><bpmn:extensionElements><zeebe:subscription correlationKey="=&quot;k&quot;" /></bpmn:extensionElements></bpmn:message>
+        <bpmn:process id="mixb" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:boundaryEvent id="a_static" attachedToRef="review" cancelActivity="false">
+            <bpmn:timerEventDefinition><bpmn:timeDuration>PT2H</bpmn:timeDuration></bpmn:timerEventDefinition>
+          </bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="b_failing" attachedToRef="review" cancelActivity="false">
+            <bpmn:timerEventDefinition><bpmn:timeDuration>=d</bpmn:timeDuration></bpmn:timerEventDefinition>
+          </bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="c_static" attachedToRef="review" cancelActivity="false">
+            <bpmn:timerEventDefinition><bpmn:timeDuration>PT3H</bpmn:timeDuration></bpmn:timerEventDefinition>
+          </bpmn:boundaryEvent>
+          <bpmn:boundaryEvent id="m_msg" attachedToRef="review" cancelActivity="false">
+            <bpmn:messageEventDefinition messageRef="msg" />
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:endEvent id="ea" />
+          <bpmn:endEvent id="eb" />
+          <bpmn:endEvent id="ec" />
+          <bpmn:endEvent id="em" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="e" />
+          <bpmn:sequenceFlow id="fa" sourceRef="a_static" targetRef="ea" />
+          <bpmn:sequenceFlow id="fb" sourceRef="b_failing" targetRef="eb" />
+          <bpmn:sequenceFlow id="fc" sourceRef="c_static" targetRef="ec" />
+          <bpmn:sequenceFlow id="fm" sourceRef="m_msg" targetRef="em" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(def, HashMap::new());
+    assert_eq!(engine.state().user_tasks.len(), 1, "the host is live");
+    let incident = extract_value_incident(&engine, "review", "'=d'");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("d", Value::Str("PT1H".into()))],
+    );
+    assert_eq!(engine.state().user_tasks.len(), 1, "no duplicate host");
+    assert_eq!(
+        engine.timers().len(),
+        3,
+        "every timer boundary is armed exactly once: {:?}",
+        engine.timers()
+    );
+    assert_eq!(
+        engine.state().message_subscriptions.len(),
+        1,
+        "the message boundary after the failing timer is armed too"
+    );
+    assert!(engine.active_incidents().is_empty());
+}
+
+#[test]
 fn sequential_mi_completion_latch_completes_without_spawning_remaining_items() {
     // Sequential counterpart of the parallel latch: with
     // `cancelRemainingInstances=false`, a condition fulfilled by the first child
