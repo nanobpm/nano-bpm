@@ -7069,8 +7069,10 @@ fn terminate_end_listener_incident_resolution_resumes_the_chain() {
     assert_eq!(incidents.len(), 1, "the failing second listener parks");
     assert_eq!(
         incidents[0].redrive,
-        Some(state::IoMappingRedrive::Completion),
-        "an end-chain listener failure is a completion-phase incident"
+        Some(state::IoMappingRedrive::TerminateEndCompletion {
+            outputs_applied: true
+        }),
+        "an end-chain listener failure is a terminate-end completion incident"
     );
     let incident_key = incidents[0].key;
     assert!(
@@ -7173,7 +7175,9 @@ fn terminate_end_output_mapping_failure_parks_and_redrives() {
     assert_eq!(incidents[0].kind, state::IncidentKind::IoMapping);
     assert_eq!(
         incidents[0].redrive,
-        Some(state::IoMappingRedrive::Completion)
+        Some(state::IoMappingRedrive::TerminateEndCompletion {
+            outputs_applied: false
+        })
     );
     let incident_key = incidents[0].key;
     assert!(
@@ -7215,6 +7219,291 @@ fn terminate_end_output_mapping_failure_parks_and_redrives() {
         Some(Value::Int(22)),
         "the re-driven output mapping projected"
     );
+
+    let drained = complete_one(&mut engine, "l0");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `=x + 1` → `x`, `end` listeners
+/// `=missingType` then `l1`), with `x = 0` seeded.
+///
+/// #1430 review: listener 0's job-type expression fails BEFORE any job is minted,
+/// so the resume index is `None` and cannot tell the recovery re-drive from the
+/// first pass. Recovery must NOT re-apply the (non-idempotent) output mapping —
+/// `x` must stay at the 1 the first pass projected, not double to 2 — and must
+/// NOT emit a second `ElementCompleting`.
+#[test]
+fn terminate_end_recovery_does_not_reapply_output_mappings_or_completing() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-nonidem" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=x + 1" target="x" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=missingType" />
+              <zeebe:executionListener eventType="end" type="l1" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-nonidem"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // Seed x = 0 so the non-idempotent `=x + 1 -> x` output mapping is observable.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("x".to_string(), Value::Int(0))]),
+        ))
+        .unwrap();
+
+    // First pass: the output projection is staged (the listener vars see it) but
+    // NOT applied to state until a listener job completes — so x is still 0.
+    // Listener 0's `=missingType` fails before any job is minted, so the resume
+    // index is `None` and cannot tell this recovery from the first pass.
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "listener 0's failing job type parks");
+    assert_eq!(incidents[0].kind, state::IncidentKind::ExtractValueError);
+    let incident_key = incidents[0].key;
+    assert!(
+        engine.pending_jobs().is_empty(),
+        "listener 0 minted no job — the resume index is None"
+    );
+    assert_eq!(
+        io_var(&engine, instance_key, "x"),
+        Some(Value::Int(0)),
+        "the output projection is staged, not yet applied to state"
+    );
+
+    // Resolve with the listener-0 type now bound: the chain opens at listener 0.
+    // The recovery must NOT re-propagate the output projection (a second
+    // `VariablesUpdated` for `x`) nor repeat `ElementCompleting`.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingType".to_string(), Value::Str("l0".into()))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(
+        !resolved.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { variables, .. } | Event::ScopedVariablesUpdated { variables, .. }
+                if variables.contains_key("x")
+        )),
+        "recovery must not re-propagate the staged output projection: {resolved:?}"
+    );
+    assert!(
+        !resolved.iter().any(
+            |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+        ),
+        "recovery must not repeat ElementCompleting: {resolved:?}"
+    );
+    assert!(
+        resolved.iter().any(|e| matches!(
+            e,
+            Event::ExecutionListenerJobCreated { job_type, listener_index: 0, .. }
+                if job_type == "l0"
+        )),
+        "the chain opens at listener 0: {resolved:?}"
+    );
+
+    // Drain the chain: listener 0 then listener 1 complete the terminate end. The
+    // recovery added no second `ElementCompleting` and no duplicate projection.
+    complete_one(&mut engine, "l0");
+    let drained = complete_one(&mut engine, "l1");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `=x + 1` → `x`, `end` listeners `l0`
+/// then `=missingType`), with `x = 0` seeded.
+///
+/// #1430 review, later-listener variant: listener 0 completes (its job minted, so
+/// the resume index is `Some(1)`), then listener 1's job type fails. Recovery
+/// resumes at listener 1 — and must still NOT re-apply the output mapping nor
+/// repeat `ElementCompleting`.
+#[test]
+fn terminate_end_mid_chain_recovery_does_not_reapply_output_mappings() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-nonidem-mid" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=x + 1" target="x" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="l0" />
+              <zeebe:executionListener eventType="end" type="=missingType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-nonidem-mid"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("x".to_string(), Value::Int(0))]),
+        ))
+        .unwrap();
+
+    // Listener 0 completes; listener 1's `=missingType` fails mid-chain. The
+    // resume index is now `Some(1)` (listener 0's job was minted).
+    complete_one(&mut engine, "l0");
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "listener 1's failing job type parks");
+    let incident_key = incidents[0].key;
+
+    // Resolve: resume at listener 1 without re-propagating the output projection
+    // (a second `VariablesUpdated` for `x`) or repeating `ElementCompleting`.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingType".to_string(), Value::Str("l1".into()))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert!(
+        !resolved.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { variables, .. } | Event::ScopedVariablesUpdated { variables, .. }
+                if variables.contains_key("x")
+        )),
+        "mid-chain recovery must not re-propagate the staged output projection: {resolved:?}"
+    );
+    assert!(
+        !resolved.iter().any(
+            |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+        ),
+        "mid-chain recovery must not repeat ElementCompleting: {resolved:?}"
+    );
+    let minted: Vec<usize> = resolved
+        .iter()
+        .filter_map(|e| match e {
+            Event::ExecutionListenerJobCreated { listener_index, .. } => Some(*listener_index),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(minted, vec![1], "the chain resumes at listener 1");
+
+    let drained = complete_one(&mut engine, "l1");
+    assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// start -> stop (terminate end, output `=assert(missingVar, ...) + 1` → `x`,
+/// `end` listener `l0`).
+///
+/// #1430 review, unsuccessful-retry variant: a failing output mapping parks the
+/// terminate end in COMPLETING. Resolving while the source is STILL unbound
+/// re-raises the incident — and must NOT emit a second `ElementCompleting` on
+/// either the failed retry or the eventual successful one.
+#[test]
+fn terminate_end_output_mapping_failed_retry_does_not_repeat_completing() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-retryfail" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:output source="=assert(missingVar, missingVar instance of number) + 1" target="x" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="l0" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml)
+        .expect("an end listener on a terminate end is accepted (#985)")
+        .remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el-retryfail"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let completing = |events: &[Event]| {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+            })
+            .count()
+    };
+
+    // First pass: the output mapping fails and parks. Exactly one ElementCompleting.
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1);
+    let first_key = incidents[0].key;
+
+    // Resolve with the source STILL unbound: the retry re-raises the incident and
+    // emits NO additional ElementCompleting.
+    let retry = engine
+        .apply_command(Command::resolve_incident(first_key))
+        .unwrap();
+    assert_eq!(
+        completing(&retry),
+        0,
+        "an unsuccessful retry must not repeat ElementCompleting: {retry:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "the failed retry re-parks");
+    let second_key = incidents[0].key;
+
+    // Resolve again with the source now bound: the mapping projects, the chain
+    // opens, and still NO additional ElementCompleting.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("missingVar".to_string(), Value::Int(21))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(second_key))
+        .unwrap();
+    assert_eq!(
+        completing(&resolved),
+        0,
+        "the successful recovery must not repeat ElementCompleting: {resolved:?}"
+    );
+    assert_eq!(io_var(&engine, instance_key, "x"), Some(Value::Int(22)));
 
     let drained = complete_one(&mut engine, "l0");
     assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
