@@ -1,0 +1,7 @@
+{
+  "description": "#1392/#1393/#1394: FEEL type errors are suppressed failures (null), not incidents. The input mapping `x + 1` with a string `x` maps y = null and the job is created (no IO_MAPPING_ERROR); the gateway condition takes the else branch of a non-boolean `if` condition, where cross-type `=`, `+` and unary `-` all yield null, so the conditioned flow is taken, not the default.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "feel-null-on-type-error", "variables": { "x": "a" } },
+    { "op": "completeJob", "jobType": "work" }
+  ]
+}

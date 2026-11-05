@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="Definitions_feel-null-on-type-error" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="feel-null-on-type-error" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="task">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+        <zeebe:ioMapping>
+          <zeebe:input source="= x + 1" target="y" />
+        </zeebe:ioMapping>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:exclusiveGateway id="split" default="toFallback" />
+    <bpmn:endEvent id="parity" />
+    <bpmn:endEvent id="fallback" />
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="task" />
+    <bpmn:sequenceFlow id="f1" sourceRef="task" targetRef="split" />
+    <bpmn:sequenceFlow id="toParity" sourceRef="split" targetRef="parity">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">= if 5 then false else ((x = 1) = null and (x + 1) = null and (-x) = null)</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="toFallback" sourceRef="split" targetRef="fallback" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="feel-null-on-type-error">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="160" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="task_di" bpmnElement="task">
+        <dc:Bounds x="240" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="split_di" bpmnElement="split" isMarkerVisible="true">
+        <dc:Bounds x="385" y="93" width="50" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="parity_di" bpmnElement="parity">
+        <dc:Bounds x="500" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="fallback_di" bpmnElement="fallback">
+        <dc:Bounds x="500" y="210" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f0_di" bpmnElement="f0">
+        <di:waypoint x="196" y="118" />
+        <di:waypoint x="240" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="340" y="118" />
+        <di:waypoint x="385" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toParity_di" bpmnElement="toParity">
+        <di:waypoint x="435" y="118" />
+        <di:waypoint x="500" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toFallback_di" bpmnElement="toFallback">
+        <di:waypoint x="410" y="143" />
+        <di:waypoint x="410" y="228" />
+        <di:waypoint x="500" y="228" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
