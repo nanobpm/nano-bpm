@@ -243,6 +243,7 @@ mi-attr              ::= "collection" sp string
                        | "outputCollection" sp string
                        | "outputElement" sp string
                        | "completionCondition" sp string
+                       | "cancelRemainingInstances" sp attr-bool
                        | "sequential" sp attr-bool
 
 # --- Sequence flow ---

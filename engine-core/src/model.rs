@@ -380,7 +380,7 @@ pub struct TimerDef {
 /// scope when the multi-instance body completes. After each child completes the
 /// FEEL `completion_condition` (when set) is evaluated; a `true` result cancels
 /// any remaining children and completes the body early.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MultiInstance {
     /// FEEL expression (leading `=` optional) evaluated on activation to the
@@ -418,6 +418,23 @@ pub struct MultiInstance {
     /// completes); `false` (the default) runs them all in parallel.
     #[cfg_attr(feature = "serde", serde(default))]
     pub sequential: bool,
+}
+
+impl Default for MultiInstance {
+    /// Explicit so programmatic construction (`..Default::default()`) agrees
+    /// with deserialization: `cancel_remaining_instances` defaults to `true`
+    /// (the BPMN default), not the `bool` zero value.
+    fn default() -> Self {
+        Self {
+            input_collection: String::new(),
+            input_element: None,
+            output_collection: None,
+            output_element: None,
+            completion_condition: None,
+            cancel_remaining_instances: true,
+            sequential: false,
+        }
+    }
 }
 
 /// The (raw, un-evaluated) assignment, scheduling and priority expressions
@@ -2962,6 +2979,36 @@ impl std::fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+#[cfg(test)]
+mod multi_instance_default_tests {
+    use super::MultiInstance;
+
+    #[test]
+    fn default_cancels_remaining_instances() {
+        let mi = MultiInstance {
+            input_collection: "=items".into(),
+            ..Default::default()
+        };
+        assert!(mi.cancel_remaining_instances);
+        assert!(!mi.sequential);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn deserialize_defaults_cancel_remaining_instances() {
+        let mi: MultiInstance =
+            serde_json::from_str(r#"{"input_collection":"=items"}"#).expect("decode");
+        assert!(mi.cancel_remaining_instances);
+        assert_eq!(
+            mi,
+            MultiInstance {
+                input_collection: "=items".into(),
+                ..Default::default()
+            }
+        );
+    }
+}
 
 #[cfg(test)]
 mod start_event_build_tests {

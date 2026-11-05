@@ -775,6 +775,7 @@ mi-attr              ::= "collection" sp string
                        | "outputCollection" sp string
                        | "outputElement" sp string
                        | "completionCondition" sp string
+                       | "cancelRemainingInstances" sp attr-bool
                        | "sequential" sp attr-bool
 "#;
 
@@ -1174,6 +1175,7 @@ pub fn sample_shared_extras() -> (
             output_collection: Some("results".into()),
             output_element: Some("=result".into()),
             completion_condition: Some("=count(results) >= 5".into()),
+            cancel_remaining_instances: true,
             sequential: false,
         }),
     )

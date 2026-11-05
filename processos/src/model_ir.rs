@@ -411,6 +411,10 @@ fn render_element_attrs(el: &Element, attrs: &mut Vec<String>) {
         if let Some(v) = &mi.completion_condition {
             parts.push(format!("completionCondition {}", quote(v)));
         }
+        if !mi.cancel_remaining_instances {
+            // Only the non-default value is rendered, keeping existing IR stable.
+            parts.push("cancelRemainingInstances false".to_string());
+        }
         parts.push(format!("sequential {}", mi.sequential));
         attrs.push(format!("multiInstance {{ {} }}", parts.join(", ")));
     }
@@ -1081,6 +1085,12 @@ impl<'a> Parser<'a> {
                             let v = self.expect_word("for multiInstance sequential")?;
                             mi.sequential = parse_bool(&v, "sequential")?;
                         }
+                        "cancelRemainingInstances" => {
+                            let v =
+                                self.expect_word("for multiInstance cancelRemainingInstances")?;
+                            mi.cancel_remaining_instances =
+                                parse_bool(&v, "cancelRemainingInstances")?;
+                        }
                         "collection" => {
                             mi.input_collection =
                                 self.expect_str("for multiInstance collection")?;
@@ -1657,6 +1667,7 @@ mod tests {
                 output_collection: Some("results".into()),
                 output_element: Some("=out".into()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: true,
             });
         }
@@ -1671,6 +1682,7 @@ mod tests {
         let mi = work.multi_instance.as_ref().unwrap();
         assert_eq!(mi.input_collection, "=items");
         assert!(mi.sequential);
+        assert!(mi.cancel_remaining_instances);
         match &parsed.definition.elements["OnFail"].kind {
             ElementKind::ErrorBoundaryEvent {
                 attached_to,
@@ -2195,5 +2207,41 @@ mod tests {
         // The new node is present and the model deploys.
         let def = parse_bpmn(model).expect("auto-laid model parses");
         assert!(def[0].elements.contains_key("Extra"), "new node present");
+    }
+}
+
+#[cfg(test)]
+mod cancel_remaining_instances_ir_tests {
+    use std::collections::HashMap;
+
+    use nanobpmn_engine_core::{MultiInstance, ProcessBuilder};
+
+    use super::{definition_to_ir, ir_to_definition};
+
+    #[test]
+    fn ir_round_trips_cancel_remaining_instances_both_values() {
+        for cancel in [true, false] {
+            let mut def = ProcessBuilder::new("P")
+                .start_event("Start")
+                .service_task("Work", "work")
+                .end_event("Done")
+                .connect("Start", "Work")
+                .connect("Work", "Done")
+                .build()
+                .unwrap();
+            def.elements.get_mut("Work").unwrap().multi_instance = Some(MultiInstance {
+                input_collection: "=items".into(),
+                cancel_remaining_instances: cancel,
+                ..Default::default()
+            });
+            let ir1 = definition_to_ir(&def, &HashMap::new());
+            let parsed = ir_to_definition(&ir1).expect("parse");
+            let mi = parsed.definition.elements["Work"]
+                .multi_instance
+                .as_ref()
+                .expect("mi");
+            assert_eq!(mi.cancel_remaining_instances, cancel, "{ir1}");
+            assert_eq!(ir1, definition_to_ir(&parsed.definition, &parsed.names));
+        }
     }
 }
