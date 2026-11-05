@@ -2566,3 +2566,149 @@ fn sub_process_compensation_handler_retires_the_throw_wait() {
 fn sub_process_compensation_handler_with_end_listener_retires_the_throw_wait() {
     run_sub_process_handler(true);
 }
+
+/// Review r4478383154 (#901): a compensation handler that is a multi-instance
+/// sub-process containing compensable work must NOT register its own body (or
+/// the undo work inside it) as compensable when it completes — a handler is
+/// undo work, not fresh compensable work. Both MI body completion paths
+/// (`complete_multi_instance_body` and the end-listener
+/// `finalize_multi_instance_body`) must route the body back to its waiting
+/// throw BEFORE any subscription registration, mirroring the leaf-activity
+/// routing in `complete` / `finalize_completion`.
+///
+/// Two throws: the first runs the MI handler; the second must compensate only
+/// the still-open `book` subscription. If the handler body registered its undo
+/// work as compensable, the second throw would re-activate the handler and
+/// hang the instance.
+///
+/// ```text
+/// start -> book(svc, comp -> undoMI[MI sub-process: u_start -> undoTask(svc, comp -> undoUndo) -> u_end])
+///       -> throw1 -> mid -> throw2 -> done
+/// ```
+fn mi_sub_process_handler_def(with_body_end_listener: bool) -> crate::model::ProcessDefinition {
+    let mut b = ProcessBuilder::new("mi-sub-handler")
+        .start_event("start")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("comp", "book", "undoMI")
+        .sub_process("undoMI", "u_start")
+        .with_multi_instance(
+            "undoMI",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .start_event("u_start")
+        .contained_in("u_start", "undoMI")
+        .service_task("undoTask", "undo-job")
+        .contained_in("undoTask", "undoMI")
+        .compensation_boundary_event("undoComp", "undoTask", "undoUndo")
+        .service_task("undoUndo", "undo-undo-job")
+        .contained_in("undoUndo", "undoMI")
+        .end_event("u_end")
+        .contained_in("u_end", "undoMI")
+        .compensation_throw_event("throw1")
+        .service_task("mid", "mid-job")
+        .compensation_throw_event("throw2")
+        .end_event("done")
+        .connect("start", "book")
+        .connect("book", "throw1")
+        .connect("throw1", "mid")
+        .connect("mid", "throw2")
+        .connect("throw2", "done")
+        .connect("u_start", "undoTask")
+        .connect("undoTask", "u_end");
+    if with_body_end_listener {
+        b = b.with_listeners(
+            "undoMI",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "undo-audit")],
+        );
+    }
+    b.build().unwrap()
+}
+
+fn run_mi_sub_process_handler_two_throws(with_body_end_listener: bool) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(mi_sub_process_handler_def(
+            with_body_end_listener,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub-handler",
+            vars(&[("items", Value::List(vec![Value::Int(1)]))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Completing `book` records its subscription and fires throw1, which
+    // activates the MI handler body (one child for the single item).
+    complete_one(&mut engine, "book-job");
+    assert!(!engine.is_completed(instance_key));
+
+    // Run the handler's undo work; the last child completes the MI body.
+    let events = complete_one(&mut engine, "undo-job");
+    if with_body_end_listener {
+        // The body parks on its end-listener chain before completing.
+        assert!(!engine.is_completed(instance_key));
+        complete_one(&mut engine, "undo-audit");
+    } else {
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::CompensationHandlerCompleted { handler_element_id, .. }
+                if handler_element_id == "undoMI"
+        )));
+    }
+    // throw1 resumed and the token moved on to `mid`.
+    assert!(!engine.is_completed(instance_key));
+
+    // The handler body's completion must have recorded NO subscription: the
+    // only still-open subscription is `book`'s, already consumed by throw1.
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensable
+            .is_empty(),
+        "a compensation handler body registers nothing compensable: {:?}",
+        engine.instance(instance_key).unwrap().compensable
+    );
+
+    // throw2 therefore finds nothing to compensate and completes the instance —
+    // it must NOT re-run the handler's undo work.
+    let events = complete_one(&mut engine, "mid-job");
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::ElementActivated { element_id, .. } if element_id == "undoMI"
+        )),
+        "the second throw must not compensate the handler's undo work"
+    );
+    assert!(
+        engine.is_completed(instance_key),
+        "throw2 drains with nothing left to compensate"
+    );
+    let inst = engine.instance(instance_key).unwrap();
+    assert!(inst.compensation_waits.is_empty());
+    assert!(inst.incidents.is_empty());
+    // The undo-undo handler wired inside the handler never ran.
+    assert!(engine
+        .activate_jobs("undo-undo-job", "w", 1, 60_000, 0)
+        .is_empty());
+}
+
+#[test]
+fn mi_sub_process_handler_body_registers_no_compensation_subscription() {
+    run_mi_sub_process_handler_two_throws(false);
+}
+
+#[test]
+fn mi_sub_process_handler_body_with_end_listener_registers_no_compensation_subscription() {
+    run_mi_sub_process_handler_two_throws(true);
+}

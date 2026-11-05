@@ -253,6 +253,45 @@ impl Engine {
             .min()
     }
 
+    /// Whether `element_instance_key` is — or runs inside — a compensation
+    /// handler a throw is still waiting on: the instance key itself is bound in
+    /// a wait's `pending_handler_keys`, or some ANCESTOR element instance of it
+    /// is (a multi-instance handler's body is the bound instance, so anything
+    /// completing inside one of its children — the child sub-process scope, or
+    /// a leaf task within it — is part of the handler's undo work).
+    ///
+    /// Compensation routing uses this to suppress subscription registration for
+    /// work completing inside a handler: undo work is not compensable, so a
+    /// later throw must never re-trigger it (review r4478383154, #901). The
+    /// pre-#897 element-id fallback deliberately does NOT extend here: an
+    /// unbound wait is matched by the completing element's own id + scope at
+    /// its own completion, and the nested registration this guards did not
+    /// exist before #901 — so no historical journal depends on it.
+    pub(crate) fn is_within_pending_compensation_handler(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> bool {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return false;
+        };
+        if instance
+            .compensation_waits
+            .values()
+            .any(|wait| wait.pending_handler_keys.contains(&element_instance_key))
+        {
+            return true;
+        }
+        self.ancestor_element_instances(instance_key, element_instance_key)
+            .iter()
+            .any(|ancestor| {
+                instance
+                    .compensation_waits
+                    .values()
+                    .any(|wait| wait.pending_handler_keys.contains(ancestor))
+            })
+    }
+
     /// Finds the error boundary event attached to `task_element_id` that catches
     /// `error_code`, if any. When several match (a malformed model), the one with
     /// the smallest id is chosen so selection stays deterministic.

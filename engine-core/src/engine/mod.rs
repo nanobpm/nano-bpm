@@ -8476,12 +8476,17 @@ impl Engine {
         // `subprocess_compensation_subscriptions` so a child carrying its OWN
         // compensation boundary records the explicit handler subscription
         // instead — never both, and never neither.
-        events.extend(self.subprocess_compensation_subscriptions(
-            instance_key,
-            child_eik,
-            &element_id,
-            body_key,
-        ));
+        // Review r4478383154: unless the owning body IS a compensation handler
+        // a throw is waiting on — then the child is undo work and registers
+        // nothing.
+        if !self.is_within_pending_compensation_handler(instance_key, child_eik) {
+            events.extend(self.subprocess_compensation_subscriptions(
+                instance_key,
+                child_eik,
+                &element_id,
+                body_key,
+            ));
+        }
 
         // Snapshot the loop configuration and this child's index before evaluating.
         let (
@@ -8931,6 +8936,24 @@ impl Engine {
             instance_key,
             body_key,
         });
+        // A multi-instance COMPENSATION HANDLER body completes back to the throw
+        // event waiting on it, not along (non-existent) outgoing flows — a
+        // handler has no incoming sequence flow, so it is only ever activated by
+        // compensation (#897). The match is by the body's element-INSTANCE key
+        // (the key the throw journaled in `handler_instance_keys`), with the
+        // element-id lookup only for waits replayed from pre-#897 journals.
+        // Review r4478383154: this routing runs BEFORE any subscription
+        // registration — a handler body is undo work, so it records nothing
+        // compensable (mirrors the leaf-activity routing order in `complete`).
+        if let Some(throw_eik) = self
+            .pending_compensation_handler_by_instance(instance_key, body_key)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
+        {
+            let (resume_events, resume_followups) =
+                self.resume_compensation_throw(instance_key, &element_id, throw_eik, body_key);
+            events.extend(resume_events);
+            return (events, resume_followups);
+        }
         // #901: the body records its scope subscription over its children's —
         // or, when the MI activity carries its OWN compensation boundary, its
         // explicit handler subscription instead (never both, never neither:
@@ -8947,21 +8970,6 @@ impl Engine {
         // (flow) scope.
         if !output_updates.is_empty() {
             events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
-        }
-        // A multi-instance COMPENSATION HANDLER body completes back to the throw
-        // event waiting on it, not along (non-existent) outgoing flows — a
-        // handler has no incoming sequence flow, so it is only ever activated by
-        // compensation (#897). The match is by the body's element-INSTANCE key
-        // (the key the throw journaled in `handler_instance_keys`), with the
-        // element-id lookup only for waits replayed from pre-#897 journals.
-        if let Some(throw_eik) = self
-            .pending_compensation_handler_by_instance(instance_key, body_key)
-            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
-        {
-            let (resume_events, resume_followups) =
-                self.resume_compensation_throw(instance_key, &element_id, throw_eik, body_key);
-            events.extend(resume_events);
-            return (events, resume_followups);
         }
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
@@ -9002,20 +9010,14 @@ impl Engine {
                 body_key,
             },
         ];
-        // #901: as in `complete_multi_instance_body` — explicit handler
-        // subscription when the MI activity carries its own compensation
-        // boundary, otherwise the handlerless scope subscription.
-        events.extend(self.subprocess_compensation_subscriptions(
-            instance_key,
-            body_key,
-            &element_id,
-            scope,
-        ));
         // A multi-instance COMPENSATION HANDLER body completes back to the throw
         // event waiting on it, not along (non-existent) outgoing flows (#897) —
         // mirrors the listener-free tail in `complete_multi_instance_body`. The
         // match is by the body's element-INSTANCE key, with the element-id
         // lookup only for waits replayed from pre-#897 journals.
+        // Review r4478383154: this routing runs BEFORE any subscription
+        // registration — a handler body is undo work, so it records nothing
+        // compensable.
         if let Some(throw_eik) = self
             .pending_compensation_handler_by_instance(instance_key, body_key)
             .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
@@ -9025,6 +9027,15 @@ impl Engine {
             events.extend(resume_events);
             return (events, resume_followups);
         }
+        // #901: as in `complete_multi_instance_body` — explicit handler
+        // subscription when the MI activity carries its own compensation
+        // boundary, otherwise the handlerless scope subscription.
+        events.extend(self.subprocess_compensation_subscriptions(
+            instance_key,
+            body_key,
+            &element_id,
+            scope,
+        ));
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -11658,23 +11669,32 @@ impl Engine {
             events.extend(resume_events);
             return (events, resume_followups);
         }
-        for handler in self.compensation_handlers_for(instance_key, &element_id) {
-            events.push(Event::CompensationSubscriptionCreated {
+        // Review r4478383154: nothing registers when the element completes
+        // INSIDE a compensation handler a throw is waiting on (e.g. the undo
+        // work of a multi-instance handler body) — undo work is not
+        // compensable, so a later throw must never re-trigger it.
+        if !self.is_within_pending_compensation_handler(instance_key, element_instance_key) {
+            for handler in self.compensation_handlers_for(instance_key, &element_id) {
+                events.push(Event::CompensationSubscriptionCreated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    handler,
+                    scope,
+                    scope_subscription: false,
+                });
+            }
+            // #901: a completing sub-process that holds compensable
+            // subscriptions records its own handlerless scope subscription, so
+            // a later whole-scope throw can fan out into them.
+            if let Some(scope_sub) = self.scope_subscription_event(
                 instance_key,
                 element_instance_key,
-                element_id: element_id.clone(),
-                handler,
+                &element_id,
                 scope,
-                scope_subscription: false,
-            });
-        }
-        // #901: a completing sub-process that holds compensable subscriptions
-        // records its own handlerless scope subscription, so a later
-        // whole-scope throw can fan out into them.
-        if let Some(scope_sub) =
-            self.scope_subscription_event(instance_key, element_instance_key, &element_id, scope)
-        {
-            events.push(scope_sub);
+            ) {
+                events.push(scope_sub);
+            }
         }
 
         // A link intermediate *throw* event has no outgoing sequence flow: it
@@ -11949,23 +11969,32 @@ impl Engine {
                 events,
             );
         }
-        for handler in self.compensation_handlers_for(instance_key, &element_id) {
-            events.push(Event::CompensationSubscriptionCreated {
+        // Review r4478383154: nothing registers when the element completes
+        // INSIDE a compensation handler a throw is waiting on (e.g. the undo
+        // work of a multi-instance handler body) — undo work is not
+        // compensable, so a later throw must never re-trigger it.
+        if !self.is_within_pending_compensation_handler(instance_key, element_instance_key) {
+            for handler in self.compensation_handlers_for(instance_key, &element_id) {
+                events.push(Event::CompensationSubscriptionCreated {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    handler,
+                    scope,
+                    scope_subscription: false,
+                });
+            }
+            // #901: a completing sub-process that holds compensable
+            // subscriptions records its own handlerless scope subscription, so
+            // a later whole-scope throw can fan out into them.
+            if let Some(scope_sub) = self.scope_subscription_event(
                 instance_key,
                 element_instance_key,
-                element_id: element_id.clone(),
-                handler,
+                &element_id,
                 scope,
-                scope_subscription: false,
-            });
-        }
-        // #901: a completing sub-process that holds compensable subscriptions
-        // records its own handlerless scope subscription, so a later
-        // whole-scope throw can fan out into them.
-        if let Some(scope_sub) =
-            self.scope_subscription_event(instance_key, element_instance_key, &element_id, scope)
-        {
-            events.push(scope_sub);
+            ) {
+                events.push(scope_sub);
+            }
         }
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
