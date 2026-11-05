@@ -371,13 +371,18 @@ impl Engine {
                 host_vars.extend(variables.clone());
             }
             for scope_id in &planned.resolution.to_create {
+                // Checked against the PARENT-scope view, exactly as application
+                // arms it (`arm_boundary_events` evaluates in the new scope's
+                // flow scope): the scope's own locals are layered on only
+                // AFTER its boundaries are checked, so they are visible to
+                // nested scopes but never to the scope's own boundaries.
+                let checked = self.check_boundary_arming(instance_key, scope_id, &host_vars);
                 for (id, variables) in &planned.scoped {
                     if id == scope_id {
                         host_vars.extend(variables.clone());
                     }
                 }
-                if let Err(failure) = self.check_boundary_arming(instance_key, scope_id, &host_vars)
-                {
+                if let Err(failure) = checked {
                     return Err(invalid(
                         instance_key,
                         &process_id,
@@ -463,11 +468,24 @@ impl Engine {
             }
 
             for (key, scope_id, parent) in fresh {
-                // Validated by `plan_modification` (`check_boundary_arming`),
-                // so arming cannot fail here; an Err would be a planning
-                // defect, and arms nothing rather than half-arming.
-                if let Ok(armed) = self.arm_boundary_events(instance_key, key, parent, &scope_id) {
-                    for event in armed {
+                // Validated by `plan_modification` (`check_boundary_arming`)
+                // against the same parent-scope view, so arming should not
+                // fail here. Never drop a failure silently: should it happen
+                // anyway, surface it as an incident on the created scope.
+                match self.arm_boundary_events(instance_key, key, parent, &scope_id) {
+                    Ok(armed) => {
+                        for event in armed {
+                            self.emit(log, event);
+                        }
+                    }
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            key,
+                            scope_id.clone(),
+                            failure,
+                            None,
+                        );
                         self.emit(log, event);
                     }
                 }

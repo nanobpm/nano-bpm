@@ -986,6 +986,54 @@ fn created_scope_boundaries_see_modification_variables() {
     }
 }
 
+/// The preflight checks a created scope's boundaries against the SAME
+/// parent-scope view application arms them in: a correlation key supplied only
+/// as a local of the new sub-process itself is not visible to its own
+/// boundary, so the command is rejected up front — never accepted with the
+/// subscription silently dropped.
+#[test]
+fn created_scope_own_locals_do_not_satisfy_its_boundary_preflight() {
+    let def = ProcessBuilder::new("boundary-own-local")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .message_boundary_event("mb", "sub", "cancel", "=k")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "b")
+        .connect("b", "se")
+        .connect("sub", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    let result = engine.apply_command(modify(
+        inst,
+        vec![ActivateElementInstruction {
+            element_id: "b".into(),
+            variable_instructions: vec![VariableInstruction {
+                variables: vars(&[("k", Value::Str("o-1".into()))]),
+                scope_id: Some("sub".into()),
+            }],
+            ..Default::default()
+        }],
+    ));
+    let err = result.expect_err("the boundary cannot see the scope's own local");
+    assert!(
+        format!("{err:?}").contains("Expected to subscribe to catch event(s) of 'sub'"),
+        "{err:?}"
+    );
+}
+
 /// Terminating a half-open parallel join by element id resets its join
 /// bookkeeping: the remaining branch's arrival must not fire the join against
 /// the cancelled branch's arrival.

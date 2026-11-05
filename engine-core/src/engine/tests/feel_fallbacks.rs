@@ -309,6 +309,42 @@ fn message_start_name_expression_failure_rejects_the_deployment() {
     assert!(engine.state().processes.is_empty(), "nothing deployed");
 }
 
+#[test]
+fn invalid_start_expression_rejects_the_whole_batch_atomically() {
+    // A later process with an invalid start expression must reject the whole
+    // `DeployResources` batch BEFORE anything is applied: the earlier, valid
+    // process must not be left installed outside the (discarded) journal.
+    let good = parse(
+        r#"<bpmn:process id="good" isExecutable="true">
+          <bpmn:startEvent id="s"><bpmn:messageEventDefinition messageRef="G" /></bpmn:startEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="G" name="go" />"#,
+    );
+    let bad = parse(
+        r#"<bpmn:process id="bad" isExecutable="true">
+          <bpmn:startEvent id="s"><bpmn:messageEventDefinition messageRef="M" /></bpmn:startEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="M" name="=missing" />"#,
+    );
+    let mut engine = Engine::new();
+    let err = engine
+        .apply_command(Command::DeployResources(vec![good, bad]))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::StartEventExpressionInvalid { ref process_id, .. } if process_id == "bad"),
+        "{err:?}"
+    );
+    assert!(engine.state().processes.is_empty(), "nothing deployed");
+    assert!(
+        engine.state().message_subscriptions.is_empty(),
+        "no start subscription left behind"
+    );
+}
+
 fn timer_process(catch: &str, duration: &str) -> ProcessDefinition {
     let body = match catch {
         "boundary" => format!(
@@ -463,6 +499,48 @@ fn mi_completion_condition_failure_raises_incident_on_the_child() {
     assert!(
         engine.is_completed(inst),
         "the satisfied condition completes the body"
+    );
+}
+
+#[test]
+fn mi_completion_condition_sees_enclosing_subprocess_locals() {
+    // The completion condition is evaluated in the MI body's visible scope,
+    // not process-root variables only: a local of the enclosing sub-process
+    // must resolve rather than raise an incident.
+    let def = parse(
+        r#"<bpmn:process id="mi" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:subProcess id="sp">
+            <bpmn:extensionElements>
+              <zeebe:ioMapping><zeebe:input source="=true" target="done" /></zeebe:ioMapping>
+            </bpmn:extensionElements>
+            <bpmn:startEvent id="ss" />
+            <bpmn:serviceTask id="work">
+              <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+              <bpmn:multiInstanceLoopCharacteristics isSequential="true">
+                <bpmn:extensionElements>
+                  <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+                </bpmn:extensionElements>
+                <bpmn:completionCondition>=done</bpmn:completionCondition>
+              </bpmn:multiInstanceLoopCharacteristics>
+            </bpmn:serviceTask>
+            <bpmn:endEvent id="se" />
+            <bpmn:sequenceFlow id="sf1" sourceRef="ss" targetRef="work" />
+            <bpmn:sequenceFlow id="sf2" sourceRef="work" targetRef="se" />
+          </bpmn:subProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sp" />
+          <bpmn:sequenceFlow id="f2" sourceRef="sp" targetRef="e" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(
+        def,
+        vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+    );
+    complete_one(&mut engine, "work");
+    assert!(
+        engine.is_completed(inst),
+        "a sub-process local must be visible to the completion condition (done=true ends the loop)"
     );
 }
 

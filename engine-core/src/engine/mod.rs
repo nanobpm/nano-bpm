@@ -1513,28 +1513,15 @@ impl Engine {
             }
         }
 
-        // Emit DeploymentCreated FIRST, unconditionally — this is the C8-spec
-        // handle the client sees in the response envelope (LongKey pattern,
-        // never empty) and mirrors Zeebe's DeploymentIntent.CREATED. The
-        // shared deployment_key is minted here and stamped onto every
-        // ProcessDeployed that follows in the same call (issue #47).
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
-        for process in processes {
-            if self
-                .state
-                .processes
-                .get(&process.id)
-                .is_some_and(|existing| existing.definition == process)
-            {
-                // Idempotent redeploy of the latest version: reuse its identity
-                // and skip it entirely (no event, no new subscription/timer).
-                continue;
-            }
-            let version = self.next_version(&process.id);
-            let process_definition_key = self.mint_key();
-            let process_id = process.id.clone();
+        // Preflight EVERY process's typed start expressions before anything
+        // is emitted or any key is minted: a later process with an invalid
+        // start expression must reject the whole batch, never leave the
+        // earlier processes installed (#1398).
+        let mut preflight = Vec::with_capacity(processes.len());
+        for process in &processes {
+            // Resolved for every process (even an idempotent redeploy, whose
+            // skip is decided below against the live state): resolution is a
+            // pure evaluation against an empty context.
             // Zeebe permits a process to declare several *typed*
             // (message/timer) start events alongside an optional none start,
             // and EVERY one of them arms its own trigger at deploy — a message
@@ -1589,13 +1576,38 @@ impl Engine {
                     Ok(r) => resolved_starts.push((start_element_id, r)),
                     Err(failure) => {
                         return Err(EngineError::StartEventExpressionInvalid {
-                            process_id: process_id.clone(),
+                            process_id: process.id.clone(),
                             element_id: start_element_id,
                             reason: failure.message,
                         })
                     }
                 }
             }
+            preflight.push(resolved_starts);
+        }
+
+        // Emit DeploymentCreated FIRST, unconditionally — this is the C8-spec
+        // handle the client sees in the response envelope (LongKey pattern,
+        // never empty) and mirrors Zeebe's DeploymentIntent.CREATED. The
+        // shared deployment_key is minted here and stamped onto every
+        // ProcessDeployed that follows in the same call (issue #47).
+        let deployment_key = self.mint_key();
+        self.emit(log, Event::DeploymentCreated { deployment_key });
+
+        for (process, resolved_starts) in processes.into_iter().zip(preflight) {
+            if self
+                .state
+                .processes
+                .get(&process.id)
+                .is_some_and(|existing| existing.definition == process)
+            {
+                // Idempotent redeploy of the latest version: reuse its identity
+                // and skip it entirely (no event, no new subscription/timer).
+                continue;
+            }
+            let version = self.next_version(&process.id);
+            let process_definition_key = self.mint_key();
+            let process_id = process.id.clone();
             self.emit(
                 log,
                 Event::ProcessDeployed {
