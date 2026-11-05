@@ -196,7 +196,7 @@ impl Engine {
     }
 
     /// Like [`Self::eval_io_mappings_in`], but *skips* a mapping whose source
-    /// references a name in `tolerated` that is absent from `vars` — that mapping
+    /// reads a name in `tolerated` that is absent from `vars` — that mapping
     /// is not evaluated at all. Used at the multi-instance
     /// **body** level, where the activity's own mappings legitimately reference
     /// per-child bindings (`loopCounter` / the configured `inputElement`) that do
@@ -212,18 +212,32 @@ impl Engine {
     ) -> Result<HashMap<String, Value>, IoMappingFailure> {
         let mut result: HashMap<String, Value> = HashMap::new();
         for m in mappings {
-            // A mapping that reads a per-child binding absent at the body level is
-            // skipped up front; the per-child pass applies it authoritatively.
-            // Decided from the references, not from an evaluation failure: an
-            // ill-typed FEEL operation on the absent (null) binding is a
-            // suppressed failure yielding `null`, not an error (#1392), so a
-            // failure-based check would project that `null` into the parent.
-            let refs = crate::feel::referenced_variables(m.source.trim());
-            if refs
-                .iter()
-                .any(|r| tolerated.contains(r) && !vars.contains_key(r))
-            {
-                continue;
+            // A mapping that READS a per-child binding absent at the body level
+            // is skipped up front; the per-child pass applies it
+            // authoritatively. Decided from the source's FREE variable
+            // references, not from an evaluation failure: an ill-typed FEEL
+            // operation on the absent (null) binding is a suppressed failure
+            // yielding `null`, not an error (#1392), so a failure-based check
+            // would project that `null` into the parent. Two corollaries:
+            //
+            // * Only an `=`-prefixed source is a FEEL expression at all
+            //   (#1160): a static source such as `loopCounter` is a literal
+            //   string passed through verbatim, never a variable reference, so
+            //   it is never skipped.
+            // * Only a FREE use of the name reads the per-child binding: a
+            //   self-contained mapping like `=for item in [1,2] return item`
+            //   whose local binding happens to share the `inputElement` name
+            //   must still run at the body level — skipping it would silently
+            //   drop the mapping (and, when its target supplies the input
+            //   collection, fan out zero children).
+            if m.source.trim_start().starts_with('=') {
+                let refs = crate::feel::free_variables(m.source.trim());
+                if refs
+                    .iter()
+                    .any(|r| tolerated.contains(r) && !vars.contains_key(r))
+                {
+                    continue;
+                }
             }
             match Self::eval_io_mapping_source(&m.source, vars) {
                 Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),

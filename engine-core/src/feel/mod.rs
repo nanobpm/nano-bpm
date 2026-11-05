@@ -193,6 +193,125 @@ fn collect_vars(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
     }
 }
 
+/// The set of variable names a FEEL expression references from its ENCLOSING
+/// scope — [`referenced_variables`] minus the uses a local binding
+/// (`for`/`some`/`every` clause, context entry, or `function(...)` parameter)
+/// covers.
+///
+/// Used where the question is "does this expression READ a name the surrounding
+/// scope must supply?" rather than "which names appear in it?": a multi-instance
+/// body deciding whether an io-mapping touches a per-child binding must not skip
+/// a self-contained mapping like `=for item in [1,2] return item` merely
+/// because the `inputElement` is also named `item` — that `item` is the loop
+/// variable, not the absent child binding. The binding walk mirrors the
+/// evaluator's scoping exactly: a `for`/`some`/`every` clause name binds from
+/// the NEXT clause onward (its own source list is evaluated outside it), a
+/// context entry key binds from the next entry onward, and a `function(...)`
+/// parameter binds over the whole body. Returns an empty set if the expression
+/// cannot be parsed — the caller then sees no external reference (the
+/// evaluation itself surfaces the parse error).
+pub fn free_variables(expr: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let src = strip_marker(expr);
+    if let Ok(tokens) = lexer::tokenize(src) {
+        if let Ok(node) = parser::parse(tokens) {
+            let mut bound = std::collections::HashSet::new();
+            collect_free_vars(&node, &mut bound, &mut out);
+        }
+    }
+    out
+}
+
+/// Walks a FEEL AST collecting the [`ast::Node::Var`] uses not covered by an
+/// enclosing local binding. `bound` is the set of names in scope at `node`; a
+/// binder extends it for the subexpressions it scopes over (see
+/// [`free_variables`]).
+fn collect_free_vars(
+    node: &ast::Node,
+    bound: &mut std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use ast::Node;
+    match node {
+        Node::Var(name) => {
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
+        }
+        Node::Null | Node::BoolLit(_) | Node::NumLit(..) | Node::StrLit(_) | Node::AtLit(_) => {}
+        Node::Member(base, _) => collect_free_vars(base, bound, out),
+        Node::Index(base, idx) => {
+            collect_free_vars(base, bound, out);
+            collect_free_vars(idx, bound, out);
+        }
+        Node::Neg(inner) | Node::Not(inner) => collect_free_vars(inner, bound, out),
+        Node::Bin(_, l, r) => {
+            collect_free_vars(l, bound, out);
+            collect_free_vars(r, bound, out);
+        }
+        Node::List(items) => items.iter().for_each(|n| collect_free_vars(n, bound, out)),
+        Node::Context(entries) => {
+            // An entry's value is evaluated with the preceding entries in
+            // scope, and its key binds from the NEXT entry onward.
+            let mut inner = bound.clone();
+            for (key, value) in entries {
+                collect_free_vars(value, &mut inner, out);
+                inner.insert(key.clone());
+            }
+        }
+        Node::If(c, t, e) => {
+            collect_free_vars(c, bound, out);
+            collect_free_vars(t, bound, out);
+            collect_free_vars(e, bound, out);
+        }
+        Node::For(clauses, body) | Node::Quant(_, clauses, body) => {
+            // A clause's source list is evaluated with the PRECEDING clause
+            // variables in scope; its own variable binds from the next clause
+            // onward and over the body.
+            let mut inner = bound.clone();
+            for (name, source) in clauses {
+                collect_free_vars(source, &mut inner, out);
+                inner.insert(name.clone());
+            }
+            collect_free_vars(body, &mut inner, out);
+        }
+        Node::Between(a, b, c) => {
+            collect_free_vars(a, bound, out);
+            collect_free_vars(b, bound, out);
+            collect_free_vars(c, bound, out);
+        }
+        Node::In(a, b) => {
+            collect_free_vars(a, bound, out);
+            collect_free_vars(b, bound, out);
+        }
+        Node::InstanceOf(inner, _) => collect_free_vars(inner, bound, out),
+        Node::FuncDef(params, body) => {
+            let mut inner = bound.clone();
+            inner.extend(params.iter().cloned());
+            collect_free_vars(body, &mut inner, out);
+        }
+        Node::Call(callee, args) => {
+            collect_free_vars(callee, bound, out);
+            match args {
+                ast::CallArgs::Positional(ns) => {
+                    ns.iter().for_each(|n| collect_free_vars(n, bound, out))
+                }
+                ast::CallArgs::Named(ns) => ns
+                    .iter()
+                    .for_each(|(_, n)| collect_free_vars(n, bound, out)),
+            }
+        }
+        Node::Range(r) => {
+            if let Some(s) = &r.start {
+                collect_free_vars(s, bound, out);
+            }
+            if let Some(e) = &r.end {
+                collect_free_vars(e, bound, out);
+            }
+        }
+    }
+}
+
 fn evaluate(expr: &str, ctx: &HashMap<String, Value>) -> Result<value::FeelVal, FeelError> {
     let src = strip_marker(expr);
     let tokens = lexer::tokenize(src)?;
@@ -240,6 +359,43 @@ mod tests {
         assert_eq!(vars("=orders[1] > amount"), vec!["amount", "orders"]);
         // Literals reference nothing.
         assert!(vars("=1 > 0").is_empty());
+    }
+
+    #[test]
+    fn free_variables_excludes_locally_bound_uses() {
+        let free = |e: &str| {
+            let mut v: Vec<String> = free_variables(e).into_iter().collect();
+            v.sort();
+            v
+        };
+        // A plain reference is free.
+        assert_eq!(free("=x > 1"), vec!["x"]);
+        // A `for`/`some` clause variable binds over its body and the following
+        // clauses, but not over its own source list.
+        assert!(free("=for item in [1, 2] return item").is_empty());
+        assert_eq!(
+            free("=for item in orders return item.price"),
+            vec!["orders"]
+        );
+        assert_eq!(
+            free("=for a in xs, b in a return b"),
+            vec!["xs"],
+            "a clause source sees the preceding clause variables, not its own"
+        );
+        assert!(free("=some item in [1] satisfies item > 0").is_empty());
+        // A use OUTSIDE the binding is still free.
+        assert_eq!(
+            free("=(for item in [1] return item)[1] + item"),
+            vec!["item"]
+        );
+        // A context entry key binds from the next entry onward.
+        assert!(free("={item: 1, y: item}.y").is_empty());
+        assert_eq!(free("={item: seed}.item"), vec!["seed"]);
+        // A function parameter binds over the body.
+        assert!(free("=function(item) item + 1").is_empty());
+        assert_eq!(free("=function(item) item + k"), vec!["k"]);
+        // An unparsable expression has no known free reference.
+        assert!(free("=for in").is_empty());
     }
 
     #[test]

@@ -1164,3 +1164,120 @@ fn multi_instance_child_job_type_resolves_against_the_child_scope() {
         .activate_jobs("=\"handle-\" + item", "w", 10, 60_000, 0)
         .is_empty());
 }
+
+#[test]
+fn multi_instance_body_static_input_mapping_named_like_child_binding_is_applied_verbatim() {
+    // A static (non-`=`) io-mapping source is a literal string passed through
+    // unevaluated (#1160) — even when its text happens to name a per-child
+    // binding (`loopCounter` / the `inputElement`). The body-level dependency
+    // scan must not parse it as a FEEL variable reference and skip the mapping:
+    // the literal is assigned to the parent scope verbatim, and the per-child
+    // pass assigns the same literal (never the child's binding value).
+    let def = ProcessBuilder::new("mi-static-src")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "loopCounter".to_string(),
+                    target: "mode".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-static-src",
+            vars(&[("items", Value::List(vec![Value::Int(1)]))]),
+        ))
+        .unwrap();
+
+    // The body-level pass assigns the literal verbatim into the body scope,
+    // which every child inherits — so each child job sees the literal string,
+    // not the child's own `loopCounter` binding (1 for the first child). The
+    // per-child pass then re-assigns the same literal.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].variables.get("mode"),
+        Some(&Value::Str("loopCounter".into())),
+        "a static source is a literal string, never a variable reference"
+    );
+    assert_eq!(
+        jobs[0].variables.get("loopCounter"),
+        Some(&Value::Int(1)),
+        "the child's own binding is unaffected by the literal mapping"
+    );
+}
+
+#[test]
+fn multi_instance_body_input_mapping_with_local_binding_shadowing_input_element_runs() {
+    // A mapping whose only use of the `inputElement` name is LOCALLY BOUND
+    // (`for item in …`) is self-contained: it does not read the per-child
+    // binding, so the body must evaluate it rather than skip it. Skipping it
+    // here would drop the input collection's provider and silently fan out
+    // zero children.
+    let def = ProcessBuilder::new("mi-local-bind")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=for item in [1, 2] return item".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("mi-local-bind", vars(&[])))
+        .unwrap();
+
+    // The self-contained mapping supplies the input collection: two children.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        2,
+        "a locally bound use of the inputElement name must not skip the mapping"
+    );
+    assert_eq!(jobs[0].variables.get("item"), Some(&Value::Int(1)));
+    assert_eq!(jobs[1].variables.get("item"), Some(&Value::Int(2)));
+}
