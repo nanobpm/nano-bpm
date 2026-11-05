@@ -178,8 +178,10 @@ impl Engine {
         }
 
         let mut by_key: Vec<Key> = Vec::new();
+        // A parked join's key (#1244) is never published in a record: it is
+        // not an element instance, so it cannot be named for termination.
         for &eik in terminate_instructions {
-            if !instance.active.contains_key(&eik) {
+            if !instance.active.contains_key(&eik) || instance.parked_joins.contains(&eik) {
                 return Err(EngineError::ElementInstanceNotFound {
                     instance_key,
                     element_instance_key: eik,
@@ -194,6 +196,9 @@ impl Engine {
         let mut by_id: Vec<Key> = instance
             .active
             .iter()
+            // A parked join (#1244) is included: terminating the join by id
+            // discards its waiting tokens (`terminate_element_instance` writes
+            // only a `ParallelJoinReset` for it).
             .filter(|(_, id)| terminate_element_ids.contains(id))
             .map(|(k, _)| *k)
             .collect();

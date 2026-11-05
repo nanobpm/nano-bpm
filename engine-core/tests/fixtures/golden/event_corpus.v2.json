@@ -1159,7 +1159,7 @@
       "element_id": "join",
       "flow": {
         "from": "fork",
-        "ordinal": 0
+        "ordinal": 1
       },
       "instance_key": 20
     }
@@ -1176,7 +1176,7 @@
       "element_id": "join",
       "flow": {
         "from": "fork",
-        "ordinal": 1
+        "ordinal": 0
       },
       "instance_key": 20
     }
@@ -1344,13 +1344,6 @@
     "SequenceFlowTaken": {
       "from": "fork",
       "instance_key": 25,
-      "to": "t"
-    }
-  },
-  {
-    "SequenceFlowTaken": {
-      "from": "fork",
-      "instance_key": 25,
       "to": "join"
     }
   },
@@ -1365,9 +1358,24 @@
     }
   },
   {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 25,
+      "to": "t"
+    }
+  },
+  {
+    "ParallelJoinOpened": {
+      "element_id": "join",
+      "element_instance_key": 28,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
     "ElementActivating": {
       "element_id": "t",
-      "element_instance_key": 28,
+      "element_instance_key": 29,
       "instance_key": 25,
       "scope": 0
     }
@@ -1375,7 +1383,7 @@
   {
     "ElementActivated": {
       "element_id": "t",
-      "element_instance_key": 28,
+      "element_instance_key": 29,
       "instance_key": 25,
       "scope": 0
     }
@@ -1384,35 +1392,12 @@
     "JobCreated": {
       "created_at": 1700000000010,
       "element_id": "t",
-      "element_instance_key": 28,
+      "element_instance_key": 29,
       "instance_key": 25,
-      "job_key": 29,
+      "job_key": 30,
       "job_type": "sync-task",
       "priority": 50,
       "retries": 3
-    }
-  },
-  {
-    "ElementActivating": {
-      "element_id": "join",
-      "element_instance_key": 30,
-      "instance_key": 25,
-      "scope": 0
-    }
-  },
-  {
-    "ElementActivated": {
-      "element_id": "join",
-      "element_instance_key": 30,
-      "instance_key": 25,
-      "scope": 0
-    }
-  },
-  {
-    "ParallelJoinOpened": {
-      "element_id": "join",
-      "element_instance_key": 30,
-      "instance_key": 25
     }
   },
   {

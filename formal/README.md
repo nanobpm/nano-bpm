@@ -178,6 +178,35 @@ historical divergence is a filed parity issue; the first, the arrival-time
 inclusive-join guard, is #1241 (closed). With it landed, `RefinesZeebe` holds on
 the entire corpus, so there is no open divergence to file.
 
+**Why an atomic pass-through is sound (#1244).** `TokenFlow` takes a
+pass-through as one atomic action. Neither engine executes it that way: Zeebe
+completes a gateway inside its activation's command batch, but completes a start,
+none or throw event through a queued `COMPLETE_ELEMENT` command. Nano does the
+same (a gateway's completion runs ahead of the drain queue; other elements queue
+a `Step::Complete`). The traces scenario `inclusive-join-pass-through-race`
+(gateway → gateway chain racing a direct flow into an inclusive join) checks
+this against Zeebe.
+
+The interleaving cannot change a join decision. While a token is part-way
+through a pass-through, it is always in one of two forms, and both engines count
+both as a live path to the join:
+
+- an **active element instance**: the element is still active until its
+  completion runs;
+- a **taken flow that has not activated its target yet**: Zeebe's
+  `activeSequenceFlowIds`; in nano, a queued `Step::Activate` or a parked join
+  token (`ParallelJoinOpened`).
+
+Zeebe drops a flow id from `activeSequenceFlowIds` in the same batch that
+activates its target, and nano dequeues the step as it activates. So a token
+leaves one form only by entering the other, with no state in which it is
+neither. Splitting or merging a pass-through into one atomic action therefore
+never changes the set of live paths a join guard sees, and `RefinesZeebe`'s
+atomic model covers both engines. What the interleaving *can* change is record
+order: which flows are taken first, and when a gateway completes. That is
+outside the guard's state, so it is pinned by the differential traces instead
+(`parallel-fork-join-tasks`, `inclusive-join-pass-through-race`).
+
 The differential *runtime* half of #1240 builds on this static formal proof. Two
 pieces have landed. The first is a **single-source corpus generator**
 (`formal/corpus/`, #1258): one graph description per model produces its

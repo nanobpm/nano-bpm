@@ -1578,11 +1578,12 @@ fn gateway_paused_on_listener(gateway: SplitGw) -> (Engine, Key, Key) {
         .iter()
         .find_map(|e| e.instance_key())
         .unwrap();
-    // An exclusive gateway selects only the first matching flow (#0 → `a`); an
-    // inclusive fork also takes the unconditional `b` flow (#1).
+    // An exclusive gateway selects only the matching flow (#0 → `a`); an
+    // inclusive fork also takes the unconditional `b` flow (#1), and journals
+    // its selection in execution order (reverse document order, #1244).
     let expected = match gateway {
         SplitGw::Exclusive => vec![0],
-        SplitGw::Inclusive => vec![0, 1],
+        SplitGw::Inclusive => vec![1, 0],
     };
     let instance = engine.instance(inst).unwrap();
     assert_eq!(
@@ -1699,7 +1700,7 @@ fn assert_migration_rejects_a_missing_carried_route(gateway: SplitGw) {
         .unwrap();
     let expected = match gateway {
         SplitGw::Exclusive => vec![0],
-        SplitGw::Inclusive => vec![0, 1],
+        SplitGw::Inclusive => vec![1, 0],
     };
     assert_eq!(
         engine

@@ -256,10 +256,21 @@ impl Engine {
         Ok(result)
     }
 
-    pub(crate) fn outgoing(&self, instance_key: Key, element_id: &str) -> Vec<SequenceFlow> {
+    /// `element_id`'s outgoing flows as `(declaration index, flow)`, in the
+    /// order the engine takes and evaluates them
+    /// ([`crate::model::Element::outgoing_in_execution_order`]).
+    pub(crate) fn outgoing_in_execution_order(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Vec<(usize, SequenceFlow)> {
         self.process_of_instance(instance_key)
             .and_then(|p| p.element(element_id))
-            .map(|e| e.outgoing.clone())
+            .map(|e| {
+                e.outgoing_in_execution_order()
+                    .map(|(index, flow)| (index, flow.clone()))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

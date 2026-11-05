@@ -1103,7 +1103,10 @@ pub struct Element {
     /// definitions serialized before this field existed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub name: Option<String>,
-    /// Outgoing sequence flows, in declaration order.
+    /// Outgoing sequence flows, in declaration (document) order. That order
+    /// fixes each flow's index and its [`IncomingFlow::ordinal`], which journals
+    /// persist, so it must never change. The engine **executes** the flows in
+    /// [`Element::outgoing_in_execution_order`], never by iterating this field.
     pub outgoing: Vec<SequenceFlow>,
     /// Id of the embedded sub-process that contains this element, or `None` for
     /// elements at the process level. Used to scope tokens and to pick the
@@ -1153,6 +1156,31 @@ pub struct Element {
     /// on the unchanged hot path (ADR 0037 §6).
     #[cfg_attr(feature = "serde", serde(default))]
     pub task_listeners: Vec<TaskListener>,
+}
+
+impl Element {
+    /// This element's outgoing flows as `(declaration index, flow)` in the order
+    /// the engine takes and evaluates them, which is **reverse document order**.
+    ///
+    /// Zeebe builds `ExecutableFlowNode.getOutgoing()` while its `ModelWalker`
+    /// visits the model depth-first, pushing each element's children with
+    /// `addFirst`. Sibling `sequenceFlow`s are therefore transformed, and
+    /// appended to their source's outgoing list, last-declared first. Every
+    /// consumer iterates that list:
+    /// - a parallel or inclusive fork takes its flows in this order
+    ///   (`BpmnStateTransitionBehavior.takeOutgoingSequenceFlows`);
+    /// - an exclusive gateway takes the *first* matching flow in this order,
+    ///   so of two matching conditions the one declared **last** wins
+    ///   (`ExclusiveGatewayProcessor.findSequenceFlowToTake`).
+    ///
+    /// This is the single source of that order (#1244). The
+    /// `formal/traces` scenarios `parallel-fork-join-tasks` and
+    /// `exclusive-gateway-first-match` pin it against Zeebe.
+    pub fn outgoing_in_execution_order(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (usize, &SequenceFlow)> + ExactSizeIterator {
+        self.outgoing.iter().enumerate().rev()
+    }
 }
 
 /// The BPMN ad-hoc sub-process implementation type (Camunda `zeebe:adHoc`).

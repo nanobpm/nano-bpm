@@ -592,6 +592,18 @@ pub struct ProcessInstance {
     /// For each open parallel-gateway join: the element instance accumulating
     /// the arriving tokens.
     pub join_instances: HashMap<ElementId, Key>,
+    /// The [`join_instances`](Self::join_instances) that are **parked**: they
+    /// hold waiting tokens but have not activated (#1244). Zeebe keeps a join's
+    /// waiting tokens as active sequence flows on the flow scope and writes no
+    /// element-instance record until the join's guard accepts an activation.
+    /// Nano parks those tokens on a key that is in `active` and `scopes`, so
+    /// they keep the process instance and the enclosing scope alive and are
+    /// torn down with it, but it emits no lifecycle event for it. The key leaves
+    /// this set when the join activates (`ElementActivating`), and leaves
+    /// `active` when the join is reset. Absent from pre-#1244 snapshots (whose
+    /// open joins were activated visibly), hence `serde(default)`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub parked_joins: std::collections::HashSet<Key>,
     /// The outgoing-flow selection a split gateway (exclusive, or an inclusive
     /// fork) made while ACTIVATING (#1402), keyed by the gateway's element
     /// instance. Completion takes exactly these flows instead of re-evaluating

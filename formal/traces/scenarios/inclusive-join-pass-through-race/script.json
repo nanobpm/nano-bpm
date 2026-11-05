@@ -1,0 +1,6 @@
+{
+  "description": "#1244: a direct flow from a parallel fork races a gateway->gateway pass-through chain into an inclusive join. The join must wait for the chain (an active path still reaches it) and fire exactly once; pins the step granularity of pass-through completions relative to the join.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "inclusive-join-pass-through-race" }
+  ]
+}

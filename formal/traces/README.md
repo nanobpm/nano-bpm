@@ -192,6 +192,14 @@ cases:
   scenario does not exist.
 - an allow-list entry lacks an issue reference (`#N` or an issues URL).
 
+**Join rejections.** Zeebe takes every flow into a join by writing an
+`ACTIVATE_ELEMENT` command, and `ProcessInstanceStateTransitionGuard` rejects it
+with `INVALID_STATE` until the join is ready, so each early arrival leaves a
+command rejection in the trace. Nano has no command records. The runner derives
+these rejections from nano's events instead (`join_activation_rejections`):
+per step, one rejection for each join arrival (`ParallelJoinTokenArrived`)
+that did not fire a join (`ParallelJoinFired`) (#1244).
+
 Allow-list entry shape:
 `{ "scenario": "<name>", "issue": "#N", "reason": "...", "ignoreRecords": [ {...} ] }`.
 

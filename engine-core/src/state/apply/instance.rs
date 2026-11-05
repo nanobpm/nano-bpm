@@ -87,6 +87,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     join_counts: HashMap::new(),
                     join_flow_arrivals: HashMap::new(),
                     join_instances: HashMap::new(),
+                    parked_joins: Default::default(),
                     gateway_routes: HashMap::new(),
                     incidents: Vec::new(),
                     variables_spilled: false,
@@ -271,6 +272,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 // ahead of this record — see `complete_terminate_end`).
                 instance.active.clear();
                 instance.scopes.clear();
+                instance.parked_joins.clear();
                 instance.multi_instances.clear();
                 instance.adhoc_instances.clear();
                 instance.join_counts.clear();
@@ -511,6 +513,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.suspended_at = None;
                 instance.active.clear();
                 instance.scopes.clear();
+                instance.parked_joins.clear();
                 instance.incidents.clear();
                 // Drop the multi-instance / ad-hoc runtime records too: a forced
                 // teardown removes the body/container token but these maps are

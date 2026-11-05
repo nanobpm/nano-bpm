@@ -1,0 +1,8 @@
+{
+  "description": "A parallel fork into two service tasks joined by a parallel join (#1244): pins the order the fork takes its outgoing flows and activates its targets, and that the join fires exactly once after both tasks complete.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "parallel-fork-join-tasks" },
+    { "op": "completeJob", "jobType": "bookA" },
+    { "op": "completeJob", "jobType": "bookB" }
+  ]
+}

@@ -410,7 +410,8 @@
       "match": "element:InclusiveGateway",
       "status": "parity",
       "evidence": [
-        "traces:inclusive-gateway-subprocess-scope"
+        "traces:inclusive-gateway-subprocess-scope",
+        "traces:inclusive-join-pass-through-race"
       ]
     },
     {
@@ -422,9 +423,9 @@
     },
     {
       "match": "element:ParallelGateway",
-      "status": "nano-tested",
+      "status": "parity",
       "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::should_run_parallel_split_and_join"
+        "traces:parallel-fork-join-tasks"
       ]
     },
     {
@@ -1392,9 +1393,11 @@
     },
     {
       "match": "rejection:BpmnStreamProcessor.processRecord:INVALID_STATE",
-      "status": "gap",
-      "issue": 1249,
-      "note": "Per-site Zeebe command rejection; needs differential scenario evidence against Zeebe."
+      "status": "parity",
+      "evidence": [
+        "traces:parallel-fork-join-tasks",
+        "traces:inclusive-join-pass-through-race"
+      ]
     },
     {
       "match": "rejection:BpmnUserTaskBehavior.rejectOngoingRequestsForUserTaskBeforeCancellation:INVALID_STATE",
