@@ -63,6 +63,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::ElementCompleting { .. }
         | Event::ElementActivated { .. }
         | Event::ElementCompleted { .. }
+        | Event::GatewayRouteSelected { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::ParallelJoinOpened { .. }
         | Event::ParallelJoinTokenArrived { .. }

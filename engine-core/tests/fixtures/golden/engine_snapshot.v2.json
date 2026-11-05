@@ -587,6 +587,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000004,
+        "gateway_routes": {},
         "incidents": [],
         "join_counts": {},
         "join_flow_arrivals": {},
@@ -619,6 +620,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000009,
+        "gateway_routes": {},
         "incidents": [],
         "join_counts": {},
         "join_flow_arrivals": {},
@@ -650,6 +652,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000010,
+        "gateway_routes": {},
         "incidents": [],
         "join_counts": {},
         "join_flow_arrivals": {
@@ -690,6 +693,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000012,
+        "gateway_routes": {},
         "incidents": [],
         "join_counts": {},
         "join_flow_arrivals": {},
@@ -720,6 +724,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000013,
+        "gateway_routes": {},
         "incidents": [
           46
         ],
@@ -756,6 +761,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000015,
+        "gateway_routes": {},
         "incidents": [
           52
         ],
@@ -788,6 +794,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000018,
+        "gateway_routes": {},
         "incidents": [],
         "join_counts": {},
         "join_flow_arrivals": {},
@@ -816,6 +823,7 @@
         "compensable": [],
         "compensation_waits": {},
         "created_at": 1700000000001,
+        "gateway_routes": {},
         "incidents": [],
         "join_counts": {},
         "join_flow_arrivals": {},

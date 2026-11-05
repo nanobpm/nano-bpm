@@ -6079,6 +6079,54 @@ impl Engine {
             Arc::make_mut(&mut activation_vars).extend(input_updates);
         }
 
+        // A split gateway's routing gate (#1402) runs BEFORE the `start`
+        // listener chain opens: the chain defers the gateway's body, and a
+        // listener completing with variable writes would otherwise be
+        // re-evaluated into the route — the selection must be fixed while the
+        // gateway is ACTIVATING, against the post-input view. On success the
+        // selection is journaled (`GatewayRouteSelected`) so the drained chain
+        // completes through exactly these flows; on failure the routing
+        // incident parks the token ACTIVATING (`gate_activated` withholds
+        // `ElementActivated`), ahead of any listener job.
+        let gateway_selection = match kind {
+            Some(ElementKind::ExclusiveGateway) => Some(
+                self.select_exclusive_flow(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    Some(&activation_vars),
+                )
+                .map(|index| vec![index]),
+            ),
+            Some(ElementKind::InclusiveGateway) => Some(self.select_inclusive_flows(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                Some(&activation_vars),
+            )),
+            _ => None,
+        };
+        if let Some(selection) = gateway_selection {
+            match selection {
+                Ok(flows) => events.push(Event::GatewayRouteSelected {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    flows,
+                }),
+                Err(failure) => {
+                    events.push(self.routing_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        Some(state::IoMappingRedrive::Activation),
+                    ));
+                    return (events, followups);
+                }
+            }
+        }
+
         // Start execution listeners (ADR 0037): before the element enacts its
         // own behaviour (creating a job, routing a gateway, opening a
         // sub-process) it runs a sequential chain of `start` listener jobs. The
@@ -6658,35 +6706,23 @@ impl Engine {
             // `activate_join`) selects its outgoing flow(s) in Zeebe's
             // `onActivate`, BEFORE `transitionToActivated`
             // (`ExclusiveGatewayProcessor.findSequenceFlowToTake`,
-            // `InclusiveGatewayProcessor.findSequenceFlowsToTake`). A routing
-            // failure therefore raises its incident while the gateway is still
-            // ACTIVATING (#1402): the `Activation` redrive is re-tagged
-            // `ActivationPending` by `gate_activated`, so resolution re-runs
-            // this body and emits `ElementActivated` only once a flow matches.
-            // On success it completes and routes (the selection is pure over
-            // the same variables, so `complete` re-selects the same flow).
+            // `InclusiveGatewayProcessor.findSequenceFlowsToTake`). The
+            // selection already ran in `activate_body_in` — against the
+            // post-input view, ahead of any `start` listener chain — and is
+            // journaled (`GatewayRouteSelected`): a routing failure raised its
+            // incident while the gateway was still ACTIVATING (the `Activation`
+            // redrive is re-tagged `ActivationPending` by `gate_activated`, so
+            // resolution re-runs the gate and emits `ElementActivated` only
+            // once a flow matches). Reaching this arm means the selection
+            // succeeded; completion takes the journaled flows verbatim, so a
+            // non-deterministic condition or a listener's variable write cannot
+            // change the route after `ElementActivated`.
             Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway) => {
-                let selection = if matches!(kind, Some(ElementKind::ExclusiveGateway)) {
-                    self.select_exclusive_flow(instance_key, element_instance_key, &element_id)
-                        .map(|_| ())
-                } else {
-                    self.select_inclusive_flows(instance_key, element_instance_key, &element_id)
-                        .map(|_| ())
-                };
-                match selection {
-                    Ok(()) => followups.push(Step::Complete {
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                    }),
-                    Err(failure) => events.push(self.routing_incident(
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        failure,
-                        Some(state::IoMappingRedrive::Activation),
-                    )),
-                }
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                });
             }
             // Pass-through elements (events, parallel split) complete
             // immediately; routing happens at completion.
@@ -11677,15 +11713,27 @@ impl Engine {
     /// chosen flow's index in the outgoing list, or the [`RoutingFailure`] (no
     /// match and no default, or a condition that failed to evaluate) the caller
     /// raises as an incident via [`Engine::routing_incident`].
-    /// Pure over the current variables, so the end-listener gate can re-select at
-    /// [`finalize_exclusive_gateway`] time without captured state.
+    ///
+    /// `vars` is the variable view to evaluate against: `Some` at activation
+    /// time (the body's post-input view — input mappings are not yet applied to
+    /// state when the body runs, so reading state would miss them), `None` to
+    /// read the element's live scope (completion, incident retries, listener
+    /// chains — every path whose inputs are already applied).
     fn select_exclusive_flow(
         &self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
+        vars: Option<&HashMap<String, Value>>,
     ) -> Result<usize, RoutingFailure> {
-        let variables = self.variables_for_element(instance_key, element_instance_key);
+        let owned;
+        let variables = match vars {
+            Some(v) => v,
+            None => {
+                owned = self.variables_for_element(instance_key, element_instance_key);
+                &owned
+            }
+        };
         let mut default_flow = None;
         for (index, flow) in self
             .outgoing(instance_key, element_id)
@@ -11701,7 +11749,7 @@ impl Engine {
             }
             match &flow.condition {
                 None => return Ok(index),
-                Some(condition) => match condition.eval(&variables) {
+                Some(condition) => match condition.eval(variables) {
                     Ok(true) => return Ok(index),
                     Ok(false) => continue,
                     Err(err) => {
@@ -11718,13 +11766,33 @@ impl Engine {
         default_flow.ok_or_else(|| RoutingFailure::no_match("exclusive", element_id))
     }
 
+    /// The outgoing-flow selection a split gateway completion must take: the
+    /// one journaled at activation ([`Event::GatewayRouteSelected`], #1402) if
+    /// present, else `None` — a gateway completing without a recorded
+    /// selection (a legacy journal, or an incident retry whose re-run only
+    /// re-gates activation) re-selects from its live scope exactly as before.
+    fn gateway_route(&self, instance_key: Key, element_instance_key: Key) -> Option<Vec<usize>> {
+        self.state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.gateway_routes.get(&element_instance_key))
+            .cloned()
+            .filter(|flows| !flows.is_empty())
+    }
+
     fn complete_exclusive_gateway(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows[0]),
+            None => {
+                self.select_exclusive_flow(instance_key, element_instance_key, &element_id, None)
+            }
+        };
+        match selected {
             Ok(flow_index) => {
                 let scope = self.scope_of(instance_key, element_instance_key);
                 let mut events = vec![Event::ElementCompleting {
@@ -11773,9 +11841,11 @@ impl Engine {
     }
 
     /// Deferred completion of an exclusive gateway whose `end` execution-listener
-    /// chain has drained (ADR 0037). Re-selects the outgoing flow from the
-    /// resident scope (the gateway rested in COMPLETING). Selection is normally
-    /// deterministic, but a listener may have rewritten a condition variable; if
+    /// chain has drained (ADR 0037). Takes the flow selected at activation
+    /// ([`Event::GatewayRouteSelected`], #1402) when one is journaled — the
+    /// chain's variable writes must not change the route chosen before
+    /// `ElementActivated`. A gateway with no recorded selection (a legacy
+    /// journal, or an incident retry) re-selects from the resident scope; if
     /// re-selection now matches nothing (or a condition fails to evaluate) the
     /// gateway raises the same incident its non-listener path would and keeps the
     /// token active, rather than emitting `ElementCompleted` with nowhere to go
@@ -11787,7 +11857,13 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows[0]),
+            None => {
+                self.select_exclusive_flow(instance_key, element_instance_key, &element_id, None)
+            }
+        };
+        match selected {
             Ok(flow_index) => {
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
                 let mut events = vec![Event::ElementCompleted {
@@ -11819,15 +11895,28 @@ impl Engine {
     /// explicit `default` flow only when no conditional flow matches. Returns the
     /// chosen flows' indices in the outgoing list (never empty), or the
     /// [`RoutingFailure`] (no match and no default, or a condition that failed
-    /// to evaluate) the caller raises as an incident. Pure over the current
-    /// variables so the end-listener gate can re-select without captured state.
+    /// to evaluate) the caller raises as an incident.
+    ///
+    /// `vars` is the variable view to evaluate against: `Some` at activation
+    /// time (the body's post-input view — input mappings are not yet applied to
+    /// state when the body runs, so reading state would miss them), `None` to
+    /// read the element's live scope (completion, incident retries, listener
+    /// chains — every path whose inputs are already applied).
     fn select_inclusive_flows(
         &self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
+        vars: Option<&HashMap<String, Value>>,
     ) -> Result<Vec<usize>, RoutingFailure> {
-        let variables = self.variables_for_element(instance_key, element_instance_key);
+        let owned;
+        let variables = match vars {
+            Some(v) => v,
+            None => {
+                owned = self.variables_for_element(instance_key, element_instance_key);
+                &owned
+            }
+        };
         let mut default_flow = None;
         let mut selected = Vec::new();
         for (index, flow) in self
@@ -11841,7 +11930,7 @@ impl Engine {
             }
             match &flow.condition {
                 None => selected.push(index),
-                Some(condition) => match condition.eval(&variables) {
+                Some(condition) => match condition.eval(variables) {
                     Ok(true) => selected.push(index),
                     Ok(false) => continue,
                     Err(err) => {
@@ -11891,10 +11980,14 @@ impl Engine {
 
     /// Routes an activated inclusive gateway (split or accepted join): takes
     /// every selected outgoing flow, gating the completion behind the `end`
-    /// execution-listener chain (ADR 0037). A condition that fails to evaluate
-    /// raises an `ExpressionEvaluation` incident; a selection that matches no
-    /// flow (and no default) raises a `NoMatchingSequenceFlow` incident and
-    /// parks the token, mirroring the exclusive gateway and Zeebe's
+    /// execution-listener chain (ADR 0037). The selection journaled at
+    /// activation ([`Event::GatewayRouteSelected`], #1402) is taken verbatim
+    /// when present; otherwise (a join accepted by `activate_join`, a legacy
+    /// journal, an incident retry) the flows are selected from the live scope.
+    /// A condition that fails to evaluate raises an `ExpressionEvaluation`
+    /// incident; a selection that matches no flow (and no default) raises a
+    /// `NoMatchingSequenceFlow` incident and parks the token, mirroring the
+    /// exclusive gateway and Zeebe's
     /// `InclusiveGatewayProcessor.finalizeActivation`.
     fn route_inclusive_gateway(
         &mut self,
@@ -11903,22 +11996,27 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected =
-            match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
-                Ok(sel) => sel,
-                Err(failure) => {
-                    return (
-                        vec![self.routing_incident(
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            failure,
-                            None,
-                        )],
-                        Vec::new(),
-                    );
-                }
-            };
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows),
+            None => {
+                self.select_inclusive_flows(instance_key, element_instance_key, &element_id, None)
+            }
+        };
+        let selected = match selected {
+            Ok(sel) => sel,
+            Err(failure) => {
+                return (
+                    vec![self.routing_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        None,
+                    )],
+                    Vec::new(),
+                );
+            }
+        };
         let mut events = vec![Event::ElementCompleting {
             instance_key,
             element_instance_key,
@@ -11950,8 +12048,11 @@ impl Engine {
     }
 
     /// Deferred completion of an inclusive-gateway split whose `end`
-    /// execution-listener chain has drained (ADR 0037). Re-selects from the
-    /// resident scope; a listener may have rewritten a condition variable, so a
+    /// execution-listener chain has drained (ADR 0037). Takes the flows selected
+    /// at activation ([`Event::GatewayRouteSelected`], #1402) when journaled —
+    /// the chain's variable writes must not change the route chosen before
+    /// `ElementActivated`. A gateway with no recorded selection (a legacy
+    /// journal, or an incident retry) re-selects from the resident scope; a
     /// re-selection that now matches nothing (or fails to evaluate) parks the
     /// token on the same incident the non-listener path would raise rather than
     /// completing with nowhere to go.
@@ -11970,7 +12071,13 @@ impl Engine {
             scope,
             &mut events,
         );
-        match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows),
+            None => {
+                self.select_inclusive_flows(instance_key, element_instance_key, &element_id, None)
+            }
+        };
+        match selected {
             Ok(selected) => {
                 events.push(Event::ElementCompleted {
                     instance_key,

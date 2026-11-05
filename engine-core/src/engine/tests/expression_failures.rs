@@ -578,3 +578,300 @@ fn inclusive_split_condition_failure_raises_incident_while_activating() {
         state::IncidentKind::ExpressionEvaluation,
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1402 review hardening — three defect classes in the activation-time gate:
+//
+//  1. The activation-time selection must evaluate against the same post-input
+//     view the rest of the activation body uses (`activation_vars`): input
+//     mappings and sub-process locals are not yet applied to state when the
+//     body runs, so a selector that re-reads state sees only the root scope.
+//  2. The selection made while ACTIVATING must be carried through completion:
+//     FEEL conditions are not required to be deterministic, so re-evaluating
+//     at `Step::Complete` can pick a different route (or raise an incident
+//     after `ElementActivated`).
+//  3. A `start` execution-listener chain defers the activation body; the
+//     routing gate must still apply when the deferred body runs, so no
+//     routing incident is raised after `ElementActivated`.
+// ---------------------------------------------------------------------------
+
+/// `start → g (split, input mapping `amount = 500`) → end`, one conditional
+/// flow `amount > 100`. The mapped value only exists in the activation body's
+/// post-input view; a selector that reads state (root `amount = 5`) instead
+/// raises a no-match incident.
+fn input_mapped_split_gateway_process(gateway: SplitGateway) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("split-mapped").start_event("s");
+    let builder = match gateway {
+        SplitGateway::Exclusive => builder.exclusive_gateway("g"),
+        SplitGateway::Inclusive => builder.inclusive_gateway("g"),
+    };
+    builder
+        .with_io(
+            "g",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=500".to_string(),
+                    target: "amount".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("e")
+        .connect("s", "g")
+        .connect_when("g", "e", "amount > 100")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn exclusive_gateway_activation_selection_sees_input_mapped_variables() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(input_mapped_split_gateway_process(
+            SplitGateway::Exclusive,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "split-mapped",
+            HashMap::from([("amount".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the input-mapped `amount = 500` satisfies `amount > 100`: {:?}",
+        engine.active_incidents()
+    );
+    assert_eq!(
+        lifecycle_of(&created, "g"),
+        vec!["Activating", "Activated", "Completing", "Completed"],
+        "the gateway routes on the post-input view: {created:?}"
+    );
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn inclusive_split_activation_selection_sees_input_mapped_variables() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(input_mapped_split_gateway_process(
+            SplitGateway::Inclusive,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "split-mapped",
+            HashMap::from([("amount".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the input-mapped `amount = 500` satisfies `amount > 100`: {:?}",
+        engine.active_incidents()
+    );
+    assert_eq!(
+        lifecycle_of(&created, "g"),
+        vec!["Activating", "Activated", "Completing", "Completed"],
+        "the gateway routes on the post-input view: {created:?}"
+    );
+    assert!(engine.is_completed(inst));
+}
+
+/// `start → g (split, `start` execution listener) → a / d(default)`: the
+/// listener completes with a variable write that flips the condition, so a
+/// completion that re-evaluates would take the default — the activation-time
+/// selection must be the one carried through.
+fn listener_flip_split_gateway_process(gateway: SplitGateway) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("split-flip").start_event("s");
+    let builder = match gateway {
+        SplitGateway::Exclusive => builder.exclusive_gateway("g"),
+        SplitGateway::Inclusive => builder.inclusive_gateway("g"),
+    };
+    builder
+        .with_listeners(
+            "g",
+            vec![el(ListenerEventType::Start, "gate-listener")],
+            Vec::new(),
+        )
+        .service_task("a", "work_a")
+        .service_task("d", "work_d")
+        .end_event("e")
+        .end_event("e_d")
+        .connect("s", "g")
+        .connect_when("g", "a", "amount > 100")
+        .connect_default("g", "d")
+        .connect("a", "e")
+        .connect("d", "e_d")
+        .build()
+        .unwrap()
+}
+
+fn assert_selection_is_carried_through_completion(gateway: SplitGateway) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(listener_flip_split_gateway_process(
+            gateway,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "split-flip",
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        lifecycle_of(&created, "g"),
+        vec!["Activating", "Activated"],
+        "{gateway:?}: the gateway parks on its start listener: {created:?}"
+    );
+
+    // The listener completes with a write that flips the condition variable,
+    // so a completion-time re-evaluation would take the default flow instead.
+    let listener = engine.activate_jobs("gate-listener", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "{gateway:?}: one start-listener job");
+    let resumed = engine
+        .apply_command(Command::complete_job_with(
+            listener[0].key,
+            HashMap::from([("amount".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+
+    assert!(
+        resumed.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "g" && to == "a"
+        )),
+        "{gateway:?}: the activation-time selection (`a`) is carried through \
+         completion even though `amount > 100` no longer holds: {resumed:?}"
+    );
+    assert!(
+        !resumed.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "g" && to == "d"
+        )),
+        "{gateway:?}: completion must not re-evaluate into the default flow"
+    );
+    assert!(engine.active_incidents().is_empty(), "{gateway:?}");
+    complete_one(&mut engine, "work_a");
+    assert!(engine.is_completed(inst), "{gateway:?}");
+}
+
+#[test]
+fn exclusive_gateway_carries_its_activation_selection_through_completion() {
+    assert_selection_is_carried_through_completion(SplitGateway::Exclusive);
+}
+
+#[test]
+fn inclusive_split_carries_its_activation_selection_through_completion() {
+    assert_selection_is_carried_through_completion(SplitGateway::Inclusive);
+}
+
+/// `start → g (split, `start` execution listener) → end`, one conditional
+/// flow `amount > 100`. The listener defers the gateway's activation body —
+/// but the routing gate must still apply to the deferred body: no
+/// CONDITION_ERROR incident may be raised after `ElementActivated`.
+fn start_listener_split_gateway_process(gateway: SplitGateway) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("split-listener").start_event("s");
+    let builder = match gateway {
+        SplitGateway::Exclusive => builder.exclusive_gateway("g"),
+        SplitGateway::Inclusive => builder.inclusive_gateway("g"),
+    };
+    builder
+        .with_listeners(
+            "g",
+            vec![el(ListenerEventType::Start, "gate-listener")],
+            Vec::new(),
+        )
+        .end_event("e")
+        .connect("s", "g")
+        .connect_when("g", "e", "amount > 100")
+        .build()
+        .unwrap()
+}
+
+fn assert_start_listener_defers_the_routing_gate(gateway: SplitGateway) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            start_listener_split_gateway_process(gateway),
+        ))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "split-listener",
+            HashMap::from([("amount".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The routing gate runs while the gateway is ACTIVATING — BEFORE the start
+    // listener chain opens: the failure parks the token on the incident and no
+    // listener job is minted (a listener would otherwise run for a gateway
+    // that can never route).
+    assert_eq!(
+        lifecycle_of(&created, "g"),
+        vec!["Activating"],
+        "{gateway:?}: the routing incident precedes the listener chain: {created:?}"
+    );
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })),
+        "{gateway:?}: no listener job is minted for a gateway that cannot \
+         route: {created:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{gateway:?}: {incidents:?}");
+    assert_eq!(
+        incidents[0].kind,
+        state::IncidentKind::NoMatchingSequenceFlow,
+        "{gateway:?}"
+    );
+    assert_eq!(incidents[0].element_id, "g");
+    assert_eq!(
+        incidents[0].redrive,
+        Some(state::IoMappingRedrive::ActivationPending),
+        "{gateway:?}: the gateway's routing failure is an ACTIVATION-phase \
+         incident (resolution re-runs the gated activation), not a \
+         completion-phase one: {:?}",
+        incidents[0]
+    );
+    let incident_key = incidents[0].key;
+
+    // Resolution fixes the variable and re-runs the gate: the gateway
+    // activates, runs its listener, then completes through the carried
+    // selection.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&resolved, "g"),
+        vec!["Activated", "Completing", "Completed"],
+        "{gateway:?}: resolution activates then completes the gateway through \
+         the fresh selection (the listener chain is not re-opened on the \
+         retry): {resolved:?}"
+    );
+    assert!(engine.active_incidents().is_empty());
+    assert!(engine.is_completed(inst), "{gateway:?}");
+}
+
+#[test]
+fn exclusive_gateway_start_listener_defers_the_routing_gate() {
+    assert_start_listener_defers_the_routing_gate(SplitGateway::Exclusive);
+}
+
+#[test]
+fn inclusive_split_start_listener_defers_the_routing_gate() {
+    assert_start_listener_defers_the_routing_gate(SplitGateway::Inclusive);
+}

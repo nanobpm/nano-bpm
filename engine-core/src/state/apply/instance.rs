@@ -87,6 +87,7 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                     join_counts: HashMap::new(),
                     join_flow_arrivals: HashMap::new(),
                     join_instances: HashMap::new(),
+                    gateway_routes: HashMap::new(),
                     incidents: Vec::new(),
                     variables_spilled: false,
                     multi_instances: HashMap::new(),
@@ -275,6 +276,11 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.join_counts.clear();
                 instance.join_flow_arrivals.clear();
                 instance.join_instances.clear();
+                // A split gateway's carried activation-time selection (#1402)
+                // is drained naturally when the gateway completes; a forced
+                // teardown (terminate end event, or termination) mid-activation
+                // would strand it on the terminal shell otherwise.
+                instance.gateway_routes.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 // A terminal instance's variables are never read from hot state
@@ -527,6 +533,9 @@ pub(super) fn apply_instance(state: &mut State, event: &Event) {
                 instance.join_counts.clear();
                 instance.join_flow_arrivals.clear();
                 instance.join_instances.clear();
+                // A split gateway's carried activation-time selection (#1402):
+                // same forced-teardown rationale as the join bookkeeping above.
+                instance.gateway_routes.clear();
                 instance.compensable.clear();
                 instance.compensation_waits.clear();
                 // Drop the variable payload on the terminal transition — see

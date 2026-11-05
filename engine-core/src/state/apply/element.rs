@@ -48,6 +48,25 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 // scope.
                 instance.scope_parents.remove(element_instance_key);
                 instance.scope_variables.remove(element_instance_key);
+                // A split gateway's carried activation-time selection (#1402)
+                // dies with it. A no-op for every other element.
+                instance.gateway_routes.remove(element_instance_key);
+            }
+        }
+
+        // A split gateway's activation-time routing selection (#1402): record it
+        // so completion takes exactly these flows instead of re-evaluating the
+        // conditions.
+        Event::GatewayRouteSelected {
+            instance_key,
+            element_instance_key,
+            flows,
+            ..
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance
+                    .gateway_routes
+                    .insert(*element_instance_key, flows.clone());
             }
         }
 
