@@ -4773,31 +4773,47 @@ impl Engine {
         if self.state.conditional_subscriptions.is_empty() {
             return scan_end;
         }
-        // Which variables changed, per instance, and which conditional
-        // subscriptions were opened, since the last pass.
-        let mut changed: HashMap<Key, std::collections::HashSet<String>> = HashMap::new();
+        // Which variables changed — per instance, as name -> the set of scopes
+        // that name was written in — and which conditional subscriptions were
+        // opened, since the last pass. The scope is kept (#1335) so a write only
+        // re-triggers subscriptions that can actually SEE it: a local write
+        // invisible to (or shadowed from) a subscription's scope must not
+        // re-fire it, or a non-interrupting boundary whose handler writes a
+        // local of the same name would loop forever.
+        let mut changed: HashMap<Key, HashMap<String, std::collections::HashSet<Key>>> =
+            HashMap::new();
         let mut opened: std::collections::HashSet<Key> = std::collections::HashSet::new();
         for event in &log[cursor..scan_end] {
             match event {
                 Event::VariablesUpdated {
                     instance_key,
                     variables,
-                } => {
-                    let entry = changed.entry(*instance_key).or_default();
-                    for name in variables.keys() {
-                        entry.insert(name.clone());
-                    }
                 }
-                Event::ProcessInstanceCreated {
+                | Event::ProcessInstanceCreated {
                     instance_key,
                     variables,
                     ..
                 } => {
-                    // Initial variables count as a change (a conditional event may
-                    // already hold at activation).
+                    // Root writes (initial variables count as a change: a
+                    // conditional event may already hold at activation).
                     let entry = changed.entry(*instance_key).or_default();
                     for name in variables.keys() {
-                        entry.insert(name.clone());
+                        entry.entry(name.clone()).or_default().insert(*instance_key);
+                    }
+                }
+                Event::ScopedVariablesUpdated {
+                    instance_key,
+                    scope_key,
+                    variables,
+                } => {
+                    let scope = if *scope_key == 0 {
+                        *instance_key
+                    } else {
+                        *scope_key
+                    };
+                    let entry = changed.entry(*instance_key).or_default();
+                    for name in variables.keys() {
+                        entry.entry(name.clone()).or_default().insert(scope);
                     }
                 }
                 Event::ConditionalSubscriptionCreated {
@@ -4812,7 +4828,12 @@ impl Engine {
             return scan_end;
         }
         // Collect the subscriptions to (re-)evaluate, deterministically by key: a
-        // newly opened one, or one whose referenced variables changed.
+        // newly opened one, or one for which a referenced variable changed in the
+        // scope that the subscription's own scope chain resolves that name to.
+        // Each referenced name's resolving scope is computed ONCE per
+        // subscription and the write check is two hash lookups (no scan, no
+        // clone), so a large unrelated update batch costs O(referenced vars) per
+        // subscription, never O(subscriptions x references x changed variables).
         let mut candidates: Vec<Key> = self
             .state
             .conditional_subscriptions
@@ -4820,9 +4841,16 @@ impl Engine {
             .filter(|s| {
                 s.state == state::MessageSubscriptionState::Open
                     && (opened.contains(&s.key)
-                        || changed
-                            .get(&s.instance_key)
-                            .is_some_and(|vars| s.referenced_vars.iter().any(|v| vars.contains(v))))
+                        || changed.get(&s.instance_key).is_some_and(|writes| {
+                            s.referenced_vars.iter().any(|v| {
+                                #[cfg(test)]
+                                resolve::note_conditional_write_check();
+                                writes.get(v).is_some_and(|scopes| {
+                                    self.resolving_scope(s.instance_key, s.element_instance_key, v)
+                                        .is_some_and(|scope| scopes.contains(&scope))
+                                })
+                            })
+                        }))
             })
             .map(|s| s.key)
             .collect();
@@ -4842,7 +4870,10 @@ impl Engine {
             let element_id = sub.element_id.clone();
             let condition = sub.condition.clone();
             let kind = sub.kind.clone();
-            let vars = self.variables(instance_key);
+            // Evaluate against the variables visible from the subscribed element's
+            // scope (its sub-process / multi-instance locals layered over the
+            // root), never the root alone (#1335, Zeebe parity).
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             if !matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
                 continue;
             }
@@ -6474,8 +6505,9 @@ impl Engine {
             // conditional event is a wait-until, not an incident (a deliberate
             // flat-scope choice).
             Some(ElementKind::ConditionalIntermediateCatchEvent { condition }) => {
-                let vars = self.variables(instance_key);
-                if matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
+                // The enclosing-scope view (#1335): a sub-process-local variable
+                // the condition reads is visible here, as in Zeebe.
+                if matches!(crate::feel::eval_bool(&condition, &element_vars), Ok(true)) {
                     followups.push(Step::Complete {
                         instance_key,
                         element_instance_key,
@@ -7461,32 +7493,36 @@ impl Engine {
         // therefore overlay the mapped values onto the eval context in memory
         // rather than writing them into the (about-to-be-torn-down, non-propagated)
         // child scope.
-        let output = match output_element.as_deref() {
-            None => None,
-            Some(expr) => {
+        // ONE post-output view of the completing child, shared by `outputElement`
+        // AND the completion condition (#1335): Zeebe applies the child's output
+        // mappings (or receives a call activity's returned variables) before the
+        // body evaluates either, so both must read the same view.
+        let post_view: Option<Arc<HashMap<String, Value>>> =
+            if output_element.is_none() && completion_condition.is_none() {
+                None
+            } else {
                 let visible = self.variables_for_element(instance_key, child_eik);
                 match &output_overlay {
                     // A call-activity child: its produced outputs (propagated
                     // child variables + the activity's already-applied output
-                    // mappings) live in `overlay`, not the child scope. Lay them
-                    // over the scope view and evaluate `output_element` against
-                    // that — the element's `zeebe:output` was applied by the
-                    // caller, so it is not re-applied here.
+                    // mappings) live in `overlay`, not the child scope. The
+                    // element's `zeebe:output` was applied by the caller, so it is
+                    // not re-applied here.
                     Some(overlay) => {
                         let mut vars = (*visible).clone();
                         vars.extend(overlay.clone());
-                        crate::feel::eval(expr, &vars).ok()
+                        Some(Arc::new(vars))
                     }
                     None => {
                         let outputs = self.io_outputs(instance_key, &element_id);
                         if outputs.is_empty() {
-                            crate::feel::eval(expr, &visible).ok()
+                            Some(visible)
                         } else {
                             match self.eval_io_mappings_in(&visible, &outputs) {
                                 Ok(mapped) => {
                                     let mut vars = (*visible).clone();
                                     vars.extend(mapped);
-                                    crate::feel::eval(expr, &vars).ok()
+                                    Some(Arc::new(vars))
                                 }
                                 Err(failure) => {
                                     // An output mapping that fails to evaluate halts
@@ -7506,7 +7542,10 @@ impl Engine {
                         }
                     }
                 }
-            }
+            };
+        let output = match (output_element.as_deref(), &post_view) {
+            (Some(expr), Some(view)) => crate::feel::eval(expr, view).ok(),
+            _ => None,
         };
         events.push(Event::MultiInstanceChildCompleted {
             instance_key,
@@ -7520,10 +7559,12 @@ impl Engine {
         let completion_now = completion_condition
             .as_deref()
             .map(|c| {
-                matches!(
-                    crate::feel::eval_bool(c, &self.variables(instance_key)),
-                    Ok(true)
-                )
+                // Zeebe evaluates the completion condition in the completing
+                // CHILD's scope (#1335): `inputElement` / `loopCounter` and child
+                // locals are visible, layered over the body's ancestors.
+                post_view
+                    .as_ref()
+                    .is_some_and(|view| matches!(crate::feel::eval_bool(c, view), Ok(true)))
             })
             .unwrap_or(false);
 

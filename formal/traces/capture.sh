@@ -48,9 +48,12 @@ if [ ! -f "$cp_file" ]; then
 fi
 cp="$src/zeebe/engine/target/classes:$src/zeebe/engine/target/test-classes:$(cat "$cp_file")"
 
-classes="$src/.nano-traces-classes"
-rm -rf "$classes"
-mkdir -p "$classes"
+# A PRIVATE per-run classes dir: the cache is shared by every worktree on the
+# machine, so a fixed path let two concurrent captures (parallel agents, maybe on
+# different JDKs) `rm -rf` and recompile each other's classes mid-run — a
+# capture then died with UnsupportedClassVersionError or a startup NPE.
+classes="$(mktemp -d "$cache/.nano-traces-classes.XXXXXX")"
+trap 'rm -rf "$classes" "$classes.sources" "$classes.javac.log"' EXIT
 # An @argfile with quoted paths: the repo checkout path may contain spaces.
 find "$here/capture/src/main/java" "$here/capture/src/test/java" -name '*.java' \
   | sed 's/.*/"&"/' > "$classes.sources"
@@ -66,7 +69,8 @@ if [ "${1:-}" = "test" ]; then
   # Every *Test class under capture/src/test/java is a harness unit test.
   tests="$(cd "$here/capture/src/test/java" && find . -name '*Test.java' \
     | sed -e 's|^\./||' -e 's|\.java$||' -e 's|/|.|g' | sort | tr '\n' ' ')"
-  exec "$java" -cp "$classes:$cp" org.junit.runner.JUnitCore $tests
+  "$java" -cp "$classes:$cp" org.junit.runner.JUnitCore $tests
+  exit 0
 fi
 
 jvm_flags=(-XX:+EnableDynamicAgentLoading -Djdk.attach.allowAttachSelf=true
@@ -86,10 +90,11 @@ if [ "${1:-}" = "harvest" ]; then
   "$java" "${jvm_flags[@]}" -cp "$classes:$cp" io.nanobpm.traces.Harvest \
     "$here" "$src/zeebe/engine/target/test-classes" "$@"
   # Capture every scenario (hand-written + harvested) from the committed XML.
-  exec "$java" "${jvm_flags[@]}" -cp "$classes:$cp" io.nanobpm.traces.Capture "$here" "$sha"
+  "$java" "${jvm_flags[@]}" -cp "$classes:$cp" io.nanobpm.traces.Capture "$here" "$sha"
+  exit 0
 fi
 
-exec "$java" -XX:+EnableDynamicAgentLoading -Djdk.attach.allowAttachSelf=true \
+"$java" -XX:+EnableDynamicAgentLoading -Djdk.attach.allowAttachSelf=true \
   --add-opens=java.base/java.io=ALL-UNNAMED --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED \
   --add-exports=java.base/jdk.internal.misc=ALL-UNNAMED --enable-native-access=ALL-UNNAMED \
   -cp "$classes:$cp" io.nanobpm.traces.Capture "$here" "$sha" "$@"

@@ -249,6 +249,13 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// The ROOT (process-instance) scope only — test-only by design (#1335).
+    /// Production code must read through [`Engine::variables_for_element`], the
+    /// scope-aware view: evaluating a condition (gateway, conditional event,
+    /// completion condition) against the root alone hides sub-process and
+    /// multi-instance locals. Gating this accessor to `cfg(test)` makes that
+    /// whole defect class a compile error rather than a review catch.
+    #[cfg(test)]
     pub(crate) fn variables(&self, instance_key: Key) -> Arc<HashMap<String, Value>> {
         let base = self
             .state
@@ -303,6 +310,36 @@ impl Engine {
             Some(&enclosing) if instance.scope_parents.contains_key(&enclosing) => enclosing,
             _ => instance.key,
         }
+    }
+
+    /// The scope that `name` resolves to when read from `element_instance_key`:
+    /// the innermost scope on its chain holding a local `name`, else the root
+    /// (instance key). `None` when the instance is unknown. This is the
+    /// visibility/shadowing rule of [`Self::visible_variables`], for one name.
+    pub(crate) fn resolving_scope(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        name: &str,
+    ) -> Option<Key> {
+        let instance = self.state.instances.get(&instance_key)?;
+        let mut cur = self.variable_scope_of(instance, element_instance_key);
+        let mut steps = 0usize;
+        while cur != instance.key && steps <= instance.scope_parents.len() {
+            if instance
+                .scope_variables
+                .get(&cur)
+                .is_some_and(|l| l.contains_key(name))
+            {
+                return Some(cur);
+            }
+            match instance.scope_parents.get(&cur) {
+                Some(&parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+            steps += 1;
+        }
+        Some(instance.key)
     }
 
     /// The variables visible in `scope_key`, resolving each name from the scope
@@ -1003,4 +1040,37 @@ mod tests {
             "instance variable must shadow the same-named cluster variable"
         );
     }
+}
+
+// Test-only probe counting how often the conditional re-evaluation candidate
+// filter inspects a changed write, so a regression test can bound its work:
+// each referenced name must cost ONE lookup per subscription, never one scan
+// per changed variable (the O(subscriptions x references x changed variables)
+// blow-up Copilot flagged on #1419). A `thread_local` keeps the production
+// `Engine` struct and its `Send` guarantee untouched; `cfg(test)` compiles it
+// out of every shipped build. It lives BELOW the trailing `#[cfg(test)] mod
+// tests` because the feel_fallback_lint source scan stops at the first
+// column-0 `#[cfg(test)]` — a probe above the production code would hide every
+// FEEL site below it from the lint.
+#[cfg(test)]
+thread_local! {
+    static CONDITIONAL_WRITE_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zeroes the [`CONDITIONAL_WRITE_CHECKS`] probe before the measured command.
+#[cfg(test)]
+pub(crate) fn reset_conditional_write_checks() {
+    CONDITIONAL_WRITE_CHECKS.with(|c| c.set(0));
+}
+
+/// Reads the [`CONDITIONAL_WRITE_CHECKS`] probe after the measured command.
+#[cfg(test)]
+pub(crate) fn conditional_write_checks() -> u64 {
+    CONDITIONAL_WRITE_CHECKS.with(std::cell::Cell::get)
+}
+
+/// Records one changed-write inspection by the candidate filter.
+#[cfg(test)]
+pub(crate) fn note_conditional_write_check() {
+    CONDITIONAL_WRITE_CHECKS.with(|c| c.set(c.get() + 1));
 }

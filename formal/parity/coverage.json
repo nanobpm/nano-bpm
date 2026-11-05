@@ -406,9 +406,9 @@
     },
     {
       "match": "element:InclusiveGateway",
-      "status": "nano-tested",
+      "status": "parity",
       "evidence": [
-        "engine-core/src/engine/tests/boundary.rs::inclusive_join_waits_while_a_boundary_that_reaches_it_is_still_armed"
+        "traces:inclusive-gateway-subprocess-scope"
       ]
     },
     {
@@ -434,9 +434,9 @@
     },
     {
       "match": "element:SubProcess",
-      "status": "nano-tested",
+      "status": "parity",
       "evidence": [
-        "engine-core/src/engine/tests/boundary.rs::should_interrupt_an_embedded_subprocess_via_its_error_boundary"
+        "traces:exclusive-gateway-subprocess-scope"
       ]
     },
     {
