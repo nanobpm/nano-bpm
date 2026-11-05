@@ -412,7 +412,7 @@ impl Engine {
     /// clone-and-merge. The engine is single-tenant, so the global scope plus the
     /// [`DEFAULT_TENANT`](crate::cluster_vars::DEFAULT_TENANT) tenant scope are
     /// overlaid; a variable scoped to any other tenant is not visible here.
-    fn overlay_cluster_variables(
+    pub(crate) fn overlay_cluster_variables(
         &self,
         base: Arc<HashMap<String, Value>>,
     ) -> Arc<HashMap<String, Value>> {

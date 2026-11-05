@@ -1661,3 +1661,97 @@ fn rejects_activation_that_would_open_an_inactive_adhoc_container() {
         assert!(eiks(&engine, inst, "agent").is_empty(), "nothing opened");
     }
 }
+
+fn nested_boundary_def() -> ProcessDefinition {
+    // `outer` (running, parked on `wait`) contains `inner`, whose message
+    // boundary correlates on `=k`. `outer` declares a local `k` via its input
+    // mapping only when `withLocal` is set.
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+      <bpmn:message id="msg" name="cancel"><bpmn:extensionElements><zeebe:subscription correlationKey="=k" /></bpmn:extensionElements></bpmn:message>
+      <bpmn:process id="nested-staged" isExecutable="true">
+        <bpmn:startEvent id="start" />
+        <bpmn:subProcess id="outer">
+          <bpmn:extensionElements><zeebe:ioMapping><zeebe:input source="=if withLocal then &quot;local&quot; else null" target="k" /></zeebe:ioMapping></bpmn:extensionElements>
+          <bpmn:startEvent id="os" />
+          <bpmn:serviceTask id="wait"><bpmn:extensionElements><zeebe:taskDefinition type="w" /></bpmn:extensionElements></bpmn:serviceTask>
+          <bpmn:subProcess id="inner">
+            <bpmn:startEvent id="is" />
+            <bpmn:serviceTask id="b"><bpmn:extensionElements><zeebe:taskDefinition type="jb" /></bpmn:extensionElements></bpmn:serviceTask>
+            <bpmn:sequenceFlow id="i1" sourceRef="is" targetRef="b" />
+          </bpmn:subProcess>
+          <bpmn:boundaryEvent id="mb" attachedToRef="inner"><bpmn:messageEventDefinition messageRef="msg" /></bpmn:boundaryEvent>
+          <bpmn:endEvent id="late" />
+          <bpmn:sequenceFlow id="o1" sourceRef="os" targetRef="wait" />
+          <bpmn:sequenceFlow id="o2" sourceRef="mb" targetRef="late" />
+        </bpmn:subProcess>
+        <bpmn:endEvent id="end" />
+        <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="outer" />
+        <bpmn:sequenceFlow id="f2" sourceRef="outer" targetRef="end" />
+      </bpmn:process></bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+fn inner_subscription_keys(engine: &Engine, inst: Key) -> Vec<String> {
+    engine
+        .state()
+        .message_subscriptions
+        .values()
+        .filter(|s| s.instance_key == inst && s.element_id == "inner")
+        .map(|s| s.correlation_key.clone())
+        .collect()
+}
+
+/// A variable instruction on an EXISTING ancestor scope (`outer`) is applied
+/// before the created scope's (`inner`) boundaries arm, so the preflight must
+/// see it too — rejecting would refuse a command that applies cleanly
+/// (#1398 review).
+#[test]
+fn staged_write_to_existing_ancestor_scope_satisfies_boundary_preflight() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        nested_boundary_def(),
+        vars(&[("withLocal", Value::Bool(false))]),
+    );
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[("k", Value::Str("o-1".into()))]),
+                    scope_id: Some("outer".into()),
+                }],
+                ..Default::default()
+            }],
+        ))
+        .expect("the staged ancestor write is visible to the boundary");
+    assert_eq!(inner_subscription_keys(&engine, inst), vec!["o-1"]);
+}
+
+/// A staged ROOT write must not override a nearer existing local of the same
+/// name in the preflight view: application arms against `outer`'s local `k`,
+/// so an unusable root `k` must not reject the command (#1398 review).
+#[test]
+fn staged_root_write_does_not_override_nearer_local_in_boundary_preflight() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        nested_boundary_def(),
+        vars(&[("withLocal", Value::Bool(true))]),
+    );
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[("k", Value::List(vec![]))]),
+                    scope_id: None,
+                }],
+                ..Default::default()
+            }],
+        ))
+        .expect("the boundary reads outer's local `k`, not the root write");
+    assert_eq!(inner_subscription_keys(&engine, inst), vec!["local"]);
+}

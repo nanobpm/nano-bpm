@@ -365,11 +365,7 @@ impl Engine {
             if planned.resolution.to_create.is_empty() {
                 continue;
             }
-            let mut host_vars =
-                (*self.variables_for_element(instance_key, planned.resolution.existing)).clone();
-            for variables in &planned.global {
-                host_vars.extend(variables.clone());
-            }
+            let mut host_vars = self.staged_parent_view(instance_key, planned);
             for scope_id in &planned.resolution.to_create {
                 // Checked against the PARENT-scope view, exactly as application
                 // arms it (`arm_boundary_events` evaluates in the new scope's
@@ -573,6 +569,70 @@ impl Engine {
     }
 
     /// The instance of flow scope `scope_id` among `scope` and its ancestors.
+    /// The variable view the first scope created by `planned` arms its
+    /// boundaries against, INCLUDING the variable writes this same command
+    /// stages on already-existing scopes (#1398 review): the root writes
+    /// (`global`) and the element-scoped writes to existing ancestor scopes,
+    /// which application emits BEFORE arming. Each staged write lands in its
+    /// own scope's locals and the chain is then merged root-first, so lexical
+    /// shadowing is preserved — a root write never overrides a nearer local of
+    /// the same name.
+    fn staged_parent_view(
+        &self,
+        instance_key: Key,
+        planned: &PlannedActivation,
+    ) -> HashMap<String, Value> {
+        let existing = planned.resolution.existing;
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return HashMap::new();
+        };
+        let leaf = self.variable_scope_of(instance, existing);
+        let mut chain: Vec<Key> = Vec::new();
+        let mut cur = leaf;
+        while cur != instance.key && cur != 0 {
+            chain.push(cur);
+            match instance.scope_parents.get(&cur) {
+                Some(&parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+        }
+        let mut root = (*instance.variables).clone();
+        let mut locals: HashMap<Key, HashMap<String, Value>> = chain
+            .iter()
+            .map(|k| {
+                (
+                    *k,
+                    instance.scope_variables.get(k).cloned().unwrap_or_default(),
+                )
+            })
+            .collect();
+        for variables in &planned.global {
+            root.extend(variables.clone());
+        }
+        for (scope_id, variables) in &planned.scoped {
+            if *scope_id == planned.element_id
+                || planned.resolution.to_create.iter().any(|c| c == scope_id)
+            {
+                continue;
+            }
+            let Some(target) = self.existing_scope_instance(instance_key, existing, scope_id)
+            else {
+                continue;
+            };
+            let target = self.variable_scope_of(instance, target);
+            match locals.get_mut(&target) {
+                Some(local) => local.extend(variables.clone()),
+                None => root.extend(variables.clone()),
+            }
+        }
+        for k in chain.iter().rev() {
+            if let Some(local) = locals.remove(k) {
+                root.extend(local);
+            }
+        }
+        (*self.overlay_cluster_variables(std::sync::Arc::new(root))).clone()
+    }
+
     fn existing_scope_instance(
         &self,
         instance_key: Key,
