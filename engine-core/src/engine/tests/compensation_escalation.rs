@@ -2712,3 +2712,102 @@ fn mi_sub_process_handler_body_registers_no_compensation_subscription() {
 fn mi_sub_process_handler_body_with_end_listener_registers_no_compensation_subscription() {
     run_mi_sub_process_handler_two_throws(true);
 }
+
+/// Review r4478697236 (#901): routing a multi-instance compensation handler
+/// body back to its throw must not drop the body's output mappings. An
+/// aggregate mapping (`results` -> `undoResults`) is written to the parent
+/// scope before the throw resumes — with and without a body end listener.
+fn run_mi_handler_output_mapping(with_body_end_listener: bool) {
+    let mut b = ProcessBuilder::new("mi-handler-out")
+        .start_event("start")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("comp", "book", "undoMI")
+        .service_task("undoMI", "undo-job")
+        .with_multi_instance(
+            "undoMI",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item".to_string()),
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "undoMI",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=results".to_string(),
+                    target: "undoResults".to_string(),
+                }],
+            },
+        )
+        .compensation_throw_event("throw1")
+        .service_task("mid", "mid-job")
+        .end_event("done")
+        .connect("start", "book")
+        .connect("book", "throw1")
+        .connect("throw1", "mid")
+        .connect("mid", "done");
+    if with_body_end_listener {
+        b = b.with_listeners(
+            "undoMI",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "undo-audit")],
+        );
+    }
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(b.build().unwrap()))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-handler-out",
+            vars(&[("items", Value::List(vec![Value::Int(1), Value::Int(2)]))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    complete_one(&mut engine, "book-job");
+    let undo_jobs = engine.activate_jobs("undo-job", "w", 10, 60_000, 0);
+    assert_eq!(undo_jobs.len(), 2);
+    for job in undo_jobs {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    // Drain every end-listener job (children and body alike).
+    if with_body_end_listener {
+        loop {
+            let jobs = engine.activate_jobs("undo-audit", "w", 10, 60_000, 0);
+            if jobs.is_empty() {
+                break;
+            }
+            for job in jobs {
+                engine
+                    .apply_command(Command::complete_job(job.key))
+                    .unwrap();
+            }
+        }
+    }
+    // The throw resumed (token on `mid`) and the mapping reached the root.
+    assert_eq!(
+        engine.variables(instance_key).get("undoResults"),
+        Some(&Value::List(vec![Value::Int(1), Value::Int(2)])),
+        "MI handler body output mapping must propagate before the throw resumes: {:?}",
+        engine.variables(instance_key)
+    );
+    complete_one(&mut engine, "mid-job");
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
+fn mi_handler_body_output_mapping_propagates_before_throw_resumes() {
+    run_mi_handler_output_mapping(false);
+}
+
+#[test]
+fn mi_handler_body_with_end_listener_output_mapping_propagates() {
+    run_mi_handler_output_mapping(true);
+}

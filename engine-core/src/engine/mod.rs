@@ -8945,6 +8945,13 @@ impl Engine {
         // Review r4478383154: this routing runs BEFORE any subscription
         // registration — a handler body is undo work, so it records nothing
         // compensable (mirrors the leaf-activity routing order in `complete`).
+        // Review r4478697236: output mappings, however, are NOT registration —
+        // they propagate to the parent (flow) scope first, so a handler body's
+        // mapped result is visible before its throw resumes (matching the
+        // end-listener path, which propagated them when the body parked).
+        if !output_updates.is_empty() {
+            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
+        }
         if let Some(throw_eik) = self
             .pending_compensation_handler_by_instance(instance_key, body_key)
             .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
@@ -8966,11 +8973,6 @@ impl Engine {
             &element_id,
             scope,
         ));
-        // Output mappings likewise propagate their projected result to the parent
-        // (flow) scope.
-        if !output_updates.is_empty() {
-            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
-        }
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
