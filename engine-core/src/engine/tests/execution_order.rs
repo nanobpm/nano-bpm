@@ -388,3 +388,98 @@ fn legacy_visibly_opened_join_replays_and_fires_once() {
         ProcessInstanceState::Completed
     );
 }
+
+/// A modification's seeded join activation opens a variable scope on the
+/// parked join's key before the readiness guard evaluates. Tearing the join
+/// down resets it without an `ElementCompleted` (there is no lifecycle to
+/// end), so the reset itself must drop that scope: otherwise the seeded
+/// locals orphan in `scope_parents` / `scope_variables` and leak into
+/// snapshots.
+#[test]
+fn resetting_a_seeded_parked_join_clears_its_variable_scope() {
+    // Three incoming flows: one arrival parks the join, and the seeded
+    // activation (itself one unidentified arrival) is still short of ready.
+    let def = ProcessBuilder::new("seeded-parked-join")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .service_task("c", "jc")
+        .parallel_gateway("join")
+        .end_event("done")
+        .connect("start", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("fork", "c")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("c", "join")
+        .connect("join", "done")
+        .build()
+        .unwrap();
+    let (mut engine, inst, _) = deploy_and_run(def, HashMap::new());
+    complete_one(&mut engine, "ja");
+    let parked = engine
+        .instance(inst)
+        .unwrap()
+        .parked_joins
+        .iter()
+        .next()
+        .copied()
+        .expect("the join is parked after the first arrival");
+    // Seed the waiting join with an element-local variable (a modification
+    // activation that stays parked: two branches have not arrived).
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![ActivateElementInstruction {
+                element_id: "join".into(),
+                variable_instructions: vec![crate::command::VariableInstruction {
+                    variables: HashMap::from([("l".to_string(), Value::Int(1))]),
+                    scope_id: Some("join".into()),
+                }],
+                ..Default::default()
+            }],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    {
+        let instance = engine.instance(inst).unwrap();
+        assert!(
+            instance.parked_joins.contains(&parked),
+            "the seeded activation reuses the waiting join, still parked"
+        );
+        assert_eq!(
+            instance.scope_variables[&parked].get("l"),
+            Some(&Value::Int(1)),
+            "the seeded local sits on the parked join's scope"
+        );
+    }
+    // Terminate the waiting join: its parked key, scope registration and
+    // seeded locals must all go.
+    let events = engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec!["join".into()],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ParallelJoinReset { element_id, .. } if element_id == "join")));
+    let instance = engine.instance(inst).unwrap();
+    assert!(instance.parked_joins.is_empty());
+    assert!(instance.join_instances.is_empty());
+    assert!(
+        !instance.scope_parents.contains_key(&parked),
+        "the parked join's scope parent must not survive its reset"
+    );
+    assert!(
+        !instance.scope_variables.contains_key(&parked),
+        "the parked join's seeded locals must not survive its reset"
+    );
+}

@@ -132,6 +132,14 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     if instance.parked_joins.remove(&eik) {
                         instance.active.remove(&eik);
                         instance.scopes.remove(&eik);
+                        // A modification's seeded join activation opens a
+                        // variable scope on the parked key before the guard
+                        // evaluates; the reset bypasses `ElementCompleted`
+                        // (which drops scopes), so drop them here or the
+                        // seeded locals orphan in `scope_parents` /
+                        // `scope_variables` and leak into snapshots.
+                        instance.scope_parents.remove(&eik);
+                        instance.scope_variables.remove(&eik);
                     }
                 }
             }
