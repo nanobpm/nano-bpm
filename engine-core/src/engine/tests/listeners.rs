@@ -1200,13 +1200,14 @@ fn end_listener_fires_on_an_adhoc_container() {
 }
 
 #[test]
-fn exclusive_gateway_end_listener_reselects_and_raises_incident_if_nothing_matches() {
-    // A gateway's `end` listener runs BEFORE the routing decision is finalised, so
-    // a listener that rewrites a condition variable is observed by the
-    // re-selection. If the rewrite makes NOTHING match (and there is no default),
-    // the gateway must raise a no-matching-flow incident and keep its token — not
-    // silently complete and drop the token (which would falsely finish the
-    // instance).
+fn exclusive_gateway_end_listener_cannot_change_the_activation_selection() {
+    // Since #1402 a split gateway's routing decision is finalised while it is
+    // ACTIVATING (Zeebe `onActivate` → `findSequenceFlowToTake`), BEFORE the
+    // `end` listener chain runs. A listener that rewrites a condition variable
+    // therefore does NOT change the route: the gateway completes through the
+    // selection it made at activation (journaled as `GatewayRouteSelected`),
+    // exactly as Zeebe takes the flow found in `finalizeActivation` after the
+    // start listeners drain.
     let process = ProcessBuilder::new("route")
         .start_event("s")
         .exclusive_gateway("g")
@@ -1224,8 +1225,8 @@ fn exclusive_gateway_end_listener_reselects_and_raises_incident_if_nothing_match
     engine
         .apply_command(Command::DeployProcess(process))
         .unwrap();
-    // `go=true` at creation → the flow to "yes" is selectable, so the gateway
-    // parks on its end listener.
+    // `go=true` at creation → the flow to "yes" is selected at activation, so
+    // the gateway parks on its end listener.
     let inst = engine
         .apply_command(Command::create_instance_with(
             "route",
@@ -1238,8 +1239,8 @@ fn exclusive_gateway_end_listener_reselects_and_raises_incident_if_nothing_match
     let audit = engine.activate_jobs("gate-audit", "W", 10, 1_000, 0);
     assert_eq!(audit.len(), 1);
 
-    // The listener completes, flipping `go` to false — now nothing matches on
-    // re-selection.
+    // The listener completes, flipping `go` to false — the activation-time
+    // selection still routes to "yes"; no incident is raised.
     let done = engine
         .apply_command(Command::complete_job_with(
             audit[0].key,
@@ -1247,25 +1248,21 @@ fn exclusive_gateway_end_listener_reselects_and_raises_incident_if_nothing_match
         ))
         .unwrap();
     assert!(
+        !done
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { .. })),
+        "the carried selection routes without re-evaluating: {done:?}"
+    );
+    assert!(
         done.iter().any(|e| matches!(
             e,
-            Event::IncidentRaised {
-                kind: state::IncidentKind::NoMatchingSequenceFlow,
-                ..
-            }
+            Event::SequenceFlowTaken { from, to, .. } if from == "g" && to == "yes"
         )),
-        "re-selection matched nothing → no-matching-flow incident"
+        "the gateway takes the flow selected while ACTIVATING: {done:?}"
     );
     assert!(
-        !done.iter().any(|e| matches!(
-            e,
-            Event::SequenceFlowTaken { to, .. } if to == "yes"
-        )),
-        "no flow taken when re-selection fails"
-    );
-    assert!(
-        !engine.is_completed(inst),
-        "instance parked on the gateway incident, not falsely completed"
+        engine.is_completed(inst),
+        "the instance completes through the carried selection"
     );
 }
 

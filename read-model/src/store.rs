@@ -6394,6 +6394,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         | Event::CompensationTriggered { .. }
         | Event::DeploymentCreated { .. }
         | Event::ElementCompleting { .. }
+        | Event::GatewayRouteSelected { .. }
         | Event::MessagePublished { .. }
         | Event::MessageStartSubscriptionCreated { .. }
         | Event::MessageSubscriptionClosing { .. }
@@ -7917,6 +7918,7 @@ mod definition_xml_tests {
             join_counts: Default::default(),
             join_flow_arrivals: Default::default(),
             join_instances: Default::default(),
+            gateway_routes: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
@@ -8183,6 +8185,7 @@ mod definition_xml_tests {
             join_counts: Default::default(),
             join_flow_arrivals: Default::default(),
             join_instances: Default::default(),
+            gateway_routes: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
             multi_instances: Default::default(),
