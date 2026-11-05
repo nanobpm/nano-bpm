@@ -1123,3 +1123,52 @@ fn resolved_boundary_timer_failure_preserves_user_task_host() {
     );
     assert_eq!(engine.timers().len(), 1, "the boundary timer is re-armed");
 }
+
+#[test]
+fn sequential_mi_completion_latch_completes_without_spawning_remaining_items() {
+    // Sequential counterpart of the parallel latch: with
+    // `cancelRemainingInstances=false`, a condition fulfilled by the first child
+    // completes the body once that child drains, instead of wedging with
+    // unspawned items and no active child (#1398 review).
+    let def = parse(
+        r#"<bpmn:process id="mils" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics isSequential="true" cancelRemainingInstances="false">
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+              </bpmn:extensionElements>
+              <bpmn:completionCondition>=done</bpmn:completionCondition>
+            </bpmn:multiInstanceLoopCharacteristics>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(
+        def,
+        vars(&[
+            (
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            ),
+            ("done", Value::Bool(true)),
+        ]),
+    );
+    let first = engine
+        .activate_jobs("work", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("first sequential child job");
+    engine
+        .apply_command(Command::complete_job(first.key))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "the latched sequential body completes; pending jobs: {:?}",
+        engine.pending_jobs()
+    );
+    assert!(engine.pending_jobs().is_empty());
+}

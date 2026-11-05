@@ -73,6 +73,29 @@ fn higher_priority_jobs_activate_before_older_lower_priority_jobs() {
 }
 
 #[test]
+fn minimum_priority_jobs_activate_last_without_overflow() {
+    // `i32::MIN` is in the accepted priority domain: indexing it must not
+    // overflow, and it must activate after an ordinary job (#1398 review).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_priority(
+            "min",
+            "-2147483648",
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(task_with_priority("mid", "-50")))
+        .unwrap();
+    // The minimum-priority instance is older (lower key) but must go last.
+    let min = create_instance_key(&mut engine, "min");
+    let mid = create_instance_key(&mut engine, "mid");
+    let jobs = engine.activate_jobs("work", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].instance_key, mid, "ordinary priority first");
+    assert_eq!(jobs[1].instance_key, min, "minimum priority last");
+}
+
+#[test]
 fn equal_priority_jobs_activate_oldest_first() {
     // Same priority (default 50) => FIFO by creation (key) is preserved.
     let mut engine = Engine::new();

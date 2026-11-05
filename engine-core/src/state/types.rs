@@ -399,9 +399,15 @@ pub fn default_true() -> bool {
 /// priority first (stored negated so a `BTreeSet`'s ascending order yields it
 /// first), then lowest key (oldest-first — keys are monotonic with creation
 /// within a partition — as the SLA/age tiebreak).
+///
+/// The negation saturates: the accepted priority domain includes `i32::MIN`,
+/// whose plain negation overflows (a panic in overflow-checked builds, and a
+/// wrap back to `i32::MIN` — i.e. *highest* priority — otherwise). Saturating
+/// maps it to `i32::MAX` so it sorts last, while every other priority keeps the
+/// exact `-priority` value the persisted snapshot index already stores.
 #[inline]
 pub(crate) fn activation_order(priority: i32, key: Key) -> (i32, Key) {
-    (-priority, key)
+    (priority.saturating_neg(), key)
 }
 
 /// Retries a job starts with when first created.
