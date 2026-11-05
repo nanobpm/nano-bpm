@@ -388,13 +388,30 @@ pub fn default_job_priority() -> i32 {
     DEFAULT_JOB_PRIORITY
 }
 
+/// serde default for `true`-by-default boolean fields (BPMN
+/// `cancelRemainingInstances`) on records serialized before the field existed.
+#[cfg(feature = "serde")]
+pub fn default_true() -> bool {
+    true
+}
+
 /// The ordering position of an activatable job in the per-type index: highest
 /// priority first (stored negated so a `BTreeSet`'s ascending order yields it
 /// first), then lowest key (oldest-first — keys are monotonic with creation
 /// within a partition — as the SLA/age tiebreak).
+///
+/// The negation is computed in `i64` so it is **collision-free over the whole
+/// accepted priority domain** (`i32::MIN..=i32::MAX`, see
+/// [`crate::engine::expression::evaluate_job_priority`]): a plain `i32`
+/// negation overflows at `i32::MIN`, and a saturating one maps both `i32::MIN`
+/// and `i32::MIN + 1` to `i32::MAX`, letting an older minimum-priority job win
+/// the key tiebreak over a newer, strictly-higher-priority one (#1398 review).
+/// The index is in-memory only (rebuilt from `jobs` by [`resync_job_index`] /
+/// [`restore_instance_snapshot`]), never persisted, so widening the stored key
+/// is replay-safe.
 #[inline]
-pub(crate) fn activation_order(priority: i32, key: Key) -> (i32, Key) {
-    (-priority, key)
+pub(crate) fn activation_order(priority: i32, key: Key) -> (i64, Key) {
+    (-i64::from(priority), key)
 }
 
 /// Retries a job starts with when first created.
@@ -754,6 +771,14 @@ pub struct MultiInstanceState {
     pub output_element: Option<String>,
     /// FEEL boolean evaluated after each child; `true` completes the body early.
     pub completion_condition: Option<String>,
+    /// The BPMN `cancelRemainingInstances` attribute (default `true`), resolved
+    /// at parse and carried by [`crate::Event::MultiInstanceActivated`]: whether
+    /// a fired completion condition cancels the children still running (`true`)
+    /// or latches and defers the body's completion until they drain (`false`).
+    /// Additive with a serde default of `true` — a body recorded before this
+    /// field existed completes exactly as the pre-field engine did.
+    #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+    pub cancel_remaining_instances: bool,
     /// Local variable name each item binds to in its child scope.
     pub input_element: Option<String>,
     /// How many children have been spawned so far (drives sequential's next
@@ -771,6 +796,16 @@ pub struct MultiInstanceState {
     pub child_indices: std::collections::BTreeMap<Key, usize>,
     /// Collected per-child output, positioned by the child's 0-based index.
     pub output_values: Vec<Option<Value>>,
+    /// Latched once the `<completionCondition>` evaluated `true` with
+    /// `cancelRemainingInstances=false`: the loop stops evaluating the condition
+    /// and the body completes once its outstanding children drain, even if a
+    /// variable the condition reads later changes (or becomes unreadable) — a
+    /// satisfied condition is not reneged (Zeebe
+    /// `ElementInstance#isCompletionConditionFulfilled`, mirrored from the ad-hoc
+    /// container's latch). Additive with a serde default: a body recorded before
+    /// this field existed has no latched fulfilment.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub completion_condition_fulfilled: bool,
 }
 
 /// Runtime state of an active ad-hoc sub-process container (ADR 0023 seam 2).
@@ -958,6 +993,27 @@ pub enum IoMappingRedrive {
     /// job creation (engine `Step::CreateJob`) against the then-current
     /// variables. Additive brand-new variant — old journals never carry it.
     JobCreation,
+    /// An ad-hoc (agent) container's agent-job `type` / `retries` expression
+    /// failed when the job for the next agent turn was to be minted (#1398
+    /// review). The container stays activated with its collected results,
+    /// active tools and iteration state intact; resolution re-mints ONLY the
+    /// agent job (engine `Step::MintAdHocAgentJob`) — re-running the
+    /// container's activation would reset its `outputCollection` and
+    /// `AdHocState`. Covers nested containers (the job type is resolved off the
+    /// parent catalog). Additive brand-new variant — old journals never carry it.
+    AdHocAgentJob,
+    /// An **execution listener**'s job `type` / `retries` expression failed
+    /// when listener `listener_index` of the element's `event_type` chain was
+    /// to be minted (#1398 review). Everything before that listener (input /
+    /// output mappings, boundary arming, earlier completed listeners) already
+    /// happened; resolution re-mints ONLY that listener's job (engine
+    /// `Step::MintExecutionListenerJob`) instead of restarting the lifecycle
+    /// phase. Additive brand-new variant — old journals never carry it.
+    ExecutionListenerJob {
+        event_type: crate::model::ListenerEventType,
+        listener_index: usize,
+        scope: Key,
+    },
     /// A multi-instance **child**'s job properties (type / retries) failed to
     /// evaluate after its per-child input mappings were already applied (#1390,
     /// #1399 review): resolution re-runs only the child's behaviour against its
@@ -979,6 +1035,68 @@ pub enum IoMappingRedrive {
     AdHocToolJobType {
         element_id: ElementId,
         variables: HashMap<String, Value>,
+    },
+    /// A task-listener job's `type` / `retries` expression failed (#1398): the
+    /// user task rests with its deferred transition and no listener job; the
+    /// incident sits on the user task's element instance. Resolution re-mints
+    /// the job of listener `listener_index` of the `event_type` chain on task
+    /// `user_task_key` (Zeebe raises the task-listener job's
+    /// `EXTRACT_VALUE_ERROR` and retries the job creation on resolution).
+    TaskListenerJob {
+        user_task_key: Key,
+        event_type: crate::model::TaskListenerEventType,
+        listener_index: usize,
+    },
+    /// An activation-time **behaviour** expression failed AFTER the element's
+    /// input mappings and `start` execution listeners already succeeded (a job
+    /// type/retries, user-task assignee/candidate/date, boundary or catch-event
+    /// trigger expression, ad-hoc active-elements collection — #1398 review):
+    /// resolution re-runs ONLY the activation body (the behaviour), never the
+    /// already-applied input mappings (which may be non-idempotent, e.g.
+    /// `=counter + 1 -> counter`) or the already-run start listeners (Zeebe
+    /// retries the failed behaviour, not the whole activation). Distinct from
+    /// [`Self::Activation`], which re-applies inputs because THEY failed.
+    /// Additive brand-new variant — old journals never carry it.
+    ActivationBody,
+    /// Like [`Self::ActivationBody`], but the failure happened BEFORE the
+    /// element reached `ACTIVATED` (a job-property expression failing in a fresh
+    /// activation, Zeebe `JobWorkerTaskProcessor.onActivate` failing before
+    /// `transitionToActivated`): the successful body re-run emits
+    /// `ElementActivated` first. Distinct from [`Self::ActivationPending`],
+    /// which re-applies the input mappings (they are what failed there); here
+    /// the inputs already succeeded, so only the behaviour re-runs. Additive
+    /// brand-new variant — old journals never carry it.
+    ActivationBodyPending,
+    /// A **timer boundary event**'s expression failed while its host's other
+    /// subscriptions were being armed (#1398 review): the host's job and any
+    /// already-armed boundaries stay live, so a full activation re-drive would
+    /// duplicate the host job and re-arm unrelated boundaries. Resolution
+    /// resumes arming AT this boundary — it and every sibling after it in the
+    /// deterministic arming order (`Engine::armable_boundaries`), which were
+    /// left un-armed — re-evaluating their expressions against
+    /// the host's scope with `base` as the scheduling base (the host's flow
+    /// scope — the same view `Engine::arm_boundary_events` evaluates against).
+    /// Additive brand-new variant — old journals never carry it.
+    BoundaryTimer {
+        /// Id of the boundary event whose timer is re-armed on resolution.
+        boundary_element_id: ElementId,
+        /// Scope the boundary's expression evaluates against (the host's flow
+        /// scope), captured so the retry sees the same view arming did.
+        base: Key,
+    },
+    /// A multi-instance **child**'s completion failed (its `outputElement` or
+    /// the body's `completionCondition` raised — #1398 review): resolution
+    /// re-drives the child's completion. `output_overlay` preserves the
+    /// already-projected outputs of a CALL-ACTIVITY child (the callee's
+    /// propagated variables plus the activity's applied `zeebe:output` mappings)
+    /// — the callee process instance that produced them is gone by resolution
+    /// time, so without them the retry would collect `null` or fail again.
+    /// `None` for a service-task / sub-process child, whose outputs still live
+    /// in its own scope. Additive brand-new variant — old journals never
+    /// carry it.
+    MiChildCompletion {
+        body_key: Key,
+        output_overlay: Option<HashMap<String, Value>>,
     },
 }
 
@@ -1349,15 +1467,17 @@ pub struct State {
     /// `due_at = None`.
     pub start_timers: HashMap<Key, StartTimer>,
     /// Index of jobs eligible to be *considered* for activation, grouped by job
-    /// type and ordered by `(−priority, key)` — highest priority first, then
-    /// oldest (lowest key) as the age/SLA tiebreak. A job is a member iff its
+    /// type and ordered by `(−priority, key)` (priority negated in `i64`, so
+    /// every accepted `i32` priority keeps a distinct slot) — highest priority
+    /// first, then oldest (lowest key) as the age/SLA tiebreak. A job is a
+    /// member iff its
     /// state is `Created` (an `Activated` job is removed when it locks and re-added
     /// by `JobLockExpired` when its lock expires). This lets `ActivateJobs` serve a
     /// worker poll in roughly `O(max_jobs)` instead of scanning every job in the
     /// system — critical when a large backlog of pending jobs accumulates under
     /// load. It is fully derived from `jobs` and kept in lockstep by
     /// [`resync_job_index`].
-    pub activatable_jobs: HashMap<String, BTreeSet<(i32, Key)>>,
+    pub activatable_jobs: HashMap<String, BTreeSet<(i64, Key)>>,
     /// The keys of all jobs currently in the `Activated` state (holding a lock).
     /// Bounded by the number of concurrently working workers, so it lets
     /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning

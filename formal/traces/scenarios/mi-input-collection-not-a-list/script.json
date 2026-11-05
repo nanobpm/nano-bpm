@@ -1,0 +1,28 @@
+{
+  "description": "#1398: a multi-instance inputCollection that is not a list -> EXTRACT_VALUE_ERROR incident on the multi-instance body (was: silently empty); fixing the variable and resolving the incident runs the instances.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "mi-input-collection",
+      "variables": {
+        "items": 5
+      }
+    },
+    {
+      "op": "updateVariables",
+      "variables": {
+        "items": [
+          1
+        ]
+      }
+    },
+    {
+      "op": "resolveIncident",
+      "elementId": "review"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}

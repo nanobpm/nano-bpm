@@ -80,6 +80,7 @@ public class CellIdsTest {
   @Test
   public void processInstanceRecordsTouchNoElementCell() {
     assertEquals(null, CellIds.elementCellOrNull("PROCESS"));
+    assertEquals(null, CellIds.elementCellOrNull("MULTI_INSTANCE_BODY"));
     assertEquals("element:ServiceTask", CellIds.elementCellOrNull("SERVICE_TASK"));
   }
 }

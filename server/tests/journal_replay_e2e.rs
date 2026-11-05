@@ -689,12 +689,15 @@ fn a_non_interrupting_message_boundary_deploys_and_spawns_a_parallel_token() {
         "non-interrupting boundary model should deploy: {body}"
     );
 
-    // Start an instance; the token parks on the main service task and the
-    // boundary subscription opens (orderId unset, so its correlation value is "").
+    // Start an instance with `orderId` set so the boundary subscription's
+    // correlation key (`=orderId`) resolves to a real value at open time. An
+    // unset correlation-key variable now raises an EXTRACT_VALUE_ERROR incident
+    // and opens no subscription (Zeebe parity, #1398) — the pre-parity behaviour
+    // of opening an empty, never-matchable key is gone.
     let (status, body) = server.request(
         "POST",
         &path("/process-instances"),
-        Some(r#"{"processDefinitionId":"notifiable"}"#),
+        Some(r#"{"processDefinitionId":"notifiable","variables":{"orderId":"order-1"}}"#),
     );
     assert_eq!(status, 200, "create instance failed: {body}");
 
@@ -703,7 +706,7 @@ fn a_non_interrupting_message_boundary_deploys_and_spawns_a_parallel_token() {
     let (status, body) = server.request(
         "POST",
         &path("/messages/correlation"),
-        Some(r#"{"name":"reminder","correlationKey":""}"#),
+        Some(r#"{"name":"reminder","correlationKey":"order-1"}"#),
     );
     assert_eq!(
         status, 200,
@@ -772,12 +775,15 @@ fn an_interrupting_message_boundary_on_a_subprocess_tears_down_the_inner_scope()
         "sub-process message-boundary model should deploy: {body}"
     );
 
-    // Start an instance; the token parks on the inner service task and the
-    // boundary subscription opens on the sub-process.
+    // Start an instance with `orderId` set so the boundary subscription's
+    // correlation key (`=orderId`) resolves to a real value at open time (an
+    // unset key now raises an EXTRACT_VALUE_ERROR incident and opens no
+    // subscription — Zeebe parity, #1398). The token parks on the inner service
+    // task and the boundary subscription opens on the sub-process.
     let (status, body) = server.request(
         "POST",
         &path("/process-instances"),
-        Some(r#"{"processDefinitionId":"cancellable-sub"}"#),
+        Some(r#"{"processDefinitionId":"cancellable-sub","variables":{"orderId":"order-7"}}"#),
     );
     assert_eq!(status, 200, "create instance failed: {body}");
     let inner_key = activate_one_job(&server, "inner-work");
@@ -787,7 +793,7 @@ fn an_interrupting_message_boundary_on_a_subprocess_tears_down_the_inner_scope()
     let (status, body) = server.request(
         "POST",
         &path("/messages/correlation"),
-        Some(r#"{"name":"order-cancelled","correlationKey":""}"#),
+        Some(r#"{"name":"order-cancelled","correlationKey":"order-7"}"#),
     );
     assert_eq!(
         status, 200,

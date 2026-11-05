@@ -3037,12 +3037,12 @@ fn adhoc_declarative_empty_collection_completes_immediately() {
 }
 
 #[test]
-fn adhoc_declarative_ignores_unknown_collection_ids() {
-    // An id in the collection that is not one of the container's inner elements
-    // is not activatable (nano prunes inner tools from the executable graph), so
-    // it is dropped rather than minting a phantom child. Only the real element
-    // runs. (Raising the Camunda NOT_FOUND incident is a separate validation
-    // gap.)
+fn adhoc_declarative_unknown_collection_ids_raise_an_incident() {
+    // Zeebe `AdHocSubProcessProcessor` (BPMN_TASK variant): an id in the
+    // `activeElementsCollection` that is not one of the container's inner
+    // elements is an EXTRACT_VALUE_ERROR on the container — "... the given
+    // elements [ghost] do not exist." — never silently dropped (#1398). Fixing
+    // the collection and resolving activates the real element.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(adhoc_declarative_process()))
@@ -3058,25 +3058,31 @@ fn adhoc_declarative_ignores_unknown_collection_ids() {
             ]),
         )]),
     );
-    let container = *engine
-        .instance(inst)
-        .unwrap()
-        .adhoc_instances
-        .keys()
-        .next()
-        .expect("container runtime state registered");
-    assert_eq!(
-        engine
-            .instance(inst)
-            .unwrap()
-            .adhoc_instances
-            .get(&container)
-            .unwrap()
-            .active
-            .len(),
-        1,
-        "only the real element activated; the unknown id was dropped"
+    assert!(
+        engine.activate_jobs("tool", "W", 10, 1_000, 0).is_empty(),
+        "no tool runs while the collection names an unknown element"
     );
+    let incident = engine.active_incidents()[0].clone();
+    assert_eq!(incident.kind, state::IncidentKind::ExtractValueError);
+    assert!(
+        incident
+            .reason
+            .contains("but the given elements [ghost] do not exist."),
+        "{}",
+        incident.reason
+    );
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([(
+                "tools".to_string(),
+                Value::List(vec![Value::Str("toolA".to_string())]),
+            )]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
     let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
     assert_eq!(tool_jobs.len(), 1, "exactly one tool ran");
     engine

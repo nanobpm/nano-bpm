@@ -212,6 +212,7 @@ fn multi_instance_call_activity_completes_normally_and_aggregates_output() {
                 output_collection: Some("results".to_string()),
                 output_element: Some("=result".to_string()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -314,6 +315,7 @@ fn multi_instance_call_activity_child_applies_inputs_once_and_keeps_callee_id_cl
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -411,6 +413,7 @@ fn multi_instance_call_activity_spawn_retry_is_mi_aware() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -495,6 +498,7 @@ fn early_multi_instance_completion_terminates_running_call_activity_callees() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

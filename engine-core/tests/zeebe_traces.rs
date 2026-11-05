@@ -947,6 +947,21 @@ impl<'a> NanoRun<'a> {
                     .unwrap_or_else(|| format!("?{instance_key}"));
                 self.variable_records(*instance_key, pid, variables, *instance_key)
             }
+            // A multi-instance child's scope bindings (`inputElement`,
+            // `loopCounter`) are Zeebe VARIABLE CREATED records on the child.
+            Event::MultiInstanceChildActivated {
+                instance_key,
+                child_key,
+                local_variables,
+                ..
+            } => {
+                let scope = self
+                    .element_ids
+                    .get(child_key)
+                    .cloned()
+                    .unwrap_or_else(|| format!("?{child_key}"));
+                self.variable_records(*child_key, scope, local_variables, *instance_key)
+            }
             Event::ScopedVariablesUpdated {
                 instance_key,
                 scope_key,

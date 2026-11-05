@@ -1460,6 +1460,7 @@ fn rebuild_with_mi_kind(
         output_collection: None,
         output_element: None,
         completion_condition: None,
+        cancel_remaining_instances: true,
         sequential,
     });
     def

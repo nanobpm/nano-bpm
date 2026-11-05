@@ -27,6 +27,7 @@ fn subprocess_terminate_end_clears_a_multi_instance_body_in_its_scope() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -99,6 +100,7 @@ fn early_multi_instance_completion_tears_down_a_running_subprocess_child_scope()
                 output_collection: None,
                 output_element: None,
                 completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -190,6 +192,7 @@ fn dead_scope_guard_rejects_mi_retries_after_the_body_is_torn_down() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -302,6 +305,7 @@ fn top_level_terminate_end_clears_a_multi_instance_body() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -354,6 +358,7 @@ fn multi_instance_child_input_mapping_failure_raises_io_mapping_and_reactivates(
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -717,6 +722,7 @@ fn multi_instance_completion_condition_completes_the_body_early() {
                 output_element: None,
                 // Fire as soon as the first child finishes.
                 completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1129,6 +1135,7 @@ fn multi_instance_child_job_type_resolves_against_the_child_scope() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1184,6 +1191,7 @@ fn multi_instance_body_static_input_mapping_named_like_child_binding_is_applied_
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1247,6 +1255,7 @@ fn multi_instance_body_input_mapping_with_local_binding_shadowing_input_element_
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1301,6 +1310,7 @@ fn multi_instance_body_input_mapping_with_filter_local_item_binding_runs() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1356,6 +1366,7 @@ fn multi_instance_body_input_mapping_with_filter_over_context_elements_runs() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1412,6 +1423,7 @@ fn multi_instance_body_input_mapping_with_bare_var_filter_runs() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

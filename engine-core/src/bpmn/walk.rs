@@ -1080,9 +1080,15 @@ pub(crate) fn parse_with_captures(
                                     let sequential = attr(attrs, "isSequential")
                                         .map(|v| v == "true")
                                         .unwrap_or(false);
+                                    // BPMN `cancelRemainingInstances` defaults to
+                                    // `true`; only an explicit "false" defers the
+                                    // body's completion until its children drain.
+                                    let cancel_remaining_instances =
+                                        attr(attrs, "cancelRemainingInstances") != Some("false");
                                     acc.nodes[idx].multi_instance =
                                         Some(crate::model::MultiInstance {
                                             sequential,
+                                            cancel_remaining_instances,
                                             ..Default::default()
                                         });
                                     if !self_closing {

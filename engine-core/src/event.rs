@@ -1290,7 +1290,25 @@ pub enum Event {
         output_collection: Option<String>,
         output_element: Option<String>,
         completion_condition: Option<String>,
+        /// The BPMN `cancelRemainingInstances` attribute resolved at parse
+        /// (default `true`): whether a fired completion condition cancels the
+        /// children still running (`true`) or latches and defers the body's
+        /// completion until they drain (`false`). Additive with a serde default
+        /// of `true` — a body recorded before this field existed completes
+        /// exactly as the pre-field engine did (cancel remaining).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default = "crate::state::types::default_true")
+        )]
+        cancel_remaining_instances: bool,
     },
+    /// A multi-instance body's `<completionCondition>` fired with
+    /// `cancelRemainingInstances=false`: the fulfilment is latched and the body
+    /// completes once its outstanding children drain — even if a variable the
+    /// condition reads later changes or becomes unreadable (Zeebe
+    /// `ElementInstance#isCompletionConditionFulfilled`). Durable so the latch
+    /// survives replay.
+    MultiInstanceCompletionConditionFulfilled { instance_key: Key, body_key: Key },
     /// A multi-instance child instance was activated at `index` (0-based) into the
     /// input collection. `local_variables` are the child's scope bindings (the
     /// `input_element` item, when named, and `loopCounter`), overlaid on the
@@ -1619,6 +1637,7 @@ impl Event {
             | Event::CompensationHandlerCompleted { instance_key, .. }
             | Event::ScopedCompensationCleared { instance_key, .. }
             | Event::MultiInstanceActivated { instance_key, .. }
+            | Event::MultiInstanceCompletionConditionFulfilled { instance_key, .. }
             | Event::MultiInstanceChildActivated { instance_key, .. }
             | Event::MultiInstanceChildCompleted { instance_key, .. }
             | Event::MultiInstanceCompleted { instance_key, .. }
@@ -1918,6 +1937,7 @@ impl Event {
                 ..
             } => m = m.max(*throw_element_instance_key),
             Event::MultiInstanceActivated { body_key, .. }
+            | Event::MultiInstanceCompletionConditionFulfilled { body_key, .. }
             | Event::MultiInstanceCompleted { body_key, .. } => m = m.max(*body_key),
             Event::MultiInstanceChildActivated {
                 body_key,

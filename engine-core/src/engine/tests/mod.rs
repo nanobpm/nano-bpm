@@ -14,6 +14,7 @@ mod call_activity;
 mod compensation_escalation;
 mod execution_order;
 mod expression_failures;
+mod feel_fallbacks;
 mod incidents;
 mod jobs;
 mod lifecycle;
@@ -548,7 +549,7 @@ fn process_none_plus_timer() -> ProcessDefinition {
 
 fn assert_job_index_consistent(engine: &Engine) {
     use std::collections::{BTreeSet, HashMap, HashSet};
-    let mut expected: HashMap<String, BTreeSet<(i32, Key)>> = HashMap::new();
+    let mut expected: HashMap<String, BTreeSet<(i64, Key)>> = HashMap::new();
     let mut expected_activated: HashSet<Key> = HashSet::new();
     for job in engine.state().jobs.values() {
         if job.state == state::JobState::Created {
@@ -812,6 +813,7 @@ fn multi_instance_service_process(sequential: bool) -> ProcessDefinition {
                 output_collection: Some("results".to_string()),
                 output_element: Some("=item * 2".to_string()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential,
             },
         )
@@ -845,6 +847,7 @@ fn multi_instance_subprocess(sequential: bool) -> ProcessDefinition {
                 output_collection: Some("done_tasks".to_string()),
                 output_element: Some("=task".to_string()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential,
             },
         )
@@ -892,6 +895,7 @@ fn multi_instance_subprocess_with_output_mapping() -> ProcessDefinition {
                 output_collection: Some("tags".to_string()),
                 output_element: Some("=tag".to_string()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -937,6 +941,7 @@ fn multi_instance_service_with_input_mapping() -> ProcessDefinition {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1669,6 +1674,7 @@ fn mi_body_with_listeners(
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

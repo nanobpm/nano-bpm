@@ -29,8 +29,8 @@ mod memory;
 mod migration;
 mod modify;
 mod resolve;
-
 pub use debug::{BreakCondition, DebugSession};
+use resolve::{JobProps, ResolvedUserTask};
 
 /// Whether the fixpoint loop should keep draining after a processed step, or pause
 /// and hand control back to a debugger. See [`StepDriver`].
@@ -326,6 +326,35 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// Re-mint ONLY the agent job of an ad-hoc container whose agent-job
+    /// `type` / `retries` expression raised an incident
+    /// ([`state::IoMappingRedrive::AdHocAgentJob`], #1398 review): the
+    /// container's collected results and ad-hoc state are preserved.
+    MintAdHocAgentJob {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
+    /// Re-mint ONLY execution listener `index` of an element's `event_type`
+    /// chain whose `type` / `retries` expression raised an incident
+    /// ([`state::IoMappingRedrive::ExecutionListenerJob`], #1398 review).
+    MintExecutionListenerJob {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        event_type: crate::model::ListenerEventType,
+        index: usize,
+        scope: Key,
+    },
+    /// Re-mint the listener job of a user task's task-listener chain whose
+    /// `type` / `retries` expression raised an incident (#1398).
+    MintTaskListenerJob {
+        instance_key: Key,
+        element_instance_key: Key,
+        user_task_key: Key,
+        event_type: crate::model::TaskListenerEventType,
+        index: usize,
+    },
     /// Re-run only the activation body (not input mappings / start listeners)
     /// of an already-active element whose activation-time expression raised an
     /// `ExpressionEvaluation` incident: a message intermediate catch whose
@@ -365,6 +394,36 @@ enum Step {
         /// kept verbatim and its `ElementActivated` is not repeated). `None`
         /// re-drives the full activation body.
         resume_listener_at: Option<usize>,
+    },
+    /// Resume arming a host's boundary events at the one whose timer expression
+    /// failed while the host was activating
+    /// ([`state::IoMappingRedrive::BoundaryTimer`], #1398 review): that boundary
+    /// and every sibling after it in the deterministic arming order are armed;
+    /// the host's job and the siblings armed before it stayed live, so a full
+    /// activation re-drive would duplicate them. Expressions re-evaluate against
+    /// the host's flow-scope view.
+    RetryBoundaryTimer {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        /// Id of the boundary event whose timer is re-armed.
+        boundary_element_id: String,
+        /// Scope the boundary expression evaluates against (the host's flow
+        /// scope — the same view the failed arming used).
+        base: Key,
+    },
+    /// Re-drive the completion of an already-activated multi-instance child
+    /// whose `outputElement` / the body's `completionCondition` raised
+    /// ([`state::IoMappingRedrive::MiChildCompletion`], #1398 review).
+    /// `output_overlay` carries the preserved, already-projected outputs of a
+    /// call-activity child so the retry collects its real result instead of
+    /// re-deriving (and losing) it.
+    RetryMiChildCompletion {
+        instance_key: Key,
+        element_id: String,
+        body_key: Key,
+        child_key: Key,
+        output_overlay: Option<HashMap<String, Value>>,
     },
     /// Run the activation body of an element a process-instance modification
     /// already activated and seeded with element-local variables (Zeebe sets a
@@ -1504,28 +1563,15 @@ impl Engine {
             }
         }
 
-        // Emit DeploymentCreated FIRST, unconditionally — this is the C8-spec
-        // handle the client sees in the response envelope (LongKey pattern,
-        // never empty) and mirrors Zeebe's DeploymentIntent.CREATED. The
-        // shared deployment_key is minted here and stamped onto every
-        // ProcessDeployed that follows in the same call (issue #47).
-        let deployment_key = self.mint_key();
-        self.emit(log, Event::DeploymentCreated { deployment_key });
-
-        for process in processes {
-            if self
-                .state
-                .processes
-                .get(&process.id)
-                .is_some_and(|existing| existing.definition == process)
-            {
-                // Idempotent redeploy of the latest version: reuse its identity
-                // and skip it entirely (no event, no new subscription/timer).
-                continue;
-            }
-            let version = self.next_version(&process.id);
-            let process_definition_key = self.mint_key();
-            let process_id = process.id.clone();
+        // Preflight EVERY process's typed start expressions before anything
+        // is emitted or any key is minted: a later process with an invalid
+        // start expression must reject the whole batch, never leave the
+        // earlier processes installed (#1398).
+        let mut preflight = Vec::with_capacity(processes.len());
+        for process in &processes {
+            // Resolved for every process (even an idempotent redeploy, whose
+            // skip is decided below against the live state): resolution is a
+            // pure evaluation against an empty context.
             // Zeebe permits a process to declare several *typed*
             // (message/timer) start events alongside an optional none start,
             // and EVERY one of them arms its own trigger at deploy — a message
@@ -1551,6 +1597,67 @@ impl Engine {
                     .map(|e| (e.id.clone(), e.kind.clone(), e.timer.clone()))
                     .collect();
             typed_starts.sort_by(|a, b| a.0.cmp(&b.0));
+            // Per Zeebe, a start-event message name / timer expression is
+            // evaluated at deploy time against an empty context; a failure
+            // rejects the deployment (Zeebe `ProcessTransformer` /
+            // `TimerStartEventSubscription` validation, #1398) — never a
+            // subscription named after the expression text or a static
+            // fallback timer. Resolve all before anything is emitted.
+            let empty = HashMap::new();
+            let mut resolved_starts = Vec::with_capacity(typed_starts.len());
+            for (start_element_id, start_kind, start_timer_def) in typed_starts {
+                let resolved = match start_kind {
+                    ElementKind::MessageStartEvent { message_name } => self
+                        .resolve_event_name(&empty, &message_name)
+                        .map(ResolvedStart::Message),
+                    ElementKind::TimerStartEvent {
+                        interval_millis,
+                        repeating,
+                    } => self
+                        .resolve_timer(&empty, start_timer_def.as_ref(), self.now, interval_millis)
+                        .map(|(due_at, interval_millis)| ResolvedStart::Timer {
+                            due_at,
+                            interval_millis,
+                            repeating,
+                        }),
+                    _ => continue,
+                };
+                match resolved {
+                    Ok(r) => resolved_starts.push((start_element_id, r)),
+                    Err(failure) => {
+                        return Err(EngineError::StartEventExpressionInvalid {
+                            process_id: process.id.clone(),
+                            element_id: start_element_id,
+                            reason: failure.message,
+                        })
+                    }
+                }
+            }
+            preflight.push(resolved_starts);
+        }
+
+        // Emit DeploymentCreated FIRST, unconditionally — this is the C8-spec
+        // handle the client sees in the response envelope (LongKey pattern,
+        // never empty) and mirrors Zeebe's DeploymentIntent.CREATED. The
+        // shared deployment_key is minted here and stamped onto every
+        // ProcessDeployed that follows in the same call (issue #47).
+        let deployment_key = self.mint_key();
+        self.emit(log, Event::DeploymentCreated { deployment_key });
+
+        for (process, resolved_starts) in processes.into_iter().zip(preflight) {
+            if self
+                .state
+                .processes
+                .get(&process.id)
+                .is_some_and(|existing| existing.definition == process)
+            {
+                // Idempotent redeploy of the latest version: reuse its identity
+                // and skip it entirely (no event, no new subscription/timer).
+                continue;
+            }
+            let version = self.next_version(&process.id);
+            let process_definition_key = self.mint_key();
+            let process_id = process.id.clone();
             self.emit(
                 log,
                 Event::ProcessDeployed {
@@ -1560,13 +1667,9 @@ impl Engine {
                     process,
                 },
             );
-            for (start_element_id, start_kind, start_timer_def) in typed_starts {
-                match start_kind {
-                    ElementKind::MessageStartEvent { message_name } => {
-                        // Per Zeebe, a start-event name expression is evaluated
-                        // at deploy time against an empty context; a static name
-                        // passes through unchanged.
-                        let message_name = self.resolve_event_name(&HashMap::new(), &message_name);
+            for (start_element_id, resolved) in resolved_starts {
+                match resolved {
+                    ResolvedStart::Message(message_name) => {
                         self.emit(
                             log,
                             Event::MessageStartSubscriptionCreated {
@@ -1577,21 +1680,12 @@ impl Engine {
                             },
                         );
                     }
-                    ElementKind::TimerStartEvent {
+                    ResolvedStart::Timer {
+                        due_at,
                         interval_millis,
                         repeating,
                     } => {
                         let timer_key = self.mint_key();
-                        // Evaluate a FEEL start-timer expression against an empty
-                        // context at deploy; a static literal falls back to the
-                        // parsed interval. For a cycle the resolved interval is
-                        // persisted so re-arming recurs on the same delay.
-                        let (due_at, interval_millis) = self.resolve_timer(
-                            &HashMap::new(),
-                            start_timer_def.as_ref(),
-                            self.now,
-                            interval_millis,
-                        );
                         self.emit(
                             log,
                             Event::ProcessStartTimerArmed {
@@ -1605,7 +1699,6 @@ impl Engine {
                             },
                         );
                     }
-                    _ => {}
                 }
             }
         }
@@ -2327,6 +2420,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Assigning,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -2375,6 +2469,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Assigning,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -2441,6 +2536,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Updating,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -2500,6 +2596,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Completing,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -2687,25 +2784,40 @@ impl Engine {
                                     self.timer_def_of(instance_key, &boundary_element_id);
                                 let rearm_vars =
                                     self.variables_for_element(instance_key, element_instance_key);
-                                let (next_due_at, _) = self.resolve_timer(
+                                match self.resolve_timer(
                                     &rearm_vars,
                                     timer_def.as_ref(),
                                     due_at,
                                     duration_millis,
-                                );
-                                self.emit(
-                                    &mut log,
-                                    Event::TimerCreated {
-                                        timer_key: next_timer_key,
-                                        instance_key,
-                                        element_instance_key,
-                                        element_id: element_id.clone(),
-                                        due_at: next_due_at,
-                                        kind: state::TimerKind::NonInterruptingBoundary {
-                                            boundary_element_id,
+                                ) {
+                                    Ok((next_due_at, _)) => self.emit(
+                                        &mut log,
+                                        Event::TimerCreated {
+                                            timer_key: next_timer_key,
+                                            instance_key,
+                                            element_instance_key,
+                                            element_id: element_id.clone(),
+                                            due_at: next_due_at,
+                                            kind: state::TimerKind::NonInterruptingBoundary {
+                                                boundary_element_id,
+                                            },
                                         },
-                                    },
-                                );
+                                    ),
+                                    // The cycle no longer evaluates (a variable it
+                                    // reads changed): raise the host's
+                                    // EXTRACT_VALUE_ERROR rather than silently
+                                    // re-arming on the static interval (#1398).
+                                    Err(failure) => {
+                                        let incident = self.expression_incident(
+                                            instance_key,
+                                            element_instance_key,
+                                            element_id.clone(),
+                                            failure,
+                                            None,
+                                        );
+                                        self.emit(&mut log, incident);
+                                    }
+                                }
                             }
                         }
                     }
@@ -3143,6 +3255,46 @@ impl Engine {
                                 element_id,
                                 preserved_seed,
                             });
+                        } else if let Some(state::IoMappingRedrive::TaskListenerJob {
+                            user_task_key,
+                            event_type,
+                            listener_index,
+                        }) = redrive
+                        {
+                            // A task-listener job property failed (#1398): the
+                            // task still holds its deferred transition, so only
+                            // the listener job is re-minted.
+                            queue.push_back(Step::MintTaskListenerJob {
+                                instance_key,
+                                element_instance_key,
+                                user_task_key,
+                                event_type,
+                                index: listener_index,
+                            });
+                        } else if let Some(state::IoMappingRedrive::ExecutionListenerJob {
+                            event_type,
+                            listener_index,
+                            scope,
+                        }) = redrive
+                        {
+                            // An execution-listener job property failed (#1398
+                            // review): re-mint only that listener's job.
+                            queue.push_back(Step::MintExecutionListenerJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                event_type,
+                                index: listener_index,
+                                scope,
+                            });
+                        } else if matches!(redrive, Some(state::IoMappingRedrive::AdHocAgentJob)) {
+                            // An agent container's agent-job property failed
+                            // (#1398 review): re-mint only the agent job.
+                            queue.push_back(Step::MintAdHocAgentJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
                         } else if matches!(redrive, Some(state::IoMappingRedrive::JobCreation)) {
                             // A job-property expression (type/retries) failed when
                             // a job was re-created for an already-running element
@@ -3158,6 +3310,8 @@ impl Engine {
                             Some(
                                 state::IoMappingRedrive::Activation
                                     | state::IoMappingRedrive::ActivationPending
+                                    | state::IoMappingRedrive::ActivationBody
+                                    | state::IoMappingRedrive::ActivationBodyPending
                             )
                         ) {
                             // An activation-time expression (job type/retries)
@@ -3165,7 +3319,14 @@ impl Engine {
                             // `JobWorkerTaskProcessor.onActivate`): the element is
                             // ACTIVATED with no job and no boundary subscriptions.
                             // Re-run the activation body, as Zeebe retries
-                            // `onActivate` on resolve.
+                            // `onActivate` on resolve. `ActivationBody` /
+                            // `ActivationBodyPending` (#1398 review) are the
+                            // body-only re-drive, raised when the element's inputs
+                            // and start listeners already succeeded — they must
+                            // NOT be re-applied (a non-idempotent input mapping
+                            // would compound, a completed start listener would run
+                            // twice). The `*Pending` forms emit `ElementActivated`
+                            // first (the failure parked the token in ACTIVATING).
                             queue.push_back(Step::RerunActivationBody {
                                 instance_key,
                                 element_instance_key,
@@ -3173,7 +3334,44 @@ impl Engine {
                                 pending: matches!(
                                     redrive,
                                     Some(state::IoMappingRedrive::ActivationPending)
+                                        | Some(state::IoMappingRedrive::ActivationBodyPending)
                                 ),
+                            });
+                        } else if let Some(state::IoMappingRedrive::BoundaryTimer {
+                            boundary_element_id,
+                            base,
+                        }) = redrive
+                        {
+                            // A timer boundary's expression failed while the host
+                            // was activating (#1398 review): the host's job and
+                            // other subscriptions stay live, so re-arm ONLY that
+                            // boundary's timer — a full activation re-drive would
+                            // duplicate the host job and re-arm the unrelated
+                            // boundaries.
+                            queue.push_back(Step::RetryBoundaryTimer {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                boundary_element_id,
+                                base,
+                            });
+                        } else if let Some(state::IoMappingRedrive::MiChildCompletion {
+                            body_key,
+                            output_overlay,
+                        }) = redrive
+                        {
+                            // An MI child's completion failed (outputElement /
+                            // completionCondition, #1398 review): re-drive the
+                            // child's completion, reusing the preserved
+                            // already-projected call-activity outputs (a
+                            // call-activity child's callee is gone by resolution
+                            // time — re-deriving them would collect `null`).
+                            queue.push_back(Step::RetryMiChildCompletion {
+                                instance_key,
+                                element_id,
+                                body_key,
+                                child_key: element_instance_key,
+                                output_overlay,
                             });
                         } else if let Some(
                             state::IoMappingRedrive::MiChildActivation { body_key, index }
@@ -3338,6 +3536,54 @@ impl Engine {
                                     resume_listener_at,
                                 })
                             }
+                            // The activation BODY failed after the element's
+                            // inputs and start listeners already succeeded
+                            // (#1398 review): re-run only the behaviour — never
+                            // the (possibly non-idempotent) input mappings or
+                            // the already-run listeners. The `Pending` form
+                            // emits `ElementActivated` first (the failure
+                            // parked the token in ACTIVATING).
+                            Some(state::IoMappingRedrive::ActivationBody) => {
+                                Some(Step::RerunActivationBody {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    pending: false,
+                                })
+                            }
+                            Some(state::IoMappingRedrive::ActivationBodyPending) => {
+                                Some(Step::RerunActivationBody {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    pending: true,
+                                })
+                            }
+                            // A timer boundary's expression failed while its
+                            // host activated: re-arm only that boundary's timer
+                            // (the host job and other subscriptions stay live).
+                            Some(state::IoMappingRedrive::BoundaryTimer {
+                                boundary_element_id,
+                                base,
+                            }) => Some(Step::RetryBoundaryTimer {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                boundary_element_id,
+                                base,
+                            }),
+                            // An MI child's completion failed: re-drive it,
+                            // reusing the preserved call-activity output overlay.
+                            Some(state::IoMappingRedrive::MiChildCompletion {
+                                body_key,
+                                output_overlay,
+                            }) => Some(Step::RetryMiChildCompletion {
+                                instance_key,
+                                element_id,
+                                body_key,
+                                child_key: element_instance_key,
+                                output_overlay,
+                            }),
                             // Output re-projection. A mainstream leaf element
                             // (service task, etc.) re-drives `Complete`, which
                             // re-evaluates its output mapping against its own
@@ -3499,6 +3745,36 @@ impl Engine {
                             // Job-property expression failures surface as
                             // `ExpressionEvaluation` (handled above); this arm keeps
                             // the `IoMapping` match exhaustive.
+                            Some(state::IoMappingRedrive::TaskListenerJob {
+                                user_task_key,
+                                event_type,
+                                listener_index,
+                            }) => Some(Step::MintTaskListenerJob {
+                                instance_key,
+                                element_instance_key,
+                                user_task_key,
+                                event_type,
+                                index: listener_index,
+                            }),
+                            Some(state::IoMappingRedrive::ExecutionListenerJob {
+                                event_type,
+                                listener_index,
+                                scope,
+                            }) => Some(Step::MintExecutionListenerJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                event_type,
+                                index: listener_index,
+                                scope,
+                            }),
+                            Some(state::IoMappingRedrive::AdHocAgentJob) => {
+                                Some(Step::MintAdHocAgentJob {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                })
+                            }
                             Some(state::IoMappingRedrive::JobCreation) => Some(Step::CreateJob {
                                 instance_key,
                                 element_instance_key,
@@ -4079,6 +4355,7 @@ impl Engine {
                             crate::model::TaskListenerEventType::Canceling,
                             pending,
                             &first,
+                            None,
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -4584,7 +4861,7 @@ impl Engine {
                     &source_definition,
                     &target_definition,
                     &mapped,
-                );
+                )?;
                 for event in plan.before {
                     self.emit(&mut log, event);
                 }
@@ -5600,12 +5877,32 @@ impl Engine {
                 element_instance_key,
                 ..
             }
+            | Step::MintTaskListenerJob {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::MintAdHocAgentJob {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::MintExecutionListenerJob {
+                instance_key,
+                element_instance_key,
+                ..
+            }
             | Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
                 ..
             }
             | Step::RetryActivation {
+                instance_key,
+                element_instance_key,
+                ..
+            }
+            | Step::RetryBoundaryTimer {
                 instance_key,
                 element_instance_key,
                 ..
@@ -5652,6 +5949,15 @@ impl Engine {
             // (element-instance) and body (owner) keys so the shared checks below
             // apply — reusing the same "did teardown remove it?" logic.
             Step::RetryMiChildActivation {
+                instance_key,
+                body_key,
+                child_key,
+                ..
+            } => (*instance_key, None, Some(*child_key), Some(*body_key)),
+            // An MI child COMPLETION retry re-drives the same already-activated
+            // child against its owning body, so the same pair of teardown checks
+            // applies.
+            Step::RetryMiChildCompletion {
                 instance_key,
                 body_key,
                 child_key,
@@ -5845,6 +6151,68 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.create_job_for(instance_key, element_instance_key, element_id),
+            Step::MintAdHocAgentJob {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => (
+                self.adhoc_agent_job_events(instance_key, element_instance_key, element_id),
+                Vec::new(),
+            ),
+            Step::MintExecutionListenerJob {
+                instance_key,
+                element_instance_key,
+                element_id,
+                event_type,
+                index,
+                scope,
+            } => {
+                let vars = self.variables_for_element(instance_key, element_instance_key);
+                (
+                    vec![self.execution_listener_job_event(
+                        instance_key,
+                        element_instance_key,
+                        &element_id,
+                        event_type,
+                        index,
+                        scope,
+                        &vars,
+                    )],
+                    Vec::new(),
+                )
+            }
+            Step::MintTaskListenerJob {
+                user_task_key,
+                event_type,
+                index,
+                ..
+            } => {
+                let Some(task) = self.state.user_tasks.get(&user_task_key) else {
+                    return (Vec::new(), Vec::new());
+                };
+                let instance_key = task.instance_key;
+                let element_instance_key = task.element_instance_key;
+                let element_id = task.element_id.clone();
+                let listeners = self.task_listeners_of(instance_key, &element_id, event_type);
+                match listeners.get(index).cloned() {
+                    Some(listener) => (
+                        vec![self.mint_task_listener_job(
+                            user_task_key,
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                            event_type,
+                            index,
+                            &listener,
+                            // The resolve-time re-mint reads the applied scope
+                            // (its input writes landed on the first pass).
+                            None,
+                        )],
+                        Vec::new(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                }
+            }
             Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
@@ -5876,6 +6244,53 @@ impl Engine {
                     (events, followups)
                 }
             }
+            Step::RetryBoundaryTimer {
+                instance_key,
+                element_instance_key,
+                element_id,
+                boundary_element_id,
+                base,
+            } => {
+                // Resume arming at the failed boundary: it and every boundary
+                // after it in the deterministic arming order were left un-armed
+                // when the incident was raised (the ones before it, and the
+                // host's job, stayed live), so re-arm exactly that suffix —
+                // nothing is duplicated and no sibling is lost. Evaluate against
+                // the host's flow-scope view, exactly as the failed arming did.
+                let (mut events, failed) = self.arm_boundaries_from(
+                    instance_key,
+                    element_instance_key,
+                    base,
+                    &element_id,
+                    Some(&boundary_element_id),
+                );
+                if let Some((boundary_element_id, failure)) = failed {
+                    events.push(self.expression_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        Some(state::IoMappingRedrive::BoundaryTimer {
+                            boundary_element_id,
+                            base,
+                        }),
+                    ));
+                }
+                (events, Vec::new())
+            }
+            Step::RetryMiChildCompletion {
+                instance_key,
+                element_id,
+                body_key,
+                child_key,
+                output_overlay,
+            } => self.complete_mi_child(
+                instance_key,
+                child_key,
+                element_id,
+                body_key,
+                output_overlay,
+            ),
             Step::RetryActivation {
                 instance_key,
                 element_instance_key,
@@ -6426,36 +6841,16 @@ impl Engine {
             &element_id,
             crate::model::ListenerEventType::Start,
         );
-        if let Some(first) = start_listeners.first() {
-            let job_type = match self.resolve_job_type(&activation_vars, &first.job_type) {
-                Ok(job_type) => job_type,
-                Err(reason) => {
-                    // #1390: a failed listener job-type expression parks the
-                    // element on an EXTRACT_VALUE_ERROR incident — no job.
-                    events.push(self.expression_incident(
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        reason,
-                        Some(state::IoMappingRedrive::Activation),
-                    ));
-                    return (events, followups);
-                }
-            };
-            let job_key = self.mint_key();
-            let retries = self.resolve_retries(&activation_vars, first.retries.as_deref());
-            events.push(Event::ExecutionListenerJobCreated {
-                job_key,
+        if !start_listeners.is_empty() {
+            events.push(self.execution_listener_job_event(
                 instance_key,
                 element_instance_key,
-                element_id: element_id.clone(),
-                job_type,
-                event_type: crate::model::ListenerEventType::Start,
-                listener_index: 0,
+                &element_id,
+                crate::model::ListenerEventType::Start,
+                0,
                 scope,
-                created_at: self.now,
-                retries,
-            });
+                &activation_vars,
+            ));
             return (events, followups);
         }
 
@@ -6557,6 +6952,20 @@ impl Engine {
     /// deferred until the element's `start` execution-listener chain drains
     /// (ADR 0037). Listener-free elements call it inline with the same key/event
     /// ordering, so their journal is unchanged.
+    ///
+    /// Every expression the body evaluates (job / user-task properties,
+    /// boundary and catch-event triggers, the ad-hoc active-elements
+    /// collection) goes through a `Result`; the first failure discards the
+    /// planned events, rewinds the keys they consumed, and raises the
+    /// element's incident with an [`state::IoMappingRedrive::ActivationBody`]
+    /// redrive (Zeebe: the activation command fails with an
+    /// `EXTRACT_VALUE_ERROR` and resolution re-runs it, #1398). The body-only
+    /// redrive — never `Activation` — because this point is only reached once
+    /// the element's input mappings and `start` listeners already succeeded:
+    /// re-applying those on resolution would compound a non-idempotent mapping
+    /// (`=counter + 1 -> counter`) or re-run a completed listener (#1398
+    /// review). No arm can substitute a fallback, because there is no
+    /// infallible arm to fall into.
     fn run_activation_body(
         &mut self,
         instance_key: Key,
@@ -6565,6 +6974,105 @@ impl Engine {
         scope: Key,
         element_vars: Arc<HashMap<String, Value>>,
     ) -> (Vec<Event>, Vec<Step>) {
+        let key_mark = self.next_local;
+        match self.try_activation_body(
+            instance_key,
+            element_id.clone(),
+            element_instance_key,
+            scope,
+            element_vars,
+        ) {
+            Ok(planned) => planned,
+            Err(failure) => {
+                self.next_local = key_mark;
+                // The body-only redrive is `ActivationBodyPending` (not
+                // `ActivationBody`) when the element has not reached ACTIVATED
+                // yet — a job-property expression failing in a FRESH activation
+                // (Zeebe `JobWorkerTaskProcessor.onActivate` fails before
+                // `transitionToActivated`): the successful re-run then emits
+                // `ElementActivated` first. Once the element IS activated (its
+                // inputs and start listeners already ran), `ActivationBody`
+                // re-runs only the behaviour — never the (possibly
+                // non-idempotent) input mappings or the completed listeners
+                // (#1398 review). (A timer boundary's failure never reaches
+                // here: the host arms it via `arm_boundaries_preserving_host`,
+                // which keeps the host's effect and raises a boundary-scoped
+                // `BoundaryTimer` incident itself.)
+                let redrive = if self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.active.contains_key(&element_instance_key))
+                    .unwrap_or(false)
+                {
+                    state::IoMappingRedrive::ActivationBody
+                } else {
+                    state::IoMappingRedrive::ActivationBodyPending
+                };
+                let event = self.expression_incident(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    failure,
+                    Some(redrive),
+                );
+                (vec![event], Vec::new())
+            }
+        }
+    }
+
+    /// Arms `element_id`'s boundary events for a host whose activation effect
+    /// (its job / user-task record / inner-flow spawn) is already planned in
+    /// `events`. A TIMER boundary's expression failure must NOT discard that
+    /// effect (#1398 review): the host stays live, the boundary is left
+    /// un-armed, and the incident carries a boundary-scoped
+    /// [`state::IoMappingRedrive::BoundaryTimer`] redrive so resolution re-arms
+    /// ONLY that timer (a whole-body re-drive would duplicate the host's job /
+    /// task / subscriptions). Any OTHER boundary failure (a message/signal name
+    /// or correlation key) propagates, failing the activation body as before.
+    fn arm_boundaries_preserving_host(
+        &mut self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        element_instance_key: Key,
+        scope: Key,
+        element_id: &str,
+    ) -> Result<(), expression::Failure> {
+        let (armed, failed) =
+            self.arm_boundaries_from(instance_key, element_instance_key, scope, element_id, None);
+        match failed {
+            None => {
+                events.extend(armed);
+                Ok(())
+            }
+            Some((boundary_element_id, failure)) if failure.boundary_timer.is_some() => {
+                // Keep the boundaries armed before the failing timer; the
+                // redrive resumes the un-armed suffix from the failing one.
+                events.extend(armed);
+                events.push(self.expression_incident(
+                    instance_key,
+                    element_instance_key,
+                    element_id.to_string(),
+                    failure,
+                    Some(state::IoMappingRedrive::BoundaryTimer {
+                        boundary_element_id,
+                        base: scope,
+                    }),
+                ));
+                Ok(())
+            }
+            Some((_, failure)) => Err(failure),
+        }
+    }
+
+    fn try_activation_body(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+        element_vars: Arc<HashMap<String, Value>>,
+    ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let kind = self.element_kind(instance_key, &element_id);
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let mut events: Vec<Event> = Vec::new();
@@ -6601,11 +7109,15 @@ impl Engine {
                         output_collection: def.output_collection.clone(),
                         output_element: def.output_element.clone(),
                     });
-                    let ids = def
-                        .active_elements_collection
-                        .as_deref()
-                        .map(|expr| self.eval_adhoc_active_elements(expr, &element_vars, def))
-                        .unwrap_or_default();
+                    let ids = match def.active_elements_collection.as_deref() {
+                        Some(expr) => self.eval_adhoc_active_elements(
+                            expr,
+                            &element_vars,
+                            def,
+                            element_instance_key,
+                        )?,
+                        None => Vec::new(),
+                    };
                     for id in &ids {
                         followups.push(Step::ActivateAdHocTool {
                             instance_key,
@@ -6624,41 +7136,30 @@ impl Engine {
                             cancel: false,
                         });
                     }
-                    events.extend(self.arm_boundary_events(
+                    self.arm_boundaries_preserving_host(
+                        &mut events,
                         instance_key,
                         element_instance_key,
                         scope,
                         &element_id,
-                    ));
-                    return (events, followups);
+                    )?;
+                    return Ok((events, followups));
                 }
                 // Zeebe `BpmnJobBehavior.evaluateJobExpressions`: a failed
                 // type/retries expression is an EXTRACT_VALUE_ERROR incident and
                 // no job (nor boundary subscription) is created (#1390).
                 let retries_raw = self.retries_of(instance_key, &element_id);
-                let props = self
-                    .resolve_job_type(&element_vars, &job_type)
-                    .and_then(|t| {
-                        Ok((
-                            t,
-                            self.resolve_job_retries(&element_vars, retries_raw.as_deref())?,
-                        ))
-                    });
-                let (job_type, retries) = match props {
-                    Ok(props) => props,
-                    Err(failure) => {
-                        let event = self.expression_incident(
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            failure,
-                            Some(state::IoMappingRedrive::Activation),
-                        );
-                        return (vec![event], Vec::new());
-                    }
-                };
+                let JobProps {
+                    job_type,
+                    retries,
+                    priority,
+                } = self.resolve_job_props(
+                    &element_vars,
+                    &job_type,
+                    retries_raw.as_deref(),
+                    priority.as_deref(),
+                )?;
                 let job_key = self.mint_key();
-                let priority = self.resolve_priority(&element_vars, priority.as_deref());
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -6702,34 +7203,33 @@ impl Engine {
                         variables: catalog_var,
                     });
                 }
-                // Arm timers/subscriptions for every attached boundary event.
-                events.extend(self.arm_boundary_events(
+                // Arm timers/subscriptions for every attached boundary event,
+                // preserving the already-minted job on a timer-boundary failure
+                // (#1398 review).
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                ));
+                )?;
             }
             // A user task creates a user task record and parks the token; a
             // CompleteUserTask releases it. The assignment/scheduling/priority
             // expressions declared on the element are resolved against the
             // element's scoped view at creation time.
             Some(ElementKind::UserTask(props)) => {
+                // Zeebe `BpmnUserTaskBehavior.evaluateUserTaskExpressions`: any
+                // failure is an EXTRACT_VALUE_ERROR and no task is created.
+                let ResolvedUserTask {
+                    assignee,
+                    candidate_groups,
+                    candidate_users,
+                    due_date,
+                    follow_up_date,
+                    priority,
+                } = self.resolve_user_task_props(&element_vars, &props)?;
                 let user_task_key = self.mint_key();
-                let assignee = self
-                    .resolve_user_task_string(&element_vars, props.assignee.as_deref())
-                    .filter(|s| !s.is_empty());
-                let candidate_groups =
-                    self.resolve_user_task_list(&element_vars, props.candidate_groups.as_deref());
-                let candidate_users =
-                    self.resolve_user_task_list(&element_vars, props.candidate_users.as_deref());
-                let due_date = self
-                    .resolve_user_task_string(&element_vars, props.due_date.as_deref())
-                    .filter(|s| !s.is_empty());
-                let follow_up_date = self
-                    .resolve_user_task_string(&element_vars, props.follow_up_date.as_deref())
-                    .filter(|s| !s.is_empty());
-                let priority = self.resolve_priority(&element_vars, props.priority.as_deref());
                 // Resolve the form linkage, enforcing the Zeebe invariant that
                 // `formId` and `externalReference` are mutually exclusive (an
                 // external reference wins and suppresses `form_key` resolution).
@@ -6797,6 +7297,11 @@ impl Engine {
                         crate::model::TaskListenerEventType::Creating,
                         pending,
                         &first,
+                        // The task's input mappings were staged but not yet
+                        // applied when this chain starts: the first listener's
+                        // `type`/`retries` resolve against the post-input view
+                        // (#1398 review).
+                        Some(&element_vars),
                     ));
                 } else if let Some(initial) = deferred_initial_assignee {
                     // No creating listeners: the task is available at once, so the
@@ -6822,15 +7327,20 @@ impl Engine {
                             crate::model::TaskListenerEventType::Assigning,
                             pending,
                             &first,
+                            // Same staged post-input view as the creating chain
+                            // above (the initial assignee's assigning chain also
+                            // starts before the input writes land).
+                            Some(&element_vars),
                         ));
                     }
                 }
-                events.extend(self.arm_boundary_events(
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                ));
+                )?;
             }
             // A timer / message / signal intermediate catch event arms its
             // trigger (timer or subscription) and parks the token; the clock
@@ -6852,7 +7362,7 @@ impl Engine {
                         element_instance_key,
                         &element_vars,
                         &element,
-                    ));
+                    )?);
                 }
             }
             // A conditional intermediate catch event evaluates its FEEL condition
@@ -6882,7 +7392,7 @@ impl Engine {
                         element_instance_key,
                         &element_vars,
                         &element,
-                    ));
+                    )?);
                 }
             }
             // An embedded sub-process opens a token scope: it activates its inner
@@ -6892,13 +7402,15 @@ impl Engine {
             // boundary.
             Some(ElementKind::SubProcess { start_event }) => {
                 // A sub-process can also carry timer/message boundary events;
-                // arm them just like a service task's.
-                events.extend(self.arm_boundary_events(
+                // arm them just like a service task's, preserving the
+                // already-planned inner-flow spawn on a timer-boundary failure.
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                ));
+                )?;
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -6928,13 +7440,16 @@ impl Engine {
                 ..
             }) => {
                 // Boundary events on the call activity are armed like any other
-                // activity (timers/messages interrupt the wait for the child).
-                events.extend(self.arm_boundary_events(
+                // activity (timers/messages interrupt the wait for the child),
+                // preserving the already-planned child spawn on a
+                // timer-boundary failure.
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                ));
+                )?;
                 let (spawn_events, spawn_followups) = self.spawn_call_activity_child(
                     instance_key,
                     element_instance_key,
@@ -7029,13 +7544,13 @@ impl Engine {
             None => {}
         }
 
-        (events, followups)
+        Ok((events, followups))
     }
 
     /// Opens a multi-instance body: evaluates the input collection and fans out
     /// one child of the activity per item. A non-list result or an evaluation
-    /// error yields an empty loop (the body completes immediately) — a flat-scope
-    /// choice mirroring the conditional-event error semantics. Children run in the
+    /// error is an EXTRACT_VALUE_ERROR incident on the still-ACTIVATING body
+    /// (Zeebe `MultiInstanceBodyProcessor`, #1398). Children run in the
     /// body's scope; parallel bodies spawn every child at once, sequential bodies
     /// spawn the first and chain the rest at each child's completion.
     /// Opens a multi-instance body under `body_key`. Callers that mint the
@@ -7060,12 +7575,10 @@ impl Engine {
                 element_id: element_id.clone(),
                 scope,
             },
-            Event::ElementActivated {
-                instance_key,
-                element_instance_key: body_key,
-                element_id: element_id.clone(),
-                scope,
-            },
+            // No `ElementActivated` yet: Zeebe's `MultiInstanceBodyProcessor`
+            // evaluates the body's input mappings, input collection and boundary
+            // subscriptions while ACTIVATING, so a failure parks the body there
+            // (#1398). `run_mi_body_activation` emits ACTIVATED once they hold.
             // The multi-instance body is a variable scope: its children run inside
             // it and its `outputCollection` accumulates here.
             Event::VariableScopeCreated {
@@ -7105,6 +7618,11 @@ impl Engine {
         mi: crate::model::MultiInstance,
     ) -> (Vec<Event>, Vec<Step>) {
         let mut events = Vec::new();
+        let already_activated = self
+            .state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.multi_instances.contains_key(&body_key));
         // Input mappings on the activity apply once, on body activation, LOCAL to
         // the body scope (Zeebe semantics), so they feed the input collection and
         // the children without leaking to the parent scope. Their source
@@ -7193,9 +7711,22 @@ impl Engine {
                 Arc::new(merged)
             }
         };
-        let items: Vec<Value> = match crate::feel::eval(&mi.input_collection, &vars) {
-            Ok(Value::List(list)) => list,
-            _ => Vec::new(),
+        // Zeebe `MultiInstanceBodyProcessor.readInputCollectionVariable` ->
+        // `evaluateArrayExpression`: anything but an ARRAY (null, a scalar, a
+        // failed evaluation) is an EXTRACT_VALUE_ERROR on the body, never an
+        // empty loop (#1398).
+        let items = match expression::evaluate_array(&mi.input_collection, &vars) {
+            Ok(items) => items,
+            Err(failure) => {
+                let event = self.expression_incident(
+                    instance_key,
+                    body_key,
+                    element_id,
+                    failure,
+                    Some(state::IoMappingRedrive::MiBodyActivation),
+                );
+                return (vec![event], Vec::new());
+            }
         };
         let total = items.len();
         let sequential = mi.sequential;
@@ -7209,6 +7740,7 @@ impl Engine {
             output_collection: mi.output_collection.clone(),
             output_element: mi.output_element.clone(),
             completion_condition: mi.completion_condition.clone(),
+            cancel_remaining_instances: mi.cancel_remaining_instances,
         });
 
         // Arm timers/subscriptions for every boundary event attached to the
@@ -7221,7 +7753,42 @@ impl Engine {
         // the start-listener gate below, so the boundary is live for the whole
         // life of the activity. A body with no attached boundaries yields no
         // events (the common case), so this is a no-op for every ordinary loop.
-        events.extend(self.arm_boundary_events(instance_key, body_key, scope, &element_id));
+        let key_mark = self.next_local;
+        match self.arm_boundary_events(instance_key, body_key, scope, &element_id) {
+            Ok(armed) => {
+                // Every activation-time expression of the body held: it is now
+                // ACTIVATED (Zeebe `transitionToActivated`). A re-drive of a body
+                // that already got this far (its `MultiInstanceActivated` record
+                // exists — a later start-listener failure) does not repeat it.
+                if !already_activated {
+                    events.push(Event::ElementActivated {
+                        instance_key,
+                        element_instance_key: body_key,
+                        element_id: element_id.clone(),
+                        scope,
+                    });
+                }
+                events.extend(armed);
+            }
+            Err(failure) => {
+                // A boundary expression failure fails the body's activation
+                // (#1398): nothing (not even `MultiInstanceActivated`) is kept,
+                // and resolution re-drives the body activation. The body has no
+                // separately-live host effect yet (its fan-out runs AFTER the
+                // arming below), so a full `MiBodyActivation` re-drive is exact
+                // — there is no host job to duplicate, unlike the leaf
+                // service-task host (#1398 review).
+                self.next_local = key_mark;
+                let event = self.expression_incident(
+                    instance_key,
+                    body_key,
+                    element_id,
+                    failure,
+                    Some(state::IoMappingRedrive::MiBodyActivation),
+                );
+                return (vec![event], Vec::new());
+            }
+        }
 
         // Start-listener gate (ADR 0037): the body rests in ACTIVATING while its
         // `start` chain runs. Zeebe fires the activity's start listeners at the
@@ -7235,36 +7802,16 @@ impl Engine {
             &element_id,
             crate::model::ListenerEventType::Start,
         );
-        if let Some(first) = start_listeners.first() {
-            let job_type = match self.resolve_job_type(&vars, &first.job_type) {
-                Ok(job_type) => job_type,
-                Err(reason) => {
-                    // #1390: a failed listener job-type expression parks the MI
-                    // body on an EXTRACT_VALUE_ERROR incident — no job.
-                    events.push(self.expression_incident(
-                        instance_key,
-                        body_key,
-                        element_id,
-                        reason,
-                        Some(state::IoMappingRedrive::MiBodyActivation),
-                    ));
-                    return (events, Vec::new());
-                }
-            };
-            let job_key = self.mint_key();
-            let retries = self.resolve_retries(&vars, first.retries.as_deref());
-            events.push(Event::ExecutionListenerJobCreated {
-                job_key,
+        if !start_listeners.is_empty() {
+            events.push(self.execution_listener_job_event(
                 instance_key,
-                element_instance_key: body_key,
-                element_id: element_id.clone(),
-                job_type,
-                event_type: crate::model::ListenerEventType::Start,
-                listener_index: 0,
+                body_key,
+                &element_id,
+                crate::model::ListenerEventType::Start,
+                0,
                 scope,
-                created_at: self.now,
-                retries,
-            });
+                &vars,
+            ));
             return (events, Vec::new());
         }
 
@@ -7529,6 +8076,11 @@ impl Engine {
     /// incident re-drive ([`retry_mi_child_activation`]) so both enact identical
     /// behaviour. Boundary events on the multi-instance activity are armed on the
     /// body, not here (see [`run_mi_body_activation`]).
+    ///
+    /// Any expression failure (job properties, the ad-hoc active-elements
+    /// collection) discards the planned events, rewinds their keys and raises
+    /// the child's incident with a [`state::IoMappingRedrive::MiChildBehaviour`]
+    /// redrive (#1390, #1398).
     fn run_mi_child_behaviour(
         &mut self,
         instance_key: Key,
@@ -7538,6 +8090,33 @@ impl Engine {
         child_index: usize,
         child_vars: &HashMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
+        let key_mark = self.next_local;
+        match self.try_mi_child_behaviour(instance_key, element_id.clone(), child_key, child_vars) {
+            Ok(planned) => planned,
+            Err(failure) => {
+                self.next_local = key_mark;
+                let event = self.expression_incident(
+                    instance_key,
+                    child_key,
+                    element_id,
+                    failure,
+                    Some(state::IoMappingRedrive::MiChildBehaviour {
+                        body_key,
+                        index: child_index,
+                    }),
+                );
+                (vec![event], Vec::new())
+            }
+        }
+    }
+
+    fn try_mi_child_behaviour(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        child_key: Key,
+        child_vars: &HashMap<String, Value>,
+    ) -> Result<(Vec<Event>, Vec<Step>), expression::Failure> {
         let mut events = Vec::new();
         let mut followups = Vec::new();
         // Boundary events attached to a multi-instance activity are armed once, on
@@ -7582,11 +8161,12 @@ impl Engine {
                     // Evaluate the active-elements collection against the child's
                     // resolved scope view (`inputElement`/`loopCounter` bound) and
                     // activate each named tool into THIS child's container scope.
-                    let ids = def
-                        .active_elements_collection
-                        .as_deref()
-                        .map(|expr| self.eval_adhoc_active_elements(expr, child_vars, def))
-                        .unwrap_or_default();
+                    let ids = match def.active_elements_collection.as_deref() {
+                        Some(expr) => {
+                            self.eval_adhoc_active_elements(expr, child_vars, def, child_key)?
+                        }
+                        None => Vec::new(),
+                    };
                     for id in &ids {
                         followups.push(Step::ActivateAdHocTool {
                             instance_key,
@@ -7605,36 +8185,23 @@ impl Engine {
                             cancel: false,
                         });
                     }
-                    return (events, followups);
+                    return Ok((events, followups));
                 }
                 // Zeebe `BpmnJobBehavior.evaluateJobExpressions` per child: a
                 // failed type/retries expression is an EXTRACT_VALUE_ERROR
                 // incident on the child, with no job (#1390).
                 let retries_raw = self.retries_of(instance_key, &element_id);
-                let props = self.resolve_job_type(child_vars, &job_type).and_then(|t| {
-                    Ok((
-                        t,
-                        self.resolve_job_retries(child_vars, retries_raw.as_deref())?,
-                    ))
-                });
-                let (job_type, retries) = match props {
-                    Ok(props) => props,
-                    Err(failure) => {
-                        let event = self.expression_incident(
-                            instance_key,
-                            child_key,
-                            element_id,
-                            failure,
-                            Some(state::IoMappingRedrive::MiChildBehaviour {
-                                body_key,
-                                index: child_index,
-                            }),
-                        );
-                        return (vec![event], Vec::new());
-                    }
-                };
+                let JobProps {
+                    job_type,
+                    retries,
+                    priority,
+                } = self.resolve_job_props(
+                    child_vars,
+                    &job_type,
+                    retries_raw.as_deref(),
+                    priority.as_deref(),
+                )?;
                 let job_key = self.mint_key();
-                let priority = self.resolve_priority(child_vars, priority.as_deref());
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -7725,7 +8292,7 @@ impl Engine {
                 });
             }
         }
-        (events, followups)
+        Ok((events, followups))
     }
 
     /// Re-drives a multi-instance child's *activation* phase after its
@@ -7833,6 +8400,8 @@ impl Engine {
         let (
             output_element,
             completion_condition,
+            cancel_remaining,
+            already_fulfilled,
             sequential,
             total,
             spawned,
@@ -7847,6 +8416,8 @@ impl Engine {
             Some(mi) => (
                 mi.output_element.clone(),
                 mi.completion_condition.clone(),
+                mi.cancel_remaining_instances,
+                mi.completion_condition_fulfilled,
                 mi.sequential,
                 mi.items.len(),
                 mi.spawned,
@@ -7890,13 +8461,20 @@ impl Engine {
         // ONE post-output view of the completing child, shared by `outputElement`
         // AND the completion condition (#1335): Zeebe applies the child's output
         // mappings (or receives a call activity's returned variables) before the
-        // body evaluates either, so both must read the same view.
+        // body evaluates either, so both must read the same view. Building that
+        // view applies the element's `zeebe:output` mappings; a mapping that
+        // fails to evaluate halts the child with an incident instead of
+        // completing it with a silently-unset output (#939) — resolution
+        // re-drives the child's completion, reusing the preserved
+        // `output_overlay` so a call-activity child collects its real
+        // (already-projected) result rather than re-deriving — and losing — it
+        // (#1398 review).
         let post_view: Option<Arc<HashMap<String, Value>>> =
             if output_element.is_none() && completion_condition.is_none() {
                 None
             } else {
                 let visible = self.variables_for_element(instance_key, child_eik);
-                match &output_overlay {
+                let built = match &output_overlay {
                     // A call-activity child: its produced outputs (propagated
                     // child variables + the activity's already-applied output
                     // mappings) live in `overlay`, not the child scope. The
@@ -7905,41 +8483,107 @@ impl Engine {
                     Some(overlay) => {
                         let mut vars = (*visible).clone();
                         vars.extend(overlay.clone());
-                        Some(Arc::new(vars))
+                        Ok(vars)
                     }
                     None => {
                         let outputs = self.io_outputs(instance_key, &element_id);
                         if outputs.is_empty() {
-                            Some(visible)
+                            Ok((*visible).clone())
                         } else {
                             match self.eval_io_mappings_in(&visible, &outputs) {
                                 Ok(mapped) => {
                                     let mut vars = (*visible).clone();
                                     vars.extend(mapped);
-                                    Some(Arc::new(vars))
+                                    Ok(vars)
                                 }
-                                Err(failure) => {
-                                    // An output mapping that fails to evaluate halts
-                                    // the child with an incident instead of completing
-                                    // it with a silently-unset output (#939). The child
-                                    // does not complete; resolution re-drives it.
-                                    let event = self.io_mapping_incident(
-                                        instance_key,
-                                        child_eik,
-                                        element_id,
-                                        failure,
-                                        state::IoMappingRedrive::Completion,
-                                    );
-                                    return (vec![event], Vec::new());
-                                }
+                                Err(failure) => Err(failure),
                             }
                         }
                     }
+                };
+                match built {
+                    Ok(vars) => Some(Arc::new(vars)),
+                    Err(failure) => {
+                        let event = self.io_mapping_incident(
+                            instance_key,
+                            child_eik,
+                            element_id,
+                            failure,
+                            state::IoMappingRedrive::MiChildCompletion {
+                                body_key,
+                                output_overlay: output_overlay.clone(),
+                            },
+                        );
+                        return (vec![event], Vec::new());
+                    }
                 }
             };
+        // Zeebe `MultiInstanceBodyProcessor.updateOutputCollection`: a failed
+        // `outputElement` is an EXTRACT_VALUE_ERROR on the COMPLETING child —
+        // never a silent `null` slot (#1398). Resolution re-drives the child's
+        // completion against the same preserved overlay.
         let output = match (output_element.as_deref(), &post_view) {
-            (Some(expr), Some(view)) => crate::feel::eval(expr, view).ok(),
+            (Some(expr), Some(view)) => match expression::evaluate_feel(expr, view) {
+                Ok(evaluated) => Some(evaluated.value),
+                Err(failure) => {
+                    let event = self.expression_incident(
+                        instance_key,
+                        child_eik,
+                        element_id,
+                        failure,
+                        Some(state::IoMappingRedrive::MiChildCompletion {
+                            body_key,
+                            output_overlay: output_overlay.clone(),
+                        }),
+                    );
+                    return (vec![event], Vec::new());
+                }
+            },
             _ => None,
+        };
+
+        // After each child, a satisfied completion condition ends the body early.
+        // Zeebe `MultiInstanceBodyProcessor.evaluateCompletionCondition` →
+        // `evaluateBooleanExpression`: a failure (or a non-boolean / null
+        // result) is an EXTRACT_VALUE_ERROR on the COMPLETING child — never a
+        // silent "not yet" (#1398). Evaluated BEFORE the child's completion is
+        // recorded so the incident leaves the body untouched for the redrive.
+        //
+        // The latch is read FIRST (#1398 review): with
+        // `cancelRemainingInstances=false` a fulfilled condition is latched
+        // (`MultiInstanceCompletionConditionFulfilled`) and later children skip
+        // the evaluation entirely — a variable the condition reads can then
+        // change (or become unreadable) without reneging the fulfilled loop.
+        //
+        // Zeebe evaluates the completion condition in the completing CHILD's
+        // scope (#1335, `childContext.getElementInstanceKey()`): `inputElement` /
+        // `loopCounter`, child locals, and the output-mapped values are visible,
+        // layered over the body's ancestors — the shared `post_view`.
+        let completion_now = if already_fulfilled {
+            true
+        } else {
+            match (completion_condition.as_deref(), &post_view) {
+                (None, _) => false,
+                (Some(c), Some(view)) => match expression::evaluate_bool(c, view) {
+                    Ok(b) => b,
+                    Err(failure) => {
+                        let event = self.expression_incident(
+                            instance_key,
+                            child_eik,
+                            element_id,
+                            failure,
+                            Some(state::IoMappingRedrive::MiChildCompletion {
+                                body_key,
+                                output_overlay: output_overlay.clone(),
+                            }),
+                        );
+                        return (vec![event], Vec::new());
+                    }
+                },
+                // A completion condition with no `post_view` cannot occur: the
+                // view is built whenever a completion condition is present.
+                (Some(_), None) => unreachable!(),
+            }
         };
         events.push(Event::MultiInstanceChildCompleted {
             instance_key,
@@ -7949,28 +8593,41 @@ impl Engine {
             output,
         });
 
-        // After each child, a satisfied completion condition ends the body early.
-        let completion_now = completion_condition
-            .as_deref()
-            .map(|c| {
-                // Zeebe evaluates the completion condition in the completing
-                // CHILD's scope (#1335): `inputElement` / `loopCounter` and child
-                // locals are visible, layered over the body's ancestors.
-                post_view
-                    .as_ref()
-                    .is_some_and(|view| matches!(crate::feel::eval_bool(c, view), Ok(true)))
-            })
-            .unwrap_or(false);
-
         let mut followups = Vec::new();
         // `active_now` still counts this child (its removal event above is not yet
         // applied), so the parallel body is drained when only this child remains.
         let others_active = active_now.saturating_sub(1);
         if completion_now {
-            followups.push(Step::CompleteMiBody {
-                instance_key,
-                body_key,
-            });
+            if cancel_remaining {
+                // `cancelRemainingInstances=true` (the BPMN default): complete the
+                // body now, cancelling the children still running.
+                followups.push(Step::CompleteMiBody {
+                    instance_key,
+                    body_key,
+                });
+            } else {
+                // `cancelRemainingInstances=false`: latch the fulfilment and let
+                // the outstanding children run out; the body completes when the
+                // last one drains (the drain check below). Latch BEFORE any
+                // further evaluation so a later child never re-evaluates the
+                // condition (#1398 review).
+                if !already_fulfilled {
+                    events.push(Event::MultiInstanceCompletionConditionFulfilled {
+                        instance_key,
+                        body_key,
+                    });
+                }
+                // A sequential body never spawns another child once the
+                // condition is fulfilled, so it completes as soon as the current
+                // child drains even with unspawned items left; a parallel body
+                // spawned all children upfront and waits for them to drain.
+                if others_active == 0 && (sequential || spawned >= total) {
+                    followups.push(Step::CompleteMiBody {
+                        instance_key,
+                        body_key,
+                    });
+                }
+            }
         } else if sequential {
             if spawned < total {
                 followups.push(Step::ActivateMiChild {
@@ -8733,19 +9390,64 @@ impl Engine {
         expr: &str,
         vars: &HashMap<String, Value>,
         def: &crate::model::AdHocSubProcessDef,
-    ) -> Vec<String> {
+        container_key: Key,
+    ) -> Result<Vec<String>, expression::Failure> {
+        // Zeebe `AdHocSubProcessProcessor.readActivateElementsCollection`: an
+        // ARRAY of STRINGs naming ad-hoc activities of this sub-process; any
+        // failure or unknown id is an EXTRACT_VALUE_ERROR on the container
+        // (#1398), never "no elements".
+        let ids = expression::evaluate_array_of_strings(expr, vars).map_err(|f| {
+            expression::Failure::extract_value(format!(
+                "Failed to activate ad-hoc elements. {}",
+                f.message
+            ))
+        })?;
         let names: std::collections::HashSet<&str> =
             def.tools.iter().map(|t| t.element_id.as_str()).collect();
-        match crate::feel::eval(expr, vars) {
-            Ok(Value::List(items)) => items
-                .into_iter()
-                .filter_map(|v| match v {
-                    Value::Str(s) if names.contains(s.as_str()) => Some(s),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
+        let missing: Vec<&str> = ids
+            .iter()
+            .map(String::as_str)
+            .filter(|id| !names.contains(id))
+            .collect();
+        if !missing.is_empty() {
+            return Err(expression::Failure::extract_value(format!(
+                "Expected to activate activities for ad-hoc sub-process with key '{container_key}', but the given elements [{}] do not exist.",
+                missing.join(", ")
+            )));
         }
+        Ok(ids)
+    }
+
+    /// Parks an ad-hoc CONTAINER on the `EXTRACT_VALUE_ERROR` of a tool
+    /// activation expression, discarding everything the activation planned
+    /// (keys rewound to `key_mark`). Resolution re-activates the tool from
+    /// scratch with its original seed (`AdHocToolJobType`, #1390 / #1398).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the incident's full addressing + redrive payload"
+    )]
+    fn adhoc_tool_incident(
+        &mut self,
+        instance_key: Key,
+        container_key: Key,
+        container_element_id: Option<String>,
+        element_id: String,
+        redrive_seed: HashMap<String, Value>,
+        failure: expression::Failure,
+        key_mark: u64,
+    ) -> (Vec<Event>, Vec<Step>) {
+        self.next_local = key_mark;
+        let event = self.expression_incident(
+            instance_key,
+            container_key,
+            container_element_id.unwrap_or_default(),
+            failure,
+            Some(state::IoMappingRedrive::AdHocToolJobType {
+                element_id,
+                variables: redrive_seed,
+            }),
+        );
+        (vec![event], Vec::new())
     }
 
     /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
@@ -8762,6 +9464,7 @@ impl Engine {
         element_id: String,
         variables: HashMap<String, Value>,
     ) -> (Vec<Event>, Vec<Step>) {
+        let key_mark = self.next_local;
         let child_key = self.mint_key();
         // The scoped view the child evaluates its own FEEL attributes (job type,
         // retries, priority) against: the container scope overlaid with the
@@ -8881,7 +9584,7 @@ impl Engine {
         let nested_is_declarative = self
             .adhoc_def_of(instance_key, &element_id)
             .is_some_and(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask);
-        let resolved_tool_job_type = if nested_is_declarative {
+        let raw_tool_job_type = if nested_is_declarative {
             None
         } else {
             // A nested AGENTIC container whose catalog entry is missing (or not
@@ -8889,7 +9592,7 @@ impl Engine {
             // (see the nested branch below); a non-service-task leaf tool (user
             // task, subProcess, callActivity, pass-through) mints no job and
             // resolves no type.
-            let raw_type = match &tool_kind {
+            match &tool_kind {
                 Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => {
                     Some(job_type.clone())
                 }
@@ -8897,25 +9600,49 @@ impl Engine {
                     Some(element_id.clone())
                 }
                 _ => None,
-            };
-            match raw_type {
-                Some(raw_type) => match self.resolve_job_type(&child_vars, &raw_type) {
-                    Ok(resolved) => Some(resolved),
-                    Err(reason) => {
-                        let event = self.expression_incident(
-                            instance_key,
-                            container_key,
-                            container_element_id.clone().unwrap_or_default(),
-                            reason,
-                            Some(state::IoMappingRedrive::AdHocToolJobType {
-                                element_id: element_id.clone(),
-                                variables: redrive_seed.clone(),
-                            }),
-                        );
-                        return (vec![event], Vec::new());
-                    }
-                },
+            }
+        };
+        // Every other tool expression is resolved here too, before any
+        // child-creation side effect (#1398): a user-task tool's properties and
+        // a nested declarative container's active-elements collection. Any
+        // failure parks the CONTAINER with the clean re-activation redrive.
+        let nested_def = self.adhoc_def_of(instance_key, &element_id);
+        let prep = (|| -> Result<_, expression::Failure> {
+            let job_type = match &raw_tool_job_type {
+                Some(raw_type) => Some(self.resolve_job_type(&child_vars, raw_type)?),
                 None => None,
+            };
+            let user_task = match &tool_kind {
+                Some(crate::model::AdHocToolKind::UserTask(props)) if nested_def.is_none() => {
+                    Some(self.resolve_user_task_props(&child_vars, props)?)
+                }
+                _ => None,
+            };
+            let nested_ids = match &nested_def {
+                Some(def) if def.impl_type == crate::model::AdHocImplementationType::BpmnTask => {
+                    match def.active_elements_collection.as_deref() {
+                        Some(expr) => {
+                            self.eval_adhoc_active_elements(expr, &child_vars, def, child_key)?
+                        }
+                        None => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            };
+            Ok((job_type, user_task, nested_ids))
+        })();
+        let (resolved_tool_job_type, resolved_user_task, nested_ids) = match prep {
+            Ok(prep) => prep,
+            Err(failure) => {
+                return self.adhoc_tool_incident(
+                    instance_key,
+                    container_key,
+                    container_element_id,
+                    element_id,
+                    redrive_seed,
+                    failure,
+                    key_mark,
+                );
             }
         };
 
@@ -8967,7 +9694,7 @@ impl Engine {
         // `complete_adhoc_tool` of THIS container (see `complete_adhoc_container`),
         // feeding this container's `outputElement`/loop across the nesting
         // boundary.
-        if let Some(nested_def) = self.adhoc_def_of(instance_key, &element_id) {
+        if let Some(nested_def) = nested_def {
             events.push(Event::AdHocActivated {
                 instance_key,
                 container_key: child_key,
@@ -8989,11 +9716,7 @@ impl Engine {
                 // Declarative nested container: activate the ids named by its
                 // `activeElementsCollection` directly (no agent job), completing
                 // once they drain.
-                let ids = nested_def
-                    .active_elements_collection
-                    .as_deref()
-                    .map(|expr| self.eval_adhoc_active_elements(expr, &child_vars, &nested_def))
-                    .unwrap_or_default();
+                let ids = nested_ids;
                 for id in &ids {
                     followups.push(Step::ActivateAdHocTool {
                         instance_key,
@@ -9030,8 +9753,11 @@ impl Engine {
                     unreachable!("nested agentic container resolved its job type above");
                 };
                 let job_key = self.mint_key();
-                let priority = self.resolve_priority(&child_vars, None);
-                let retries = self.resolve_retries(&child_vars, None);
+                // The catalog carries no per-tool retries / priority: the
+                // engine defaults (no expression, nothing to fail).
+                let JobProps {
+                    retries, priority, ..
+                } = JobProps::defaults(job_type.clone());
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -9055,8 +9781,11 @@ impl Engine {
                     unreachable!("service-task tool resolved its job type above");
                 };
                 let job_key = self.mint_key();
-                let priority = self.resolve_priority(&child_vars, None);
-                let retries = self.resolve_retries(&child_vars, None);
+                // The catalog carries no per-tool retries / priority: the
+                // engine defaults (no expression, nothing to fail).
+                let JobProps {
+                    retries, priority, ..
+                } = JobProps::defaults(job_type.clone());
                 events.push(Event::JobCreated {
                     job_key,
                     instance_key,
@@ -9078,21 +9807,18 @@ impl Engine {
             // Task listeners declared on the tool are pruned with it, so v1 emits
             // the plain CREATED record without a listener chain.
             Some(crate::model::AdHocToolKind::UserTask(props)) => {
+                let Some(ResolvedUserTask {
+                    assignee,
+                    candidate_groups,
+                    candidate_users,
+                    due_date,
+                    follow_up_date,
+                    priority,
+                }) = resolved_user_task
+                else {
+                    unreachable!("user-task tool resolved its properties above");
+                };
                 let user_task_key = self.mint_key();
-                let assignee = self
-                    .resolve_user_task_string(&child_vars, props.assignee.as_deref())
-                    .filter(|s| !s.is_empty());
-                let candidate_groups =
-                    self.resolve_user_task_list(&child_vars, props.candidate_groups.as_deref());
-                let candidate_users =
-                    self.resolve_user_task_list(&child_vars, props.candidate_users.as_deref());
-                let due_date = self
-                    .resolve_user_task_string(&child_vars, props.due_date.as_deref())
-                    .filter(|s| !s.is_empty());
-                let follow_up_date = self
-                    .resolve_user_task_string(&child_vars, props.follow_up_date.as_deref())
-                    .filter(|s| !s.is_empty());
-                let priority = self.resolve_priority(&child_vars, props.priority.as_deref());
                 let (form_key, external_form_reference) =
                     self.resolve_user_task_form_linkage(&props);
                 events.push(Event::UserTaskCreated {
@@ -9124,12 +9850,20 @@ impl Engine {
             // down the inner instance, re-emit the agent job). Boundary events on
             // the subProcess tool arm exactly like a normal embedded sub-process.
             Some(crate::model::AdHocToolKind::SubProcess { start_event }) => {
-                events.extend(self.arm_boundary_events(
-                    instance_key,
-                    child_key,
-                    inner_key,
-                    &element_id,
-                ));
+                match self.arm_boundary_events(instance_key, child_key, inner_key, &element_id) {
+                    Ok(armed) => events.extend(armed),
+                    Err(failure) => {
+                        return self.adhoc_tool_incident(
+                            instance_key,
+                            container_key,
+                            container_element_id,
+                            element_id,
+                            redrive_seed,
+                            failure,
+                            key_mark,
+                        );
+                    }
+                }
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -9235,7 +9969,7 @@ impl Engine {
         container_element_id: &str,
         output_updates: &HashMap<String, Value>,
         others: usize,
-    ) -> AdHocPostTool {
+    ) -> Result<AdHocPostTool, expression::Failure> {
         // Borrow the container's catalog entry once by reference (no clone of the
         // def or its `tools` / `inner_flows`) and reuse it for BOTH the
         // completion-condition evaluation and the `cancelRemainingInstances` read
@@ -9247,17 +9981,31 @@ impl Engine {
                 .iter()
                 .find(|d| d.container_id == container_element_id)
         }) else {
-            return AdHocPostTool::Continue;
+            return Ok(AdHocPostTool::Continue);
         };
-        let completion_now = def
-            .completion_condition
-            .as_ref()
-            .map(|cond| {
+        // Zeebe `AdHocSubProcessProcessor.beforeExecutionPathCompleted`: a
+        // failed condition (or a non-boolean / null result) is an
+        // EXTRACT_VALUE_ERROR "Failed to evaluate completion condition. …" on
+        // the completing child — never a silent "not yet" (#1398).
+        let completion_now = match def.completion_condition.as_ref() {
+            None => false,
+            Some(cond) => {
                 let mut ctx = (*self.variables_for_element(instance_key, container_key)).clone();
                 ctx.extend(output_updates.iter().map(|(k, v)| (k.clone(), v.clone())));
-                matches!(crate::feel::eval_bool(cond, &ctx), Ok(true))
-            })
-            .unwrap_or(false);
+                match expression::evaluate_bool(cond, &ctx) {
+                    Ok(b) => b,
+                    Err(failure) => {
+                        return Err(expression::Failure {
+                            message: format!(
+                                "Failed to evaluate completion condition. {}",
+                                failure.message
+                            ),
+                            ..failure
+                        })
+                    }
+                }
+            }
+        };
         let already_fulfilled = self
             .state
             .instances
@@ -9266,14 +10014,14 @@ impl Engine {
             .map(|a| a.completion_condition_fulfilled)
             .unwrap_or(false);
         if !(completion_now || already_fulfilled) {
-            return AdHocPostTool::Continue;
+            return Ok(AdHocPostTool::Continue);
         }
         let cancel_remaining = def.cancel_remaining_instances;
         if cancel_remaining {
             // `cancelRemainingInstances=true` (the BPMN default): complete now,
             // cancelling any tools still running this turn — exactly like a
             // multi-instance body's early completion.
-            return AdHocPostTool::Complete { cancel: true };
+            return Ok(AdHocPostTool::Complete { cancel: true });
         }
         // `cancelRemainingInstances=false`: defer container completion until no
         // active children/flows remain (Zeebe
@@ -9295,7 +10043,7 @@ impl Engine {
         // the tool whose completion then completes the container on the latched
         // condition.
         if others == 0 && !self.adhoc_container_blocked_by_incident(instance_key, container_key) {
-            return AdHocPostTool::Complete { cancel: false };
+            return Ok(AdHocPostTool::Complete { cancel: false });
         }
         let fulfilled_event = (!already_fulfilled).then(|| {
             Box::new(Event::AdHocCompletionConditionFulfilled {
@@ -9303,7 +10051,7 @@ impl Engine {
                 container_key,
             })
         });
-        AdHocPostTool::Defer { fulfilled_event }
+        Ok(AdHocPostTool::Defer { fulfilled_event })
     }
 
     fn complete_adhoc_tool(
@@ -9368,10 +10116,31 @@ impl Engine {
         // resident — its `ElementCompleted` is deferred until the append is known
         // to be safe below) — an entry in the agent's accumulated
         // `outputCollection` memory.
-        let output = output_element.as_deref().and_then(|expr| {
-            let vars = self.variables_for_element(instance_key, child_eik);
-            crate::feel::eval(expr, &vars).ok()
-        });
+        //
+        // Zeebe `AdHocSubProcessOutputCollectionBehavior`: a failed
+        // `outputElement` is an EXTRACT_VALUE_ERROR on the COMPLETING tool child
+        // — never a silent `null` entry (#1398). Like the type guard below,
+        // nothing is emitted but the incident, and resolution re-drives the
+        // tool's completion (reusing a call-activity tool's single-pass output
+        // projection, #1176).
+        let output = match output_element.as_deref() {
+            None => None,
+            Some(expr) => {
+                let vars = self.variables_for_element(instance_key, child_eik);
+                match expression::evaluate_feel(expr, &vars) {
+                    Ok(evaluated) => Some(evaluated.value),
+                    Err(failure) => {
+                        return self.adhoc_tool_completion_incident(
+                            instance_key,
+                            child_eik,
+                            tool_element_id,
+                            precomputed_output.as_ref(),
+                            failure,
+                        );
+                    }
+                }
+            }
+        };
         // Type guard (Zeebe `AdHocSubProcessOutputCollectionBehavior`): the
         // `outputCollection` target must be an array to append to. It is seeded to
         // `[]` on activation, so a non-array here means an input mapping (or the
@@ -9468,6 +10237,8 @@ impl Engine {
         // has no element entry, so `io_outputs` cannot see it). Evaluated in the
         // child's local scope while it is still resident — its `ElementCompleted`
         // above tears the scope down only when the caller applies the events.
+        // Kept for a completion-condition incident's redrive (#1398).
+        let precomputed_ref = precomputed_output.clone();
         let output_updates = match precomputed_output {
             // Call-activity tool bridge (#1159): the output mapping was already
             // projected ONCE against the child's real produced variables. Use it
@@ -9523,7 +10294,16 @@ impl Engine {
             &output_updates,
             others,
         ) {
-            AdHocPostTool::Complete { cancel } => {
+            Err(failure) => {
+                return self.adhoc_tool_completion_incident(
+                    instance_key,
+                    child_eik,
+                    tool_element_id,
+                    precomputed_ref.as_ref(),
+                    failure,
+                );
+            }
+            Ok(AdHocPostTool::Complete { cancel }) => {
                 return (
                     events,
                     vec![Step::CompleteAdHoc {
@@ -9533,13 +10313,13 @@ impl Engine {
                     }],
                 );
             }
-            AdHocPostTool::Defer { fulfilled_event } => {
+            Ok(AdHocPostTool::Defer { fulfilled_event }) => {
                 if let Some(event) = fulfilled_event {
                     events.push(*event);
                 }
                 return (events, Vec::new());
             }
-            AdHocPostTool::Continue => {}
+            Ok(AdHocPostTool::Continue) => {}
         }
         if others == 0 {
             // A sibling tool whose activation failed before its child was created
@@ -9671,6 +10451,8 @@ impl Engine {
         // into the container scope so the follow-up can read it — evaluated in the
         // child's local scope while it is still resident (its `ElementCompleted`
         // above tears the scope down only when the caller applies these events).
+        // Kept for a completion-condition incident's redrive (#1398).
+        let precomputed_ref = precomputed_output.clone();
         let output_updates = match precomputed_output {
             // Call-activity tool bridge (#1159): the output mapping was already
             // projected ONCE against the child's real produced variables. Use it
@@ -9728,7 +10510,16 @@ impl Engine {
             &output_updates,
             others,
         ) {
-            AdHocPostTool::Complete { cancel } => {
+            Err(failure) => {
+                return self.adhoc_tool_completion_incident(
+                    instance_key,
+                    child_eik,
+                    tool_element_id,
+                    precomputed_ref.as_ref(),
+                    failure,
+                );
+            }
+            Ok(AdHocPostTool::Complete { cancel }) => {
                 return (
                     events,
                     vec![Step::CompleteAdHoc {
@@ -9738,13 +10529,13 @@ impl Engine {
                     }],
                 );
             }
-            AdHocPostTool::Defer { fulfilled_event } => {
+            Ok(AdHocPostTool::Defer { fulfilled_event }) => {
                 if let Some(event) = fulfilled_event {
                     events.push(*event);
                 }
                 return (events, Vec::new());
             }
-            AdHocPostTool::Continue => {}
+            Ok(AdHocPostTool::Continue) => {}
         }
         // Take each outgoing inner flow and activate its target as a fresh tool
         // child of the container, continuing the execution path.
@@ -9765,6 +10556,35 @@ impl Engine {
         (events, followups)
     }
 
+    /// Parks a COMPLETING ad-hoc tool child on the `EXTRACT_VALUE_ERROR` of
+    /// its container's `outputElement` / `completionCondition` (#1398),
+    /// emitting nothing else: resolution re-drives the tool's completion —
+    /// reusing a call-activity tool's single-pass output projection (#1176),
+    /// else a plain re-completion against its still-resident scope.
+    fn adhoc_tool_completion_incident(
+        &mut self,
+        instance_key: Key,
+        child_eik: Key,
+        tool_element_id: String,
+        precomputed_output: Option<&HashMap<String, Value>>,
+        failure: expression::Failure,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let redrive = match precomputed_output {
+            Some(precomputed_output) => state::IoMappingRedrive::AdHocToolOutputCollection {
+                precomputed_output: precomputed_output.clone(),
+            },
+            None => state::IoMappingRedrive::Completion,
+        };
+        let event = self.expression_incident(
+            instance_key,
+            child_eik,
+            tool_element_id,
+            failure,
+            Some(redrive),
+        );
+        (vec![event], Vec::new())
+    }
+
     /// Builds the `JobCreated` event that (re-)emits an ad-hoc container's agent
     /// job on the container element instance, so the agent worker activates it to
     /// inspect accumulated tool results and drive the next turn.
@@ -9781,29 +10601,30 @@ impl Engine {
                 None => return Vec::new(),
             };
         let container_vars = self.variables_for_element(instance_key, container_key);
-        let job_type = match self.resolve_job_type(&container_vars, &job_type) {
-            Ok(job_type) => job_type,
+        let retries_raw = self.retries_of(instance_key, &container_element_id);
+        let props =
+            self.resolve_job_props(&container_vars, &job_type, retries_raw.as_deref(), None);
+        let JobProps {
+            job_type,
+            retries,
+            priority,
+        } = match props {
+            Ok(props) => props,
             Err(reason) => {
-                // #1390: a failed container job-type expression parks the
+                // #1390 / #1398: a failed container job-type / retries expression parks the
                 // container on an EXTRACT_VALUE_ERROR incident — no agent job.
-                // `redrive: None` resolves via `Step::Complete`, which routes a
-                // JOB_WORKER container back through `complete_adhoc_container`,
-                // whose turn loop re-mints the agent job via this function.
+                // The `AdHocAgentJob` redrive re-mints ONLY the agent job on
+                // resolution, preserving the container's collected results and
+                // ad-hoc state (re-running its activation would reset them).
                 return vec![self.expression_incident(
                     instance_key,
                     container_key,
                     container_element_id,
                     reason,
-                    None,
+                    Some(state::IoMappingRedrive::AdHocAgentJob),
                 )];
             }
         };
-        let retries = self.resolve_retries(
-            &container_vars,
-            self.retries_of(instance_key, &container_element_id)
-                .as_deref(),
-        );
-        let priority = self.resolve_priority(&container_vars, None);
         let job_key = self.mint_key();
         vec![Event::JobCreated {
             job_key,
@@ -10692,42 +11513,21 @@ impl Engine {
         // completion-time variable view, including any script/DMN result and
         // output mappings staged above), and defer `ElementCompleted` + the
         // outgoing flows to `finalize_completion` when the chain drains.
-        if let Some(first) = end_listeners.first() {
+        if !end_listeners.is_empty() {
             let mut listener_vars =
                 (*self.variables_for_element(instance_key, element_instance_key)).clone();
             if let Some(update) = &script_update {
                 listener_vars.extend(update.clone());
             }
-            let job_type = match self.resolve_job_type(&listener_vars, &first.job_type) {
-                Ok(job_type) => job_type,
-                Err(reason) => {
-                    // #1390: a failed end-listener job-type expression parks the
-                    // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
-                    // job; resolving re-drives completion.
-                    events.push(self.expression_incident(
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        reason,
-                        Some(state::IoMappingRedrive::Completion),
-                    ));
-                    return (events, Vec::new());
-                }
-            };
-            let job_key = self.mint_key();
-            let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
-            events.push(Event::ExecutionListenerJobCreated {
-                job_key,
+            events.push(self.execution_listener_job_event(
                 instance_key,
                 element_instance_key,
-                element_id: element_id.clone(),
-                job_type,
-                event_type: crate::model::ListenerEventType::End,
-                listener_index: 0,
+                &element_id,
+                crate::model::ListenerEventType::End,
+                0,
                 scope,
-                created_at: self.now,
-                retries,
-            });
+                &listener_vars,
+            ));
             return (events, Vec::new());
         }
 
@@ -10807,6 +11607,68 @@ impl Engine {
         (events, followups)
     }
 
+    /// Mints execution listener `index` of `element_id`'s `event_type` chain
+    /// (ADR 0037) — the single minting path for every execution-listener job.
+    /// `vars` is the view its FEEL `type` / `retries` resolve against. A failed
+    /// expression yields an EXTRACT_VALUE_ERROR incident whose redrive
+    /// ([`state::IoMappingRedrive::ExecutionListenerJob`]) re-mints ONLY this
+    /// listener on resolution — never restarting the lifecycle phase, which
+    /// would replay completed listeners, mappings or boundary arming (#1398
+    /// review). The caller must have checked that listener `index` exists; a
+    /// missing one (model changed under a redrive) mints nothing useful, so it
+    /// is reported as the same incident class rather than silently dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn execution_listener_job_event(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        event_type: crate::model::ListenerEventType,
+        index: usize,
+        scope: Key,
+        vars: &HashMap<String, Value>,
+    ) -> Event {
+        let listeners = self.listeners_of(instance_key, element_id, event_type);
+        let redrive = state::IoMappingRedrive::ExecutionListenerJob {
+            event_type,
+            listener_index: index,
+            scope,
+        };
+        let props = match listeners.get(index) {
+            Some(listener) => {
+                self.resolve_job_props(vars, &listener.job_type, listener.retries.as_deref(), None)
+            }
+            None => Err(expression::Failure::extract_value(format!(
+                "execution listener {index} of '{element_id}' is not defined"
+            ))),
+        };
+        match props {
+            Ok(JobProps {
+                job_type, retries, ..
+            }) => Event::ExecutionListenerJobCreated {
+                job_key: self.mint_key(),
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                job_type,
+                event_type,
+                listener_index: index,
+                scope,
+                created_at: self.now,
+                retries,
+            },
+            // #1390: a failed listener job-type expression parks the element on
+            // an EXTRACT_VALUE_ERROR incident — no job.
+            Err(reason) => self.expression_incident(
+                instance_key,
+                element_instance_key,
+                element_id.to_string(),
+                reason,
+                Some(redrive),
+            ),
+        }
+    }
+
     /// Mints the first `end` execution-listener job for an element that has just
     /// entered COMPLETING (ADR 0037), if it declares any. Returns the
     /// `ExecutionListenerJobCreated` event when there is an end chain to run — the
@@ -10833,36 +11695,18 @@ impl Engine {
             element_id,
             crate::model::ListenerEventType::End,
         );
-        let first = end_listeners.first()?;
-        let job_type = match self.resolve_job_type(vars, &first.job_type) {
-            Ok(job_type) => job_type,
-            Err(reason) => {
-                // #1390: a failed end-listener job-type expression parks the
-                // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
-                // job; resolving re-drives completion.
-                return Some(self.expression_incident(
-                    instance_key,
-                    element_instance_key,
-                    element_id.to_string(),
-                    reason,
-                    Some(state::IoMappingRedrive::Completion),
-                ));
-            }
-        };
-        let job_key = self.mint_key();
-        let retries = self.resolve_retries(vars, first.retries.as_deref());
-        Some(Event::ExecutionListenerJobCreated {
-            job_key,
+        if end_listeners.is_empty() {
+            return None;
+        }
+        Some(self.execution_listener_job_event(
             instance_key,
             element_instance_key,
-            element_id: element_id.to_string(),
-            job_type,
-            event_type: crate::model::ListenerEventType::End,
-            listener_index: 0,
+            element_id,
+            crate::model::ListenerEventType::End,
+            0,
             scope,
-            created_at: self.now,
-            retries,
-        })
+            vars,
+        ))
     }
 
     /// Dispatches the deferred completion of an element whose `end`
@@ -11555,52 +12399,22 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         let listeners = self.listeners_of(instance_key, &element_id, event_type);
         let next_index = index + 1;
-        if let Some(next) = listeners.get(next_index) {
+        if next_index < listeners.len() {
             // The element's applied scope view (input mappings for a start chain,
             // completion-time state for an end chain, plus any variables merged by
             // preceding listener completions) is what the next listener's FEEL
             // attributes resolve against.
             let listener_vars = self.variables_for_element(instance_key, element_instance_key);
-            let job_type = match self.resolve_job_type(&listener_vars, &next.job_type) {
-                Ok(job_type) => job_type,
-                Err(reason) => {
-                    // #1390: a failed listener job-type expression parks the
-                    // element on an EXTRACT_VALUE_ERROR incident — no job. The
-                    // redrive phase matches the chain: a `start` chain gates
-                    // activation, an `end` chain gates completion.
-                    let redrive = match event_type {
-                        crate::model::ListenerEventType::Start => {
-                            state::IoMappingRedrive::Activation
-                        }
-                        crate::model::ListenerEventType::End => state::IoMappingRedrive::Completion,
-                    };
-                    return (
-                        vec![self.expression_incident(
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            reason,
-                            Some(redrive),
-                        )],
-                        Vec::new(),
-                    );
-                }
-            };
-            let job_key = self.mint_key();
-            let retries = self.resolve_retries(&listener_vars, next.retries.as_deref());
             return (
-                vec![Event::ExecutionListenerJobCreated {
-                    job_key,
+                vec![self.execution_listener_job_event(
                     instance_key,
                     element_instance_key,
-                    element_id,
-                    job_type,
+                    &element_id,
                     event_type,
-                    listener_index: next_index,
+                    next_index,
                     scope,
-                    created_at: self.now,
-                    retries,
-                }],
+                    &listener_vars,
+                )],
                 Vec::new(),
             );
         }
@@ -11656,6 +12470,9 @@ impl Engine {
     /// the deferred transition on the task and mints the first listener's job.
     /// The caller has already checked that `first` exists (the listener-free
     /// path never calls this, keeping listener-free user tasks byte-identical).
+    /// `staged_vars` is the activation's post-input-mapping view, forwarded to
+    /// the first listener's job minting (see
+    /// [`Self::mint_task_listener_job`]); `None` reads the applied scope.
     #[allow(clippy::too_many_arguments)]
     fn start_task_listener_chain(
         &mut self,
@@ -11666,6 +12483,7 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         pending: state::PendingUserTaskTransition,
         first: &crate::model::TaskListener,
+        staged_vars: Option<&HashMap<String, Value>>,
     ) -> Vec<Event> {
         let job_event = self.mint_task_listener_job(
             user_task_key,
@@ -11675,6 +12493,7 @@ impl Engine {
             event_type,
             0,
             first,
+            staged_vars,
         );
         vec![
             Event::UserTaskTransitionDeferred {
@@ -11687,7 +12506,16 @@ impl Engine {
     }
 
     /// Mints a task-listener job for the listener at `index` of `event_type`'s
-    /// chain, resolving its `type`/`retries` FEEL against the user task's scope.
+    /// chain, resolving its `type`/`retries` FEEL against the user task's scope
+    /// — or, when either fails, the user task's incident (#1398).
+    ///
+    /// `staged_vars`, when given, is the post-input-mapping view the task's
+    /// activation staged but has not yet applied to state: the FIRST
+    /// `creating` listener is minted before those writes land, so a listener
+    /// `type` supplied by an input mapping (`type="=listenerType"`) must
+    /// resolve against the staged view rather than the persisted (pre-input)
+    /// scope (#1398 review). Later listeners (and the resolve-time re-mint)
+    /// pass `None` and read the applied scope, which by then holds the inputs.
     #[allow(clippy::too_many_arguments)]
     fn mint_task_listener_job(
         &mut self,
@@ -11698,11 +12526,43 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         index: usize,
         listener: &crate::model::TaskListener,
+        staged_vars: Option<&HashMap<String, Value>>,
     ) -> Event {
-        let listener_vars = self.variables_for_element(instance_key, element_instance_key);
+        let persisted;
+        let listener_vars = match staged_vars {
+            Some(vars) => vars,
+            None => {
+                persisted = self.variables_for_element(instance_key, element_instance_key);
+                &persisted
+            }
+        };
+        // Zeebe `BpmnJobBehavior.evaluateJobExpressions` for the listener job:
+        // a failed `type` / `retries` is an EXTRACT_VALUE_ERROR incident on the
+        // user task, never a job of the literal expression text (#1398).
+        let JobProps {
+            job_type, retries, ..
+        } = match self.resolve_job_props(
+            listener_vars,
+            &listener.job_type,
+            listener.retries.as_deref(),
+            None,
+        ) {
+            Ok(props) => props,
+            Err(failure) => {
+                return self.expression_incident(
+                    instance_key,
+                    element_instance_key,
+                    element_id.to_string(),
+                    failure,
+                    Some(state::IoMappingRedrive::TaskListenerJob {
+                        user_task_key,
+                        event_type,
+                        listener_index: index,
+                    }),
+                );
+            }
+        };
         let job_key = self.mint_key();
-        let job_type = self.resolve_job_type_lenient(&listener_vars, &listener.job_type);
-        let retries = self.resolve_retries(&listener_vars, listener.retries.as_deref());
         Event::TaskListenerJobCreated {
             job_key,
             instance_key,
@@ -11743,6 +12603,9 @@ impl Engine {
                 event_type,
                 next_index,
                 &next,
+                // A subsequent listener mints after the chain's earlier jobs
+                // completed — the task's scope (with its inputs) is applied.
+                None,
             );
             return (vec![job_event], Vec::new());
         }
@@ -11935,6 +12798,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Assigning,
                         new_pending,
                         &first,
+                        None,
                     ));
                 }
             }
@@ -12048,13 +12912,17 @@ impl Engine {
                 // resolution re-attempts this job creation (#1390).
                 let job_vars = self.variables_for_element(instance_key, element_instance_key);
                 let retries_raw = self.retries_of(instance_key, &element_id);
-                let props = self.resolve_job_type(&job_vars, &job_type).and_then(|t| {
-                    Ok((
-                        t,
-                        self.resolve_job_retries(&job_vars, retries_raw.as_deref())?,
-                    ))
-                });
-                let (job_type, retries) = match props {
+                let props = self.resolve_job_props(
+                    &job_vars,
+                    &job_type,
+                    retries_raw.as_deref(),
+                    priority.as_deref(),
+                );
+                let JobProps {
+                    job_type,
+                    retries,
+                    priority,
+                } = match props {
                     Ok(props) => props,
                     Err(failure) => {
                         let event = self.expression_incident(
@@ -12068,7 +12936,6 @@ impl Engine {
                     }
                 };
                 let job_key = self.mint_key();
-                let priority = self.resolve_priority(&job_vars, priority.as_deref());
                 (
                     vec![Event::JobCreated {
                         job_key,
@@ -13786,6 +14653,16 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
     owned.into_iter().filter_map(|k| map.remove(&k)).collect()
 }
 
+/// A process start event's deploy-time-resolved trigger.
+enum ResolvedStart {
+    Message(String),
+    Timer {
+        due_at: u64,
+        interval_millis: u64,
+        repeating: bool,
+    },
+}
+
 /// Errors returned by [`Engine::apply_command`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineError {
@@ -13797,6 +14674,15 @@ pub enum EngineError {
     /// `DeployProcess` was given a definition whose `start_event` is not among
     /// its elements.
     NoStartEvent { process_id: String },
+    /// `DeployProcess` was given a process whose start event carries a FEEL
+    /// expression (message name, timer) that fails to evaluate at deploy time
+    /// (Zeebe `ProcessMessageStartEventMessageNameValidator` /
+    /// `TimerCatchEventExpressionValidator`, #1398).
+    StartEventExpressionInvalid {
+        process_id: String,
+        element_id: String,
+        reason: String,
+    },
     /// `CompleteJob` referenced a job key that does not exist.
     JobNotFound { job_key: Key },
     /// `CompleteJob`/`FailJob` referenced a job that is not in a state where it
@@ -14091,6 +14977,16 @@ pub enum EngineError {
         target_catch_event_id: String,
         source_catch_event_ids: Vec<String>,
     },
+    /// A target catch event the migrated element must subscribe to has an
+    /// expression (message / signal name, correlation key, timer) that fails
+    /// to evaluate. HTTP 409. Zeebe `ProcessInstanceMigrationCatchEventBehavior`
+    /// (#1398).
+    MigrationCatchEventSubscriptionFailed {
+        instance_key: Key,
+        element_id: String,
+        target_element_id: String,
+        reason: String,
+    },
     /// An AgentInstance command referenced an `agent_instance_key` that does not
     /// identify a known agent instance.
     AgentInstanceNotFound { agent_instance_key: Key },
@@ -14248,6 +15144,10 @@ impl std::fmt::Display for EngineError {
                 f,
                 "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' is mapped to an element with id '{target_element_id}' and has a catch event with id '{catch_event_id}' that is mapped to a catch event with id '{target_catch_event_id}'. These mappings detach the catch event from the element in the target process. Catch events must stay attached to the same element instance."
             ),
+            EngineError::MigrationCatchEventSubscriptionFailed { instance_key, element_id, target_element_id, reason } => write!(
+                f,
+                "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' is mapped to element with id '{target_element_id}' that must be subscribed to a catch event. {reason}"
+            ),
             EngineError::MigrationCatchEventsMerged { instance_key, element_id, target_catch_event_id, source_catch_event_ids } => write!(
                 f,
                 "Expected to migrate process instance '{instance_key}' but active element with id '{element_id}' has a catch event attached that is mapped to a catch event with id '{target_catch_event_id}'. There are multiple mapping instructions that target this catch event: '{}'. Catch events cannot be merged by process instance migration. Please ensure the mapping instructions target a catch event only once.",
@@ -14259,6 +15159,14 @@ impl std::fmt::Display for EngineError {
             EngineError::DecisionNotFound { reference } => {
                 write!(f, "no deployed decision with {reference}")
             }
+            EngineError::StartEventExpressionInvalid {
+                process_id,
+                element_id,
+                reason,
+            } => write!(
+                f,
+                "Expected to deploy process '{process_id}' but start event '{element_id}' has an invalid expression: {reason}"
+            ),
             EngineError::NoStartEvent { process_id } => {
                 write!(
                     f,
@@ -14783,7 +15691,11 @@ impl RoutingFailure {
 /// incident on the activating element instance, that incident is re-tagged
 /// [`state::IoMappingRedrive::ActivationPending`] (so its resolution emits
 /// `ElementActivated` once the re-run succeeds) and `activated` is withheld;
-/// otherwise `activated` is inserted at `at`.
+/// otherwise `activated` is inserted at `at`. An
+/// [`state::IoMappingRedrive::ActivationBody`] incident (a body-expression
+/// failure after the inputs/listeners succeeded, #1398 review) is likewise
+/// re-tagged [`state::IoMappingRedrive::ActivationBodyPending`] and withholds
+/// `activated` — the body re-run then emits it once it succeeds.
 fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Event> {
     let eik = match &activated {
         Event::ElementActivated {
@@ -14796,13 +15708,28 @@ fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Ev
     for e in &mut events {
         if let Event::IncidentRaised {
             element_instance_key,
-            redrive: Some(redrive @ state::IoMappingRedrive::Activation),
+            redrive: Some(redrive),
             ..
         } = e
         {
             if *element_instance_key == eik {
-                *redrive = state::IoMappingRedrive::ActivationPending;
-                parked = true;
+                match redrive {
+                    state::IoMappingRedrive::Activation => {
+                        *redrive = state::IoMappingRedrive::ActivationPending;
+                        parked = true;
+                    }
+                    state::IoMappingRedrive::ActivationBody => {
+                        *redrive = state::IoMappingRedrive::ActivationBodyPending;
+                        parked = true;
+                    }
+                    // Already pending-tagged (the failure site detected the
+                    // pre-activation state itself): still withhold `activated`.
+                    state::IoMappingRedrive::ActivationPending
+                    | state::IoMappingRedrive::ActivationBodyPending => {
+                        parked = true;
+                    }
+                    _ => {}
+                }
             }
         }
     }

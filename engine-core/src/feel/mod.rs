@@ -63,9 +63,22 @@ pub fn eval(expr: &str, ctx: &HashMap<String, Value>) -> Result<Value, FeelError
 pub(crate) fn eval_typed(
     expr: &str,
     ctx: &HashMap<String, Value>,
-) -> Result<(Value, &'static str), FeelError> {
+) -> Result<(Value, &'static str, Vec<&'static str>), FeelError> {
     let v = evaluate(expr, ctx)?;
-    let kind = match &v {
+    let kind = feel_kind(&v);
+    // Native kinds of a list result's items, captured before conversion:
+    // temporal items render to `Value::Str` and would otherwise be
+    // indistinguishable from genuine `STRING` items.
+    let item_kinds = match &v {
+        value::FeelVal::List(items) => items.iter().map(feel_kind).collect(),
+        _ => Vec::new(),
+    };
+    Ok((v.into_value(), kind, item_kinds))
+}
+
+/// The Zeebe `ResultType` name of a native FEEL value.
+fn feel_kind(v: &value::FeelVal) -> &'static str {
+    match v {
         value::FeelVal::Null => "NULL",
         value::FeelVal::Bool(_) => "BOOLEAN",
         value::FeelVal::Int(_) | value::FeelVal::Double(_) => "NUMBER",
@@ -78,8 +91,7 @@ pub(crate) fn eval_typed(
         value::FeelVal::YmDur(_) => "PERIOD",
         value::FeelVal::DtDur(_) => "DURATION",
         value::FeelVal::Range(_) | value::FeelVal::Function(_) => "UNKNOWN",
-    };
-    Ok((v.into_value(), kind))
+    }
 }
 
 /// Evaluates a FEEL expression expecting a string result (job type, correlation

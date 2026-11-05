@@ -986,6 +986,323 @@ fn created_scope_boundaries_see_modification_variables() {
     }
 }
 
+/// Preflight must validate each activation against the state the command
+/// reaches when that activation applies — including EARLIER instructions'
+/// variable writes. Here the first instruction stages root `k`; the second
+/// opens `sub`, whose boundary correlation key `=k` resolves only through that
+/// staged write. Application arms the boundary AFTER the write lands, so the
+/// command is valid and preflight must accept it (#1398 review).
+#[test]
+fn preflight_sees_an_earlier_instructions_staged_root_write() {
+    let def = ProcessBuilder::new("boundary-staged")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .message_boundary_event("mb", "sub", "cancel", "=k")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "b")
+        .connect("b", "se")
+        .connect("sub", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![
+                ActivateElementInstruction {
+                    element_id: "a".into(),
+                    variables: vars(&[("k", Value::Str("o-1".into()))]),
+                    ..Default::default()
+                },
+                ActivateElementInstruction {
+                    element_id: "b".into(),
+                    ..Default::default()
+                },
+            ],
+        ))
+        .unwrap();
+    let keys: Vec<&str> = engine
+        .state()
+        .message_subscriptions
+        .values()
+        .filter(|s| s.instance_key == inst && s.element_id == "sub")
+        .map(|s| s.correlation_key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["o-1"],
+        "the boundary armed against the earlier instruction's staged write"
+    );
+}
+
+/// The mirror image: preflight must not ACCEPT a command whose boundary
+/// expression fails only once an earlier instruction's staged write is in
+/// view — otherwise the failure surfaces as an incident AFTER the earlier
+/// instruction's writes and activations were already emitted, breaking the
+/// command's all-or-nothing guarantee (#1398 review).
+#[test]
+fn preflight_rejects_a_boundary_failing_only_under_an_earlier_staged_write() {
+    let def = ProcessBuilder::new("boundary-staged-bad")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .message_boundary_event("mb", "sub", "cancel", "=k")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "b")
+        .connect("b", "se")
+        .connect("sub", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    // `k` is a NUMBER: the correlation key needs a STRING/number-renderable —
+    // but a MAP value fails extraction outright, and only the earlier
+    // instruction's staged write brings it into view.
+    let result = engine.apply_command(modify(
+        inst,
+        vec![
+            ActivateElementInstruction {
+                element_id: "a".into(),
+                variables: vars(&[(
+                    "k",
+                    Value::Map(std::collections::BTreeMap::from([(
+                        "nested".to_string(),
+                        Value::Int(1),
+                    )])),
+                )]),
+                ..Default::default()
+            },
+            ActivateElementInstruction {
+                element_id: "b".into(),
+                ..Default::default()
+            },
+        ],
+    ));
+    let err = result.expect_err("the boundary fails under the staged write");
+    assert!(
+        format!("{err:?}").contains("Expected to subscribe to catch event(s) of 'sub'"),
+        "{err:?}"
+    );
+    // All-or-nothing: the rejected command emits nothing — no staged root
+    // write, no created scope, no boundary subscription.
+    assert_eq!(
+        engine.instance(inst).unwrap().variables.get("k"),
+        None,
+        "the earlier instruction's root write was not applied"
+    );
+    assert!(
+        eiks(&engine, inst, "sub").is_empty(),
+        "no flow scope was created"
+    );
+    assert!(
+        engine
+            .state()
+            .message_subscriptions
+            .values()
+            .all(|s| s.instance_key != inst),
+        "no boundary subscription was armed"
+    );
+}
+
+/// Activations of one command share the flow scopes the command creates
+/// (application reuses them), so a later activation targeting an element
+/// directly under such a scope must RESOLVE into it: two instructions for
+/// sibling elements of one not-yet-existing sub-process land in ONE `sub`
+/// instance, not two (#1398 review).
+#[test]
+fn preflight_reuses_a_scope_created_by_an_earlier_instruction() {
+    let def = ProcessBuilder::new("scope-reuse")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .service_task("c", "jobC")
+        .contained_in("c", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .end_event("end")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "b")
+        .connect("ss", "c")
+        .connect("b", "se")
+        .connect("c", "se")
+        .connect("sub", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![
+                ActivateElementInstruction {
+                    element_id: "b".into(),
+                    ..Default::default()
+                },
+                ActivateElementInstruction {
+                    element_id: "c".into(),
+                    ..Default::default()
+                },
+            ],
+        ))
+        .unwrap();
+    assert_eq!(
+        eiks(&engine, inst, "sub").len(),
+        1,
+        "both activations share the one created sub-process scope"
+    );
+    let sub = eiks(&engine, inst, "sub")[0];
+    for id in ["b", "c"] {
+        let keys = eiks(&engine, inst, id);
+        assert_eq!(keys.len(), 1, "one {id} instance");
+        assert_eq!(
+            scope_of(&engine, inst, keys[0]),
+            sub,
+            "{id} lands in the shared created scope"
+        );
+    }
+}
+
+/// A nested created scope's boundary is checked against the view that
+/// includes the OUTER scope's staged locals: the first instruction opens
+/// `outer` (staging `k` as its local) and `inner` (whose boundary key is
+/// `=k`). Application arms `inner`'s boundary after `outer`'s local is
+/// written, so the command is valid — preflight must carry the outer scope's
+/// staged write into the nested scope's view (#1398 review).
+#[test]
+fn preflight_carries_an_outer_created_scopes_locals_into_a_nested_scope() {
+    let def = ProcessBuilder::new("nested-staged")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("outer", "os")
+        .start_event("os")
+        .contained_in("os", "outer")
+        .sub_process("inner", "is")
+        .contained_in("inner", "outer")
+        .start_event("is")
+        .contained_in("is", "inner")
+        .service_task("t", "work")
+        .contained_in("t", "inner")
+        .end_event("ie")
+        .contained_in("ie", "inner")
+        .end_event("oe")
+        .contained_in("oe", "outer")
+        .message_boundary_event("mb", "inner", "cancel", "=k")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "outer")
+        .connect("os", "inner")
+        .connect("is", "t")
+        .connect("t", "ie")
+        .connect("inner", "oe")
+        .connect("outer", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "t".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[("k", Value::Str("o-1".into()))]),
+                    scope_id: Some("outer".into()),
+                }],
+                ..Default::default()
+            }],
+        ))
+        .unwrap();
+    let keys: Vec<&str> = engine
+        .state()
+        .message_subscriptions
+        .values()
+        .filter(|s| s.instance_key == inst && s.element_id == "inner")
+        .map(|s| s.correlation_key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["o-1"],
+        "the nested scope's boundary saw the outer scope's staged local"
+    );
+}
+
+/// The preflight checks a created scope's boundaries against the SAME
+/// parent-scope view application arms them in: a correlation key supplied only
+/// as a local of the new sub-process itself is not visible to its own
+/// boundary, so the command is rejected up front — never accepted with the
+/// subscription silently dropped.
+#[test]
+fn created_scope_own_locals_do_not_satisfy_its_boundary_preflight() {
+    let def = ProcessBuilder::new("boundary-own-local")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .message_boundary_event("mb", "sub", "cancel", "=k")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "b")
+        .connect("b", "se")
+        .connect("sub", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    let result = engine.apply_command(modify(
+        inst,
+        vec![ActivateElementInstruction {
+            element_id: "b".into(),
+            variable_instructions: vec![VariableInstruction {
+                variables: vars(&[("k", Value::Str("o-1".into()))]),
+                scope_id: Some("sub".into()),
+            }],
+            ..Default::default()
+        }],
+    ));
+    let err = result.expect_err("the boundary cannot see the scope's own local");
+    assert!(
+        format!("{err:?}").contains("Expected to subscribe to catch event(s) of 'sub'"),
+        "{err:?}"
+    );
+}
+
 /// Terminating a half-open parallel join by element id resets its join
 /// bookkeeping: the remaining branch's arrival must not fire the join against
 /// the cancelled branch's arrival.
@@ -1612,4 +1929,264 @@ fn rejects_activation_that_would_open_an_inactive_adhoc_container() {
         );
         assert!(eiks(&engine, inst, "agent").is_empty(), "nothing opened");
     }
+}
+
+fn nested_boundary_def() -> ProcessDefinition {
+    // `outer` (running, parked on `wait`) contains `inner`, whose message
+    // boundary correlates on `=k`. `outer` declares a local `k` via its input
+    // mapping only when `withLocal` is set.
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+      <bpmn:message id="msg" name="cancel"><bpmn:extensionElements><zeebe:subscription correlationKey="=k" /></bpmn:extensionElements></bpmn:message>
+      <bpmn:process id="nested-staged" isExecutable="true">
+        <bpmn:startEvent id="start" />
+        <bpmn:subProcess id="outer">
+          <bpmn:extensionElements><zeebe:ioMapping><zeebe:input source="=if withLocal then &quot;local&quot; else null" target="k" /></zeebe:ioMapping></bpmn:extensionElements>
+          <bpmn:startEvent id="os" />
+          <bpmn:serviceTask id="wait"><bpmn:extensionElements><zeebe:taskDefinition type="w" /></bpmn:extensionElements></bpmn:serviceTask>
+          <bpmn:subProcess id="inner">
+            <bpmn:startEvent id="is" />
+            <bpmn:serviceTask id="b"><bpmn:extensionElements><zeebe:taskDefinition type="jb" /></bpmn:extensionElements></bpmn:serviceTask>
+            <bpmn:sequenceFlow id="i1" sourceRef="is" targetRef="b" />
+          </bpmn:subProcess>
+          <bpmn:boundaryEvent id="mb" attachedToRef="inner"><bpmn:messageEventDefinition messageRef="msg" /></bpmn:boundaryEvent>
+          <bpmn:endEvent id="late" />
+          <bpmn:sequenceFlow id="o1" sourceRef="os" targetRef="wait" />
+          <bpmn:sequenceFlow id="o2" sourceRef="mb" targetRef="late" />
+        </bpmn:subProcess>
+        <bpmn:endEvent id="end" />
+        <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="outer" />
+        <bpmn:sequenceFlow id="f2" sourceRef="outer" targetRef="end" />
+      </bpmn:process></bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+fn inner_subscription_keys(engine: &Engine, inst: Key) -> Vec<String> {
+    engine
+        .state()
+        .message_subscriptions
+        .values()
+        .filter(|s| s.instance_key == inst && s.element_id == "inner")
+        .map(|s| s.correlation_key.clone())
+        .collect()
+}
+
+/// A variable instruction on an EXISTING ancestor scope (`outer`) is applied
+/// before the created scope's (`inner`) boundaries arm, so the preflight must
+/// see it too — rejecting would refuse a command that applies cleanly
+/// (#1398 review).
+#[test]
+fn staged_write_to_existing_ancestor_scope_satisfies_boundary_preflight() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        nested_boundary_def(),
+        vars(&[("withLocal", Value::Bool(false))]),
+    );
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[("k", Value::Str("o-1".into()))]),
+                    scope_id: Some("outer".into()),
+                }],
+                ..Default::default()
+            }],
+        ))
+        .expect("the staged ancestor write is visible to the boundary");
+    assert_eq!(inner_subscription_keys(&engine, inst), vec!["o-1"]);
+}
+
+/// A staged ROOT write must not override a nearer existing local of the same
+/// name in the preflight view: application arms against `outer`'s local `k`,
+/// so an unusable root `k` must not reject the command (#1398 review).
+#[test]
+fn staged_root_write_does_not_override_nearer_local_in_boundary_preflight() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        nested_boundary_def(),
+        vars(&[("withLocal", Value::Bool(true))]),
+    );
+    engine
+        .apply_command(modify(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variable_instructions: vec![VariableInstruction {
+                    variables: vars(&[("k", Value::List(vec![]))]),
+                    scope_id: None,
+                }],
+                ..Default::default()
+            }],
+        ))
+        .expect("the boundary reads outer's local `k`, not the root write");
+    assert_eq!(inner_subscription_keys(&engine, inst), vec!["local"]);
+}
+
+/// An earlier instruction's write to an EXISTING scope instance is visible
+/// only on that instance's lineage. With two running `outer` instances, a
+/// write to `outer` A must not satisfy the boundary of an `inner` created
+/// under `outer` B — B's own `k` is null, so application would fail arming
+/// after A's write already landed. Preflight must reject the whole command
+/// (#1398 review).
+#[test]
+fn staged_write_to_one_existing_scope_instance_is_invisible_to_a_sibling_instance() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        nested_boundary_def(),
+        vars(&[("withLocal", Value::Bool(false))]),
+    );
+    engine
+        .apply_command(modify(inst, vec![under("wait", inst)]))
+        .unwrap();
+    let outers = eiks(&engine, inst, "outer");
+    assert_eq!(outers.len(), 2, "two running outer instances");
+    let mut write_a = under("b", outers[0]);
+    write_a.variable_instructions = vec![VariableInstruction {
+        variables: vars(&[("k", Value::Str("o-1".into()))]),
+        scope_id: Some("outer".into()),
+    }];
+    let result = engine.apply_command(modify(inst, vec![write_a, under("b", outers[1])]));
+    let err = result.expect_err("outer B's boundary key is still null");
+    assert!(
+        format!("{err:?}").contains("Expected to subscribe to catch event(s) of 'inner'"),
+        "{err:?}"
+    );
+    assert!(eiks(&engine, inst, "inner").is_empty(), "nothing applied");
+    assert!(inner_subscription_keys(&engine, inst).is_empty());
+}
+
+/// Created-scope locals shadow EXISTING ancestor locals: `outer` (existing)
+/// holds an unusable map `k`; the first instruction creates `middle` with a
+/// local `k = "ready"`; the second creates `inner` under that reused `middle`.
+/// `inner`'s boundary reads `middle`'s `k`, so the command is valid
+/// (#1398 review).
+#[test]
+fn created_scope_local_shadows_existing_ancestor_local_in_preflight() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+      <bpmn:message id="msg" name="cancel"><bpmn:extensionElements><zeebe:subscription correlationKey="=k" /></bpmn:extensionElements></bpmn:message>
+      <bpmn:process id="shadow" isExecutable="true">
+        <bpmn:startEvent id="start" />
+        <bpmn:subProcess id="outer">
+          <bpmn:extensionElements><zeebe:ioMapping><zeebe:input source="={a: 1}" target="k" /></zeebe:ioMapping></bpmn:extensionElements>
+          <bpmn:startEvent id="os" />
+          <bpmn:serviceTask id="wait"><bpmn:extensionElements><zeebe:taskDefinition type="w" /></bpmn:extensionElements></bpmn:serviceTask>
+          <bpmn:subProcess id="middle">
+            <bpmn:startEvent id="ms" />
+            <bpmn:serviceTask id="m"><bpmn:extensionElements><zeebe:taskDefinition type="jm" /></bpmn:extensionElements></bpmn:serviceTask>
+            <bpmn:subProcess id="inner">
+              <bpmn:startEvent id="is" />
+              <bpmn:serviceTask id="b"><bpmn:extensionElements><zeebe:taskDefinition type="jb" /></bpmn:extensionElements></bpmn:serviceTask>
+              <bpmn:sequenceFlow id="i1" sourceRef="is" targetRef="b" />
+            </bpmn:subProcess>
+            <bpmn:boundaryEvent id="mb" attachedToRef="inner"><bpmn:messageEventDefinition messageRef="msg" /></bpmn:boundaryEvent>
+            <bpmn:endEvent id="late" />
+            <bpmn:sequenceFlow id="m1" sourceRef="ms" targetRef="m" />
+            <bpmn:sequenceFlow id="m2" sourceRef="mb" targetRef="late" />
+          </bpmn:subProcess>
+          <bpmn:sequenceFlow id="o1" sourceRef="os" targetRef="wait" />
+        </bpmn:subProcess>
+        <bpmn:endEvent id="end" />
+        <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="outer" />
+        <bpmn:sequenceFlow id="f2" sourceRef="outer" targetRef="end" />
+      </bpmn:process></bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![
+                ActivateElementInstruction {
+                    element_id: "m".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("k", Value::Str("ready".into()))]),
+                        scope_id: Some("middle".into()),
+                    }],
+                    ..Default::default()
+                },
+                ActivateElementInstruction {
+                    element_id: "b".into(),
+                    ..Default::default()
+                },
+            ],
+        ))
+        .expect("inner's boundary reads middle's local `k`");
+    assert_eq!(eiks(&engine, inst, "middle").len(), 1, "middle is shared");
+    assert_eq!(inner_subscription_keys(&engine, inst), vec!["ready"]);
+}
+
+/// Two activations in one command sharing a sub-process the command creates:
+/// application creates (and arms) the scope once, on the first activation, so
+/// the boundary preflight runs only there. A later instruction that changes the
+/// variable the boundary reads must not re-check (and reject) the already
+/// captured subscription (#1398 review).
+#[test]
+fn shared_created_scope_boundary_is_checked_only_on_first_creation() {
+    let def = ProcessBuilder::new("boundary-shared-scope")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .sub_process("sub", "ss")
+        .start_event("ss")
+        .contained_in("ss", "sub")
+        .parallel_gateway("fork")
+        .contained_in("fork", "sub")
+        .service_task("b", "jobB")
+        .contained_in("b", "sub")
+        .service_task("c", "jobC")
+        .contained_in("c", "sub")
+        .end_event("se")
+        .contained_in("se", "sub")
+        .end_event("se2")
+        .contained_in("se2", "sub")
+        .message_boundary_event("mb", "sub", "cancel", "=k")
+        .end_event("end")
+        .end_event("late")
+        .connect("start", "a")
+        .connect("a", "sub")
+        .connect("ss", "fork")
+        .connect("fork", "b")
+        .connect("fork", "c")
+        .connect("b", "se")
+        .connect("c", "se2")
+        .connect("sub", "end")
+        .connect("mb", "late")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![
+                ActivateElementInstruction {
+                    element_id: "b".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("k", Value::Str("ready".into()))]),
+                        scope_id: None,
+                    }],
+                    ..Default::default()
+                },
+                ActivateElementInstruction {
+                    element_id: "c".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("k", Value::Null)]),
+                        scope_id: None,
+                    }],
+                    ..Default::default()
+                },
+            ],
+        ))
+        .expect("the shared scope armed once, with k = \"ready\"");
+    let keys: Vec<&str> = engine
+        .state()
+        .message_subscriptions
+        .values()
+        .filter(|s| s.instance_key == inst && s.element_id == "sub")
+        .map(|s| s.correlation_key.as_str())
+        .collect();
+    assert_eq!(keys, vec!["ready"]);
 }

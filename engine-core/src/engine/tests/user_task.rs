@@ -1,6 +1,55 @@
 //! `user_task` engine tests (slice 7 of #1201), extracted verbatim.
 use super::*;
 
+/// A FEEL `function` or `range` result converts to `Value::Null` at the API
+/// boundary but keeps the kind `UNKNOWN`. The nullable due/follow-up dates
+/// must accept only a native FEEL `null` as "no date" — anything else,
+/// including a value that merely *renders* as null, is a wrong-type incident
+/// (Zeebe `evaluateDateTimeExpression`, #1398 review).
+#[test]
+fn should_raise_an_incident_when_a_due_date_expression_yields_a_function() {
+    use crate::model::UserTaskProps;
+    let def = ProcessBuilder::new("fn-date")
+        .start_event("start")
+        .user_task_with(
+            "review",
+            UserTaskProps {
+                assignee: None,
+                candidate_groups: None,
+                candidate_users: None,
+                due_date: Some("=function(x) x".to_string()),
+                follow_up_date: Some("=[1..2]".to_string()),
+                priority: None,
+                form_id: None,
+                external_form_reference: None,
+            },
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("fn-date"))
+        .unwrap();
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Event::UserTaskCreated { .. })),
+        "no user task is created on a wrong-typed date"
+    );
+    let incident = engine.active_incidents()[0].clone();
+    assert_eq!(incident.kind, state::IncidentKind::ExtractValueError);
+    assert!(
+        incident.reason.contains("but was 'UNKNOWN'"),
+        "a function/range result is not an absent date: {}",
+        incident.reason
+    );
+}
+
 #[test]
 fn subprocess_terminate_end_cancels_a_resting_user_task_in_its_scope() {
     // A terminate end must cancel a resting user task in the torn-down scope —
@@ -192,19 +241,19 @@ fn should_create_a_user_task_with_resolved_attributes() {
 }
 
 #[test]
-fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
+fn should_raise_an_incident_when_assignee_expression_is_null() {
     use crate::model::UserTaskProps;
-    // Reproduces merlin instance 19153 (#900): a `=FEEL` assignee whose
-    // variable is null must create the task UNASSIGNED (assignee None) rather
-    // than storing the raw "=maybeNull" literal, which hides the task from
-    // assignee-aware operator views. candidateGroups must survive so the task
-    // stays claimable by the group.
+    // #900 stopped storing the raw "=who" literal as the assignee. Zeebe
+    // (`BpmnUserTaskBehavior.evaluateAssigneeExpression` ->
+    // `evaluateStringExpression`) goes further: a NULL assignee is an
+    // EXTRACT_VALUE_ERROR incident — no task is created until the operator
+    // fixes the variable (#1398). The nullable dates stay absent.
     let def = ProcessBuilder::new("escalation")
         .start_event("start")
         .user_task_with(
             "review",
             UserTaskProps {
-                assignee: Some("=maybeNull".to_string()),
+                assignee: Some("=who".to_string()),
                 candidate_groups: Some("operators".to_string()),
                 candidate_users: None,
                 due_date: Some("=maybeNull".to_string()),
@@ -224,7 +273,10 @@ fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
     // maybeNull is explicitly null (intent: escalate unassigned).
-    let vars = HashMap::from([("maybeNull".to_string(), Value::Null)]);
+    let vars = HashMap::from([
+        ("maybeNull".to_string(), Value::Null),
+        ("who".to_string(), Value::Null),
+    ]);
     let created = engine
         .apply_command(Command::CreateInstance {
             process_id: "escalation".to_string(),
@@ -235,21 +287,38 @@ fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
             version: None,
         })
         .unwrap();
-    let user_task_key = created
-        .iter()
-        .find_map(|e| match e {
-            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
-            _ => None,
-        })
-        .expect("user task created");
-
-    let task = &engine.state().user_tasks[&user_task_key];
-    // The categorical fix: the null-resolving expressions are absent, never the
-    // raw "=maybeNull".
-    assert_eq!(
-        task.assignee, None,
-        "null assignee expression must be absent"
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Event::UserTaskCreated { .. })),
+        "no user task is created on an unevaluable assignee"
     );
+    let incident = engine.active_incidents()[0].clone();
+    assert_eq!(incident.kind, state::IncidentKind::ExtractValueError);
+    assert!(
+        incident.reason.contains("but was 'NULL'"),
+        "{}",
+        incident.reason
+    );
+
+    // The operator supplies the assignee and resolves: the task is created.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("who".to_string(), Value::Str("operator-1".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+    let task = engine
+        .state()
+        .user_tasks
+        .values()
+        .next()
+        .expect("user task created on resolve");
+    assert_eq!(task.assignee.as_deref(), Some("operator-1"));
     assert_eq!(
         task.due_date, None,
         "null dueDate expression must be absent"
@@ -258,19 +327,7 @@ fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
         task.follow_up_date, None,
         "null followUpDate expression must be absent"
     );
-    // The candidate group survives, so the unassigned task is still claimable.
     assert_eq!(task.candidate_groups, vec!["operators"]);
-
-    // And it is claimable via assign_user_task (the manual unblock in #900).
-    engine
-        .apply_command(Command::assign_user_task(user_task_key, "operator-1"))
-        .unwrap();
-    assert_eq!(
-        engine.state().user_tasks[&user_task_key]
-            .assignee
-            .as_deref(),
-        Some("operator-1")
-    );
 }
 
 #[test]

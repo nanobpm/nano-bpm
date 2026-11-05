@@ -2059,8 +2059,14 @@ fn emit_multi_instance(el: &Element, out: &mut String) {
     } else {
         ""
     };
+    // `cancelRemainingInstances` defaults to `true`; emit only the override.
+    let cancel = if mi.cancel_remaining_instances {
+        ""
+    } else {
+        " cancelRemainingInstances=\"false\""
+    };
     out.push_str(&format!(
-        "      <bpmn:multiInstanceLoopCharacteristics{seq}>\n"
+        "      <bpmn:multiInstanceLoopCharacteristics{seq}{cancel}>\n"
     ));
     out.push_str("        <bpmn:extensionElements>\n");
     out.push_str(&format!(
@@ -4725,6 +4731,7 @@ mod tests {
                 input_element: Some("item".into()),
                 output_collection: Some("results".into()),
                 output_element: Some("= result".into()),
+                cancel_remaining_instances: true,
                 sequential: true,
                 completion_condition: None,
             });
@@ -5927,6 +5934,7 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
                     output_collection: Some("results".to_string()),
                     output_element: Some("=item * 2".to_string()),
                     completion_condition: Some("=count(results) >= 2".to_string()),
+                    cancel_remaining_instances: true,
                     sequential: true,
                 },
             )
@@ -5966,6 +5974,38 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
             Some("=count(results) >= 2")
         );
         assert!(mi.sequential);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_cancel_remaining_instances_both_values() {
+        for cancel in [true, false] {
+            let def = nanobpmn_engine_core::ProcessBuilder::new("Batched")
+                .start_event("Start")
+                .service_task("Each", "handle")
+                .with_multi_instance(
+                    "Each",
+                    nanobpmn_engine_core::MultiInstance {
+                        input_collection: "=items".to_string(),
+                        completion_condition: Some("=true".to_string()),
+                        cancel_remaining_instances: cancel,
+                        ..Default::default()
+                    },
+                )
+                .end_event("Done")
+                .connect("Start", "Each")
+                .connect("Each", "Done")
+                .build()
+                .unwrap();
+            let xml = definition_to_xml(&def);
+            let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+            let mi = reparsed[0]
+                .element("Each")
+                .unwrap()
+                .multi_instance
+                .as_ref()
+                .expect("multi-instance survives the round-trip");
+            assert_eq!(mi.cancel_remaining_instances, cancel, "{xml}");
+        }
     }
 
     #[test]
