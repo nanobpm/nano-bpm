@@ -715,6 +715,7 @@
           }
         },
         "created_at": 1700000000011,
+        "gateway_routes": {},
         "incidents": [],
         "join_counts": {},
         "join_flow_arrivals": {},
