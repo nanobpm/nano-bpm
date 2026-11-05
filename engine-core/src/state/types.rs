@@ -711,6 +711,16 @@ pub struct CompensationWait {
     pub scope: Key,
     /// Handler activity ids still outstanding (one entry per triggered handler).
     pub pending_handlers: Vec<ElementId>,
+    /// The element-instance key of each outstanding handler, positionally
+    /// aligned with `pending_handlers` (#897). This is the handler-instance ->
+    /// throw-instance binding: a completing handler instance is matched against
+    /// these keys, so its completion retires the throw that activated IT — never
+    /// another throw in the same scope waiting on the same handler element id.
+    /// Empty for waits replayed from pre-#897 `CompensationTriggered` records
+    /// (`serde(default)`); such a wait falls back to element-id completion
+    /// matching, exactly the pre-#897 behaviour for that journal.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_handler_keys: Vec<Key>,
 }
 
 /// Runtime state of an active multi-instance body (the element instance carrying

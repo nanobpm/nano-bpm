@@ -160,6 +160,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             scope,
             handlers,
             consumed,
+            handler_instance_keys,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance
@@ -171,6 +172,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                         throw_element_id: throw_element_id.clone(),
                         scope: *scope,
                         pending_handlers: handlers.clone(),
+                        pending_handler_keys: handler_instance_keys.clone(),
                     },
                 );
             }
@@ -182,18 +184,32 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             instance_key,
             throw_element_instance_key,
             handler_element_id,
+            handler_element_instance_key,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 let done = if let Some(wait) = instance
                     .compensation_waits
                     .get_mut(throw_element_instance_key)
                 {
-                    if let Some(pos) = wait
-                        .pending_handlers
-                        .iter()
-                        .position(|h| h == handler_element_id)
-                    {
+                    // #897: match by the handler's element-instance key when the
+                    // wait carries the binding (post-#897 journals); a pre-#897
+                    // replayed wait has no keys and matches by element id only —
+                    // even when the completion event itself carries a key (a
+                    // legacy wait restored and resumed under the current build).
+                    let pos = match handler_element_instance_key {
+                        Some(key) if !wait.pending_handler_keys.is_empty() => {
+                            wait.pending_handler_keys.iter().position(|k| k == key)
+                        }
+                        _ => wait
+                            .pending_handlers
+                            .iter()
+                            .position(|h| h == handler_element_id),
+                    };
+                    if let Some(pos) = pos {
                         wait.pending_handlers.remove(pos);
+                        if pos < wait.pending_handler_keys.len() {
+                            wait.pending_handler_keys.remove(pos);
+                        }
                     }
                     wait.pending_handlers.is_empty()
                 } else {

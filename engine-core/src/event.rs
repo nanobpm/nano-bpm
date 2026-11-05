@@ -1220,6 +1220,14 @@ pub enum Event {
     /// element-instance keys removed. The throw's token
     /// (`throw_element_instance_key`) rests until every triggered handler
     /// completes.
+    ///
+    /// `handler_instance_keys` (#897) is the element-instance key minted for each
+    /// activated handler, positionally aligned with `handlers`: it binds every
+    /// pending handler to the throw that activated it, so a handler's completion
+    /// routes back to ITS throw — never to another throw in the same scope that
+    /// happens to wait on the same handler element id (the `element_id` + `min()`
+    /// misattribution). Additive: `serde(default)` decodes pre-#897 records with
+    /// an empty list, and the reducer falls back to id-only waits for them.
     CompensationTriggered {
         instance_key: Key,
         throw_element_instance_key: Key,
@@ -1227,14 +1235,24 @@ pub enum Event {
         scope: Key,
         handlers: Vec<ElementId>,
         consumed: Vec<Key>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        handler_instance_keys: Vec<Key>,
     },
     /// One compensation handler triggered by a compensation throw event
     /// completed. Removes the handler from the throw's outstanding set; when it
     /// empties the throw event completes and routes onward.
+    ///
+    /// `handler_element_instance_key` (#897) is the completing handler's element
+    /// instance key: the reducer matches the outstanding entry by instance key
+    /// (not merely by element id), so two throws in one scope waiting on the same
+    /// handler element id can never consume each other's completions. `None` only
+    /// on pre-#897 replay paths that route by element id.
     CompensationHandlerCompleted {
         instance_key: Key,
         throw_element_instance_key: Key,
         handler_element_id: ElementId,
+        #[cfg_attr(feature = "serde", serde(default))]
+        handler_element_instance_key: Option<Key>,
     },
     /// A sub-process scope was torn down (by a scoped terminate end or an
     /// interrupting boundary), so the compensation state scoped to it must be
@@ -1876,10 +1894,11 @@ impl Event {
                 throw_element_instance_key,
                 scope,
                 consumed,
+                handler_instance_keys,
                 ..
             } => {
                 m = m.max(*throw_element_instance_key).max(*scope);
-                for key in consumed {
+                for key in consumed.iter().chain(handler_instance_keys) {
                     m = m.max(*key);
                 }
             }

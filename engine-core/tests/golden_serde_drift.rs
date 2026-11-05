@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 
 use nanobpmn_engine_core::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, Engine, EngineSnapshot, Event,
-    MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
+    IoMapping, Mapping, MigratedChildInstance, MigratedElementInstance, MigratedSubscription,
     MigratedSubscriptionTrigger, MoveInstruction, MoveSource, ProcessBuilder, ProcessDefinition,
     SubscriptionMigrationAction, Value, VariableInstruction, SNAPSHOT_FORMAT_VERSION,
 };
@@ -417,6 +417,54 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
         );
     }
 
+    // Compensation witness (#897): a compensable activity whose throw has fired
+    // and is parked on its handler — which rests on an IO-mapping incident, so
+    // the wait (with `pending_handler_keys`, the handler-instance ->
+    // throw-instance binding) is live in the snapshot and the journal pins the
+    // `CompensationTriggered` `handler_instance_keys` frame: the exact shapes
+    // #897 made additive, so a later field/tag change to them cannot slip past
+    // the drift guard. The handler parks WITHOUT a job (its job is never
+    // created behind the activation incident), and `book` is a pass-through
+    // task (no job either), keeping the one-job-per-instance determinism
+    // contract (`jobs_by_instance` is a `HashSet`; a job's serialized order in
+    // a two-job instance would be nondeterministic).
+    let trip: ProcessDefinition = ProcessBuilder::new("trip")
+        .start_event("s")
+        .task("book")
+        .compensation_boundary_event("book-comp", "book", "cancel")
+        .service_task("cancel", "cancel-job")
+        .with_io(
+            "cancel",
+            IoMapping {
+                inputs: vec![Mapping {
+                    source: "= missing_var".to_string(),
+                    target: "mapped".to_string(),
+                }],
+                outputs: vec![],
+            },
+        )
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("s", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .build()
+        .expect("build trip process");
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(trip), T0 + 10)
+            .expect("deploy trip"),
+    );
+    // Creating the instance drives `book` (pass-through) to completion, which
+    // records its compensation subscription and fires the throw; the handler
+    // activates and parks on its input-mapping incident, leaving the throw's
+    // wait live. No job is ever created on this instance.
+    journal.extend(
+        engine
+            .apply_command_at(Command::create_instance("trip"), T0 + 11)
+            .expect("create trip instance"),
+    );
+
     // Decision-evaluation witnesses (#1292): pin `DecisionEvaluated` (its
     // `decision_evaluation_key`, `failure`, and each evaluated decision's
     // `decision_key`/`decision_version`) across a successful businessRuleTask,
@@ -724,11 +772,54 @@ fn pre_1374_migrated_record_decodes_with_defaults() {
     );
 }
 
+/// The #897 additive fields default when absent: pre-#897 `CompensationTriggered`
+/// / `CompensationHandlerCompleted` records (no handler-instance keys) still
+/// decode — the property that lets this change skip a `SNAPSHOT_FORMAT_VERSION`
+/// bump — and the decoded wait binding is empty, so replay falls back to the
+/// historical element-id matching for that journal.
+#[test]
+fn pre_897_compensation_records_decode_with_defaults() {
+    let old_trigger = r#"{"CompensationTriggered":{"instance_key":1,"throw_element_instance_key":2,"throw_element_id":"throw","scope":0,"handlers":["cancel"],"consumed":[3]}}"#;
+    let decoded = nanobpmn_engine_core::decode_event_json(old_trigger).expect("decode old trigger");
+    assert_eq!(
+        decoded,
+        Event::CompensationTriggered {
+            instance_key: 1,
+            throw_element_instance_key: 2,
+            throw_element_id: "throw".to_string(),
+            scope: 0,
+            handlers: vec!["cancel".to_string()],
+            consumed: vec![3],
+            handler_instance_keys: vec![],
+        }
+    );
+    let old_completed = r#"{"CompensationHandlerCompleted":{"instance_key":1,"throw_element_instance_key":2,"handler_element_id":"cancel"}}"#;
+    let decoded =
+        nanobpmn_engine_core::decode_event_json(old_completed).expect("decode old completion");
+    assert_eq!(
+        decoded,
+        Event::CompensationHandlerCompleted {
+            instance_key: 1,
+            throw_element_instance_key: 2,
+            handler_element_id: "cancel".to_string(),
+            handler_element_instance_key: None,
+        }
+    );
+}
+
 /// Guards the `EngineSnapshot` / `State` serialized shape against silent drift.
 #[test]
 fn engine_snapshot_shape_is_pinned_to_version() {
     let (snapshot, _journal) = build_golden_corpus();
     let actual = canonical_json(&snapshot);
+    if std::env::var_os("UPDATE_GOLDEN").is_none() {
+        let expected =
+            std::fs::read_to_string(golden_path(&snapshot_golden_name())).unwrap_or_default();
+        if expected != actual {
+            std::fs::write("/tmp/snap_actual.json", &actual).unwrap();
+            std::fs::write("/tmp/snap_expected.json", &expected).unwrap();
+        }
+    }
     assert_or_update_golden(&snapshot_golden_name(), &actual);
 }
 
