@@ -2024,3 +2024,97 @@ fn staged_root_write_does_not_override_nearer_local_in_boundary_preflight() {
         .expect("the boundary reads outer's local `k`, not the root write");
     assert_eq!(inner_subscription_keys(&engine, inst), vec!["local"]);
 }
+
+/// An earlier instruction's write to an EXISTING scope instance is visible
+/// only on that instance's lineage. With two running `outer` instances, a
+/// write to `outer` A must not satisfy the boundary of an `inner` created
+/// under `outer` B — B's own `k` is null, so application would fail arming
+/// after A's write already landed. Preflight must reject the whole command
+/// (#1398 review).
+#[test]
+fn staged_write_to_one_existing_scope_instance_is_invisible_to_a_sibling_instance() {
+    let mut engine = Engine::new();
+    let inst = start(
+        &mut engine,
+        nested_boundary_def(),
+        vars(&[("withLocal", Value::Bool(false))]),
+    );
+    engine
+        .apply_command(modify(inst, vec![under("wait", inst)]))
+        .unwrap();
+    let outers = eiks(&engine, inst, "outer");
+    assert_eq!(outers.len(), 2, "two running outer instances");
+    let mut write_a = under("b", outers[0]);
+    write_a.variable_instructions = vec![VariableInstruction {
+        variables: vars(&[("k", Value::Str("o-1".into()))]),
+        scope_id: Some("outer".into()),
+    }];
+    let result = engine.apply_command(modify(inst, vec![write_a, under("b", outers[1])]));
+    let err = result.expect_err("outer B's boundary key is still null");
+    assert!(
+        format!("{err:?}").contains("Expected to subscribe to catch event(s) of 'inner'"),
+        "{err:?}"
+    );
+    assert!(eiks(&engine, inst, "inner").is_empty(), "nothing applied");
+    assert!(inner_subscription_keys(&engine, inst).is_empty());
+}
+
+/// Created-scope locals shadow EXISTING ancestor locals: `outer` (existing)
+/// holds an unusable map `k`; the first instruction creates `middle` with a
+/// local `k = "ready"`; the second creates `inner` under that reused `middle`.
+/// `inner`'s boundary reads `middle`'s `k`, so the command is valid
+/// (#1398 review).
+#[test]
+fn created_scope_local_shadows_existing_ancestor_local_in_preflight() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+      <bpmn:message id="msg" name="cancel"><bpmn:extensionElements><zeebe:subscription correlationKey="=k" /></bpmn:extensionElements></bpmn:message>
+      <bpmn:process id="shadow" isExecutable="true">
+        <bpmn:startEvent id="start" />
+        <bpmn:subProcess id="outer">
+          <bpmn:extensionElements><zeebe:ioMapping><zeebe:input source="={a: 1}" target="k" /></zeebe:ioMapping></bpmn:extensionElements>
+          <bpmn:startEvent id="os" />
+          <bpmn:serviceTask id="wait"><bpmn:extensionElements><zeebe:taskDefinition type="w" /></bpmn:extensionElements></bpmn:serviceTask>
+          <bpmn:subProcess id="middle">
+            <bpmn:startEvent id="ms" />
+            <bpmn:serviceTask id="m"><bpmn:extensionElements><zeebe:taskDefinition type="jm" /></bpmn:extensionElements></bpmn:serviceTask>
+            <bpmn:subProcess id="inner">
+              <bpmn:startEvent id="is" />
+              <bpmn:serviceTask id="b"><bpmn:extensionElements><zeebe:taskDefinition type="jb" /></bpmn:extensionElements></bpmn:serviceTask>
+              <bpmn:sequenceFlow id="i1" sourceRef="is" targetRef="b" />
+            </bpmn:subProcess>
+            <bpmn:boundaryEvent id="mb" attachedToRef="inner"><bpmn:messageEventDefinition messageRef="msg" /></bpmn:boundaryEvent>
+            <bpmn:endEvent id="late" />
+            <bpmn:sequenceFlow id="m1" sourceRef="ms" targetRef="m" />
+            <bpmn:sequenceFlow id="m2" sourceRef="mb" targetRef="late" />
+          </bpmn:subProcess>
+          <bpmn:sequenceFlow id="o1" sourceRef="os" targetRef="wait" />
+        </bpmn:subProcess>
+        <bpmn:endEvent id="end" />
+        <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="outer" />
+        <bpmn:sequenceFlow id="f2" sourceRef="outer" targetRef="end" />
+      </bpmn:process></bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    let inst = start(&mut engine, def, HashMap::new());
+    engine
+        .apply_command(modify(
+            inst,
+            vec![
+                ActivateElementInstruction {
+                    element_id: "m".into(),
+                    variable_instructions: vec![VariableInstruction {
+                        variables: vars(&[("k", Value::Str("ready".into()))]),
+                        scope_id: Some("middle".into()),
+                    }],
+                    ..Default::default()
+                },
+                ActivateElementInstruction {
+                    element_id: "b".into(),
+                    ..Default::default()
+                },
+            ],
+        ))
+        .expect("inner's boundary reads middle's local `k`");
+    assert_eq!(eiks(&engine, inst, "middle").len(), 1, "middle is shared");
+    assert_eq!(inner_subscription_keys(&engine, inst), vec!["ready"]);
+}
