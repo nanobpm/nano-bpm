@@ -1398,10 +1398,17 @@ fn masked_residuals(
 ) -> Vec<String> {
     let mut errors = Vec::new();
     for entry in allowlist["entries"].as_array().expect("allowlist.entries") {
-        let Some(ignore) = entry["ignoreRecords"].as_array() else {
-            continue;
-        };
         let scenario = entry["scenario"].as_str().unwrap_or_default();
+        let ignore = match entry.get("ignoreRecords") {
+            None => continue,
+            Some(J::Array(ignore)) => ignore,
+            Some(_) => {
+                errors.push(format!(
+                    "allow-list entry `{scenario}`: ignoreRecords must be an array of matchers"
+                ));
+                continue;
+            }
+        };
         if ignore
             .iter()
             .any(|m| m.as_object().is_none_or(|o| o.is_empty()))
@@ -1411,13 +1418,21 @@ fn masked_residuals(
             ));
             continue;
         }
-        if let Some((golden, Some(nano))) = traces.get(scenario) {
-            if let Some(d) = diff(&mask_records(golden, ignore), &mask_records(nano, ignore)) {
-                errors.push(format!(
-                    "scenario `{scenario}` diverges from Zeebe beyond its allow-listed \
-                     ignoreRecords:\n{d}"
-                ));
+        match traces.get(scenario) {
+            Some((golden, Some(nano))) => {
+                if let Some(d) = diff(&mask_records(golden, ignore), &mask_records(nano, ignore)) {
+                    errors.push(format!(
+                        "scenario `{scenario}` diverges from Zeebe beyond its allow-listed \
+                         ignoreRecords:\n{d}"
+                    ));
+                }
             }
+            // Record masking only narrows a divergence in a successfully
+            // replayed trace; it never exempts a scenario nano could not run.
+            _ => errors.push(format!(
+                "scenario `{scenario}` has ignoreRecords but no nano trace to compare \
+                 (replay failed, rejection mismatch, or unknown scenario)"
+            )),
         }
     }
     errors
@@ -1949,6 +1964,13 @@ fn ignore_records_masks_only_the_matched_records() {
     assert!(err[0].contains("beyond its allow-listed"), "{err:?}");
     let err = masked_residuals(&entry(json!([{}])), &traces);
     assert!(err[0].contains("non-empty object"), "{err:?}");
+    // A present-but-malformed mask must not widen into a whole-scenario exemption.
+    let err = masked_residuals(&entry(json!({"valueType": "JOB"})), &traces);
+    assert!(err[0].contains("must be an array"), "{err:?}");
+    // Masking never exempts a scenario nano failed to replay.
+    let failed = BTreeMap::from([(sc.name.clone(), (golden, None))]);
+    let err = masked_residuals(&entry(json!([{"valueType": "JOB"}])), &failed);
+    assert!(err[0].contains("no nano trace"), "{err:?}");
 }
 
 /// Editing a script's `expectRejection` without recapturing must fail the

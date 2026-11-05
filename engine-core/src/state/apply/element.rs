@@ -174,10 +174,14 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 {
                     // #897: match by the handler's element-instance key when the
                     // wait carries the binding (post-#897 journals); a pre-#897
-                    // replayed wait has no keys and matches by element id only.
+                    // replayed wait has no keys and matches by element id only —
+                    // even when the completion event itself carries a key (a
+                    // legacy wait restored and resumed under the current build).
                     let pos = match handler_element_instance_key {
-                        Some(key) => wait.pending_handler_keys.iter().position(|k| k == key),
-                        None => wait
+                        Some(key) if !wait.pending_handler_keys.is_empty() => {
+                            wait.pending_handler_keys.iter().position(|k| k == key)
+                        }
+                        _ => wait
                             .pending_handlers
                             .iter()
                             .position(|h| h == handler_element_id),

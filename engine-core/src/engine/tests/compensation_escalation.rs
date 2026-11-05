@@ -1014,3 +1014,61 @@ fn xml_declared_escalation_boundary_end_listener_fires_end_to_end() {
     );
     let _ = inst;
 }
+
+/// A compensation wait restored from a pre-#897 snapshot/journal carries no
+/// `pending_handler_keys`. Its handlers, completing under the current build,
+/// still emit a keyed `CompensationHandlerCompleted`; the reducer must fall back
+/// to element-id matching for such an unbound wait, or the throw stays blocked
+/// forever after every handler has finished.
+#[test]
+fn legacy_unbound_wait_completes_when_its_handlers_finish() {
+    let def = ProcessBuilder::new("comp-legacy")
+        .start_event("s")
+        .service_task("bookA", "book-job")
+        .compensation_boundary_event("compA", "bookA", "cancelA")
+        .service_task("bookB", "book-job")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .service_task("cancelA", "cancel-job")
+        .service_task("cancelB", "cancel-job")
+        .connect("s", "bookA")
+        .connect("bookA", "bookB")
+        .connect("bookB", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-legacy"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    for _ in 0..2 {
+        let job = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+        engine.apply_command(Command::complete_job(job)).unwrap();
+    }
+    // Simulate the pre-#897 restored shape: the wait has no handler bindings.
+    let instance = engine.state.instances.get_mut(&instance_key).unwrap();
+    assert_eq!(instance.compensation_waits.len(), 1);
+    for wait in instance.compensation_waits.values_mut() {
+        assert_eq!(wait.pending_handlers.len(), 2);
+        wait.pending_handler_keys.clear();
+    }
+    let cancel_jobs = engine.activate_jobs("cancel-job", "w", 2, 60_000, 0);
+    assert_eq!(cancel_jobs.len(), 2);
+    for job in cancel_jobs {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .is_empty(),
+        "the legacy wait drains once both handlers complete"
+    );
+    assert!(engine.is_completed(instance_key));
+}
