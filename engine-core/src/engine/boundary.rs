@@ -756,12 +756,19 @@ impl Engine {
                 interrupting,
                 ..
             } => {
-                let (due_at, _) = self.resolve_timer(
-                    host_vars,
-                    boundary.timer.as_ref(),
-                    self.now,
-                    *duration_millis,
-                )?;
+                let (due_at, _) = self
+                    .resolve_timer(
+                        host_vars,
+                        boundary.timer.as_ref(),
+                        self.now,
+                        *duration_millis,
+                    )
+                    // Tag the failure with the boundary's id so the incident the
+                    // host raises can carry a boundary-scoped retry (re-arm only
+                    // this timer) instead of a whole-activation re-drive that
+                    // would duplicate the host's already-live job and other
+                    // subscriptions (#1398 review).
+                    .map_err(|f| f.with_boundary_timer(&boundary.id))?;
                 let timer_key = self.mint_key();
                 let boundary_element_id = boundary.id.clone();
                 let kind = if *interrupting {

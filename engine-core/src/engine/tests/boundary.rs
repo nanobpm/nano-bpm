@@ -447,6 +447,7 @@ fn interrupting_boundary_on_a_multi_instance_service_task_tears_down_the_whole_l
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -533,6 +534,7 @@ fn interrupting_boundary_on_a_multi_instance_subprocess_tears_down_every_child_s
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -633,6 +635,7 @@ fn interrupting_boundary_on_a_multi_instance_call_activity_cancels_every_child_i
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -732,6 +735,7 @@ fn normal_multi_instance_completion_disarms_the_body_boundary() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

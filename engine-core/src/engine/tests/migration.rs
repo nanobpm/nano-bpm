@@ -1065,6 +1065,7 @@ fn migration_rejects_active_multi_instance_body() {
                 output_collection: Some("results".to_string()),
                 output_element: Some("=item * 2".to_string()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

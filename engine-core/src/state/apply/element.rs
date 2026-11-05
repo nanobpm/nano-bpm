@@ -298,6 +298,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             output_collection,
             output_element,
             completion_condition,
+            cancel_remaining_instances,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 let total = items.len();
@@ -310,13 +311,30 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                         output_collection: output_collection.clone(),
                         output_element: output_element.clone(),
                         completion_condition: completion_condition.clone(),
+                        cancel_remaining_instances: *cancel_remaining_instances,
                         input_element: input_element.clone(),
                         spawned: 0,
                         active: std::collections::BTreeSet::new(),
                         child_indices: std::collections::BTreeMap::new(),
                         output_values: vec![None; total],
+                        completion_condition_fulfilled: false,
                     },
                 );
+            }
+        }
+
+        // The declared completion condition fired with
+        // `cancelRemainingInstances=false`: latch the fulfilment so the body
+        // stops re-evaluating the condition and completes once its outstanding
+        // children drain.
+        Event::MultiInstanceCompletionConditionFulfilled {
+            instance_key,
+            body_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                if let Some(mi) = instance.multi_instances.get_mut(body_key) {
+                    mi.completion_condition_fulfilled = true;
+                }
             }
         }
 

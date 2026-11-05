@@ -53,6 +53,12 @@ impl ErrorType {
 pub(crate) struct Failure {
     pub(crate) error_type: ErrorType,
     pub(crate) message: String,
+    /// Set when the failure came from arming a TIMER boundary event: the
+    /// boundary's element id. The engine uses it to give the incident a
+    /// boundary-scoped retry (re-arm only that timer) instead of a whole-body
+    /// re-drive that would duplicate the host's already-live job and other
+    /// subscriptions (#1398 review).
+    pub(crate) boundary_timer: Option<String>,
 }
 
 impl Failure {
@@ -60,7 +66,15 @@ impl Failure {
         Failure {
             error_type: ErrorType::ExtractValueError,
             message: message.into(),
+            boundary_timer: None,
         }
+    }
+
+    /// This failure, marked as raised while arming the timer of boundary event
+    /// `boundary_element_id` (see [`Self::boundary_timer`]).
+    pub(crate) fn with_boundary_timer(mut self, boundary_element_id: &str) -> Self {
+        self.boundary_timer = Some(boundary_element_id.to_string());
+        self
     }
 }
 

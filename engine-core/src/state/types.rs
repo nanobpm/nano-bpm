@@ -388,6 +388,13 @@ pub fn default_job_priority() -> i32 {
     DEFAULT_JOB_PRIORITY
 }
 
+/// serde default for `true`-by-default boolean fields (BPMN
+/// `cancelRemainingInstances`) on records serialized before the field existed.
+#[cfg(feature = "serde")]
+pub fn default_true() -> bool {
+    true
+}
+
 /// The ordering position of an activatable job in the per-type index: highest
 /// priority first (stored negated so a `BTreeSet`'s ascending order yields it
 /// first), then lowest key (oldest-first — keys are monotonic with creation
@@ -754,6 +761,14 @@ pub struct MultiInstanceState {
     pub output_element: Option<String>,
     /// FEEL boolean evaluated after each child; `true` completes the body early.
     pub completion_condition: Option<String>,
+    /// The BPMN `cancelRemainingInstances` attribute (default `true`), resolved
+    /// at parse and carried by [`crate::Event::MultiInstanceActivated`]: whether
+    /// a fired completion condition cancels the children still running (`true`)
+    /// or latches and defers the body's completion until they drain (`false`).
+    /// Additive with a serde default of `true` — a body recorded before this
+    /// field existed completes exactly as the pre-field engine did.
+    #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+    pub cancel_remaining_instances: bool,
     /// Local variable name each item binds to in its child scope.
     pub input_element: Option<String>,
     /// How many children have been spawned so far (drives sequential's next
@@ -771,6 +786,16 @@ pub struct MultiInstanceState {
     pub child_indices: std::collections::BTreeMap<Key, usize>,
     /// Collected per-child output, positioned by the child's 0-based index.
     pub output_values: Vec<Option<Value>>,
+    /// Latched once the `<completionCondition>` evaluated `true` with
+    /// `cancelRemainingInstances=false`: the loop stops evaluating the condition
+    /// and the body completes once its outstanding children drain, even if a
+    /// variable the condition reads later changes (or becomes unreadable) — a
+    /// satisfied condition is not reneged (Zeebe
+    /// `ElementInstance#isCompletionConditionFulfilled`, mirrored from the ad-hoc
+    /// container's latch). Additive with a serde default: a body recorded before
+    /// this field existed has no latched fulfilment.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub completion_condition_fulfilled: bool,
 }
 
 /// Runtime state of an active ad-hoc sub-process container (ADR 0023 seam 2).
@@ -990,6 +1015,55 @@ pub enum IoMappingRedrive {
         user_task_key: Key,
         event_type: crate::model::TaskListenerEventType,
         listener_index: usize,
+    },
+    /// An activation-time **behaviour** expression failed AFTER the element's
+    /// input mappings and `start` execution listeners already succeeded (a job
+    /// type/retries, user-task assignee/candidate/date, boundary or catch-event
+    /// trigger expression, ad-hoc active-elements collection — #1398 review):
+    /// resolution re-runs ONLY the activation body (the behaviour), never the
+    /// already-applied input mappings (which may be non-idempotent, e.g.
+    /// `=counter + 1 -> counter`) or the already-run start listeners (Zeebe
+    /// retries the failed behaviour, not the whole activation). Distinct from
+    /// [`Self::Activation`], which re-applies inputs because THEY failed.
+    /// Additive brand-new variant — old journals never carry it.
+    ActivationBody,
+    /// Like [`Self::ActivationBody`], but the failure happened BEFORE the
+    /// element reached `ACTIVATED` (a job-property expression failing in a fresh
+    /// activation, Zeebe `JobWorkerTaskProcessor.onActivate` failing before
+    /// `transitionToActivated`): the successful body re-run emits
+    /// `ElementActivated` first. Distinct from [`Self::ActivationPending`],
+    /// which re-applies the input mappings (they are what failed there); here
+    /// the inputs already succeeded, so only the behaviour re-runs. Additive
+    /// brand-new variant — old journals never carry it.
+    ActivationBodyPending,
+    /// A **timer boundary event**'s expression failed while its host's other
+    /// subscriptions were being armed (#1398 review): the host's job and any
+    /// already-armed boundaries stay live, so a full activation re-drive would
+    /// duplicate the host job and re-arm unrelated boundaries. Resolution
+    /// re-arms ONLY this boundary's timer, re-evaluating its expression against
+    /// the host's scope with `base` as the scheduling base (the host's flow
+    /// scope — the same view `Engine::arm_boundary_events` evaluates against).
+    /// Additive brand-new variant — old journals never carry it.
+    BoundaryTimer {
+        /// Id of the boundary event whose timer is re-armed on resolution.
+        boundary_element_id: ElementId,
+        /// Scope the boundary's expression evaluates against (the host's flow
+        /// scope), captured so the retry sees the same view arming did.
+        base: Key,
+    },
+    /// A multi-instance **child**'s completion failed (its `outputElement` or
+    /// the body's `completionCondition` raised — #1398 review): resolution
+    /// re-drives the child's completion. `output_overlay` preserves the
+    /// already-projected outputs of a CALL-ACTIVITY child (the callee's
+    /// propagated variables plus the activity's applied `zeebe:output` mappings)
+    /// — the callee process instance that produced them is gone by resolution
+    /// time, so without them the retry would collect `null` or fail again.
+    /// `None` for a service-task / sub-process child, whose outputs still live
+    /// in its own scope. Additive brand-new variant — old journals never
+    /// carry it.
+    MiChildCompletion {
+        body_key: Key,
+        output_overlay: Option<HashMap<String, Value>>,
     },
 }
 

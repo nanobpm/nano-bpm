@@ -375,6 +375,34 @@ enum Step {
         /// re-drives the full activation body.
         resume_listener_at: Option<usize>,
     },
+    /// Re-arm ONLY the timer of one boundary event whose expression failed while
+    /// its host was activating ([`state::IoMappingRedrive::BoundaryTimer`],
+    /// #1398 review): the host's job and its other boundary subscriptions stay
+    /// live, so a full activation re-drive would duplicate them. The boundary's
+    /// expression re-evaluates against the host's flow-scope view.
+    RetryBoundaryTimer {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        /// Id of the boundary event whose timer is re-armed.
+        boundary_element_id: String,
+        /// Scope the boundary expression evaluates against (the host's flow
+        /// scope — the same view the failed arming used).
+        base: Key,
+    },
+    /// Re-drive the completion of an already-activated multi-instance child
+    /// whose `outputElement` / the body's `completionCondition` raised
+    /// ([`state::IoMappingRedrive::MiChildCompletion`], #1398 review).
+    /// `output_overlay` carries the preserved, already-projected outputs of a
+    /// call-activity child so the retry collects its real result instead of
+    /// re-deriving (and losing) it.
+    RetryMiChildCompletion {
+        instance_key: Key,
+        element_id: String,
+        body_key: Key,
+        child_key: Key,
+        output_overlay: Option<HashMap<String, Value>>,
+    },
     /// Run the activation body of an element a process-instance modification
     /// already activated and seeded with element-local variables (Zeebe sets a
     /// modification's element-scoped variables BEFORE the element activates).
@@ -2370,6 +2398,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Assigning,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -2418,6 +2447,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Assigning,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -2484,6 +2514,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Updating,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -2543,6 +2574,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Completing,
                         pending,
                         &first,
+                        None,
                     ) {
                         self.emit(&mut log, event);
                     }
@@ -3232,6 +3264,8 @@ impl Engine {
                             Some(
                                 state::IoMappingRedrive::Activation
                                     | state::IoMappingRedrive::ActivationPending
+                                    | state::IoMappingRedrive::ActivationBody
+                                    | state::IoMappingRedrive::ActivationBodyPending
                             )
                         ) {
                             // An activation-time expression (job type/retries)
@@ -3239,7 +3273,14 @@ impl Engine {
                             // `JobWorkerTaskProcessor.onActivate`): the element is
                             // ACTIVATED with no job and no boundary subscriptions.
                             // Re-run the activation body, as Zeebe retries
-                            // `onActivate` on resolve.
+                            // `onActivate` on resolve. `ActivationBody` /
+                            // `ActivationBodyPending` (#1398 review) are the
+                            // body-only re-drive, raised when the element's inputs
+                            // and start listeners already succeeded — they must
+                            // NOT be re-applied (a non-idempotent input mapping
+                            // would compound, a completed start listener would run
+                            // twice). The `*Pending` forms emit `ElementActivated`
+                            // first (the failure parked the token in ACTIVATING).
                             queue.push_back(Step::RerunActivationBody {
                                 instance_key,
                                 element_instance_key,
@@ -3247,7 +3288,44 @@ impl Engine {
                                 pending: matches!(
                                     redrive,
                                     Some(state::IoMappingRedrive::ActivationPending)
+                                        | Some(state::IoMappingRedrive::ActivationBodyPending)
                                 ),
+                            });
+                        } else if let Some(state::IoMappingRedrive::BoundaryTimer {
+                            boundary_element_id,
+                            base,
+                        }) = redrive
+                        {
+                            // A timer boundary's expression failed while the host
+                            // was activating (#1398 review): the host's job and
+                            // other subscriptions stay live, so re-arm ONLY that
+                            // boundary's timer — a full activation re-drive would
+                            // duplicate the host job and re-arm the unrelated
+                            // boundaries.
+                            queue.push_back(Step::RetryBoundaryTimer {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                boundary_element_id,
+                                base,
+                            });
+                        } else if let Some(state::IoMappingRedrive::MiChildCompletion {
+                            body_key,
+                            output_overlay,
+                        }) = redrive
+                        {
+                            // An MI child's completion failed (outputElement /
+                            // completionCondition, #1398 review): re-drive the
+                            // child's completion, reusing the preserved
+                            // already-projected call-activity outputs (a
+                            // call-activity child's callee is gone by resolution
+                            // time — re-deriving them would collect `null`).
+                            queue.push_back(Step::RetryMiChildCompletion {
+                                instance_key,
+                                element_id,
+                                body_key,
+                                child_key: element_instance_key,
+                                output_overlay,
                             });
                         } else if let Some(
                             state::IoMappingRedrive::MiChildActivation { body_key, index }
@@ -3412,6 +3490,54 @@ impl Engine {
                                     resume_listener_at,
                                 })
                             }
+                            // The activation BODY failed after the element's
+                            // inputs and start listeners already succeeded
+                            // (#1398 review): re-run only the behaviour — never
+                            // the (possibly non-idempotent) input mappings or
+                            // the already-run listeners. The `Pending` form
+                            // emits `ElementActivated` first (the failure
+                            // parked the token in ACTIVATING).
+                            Some(state::IoMappingRedrive::ActivationBody) => {
+                                Some(Step::RerunActivationBody {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    pending: false,
+                                })
+                            }
+                            Some(state::IoMappingRedrive::ActivationBodyPending) => {
+                                Some(Step::RerunActivationBody {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    pending: true,
+                                })
+                            }
+                            // A timer boundary's expression failed while its
+                            // host activated: re-arm only that boundary's timer
+                            // (the host job and other subscriptions stay live).
+                            Some(state::IoMappingRedrive::BoundaryTimer {
+                                boundary_element_id,
+                                base,
+                            }) => Some(Step::RetryBoundaryTimer {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                boundary_element_id,
+                                base,
+                            }),
+                            // An MI child's completion failed: re-drive it,
+                            // reusing the preserved call-activity output overlay.
+                            Some(state::IoMappingRedrive::MiChildCompletion {
+                                body_key,
+                                output_overlay,
+                            }) => Some(Step::RetryMiChildCompletion {
+                                instance_key,
+                                element_id,
+                                body_key,
+                                child_key: element_instance_key,
+                                output_overlay,
+                            }),
                             // Output re-projection. A mainstream leaf element
                             // (service task, etc.) re-drives `Complete`, which
                             // re-evaluates its output mapping against its own
@@ -4164,6 +4290,7 @@ impl Engine {
                             crate::model::TaskListenerEventType::Canceling,
                             pending,
                             &first,
+                            None,
                         ) {
                             self.emit(&mut log, event);
                         }
@@ -5700,6 +5827,11 @@ impl Engine {
                 element_instance_key,
                 ..
             }
+            | Step::RetryBoundaryTimer {
+                instance_key,
+                element_instance_key,
+                ..
+            }
             | Step::ResumeSeededActivation {
                 instance_key,
                 element_instance_key,
@@ -5742,6 +5874,15 @@ impl Engine {
             // (element-instance) and body (owner) keys so the shared checks below
             // apply — reusing the same "did teardown remove it?" logic.
             Step::RetryMiChildActivation {
+                instance_key,
+                body_key,
+                child_key,
+                ..
+            } => (*instance_key, None, Some(*child_key), Some(*body_key)),
+            // An MI child COMPLETION retry re-drives the same already-activated
+            // child against its owning body, so the same pair of teardown checks
+            // applies.
+            Step::RetryMiChildCompletion {
                 instance_key,
                 body_key,
                 child_key,
@@ -5958,6 +6099,9 @@ impl Engine {
                             event_type,
                             index,
                             &listener,
+                            // The resolve-time re-mint reads the applied scope
+                            // (its input writes landed on the first pass).
+                            None,
                         )],
                         Vec::new(),
                     ),
@@ -5995,6 +6139,69 @@ impl Engine {
                     (events, followups)
                 }
             }
+            Step::RetryBoundaryTimer {
+                instance_key,
+                element_instance_key,
+                element_id,
+                boundary_element_id,
+                base,
+            } => {
+                // Re-arm ONLY the failed boundary's timer: the host's job and
+                // its other boundary subscriptions stayed live while the
+                // incident was parked, so nothing else is re-derived. Evaluate
+                // against the host's flow-scope view, exactly as the failed
+                // arming did.
+                let host_vars = self.variables_for_element(instance_key, base);
+                let boundary = self
+                    .process_of_instance(instance_key)
+                    .and_then(|p| p.element(&boundary_element_id))
+                    .cloned();
+                match boundary {
+                    Some(boundary) => {
+                        let key_mark = self.next_local;
+                        match self.arm_boundary(
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                            &host_vars,
+                            &boundary,
+                        ) {
+                            Ok(event) => (event.into_iter().collect(), Vec::new()),
+                            Err(failure) => {
+                                self.next_local = key_mark;
+                                let event = self.expression_incident(
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                    failure,
+                                    Some(state::IoMappingRedrive::BoundaryTimer {
+                                        boundary_element_id,
+                                        base,
+                                    }),
+                                );
+                                (vec![event], Vec::new())
+                            }
+                        }
+                    }
+                    // The boundary vanished from the definition (a migration
+                    // swapped the process while the incident was parked): nothing
+                    // left to arm.
+                    None => (Vec::new(), Vec::new()),
+                }
+            }
+            Step::RetryMiChildCompletion {
+                instance_key,
+                element_id,
+                body_key,
+                child_key,
+                output_overlay,
+            } => self.complete_mi_child(
+                instance_key,
+                child_key,
+                element_id,
+                body_key,
+                output_overlay,
+            ),
             Step::RetryActivation {
                 instance_key,
                 element_instance_key,
@@ -6688,10 +6895,15 @@ impl Engine {
     /// boundary and catch-event triggers, the ad-hoc active-elements
     /// collection) goes through a `Result`; the first failure discards the
     /// planned events, rewinds the keys they consumed, and raises the
-    /// element's incident with an [`state::IoMappingRedrive::Activation`]
+    /// element's incident with an [`state::IoMappingRedrive::ActivationBody`]
     /// redrive (Zeebe: the activation command fails with an
-    /// `EXTRACT_VALUE_ERROR` and resolution re-runs it, #1398). No arm can
-    /// substitute a fallback, because there is no infallible arm to fall into.
+    /// `EXTRACT_VALUE_ERROR` and resolution re-runs it, #1398). The body-only
+    /// redrive — never `Activation` — because this point is only reached once
+    /// the element's input mappings and `start` listeners already succeeded:
+    /// re-applying those on resolution would compound a non-idempotent mapping
+    /// (`=counter + 1 -> counter`) or re-run a completed listener (#1398
+    /// review). No arm can substitute a fallback, because there is no
+    /// infallible arm to fall into.
     fn run_activation_body(
         &mut self,
         instance_key: Key,
@@ -6711,12 +6923,49 @@ impl Engine {
             Ok(planned) => planned,
             Err(failure) => {
                 self.next_local = key_mark;
+                // A TIMER BOUNDARY's failure is the one site whose host's other
+                // effects (its job, already-armed boundaries) were emitted by the
+                // caller BEFORE the body ran — they stay live, so resolution must
+                // re-arm ONLY that boundary's timer, not re-run the whole body
+                // (#1398 review). Every other failure here precedes any live
+                // effect, so the body-only re-drive is exact.
+                //
+                // The body-only redrive is `ActivationBodyPending` (not
+                // `ActivationBody`) when the element has not reached ACTIVATED
+                // yet — a job-property expression failing in a FRESH activation
+                // (Zeebe `JobWorkerTaskProcessor.onActivate` fails before
+                // `transitionToActivated`): the successful re-run then emits
+                // `ElementActivated` first. Once the element IS activated (its
+                // inputs and start listeners already ran), `ActivationBody`
+                // re-runs only the behaviour — never the (possibly
+                // non-idempotent) input mappings or the completed listeners.
+                let body_redrive = if self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.active.contains_key(&element_instance_key))
+                    .unwrap_or(false)
+                {
+                    state::IoMappingRedrive::ActivationBody
+                } else {
+                    state::IoMappingRedrive::ActivationBodyPending
+                };
+                let redrive = failure
+                    .boundary_timer
+                    .as_ref()
+                    .map(
+                        |boundary_element_id| state::IoMappingRedrive::BoundaryTimer {
+                            boundary_element_id: boundary_element_id.clone(),
+                            base: scope,
+                        },
+                    )
+                    .unwrap_or(body_redrive);
                 let event = self.expression_incident(
                     instance_key,
                     element_instance_key,
                     element_id,
                     failure,
-                    Some(state::IoMappingRedrive::Activation),
+                    Some(redrive),
                 );
                 (vec![event], Vec::new())
             }
@@ -6861,12 +7110,38 @@ impl Engine {
                     });
                 }
                 // Arm timers/subscriptions for every attached boundary event.
-                events.extend(self.arm_boundary_events(
+                // A TIMER boundary's expression failure is the one
+                // activation-body failure that does NOT discard the host's job
+                // (#1398 review): the job is already minted above and stays
+                // live, the boundary is simply not armed, and the incident
+                // carries a boundary-scoped `BoundaryTimer` redrive so
+                // resolution re-arms ONLY that timer. Any OTHER boundary
+                // failure (a message/signal name or correlation key) still
+                // fails the whole activation body, as before.
+                match self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                )?);
+                ) {
+                    Ok(armed) => events.extend(armed),
+                    Err(failure) => {
+                        if let Some(boundary_element_id) = failure.boundary_timer.clone() {
+                            events.push(self.expression_incident(
+                                instance_key,
+                                element_instance_key,
+                                element_id.clone(),
+                                failure,
+                                Some(state::IoMappingRedrive::BoundaryTimer {
+                                    boundary_element_id,
+                                    base: scope,
+                                }),
+                            ));
+                        } else {
+                            return Err(failure);
+                        }
+                    }
+                }
             }
             // A user task creates a user task record and parks the token; a
             // CompleteUserTask releases it. The assignment/scheduling/priority
@@ -6951,6 +7226,11 @@ impl Engine {
                         crate::model::TaskListenerEventType::Creating,
                         pending,
                         &first,
+                        // The task's input mappings were staged but not yet
+                        // applied when this chain starts: the first listener's
+                        // `type`/`retries` resolve against the post-input view
+                        // (#1398 review).
+                        Some(&element_vars),
                     ));
                 } else if let Some(initial) = deferred_initial_assignee {
                     // No creating listeners: the task is available at once, so the
@@ -6976,6 +7256,10 @@ impl Engine {
                             crate::model::TaskListenerEventType::Assigning,
                             pending,
                             &first,
+                            // Same staged post-input view as the creating chain
+                            // above (the initial assignee's assigning chain also
+                            // starts before the input writes land).
+                            Some(&element_vars),
                         ));
                     }
                 }
@@ -7379,6 +7663,7 @@ impl Engine {
             output_collection: mi.output_collection.clone(),
             output_element: mi.output_element.clone(),
             completion_condition: mi.completion_condition.clone(),
+            cancel_remaining_instances: mi.cancel_remaining_instances,
         });
 
         // Arm timers/subscriptions for every boundary event attached to the
@@ -7411,14 +7696,26 @@ impl Engine {
             Err(failure) => {
                 // A boundary expression failure fails the body's activation
                 // (#1398): nothing (not even `MultiInstanceActivated`) is kept,
-                // and resolution re-drives the body activation.
+                // and resolution re-drives the body activation. A TIMER
+                // boundary's failure is the exception: the body's
+                // `MultiInstanceActivated` and any already-armed boundaries stay
+                // live, so resolution re-arms ONLY that boundary's timer
+                // (`BoundaryTimer`) rather than re-running the whole fan-out
+                // (#1398 review).
                 self.next_local = key_mark;
+                let redrive = failure.boundary_timer.as_ref().map_or(
+                    state::IoMappingRedrive::MiBodyActivation,
+                    |boundary_element_id| state::IoMappingRedrive::BoundaryTimer {
+                        boundary_element_id: boundary_element_id.clone(),
+                        base: scope,
+                    },
+                );
                 let event = self.expression_incident(
                     instance_key,
                     body_key,
                     element_id,
                     failure,
-                    Some(state::IoMappingRedrive::MiBodyActivation),
+                    Some(redrive),
                 );
                 return (vec![event], Vec::new());
             }
@@ -12150,6 +12447,9 @@ impl Engine {
     /// the deferred transition on the task and mints the first listener's job.
     /// The caller has already checked that `first` exists (the listener-free
     /// path never calls this, keeping listener-free user tasks byte-identical).
+    /// `staged_vars` is the activation's post-input-mapping view, forwarded to
+    /// the first listener's job minting (see
+    /// [`Self::mint_task_listener_job`]); `None` reads the applied scope.
     #[allow(clippy::too_many_arguments)]
     fn start_task_listener_chain(
         &mut self,
@@ -12160,6 +12460,7 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         pending: state::PendingUserTaskTransition,
         first: &crate::model::TaskListener,
+        staged_vars: Option<&HashMap<String, Value>>,
     ) -> Vec<Event> {
         let job_event = self.mint_task_listener_job(
             user_task_key,
@@ -12169,6 +12470,7 @@ impl Engine {
             event_type,
             0,
             first,
+            staged_vars,
         );
         vec![
             Event::UserTaskTransitionDeferred {
@@ -12183,6 +12485,14 @@ impl Engine {
     /// Mints a task-listener job for the listener at `index` of `event_type`'s
     /// chain, resolving its `type`/`retries` FEEL against the user task's scope
     /// — or, when either fails, the user task's incident (#1398).
+    ///
+    /// `staged_vars`, when given, is the post-input-mapping view the task's
+    /// activation staged but has not yet applied to state: the FIRST
+    /// `creating` listener is minted before those writes land, so a listener
+    /// `type` supplied by an input mapping (`type="=listenerType"`) must
+    /// resolve against the staged view rather than the persisted (pre-input)
+    /// scope (#1398 review). Later listeners (and the resolve-time re-mint)
+    /// pass `None` and read the applied scope, which by then holds the inputs.
     #[allow(clippy::too_many_arguments)]
     fn mint_task_listener_job(
         &mut self,
@@ -12193,15 +12503,23 @@ impl Engine {
         event_type: crate::model::TaskListenerEventType,
         index: usize,
         listener: &crate::model::TaskListener,
+        staged_vars: Option<&HashMap<String, Value>>,
     ) -> Event {
-        let listener_vars = self.variables_for_element(instance_key, element_instance_key);
+        let persisted;
+        let listener_vars = match staged_vars {
+            Some(vars) => vars,
+            None => {
+                persisted = self.variables_for_element(instance_key, element_instance_key);
+                &persisted
+            }
+        };
         // Zeebe `BpmnJobBehavior.evaluateJobExpressions` for the listener job:
         // a failed `type` / `retries` is an EXTRACT_VALUE_ERROR incident on the
         // user task, never a job of the literal expression text (#1398).
         let JobProps {
             job_type, retries, ..
         } = match self.resolve_job_props(
-            &listener_vars,
+            listener_vars,
             &listener.job_type,
             listener.retries.as_deref(),
             None,
@@ -12262,6 +12580,9 @@ impl Engine {
                 event_type,
                 next_index,
                 &next,
+                // A subsequent listener mints after the chain's earlier jobs
+                // completed — the task's scope (with its inputs) is applied.
+                None,
             );
             return (vec![job_event], Vec::new());
         }
@@ -12454,6 +12775,7 @@ impl Engine {
                         crate::model::TaskListenerEventType::Assigning,
                         new_pending,
                         &first,
+                        None,
                     ));
                 }
             }
@@ -15346,7 +15668,11 @@ impl RoutingFailure {
 /// incident on the activating element instance, that incident is re-tagged
 /// [`state::IoMappingRedrive::ActivationPending`] (so its resolution emits
 /// `ElementActivated` once the re-run succeeds) and `activated` is withheld;
-/// otherwise `activated` is inserted at `at`.
+/// otherwise `activated` is inserted at `at`. An
+/// [`state::IoMappingRedrive::ActivationBody`] incident (a body-expression
+/// failure after the inputs/listeners succeeded, #1398 review) is likewise
+/// re-tagged [`state::IoMappingRedrive::ActivationBodyPending`] and withholds
+/// `activated` — the body re-run then emits it once it succeeds.
 fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Event> {
     let eik = match &activated {
         Event::ElementActivated {
@@ -15359,13 +15685,28 @@ fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Ev
     for e in &mut events {
         if let Event::IncidentRaised {
             element_instance_key,
-            redrive: Some(redrive @ state::IoMappingRedrive::Activation),
+            redrive: Some(redrive),
             ..
         } = e
         {
             if *element_instance_key == eik {
-                *redrive = state::IoMappingRedrive::ActivationPending;
-                parked = true;
+                match redrive {
+                    state::IoMappingRedrive::Activation => {
+                        *redrive = state::IoMappingRedrive::ActivationPending;
+                        parked = true;
+                    }
+                    state::IoMappingRedrive::ActivationBody => {
+                        *redrive = state::IoMappingRedrive::ActivationBodyPending;
+                        parked = true;
+                    }
+                    // Already pending-tagged (the failure site detected the
+                    // pre-activation state itself): still withhold `activated`.
+                    state::IoMappingRedrive::ActivationPending
+                    | state::IoMappingRedrive::ActivationBodyPending => {
+                        parked = true;
+                    }
+                    _ => {}
+                }
             }
         }
     }

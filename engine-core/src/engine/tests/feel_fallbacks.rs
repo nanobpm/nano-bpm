@@ -746,3 +746,336 @@ fn job_priority_expression_failure_raises_incident() {
     set_and_resolve(&mut engine, inst, &incident, &[("prio", Value::Int(70))]);
     assert_eq!(engine.pending_jobs()[0].priority, 70);
 }
+
+// ---------------------------------------------------------------------------
+// Incident-resolution retry fidelity (#1398 review): a resolved incident
+// re-drives ONLY the failed work — never the already-applied input mappings,
+// the already-run start listeners, the host's live job, or the other boundary
+// subscriptions — and preserves the already-projected call-activity outputs.
+// ---------------------------------------------------------------------------
+
+/// A service task with a non-idempotent input mapping (`=counter + 1 ->
+/// counter`) whose job TYPE expression fails on activation.
+fn task_with_compounding_input_and_bad_job_type() -> ProcessDefinition {
+    parse(
+        r#"<bpmn:process id="nip" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="=jobType" />
+              <zeebe:ioMapping><zeebe:input source="=counter + 1" target="counter" /></zeebe:ioMapping>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+        </bpmn:process>"#,
+    )
+}
+
+#[test]
+fn resolved_activation_body_failure_does_not_reapply_input_mappings() {
+    // The input mapping `=counter + 1 -> counter` applies once (counter 0 -> 1).
+    // The job-type expression then fails. Resolving the incident must re-run
+    // ONLY the behaviour (mint the job) — re-applying the input mapping would
+    // increment `counter` a second time (#1398 review).
+    let (mut engine, inst) = start(
+        task_with_compounding_input_and_bad_job_type(),
+        vars(&[("counter", Value::Int(0))]),
+    );
+    assert!(engine.pending_jobs().is_empty(), "no job yet");
+    let incident = extract_value_incident(&engine, "work", "'=jobType'");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("jobType", Value::Str("work".into()))],
+    );
+    assert_eq!(job_types(&engine), vec!["work".to_string()]);
+    let scope = engine.variables_for_element(inst, engine.pending_jobs()[0].element_instance_key);
+    assert_eq!(
+        scope.get("counter"),
+        Some(&Value::Int(1)),
+        "the input mapping applied exactly once, not again on retry"
+    );
+}
+
+/// A user task with a `creating` listener whose assignee expression fails AFTER
+/// the listener chain drained.
+fn user_task_with_listener_and_bad_assignee() -> ProcessDefinition {
+    parse(
+        r#"<bpmn:process id="utl" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements>
+              <zeebe:userTask />
+              <zeebe:assignmentDefinition assignee="=assignee" />
+              <zeebe:taskListeners>
+                <zeebe:taskListener eventType="creating" type="audit" />
+              </zeebe:taskListeners>
+            </bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="e" />
+        </bpmn:process>"#,
+    )
+}
+
+#[test]
+fn resolved_assignee_failure_does_not_rerun_completed_start_listener() {
+    // The `creating` listener job runs and completes; the assignee expression
+    // then fails. Resolving the incident must NOT run the `creating` listener a
+    // second time (#1398 review).
+    let (mut engine, inst) = start(user_task_with_listener_and_bad_assignee(), HashMap::new());
+    // The creating listener job exists; the assignee failure parks the task.
+    let listener_jobs: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    // The assignee failure happens at activation, before the listener chain
+    // runs — so resolve the assignee FIRST, then drain the listener once.
+    let incident = extract_value_incident(&engine, "review", "'=assignee'");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("assignee", Value::Str("sam".into()))],
+    );
+    // Now the creating listener job is minted exactly once.
+    let jobs = engine.pending_jobs();
+    assert_eq!(
+        jobs.iter().filter(|j| j.job_type == "audit").count(),
+        1,
+        "the creating listener ran exactly once: {listener_jobs:?} -> {jobs:?}"
+    );
+}
+
+#[test]
+fn creating_task_listener_type_reads_staged_input_mapping() {
+    // The first `creating` task listener is minted before the task's input
+    // mappings are applied to state. A listener `type="=listenerType"` supplied
+    // by an input mapping must resolve against the staged post-input view, not
+    // raise an incident (#1398 review).
+    let def = parse(
+        r#"<bpmn:process id="tlm" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements>
+              <zeebe:userTask />
+              <zeebe:ioMapping><zeebe:input source="=&quot;create-audit&quot;" target="listenerType" /></zeebe:ioMapping>
+              <zeebe:taskListeners>
+                <zeebe:taskListener eventType="creating" type="=listenerType" />
+              </zeebe:taskListeners>
+            </bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="e" />
+        </bpmn:process>"#,
+    );
+    let (engine, _inst) = start(def, HashMap::new());
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the mapped listener type resolves, no incident: {:?}",
+        engine.active_incidents()
+    );
+    assert_eq!(job_types(&engine), vec!["create-audit".to_string()]);
+}
+
+/// A service task with a non-interrupting timer boundary whose duration
+/// expression fails.
+fn task_with_failing_boundary_timer() -> ProcessDefinition {
+    parse(
+        r#"<bpmn:process id="nbt" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:boundaryEvent id="ping" attachedToRef="work" cancelActivity="false">
+            <bpmn:timerEventDefinition><bpmn:timeDuration>=d</bpmn:timeDuration></bpmn:timerEventDefinition>
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:endEvent id="eb" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+          <bpmn:sequenceFlow id="f3" sourceRef="ping" targetRef="eb" />
+        </bpmn:process>"#,
+    )
+}
+
+#[test]
+fn resolved_boundary_timer_failure_does_not_duplicate_host_job() {
+    // The host's job is minted; the boundary timer's duration expression fails.
+    // Resolving the incident must re-arm ONLY the timer — a full activation
+    // re-drive would mint a SECOND host job (#1398 review).
+    let (mut engine, inst) = start(task_with_failing_boundary_timer(), HashMap::new());
+    assert_eq!(
+        job_types(&engine),
+        vec!["work".to_string()],
+        "host job lives"
+    );
+    assert!(engine.timers().is_empty(), "no timer armed yet");
+    let incident = extract_value_incident(&engine, "work", "'=d'");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("d", Value::Str("PT1H".into()))],
+    );
+    assert_eq!(
+        job_types(&engine),
+        vec!["work".to_string()],
+        "exactly one host job — the retry did not re-run the activation"
+    );
+    assert_eq!(engine.timers().len(), 1, "the boundary timer is re-armed");
+    assert_eq!(engine.timers()[0].due_at, engine.now + 3_600_000);
+}
+
+#[test]
+fn mi_call_activity_completion_retry_reuses_projected_output_overlay() {
+    // A multi-instance CALL ACTIVITY child whose `outputElement` fails: the
+    // callee's results live in the projected overlay, not the child scope, so a
+    // generic completion retry would collect `null`. The retry must reuse the
+    // preserved overlay (#1398 review).
+    let callee = ProcessBuilder::new("callee")
+        .start_event("cs")
+        .service_task("ct", "callee-work")
+        .end_event("ce")
+        .connect("cs", "ct")
+        .connect("ct", "ce")
+        .build()
+        .unwrap();
+    let def = ProcessBuilder::new("mi-call")
+        .start_event("start")
+        .call_activity("each", "callee")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=result + suffix".to_string()),
+                completion_condition: None,
+                cancel_remaining_instances: true,
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(callee))
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-call",
+            vars(&[("items", Value::List(vec![Value::Int(7)]))]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // Complete the callee's job, producing `result` — the child then fails on
+    // `outputElement = result + suffix` (suffix unset).
+    let jobs = engine.activate_jobs("callee-work", "W", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1);
+    engine
+        .apply_command(Command::complete_job_with_result(
+            jobs[0].key,
+            HashMap::from([("result".to_string(), Value::Int(7))]),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+    let incident = extract_value_incident(&engine, "each", "suffix");
+    // Fix `suffix` and resolve: the retry must collect the callee's real
+    // projected result (7 + 1 = 8), not `null`.
+    set_and_resolve(&mut engine, key, &incident, &[("suffix", Value::Int(1))]);
+    // The body drained and wrote the aggregate; the token advanced to the sink.
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![Value::Int(8)])),
+        "the retry reused the preserved output overlay"
+    );
+    complete_one(&mut engine, "sink-work");
+    assert!(engine.is_completed(key));
+}
+
+#[test]
+fn mi_completion_latch_skips_reevaluation_after_variable_change() {
+    // With `cancelRemainingInstances=false`, a fulfilled completion condition is
+    // latched: a later child completes the drained body WITHOUT re-evaluating
+    // the condition — even after the variable it reads becomes unreadable
+    // (#1398 review).
+    let def = parse(
+        r#"<bpmn:process id="mil" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics isSequential="false" cancelRemainingInstances="false">
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" />
+              </bpmn:extensionElements>
+              <bpmn:completionCondition>=done</bpmn:completionCondition>
+            </bpmn:multiInstanceLoopCharacteristics>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(
+        def,
+        vars(&[
+            ("items", Value::List(vec![Value::Int(1), Value::Int(2)])),
+            ("done", Value::Bool(true)),
+        ]),
+    );
+    // First child completes: the condition fires (done=true) and latches; the
+    // body defers (cancelRemainingInstances=false) with one child still active.
+    // Activate and complete exactly ONE child (a batch-10 `complete_one` would
+    // drain both at once).
+    let first = engine
+        .activate_jobs("work", "test-worker", 1, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("one child job");
+    engine
+        .apply_command(Command::complete_job(first.key))
+        .unwrap();
+    assert!(
+        !engine.is_completed(inst),
+        "the body defers until the remaining child drains"
+    );
+    assert_eq!(engine.pending_jobs().len(), 1, "one child still running");
+    // Make the condition unreadable, then complete the remaining child: the
+    // latched fulfilment must complete the body WITHOUT re-evaluating `=done`.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[("done", Value::Str("not-a-bool".into()))]),
+        ))
+        .unwrap();
+    let second = engine
+        .activate_jobs("work", "test-worker", 1, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("the remaining child job");
+    engine
+        .apply_command(Command::complete_job(second.key))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "the latched condition completes the drained body without re-evaluating"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no incident from re-evaluating the latched condition: {:?}",
+        engine.active_incidents()
+    );
+}

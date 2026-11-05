@@ -74,6 +74,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::CompensationHandlerCompleted { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::MultiInstanceActivated { .. }
+        | Event::MultiInstanceCompletionConditionFulfilled { .. }
         | Event::MultiInstanceChildActivated { .. }
         | Event::MultiInstanceChildCompleted { .. }
         | Event::MultiInstanceCompleted { .. }

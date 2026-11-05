@@ -97,6 +97,7 @@ fn interrupting_boundary_cancels_the_multi_instance_body_start_listener_job() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

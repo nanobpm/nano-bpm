@@ -404,6 +404,16 @@ pub struct MultiInstance {
     /// every child.
     #[cfg_attr(feature = "serde", serde(default))]
     pub completion_condition: Option<String>,
+    /// The BPMN `cancelRemainingInstances` attribute (default `true`). When the
+    /// `<completionCondition>` fires: `true` cancels the children still running
+    /// and completes the body at once; `false` latches the fulfilment and
+    /// completes the body once the outstanding children drain (Zeebe
+    /// `MultiInstanceBodyProcessor` / `isCompletionConditionFulfilled`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "crate::state::types::default_true")
+    )]
+    pub cancel_remaining_instances: bool,
     /// `true` runs children one at a time (each starts only after the previous
     /// completes); `false` (the default) runs them all in parallel.
     #[cfg_attr(feature = "serde", serde(default))]

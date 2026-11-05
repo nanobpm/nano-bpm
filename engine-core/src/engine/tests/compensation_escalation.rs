@@ -476,6 +476,7 @@ fn interrupting_escalation_boundary_on_a_multi_instance_subprocess_clears_the_bo
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -559,6 +560,7 @@ fn non_interrupting_escalation_boundary_on_a_multi_instance_subprocess_arms_at_t
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

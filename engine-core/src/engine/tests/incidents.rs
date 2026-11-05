@@ -271,6 +271,7 @@ fn interrupting_boundary_on_a_multi_instance_body_resolves_a_stale_body_incident
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -357,6 +358,7 @@ fn early_multi_instance_completion_resolves_a_stale_child_root_incident() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: Some("=true".to_string()),
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1546,6 +1548,7 @@ fn multi_instance_body_input_mapping_genuine_failure_raises_incident_and_recover
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1640,6 +1643,7 @@ fn multi_instance_body_output_mapping_genuine_failure_raises_incident_and_recove
                 output_collection: Some("results".to_string()),
                 output_element: Some("=item".to_string()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

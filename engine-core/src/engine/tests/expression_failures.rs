@@ -165,6 +165,7 @@ fn multi_instance_child_job_type_failure_raises_incident_on_the_child() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: true,
             },
         )
@@ -258,6 +259,7 @@ fn multi_instance_child_job_property_resolve_does_not_reapply_inputs() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: true,
             },
         )
