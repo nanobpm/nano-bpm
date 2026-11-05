@@ -12496,6 +12496,33 @@ impl Engine {
                 });
             }
             if !output_updates.is_empty() {
+                // An input-mapped local of the same name would otherwise SHADOW
+                // the projected value for every later (and resumed) end listener:
+                // the outward propagation below never touches the element's own
+                // scope. Mirror the projected value onto any such shadowing local
+                // ONCE, here (the single projection pass), so listeners 1..n and
+                // an incident resume read the output-mapped view without
+                // re-evaluating outputs; later listener writes still land after.
+                let shadowed: HashMap<String, Value> = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.scope_variables.get(&element_instance_key))
+                    .map(|local| {
+                        output_updates
+                            .iter()
+                            .filter(|(k, _)| local.contains_key(*k))
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !shadowed.is_empty() {
+                    events.push(Event::ScopedVariablesUpdated {
+                        instance_key,
+                        scope_key: element_instance_key,
+                        variables: shadowed,
+                    });
+                }
                 // Merge the projection into the enclosing (flow) scope and
                 // upward — the element's own scope is torn down by its
                 // completion, so propagating from the parent avoids writing

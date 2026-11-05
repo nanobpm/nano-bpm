@@ -7509,3 +7509,56 @@ fn terminate_end_output_mapping_failed_retry_does_not_repeat_completing() {
     assert!(drained.contains(&Event::ProcessInstanceCompleted { instance_key }));
     assert!(engine.is_completed(instance_key));
 }
+
+/// #985 / #1430: an output mapping onto a name an input mapping made local must
+/// not be SHADOWED by the stale local for later end listeners (Copilot review).
+#[test]
+fn terminate_end_output_mapping_is_not_shadowed_by_input_local_for_later_listeners() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-shadow" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:input source="=&quot;old&quot;" target="listenerType" />
+              <zeebe:output source="=&quot;new&quot;" target="listenerType" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).expect("parses").remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("term-el-shadow"))
+        .unwrap();
+    let types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["new".to_string()],
+        "listener 0 sees the output view"
+    );
+    complete_one(&mut engine, "new");
+    let types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["new".to_string()],
+        "listener 1 must read the output-mapped value, not the stale input local"
+    );
+}
