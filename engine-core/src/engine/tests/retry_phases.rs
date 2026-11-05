@@ -165,11 +165,40 @@ fn mi_body_start_listener_retry_preserves_body_and_boundaries() {
     );
     let (mut engine, inst) = start(def, items());
     let incident = only_incident(&engine, "each");
-    let before: Vec<(Key, u64)> = engine.timers().iter().map(|t| (t.key, t.due_at)).collect();
+    let timers = |e: &Engine| -> Vec<(Key, u64, state::TimerState)> {
+        e.timers()
+            .iter()
+            .map(|t| (t.key, t.due_at, t.state))
+            .collect()
+    };
+    let before = timers(&engine);
+    assert_eq!(
+        before.len(),
+        1,
+        "exactly one boundary timer armed: {before:?}"
+    );
+    assert_eq!(before[0].2, state::TimerState::Created, "{before:?}");
+    // Change the collection: a re-evaluating retry would yield three children.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[(
+                "items",
+                Value::List(vec![
+                    Value::Str("x".into()),
+                    Value::Str("y".into()),
+                    Value::Str("z".into()),
+                ]),
+            )]),
+        ))
+        .unwrap();
     resolve(&mut engine, inst, &incident, &[]);
     let incident = only_incident(&engine, "each");
-    let after: Vec<(Key, u64)> = engine.timers().iter().map(|t| (t.key, t.due_at)).collect();
-    assert_eq!(before, after, "re-raise must not re-arm boundaries");
+    assert_eq!(
+        before,
+        timers(&engine),
+        "re-raise must not re-arm boundaries"
+    );
     resolve(
         &mut engine,
         inst,
@@ -177,11 +206,11 @@ fn mi_body_start_listener_retry_preserves_body_and_boundaries() {
         &[("lt", Value::Str("audit".into()))],
     );
     assert_eq!(complete_all(&mut engine, "audit", &[]), 1);
-    let after: Vec<(Key, u64)> = engine.timers().iter().map(|t| (t.key, t.due_at)).collect();
-    assert!(after.len() <= 1, "at most one boundary timer: {after:?}");
-    if !before.is_empty() {
-        assert_eq!(before, after, "the original boundary timer survives");
-    }
+    assert_eq!(
+        before,
+        timers(&engine),
+        "the original boundary timer survives, still Created"
+    );
     assert_eq!(
         job_types(&engine),
         vec!["handle".to_string(), "handle".to_string()]
