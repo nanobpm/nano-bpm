@@ -193,6 +193,181 @@ fn collect_vars(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
     }
 }
 
+/// The set of variable names a FEEL expression references from its ENCLOSING
+/// scope — [`referenced_variables`] minus the uses a local binding
+/// (`for`/`some`/`every` clause, context entry, or `function(...)` parameter)
+/// covers.
+///
+/// Used where the question is "does this expression READ a name the surrounding
+/// scope must supply?" rather than "which names appear in it?": a multi-instance
+/// body deciding whether an io-mapping touches a per-child binding must not skip
+/// a self-contained mapping like `=for item in [1,2] return item` merely
+/// because the `inputElement` is also named `item` — that `item` is the loop
+/// variable, not the absent child binding. The binding walk mirrors the
+/// evaluator's scoping exactly: a `for`/`some`/`every` clause name binds from
+/// the NEXT clause onward (its own source list is evaluated outside it), a
+/// context entry key binds from the next entry onward, a `function(...)`
+/// parameter binds over the whole body, and a list filter (`base[predicate]`)
+/// binds `item` over the predicate — plus, for a filter over literal context
+/// elements, each element's entry keys (`=[{price: 1}][price > 0]` binds
+/// `price`). A BARE variable index stays a genuine outer reference only when
+/// the name is already in scope (`orders[item]` with an outer `item` resolves
+/// numerically); out of scope it is a filter and binds `item`
+/// (`=[true, false][item]`). Returns an empty set if the expression
+/// cannot be parsed — the caller then sees no external reference (the
+/// evaluation itself surfaces the parse error).
+pub fn free_variables(expr: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let src = strip_marker(expr);
+    if let Ok(tokens) = lexer::tokenize(src) {
+        if let Ok(node) = parser::parse(tokens) {
+            let mut bound = std::collections::HashSet::new();
+            collect_free_vars(&node, &mut bound, &mut out);
+        }
+    }
+    out
+}
+
+/// Walks a FEEL AST collecting the [`ast::Node::Var`] uses not covered by an
+/// enclosing local binding. `bound` is the set of names in scope at `node`; a
+/// binder extends it for the subexpressions it scopes over (see
+/// [`free_variables`]).
+fn collect_free_vars(
+    node: &ast::Node,
+    bound: &mut std::collections::HashSet<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    use ast::Node;
+    match node {
+        Node::Var(name) => {
+            if !bound.contains(name) {
+                out.insert(name.clone());
+            }
+        }
+        Node::Null | Node::BoolLit(_) | Node::NumLit(..) | Node::StrLit(_) | Node::AtLit(_) => {}
+        Node::Member(base, _) => collect_free_vars(base, bound, out),
+        Node::Index(base, idx) => {
+            collect_free_vars(base, bound, out);
+            // `base[idx]` is a numeric index when `idx` evaluates to a number
+            // in the CURRENT scope, otherwise a boolean filter evaluated per
+            // element (eval_index). eval_node NEVER errors on a Var (an
+            // unknown name yields Null, or the builtin function value), so
+            // the numeric probe fails exactly when `idx` does not evaluate
+            // to a number in the current scope — and the filter frame then
+            // binds `item` to the element under test plus, for a context
+            // element, every entry key of that element. A static walk cannot
+            // know a variable base's elements, so it cannot foresee which
+            // entry names a filter would bind: it settles what it can and
+            // treats the rest as a filter, mirroring the dependency question
+            // this walk answers — with `inputElement="item"` absent at the
+            // body level, skipping the mapping is exactly the tolerated case
+            // for a genuine outer reference, while a self-contained filter
+            // must not skip.
+            match idx.as_ref() {
+                // A literal number is always a numeric index: no filter, no
+                // binding.
+                Node::NumLit(..) => {}
+                // A BARE variable index resolves numerically whenever the
+                // current scope supplies the name, so an IN-SCOPE use
+                // (`orders[item]` with an outer `item`) is a genuine outer
+                // reference and stays free. An OUT-OF-SCOPE bare variable is
+                // never numeric (eval_node yields Null for it), so the
+                // subscript is a filter and binds `item` over it —
+                // `=[true, false][item]` is self-contained.
+                Node::Var(name) => {
+                    if !bound.contains(name) {
+                        let mut inner = bound.clone();
+                        inner.insert("item".to_string());
+                        collect_free_vars(idx, &mut inner, out);
+                    }
+                }
+                // Any other index shape is treated as a filter: bind `item`
+                // over the predicate, plus the entry keys of literal context
+                // elements in the base (`=[{price: 1}][price > 0]` binds
+                // `price`). A variable base's elements are unknowable
+                // statically, so its entry names cannot be settled here.
+                _ => {
+                    let mut inner = bound.clone();
+                    inner.insert("item".to_string());
+                    if let Node::List(items) = base.as_ref() {
+                        for item in items {
+                            if let Node::Context(entries) = item {
+                                inner.extend(entries.iter().map(|(key, _)| key.clone()));
+                            }
+                        }
+                    }
+                    collect_free_vars(idx, &mut inner, out);
+                }
+            }
+        }
+        Node::Neg(inner) | Node::Not(inner) => collect_free_vars(inner, bound, out),
+        Node::Bin(_, l, r) => {
+            collect_free_vars(l, bound, out);
+            collect_free_vars(r, bound, out);
+        }
+        Node::List(items) => items.iter().for_each(|n| collect_free_vars(n, bound, out)),
+        Node::Context(entries) => {
+            // An entry's value is evaluated with the preceding entries in
+            // scope, and its key binds from the NEXT entry onward.
+            let mut inner = bound.clone();
+            for (key, value) in entries {
+                collect_free_vars(value, &mut inner, out);
+                inner.insert(key.clone());
+            }
+        }
+        Node::If(c, t, e) => {
+            collect_free_vars(c, bound, out);
+            collect_free_vars(t, bound, out);
+            collect_free_vars(e, bound, out);
+        }
+        Node::For(clauses, body) | Node::Quant(_, clauses, body) => {
+            // A clause's source list is evaluated with the PRECEDING clause
+            // variables in scope; its own variable binds from the next clause
+            // onward and over the body.
+            let mut inner = bound.clone();
+            for (name, source) in clauses {
+                collect_free_vars(source, &mut inner, out);
+                inner.insert(name.clone());
+            }
+            collect_free_vars(body, &mut inner, out);
+        }
+        Node::Between(a, b, c) => {
+            collect_free_vars(a, bound, out);
+            collect_free_vars(b, bound, out);
+            collect_free_vars(c, bound, out);
+        }
+        Node::In(a, b) => {
+            collect_free_vars(a, bound, out);
+            collect_free_vars(b, bound, out);
+        }
+        Node::InstanceOf(inner, _) => collect_free_vars(inner, bound, out),
+        Node::FuncDef(params, body) => {
+            let mut inner = bound.clone();
+            inner.extend(params.iter().cloned());
+            collect_free_vars(body, &mut inner, out);
+        }
+        Node::Call(callee, args) => {
+            collect_free_vars(callee, bound, out);
+            match args {
+                ast::CallArgs::Positional(ns) => {
+                    ns.iter().for_each(|n| collect_free_vars(n, bound, out))
+                }
+                ast::CallArgs::Named(ns) => ns
+                    .iter()
+                    .for_each(|(_, n)| collect_free_vars(n, bound, out)),
+            }
+        }
+        Node::Range(r) => {
+            if let Some(s) = &r.start {
+                collect_free_vars(s, bound, out);
+            }
+            if let Some(e) = &r.end {
+                collect_free_vars(e, bound, out);
+            }
+        }
+    }
+}
+
 fn evaluate(expr: &str, ctx: &HashMap<String, Value>) -> Result<value::FeelVal, FeelError> {
     let src = strip_marker(expr);
     let tokens = lexer::tokenize(src)?;
@@ -240,6 +415,65 @@ mod tests {
         assert_eq!(vars("=orders[1] > amount"), vec!["amount", "orders"]);
         // Literals reference nothing.
         assert!(vars("=1 > 0").is_empty());
+    }
+
+    #[test]
+    fn free_variables_excludes_locally_bound_uses() {
+        let free = |e: &str| {
+            let mut v: Vec<String> = free_variables(e).into_iter().collect();
+            v.sort();
+            v
+        };
+        // A plain reference is free.
+        assert_eq!(free("=x > 1"), vec!["x"]);
+        // A `for`/`some` clause variable binds over its body and the following
+        // clauses, but not over its own source list.
+        assert!(free("=for item in [1, 2] return item").is_empty());
+        assert_eq!(
+            free("=for item in orders return item.price"),
+            vec!["orders"]
+        );
+        assert_eq!(
+            free("=for a in xs, b in a return b"),
+            vec!["xs"],
+            "a clause source sees the preceding clause variables, not its own"
+        );
+        assert!(free("=some item in [1] satisfies item > 0").is_empty());
+        // A use OUTSIDE the binding is still free.
+        assert_eq!(
+            free("=(for item in [1] return item)[1] + item"),
+            vec!["item"]
+        );
+        // A context entry key binds from the next entry onward.
+        assert!(free("={item: 1, y: item}.y").is_empty());
+        assert_eq!(free("={item: seed}.item"), vec!["seed"]);
+        // A function parameter binds over the body.
+        assert!(free("=function(item) item + 1").is_empty());
+        assert_eq!(free("=function(item) item + k"), vec!["k"]);
+        // A list FILTER (`base[predicate]`) binds `item` to the element under
+        // test over the predicate (eval_index): a predicate whose only use of
+        // the name is that filter-local binding is self-contained.
+        assert!(free("=[1, 2][item > 0]").is_empty());
+        assert_eq!(free("=orders[item.price > limit]"), vec!["limit", "orders"]);
+        // A bare variable index that is NOT in scope is not numeric, so the
+        // subscript is a filter at runtime and binds `item` over it
+        // (eval_index): `=[true, false][item]` is self-contained.
+        assert!(free("=[true, false][item]").is_empty());
+        // The same holds for a list base: with `item` absent the subscript is
+        // a filter, so `orders[item]` reads only the base (probe-verified:
+        // an unbound `item` yields `List([])`, never a numeric index).
+        assert_eq!(free("=orders[item]"), vec!["orders"]);
+        // A filter over context elements also binds each element's entries,
+        // so `=[{price: 1}][price > 0]` reads nothing from the outer scope.
+        assert!(free("=[{price: 1}][price > 0]").is_empty());
+        // A filter over a VARIABLE base cannot settle the elements' entry
+        // names statically (their values are unknowable), so a name colliding
+        // with an entry stays free: with `orders = [{price: …}]` the runtime
+        // binds `price`, but the walk must keep it free — the base alone is
+        // not proof the binding exists.
+        assert_eq!(free("=orders[price > 0]"), vec!["orders", "price"]);
+        // An unparsable expression has no known free reference.
+        assert!(free("=for in").is_empty());
     }
 
     #[test]
@@ -308,11 +542,92 @@ mod tests {
     }
 
     #[test]
-    fn type_errors_are_reported() {
-        let c = ctx(&[("name", Value::Str("ann".into()))]);
-        assert!(eval("name + 1", &c).is_err());
+    fn syntax_errors_are_reported() {
+        let c = ctx(&[]);
         assert!(eval("1 +", &c).is_err());
         assert!(eval("(1 + 2", &c).is_err());
+    }
+
+    /// Defect-class guard for #1392 / #1393 / #1394: an operator applied to
+    /// ill-typed operands is a *suppressed failure* in feel-scala 1.22.1 (the
+    /// version the pinned Zeebe embeds) — the result is `null`, never an
+    /// evaluation error — and a non-boolean `if` condition takes the `else`
+    /// branch. Every expected outcome below was captured from feel-scala 1.22.1
+    /// (`formal/feel-scala/FeelScalaEval.java`), so the table *is* the Zeebe
+    /// oracle for every operator family, not only the fuzzed subset.
+    #[test]
+    fn ill_typed_operators_yield_null_like_feel_scala() {
+        let c = ctx(&[("name", Value::Str("ann".into()))]);
+        let null = Ok(Value::Null);
+        let t = Ok(Value::Bool(true));
+        let f = Ok(Value::Bool(false));
+        let two = Ok(Value::Int(2));
+        let cases: &[(&str, &Result<Value, FeelError>)] = &[
+            // #1392 — arithmetic, unary and comparison type errors → null.
+            ("name + 1", &null),
+            ("1 + true", &null),
+            ("-false", &null),
+            (r#"-"a""#, &null),
+            ("- null", &null),
+            ("not(5)", &null),
+            ("not(5) = 6", &f),
+            (r#""a" * 2"#, &null),
+            (r#"2 ** "a""#, &null),
+            ("2 ** null", &null),
+            (r#""a" - "b""#, &null),
+            (r#"1 / "a""#, &null),
+            ("null + 1", &null),
+            (r#"@"P1D" + 1"#, &null),
+            (r#"date("2020-01-01") + 1"#, &null),
+            (r#"1 < "a""#, &null),
+            ("1 < null", &null),
+            ("null < null", &null),
+            (r#"date("2020-01-01") < 1"#, &null),
+            (r#"1 between "a" and 3"#, &null),
+            ("1 between null and 3", &null),
+            ("null between 1 and 2", &null),
+            (r#""a" in (2..5)"#, &null),
+            (r#"1 in "a""#, &null),
+            ("(1 + true) = null", &t),
+            ("true and 5", &null),
+            ("false and 5", &f),
+            ("5 or true", &t),
+            // #1393 — a non-boolean `if` condition takes the else branch.
+            ("if 5 then 1 else 2", &two),
+            ("if null then 1 else 2", &two),
+            (r#"if "x" then 1 else 2"#, &two),
+            ("if 1 + true then 1 else 2", &two),
+            // #1394 — `=` / `!=` across mismatched non-null types → null.
+            (r#"1 = "1""#, &null),
+            (r#"false = "ab""#, &null),
+            (r#"1 != "a""#, &null),
+            ("1 = true", &null),
+            ("true != 1", &null),
+            ("[1] = 1", &null),
+            ("{a:1} = 1", &null),
+            (r#"date("2020-01-01") = 1"#, &null),
+            // ...while null against a value, and nested mismatches, stay boolean.
+            ("null = 1", &f),
+            ("null != 1", &t),
+            ("null = null", &t),
+            (r#"[1,2] = [1,"a"]"#, &f),
+            (r#"{a:1} = {a:"x"}"#, &f),
+            ("[1] = [1]", &t),
+            // List membership tolerates mismatched items.
+            (r#"1 in [1,"a"]"#, &t),
+            (r#""a" in [1,2]"#, &f),
+            ("5 in null", &f),
+            ("null in [1]", &f),
+            ("1 in 1", &t),
+        ];
+        let mut failures = Vec::new();
+        for (expr, want) in cases {
+            let got = eval(expr, &c);
+            if &got != *want {
+                failures.push(format!("{expr}: got {got:?}, feel-scala {want:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

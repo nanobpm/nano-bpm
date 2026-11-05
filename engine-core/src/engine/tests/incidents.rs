@@ -10,7 +10,7 @@ fn inline_script_task_raises_an_incident_when_the_expression_fails_and_recovers(
     // then writes the result and lets the instance continue.
     let def = ProcessBuilder::new("scripted-fail")
         .start_event("start")
-        .script_task("calc", "=n + 1", "next")
+        .script_task("calc", "=assert(n, n instance of number) + 1", "next")
         .service_task("work", "do-work")
         .end_event("end")
         .connect("start", "calc")
@@ -804,7 +804,7 @@ fn should_re_raise_a_gateway_incident_when_resolution_still_finds_no_flow() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Int(7))]);
+    let vars = HashMap::from([("d".to_string(), Value::Bool(false))]);
     let created = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -844,7 +844,7 @@ fn should_recover_a_gateway_incident_after_fixing_variables() {
         .unwrap();
     let mut engine = Engine::new();
     engine.apply_command(Command::DeployProcess(def)).unwrap();
-    let vars = HashMap::from([("d".to_string(), Value::Int(7))]);
+    let vars = HashMap::from([("d".to_string(), Value::Bool(false))]);
     let created = engine
         .apply_command(Command::create_instance_with("strict", vars))
         .unwrap();
@@ -1219,7 +1219,7 @@ fn input_mapping_eval_failure_raises_io_mapping_incident_and_no_job() {
             "t",
             crate::model::IoMapping {
                 inputs: vec![crate::model::Mapping {
-                    source: "=x + 1".to_string(),
+                    source: "=assert(x, x instance of number) + 1".to_string(),
                     target: "y".to_string(),
                 }],
                 outputs: Vec::new(),
@@ -1284,7 +1284,7 @@ fn output_mapping_eval_failure_raises_incident_and_does_not_complete() {
             crate::model::IoMapping {
                 inputs: Vec::new(),
                 outputs: vec![crate::model::Mapping {
-                    source: "=bad + 1".to_string(),
+                    source: "=assert(bad, bad instance of number) + 1".to_string(),
                     target: "approved".to_string(),
                 }],
             },
@@ -1362,7 +1362,7 @@ fn message_catch_output_mapping_incident_resolves_via_complete_not_reopen() {
             crate::model::IoMapping {
                 inputs: Vec::new(),
                 outputs: vec![crate::model::Mapping {
-                    source: "=bad + 1".to_string(),
+                    source: "=assert(bad, bad instance of number) + 1".to_string(),
                     target: "approved".to_string(),
                 }],
             },
@@ -1462,7 +1462,7 @@ fn subprocess_output_mapping_eval_failure_raises_io_mapping_incident() {
     engine
         .apply_command(Command::DeployProcess(subprocess_with_input_mapping(vec![
             crate::model::Mapping {
-                source: "=bad + 1".to_string(),
+                source: "=assert(bad, bad instance of number) + 1".to_string(),
                 target: "exported".to_string(),
             },
         ])))
@@ -1555,7 +1555,7 @@ fn multi_instance_body_input_mapping_genuine_failure_raises_incident_and_recover
                 // Does NOT reference a per-child binding ⇒ evaluated at the body
                 // level; `badFactor` is a string, so it fails genuinely.
                 inputs: vec![crate::model::Mapping {
-                    source: "=badFactor + 1".to_string(),
+                    source: "=assert(badFactor, badFactor instance of number) + 1".to_string(),
                     target: "scaled".to_string(),
                 }],
                 outputs: Vec::new(),
@@ -1649,7 +1649,7 @@ fn multi_instance_body_output_mapping_genuine_failure_raises_incident_and_recove
                 inputs: Vec::new(),
                 // Evaluated at body completion; `badOut` is a string ⇒ fails.
                 outputs: vec![crate::model::Mapping {
-                    source: "=badOut + 1".to_string(),
+                    source: "=assert(badOut, badOut instance of number) + 1".to_string(),
                     target: "summary".to_string(),
                 }],
             },
@@ -2397,9 +2397,10 @@ fn task_with_job_type_expr(job_type: &str) -> ProcessDefinition {
 #[test]
 fn should_create_incident_if_job_type_expression_evaluation_failed() {
     // Zeebe `JobWorkerElementIncidentTest.shouldCreateIncidentIfJobTypeExpressionEvaluationFailed`:
-    // a job-type FEEL expression that cannot be evaluated (a missing variable
-    // without `is defined`, or — here — a type error such as concatenating a
-    // string with a number) raises an EXTRACT_VALUE_ERROR incident on the task
+    // a job-type FEEL expression that does not yield a string (a missing
+    // variable without `is defined`, or — here — a type error such as
+    // concatenating a string with a number, which feel-scala suppresses to
+    // `null`, #1392) raises an EXTRACT_VALUE_ERROR incident on the task
     // and creates NO job. nano used to fall back to the literal expression text
     // as the job type, parking the token with no incident and no subscribable
     // worker (#1390).
@@ -2426,8 +2427,8 @@ fn should_create_incident_if_job_type_expression_evaluation_failed() {
     );
     assert_eq!(active[0].element_id, "task");
     assert!(
-        active[0].reason.contains("Expected to evaluate expression"),
-        "the reason names the failed expression: {}",
+        active[0].reason.contains("to be 'STRING', but was 'NULL'"),
+        "the reason names the failed expression and its null result: {}",
         active[0].reason
     );
     assert_eq!(

@@ -1065,7 +1065,7 @@ fn call_activity_input_mapping_failure_raises_io_mapping_and_respawns_on_resolve
         .unwrap();
     let io = crate::model::IoMapping {
         inputs: vec![crate::model::Mapping {
-            source: "=orderId + 1".to_string(),
+            source: "=assert(orderId, orderId instance of number) + 1".to_string(),
             target: "childOrder".to_string(),
         }],
         outputs: Vec::new(),
@@ -1146,7 +1146,7 @@ fn call_activity_output_mapping_failure_preserves_child_context_on_redrive() {
         }],
         outputs: vec![crate::model::Mapping {
             // `childTag` is a string; `string + 1` is a FEEL type error.
-            source: "=childTag + 1".to_string(),
+            source: "=assert(childTag, childTag instance of number) + 1".to_string(),
             target: "echoed".to_string(),
         }],
     };

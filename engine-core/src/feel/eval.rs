@@ -80,16 +80,14 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
                 FeelVal::Double(d) => Ok(FeelVal::num(-d)),
                 FeelVal::YmDur(d) => Ok(FeelVal::YmDur(YmDuration::new(-d.months))),
                 FeelVal::DtDur(d) => Ok(FeelVal::DtDur(DtDuration::from_nanos(-d.nanos))),
-                other => Err(FeelError(format!("cannot negate {}", other.type_name()))),
+                // An ill-typed operand is a suppressed failure: `null` (#1392).
+                _ => Ok(FeelVal::Null),
             }
         }
         Node::Not(inner) => match eval_node(inner, ctx)? {
             FeelVal::Bool(b) => Ok(FeelVal::Bool(!b)),
-            FeelVal::Null => Ok(FeelVal::Null),
-            other => Err(FeelError(format!(
-                "cannot apply not to {}",
-                other.type_name()
-            ))),
+            // `null` and an ill-typed operand both yield `null` (#1392).
+            _ => Ok(FeelVal::Null),
         },
         Node::Bin(op, lhs, rhs) => eval_binary(*op, lhs, rhs, ctx),
         Node::List(items) => {
@@ -114,8 +112,9 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
         }
         Node::If(cond, then, otherwise) => match eval_node(cond, ctx)? {
             FeelVal::Bool(true) => eval_node(then, ctx),
-            FeelVal::Bool(false) => eval_node(otherwise, ctx),
-            _ => Ok(FeelVal::Null),
+            // Any non-`true` condition (false, null, a non-boolean) takes the
+            // else branch, as feel-scala does (#1393).
+            _ => eval_node(otherwise, ctx),
         },
         Node::For(clauses, body) => {
             let mut out = Vec::new();
@@ -127,17 +126,16 @@ fn eval_node(node: &Node, ctx: &mut Ctx) -> Result<FeelVal, FeelError> {
             let xv = eval_node(x, ctx)?;
             let lov = eval_node(lo, ctx)?;
             let hiv = eval_node(hi, ctx)?;
-            let ge = matches!(
-                compare(&xv, &lov),
-                Some(Ordering::Greater | Ordering::Equal)
-            );
-            let le = matches!(compare(&xv, &hiv), Some(Ordering::Less | Ordering::Equal));
-            Ok(FeelVal::Bool(ge && le))
+            // An incomparable bound (incl. `null`) is a suppressed failure.
+            Ok(match (compare(&xv, &lov), compare(&xv, &hiv)) {
+                (Some(lo), Some(hi)) => FeelVal::Bool(lo.is_ge() && hi.is_le()),
+                _ => FeelVal::Null,
+            })
         }
         Node::In(x, rhs) => {
             let xv = eval_node(x, ctx)?;
             let rv = eval_node(rhs, ctx)?;
-            Ok(FeelVal::Bool(in_test(&xv, &rv)))
+            Ok(in_test(&xv, &rv))
         }
         Node::InstanceOf(x, ty) => {
             let xv = eval_node(x, ctx)?;
@@ -427,35 +425,43 @@ fn dt_member(d: &DtDuration, name: &str) -> FeelVal {
 
 // --- in / instance of -------------------------------------------------------
 
-fn in_test(x: &FeelVal, rhs: &FeelVal) -> bool {
+/// `x in rhs`. A list tests membership (mismatched items simply do not match);
+/// a range or a single value against an ill-typed `x` is a suppressed failure
+/// (`null`), as in feel-scala (#1392); a `null` on either side of a single-value
+/// test is a plain `false`.
+fn in_test(x: &FeelVal, rhs: &FeelVal) -> FeelVal {
     match rhs {
-        FeelVal::Range(r) => range_contains(r, x),
-        FeelVal::List(items) => items.iter().any(|item| match item {
-            FeelVal::Range(r) => range_contains(r, x),
+        FeelVal::Range(r) => range_contains(r, x).map_or(FeelVal::Null, FeelVal::Bool),
+        FeelVal::List(items) => FeelVal::Bool(items.iter().any(|item| match item {
+            FeelVal::Range(r) => range_contains(r, x) == Some(true),
             other => feel_eq(x, other),
-        }),
-        other => feel_eq(x, other),
+        })),
+        other if matches!(x, FeelVal::Null) || matches!(other, FeelVal::Null) => {
+            FeelVal::Bool(feel_eq(x, other))
+        }
+        other => eq_op(x, other),
     }
 }
 
-fn range_contains(r: &Range, x: &FeelVal) -> bool {
+/// Range membership; `None` when `x` is incomparable with a bound.
+fn range_contains(r: &Range, x: &FeelVal) -> Option<bool> {
     let lower_ok = match &r.start {
         None => true,
-        Some(s) => match compare(x, s) {
-            Some(Ordering::Greater) => true,
-            Some(Ordering::Equal) => r.start_inclusive,
-            _ => false,
+        Some(s) => match compare(x, s)? {
+            Ordering::Greater => true,
+            Ordering::Equal => r.start_inclusive,
+            Ordering::Less => false,
         },
     };
     let upper_ok = match &r.end {
         None => true,
-        Some(e) => match compare(x, e) {
-            Some(Ordering::Less) => true,
-            Some(Ordering::Equal) => r.end_inclusive,
-            _ => false,
+        Some(e) => match compare(x, e)? {
+            Ordering::Less => true,
+            Ordering::Equal => r.end_inclusive,
+            Ordering::Greater => false,
         },
     };
-    lower_ok && upper_ok
+    Some(lower_ok && upper_ok)
 }
 
 fn instance_of(v: &FeelVal, ty: &str) -> bool {
@@ -504,163 +510,167 @@ fn eval_binary(op: BinOp, lhs: &Node, rhs: &Node, ctx: &mut Ctx) -> Result<FeelV
 
     let l = eval_node(lhs, ctx)?;
     let r = eval_node(rhs, ctx)?;
-    match op {
+    // An operator applied to ill-typed operands is a *suppressed failure* in
+    // feel-scala (the FEEL engine Zeebe embeds): the result is `null`, never an
+    // evaluation error (#1392). Each operator therefore yields `Option`, and
+    // `None` (the type error) is mapped to `null` in this single place.
+    let out = match op {
         BinOp::Add => add(&l, &r),
         BinOp::Sub => sub(&l, &r),
         BinOp::Mul => mul(&l, &r),
         BinOp::Div => div(&l, &r),
         BinOp::Exp => match (l.as_f64(), r.as_f64()) {
-            (Some(a), Some(b)) => Ok(FeelVal::num(a.powf(b))),
-            _ => Err(type_err("**", &l, &r)),
+            (Some(a), Some(b)) => Some(FeelVal::num(a.powf(b))),
+            _ => None,
         },
-        BinOp::Eq => Ok(FeelVal::Bool(feel_eq(&l, &r))),
-        BinOp::Ne => Ok(FeelVal::Bool(!feel_eq(&l, &r))),
+        BinOp::Eq => Some(eq_op(&l, &r)),
+        BinOp::Ne => Some(match eq_op(&l, &r) {
+            FeelVal::Bool(b) => FeelVal::Bool(!b),
+            other => other,
+        }),
         BinOp::Lt => cmp_op(&l, &r, |o| o.is_lt()),
         BinOp::Le => cmp_op(&l, &r, |o| o.is_le()),
         BinOp::Gt => cmp_op(&l, &r, |o| o.is_gt()),
         BinOp::Ge => cmp_op(&l, &r, |o| o.is_ge()),
         BinOp::And | BinOp::Or => unreachable!("handled above"),
-    }
+    };
+    Ok(out.unwrap_or(FeelVal::Null))
 }
 
 const NANOS_PER_SEC: i128 = 1_000_000_000;
 
-fn add(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
+fn add(l: &FeelVal, r: &FeelVal) -> Option<FeelVal> {
     use FeelVal::*;
     if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
-        return Ok(FeelVal::num(a + b));
+        return Some(FeelVal::num(a + b));
     }
     match (l, r) {
-        (Str(a), Str(b)) => Ok(Str(format!("{a}{b}"))),
+        (Str(a), Str(b)) => Some(Str(format!("{a}{b}"))),
         // date/datetime + durations (commutative)
-        (Date(d), YmDur(y)) | (YmDur(y), Date(d)) => Ok(FeelVal::Date(d.add_months(y.months))),
+        (Date(d), YmDur(y)) | (YmDur(y), Date(d)) => Some(FeelVal::Date(d.add_months(y.months))),
         (Date(d), DtDur(dt)) | (DtDur(dt), Date(d)) => {
             let base = super::temporal::DateTime {
                 date: *d,
                 time: super::temporal::Time::new(0, 0, 0, 0),
             };
-            Ok(FeelVal::Date(base.add_dt(*dt).date))
+            Some(FeelVal::Date(base.add_dt(*dt).date))
         }
         (DateTime(d), YmDur(y)) | (YmDur(y), DateTime(d)) => {
-            Ok(FeelVal::DateTime(super::temporal::DateTime {
+            Some(FeelVal::DateTime(super::temporal::DateTime {
                 date: d.date.add_months(y.months),
                 time: d.time.clone(),
             }))
         }
-        (DateTime(d), DtDur(dt)) | (DtDur(dt), DateTime(d)) => Ok(FeelVal::DateTime(d.add_dt(*dt))),
+        (DateTime(d), DtDur(dt)) | (DtDur(dt), DateTime(d)) => {
+            Some(FeelVal::DateTime(d.add_dt(*dt)))
+        }
         (Time(t), DtDur(dt)) | (DtDur(dt), Time(t)) => {
             let nanos = t.nano_of_day() + dt.nanos;
-            Ok(FeelVal::Time(time_from_nanos(nanos, t)))
+            Some(FeelVal::Time(time_from_nanos(nanos, t)))
         }
-        (YmDur(a), YmDur(b)) => Ok(FeelVal::YmDur(YmDuration::new(a.months + b.months))),
-        (DtDur(a), DtDur(b)) => Ok(FeelVal::DtDur(DtDuration::from_nanos(a.nanos + b.nanos))),
-        _ => Err(type_err("+", l, r)),
+        (YmDur(a), YmDur(b)) => Some(FeelVal::YmDur(YmDuration::new(a.months + b.months))),
+        (DtDur(a), DtDur(b)) => Some(FeelVal::DtDur(DtDuration::from_nanos(a.nanos + b.nanos))),
+        _ => None,
     }
 }
 
-fn sub(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
+fn sub(l: &FeelVal, r: &FeelVal) -> Option<FeelVal> {
     use FeelVal::*;
     if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
-        return Ok(FeelVal::num(a - b));
+        return Some(FeelVal::num(a - b));
     }
     match (l, r) {
-        (Date(a), Date(b)) => Ok(FeelVal::DtDur(DtDuration::from_seconds(
+        (Date(a), Date(b)) => Some(FeelVal::DtDur(DtDuration::from_seconds(
             (a.epoch_day() - b.epoch_day()) * 86_400,
         ))),
-        (DateTime(a), DateTime(b)) => Ok(FeelVal::DtDur(DtDuration::from_nanos(
+        (DateTime(a), DateTime(b)) => Some(FeelVal::DtDur(DtDuration::from_nanos(
             a.epoch_nanos() - b.epoch_nanos(),
         ))),
-        (Time(a), Time(b)) => Ok(FeelVal::DtDur(DtDuration::from_nanos(
+        (Time(a), Time(b)) => Some(FeelVal::DtDur(DtDuration::from_nanos(
             a.nano_of_day() - b.nano_of_day(),
         ))),
-        (Date(d), YmDur(y)) => Ok(FeelVal::Date(d.add_months(-y.months))),
+        (Date(d), YmDur(y)) => Some(FeelVal::Date(d.add_months(-y.months))),
         (Date(d), DtDur(dt)) => {
             let base = super::temporal::DateTime {
                 date: *d,
                 time: super::temporal::Time::new(0, 0, 0, 0),
             };
-            Ok(FeelVal::Date(
+            Some(FeelVal::Date(
                 base.add_dt(DtDuration::from_nanos(-dt.nanos)).date,
             ))
         }
-        (DateTime(d), YmDur(y)) => Ok(FeelVal::DateTime(super::temporal::DateTime {
+        (DateTime(d), YmDur(y)) => Some(FeelVal::DateTime(super::temporal::DateTime {
             date: d.date.add_months(-y.months),
             time: d.time.clone(),
         })),
-        (DateTime(d), DtDur(dt)) => Ok(FeelVal::DateTime(
+        (DateTime(d), DtDur(dt)) => Some(FeelVal::DateTime(
             d.add_dt(DtDuration::from_nanos(-dt.nanos)),
         )),
-        (Time(t), DtDur(dt)) => Ok(FeelVal::Time(time_from_nanos(
+        (Time(t), DtDur(dt)) => Some(FeelVal::Time(time_from_nanos(
             t.nano_of_day() - dt.nanos,
             t,
         ))),
-        (YmDur(a), YmDur(b)) => Ok(FeelVal::YmDur(YmDuration::new(a.months - b.months))),
-        (DtDur(a), DtDur(b)) => Ok(FeelVal::DtDur(DtDuration::from_nanos(a.nanos - b.nanos))),
-        _ => Err(type_err("-", l, r)),
+        (YmDur(a), YmDur(b)) => Some(FeelVal::YmDur(YmDuration::new(a.months - b.months))),
+        (DtDur(a), DtDur(b)) => Some(FeelVal::DtDur(DtDuration::from_nanos(a.nanos - b.nanos))),
+        _ => None,
     }
 }
 
-fn mul(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
+fn mul(l: &FeelVal, r: &FeelVal) -> Option<FeelVal> {
     use FeelVal::*;
     if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
-        return Ok(FeelVal::num(a * b));
+        return Some(FeelVal::num(a * b));
     }
     match (l, r) {
-        (YmDur(d), other) | (other, YmDur(d)) => match other.as_f64() {
-            Some(n) => Ok(FeelVal::YmDur(YmDuration::new(
-                (d.months as f64 * n).round() as i64,
-            ))),
-            None => Err(type_err("*", l, r)),
-        },
-        (DtDur(d), other) | (other, DtDur(d)) => match other.as_f64() {
-            Some(n) => Ok(FeelVal::DtDur(DtDuration::from_nanos(
-                (d.nanos as f64 * n).round() as i128,
-            ))),
-            None => Err(type_err("*", l, r)),
-        },
-        _ => Err(type_err("*", l, r)),
+        (YmDur(d), other) | (other, YmDur(d)) => other
+            .as_f64()
+            .map(|n| FeelVal::YmDur(YmDuration::new((d.months as f64 * n).round() as i64))),
+        (DtDur(d), other) | (other, DtDur(d)) => other
+            .as_f64()
+            .map(|n| FeelVal::DtDur(DtDuration::from_nanos((d.nanos as f64 * n).round() as i128))),
+        _ => None,
     }
 }
 
-fn div(l: &FeelVal, r: &FeelVal) -> Result<FeelVal, FeelError> {
+fn div(l: &FeelVal, r: &FeelVal) -> Option<FeelVal> {
     use FeelVal::*;
     if let (Some(a), Some(b)) = (l.as_f64(), r.as_f64()) {
         return if b == 0.0 {
-            Ok(FeelVal::Null)
+            Some(FeelVal::Null)
         } else {
-            Ok(FeelVal::num(a / b))
+            Some(FeelVal::num(a / b))
         };
     }
     match (l, r) {
         (YmDur(a), YmDur(b)) => {
             if b.months == 0 {
-                Ok(FeelVal::Null)
+                Some(FeelVal::Null)
             } else {
-                Ok(FeelVal::num(a.months as f64 / b.months as f64))
+                Some(FeelVal::num(a.months as f64 / b.months as f64))
             }
         }
         (DtDur(a), DtDur(b)) => {
             if b.nanos == 0 {
-                Ok(FeelVal::Null)
+                Some(FeelVal::Null)
             } else {
-                Ok(FeelVal::num(a.nanos as f64 / b.nanos as f64))
+                Some(FeelVal::num(a.nanos as f64 / b.nanos as f64))
             }
         }
         (YmDur(d), other) => match other.as_f64() {
-            Some(x) if x != 0.0 => Ok(FeelVal::YmDur(YmDuration::new(
+            Some(x) if x != 0.0 => Some(FeelVal::YmDur(YmDuration::new(
                 (d.months as f64 / x).round() as i64,
             ))),
-            Some(_) => Ok(FeelVal::Null),
-            None => Err(type_err("/", l, r)),
+            Some(_) => Some(FeelVal::Null),
+            None => None,
         },
         (DtDur(d), other) => match other.as_f64() {
-            Some(x) if x != 0.0 => Ok(FeelVal::DtDur(DtDuration::from_nanos(
+            Some(x) if x != 0.0 => Some(FeelVal::DtDur(DtDuration::from_nanos(
                 (d.nanos as f64 / x).round() as i128,
             ))),
-            Some(_) => Ok(FeelVal::Null),
-            None => Err(type_err("/", l, r)),
+            Some(_) => Some(FeelVal::Null),
+            None => None,
         },
-        _ => Err(type_err("/", l, r)),
+        _ => None,
     }
 }
 
@@ -716,10 +726,20 @@ pub fn compare(l: &FeelVal, r: &FeelVal) -> Option<Ordering> {
     }
 }
 
-fn cmp_op(l: &FeelVal, r: &FeelVal, f: impl Fn(Ordering) -> bool) -> Result<FeelVal, FeelError> {
-    match compare(l, r) {
-        Some(o) => Ok(FeelVal::Bool(f(o))),
-        None => Err(type_err("comparison", l, r)),
+fn cmp_op(l: &FeelVal, r: &FeelVal, f: impl Fn(Ordering) -> bool) -> Option<FeelVal> {
+    compare(l, r).map(|o| FeelVal::Bool(f(o)))
+}
+
+/// The `=` operator. `null` against anything is a plain boolean; two non-null
+/// values of different types are a suppressed failure (`null`), as in
+/// feel-scala (#1394). Nested list / context items keep [`feel_eq`]'s
+/// structural `false` on a mismatch, which feel-scala also does.
+fn eq_op(l: &FeelVal, r: &FeelVal) -> FeelVal {
+    let either_null = matches!(l, FeelVal::Null) || matches!(r, FeelVal::Null);
+    if either_null || l.type_name() == r.type_name() {
+        FeelVal::Bool(feel_eq(l, r))
+    } else {
+        FeelVal::Null
     }
 }
 
@@ -737,12 +757,4 @@ fn ternary_or(l: &FeelVal, r: &FeelVal) -> FeelVal {
         (Some(false), Some(false)) => FeelVal::Bool(false),
         _ => FeelVal::Null,
     }
-}
-
-fn type_err(op: &str, l: &FeelVal, r: &FeelVal) -> FeelError {
-    FeelError(format!(
-        "{op} not defined for {} and {}",
-        l.type_name(),
-        r.type_name()
-    ))
 }

@@ -883,7 +883,7 @@ fn retry_of_a_seeded_activation_keeps_its_element_locals() {
             "t",
             crate::model::IoMapping {
                 inputs: vec![crate::model::Mapping {
-                    source: "=local + missing".to_string(),
+                    source: "=local + assert(missing, missing != null)".to_string(),
                     target: "y".to_string(),
                 }],
                 outputs: Vec::new(),
@@ -1043,7 +1043,7 @@ fn an_incident_parked_multi_instance_body_is_not_a_flow_scope() {
     def.elements.get_mut("wave").unwrap().io = crate::model::IoMapping {
         // A genuine body-level input failure (`badFactor` is a string).
         inputs: vec![crate::model::Mapping {
-            source: "=badFactor + 1".to_string(),
+            source: "=assert(badFactor, badFactor instance of number) + 1".to_string(),
             target: "scaled".to_string(),
         }],
         outputs: Vec::new(),
@@ -1269,7 +1269,7 @@ fn call_activity_spawn_retry_keeps_element_locals() {
             "c1",
             crate::model::IoMapping {
                 inputs: vec![crate::model::Mapping {
-                    source: "=local + missing".to_string(),
+                    source: "=local + assert(missing, missing != null)".to_string(),
                     target: "childOrder".to_string(),
                 }],
                 outputs: Vec::new(),

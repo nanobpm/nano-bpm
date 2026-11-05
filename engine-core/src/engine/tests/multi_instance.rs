@@ -363,7 +363,7 @@ fn multi_instance_child_input_mapping_failure_raises_io_mapping_and_reactivates(
                 // References the per-child binding `item` (tolerated at the body
                 // level) and the root `factor` (a string ⇒ per-child eval fails).
                 inputs: vec![crate::model::Mapping {
-                    source: "=factor + item".to_string(),
+                    source: "=assert(factor, factor instance of number) + item".to_string(),
                     target: "weighted".to_string(),
                 }],
                 outputs: Vec::new(),
@@ -1163,4 +1163,284 @@ fn multi_instance_child_job_type_resolves_against_the_child_scope() {
     assert!(engine
         .activate_jobs("=\"handle-\" + item", "w", 10, 60_000, 0)
         .is_empty());
+}
+
+#[test]
+fn multi_instance_body_static_input_mapping_named_like_child_binding_is_applied_verbatim() {
+    // A static (non-`=`) io-mapping source is a literal string passed through
+    // unevaluated (#1160) — even when its text happens to name a per-child
+    // binding (`loopCounter` / the `inputElement`). The body-level dependency
+    // scan must not parse it as a FEEL variable reference and skip the mapping:
+    // the literal is assigned to the parent scope verbatim, and the per-child
+    // pass assigns the same literal (never the child's binding value).
+    let def = ProcessBuilder::new("mi-static-src")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "loopCounter".to_string(),
+                    target: "mode".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-static-src",
+            vars(&[("items", Value::List(vec![Value::Int(1)]))]),
+        ))
+        .unwrap();
+
+    // The body-level pass assigns the literal verbatim into the body scope,
+    // which every child inherits — so each child job sees the literal string,
+    // not the child's own `loopCounter` binding (1 for the first child). The
+    // per-child pass then re-assigns the same literal.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(
+        jobs[0].variables.get("mode"),
+        Some(&Value::Str("loopCounter".into())),
+        "a static source is a literal string, never a variable reference"
+    );
+    assert_eq!(
+        jobs[0].variables.get("loopCounter"),
+        Some(&Value::Int(1)),
+        "the child's own binding is unaffected by the literal mapping"
+    );
+}
+
+#[test]
+fn multi_instance_body_input_mapping_with_local_binding_shadowing_input_element_runs() {
+    // A mapping whose only use of the `inputElement` name is LOCALLY BOUND
+    // (`for item in …`) is self-contained: it does not read the per-child
+    // binding, so the body must evaluate it rather than skip it. Skipping it
+    // here would drop the input collection's provider and silently fan out
+    // zero children.
+    let def = ProcessBuilder::new("mi-local-bind")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=for item in [1, 2] return item".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("mi-local-bind", vars(&[])))
+        .unwrap();
+
+    // The self-contained mapping supplies the input collection: two children.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        2,
+        "a locally bound use of the inputElement name must not skip the mapping"
+    );
+    assert_eq!(jobs[0].variables.get("item"), Some(&Value::Int(1)));
+    assert_eq!(jobs[1].variables.get("item"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn multi_instance_body_input_mapping_with_filter_local_item_binding_runs() {
+    // A list filter binds `item` to the element under test over its predicate
+    // (eval_index), so `=[1, 2][item > 0]` is self-contained even when the
+    // `inputElement` is also named `item`: the predicate does not read the
+    // per-child binding. The body must evaluate the mapping rather than skip
+    // it — skipping it here would drop the input collection's provider and
+    // silently fan out zero children (Copilot review 5778200940).
+    let def = ProcessBuilder::new("mi-filter-bind")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=[1, 2][item > 0]".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("mi-filter-bind", vars(&[])))
+        .unwrap();
+
+    // The filter-local mapping supplies the input collection: two children.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        2,
+        "a filter-local use of the inputElement name must not skip the mapping"
+    );
+    assert_eq!(jobs[0].variables.get("item"), Some(&Value::Int(1)));
+    assert_eq!(jobs[1].variables.get("item"), Some(&Value::Int(2)));
+}
+
+#[test]
+fn multi_instance_body_input_mapping_with_filter_over_context_elements_runs() {
+    // A filter over context elements binds each element's entries over the
+    // predicate (eval_index), so `=[{price: 1}, {price: 2}][price > 1]` is
+    // self-contained even when the `inputElement` is also named `price`: the
+    // predicate reads the element's own `price`, not the per-child binding.
+    // The body must evaluate the mapping rather than skip it — skipping it
+    // here would drop the input collection's provider and silently fan out
+    // zero children (Copilot review 5778355773).
+    let def = ProcessBuilder::new("mi-filter-ctx")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("price".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=[{price: 1}, {price: 2}][price > 1]".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("mi-filter-ctx", vars(&[])))
+        .unwrap();
+
+    // The context-filter mapping supplies the input collection: one child
+    // (only the {price: 2} element survives the filter), and the surviving
+    // element — a context — is the child's `price` binding.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "a filter over context elements must not skip the mapping"
+    );
+    let expected: crate::Value =
+        Value::Map([("price".to_string(), Value::Int(2))].into_iter().collect());
+    assert_eq!(jobs[0].variables.get("price"), Some(&expected));
+}
+
+#[test]
+fn multi_instance_body_input_mapping_with_bare_var_filter_runs() {
+    // A bare-variable subscript that is NOT in scope is not numeric, so the
+    // subscript is a filter at runtime and binds `item` over it (eval_index):
+    // `=[true, false][item]` is self-contained even when the `inputElement`
+    // is also named `item`. The body must evaluate the mapping rather than
+    // skip it (Copilot review 5778355773).
+    let def = ProcessBuilder::new("mi-bare-var-filter")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=[true, false][item]".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-bare-var-filter",
+            vars(&[]),
+        ))
+        .unwrap();
+
+    // The bare-var filter keeps only the `true` element: one child.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1, "a bare-var filter must not skip the mapping");
+    assert_eq!(jobs[0].variables.get("item"), Some(&Value::Bool(true)));
 }

@@ -6,7 +6,8 @@
       "match": "element:ExclusiveGateway",
       "status": "parity",
       "evidence": [
-        "traces:exclusive-gateway-default"
+        "traces:exclusive-gateway-default",
+        "traces:feel-null-on-type-error"
       ]
     },
     {
@@ -243,7 +244,8 @@
       "match": "intent:Variable:CREATED",
       "status": "parity",
       "evidence": [
-        "traces:job-type-expression-failure"
+        "traces:job-type-expression-failure",
+        "traces:feel-null-on-type-error"
       ]
     },
     {

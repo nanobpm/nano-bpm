@@ -25,14 +25,13 @@ with a different `FEEL_FUZZ_CASES` makes entries go stale on purpose.
 
 ## Current known divergences
 
-| Issue | Class |
-| --- | --- |
-| #1392 | Type errors (`1 + true`, `-false`, `not(5)`): nano gives `err`, feel-scala gives `null` (suppressed failure). |
-| #1393 | A non-boolean `if` condition: nano gives `null`, feel-scala takes the `else` branch. |
-| #1394 | `=` / `!=` across mismatched types: nano gives a boolean, feel-scala gives `null`. |
+None. The corpus agrees with feel-scala on every row. The classes found by the
+first run (#1392 type errors → `null`, #1393 non-boolean `if` condition → `else`,
+#1394 cross-type `=` / `!=` → `null`) were fixed together in nano and the Lean
+reference, and their entries removed.
 
-When you fix one of these in nano and in the Lean reference, its entries go
-stale and the gate tells you to remove them.
+When you fix a listed divergence in nano and in the Lean reference, its entries
+go stale and the gate tells you to remove them.
 
 ## Workflow
 
