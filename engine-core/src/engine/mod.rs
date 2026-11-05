@@ -335,6 +335,17 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// Re-mint ONLY execution listener `index` of an element's `event_type`
+    /// chain whose `type` / `retries` expression raised an incident
+    /// ([`state::IoMappingRedrive::ExecutionListenerJob`], #1398 review).
+    MintExecutionListenerJob {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        event_type: crate::model::ListenerEventType,
+        index: usize,
+        scope: Key,
+    },
     /// Re-mint the listener job of a user task's task-listener chain whose
     /// `type` / `retries` expression raised an incident (#1398).
     MintTaskListenerJob {
@@ -3260,6 +3271,22 @@ impl Engine {
                                 event_type,
                                 index: listener_index,
                             });
+                        } else if let Some(state::IoMappingRedrive::ExecutionListenerJob {
+                            event_type,
+                            listener_index,
+                            scope,
+                        }) = redrive
+                        {
+                            // An execution-listener job property failed (#1398
+                            // review): re-mint only that listener's job.
+                            queue.push_back(Step::MintExecutionListenerJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                event_type,
+                                index: listener_index,
+                                scope,
+                            });
                         } else if matches!(redrive, Some(state::IoMappingRedrive::AdHocAgentJob)) {
                             // An agent container's agent-job property failed
                             // (#1398 review): re-mint only the agent job.
@@ -3728,6 +3755,18 @@ impl Engine {
                                 user_task_key,
                                 event_type,
                                 index: listener_index,
+                            }),
+                            Some(state::IoMappingRedrive::ExecutionListenerJob {
+                                event_type,
+                                listener_index,
+                                scope,
+                            }) => Some(Step::MintExecutionListenerJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                event_type,
+                                index: listener_index,
+                                scope,
                             }),
                             Some(state::IoMappingRedrive::AdHocAgentJob) => {
                                 Some(Step::MintAdHocAgentJob {
@@ -5848,6 +5887,11 @@ impl Engine {
                 element_instance_key,
                 ..
             }
+            | Step::MintExecutionListenerJob {
+                instance_key,
+                element_instance_key,
+                ..
+            }
             | Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
@@ -6115,6 +6159,28 @@ impl Engine {
                 self.adhoc_agent_job_events(instance_key, element_instance_key, element_id),
                 Vec::new(),
             ),
+            Step::MintExecutionListenerJob {
+                instance_key,
+                element_instance_key,
+                element_id,
+                event_type,
+                index,
+                scope,
+            } => {
+                let vars = self.variables_for_element(instance_key, element_instance_key);
+                (
+                    vec![self.execution_listener_job_event(
+                        instance_key,
+                        element_instance_key,
+                        &element_id,
+                        event_type,
+                        index,
+                        scope,
+                        &vars,
+                    )],
+                    Vec::new(),
+                )
+            }
             Step::MintTaskListenerJob {
                 user_task_key,
                 event_type,
@@ -6775,43 +6841,16 @@ impl Engine {
             &element_id,
             crate::model::ListenerEventType::Start,
         );
-        if let Some(first) = start_listeners.first() {
-            let props = self.resolve_job_props(
-                &activation_vars,
-                &first.job_type,
-                first.retries.as_deref(),
-                None,
-            );
-            let JobProps {
-                job_type, retries, ..
-            } = match props {
-                Ok(props) => props,
-                Err(reason) => {
-                    // #1390: a failed listener job-type expression parks the
-                    // element on an EXTRACT_VALUE_ERROR incident — no job.
-                    events.push(self.expression_incident(
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        reason,
-                        Some(state::IoMappingRedrive::Activation),
-                    ));
-                    return (events, followups);
-                }
-            };
-            let job_key = self.mint_key();
-            events.push(Event::ExecutionListenerJobCreated {
-                job_key,
+        if !start_listeners.is_empty() {
+            events.push(self.execution_listener_job_event(
                 instance_key,
                 element_instance_key,
-                element_id: element_id.clone(),
-                job_type,
-                event_type: crate::model::ListenerEventType::Start,
-                listener_index: 0,
+                &element_id,
+                crate::model::ListenerEventType::Start,
+                0,
                 scope,
-                created_at: self.now,
-                retries,
-            });
+                &activation_vars,
+            ));
             return (events, followups);
         }
 
@@ -7763,39 +7802,16 @@ impl Engine {
             &element_id,
             crate::model::ListenerEventType::Start,
         );
-        if let Some(first) = start_listeners.first() {
-            let props =
-                self.resolve_job_props(&vars, &first.job_type, first.retries.as_deref(), None);
-            let JobProps {
-                job_type, retries, ..
-            } = match props {
-                Ok(props) => props,
-                Err(reason) => {
-                    // #1390: a failed listener job-type expression parks the MI
-                    // body on an EXTRACT_VALUE_ERROR incident — no job.
-                    events.push(self.expression_incident(
-                        instance_key,
-                        body_key,
-                        element_id,
-                        reason,
-                        Some(state::IoMappingRedrive::MiBodyActivation),
-                    ));
-                    return (events, Vec::new());
-                }
-            };
-            let job_key = self.mint_key();
-            events.push(Event::ExecutionListenerJobCreated {
-                job_key,
+        if !start_listeners.is_empty() {
+            events.push(self.execution_listener_job_event(
                 instance_key,
-                element_instance_key: body_key,
-                element_id: element_id.clone(),
-                job_type,
-                event_type: crate::model::ListenerEventType::Start,
-                listener_index: 0,
+                body_key,
+                &element_id,
+                crate::model::ListenerEventType::Start,
+                0,
                 scope,
-                created_at: self.now,
-                retries,
-            });
+                &vars,
+            ));
             return (events, Vec::new());
         }
 
@@ -11497,49 +11513,21 @@ impl Engine {
         // completion-time variable view, including any script/DMN result and
         // output mappings staged above), and defer `ElementCompleted` + the
         // outgoing flows to `finalize_completion` when the chain drains.
-        if let Some(first) = end_listeners.first() {
+        if !end_listeners.is_empty() {
             let mut listener_vars =
                 (*self.variables_for_element(instance_key, element_instance_key)).clone();
             if let Some(update) = &script_update {
                 listener_vars.extend(update.clone());
             }
-            let props = self.resolve_job_props(
-                &listener_vars,
-                &first.job_type,
-                first.retries.as_deref(),
-                None,
-            );
-            let JobProps {
-                job_type, retries, ..
-            } = match props {
-                Ok(props) => props,
-                Err(reason) => {
-                    // #1390: a failed end-listener job-type expression parks the
-                    // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
-                    // job; resolving re-drives completion.
-                    events.push(self.expression_incident(
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        reason,
-                        Some(state::IoMappingRedrive::Completion),
-                    ));
-                    return (events, Vec::new());
-                }
-            };
-            let job_key = self.mint_key();
-            events.push(Event::ExecutionListenerJobCreated {
-                job_key,
+            events.push(self.execution_listener_job_event(
                 instance_key,
                 element_instance_key,
-                element_id: element_id.clone(),
-                job_type,
-                event_type: crate::model::ListenerEventType::End,
-                listener_index: 0,
+                &element_id,
+                crate::model::ListenerEventType::End,
+                0,
                 scope,
-                created_at: self.now,
-                retries,
-            });
+                &listener_vars,
+            ));
             return (events, Vec::new());
         }
 
@@ -11619,6 +11607,68 @@ impl Engine {
         (events, followups)
     }
 
+    /// Mints execution listener `index` of `element_id`'s `event_type` chain
+    /// (ADR 0037) — the single minting path for every execution-listener job.
+    /// `vars` is the view its FEEL `type` / `retries` resolve against. A failed
+    /// expression yields an EXTRACT_VALUE_ERROR incident whose redrive
+    /// ([`state::IoMappingRedrive::ExecutionListenerJob`]) re-mints ONLY this
+    /// listener on resolution — never restarting the lifecycle phase, which
+    /// would replay completed listeners, mappings or boundary arming (#1398
+    /// review). The caller must have checked that listener `index` exists; a
+    /// missing one (model changed under a redrive) mints nothing useful, so it
+    /// is reported as the same incident class rather than silently dropped.
+    #[allow(clippy::too_many_arguments)]
+    fn execution_listener_job_event(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        event_type: crate::model::ListenerEventType,
+        index: usize,
+        scope: Key,
+        vars: &HashMap<String, Value>,
+    ) -> Event {
+        let listeners = self.listeners_of(instance_key, element_id, event_type);
+        let redrive = state::IoMappingRedrive::ExecutionListenerJob {
+            event_type,
+            listener_index: index,
+            scope,
+        };
+        let props = match listeners.get(index) {
+            Some(listener) => {
+                self.resolve_job_props(vars, &listener.job_type, listener.retries.as_deref(), None)
+            }
+            None => Err(expression::Failure::extract_value(format!(
+                "execution listener {index} of '{element_id}' is not defined"
+            ))),
+        };
+        match props {
+            Ok(JobProps {
+                job_type, retries, ..
+            }) => Event::ExecutionListenerJobCreated {
+                job_key: self.mint_key(),
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                job_type,
+                event_type,
+                listener_index: index,
+                scope,
+                created_at: self.now,
+                retries,
+            },
+            // #1390: a failed listener job-type expression parks the element on
+            // an EXTRACT_VALUE_ERROR incident — no job.
+            Err(reason) => self.expression_incident(
+                instance_key,
+                element_instance_key,
+                element_id.to_string(),
+                reason,
+                Some(redrive),
+            ),
+        }
+    }
+
     /// Mints the first `end` execution-listener job for an element that has just
     /// entered COMPLETING (ADR 0037), if it declares any. Returns the
     /// `ExecutionListenerJobCreated` event when there is an end chain to run — the
@@ -11645,38 +11695,18 @@ impl Engine {
             element_id,
             crate::model::ListenerEventType::End,
         );
-        let first = end_listeners.first()?;
-        let props = self.resolve_job_props(vars, &first.job_type, first.retries.as_deref(), None);
-        let JobProps {
-            job_type, retries, ..
-        } = match props {
-            Ok(props) => props,
-            Err(reason) => {
-                // #1390: a failed end-listener job-type expression parks the
-                // COMPLETING element on an EXTRACT_VALUE_ERROR incident — no
-                // job; resolving re-drives completion.
-                return Some(self.expression_incident(
-                    instance_key,
-                    element_instance_key,
-                    element_id.to_string(),
-                    reason,
-                    Some(state::IoMappingRedrive::Completion),
-                ));
-            }
-        };
-        let job_key = self.mint_key();
-        Some(Event::ExecutionListenerJobCreated {
-            job_key,
+        if end_listeners.is_empty() {
+            return None;
+        }
+        Some(self.execution_listener_job_event(
             instance_key,
             element_instance_key,
-            element_id: element_id.to_string(),
-            job_type,
-            event_type: crate::model::ListenerEventType::End,
-            listener_index: 0,
+            element_id,
+            crate::model::ListenerEventType::End,
+            0,
             scope,
-            created_at: self.now,
-            retries,
-        })
+            vars,
+        ))
     }
 
     /// Dispatches the deferred completion of an element whose `end`
@@ -12369,59 +12399,22 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         let listeners = self.listeners_of(instance_key, &element_id, event_type);
         let next_index = index + 1;
-        if let Some(next) = listeners.get(next_index) {
+        if next_index < listeners.len() {
             // The element's applied scope view (input mappings for a start chain,
             // completion-time state for an end chain, plus any variables merged by
             // preceding listener completions) is what the next listener's FEEL
             // attributes resolve against.
             let listener_vars = self.variables_for_element(instance_key, element_instance_key);
-            let props = self.resolve_job_props(
-                &listener_vars,
-                &next.job_type,
-                next.retries.as_deref(),
-                None,
-            );
-            let JobProps {
-                job_type, retries, ..
-            } = match props {
-                Ok(props) => props,
-                Err(reason) => {
-                    // #1390: a failed listener job-type expression parks the
-                    // element on an EXTRACT_VALUE_ERROR incident — no job. The
-                    // redrive phase matches the chain: a `start` chain gates
-                    // activation, an `end` chain gates completion.
-                    let redrive = match event_type {
-                        crate::model::ListenerEventType::Start => {
-                            state::IoMappingRedrive::Activation
-                        }
-                        crate::model::ListenerEventType::End => state::IoMappingRedrive::Completion,
-                    };
-                    return (
-                        vec![self.expression_incident(
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            reason,
-                            Some(redrive),
-                        )],
-                        Vec::new(),
-                    );
-                }
-            };
-            let job_key = self.mint_key();
             return (
-                vec![Event::ExecutionListenerJobCreated {
-                    job_key,
+                vec![self.execution_listener_job_event(
                     instance_key,
                     element_instance_key,
-                    element_id,
-                    job_type,
+                    &element_id,
                     event_type,
-                    listener_index: next_index,
+                    next_index,
                     scope,
-                    created_at: self.now,
-                    retries,
-                }],
+                    &listener_vars,
+                )],
                 Vec::new(),
             );
         }

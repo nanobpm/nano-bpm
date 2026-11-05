@@ -998,6 +998,18 @@ pub enum IoMappingRedrive {
     /// `AdHocState`. Covers nested containers (the job type is resolved off the
     /// parent catalog). Additive brand-new variant — old journals never carry it.
     AdHocAgentJob,
+    /// An **execution listener**'s job `type` / `retries` expression failed
+    /// when listener `listener_index` of the element's `event_type` chain was
+    /// to be minted (#1398 review). Everything before that listener (input /
+    /// output mappings, boundary arming, earlier completed listeners) already
+    /// happened; resolution re-mints ONLY that listener's job (engine
+    /// `Step::MintExecutionListenerJob`) instead of restarting the lifecycle
+    /// phase. Additive brand-new variant — old journals never carry it.
+    ExecutionListenerJob {
+        event_type: crate::model::ListenerEventType,
+        listener_index: usize,
+        scope: Key,
+    },
     /// A multi-instance **child**'s job properties (type / retries) failed to
     /// evaluate after its per-child input mappings were already applied (#1390,
     /// #1399 review): resolution re-runs only the child's behaviour against its

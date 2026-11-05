@@ -1327,3 +1327,110 @@ fn resolved_agent_job_retries_failure_preserves_container_results() {
     assert_eq!(agents.len(), 1, "exactly one turn-2 agent job is minted");
     assert_eq!(agents[0].element_instance_key, container);
 }
+
+// ---------------------------------------------------------------------------
+// Execution-listener job-property retry re-mints ONLY the failed listener
+// (#1398 review): a lifecycle-phase restart would replay completed listeners,
+// non-idempotent input/output mappings or boundary arming.
+// ---------------------------------------------------------------------------
+
+/// `work` declares a non-idempotent mapping (`input`: `=n + 1 -> n` local,
+/// `output`: `=n -> n` root) and two `event_type` listeners, `first` and
+/// `=second` (an expression that fails until `second` is set).
+fn task_with_two_listeners(event_type: &str) -> ProcessDefinition {
+    parse(&format!(
+        r#"<bpmn:process id="el2" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="work" />
+              <zeebe:ioMapping>
+                <zeebe:input source="=n + 1" target="n" />
+                <zeebe:output source="=n" target="n" />
+              </zeebe:ioMapping>
+              <zeebe:executionListeners>
+                <zeebe:executionListener eventType="{event_type}" type="first" />
+                <zeebe:executionListener eventType="{event_type}" type="=second" />
+              </zeebe:executionListeners>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="f2" sourceRef="work" targetRef="e" />
+        </bpmn:process>"#
+    ))
+}
+
+fn complete_only_job(engine: &mut Engine, job_type: &str) {
+    let jobs = engine.activate_jobs(job_type, "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1, "one {job_type} job: {:?}", job_types(engine));
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn later_start_listener_failure_retries_only_that_listener() {
+    let (mut engine, inst) = start(
+        task_with_two_listeners("start"),
+        vars(&[("n", Value::Int(0))]),
+    );
+    complete_only_job(&mut engine, "first");
+    let incident = extract_value_incident(&engine, "work", "second");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("second", Value::Str("second".into()))],
+    );
+    // Only the failed listener is re-minted — `first` does not run again.
+    assert_eq!(job_types(&engine), vec!["second".to_string()]);
+    complete_only_job(&mut engine, "second");
+    // The input mapping ran exactly once (0 + 1), not again on the retry.
+    let jobs = engine.activate_jobs("work", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].variables.get("n"), Some(&Value::Int(1)));
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn later_end_listener_failure_retries_only_that_listener() {
+    let (mut engine, inst) = start(
+        task_with_two_listeners("end"),
+        vars(&[("n", Value::Int(0))]),
+    );
+    complete_only_job(&mut engine, "work");
+    complete_only_job(&mut engine, "first");
+    let incident = extract_value_incident(&engine, "work", "second");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("second", Value::Str("second".into()))],
+    );
+    assert_eq!(job_types(&engine), vec!["second".to_string()]);
+    // The input (0 + 1) and output mappings ran exactly once.
+    assert_eq!(
+        engine.instance(inst).unwrap().variables.get("n"),
+        Some(&Value::Int(1))
+    );
+    complete_only_job(&mut engine, "second");
+    assert!(engine.pending_jobs().is_empty());
+}
+
+// zeebe-cells: incident:EXTRACT_VALUE_ERROR
+#[test]
+fn first_start_listener_failure_does_not_reapply_input_mappings() {
+    let (mut engine, inst) = start(task_with_start_listener(r#"type="=audit""#), HashMap::new());
+    let incident = extract_value_incident(&engine, "work", "audit");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("audit", Value::Str("audit".into()))],
+    );
+    assert_eq!(job_types(&engine), vec!["audit".to_string()]);
+    complete_only_job(&mut engine, "audit");
+    assert_eq!(job_types(&engine), vec!["work".to_string()]);
+}
