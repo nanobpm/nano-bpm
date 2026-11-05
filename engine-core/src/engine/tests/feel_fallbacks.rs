@@ -1079,3 +1079,47 @@ fn mi_completion_latch_skips_reevaluation_after_variable_change() {
         engine.active_incidents()
     );
 }
+
+#[test]
+fn resolved_boundary_timer_failure_preserves_user_task_host() {
+    // The same boundary-scoped retry preserves a USER TASK host: the task record
+    // is created, the boundary timer's expression fails, and resolution re-arms
+    // ONLY the timer — never a second task (#1398 review, host-preservation
+    // class).
+    let def = parse(
+        r#"<bpmn:process id="utb" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:boundaryEvent id="ping" attachedToRef="review" cancelActivity="false">
+            <bpmn:timerEventDefinition><bpmn:timeDuration>=d</bpmn:timeDuration></bpmn:timerEventDefinition>
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:endEvent id="eb" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="f2" sourceRef="review" targetRef="e" />
+          <bpmn:sequenceFlow id="f3" sourceRef="ping" targetRef="eb" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(def, HashMap::new());
+    assert_eq!(
+        engine.state().user_tasks.len(),
+        1,
+        "the user task host is live"
+    );
+    assert!(engine.timers().is_empty(), "no timer armed yet");
+    let incident = extract_value_incident(&engine, "review", "'=d'");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("d", Value::Str("PT1H".into()))],
+    );
+    assert_eq!(
+        engine.state().user_tasks.len(),
+        1,
+        "exactly one user task — the retry did not re-run the activation"
+    );
+    assert_eq!(engine.timers().len(), 1, "the boundary timer is re-armed");
+}

@@ -6923,13 +6923,6 @@ impl Engine {
             Ok(planned) => planned,
             Err(failure) => {
                 self.next_local = key_mark;
-                // A TIMER BOUNDARY's failure is the one site whose host's other
-                // effects (its job, already-armed boundaries) were emitted by the
-                // caller BEFORE the body ran — they stay live, so resolution must
-                // re-arm ONLY that boundary's timer, not re-run the whole body
-                // (#1398 review). Every other failure here precedes any live
-                // effect, so the body-only re-drive is exact.
-                //
                 // The body-only redrive is `ActivationBodyPending` (not
                 // `ActivationBody`) when the element has not reached ACTIVATED
                 // yet — a job-property expression failing in a FRESH activation
@@ -6938,8 +6931,12 @@ impl Engine {
                 // `ElementActivated` first. Once the element IS activated (its
                 // inputs and start listeners already ran), `ActivationBody`
                 // re-runs only the behaviour — never the (possibly
-                // non-idempotent) input mappings or the completed listeners.
-                let body_redrive = if self
+                // non-idempotent) input mappings or the completed listeners
+                // (#1398 review). (A timer boundary's failure never reaches
+                // here: the host arms it via `arm_boundaries_preserving_host`,
+                // which keeps the host's effect and raises a boundary-scoped
+                // `BoundaryTimer` incident itself.)
+                let redrive = if self
                     .state
                     .instances
                     .get(&instance_key)
@@ -6950,16 +6947,6 @@ impl Engine {
                 } else {
                     state::IoMappingRedrive::ActivationBodyPending
                 };
-                let redrive = failure
-                    .boundary_timer
-                    .as_ref()
-                    .map(
-                        |boundary_element_id| state::IoMappingRedrive::BoundaryTimer {
-                            boundary_element_id: boundary_element_id.clone(),
-                            base: scope,
-                        },
-                    )
-                    .unwrap_or(body_redrive);
                 let event = self.expression_incident(
                     instance_key,
                     element_instance_key,
@@ -6968,6 +6955,48 @@ impl Engine {
                     Some(redrive),
                 );
                 (vec![event], Vec::new())
+            }
+        }
+    }
+
+    /// Arms `element_id`'s boundary events for a host whose activation effect
+    /// (its job / user-task record / inner-flow spawn) is already planned in
+    /// `events`. A TIMER boundary's expression failure must NOT discard that
+    /// effect (#1398 review): the host stays live, the boundary is left
+    /// un-armed, and the incident carries a boundary-scoped
+    /// [`state::IoMappingRedrive::BoundaryTimer`] redrive so resolution re-arms
+    /// ONLY that timer (a whole-body re-drive would duplicate the host's job /
+    /// task / subscriptions). Any OTHER boundary failure (a message/signal name
+    /// or correlation key) propagates, failing the activation body as before.
+    fn arm_boundaries_preserving_host(
+        &mut self,
+        events: &mut Vec<Event>,
+        instance_key: Key,
+        element_instance_key: Key,
+        scope: Key,
+        element_id: &str,
+    ) -> Result<(), expression::Failure> {
+        match self.arm_boundary_events(instance_key, element_instance_key, scope, element_id) {
+            Ok(armed) => {
+                events.extend(armed);
+                Ok(())
+            }
+            Err(failure) => {
+                if let Some(boundary_element_id) = failure.boundary_timer.clone() {
+                    events.push(self.expression_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id.to_string(),
+                        failure,
+                        Some(state::IoMappingRedrive::BoundaryTimer {
+                            boundary_element_id,
+                            base: scope,
+                        }),
+                    ));
+                    Ok(())
+                } else {
+                    Err(failure)
+                }
             }
         }
     }
@@ -7043,12 +7072,13 @@ impl Engine {
                             cancel: false,
                         });
                     }
-                    events.extend(self.arm_boundary_events(
+                    self.arm_boundaries_preserving_host(
+                        &mut events,
                         instance_key,
                         element_instance_key,
                         scope,
                         &element_id,
-                    )?);
+                    )?;
                     return Ok((events, followups));
                 }
                 // Zeebe `BpmnJobBehavior.evaluateJobExpressions`: a failed
@@ -7109,39 +7139,16 @@ impl Engine {
                         variables: catalog_var,
                     });
                 }
-                // Arm timers/subscriptions for every attached boundary event.
-                // A TIMER boundary's expression failure is the one
-                // activation-body failure that does NOT discard the host's job
-                // (#1398 review): the job is already minted above and stays
-                // live, the boundary is simply not armed, and the incident
-                // carries a boundary-scoped `BoundaryTimer` redrive so
-                // resolution re-arms ONLY that timer. Any OTHER boundary
-                // failure (a message/signal name or correlation key) still
-                // fails the whole activation body, as before.
-                match self.arm_boundary_events(
+                // Arm timers/subscriptions for every attached boundary event,
+                // preserving the already-minted job on a timer-boundary failure
+                // (#1398 review).
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                ) {
-                    Ok(armed) => events.extend(armed),
-                    Err(failure) => {
-                        if let Some(boundary_element_id) = failure.boundary_timer.clone() {
-                            events.push(self.expression_incident(
-                                instance_key,
-                                element_instance_key,
-                                element_id.clone(),
-                                failure,
-                                Some(state::IoMappingRedrive::BoundaryTimer {
-                                    boundary_element_id,
-                                    base: scope,
-                                }),
-                            ));
-                        } else {
-                            return Err(failure);
-                        }
-                    }
-                }
+                )?;
             }
             // A user task creates a user task record and parks the token; a
             // CompleteUserTask releases it. The assignment/scheduling/priority
@@ -7263,12 +7270,13 @@ impl Engine {
                         ));
                     }
                 }
-                events.extend(self.arm_boundary_events(
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                )?);
+                )?;
             }
             // A timer / message / signal intermediate catch event arms its
             // trigger (timer or subscription) and parks the token; the clock
@@ -7330,13 +7338,15 @@ impl Engine {
             // boundary.
             Some(ElementKind::SubProcess { start_event }) => {
                 // A sub-process can also carry timer/message boundary events;
-                // arm them just like a service task's.
-                events.extend(self.arm_boundary_events(
+                // arm them just like a service task's, preserving the
+                // already-planned inner-flow spawn on a timer-boundary failure.
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                )?);
+                )?;
                 followups.push(Step::Activate {
                     instance_key,
                     element_id: start_event,
@@ -7366,13 +7376,16 @@ impl Engine {
                 ..
             }) => {
                 // Boundary events on the call activity are armed like any other
-                // activity (timers/messages interrupt the wait for the child).
-                events.extend(self.arm_boundary_events(
+                // activity (timers/messages interrupt the wait for the child),
+                // preserving the already-planned child spawn on a
+                // timer-boundary failure.
+                self.arm_boundaries_preserving_host(
+                    &mut events,
                     instance_key,
                     element_instance_key,
                     scope,
                     &element_id,
-                )?);
+                )?;
                 let (spawn_events, spawn_followups) = self.spawn_call_activity_child(
                     instance_key,
                     element_instance_key,
@@ -7696,26 +7709,18 @@ impl Engine {
             Err(failure) => {
                 // A boundary expression failure fails the body's activation
                 // (#1398): nothing (not even `MultiInstanceActivated`) is kept,
-                // and resolution re-drives the body activation. A TIMER
-                // boundary's failure is the exception: the body's
-                // `MultiInstanceActivated` and any already-armed boundaries stay
-                // live, so resolution re-arms ONLY that boundary's timer
-                // (`BoundaryTimer`) rather than re-running the whole fan-out
-                // (#1398 review).
+                // and resolution re-drives the body activation. The body has no
+                // separately-live host effect yet (its fan-out runs AFTER the
+                // arming below), so a full `MiBodyActivation` re-drive is exact
+                // — there is no host job to duplicate, unlike the leaf
+                // service-task host (#1398 review).
                 self.next_local = key_mark;
-                let redrive = failure.boundary_timer.as_ref().map_or(
-                    state::IoMappingRedrive::MiBodyActivation,
-                    |boundary_element_id| state::IoMappingRedrive::BoundaryTimer {
-                        boundary_element_id: boundary_element_id.clone(),
-                        base: scope,
-                    },
-                );
                 let event = self.expression_incident(
                     instance_key,
                     body_key,
                     element_id,
                     failure,
-                    Some(redrive),
+                    Some(state::IoMappingRedrive::MiBodyActivation),
                 );
                 return (vec![event], Vec::new());
             }
