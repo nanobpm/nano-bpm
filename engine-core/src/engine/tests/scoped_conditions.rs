@@ -399,3 +399,95 @@ fn multi_instance_completion_condition_sees_output_mapped_value() {
         "third child must not start"
     );
 }
+
+/// Candidate selection is driven by the scope each referenced name RESOLVES to
+/// from the subscription's element, never by a same-named write anywhere else.
+/// A parked catch inside a sub-process that declares a local `status` resolves
+/// `status` to that sub-process scope, so a root `status` write — even buried
+/// in a large batch of unrelated root writes — must not re-trigger it; only a
+/// write into the sub-process scope may.
+///
+/// The same test bounds the filter's WORK (Copilot #1419): each referenced
+/// name costs ONE write lookup per subscription, so a batch of N unrelated
+/// writes is inspected once, never scanned N times.
+#[test]
+fn reevaluation_matches_only_writes_in_the_referenced_names_resolved_scope() {
+    let def = ProcessBuilder::new("cond-reeval-shadowed")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=null".to_string(),
+                    target: "status".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .conditional_intermediate_catch_event("gate", "=status = \"done\"")
+        .contained_in("gate", "sub")
+        .service_task("after", "after")
+        .contained_in("after", "sub")
+        .end_event("after_end")
+        .contained_in("after_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "gate")
+        .connect("gate", "after")
+        .connect("after", "after_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let ik = create_instance_key(&mut engine, "cond-reeval-shadowed");
+    assert!(!has_job(&mut engine, "after"), "gate must park first");
+
+    // A large batch of root writes: 64 unrelated names plus a ROOT `status`
+    // write the parked catch cannot see (its sub-process local shadows the
+    // root). Selecting the catch's candidacy costs ONE scope resolution for its
+    // single referenced name — never one per changed variable.
+    let mut batch = vars(&[("status", Value::Str("done".to_string()))]);
+    for i in 0..64 {
+        batch.insert(format!("noise{i}"), Value::Int(i));
+    }
+    crate::engine::resolve::reset_conditional_write_checks();
+    let out = engine
+        .apply_command(Command::set_variables(ik, batch))
+        .unwrap();
+    assert!(
+        out.iter()
+            .all(|e| !matches!(e, Event::ConditionalTriggered { .. })),
+        "a root `status` write is invisible to the catch's shadowed scope"
+    );
+    assert_eq!(
+        crate::engine::resolve::conditional_write_checks(),
+        1,
+        "candidate selection inspects each referenced name once, \
+         not every changed variable"
+    );
+    assert!(!has_job(&mut engine, "after"));
+
+    // The same name written into the sub-process scope the catch resolves
+    // `status` to DOES re-evaluate it.
+    let gate_eik = engine
+        .conditional_subscriptions()
+        .first()
+        .map(|s| s.element_instance_key)
+        .expect("parked conditional subscription");
+    let sub_scope = *engine.instance(ik).unwrap().scopes.get(&gate_eik).unwrap();
+    engine
+        .apply_command(Command::set_variables_scoped(
+            sub_scope,
+            vars(&[("status", Value::Str("done".to_string()))]),
+            true,
+        ))
+        .unwrap();
+    assert!(
+        has_job(&mut engine, "after"),
+        "a write into the referenced name's resolved scope must fire the catch"
+    );
+}

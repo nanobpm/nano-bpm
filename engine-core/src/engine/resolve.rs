@@ -1041,3 +1041,36 @@ mod tests {
         );
     }
 }
+
+// Test-only probe counting how often the conditional re-evaluation candidate
+// filter inspects a changed write, so a regression test can bound its work:
+// each referenced name must cost ONE lookup per subscription, never one scan
+// per changed variable (the O(subscriptions x references x changed variables)
+// blow-up Copilot flagged on #1419). A `thread_local` keeps the production
+// `Engine` struct and its `Send` guarantee untouched; `cfg(test)` compiles it
+// out of every shipped build. It lives BELOW the trailing `#[cfg(test)] mod
+// tests` because the feel_fallback_lint source scan stops at the first
+// column-0 `#[cfg(test)]` — a probe above the production code would hide every
+// FEEL site below it from the lint.
+#[cfg(test)]
+thread_local! {
+    static CONDITIONAL_WRITE_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zeroes the [`CONDITIONAL_WRITE_CHECKS`] probe before the measured command.
+#[cfg(test)]
+pub(crate) fn reset_conditional_write_checks() {
+    CONDITIONAL_WRITE_CHECKS.with(|c| c.set(0));
+}
+
+/// Reads the [`CONDITIONAL_WRITE_CHECKS`] probe after the measured command.
+#[cfg(test)]
+pub(crate) fn conditional_write_checks() -> u64 {
+    CONDITIONAL_WRITE_CHECKS.with(std::cell::Cell::get)
+}
+
+/// Records one changed-write inspection by the candidate filter.
+#[cfg(test)]
+pub(crate) fn note_conditional_write_check() {
+    CONDITIONAL_WRITE_CHECKS.with(|c| c.set(c.get() + 1));
+}

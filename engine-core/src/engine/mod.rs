@@ -4773,13 +4773,15 @@ impl Engine {
         if self.state.conditional_subscriptions.is_empty() {
             return scan_end;
         }
-        // Which variables changed — per instance, as `(owning scope, name)` — and
-        // which conditional subscriptions were opened, since the last pass. The
-        // scope is kept (#1335) so a write only re-triggers subscriptions that can
-        // actually SEE it: a local write invisible to (or shadowed from) a
-        // subscription's scope must not re-fire it, or a non-interrupting boundary
-        // whose handler writes a local of the same name would loop forever.
-        let mut changed: HashMap<Key, std::collections::HashSet<(Key, String)>> = HashMap::new();
+        // Which variables changed — per instance, as name -> the set of scopes
+        // that name was written in — and which conditional subscriptions were
+        // opened, since the last pass. The scope is kept (#1335) so a write only
+        // re-triggers subscriptions that can actually SEE it: a local write
+        // invisible to (or shadowed from) a subscription's scope must not
+        // re-fire it, or a non-interrupting boundary whose handler writes a
+        // local of the same name would loop forever.
+        let mut changed: HashMap<Key, HashMap<String, std::collections::HashSet<Key>>> =
+            HashMap::new();
         let mut opened: std::collections::HashSet<Key> = std::collections::HashSet::new();
         for event in &log[cursor..scan_end] {
             match event {
@@ -4796,7 +4798,7 @@ impl Engine {
                     // conditional event may already hold at activation).
                     let entry = changed.entry(*instance_key).or_default();
                     for name in variables.keys() {
-                        entry.insert((*instance_key, name.clone()));
+                        entry.entry(name.clone()).or_default().insert(*instance_key);
                     }
                 }
                 Event::ScopedVariablesUpdated {
@@ -4811,7 +4813,7 @@ impl Engine {
                     };
                     let entry = changed.entry(*instance_key).or_default();
                     for name in variables.keys() {
-                        entry.insert((scope, name.clone()));
+                        entry.entry(name.clone()).or_default().insert(scope);
                     }
                 }
                 Event::ConditionalSubscriptionCreated {
@@ -4828,6 +4830,10 @@ impl Engine {
         // Collect the subscriptions to (re-)evaluate, deterministically by key: a
         // newly opened one, or one for which a referenced variable changed in the
         // scope that the subscription's own scope chain resolves that name to.
+        // Each referenced name's resolving scope is computed ONCE per
+        // subscription and the write check is two hash lookups (no scan, no
+        // clone), so a large unrelated update batch costs O(referenced vars) per
+        // subscription, never O(subscriptions x references x changed variables).
         let mut candidates: Vec<Key> = self
             .state
             .conditional_subscriptions
@@ -4837,13 +4843,11 @@ impl Engine {
                     && (opened.contains(&s.key)
                         || changed.get(&s.instance_key).is_some_and(|writes| {
                             s.referenced_vars.iter().any(|v| {
-                                writes.iter().any(|(scope, name)| {
-                                    name == v
-                                        && self.resolving_scope(
-                                            s.instance_key,
-                                            s.element_instance_key,
-                                            v,
-                                        ) == Some(*scope)
+                                #[cfg(test)]
+                                resolve::note_conditional_write_check();
+                                writes.get(v).is_some_and(|scopes| {
+                                    self.resolving_scope(s.instance_key, s.element_instance_key, v)
+                                        .is_some_and(|scope| scopes.contains(&scope))
                                 })
                             })
                         }))
