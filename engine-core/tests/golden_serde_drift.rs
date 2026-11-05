@@ -588,6 +588,16 @@ fn build_event_witnesses() -> Vec<Event> {
         scope_id: Some("sub".to_string()),
     };
     vec![
+        // The #1402 carried-selection frame: a split gateway journals the
+        // outgoing-flow indices it picked while ACTIVATING so completion takes
+        // exactly those flows. The executed corpus completes its gateways in
+        // the same command that selects them, so the frame is pinned here.
+        Event::GatewayRouteSelected {
+            instance_key: 1,
+            element_instance_key: 2,
+            element_id: "g".to_string(),
+            flows: vec![0, 2],
+        },
         Event::ProcessInstanceModified {
             instance_key: 1,
             activate_instructions: vec![ActivateElementInstruction {

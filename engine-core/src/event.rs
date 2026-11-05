@@ -475,6 +475,24 @@ pub enum Event {
         element_id: ElementId,
     },
 
+    /// A split gateway (exclusive, or an inclusive fork) selected its outgoing
+    /// flow(s) while ACTIVATING (Zeebe `onActivate`, #1402). The selection is
+    /// journaled so completion takes exactly these flows instead of
+    /// re-evaluating the conditions: FEEL expressions are not required to be
+    /// deterministic (and a listener may rewrite a condition variable), so a
+    /// completion-time re-evaluation could pick a different route — or raise a
+    /// routing incident after `ElementActivated`. Cleared when the gateway
+    /// completes. Indices are into the element's outgoing-flow list (document
+    /// order), exactly as `Engine::take_flow` consumes them.
+    GatewayRouteSelected {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        /// The selected outgoing-flow indices (exactly one for an exclusive
+        /// gateway, one or more for an inclusive fork).
+        flows: Vec<usize>,
+    },
+
     /// A token moved along a sequence flow from one element to another.
     SequenceFlowTaken {
         instance_key: Key,
@@ -1526,6 +1544,7 @@ impl Event {
             | Event::ElementActivated { instance_key, .. }
             | Event::ElementCompleting { instance_key, .. }
             | Event::ElementCompleted { instance_key, .. }
+            | Event::GatewayRouteSelected { instance_key, .. }
             | Event::SequenceFlowTaken { instance_key, .. }
             | Event::ParallelJoinOpened { instance_key, .. }
             | Event::ParallelJoinTokenArrived { instance_key, .. }
