@@ -357,6 +357,14 @@ enum Step {
         /// raised before `ElementActivated`, [`state::IoMappingRedrive::ActivationPending`]):
         /// a successful re-run then emits `ElementActivated` first.
         pending: bool,
+        /// `Some(n)` resumes a partially-drained `start` execution-listener
+        /// chain at listener index `n` (a mid-chain listener job-type failure,
+        /// #1390): the activation-time work before the chain — input mappings
+        /// and a split gateway's routing gate (#1402) — already succeeded, so
+        /// the retry must NOT re-run it (a gateway's journaled selection is
+        /// kept verbatim and its `ElementActivated` is not repeated). `None`
+        /// re-drives the full activation body.
+        resume_listener_at: Option<usize>,
     },
     /// Run the activation body of an element a process-instance modification
     /// already activated and seeded with element-local variables (Zeebe sets a
@@ -3078,6 +3086,35 @@ impl Engine {
                             });
                         } else if matches!(
                             redrive,
+                            Some(
+                                state::IoMappingRedrive::Activation
+                                    | state::IoMappingRedrive::ActivationPending
+                            )
+                        ) {
+                            // An activation-phase failure on these kinds — the
+                            // split-gateway routing gate (#1402): the token is
+                            // still ACTIVATING, so re-drive the gated activation
+                            // (input re-application, routing gate, the unopened
+                            // `start` listener chain). Re-driving `Complete`
+                            // would bypass the gate: a still-failing retry would
+                            // raise the routing incident AFTER `ElementActivated`,
+                            // and a successful one would skip the listener jobs
+                            // the failed attempt never created.
+                            queue.push_back(Step::RetryActivation {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                pending: matches!(
+                                    redrive,
+                                    Some(state::IoMappingRedrive::ActivationPending)
+                                ),
+                                // A routing-gate incident is raised before any
+                                // listener job, so there is never a chain to
+                                // resume.
+                                resume_listener_at: None,
+                            });
+                        } else if matches!(
+                            redrive,
                             Some(state::IoMappingRedrive::CallActivitySpawn)
                                 | Some(state::IoMappingRedrive::AdHocCallActivitySpawn { .. })
                         ) {
@@ -3257,6 +3294,25 @@ impl Engine {
                     // failures re-drive uniformly by lifecycle phase — `ACTIVATING`
                     // re-applies inputs, `COMPLETING` re-applies outputs).
                     state::IncidentKind::IoMapping | state::IncidentKind::ExtractValueError => {
+                        // A mid-chain `start` listener's job-type failure
+                        // (#1390) parks the element with the pre-chain
+                        // activation already done; the retry resumes the chain
+                        // at the failed listener rather than re-running the
+                        // activation body (which would re-apply inputs and, for
+                        // a split gateway, re-select the journaled route and
+                        // repeat `ElementActivated`, #1402).
+                        let resume_listener_at =
+                            if matches!(redrive, Some(state::IoMappingRedrive::Activation))
+                                && matches!(kind, state::IncidentKind::ExtractValueError)
+                            {
+                                self.listener_resume_index(
+                                    instance_key,
+                                    element_instance_key,
+                                    &element_id,
+                                )
+                            } else {
+                                None
+                            };
                         let step: Option<Step> = match redrive {
                             // Mainstream input: re-run the activation body so the
                             // now-fixed inputs are re-applied before the element's
@@ -3268,6 +3324,7 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                     pending: false,
+                                    resume_listener_at,
                                 })
                             }
                             // The same, for a token still in ACTIVATING: the
@@ -3278,6 +3335,7 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                     pending: true,
+                                    resume_listener_at,
                                 })
                             }
                             // Output re-projection. A mainstream leaf element
@@ -4421,6 +4479,79 @@ impl Engine {
                                 });
                             }
                         }
+                    }
+                }
+
+                // 5c. A split gateway paused mid-activation (a `start` listener
+                //     chain is draining) carries its activation-time outgoing-flow
+                //     selection as SOURCE-definition indices (`gateway_routes`,
+                //     #1402), which the applier cannot remap — a sequence-flow
+                //     index is a document-order position, not an id, and the
+                //     mapping instructions name elements, not flows. Migration
+                //     swaps the definition those indices are read against, so a
+                //     reordered, removed, or rewired target flow would complete
+                //     the migrated gateway onto the wrong branch (or panic
+                //     `take_flow` on an index the target no longer has). Require
+                //     the target gateway's outgoing list to carry the SAME flows
+                //     in the SAME order — each target flow's condition, default
+                //     flag, and (mapped) target equal to the source's — so every
+                //     carried index resolves identically. This is the flow-level
+                //     analogue of the `MigratedJoinFlowMissing` guard above; a
+                //     migration that rewires a paused gateway's flows is rejected
+                //     until flow-index remapping lands.
+                let mut carried: Vec<(String, Vec<usize>)> = instance
+                    .gateway_routes
+                    .iter()
+                    .filter(|(_, flows)| !flows.is_empty())
+                    .filter_map(|(eik, flows)| {
+                        instance
+                            .active
+                            .get(eik)
+                            .map(|eid| (eid.clone(), flows.clone()))
+                    })
+                    .collect();
+                carried.sort();
+                for (src, carried_flows) in carried {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "a carried route's gateway is active, so step 5 guarantees it is mapped"
+                    )]
+                    let tgt = mapped.get(&src).expect(
+                        "a carried route's gateway is active, so step 5 guarantees it is mapped",
+                    );
+                    let source_flows = source_def
+                        .definition
+                        .element(&src)
+                        .map(|e| e.outgoing.clone())
+                        .unwrap_or_default();
+                    let target_flows = target
+                        .definition
+                        .element(tgt)
+                        .map(|e| e.outgoing.clone())
+                        .unwrap_or_default();
+                    // The source flow's target migrates by the element mapping;
+                    // an unmapped flow target keeps its id (the applier's
+                    // `remap_id` does the same).
+                    let remap_target =
+                        |to: &str| mapped.get(to).cloned().unwrap_or_else(|| to.to_string());
+                    let same_flow = |sf: &SequenceFlow, tf: &SequenceFlow| {
+                        remap_target(&sf.to) == tf.to
+                            && sf.is_default == tf.is_default
+                            && sf.condition.as_ref().map(|c| &c.expression)
+                                == tf.condition.as_ref().map(|c| &c.expression)
+                    };
+                    let flows_preserved = source_flows.len() == target_flows.len()
+                        && source_flows
+                            .iter()
+                            .zip(target_flows.iter())
+                            .all(|(sf, tf)| same_flow(sf, tf));
+                    if !flows_preserved {
+                        return Err(EngineError::MigratedGatewayRouteMissing {
+                            instance_key,
+                            source_element_id: src.clone(),
+                            target_element_id: tgt.clone(),
+                            flow_index: carried_flows[0],
+                        });
                     }
                 }
 
@@ -5693,18 +5824,20 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id,
-                pending,
+                pending: activation_pending,
+                resume_listener_at,
             } => {
-                // The element instance is already ACTIVATED (parked on the
-                // resolved input-mapping incident); reconstruct its enclosing
-                // scope and re-run the activation body so the now-fixed input
-                // mappings are re-applied before the element's behaviour runs.
+                // The element instance is parked on the resolved activation-time
+                // incident; re-drive the activation so the now-fixed input
+                // mappings / routing conditions are re-applied before the
+                // element's behaviour runs.
                 let scope = self.scope_of(instance_key, element_instance_key);
                 // Re-evaluate in the same view as the first attempt: an element
                 // whose own scope is already registered (a modification seeded
                 // element-local variables, or a sub-process scope that holds no
                 // locals yet) evaluates in that scope; otherwise the enclosing
-                // scope.
+                // scope. This applies to split gateways too — a
+                // modification-seeded gateway's gate must see its locals.
                 let registered = self
                     .state
                     .instances
@@ -5716,6 +5849,76 @@ impl Engine {
                 } else {
                     scope
                 };
+                // A mid-chain `start` listener failure resumes the chain at the
+                // failed listener: the pre-chain activation (input mappings, a
+                // split gateway's routing gate) already succeeded, so it is NOT
+                // re-run — the gateway keeps its journaled selection and its
+                // already-emitted `ElementActivated` is repeated only when the
+                // token is still ACTIVATING (`pending`).
+                if let Some(resume_at) = resume_listener_at {
+                    let activated = Event::ElementActivated {
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        scope,
+                    };
+                    let mut events = Vec::new();
+                    if activation_pending {
+                        events.push(activated);
+                    }
+                    let (chain_events, chain_followups) = self.advance_listener(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        crate::model::ListenerEventType::Start,
+                        resume_at.saturating_sub(1),
+                        scope,
+                    );
+                    events.extend(chain_events);
+                    return (events, chain_followups);
+                }
+                // A split gateway (exclusive, or an inclusive fork) re-runs the
+                // FULL gated activation (`Step::Activate`, #1402): the routing
+                // gate, the journaled selection, and the `start` listener chain
+                // the failed attempt never opened. A bare body redrive would
+                // activate a retry that still matches no flow (raising the
+                // routing incident AFTER `ElementActivated`) and would skip the
+                // listener chain on a successful one.
+                let kind = self.element_kind(instance_key, &element_id);
+                let is_split_gateway = matches!(
+                    kind,
+                    Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway)
+                ) && self.join_kind(instance_key, &element_id).is_none();
+                if is_split_gateway {
+                    // Re-drive the gated activation ON the parked element
+                    // instance (Zeebe's resolve re-runs `onActivate` on the same
+                    // element instance — no second `ELEMENT_ACTIVATING`). The
+                    // parked token was never observable (no `ElementActivated`,
+                    // no listener job, no scope writes precede the incident, and
+                    // a gateway arms no boundary events), so reusing it carries
+                    // nothing stale: the gate re-selects and re-journals the
+                    // route, overwriting any carried selection the failed attempt
+                    // recorded.
+                    let activated = Event::ElementActivated {
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        scope,
+                    };
+                    let (events, followups) = self.activate_body_in(
+                        instance_key,
+                        element_id,
+                        element_instance_key,
+                        scope,
+                        view,
+                    );
+                    return if activation_pending {
+                        (gate_activated(events, activated, 0), followups)
+                    } else {
+                        (events, followups)
+                    };
+                }
+                // Any other element: re-run the activation body.
                 let activated = Event::ElementActivated {
                     instance_key,
                     element_instance_key,
@@ -5729,7 +5932,7 @@ impl Engine {
                     scope,
                     view,
                 );
-                if pending {
+                if activation_pending {
                     (gate_activated(events, activated, 0), followups)
                 } else {
                     (events, followups)
@@ -6106,6 +6309,54 @@ impl Engine {
             Arc::make_mut(&mut activation_vars).extend(input_updates);
         }
 
+        // A split gateway's routing gate (#1402) runs BEFORE the `start`
+        // listener chain opens: the chain defers the gateway's body, and a
+        // listener completing with variable writes would otherwise be
+        // re-evaluated into the route — the selection must be fixed while the
+        // gateway is ACTIVATING, against the post-input view. On success the
+        // selection is journaled (`GatewayRouteSelected`) so the drained chain
+        // completes through exactly these flows; on failure the routing
+        // incident parks the token ACTIVATING (`gate_activated` withholds
+        // `ElementActivated`), ahead of any listener job.
+        let gateway_selection = match kind {
+            Some(ElementKind::ExclusiveGateway) => Some(
+                self.select_exclusive_flow(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    Some(&activation_vars),
+                )
+                .map(|index| vec![index]),
+            ),
+            Some(ElementKind::InclusiveGateway) => Some(self.select_inclusive_flows(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                Some(&activation_vars),
+            )),
+            _ => None,
+        };
+        if let Some(selection) = gateway_selection {
+            match selection {
+                Ok(flows) => events.push(Event::GatewayRouteSelected {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                    flows,
+                }),
+                Err(failure) => {
+                    events.push(self.routing_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        Some(state::IoMappingRedrive::Activation),
+                    ));
+                    return (events, followups);
+                }
+            }
+        }
+
         // Start execution listeners (ADR 0037): before the element enacts its
         // own behaviour (creating a job, routing a gateway, opening a
         // sub-process) it runs a sequential chain of `start` listener jobs. The
@@ -6197,6 +6448,31 @@ impl Engine {
     /// Builds the incident for an expression [`expression::Failure`] (Zeebe
     /// `BpmnIncidentBehavior.createIncident(failure, context)`): the failure's
     /// error type selects the incident kind, its message is the reason.
+    /// The single construction site for a gateway routing incident (Zeebe
+    /// `CONDITION_ERROR`): every exclusive/inclusive selection failure — at
+    /// activation, completion, or after an `end` listener chain — raises it
+    /// through here, so kind and reason cannot drift between paths.
+    fn routing_incident(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        failure: RoutingFailure,
+        redrive: Option<state::IoMappingRedrive>,
+    ) -> Event {
+        Event::IncidentRaised {
+            incident_key: self.mint_key(),
+            instance_key,
+            element_instance_key,
+            element_id,
+            kind: failure.kind,
+            redrive,
+            reason: failure.reason,
+            job_key: None,
+            created_at: self.now,
+        }
+    }
+
     fn expression_incident(
         &mut self,
         instance_key: Key,
@@ -6662,8 +6938,30 @@ impl Engine {
             // and immediately completes (no job). Its FEEL expression is
             // evaluated at completion (see `complete`), where a failure raises
             // an ExpressionEvaluation incident that re-evaluates on resolution.
-            // Pass-through elements (events, exclusive gateway, parallel split)
-            // complete immediately; routing happens at completion.
+            // A split gateway (exclusive; inclusive fork — a join is routed by
+            // `activate_join`) selects its outgoing flow(s) in Zeebe's
+            // `onActivate`, BEFORE `transitionToActivated`
+            // (`ExclusiveGatewayProcessor.findSequenceFlowToTake`,
+            // `InclusiveGatewayProcessor.findSequenceFlowsToTake`). The
+            // selection already ran in `activate_body_in` — against the
+            // post-input view, ahead of any `start` listener chain — and is
+            // journaled (`GatewayRouteSelected`): a routing failure raised its
+            // incident while the gateway was still ACTIVATING (the `Activation`
+            // redrive is re-tagged `ActivationPending` by `gate_activated`, so
+            // resolution re-runs the gate and emits `ElementActivated` only
+            // once a flow matches). Reaching this arm means the selection
+            // succeeded; completion takes the journaled flows verbatim, so a
+            // non-deterministic condition or a listener's variable write cannot
+            // change the route after `ElementActivated`.
+            Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway) => {
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                });
+            }
+            // Pass-through elements (events, parallel split) complete
+            // immediately; routing happens at completion.
             Some(_) => {
                 followups.push(Step::Complete {
                     instance_key,
@@ -11151,6 +11449,40 @@ impl Engine {
         self.torn_down_scopes.insert(scope);
         (self.scope_teardown_events(instance_key, scope), Vec::new())
     }
+
+    /// The `start` execution-listener index a resolved mid-chain job-type
+    /// failure (#1390) resumes at: one past the highest-index listener job the
+    /// element already minted, or `None` when no `start` listener job exists
+    /// (the failure preceded the chain — e.g. the first listener's job type —
+    /// so the full activation body re-runs). Counting minted jobs — not
+    /// completions — keeps the index correct when a completed listener's
+    /// writes are what the failed expression referenced.
+    fn listener_resume_index(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) -> Option<usize> {
+        self.state
+            .jobs
+            .values()
+            .filter(|j| {
+                j.instance_key == instance_key
+                    && j.element_instance_key == element_instance_key
+                    && j.element_id == element_id
+            })
+            .filter_map(|j| match j.kind {
+                state::JobKind::ExecutionListener {
+                    event_type: crate::model::ListenerEventType::Start,
+                    index,
+                    ..
+                } => Some(index),
+                _ => None,
+            })
+            .max()
+            .map(|i| i + 1)
+    }
+
     /// completed (ADR 0037). If another listener remains in the chain, its job is
     /// created; otherwise the chain has drained and the deferred lifecycle
     /// transition runs — a `Start` chain enacts the element's activation
@@ -11705,18 +12037,30 @@ impl Engine {
     /// Selects the outgoing flow an exclusive gateway takes, evaluating each
     /// conditional flow in document order against the instance variables and
     /// falling back to the explicit `default` flow when none matches. Returns the
-    /// chosen flow's index in the outgoing list (`Ok(Some)`), `Ok(None)` when nothing matches and
-    /// there is no default (the caller raises a no-matching-flow incident), or
-    /// `Err(reason)` when a condition failed to evaluate (an expression incident).
-    /// Pure over the current variables, so the end-listener gate can re-select at
-    /// [`finalize_exclusive_gateway`] time without captured state.
+    /// chosen flow's index in the outgoing list, or the [`RoutingFailure`] (no
+    /// match and no default, or a condition that failed to evaluate) the caller
+    /// raises as an incident via [`Engine::routing_incident`].
+    ///
+    /// `vars` is the variable view to evaluate against: `Some` at activation
+    /// time (the body's post-input view — input mappings are not yet applied to
+    /// state when the body runs, so reading state would miss them), `None` to
+    /// read the element's live scope (completion, incident retries, listener
+    /// chains — every path whose inputs are already applied).
     fn select_exclusive_flow(
         &self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-    ) -> Result<Option<usize>, String> {
-        let variables = self.variables_for_element(instance_key, element_instance_key);
+        vars: Option<&HashMap<String, Value>>,
+    ) -> Result<usize, RoutingFailure> {
+        let owned;
+        let variables = match vars {
+            Some(v) => v,
+            None => {
+                owned = self.variables_for_element(instance_key, element_instance_key);
+                &owned
+            }
+        };
         let mut default_flow = None;
         for (index, flow) in self
             .outgoing(instance_key, element_id)
@@ -11731,21 +12075,36 @@ impl Engine {
                 continue;
             }
             match &flow.condition {
-                None => return Ok(Some(index)),
-                Some(condition) => match condition.eval(&variables) {
-                    Ok(true) => return Ok(Some(index)),
+                None => return Ok(index),
+                Some(condition) => match condition.eval(variables) {
+                    Ok(true) => return Ok(index),
                     Ok(false) => continue,
                     Err(err) => {
-                        return Err(format!(
-                            "failed to evaluate condition '{}' at exclusive gateway \
-                             '{element_id}': {}",
-                            condition.expression, err.0
+                        return Err(RoutingFailure::condition(
+                            "exclusive",
+                            element_id,
+                            &condition.expression,
+                            &err.0,
                         ));
                     }
                 },
             }
         }
-        Ok(default_flow)
+        default_flow.ok_or_else(|| RoutingFailure::no_match("exclusive", element_id))
+    }
+
+    /// The outgoing-flow selection a split gateway completion must take: the
+    /// one journaled at activation ([`Event::GatewayRouteSelected`], #1402) if
+    /// present, else `None` — a gateway completing without a recorded
+    /// selection (a legacy journal, or an incident retry whose re-run only
+    /// re-gates activation) re-selects from its live scope exactly as before.
+    fn gateway_route(&self, instance_key: Key, element_instance_key: Key) -> Option<Vec<usize>> {
+        self.state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.gateway_routes.get(&element_instance_key))
+            .cloned()
+            .filter(|flows| !flows.is_empty())
     }
 
     fn complete_exclusive_gateway(
@@ -11754,30 +12113,14 @@ impl Engine {
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected =
-            match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
-                Ok(sel) => sel,
-                Err(reason) => {
-                    let incident_key = self.mint_key();
-                    return (
-                        vec![Event::IncidentRaised {
-                            incident_key,
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            kind: state::IncidentKind::ExpressionEvaluation,
-                            redrive: None,
-                            reason,
-                            job_key: None,
-                            created_at: self.now,
-                        }],
-                        Vec::new(),
-                    );
-                }
-            };
-
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows[0]),
+            None => {
+                self.select_exclusive_flow(instance_key, element_instance_key, &element_id, None)
+            }
+        };
         match selected {
-            Some(flow_index) => {
+            Ok(flow_index) => {
                 let scope = self.scope_of(instance_key, element_instance_key);
                 let mut events = vec![Event::ElementCompleting {
                     instance_key,
@@ -11807,32 +12150,29 @@ impl Engine {
                 events.extend(taken);
                 (events, vec![step])
             }
-            None => {
-                // The token stays active (parked on the incident) so the instance
-                // does not falsely complete.
-                let incident_key = self.mint_key();
-                let events = vec![Event::IncidentRaised {
-                    incident_key,
+            // Normally unreachable: the selection already succeeded while the
+            // gateway was ACTIVATING (`run_activation_body`, #1402). Kept total:
+            // the token stays parked on the incident so the instance does not
+            // falsely complete.
+            Err(failure) => (
+                vec![self.routing_incident(
                     instance_key,
                     element_instance_key,
-                    element_id: element_id.clone(),
-                    kind: state::IncidentKind::NoMatchingSequenceFlow,
-                    redrive: None,
-                    reason: format!(
-                        "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
-                    ),
-                    job_key: None,
-                    created_at: self.now,
-                }];
-                (events, Vec::new())
-            }
+                    element_id,
+                    failure,
+                    None,
+                )],
+                Vec::new(),
+            ),
         }
     }
 
     /// Deferred completion of an exclusive gateway whose `end` execution-listener
-    /// chain has drained (ADR 0037). Re-selects the outgoing flow from the
-    /// resident scope (the gateway rested in COMPLETING). Selection is normally
-    /// deterministic, but a listener may have rewritten a condition variable; if
+    /// chain has drained (ADR 0037). Takes the flow selected at activation
+    /// ([`Event::GatewayRouteSelected`], #1402) when one is journaled — the
+    /// chain's variable writes must not change the route chosen before
+    /// `ElementActivated`. A gateway with no recorded selection (a legacy
+    /// journal, or an incident retry) re-selects from the resident scope; if
     /// re-selection now matches nothing (or a condition fails to evaluate) the
     /// gateway raises the same incident its non-listener path would and keeps the
     /// token active, rather than emitting `ElementCompleted` with nowhere to go
@@ -11844,8 +12184,14 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        match self.select_exclusive_flow(instance_key, element_instance_key, &element_id) {
-            Ok(Some(flow_index)) => {
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows[0]),
+            None => {
+                self.select_exclusive_flow(instance_key, element_instance_key, &element_id, None)
+            }
+        };
+        match selected {
+            Ok(flow_index) => {
                 let (taken, step) = self.take_flow(instance_key, &element_id, flow_index, scope);
                 let mut events = vec![Event::ElementCompleted {
                     instance_key,
@@ -11855,61 +12201,49 @@ impl Engine {
                 events.extend(taken);
                 (events, vec![step])
             }
-            Ok(None) => {
-                // No flow matches now (and no default). Keep the token parked on
-                // an incident — do not complete — mirroring the non-listener path.
-                let incident_key = self.mint_key();
-                (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        kind: state::IncidentKind::NoMatchingSequenceFlow,
-                        redrive: None,
-                        reason: format!(
-                            "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
-                        ),
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                )
-            }
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                (
-                    vec![Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Vec::new(),
-                )
-            }
+            // No flow matches now (a listener rewrote a condition variable), or
+            // a condition fails: keep the token parked on an incident — do not
+            // complete — mirroring the non-listener path.
+            Err(failure) => (
+                vec![self.routing_incident(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    failure,
+                    None,
+                )],
+                Vec::new(),
+            ),
         }
     }
 
     /// Inclusive gateway: selects **every** outgoing flow whose condition holds
     /// (an unconditional non-default flow is always taken), falling back to the
     /// explicit `default` flow only when no conditional flow matches. Returns the
-    /// chosen flows' indices in the outgoing list (`Ok(vec)`; an empty vec means nothing matched and there is
-    /// no default — the caller raises a no-matching-flow incident), or
-    /// `Err(reason)` when a condition failed to evaluate. Pure over the current
-    /// variables so the end-listener gate can re-select without captured state.
+    /// chosen flows' indices in the outgoing list (never empty), or the
+    /// [`RoutingFailure`] (no match and no default, or a condition that failed
+    /// to evaluate) the caller raises as an incident.
+    ///
+    /// `vars` is the variable view to evaluate against: `Some` at activation
+    /// time (the body's post-input view — input mappings are not yet applied to
+    /// state when the body runs, so reading state would miss them), `None` to
+    /// read the element's live scope (completion, incident retries, listener
+    /// chains — every path whose inputs are already applied).
     fn select_inclusive_flows(
         &self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
-    ) -> Result<Vec<usize>, String> {
-        let variables = self.variables_for_element(instance_key, element_instance_key);
+        vars: Option<&HashMap<String, Value>>,
+    ) -> Result<Vec<usize>, RoutingFailure> {
+        let owned;
+        let variables = match vars {
+            Some(v) => v,
+            None => {
+                owned = self.variables_for_element(instance_key, element_instance_key);
+                &owned
+            }
+        };
         let mut default_flow = None;
         let mut selected = Vec::new();
         for (index, flow) in self
@@ -11923,22 +12257,24 @@ impl Engine {
             }
             match &flow.condition {
                 None => selected.push(index),
-                Some(condition) => match condition.eval(&variables) {
+                Some(condition) => match condition.eval(variables) {
                     Ok(true) => selected.push(index),
                     Ok(false) => continue,
                     Err(err) => {
-                        return Err(format!(
-                            "failed to evaluate condition '{}' at inclusive gateway \
-                             '{element_id}': {}",
-                            condition.expression, err.0
+                        return Err(RoutingFailure::condition(
+                            "inclusive",
+                            element_id,
+                            &condition.expression,
+                            &err.0,
                         ));
                     }
                 },
             }
         }
         if selected.is_empty() {
-            if let Some(d) = default_flow {
-                selected.push(d);
+            match default_flow {
+                Some(d) => selected.push(d),
+                None => return Err(RoutingFailure::no_match("inclusive", element_id)),
             }
         }
         Ok(selected)
@@ -11971,10 +12307,14 @@ impl Engine {
 
     /// Routes an activated inclusive gateway (split or accepted join): takes
     /// every selected outgoing flow, gating the completion behind the `end`
-    /// execution-listener chain (ADR 0037). A condition that fails to evaluate
-    /// raises an `ExpressionEvaluation` incident; a selection that matches no
-    /// flow (and no default) raises a `NoMatchingSequenceFlow` incident and
-    /// parks the token, mirroring the exclusive gateway and Zeebe's
+    /// execution-listener chain (ADR 0037). The selection journaled at
+    /// activation ([`Event::GatewayRouteSelected`], #1402) is taken verbatim
+    /// when present; otherwise (a join accepted by `activate_join`, a legacy
+    /// journal, an incident retry) the flows are selected from the live scope.
+    /// A condition that fails to evaluate raises an `ExpressionEvaluation`
+    /// incident; a selection that matches no flow (and no default) raises a
+    /// `NoMatchingSequenceFlow` incident and parks the token, mirroring the
+    /// exclusive gateway and Zeebe's
     /// `InclusiveGatewayProcessor.finalizeActivation`.
     fn route_inclusive_gateway(
         &mut self,
@@ -11983,46 +12323,27 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let selected =
-            match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
-                Ok(sel) => sel,
-                Err(reason) => {
-                    let incident_key = self.mint_key();
-                    return (
-                        vec![Event::IncidentRaised {
-                            incident_key,
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            kind: state::IncidentKind::ExpressionEvaluation,
-                            redrive: None,
-                            reason,
-                            job_key: None,
-                            created_at: self.now,
-                        }],
-                        Vec::new(),
-                    );
-                }
-            };
-        if selected.is_empty() {
-            let incident_key = self.mint_key();
-            return (
-                vec![Event::IncidentRaised {
-                    incident_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    kind: state::IncidentKind::NoMatchingSequenceFlow,
-                    redrive: None,
-                    reason: format!(
-                        "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
-                    ),
-                    job_key: None,
-                    created_at: self.now,
-                }],
-                Vec::new(),
-            );
-        }
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows),
+            None => {
+                self.select_inclusive_flows(instance_key, element_instance_key, &element_id, None)
+            }
+        };
+        let selected = match selected {
+            Ok(sel) => sel,
+            Err(failure) => {
+                return (
+                    vec![self.routing_incident(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        failure,
+                        None,
+                    )],
+                    Vec::new(),
+                );
+            }
+        };
         let mut events = vec![Event::ElementCompleting {
             instance_key,
             element_instance_key,
@@ -12054,8 +12375,11 @@ impl Engine {
     }
 
     /// Deferred completion of an inclusive-gateway split whose `end`
-    /// execution-listener chain has drained (ADR 0037). Re-selects from the
-    /// resident scope; a listener may have rewritten a condition variable, so a
+    /// execution-listener chain has drained (ADR 0037). Takes the flows selected
+    /// at activation ([`Event::GatewayRouteSelected`], #1402) when journaled —
+    /// the chain's variable writes must not change the route chosen before
+    /// `ElementActivated`. A gateway with no recorded selection (a legacy
+    /// journal, or an incident retry) re-selects from the resident scope; a
     /// re-selection that now matches nothing (or fails to evaluate) parks the
     /// token on the same incident the non-listener path would raise rather than
     /// completing with nowhere to go.
@@ -12074,8 +12398,14 @@ impl Engine {
             scope,
             &mut events,
         );
-        match self.select_inclusive_flows(instance_key, element_instance_key, &element_id) {
-            Ok(selected) if !selected.is_empty() => {
+        let selected = match self.gateway_route(instance_key, element_instance_key) {
+            Some(flows) => Ok(flows),
+            None => {
+                self.select_inclusive_flows(instance_key, element_instance_key, &element_id, None)
+            }
+        };
+        match selected {
+            Ok(selected) => {
                 events.push(Event::ElementCompleted {
                     instance_key,
                     element_instance_key,
@@ -12090,36 +12420,14 @@ impl Engine {
                 }
                 (events, followups)
             }
-            Ok(_) => {
-                let incident_key = self.mint_key();
-                events.push(Event::IncidentRaised {
-                    incident_key,
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    kind: state::IncidentKind::NoMatchingSequenceFlow,
-                    redrive: None,
-                    reason: format!(
-                        "no matching outgoing sequence flow at inclusive gateway '{element_id}'"
-                    ),
-                    job_key: None,
-                    created_at: self.now,
-                });
-                (events, Vec::new())
-            }
-            Err(reason) => {
-                let incident_key = self.mint_key();
-                events.push(Event::IncidentRaised {
-                    incident_key,
+            Err(failure) => {
+                events.push(self.routing_incident(
                     instance_key,
                     element_instance_key,
                     element_id,
-                    kind: state::IncidentKind::ExpressionEvaluation,
-                    redrive: None,
-                    reason,
-                    job_key: None,
-                    created_at: self.now,
-                });
+                    failure,
+                    None,
+                ));
                 (events, Vec::new())
             }
         }
@@ -13600,6 +13908,21 @@ pub enum EngineError {
         flow_source_element_id: String,
         flow_ordinal: usize,
     },
+    /// A `MigrateInstance` moved a split gateway (exclusive, or an inclusive
+    /// fork) whose activation-time outgoing-flow selection is still carried
+    /// ([`Event::GatewayRouteSelected`], #1402) onto a target gateway whose
+    /// outgoing flows no longer contain that selection: the carried indices are
+    /// source-definition positions, so a reordered, removed, or differently
+    /// routed target flow would complete the migrated gateway onto the wrong
+    /// branch (or panic `take_flow`). Every carried flow must exist in the
+    /// target with the same condition, the same default flag, and a target
+    /// element the source flow's target maps to. Maps to HTTP 409.
+    MigratedGatewayRouteMissing {
+        instance_key: Key,
+        source_element_id: String,
+        target_element_id: String,
+        flow_index: usize,
+    },
     /// A `MigrateInstance` targeted an instance that contains an active element
     /// class this phase does not yet support migrating (boundary events, event
     /// subprocesses, multi-instance bodies, call activities, event-based-gateway
@@ -14102,6 +14425,20 @@ impl std::fmt::Display for EngineError {
                      {flow_source_element_id}, which is not an incoming flow of {target_element_id}"
                 )
             }
+            EngineError::MigratedGatewayRouteMissing {
+                instance_key,
+                source_element_id,
+                target_element_id,
+                flow_index,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} maps split gateway {source_element_id} \
+                     to {target_element_id}, but the gateway's carried activation-time selection \
+                     names source outgoing flow #{flow_index}, which has no equal outgoing flow \
+                     (same condition, default flag, and mapped target) on {target_element_id}"
+                )
+            }
             EngineError::UnsupportedMigration {
                 instance_key,
                 element_id,
@@ -14341,6 +14678,37 @@ pub fn check_business_id(business_id: Option<&str>) -> Result<(), EngineError> {
         Ok(())
     } else {
         Err(EngineError::BusinessIdInvalid { chars })
+    }
+}
+
+/// Why a split gateway could not select an outgoing flow (Zeebe
+/// `CONDITION_ERROR`): a condition failed to evaluate
+/// ([`state::IncidentKind::ExpressionEvaluation`]) or nothing matched and there
+/// is no default ([`state::IncidentKind::NoMatchingSequenceFlow`]).
+#[derive(Debug)]
+struct RoutingFailure {
+    kind: state::IncidentKind,
+    reason: String,
+}
+
+impl RoutingFailure {
+    fn condition(gateway: &str, element_id: &str, expression: &str, err: &str) -> Self {
+        RoutingFailure {
+            kind: state::IncidentKind::ExpressionEvaluation,
+            reason: format!(
+                "failed to evaluate condition '{expression}' at {gateway} gateway \
+                 '{element_id}': {err}"
+            ),
+        }
+    }
+
+    fn no_match(gateway: &str, element_id: &str) -> Self {
+        RoutingFailure {
+            kind: state::IncidentKind::NoMatchingSequenceFlow,
+            reason: format!(
+                "no matching outgoing sequence flow at {gateway} gateway '{element_id}'"
+            ),
+        }
     }
 }
 

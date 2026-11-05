@@ -1547,6 +1547,7 @@ mod tests {
                 join_counts: HashMap::new(),
                 join_flow_arrivals: HashMap::new(),
                 join_instances: HashMap::new(),
+                gateway_routes: HashMap::new(),
                 incidents: Vec::new(),
                 variables_spilled: false,
                 multi_instances: HashMap::new(),

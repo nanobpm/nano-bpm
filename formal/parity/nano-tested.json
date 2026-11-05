@@ -29,7 +29,6 @@
     "event:intermediate-throw:link",
     "incident:CALLED_DECISION_ERROR",
     "incident:CALLED_ELEMENT_ERROR",
-    "incident:CONDITION_ERROR",
     "incident:UNHANDLED_ERROR_EVENT"
   ]
 }

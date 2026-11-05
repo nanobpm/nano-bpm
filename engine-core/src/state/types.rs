@@ -592,6 +592,19 @@ pub struct ProcessInstance {
     /// For each open parallel-gateway join: the element instance accumulating
     /// the arriving tokens.
     pub join_instances: HashMap<ElementId, Key>,
+    /// The outgoing-flow selection a split gateway (exclusive, or an inclusive
+    /// fork) made while ACTIVATING (#1402), keyed by the gateway's element
+    /// instance. Completion takes exactly these flows instead of re-evaluating
+    /// the conditions (FEEL is not required to be deterministic, and a
+    /// listener may rewrite a condition variable). Inserted by
+    /// [`crate::Event::GatewayRouteSelected`], removed when the gateway
+    /// completes. Empty for instances with no in-flight split gateway and for
+    /// snapshots written before the selection was journaled
+    /// (`serde(default)`); a gateway completing without a recorded selection
+    /// (a legacy journal, or an incident retry) re-selects from the current
+    /// variables exactly as before.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gateway_routes: HashMap<Key, Vec<usize>>,
     /// Keys of incidents currently **active** on this instance (parked tokens).
     /// The full records live in [`State::incidents`] and are retained after
     /// resolution; resolving an incident removes its key from this active index

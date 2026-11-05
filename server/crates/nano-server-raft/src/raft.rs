@@ -379,6 +379,7 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         | E::MappedElementTypeChanged { .. }
         | E::MigratedParallelJoinArityChanged { .. }
         | E::MigratedJoinFlowMissing { .. }
+        | E::MigratedGatewayRouteMissing { .. }
         | E::UnsupportedMigration { .. } => (409, e.to_string()),
         // Process-instance modification / migration rejection surface (#1374),
         // Zeebe parity: a malformed or unresolvable instruction is
@@ -2550,6 +2551,15 @@ mod tests {
                     target_element_id: "b".into(),
                     flow_source_element_id: "c".into(),
                     flow_ordinal: 0,
+                },
+                409,
+            ),
+            (
+                E::MigratedGatewayRouteMissing {
+                    instance_key: 1,
+                    source_element_id: "a".into(),
+                    target_element_id: "b".into(),
+                    flow_index: 0,
                 },
                 409,
             ),

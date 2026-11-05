@@ -1,5 +1,16 @@
 [
   {
+    "GatewayRouteSelected": {
+      "element_id": "g",
+      "element_instance_key": 2,
+      "flows": [
+        0,
+        2
+      ],
+      "instance_key": 1
+    }
+  },
+  {
     "ProcessInstanceModified": {
       "activate_instructions": [
         {
