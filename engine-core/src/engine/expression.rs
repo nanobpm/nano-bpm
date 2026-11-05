@@ -320,7 +320,11 @@ pub(crate) fn evaluate_nullable_date_time(
     }
     let evaluated = evaluate_or_failure(raw, vars)?;
     match (evaluated.value, evaluated.kind) {
-        (Value::Null, _) => Ok(None),
+        // Only a NATIVE FEEL `null` is "no date": a `Function`/`Range` result
+        // also converts to `Value::Null` at the API boundary but keeps the
+        // kind `UNKNOWN` — accepting it here would silently drop a wrong-typed
+        // expression instead of raising the incident (#1398 review).
+        (Value::Null, "NULL") => Ok(None),
         (Value::Str(s), "DATE_TIME") => Ok(Some(s)),
         (Value::Str(s), "STRING") => {
             if crate::feel::temporal::DateTime::parse(s.trim()).is_some() {

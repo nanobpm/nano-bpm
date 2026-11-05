@@ -1,6 +1,55 @@
 //! `user_task` engine tests (slice 7 of #1201), extracted verbatim.
 use super::*;
 
+/// A FEEL `function` or `range` result converts to `Value::Null` at the API
+/// boundary but keeps the kind `UNKNOWN`. The nullable due/follow-up dates
+/// must accept only a native FEEL `null` as "no date" — anything else,
+/// including a value that merely *renders* as null, is a wrong-type incident
+/// (Zeebe `evaluateDateTimeExpression`, #1398 review).
+#[test]
+fn should_raise_an_incident_when_a_due_date_expression_yields_a_function() {
+    use crate::model::UserTaskProps;
+    let def = ProcessBuilder::new("fn-date")
+        .start_event("start")
+        .user_task_with(
+            "review",
+            UserTaskProps {
+                assignee: None,
+                candidate_groups: None,
+                candidate_users: None,
+                due_date: Some("=function(x) x".to_string()),
+                follow_up_date: Some("=[1..2]".to_string()),
+                priority: None,
+                form_id: None,
+                external_form_reference: None,
+            },
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("fn-date"))
+        .unwrap();
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Event::UserTaskCreated { .. })),
+        "no user task is created on a wrong-typed date"
+    );
+    let incident = engine.active_incidents()[0].clone();
+    assert_eq!(incident.kind, state::IncidentKind::ExtractValueError);
+    assert!(
+        incident.reason.contains("but was 'UNKNOWN'"),
+        "a function/range result is not an absent date: {}",
+        incident.reason
+    );
+}
+
 #[test]
 fn subprocess_terminate_end_cancels_a_resting_user_task_in_its_scope() {
     // A terminate end must cancel a resting user task in the torn-down scope —

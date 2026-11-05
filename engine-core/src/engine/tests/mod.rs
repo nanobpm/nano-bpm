@@ -549,7 +549,7 @@ fn process_none_plus_timer() -> ProcessDefinition {
 
 fn assert_job_index_consistent(engine: &Engine) {
     use std::collections::{BTreeSet, HashMap, HashSet};
-    let mut expected: HashMap<String, BTreeSet<(i32, Key)>> = HashMap::new();
+    let mut expected: HashMap<String, BTreeSet<(i64, Key)>> = HashMap::new();
     let mut expected_activated: HashSet<Key> = HashSet::new();
     for job in engine.state().jobs.values() {
         if job.state == state::JobState::Created {

@@ -96,6 +96,40 @@ fn minimum_priority_jobs_activate_last_without_overflow() {
 }
 
 #[test]
+fn adjacent_minimum_priorities_do_not_collide_in_the_activation_index() {
+    // The activatable index orders by descending priority. A saturating
+    // negation maps BOTH `i32::MIN` and `i32::MIN + 1` to `i32::MAX`, so the
+    // older `i32::MIN` job would win the key tiebreak over the newer,
+    // strictly-higher `i32::MIN + 1` job (#1398 review). The ordering must
+    // distinguish every accepted priority.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_priority(
+            "min",
+            "-2147483648",
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(task_with_priority(
+            "min-plus-one",
+            "-2147483647",
+        )))
+        .unwrap();
+    // The `i32::MIN` instance is older (lower key): a collision would select
+    // it first.
+    let min = create_instance_key(&mut engine, "min");
+    let min_plus_one = create_instance_key(&mut engine, "min-plus-one");
+    let jobs = engine.activate_jobs("work", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(
+        jobs[0].instance_key, min_plus_one,
+        "the higher priority (i32::MIN + 1) activates first"
+    );
+    assert_eq!(jobs[1].instance_key, min, "i32::MIN activates last");
+    assert_job_index_consistent(&engine);
+}
+
+#[test]
 fn equal_priority_jobs_activate_oldest_first() {
     // Same priority (default 50) => FIFO by creation (key) is preserved.
     let mut engine = Engine::new();

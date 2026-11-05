@@ -400,14 +400,18 @@ pub fn default_true() -> bool {
 /// first), then lowest key (oldest-first — keys are monotonic with creation
 /// within a partition — as the SLA/age tiebreak).
 ///
-/// The negation saturates: the accepted priority domain includes `i32::MIN`,
-/// whose plain negation overflows (a panic in overflow-checked builds, and a
-/// wrap back to `i32::MIN` — i.e. *highest* priority — otherwise). Saturating
-/// maps it to `i32::MAX` so it sorts last, while every other priority keeps the
-/// exact `-priority` value the persisted snapshot index already stores.
+/// The negation is computed in `i64` so it is **collision-free over the whole
+/// accepted priority domain** (`i32::MIN..=i32::MAX`, see
+/// [`crate::engine::expression::evaluate_job_priority`]): a plain `i32`
+/// negation overflows at `i32::MIN`, and a saturating one maps both `i32::MIN`
+/// and `i32::MIN + 1` to `i32::MAX`, letting an older minimum-priority job win
+/// the key tiebreak over a newer, strictly-higher-priority one (#1398 review).
+/// The index is in-memory only (rebuilt from `jobs` by [`resync_job_index`] /
+/// [`restore_instance_snapshot`]), never persisted, so widening the stored key
+/// is replay-safe.
 #[inline]
-pub(crate) fn activation_order(priority: i32, key: Key) -> (i32, Key) {
-    (priority.saturating_neg(), key)
+pub(crate) fn activation_order(priority: i32, key: Key) -> (i64, Key) {
+    (-i64::from(priority), key)
 }
 
 /// Retries a job starts with when first created.
@@ -1463,15 +1467,17 @@ pub struct State {
     /// `due_at = None`.
     pub start_timers: HashMap<Key, StartTimer>,
     /// Index of jobs eligible to be *considered* for activation, grouped by job
-    /// type and ordered by `(−priority, key)` — highest priority first, then
-    /// oldest (lowest key) as the age/SLA tiebreak. A job is a member iff its
+    /// type and ordered by `(−priority, key)` (priority negated in `i64`, so
+    /// every accepted `i32` priority keeps a distinct slot) — highest priority
+    /// first, then oldest (lowest key) as the age/SLA tiebreak. A job is a
+    /// member iff its
     /// state is `Created` (an `Activated` job is removed when it locks and re-added
     /// by `JobLockExpired` when its lock expires). This lets `ActivateJobs` serve a
     /// worker poll in roughly `O(max_jobs)` instead of scanning every job in the
     /// system — critical when a large backlog of pending jobs accumulates under
     /// load. It is fully derived from `jobs` and kept in lockstep by
     /// [`resync_job_index`].
-    pub activatable_jobs: HashMap<String, BTreeSet<(i32, Key)>>,
+    pub activatable_jobs: HashMap<String, BTreeSet<(i64, Key)>>,
     /// The keys of all jobs currently in the `Activated` state (holding a lock).
     /// Bounded by the number of concurrently working workers, so it lets
     /// `ExpireJobs` find expired locks in `O(activated)` rather than scanning

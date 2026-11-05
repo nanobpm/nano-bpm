@@ -45,6 +45,92 @@ pub(super) struct ModificationPlan {
     terminations: Vec<Key>,
 }
 
+/// One variable write a modification stages before a later activation's
+/// boundary preflight runs — mirroring where [`Engine::apply_modification`]
+/// emits the same write.
+enum StagedWrite {
+    /// A root-scope write (a `global` batch).
+    Root(HashMap<String, Value>),
+    /// A write to an already-existing scope, keyed by its element id
+    /// (application resolves the instance within the activation's landing
+    /// lineage; the view builder resolves it the same way).
+    ExistingScopeById(ElementId, HashMap<String, Value>),
+    /// A write to a flow scope this command creates, keyed by the scope's
+    /// element id (application lands it in the created scope instance, which
+    /// has no key at planning time).
+    CreatedScope(ElementId, HashMap<String, Value>),
+}
+
+/// The writes of the activations planned so far, in instruction order — the
+/// state a later activation's preflight must see.
+#[derive(Default)]
+struct StagedWrites {
+    writes: Vec<StagedWrite>,
+    /// Flow scopes the command creates, in creation order: `(parent
+    /// scope, scope element id)` — an existing instance key, or the element
+    /// id of a scope the same instruction created earlier in its chain.
+    created: Vec<(StagedParent, ElementId)>,
+}
+
+/// The parent a created scope hangs under at planning time.
+#[derive(Clone, PartialEq, Eq)]
+enum StagedParent {
+    /// An existing scope instance (or `0` for the root).
+    Existing(Key),
+    /// A scope the same activation creates earlier in its chain, by element
+    /// id (chain ids are unique per activation).
+    Created(ElementId),
+}
+
+impl StagedWrites {
+    /// Folds one planned activation's effects into the staged state, mirroring
+    /// [`Engine::apply_modification`]: the scopes it opens are shared with
+    /// later instructions (same parent, same element id), then its variable
+    /// writes land — root batches first, then the scoped writes, each in the
+    /// scope application targets.
+    fn stage(&mut self, planned: &PlannedActivation) {
+        // The scope this activation's chain ends in: the innermost created
+        // scope's element id, or the existing landing scope.
+        let mut scope = StagedParent::Existing(planned.resolution.existing);
+        for scope_id in &planned.resolution.to_create {
+            if !self
+                .created
+                .iter()
+                .any(|(p, id)| *p == scope && id == scope_id)
+            {
+                self.created.push((scope.clone(), scope_id.clone()));
+            }
+            scope = StagedParent::Created(scope_id.clone());
+        }
+        for variables in &planned.global {
+            self.writes.push(StagedWrite::Root(variables.clone()));
+        }
+        for (scope_id, variables) in &planned.scoped {
+            if *scope_id == planned.element_id {
+                // Written into the element's own fresh scope after arming:
+                // never visible to a boundary preflight.
+                continue;
+            }
+            if planned.resolution.to_create.iter().any(|c| c == scope_id) {
+                self.writes.push(StagedWrite::CreatedScope(
+                    scope_id.clone(),
+                    variables.clone(),
+                ));
+                continue;
+            }
+            // Application targets the existing instance of `scope_id` within
+            // the activation's landing lineage; preflight resolves the same
+            // instance lazily (it needs the engine), so stage it under the
+            // element id and resolve at view-build time — keyed here by the
+            // id to keep staging engine-free.
+            self.writes.push(StagedWrite::ExistingScopeById(
+                scope_id.clone(),
+                variables.clone(),
+            ));
+        }
+    }
+}
+
 impl Engine {
     /// Validates a `ModifyInstance` against the current state without emitting
     /// anything (Zeebe validation order: activate targets, ancestors, variable
@@ -361,11 +447,24 @@ impl Engine {
         // a failing boundary expression rejects the whole command —
         // "Expected to subscribe to catch event(s) of '<scope>' but <failure>"
         // — before anything is emitted (#1398).
+        //
+        // Each activation is checked against the variable view the command
+        // reaches when that activation APPLIES: the current state plus every
+        // earlier instruction's writes (application emits instructions in
+        // order, so an earlier instruction's variables are live when a later
+        // instruction's scope boundaries arm) plus this instruction's own
+        // staged writes. Checking against the original state alone would
+        // reject a valid command (a boundary key supplied by an earlier
+        // instruction) or accept an invalid one whose failure then surfaces as
+        // an incident AFTER earlier instructions already emitted — breaking
+        // all-or-nothing (#1398 review).
+        let mut staged = StagedWrites::default();
         for planned in &activations {
             if planned.resolution.to_create.is_empty() {
+                staged.stage(planned);
                 continue;
             }
-            let mut host_vars = self.staged_parent_view(instance_key, planned);
+            let mut host_vars = self.staged_parent_view(instance_key, planned, &staged);
             for scope_id in &planned.resolution.to_create {
                 // Checked against the PARENT-scope view, exactly as application
                 // arms it (`arm_boundary_events` evaluates in the new scope's
@@ -389,6 +488,7 @@ impl Engine {
                     ));
                 }
             }
+            staged.stage(planned);
         }
 
         Ok(ModificationPlan {
@@ -570,17 +670,20 @@ impl Engine {
 
     /// The instance of flow scope `scope_id` among `scope` and its ancestors.
     /// The variable view the first scope created by `planned` arms its
-    /// boundaries against, INCLUDING the variable writes this same command
-    /// stages on already-existing scopes (#1398 review): the root writes
-    /// (`global`) and the element-scoped writes to existing ancestor scopes,
-    /// which application emits BEFORE arming. Each staged write lands in its
-    /// own scope's locals and the chain is then merged root-first, so lexical
+    /// boundaries against, INCLUDING every write this same command stages
+    /// before that arming (#1398 review): `staged` holds every EARLIER
+    /// instruction's writes (application emits them in instruction order, so
+    /// they are live when this activation's scopes arm), and `planned`'s own
+    /// root writes (`global`) and element-scoped writes to existing ancestor
+    /// scopes land before arming too. Each staged write lands in its own
+    /// scope's locals and the chain is then merged root-first, so lexical
     /// shadowing is preserved — a root write never overrides a nearer local of
     /// the same name.
     fn staged_parent_view(
         &self,
         instance_key: Key,
         planned: &PlannedActivation,
+        staged: &StagedWrites,
     ) -> HashMap<String, Value> {
         let existing = planned.resolution.existing;
         let Some(instance) = self.state.instances.get(&instance_key) else {
@@ -606,6 +709,33 @@ impl Engine {
                 )
             })
             .collect();
+        // Earlier instructions' writes, in instruction order. A write to an
+        // existing scope lands in that scope's locals (or the root view when
+        // the scope is not on this activation's chain, exactly as the live
+        // write would be visible through the root merge); a write to a scope
+        // this command creates is visible to any activation nested under it.
+        for staged_write in &staged.writes {
+            match staged_write {
+                StagedWrite::Root(variables) => root.extend(variables.clone()),
+                StagedWrite::ExistingScopeById(scope_id, variables) => {
+                    let Some(target) =
+                        self.existing_scope_instance(instance_key, existing, scope_id)
+                    else {
+                        continue;
+                    };
+                    let target = self.variable_scope_of(instance, target);
+                    match locals.get_mut(&target) {
+                        Some(local) => local.extend(variables.clone()),
+                        None => root.extend(variables.clone()),
+                    }
+                }
+                StagedWrite::CreatedScope(scope_id, variables) => {
+                    if planned.resolution.to_create.iter().any(|c| c == scope_id) {
+                        root.extend(variables.clone());
+                    }
+                }
+            }
+        }
         for variables in &planned.global {
             root.extend(variables.clone());
         }
