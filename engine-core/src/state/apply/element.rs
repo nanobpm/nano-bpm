@@ -128,19 +128,29 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 instance.join_flow_arrivals.remove(element_id);
                 // A reset parked join (#1244) never activated, so its tokens
                 // simply vanish with it: nothing completes or terminates.
-                if let Some(eik) = instance.join_instances.remove(element_id) {
-                    if instance.parked_joins.remove(&eik) {
-                        instance.active.remove(&eik);
-                        instance.scopes.remove(&eik);
-                        // A modification's seeded join activation opens a
-                        // variable scope on the parked key before the guard
-                        // evaluates; the reset bypasses `ElementCompleted`
-                        // (which drops scopes), so drop them here or the
-                        // seeded locals orphan in `scope_parents` /
-                        // `scope_variables` and leak into snapshots.
-                        instance.scope_parents.remove(&eik);
-                        instance.scope_variables.remove(&eik);
-                    }
+                // Drop EVERY parked key of this element, not just the one
+                // `join_instances` names: migration can merge two waiting
+                // joins onto one target, keeping both keys in `active` but
+                // only one in `join_instances`.
+                instance.join_instances.remove(element_id);
+                let parked: Vec<_> = instance
+                    .parked_joins
+                    .iter()
+                    .copied()
+                    .filter(|eik| instance.active.get(eik) == Some(element_id))
+                    .collect();
+                for eik in parked {
+                    instance.parked_joins.remove(&eik);
+                    instance.active.remove(&eik);
+                    instance.scopes.remove(&eik);
+                    // A modification's seeded join activation opens a
+                    // variable scope on the parked key before the guard
+                    // evaluates; the reset bypasses `ElementCompleted`
+                    // (which drops scopes), so drop them here or the
+                    // seeded locals orphan in `scope_parents` /
+                    // `scope_variables` and leak into snapshots.
+                    instance.scope_parents.remove(&eik);
+                    instance.scope_variables.remove(&eik);
                 }
             }
         }

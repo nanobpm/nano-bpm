@@ -483,3 +483,98 @@ fn resetting_a_seeded_parked_join_clears_its_variable_scope() {
         "the parked join's seeded locals must not survive its reset"
     );
 }
+
+/// Migration may map two waiting joins onto one target join. Both parked keys
+/// survive in `active`, but `join_instances` keeps only one of them, so a
+/// reset that only consults `join_instances` strands the other key active
+/// and the instance can never complete. Tearing the target down must drop
+/// every parked key of that element.
+#[test]
+fn resetting_a_join_merged_by_migration_drops_every_parked_key() {
+    fn two_joins(id: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("b", "jb")
+            .service_task("c", "jc")
+            .service_task("d", "jd")
+            .parallel_gateway("j1")
+            .parallel_gateway("j2")
+            .end_event("e1")
+            .end_event("e2")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "b")
+            .connect("fork", "c")
+            .connect("fork", "d")
+            .connect("a", "j1")
+            .connect("b", "j1")
+            .connect("c", "j2")
+            .connect("d", "j2")
+            .connect("j1", "e1")
+            .connect("j2", "e2")
+            .build()
+            .unwrap()
+    }
+    let target = ProcessBuilder::new("merged")
+        .start_event("start")
+        .parallel_gateway("fork")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .service_task("c", "jc")
+        .service_task("d", "jd")
+        .parallel_gateway("j")
+        .end_event("e1")
+        .end_event("eb")
+        .end_event("ed")
+        .connect("start", "fork")
+        .connect("fork", "a")
+        .connect("fork", "b")
+        .connect("fork", "c")
+        .connect("fork", "d")
+        // Same arity (two incomings) as each source join; the arrivals'
+        // flows (a -> j1, c -> j2) both exist on the merged join.
+        .connect("a", "j")
+        .connect("c", "j")
+        .connect("b", "eb")
+        .connect("d", "ed")
+        .connect("j", "e1")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, two_joins("source"));
+    let target_key = deploy_for_migration(&mut engine, target);
+    let inst = create_instance_key(&mut engine, "source");
+    complete_one(&mut engine, "ja");
+    complete_one(&mut engine, "jc");
+    assert_eq!(engine.instance(inst).unwrap().parked_joins.len(), 2);
+
+    let mapping = ["a", "b", "c", "d"]
+        .iter()
+        .map(|s| (s.to_string(), s.to_string()))
+        .chain([("j1".into(), "j".into()), ("j2".into(), "j".into())])
+        .collect();
+    engine
+        .apply_command(Command::migrate_instance(inst, target_key, mapping))
+        .unwrap();
+
+    engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec!["j".into()],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.parked_joins.is_empty(),
+        "every parked key is reset"
+    );
+    assert!(
+        !instance.active.values().any(|e| e == "j"),
+        "no parked key of the merged join may stay active"
+    );
+}
