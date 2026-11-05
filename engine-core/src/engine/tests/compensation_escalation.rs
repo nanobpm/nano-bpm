@@ -52,6 +52,139 @@ fn should_run_the_compensation_handler_when_a_compensation_throw_event_fires() {
     assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
 }
 
+/// Defect class (#897): two compensation throw events in the SAME scope can both
+/// be waiting on the SAME handler element id. Routing a handler completion back
+/// to its throw by `element_id` + scope and then picking `.min()` throw key
+/// attributes the SECOND throw's handler completion to the FIRST throw: that
+/// throw completes early (its token routes onward while its own handler is still
+/// running) and the second throw's wait is left with a pending handler that no
+/// active element instance can ever clear, so it waits forever. The fix tracks
+/// handler *element-instance keys*: a throw records the exact handler instances
+/// it activated, and a completing handler routes to the throw that activated IT.
+///
+/// Topology (a parallel split runs two compensable activities wired to the same
+/// `cancel` handler; each branch then reaches its own compensation throw, so
+/// each throw compensates the one activity completed in the scope at that
+/// point):
+///
+/// ```text
+/// start -> split =< bookA(svc, comp-boundary -> cancel(svc)) -> throw1 -> done1
+///                  bookB(svc, comp-boundary -> cancel(svc)) -> throw2 -> done2 >
+/// ```
+#[test]
+fn two_throws_in_one_scope_route_each_handler_completion_to_its_own_throw() {
+    let def = ProcessBuilder::new("comp-two-throw")
+        .start_event("s")
+        .parallel_gateway("split")
+        .service_task("bookA", "book-job")
+        .compensation_boundary_event("compA", "bookA", "cancel")
+        .compensation_throw_event("throw1")
+        .end_event("done1")
+        .service_task("bookB", "book-job")
+        .compensation_boundary_event("compB", "bookB", "cancel")
+        .compensation_throw_event("throw2")
+        .end_event("done2")
+        .service_task("cancel", "cancel-job")
+        .connect("s", "split")
+        .connect("split", "bookA")
+        .connect("bookA", "throw1")
+        .connect("throw1", "done1")
+        .connect("split", "bookB")
+        .connect("bookB", "throw2")
+        .connect("throw2", "done2")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-two-throw"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Complete bookA first: throw1 fires with only bookA's subscription in the
+    // scope and rests on its `cancel` handler. Then bookB: throw2 fires with
+    // only bookB's subscription left and rests on its own `cancel` handler.
+    // (One job at a time: `activate_jobs` LOCKS what it returns, so a second
+    // batch at the same logical instant would not see a job locked by the
+    // first.)
+    let book_a = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    engine.apply_command(Command::complete_job(book_a)).unwrap();
+    let book_b = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    engine.apply_command(Command::complete_job(book_b)).unwrap();
+
+    let throw_of = |engine: &Engine, element_id: &str| {
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .iter()
+            .find(|(_, w)| w.throw_element_id == element_id)
+            .map(|(k, _)| *k)
+            .unwrap_or_else(|| panic!("{element_id} is waiting on its `cancel` handler"))
+    };
+    let t1 = throw_of(&engine, "throw1");
+    let t2 = throw_of(&engine, "throw2");
+
+    // Complete the two handler jobs in REVERSE activation order: throw2's
+    // handler finishes while throw1's is still running. The completion must
+    // retire throw2 (the throw that activated THAT handler instance) — an
+    // `element_id` + `.min()` lookup instead attributes it to throw1, which
+    // then completes early while its own handler is still running, and throw2
+    // is left waiting on a handler instance that no longer exists.
+    let cancel_jobs = engine.activate_jobs("cancel-job", "w", 2, 60_000, 0);
+    assert_eq!(cancel_jobs.len(), 2, "one handler instance per throw");
+    let first = engine
+        .apply_command(Command::complete_job(cancel_jobs[1].key))
+        .unwrap();
+    assert!(
+        first.iter().any(|e| matches!(
+            e,
+            Event::CompensationHandlerCompleted {
+                throw_element_instance_key,
+                handler_element_id,
+                ..
+            } if *throw_element_instance_key == t2 && handler_element_id == "cancel"
+        )),
+        "throw2's handler completion retires throw2, the throw that activated it"
+    );
+    assert!(
+        first.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "throw2" && to == "done2"
+        )),
+        "throw2 routes onward once its own handler is done"
+    );
+    assert_eq!(
+        throw_of(&engine, "throw1"),
+        t1,
+        "throw1 is still waiting on its own (still-running) handler"
+    );
+
+    let second = engine
+        .apply_command(Command::complete_job(cancel_jobs[0].key))
+        .unwrap();
+    assert!(second.iter().any(|e| matches!(
+        e,
+        Event::CompensationHandlerCompleted {
+            throw_element_instance_key,
+            handler_element_id,
+            ..
+        } if *throw_element_instance_key == t1 && handler_element_id == "cancel"
+    )));
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .is_empty(),
+        "no throw is left waiting on a handler that already completed"
+    );
+    assert!(
+        engine.is_completed(instance_key),
+        "both throws completed and routed onward, so the instance finishes"
+    );
+}
+
 #[test]
 fn should_pass_through_a_compensation_throw_event_with_nothing_to_compensate() {
     // start -> throw(compensation) -> done, with a compensable activity that is

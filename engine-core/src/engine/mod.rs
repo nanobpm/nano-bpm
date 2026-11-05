@@ -5869,6 +5869,23 @@ impl Engine {
         if let Some(join) = self.join_kind(instance_key, &element_id) {
             return self.activate_join(instance_key, element_id, scope, via, join, pending);
         }
+        let element_instance_key = self.mint_key();
+        self.activate_with_key(instance_key, element_id, scope, element_instance_key)
+    }
+
+    /// Activates `element_id` with a caller-minted `element_instance_key` (every
+    /// caller mints its own key — [`activate`](Self::activate) does so after the
+    /// join guard; the compensation-throw path mints its handler keys BEFORE
+    /// emitting `CompensationTriggered`, so the journaled
+    /// `handler_instance_keys` binding (#897) matches the instances the
+    /// activations actually use).
+    fn activate_with_key(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+        element_instance_key: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         let kind = self.element_kind(instance_key, &element_id);
 
         // A multi-instance activity: unless we are already inside its body (i.e.
@@ -5890,7 +5907,6 @@ impl Engine {
             }
         }
 
-        let element_instance_key = self.mint_key();
         let activated = Event::ElementActivated {
             instance_key,
             element_instance_key,
@@ -6600,11 +6616,18 @@ impl Engine {
                         element_id,
                     });
                 } else {
-                    // Compensate newest-first (reverse completion order).
+                    // Compensate newest-first (reverse completion order). Mint
+                    // each handler's element-instance key NOW and journal it with
+                    // the trigger (#897): the wait binds the throw to the exact
+                    // handler instances it activated, so a handler completion
+                    // later routes back to THIS throw even when another throw in
+                    // the same scope waits on the same handler element id.
                     let mut handlers = Vec::new();
+                    let mut handler_keys = Vec::new();
                     let mut consumed = Vec::new();
                     for target in targets.iter().rev() {
                         handlers.push(target.handler.clone());
+                        handler_keys.push(self.mint_key());
                         consumed.push(target.element_instance_key);
                     }
                     events.push(Event::CompensationTriggered {
@@ -6614,14 +6637,13 @@ impl Engine {
                         scope,
                         handlers: handlers.clone(),
                         consumed,
+                        handler_instance_keys: handler_keys.clone(),
                     });
-                    for handler in handlers {
-                        followups.push(Step::Activate {
-                            instance_key,
-                            element_id: handler,
-                            scope,
-                            via: None,
-                        });
+                    for (handler, handler_key) in handlers.into_iter().zip(handler_keys) {
+                        let (handler_events, handler_followups) =
+                            self.activate_with_key(instance_key, handler, scope, handler_key);
+                        events.extend(handler_events);
+                        followups.extend(handler_followups);
                     }
                 }
             }
@@ -10312,10 +10334,18 @@ impl Engine {
         // compensation handler routes back to the throw event waiting on it (its
         // `ElementCompleted` was emitted inline above); a completing compensable
         // activity records a compensation subscription before its outgoing flow.
-        if let Some(throw_eik) = self.pending_compensation_handler(instance_key, &element_id, scope)
+        // The match is by the handler's element-INSTANCE key (#897), with the
+        // element-id lookup only for waits replayed from pre-#897 journals.
+        if let Some(throw_eik) = self
+            .pending_compensation_handler_by_instance(instance_key, element_instance_key)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
         {
-            let (resume_events, resume_followups) =
-                self.resume_compensation_throw(instance_key, &element_id, throw_eik);
+            let (resume_events, resume_followups) = self.resume_compensation_throw(
+                instance_key,
+                &element_id,
+                throw_eik,
+                element_instance_key,
+            );
             events.extend(resume_events);
             return (events, resume_followups);
         }
@@ -10504,7 +10534,11 @@ impl Engine {
     ) -> (Vec<Event>, Vec<Step>) {
         // A compensation handler completing routes back to the compensation
         // throw event waiting on it, not along (non-existent) outgoing flows.
-        if let Some(throw_eik) = self.pending_compensation_handler(instance_key, &element_id, scope)
+        // The match is by the handler's element-INSTANCE key (#897), with the
+        // element-id lookup only for waits replayed from pre-#897 journals.
+        if let Some(throw_eik) = self
+            .pending_compensation_handler_by_instance(instance_key, element_instance_key)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
         {
             return self.finalize_compensation_handler(
                 instance_key,
@@ -10747,8 +10781,12 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         }];
-        let (resume_events, followups) =
-            self.resume_compensation_throw(instance_key, &element_id, throw_eik);
+        let (resume_events, followups) = self.resume_compensation_throw(
+            instance_key,
+            &element_id,
+            throw_eik,
+            element_instance_key,
+        );
         events.extend(resume_events);
         (events, followups)
     }
@@ -10758,11 +10796,15 @@ impl Engine {
     /// event's last outstanding handler — completes the compensation throw event
     /// and routes its token onward. Shared by the inline ([`complete`]) and
     /// deferred ([`finalize_compensation_handler`]) completion paths.
+    /// `handler_eik` binds the completion to the exact handler instance (#897),
+    /// so the reducer retires that instance's outstanding entry — never another
+    /// handler's that merely shares the element id.
     fn resume_compensation_throw(
         &self,
         instance_key: Key,
         handler_element_id: &str,
         throw_eik: Key,
+        handler_eik: Key,
     ) -> (Vec<Event>, Vec<Step>) {
         let wait = self
             .state
@@ -10780,6 +10822,7 @@ impl Engine {
             instance_key,
             throw_element_instance_key: throw_eik,
             handler_element_id: handler_element_id.to_string(),
+            handler_element_instance_key: Some(handler_eik),
         }];
         let mut followups = Vec::new();
         if last_handler {

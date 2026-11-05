@@ -47,13 +47,40 @@ impl Engine {
             .collect()
     }
 
-    /// If a completing element instance (identified by `element_id` running in
-    /// `scope`) is a compensation handler a compensation throw event is still
-    /// waiting on, returns that throw event's element instance key. A
-    /// compensation handler has no incoming sequence flow, so it is only ever
-    /// activated by compensation; its completion therefore routes back to the
-    /// throw rather than along (non-existent) outgoing flows.
-    pub(crate) fn pending_compensation_handler(
+    /// If the completing element instance `element_instance_key` is a
+    /// compensation handler a compensation throw event is still waiting on,
+    /// returns that throw event's element instance key. The match is on the
+    /// handler's element-INSTANCE key (#897): a throw journals the exact handler
+    /// instances it activates (`CompensationTriggered::handler_instance_keys`),
+    /// so two throws in the same scope waiting on the same handler element id
+    /// each retire only on their OWN handler's completion — never on the other's
+    /// via an `element_id` + `min()` guess. A compensation handler has no
+    /// incoming sequence flow, so it is only ever activated by compensation; its
+    /// completion therefore routes back to the throw rather than along
+    /// (non-existent) outgoing flows.
+    ///
+    /// Waits replayed from pre-#897 journals carry no handler keys; for those
+    /// the caller falls back to [`pending_compensation_handler_by_id`].
+    pub(crate) fn pending_compensation_handler_by_instance(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+    ) -> Option<Key> {
+        let instance = self.state.instances.get(&instance_key)?;
+        instance
+            .compensation_waits
+            .iter()
+            .find(|(_, wait)| wait.pending_handler_keys.contains(&element_instance_key))
+            .map(|(throw_eik, _)| *throw_eik)
+    }
+
+    /// Pre-#897 fallback for [`pending_compensation_handler_by_instance`]: a wait
+    /// replayed from a journal written before handler-instance tracking carries
+    /// no `pending_handler_keys`, so a completing handler can only be matched by
+    /// its element id + scope — the historical behaviour, kept so an old journal
+    /// still replays to the same state it always did. Only waits WITHOUT the
+    /// instance binding are considered (a bound wait is always matched by key).
+    pub(crate) fn pending_compensation_handler_by_id(
         &self,
         instance_key: Key,
         element_id: &str,
@@ -64,7 +91,9 @@ impl Engine {
             .compensation_waits
             .iter()
             .filter(|(_, wait)| {
-                wait.scope == scope && wait.pending_handlers.iter().any(|h| h == element_id)
+                wait.pending_handler_keys.is_empty()
+                    && wait.scope == scope
+                    && wait.pending_handlers.iter().any(|h| h == element_id)
             })
             .map(|(throw_eik, _)| *throw_eik)
             .min()
