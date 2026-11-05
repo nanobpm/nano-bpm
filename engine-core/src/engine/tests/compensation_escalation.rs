@@ -1342,6 +1342,7 @@ fn multi_instance_compensation_handler_completion_retires_the_throw_wait() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

@@ -1124,9 +1124,13 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
     let incident = extract_value_incident(&engine, "g");
     assert_eq!(
         incident.redrive,
-        Some(state::IoMappingRedrive::Activation),
-        "{gateway:?}: a mid-chain listener failure is an activation-phase \
-         incident: {:?}",
+        Some(state::IoMappingRedrive::ExecutionListenerJob {
+            event_type: crate::model::ListenerEventType::Start,
+            listener_index: 1,
+            scope: 0,
+        }),
+        "{gateway:?}: a mid-chain listener failure re-mints only the failed \
+         listener (#1398), not the whole activation phase: {:?}",
         incident
     );
 

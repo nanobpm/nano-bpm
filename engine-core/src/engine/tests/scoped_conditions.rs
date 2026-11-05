@@ -238,6 +238,7 @@ fn multi_instance_completion_condition_sees_child_scope() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: Some("=item = 2".to_string()),
+                cancel_remaining_instances: true,
                 sequential: true,
             },
         )
@@ -357,6 +358,7 @@ fn multi_instance_completion_condition_sees_output_mapped_value() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: Some("=stop = true".to_string()),
+                cancel_remaining_instances: true,
                 sequential: true,
             },
         )

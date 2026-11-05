@@ -1191,6 +1191,7 @@ fn multi_instance_body_static_input_mapping_named_like_child_binding_is_applied_
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1254,6 +1255,7 @@ fn multi_instance_body_input_mapping_with_local_binding_shadowing_input_element_
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1308,6 +1310,7 @@ fn multi_instance_body_input_mapping_with_filter_local_item_binding_runs() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1363,6 +1366,7 @@ fn multi_instance_body_input_mapping_with_filter_over_context_elements_runs() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -1419,6 +1423,7 @@ fn multi_instance_body_input_mapping_with_bare_var_filter_runs() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )

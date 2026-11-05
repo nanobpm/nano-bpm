@@ -548,17 +548,20 @@ fn mi_completion_condition_sees_enclosing_subprocess_locals() {
 #[test]
 fn mi_output_element_failure_raises_incident_on_the_child() {
     // Zeebe `MultiInstanceOutputCollectionBehavior.readOutputElementVariable`:
-    // a failure is an incident — nano used to collect `null`.
+    // a failure is an incident — nano used to collect `null`. The expression
+    // forces a strict read of the unbound `suffix` (`substring(null, …)` is a
+    // genuine evaluation error): feel-scala null-on-type-error parity (#1420)
+    // makes a bare `item + suffix` return `null` rather than fail.
     let (mut engine, inst) = start(
         mi_process_ending_in(
-            r#"inputCollection="=items" inputElement="item" outputCollection="out" outputElement="=item + suffix""#,
+            r#"inputCollection="=items" inputElement="item" outputCollection="out" outputElement="=item + substring(suffix, 1)""#,
             "",
             r#"<bpmn:userTask id="e" />"#,
         ),
         vars(&[("items", Value::List(vec![Value::Str("a".into())]))]),
     );
     complete_one(&mut engine, "work");
-    let incident = extract_value_incident(&engine, "work", "'=item + suffix'");
+    let incident = extract_value_incident(&engine, "work", "substring");
     set_and_resolve(
         &mut engine,
         inst,
@@ -956,7 +959,7 @@ fn mi_call_activity_completion_retry_reuses_projected_output_overlay() {
                 input_collection: "=items".to_string(),
                 input_element: Some("item".to_string()),
                 output_collection: Some("results".to_string()),
-                output_element: Some("=result + suffix".to_string()),
+                output_element: Some("=result + abs(suffix)".to_string()),
                 completion_condition: None,
                 cancel_remaining_instances: true,
                 sequential: false,
@@ -982,7 +985,9 @@ fn mi_call_activity_completion_retry_reuses_projected_output_overlay() {
         .unwrap();
     let key = created.iter().find_map(|e| e.instance_key()).unwrap();
     // Complete the callee's job, producing `result` — the child then fails on
-    // `outputElement = result + suffix` (suffix unset).
+    // `outputElement = result + abs(suffix)` (suffix unset → `abs(null)` is a
+    // genuine evaluation error under feel-scala null-on-type-error parity,
+    // #1420; a bare `result + suffix` would return `null`).
     let jobs = engine.activate_jobs("callee-work", "W", 10, 60_000, 0);
     assert_eq!(jobs.len(), 1);
     engine
@@ -992,7 +997,7 @@ fn mi_call_activity_completion_retry_reuses_projected_output_overlay() {
             crate::model::AdHocJobResult::default(),
         ))
         .unwrap();
-    let incident = extract_value_incident(&engine, "each", "suffix");
+    let incident = extract_value_incident(&engine, "each", "abs");
     // Fix `suffix` and resolve: the retry must collect the callee's real
     // projected result (7 + 1 = 8), not `null`.
     set_and_resolve(&mut engine, key, &incident, &[("suffix", Value::Int(1))]);
