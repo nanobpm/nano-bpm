@@ -75,6 +75,9 @@ pub(crate) use super::MAX_JOB_TYPE_LENGTH;
 pub(crate) struct Evaluated {
     pub(crate) value: Value,
     pub(crate) kind: &'static str,
+    /// Native kinds of the items when the result is an `ARRAY` (empty
+    /// otherwise / for static values).
+    pub(crate) item_kinds: Vec<&'static str>,
 }
 
 /// Whether `raw` is a FEEL expression (leading `=`) rather than a static value.
@@ -94,10 +97,15 @@ pub(crate) fn evaluate_or_failure(
         return Ok(Evaluated {
             value: Value::Str(raw.to_string()),
             kind: "STRING",
+            item_kinds: Vec::new(),
         });
     }
     crate::feel::eval_typed(raw.trim(), vars)
-        .map(|(value, kind)| Evaluated { value, kind })
+        .map(|(value, kind, item_kinds)| Evaluated {
+            value,
+            kind,
+            item_kinds,
+        })
         .map_err(|e| {
             Failure::extract_value(format!(
                 "Expected to evaluate expression '{}', but failed: {}",
@@ -123,6 +131,7 @@ pub(crate) fn evaluate_string(raw: &str, vars: &HashMap<String, Value>) -> Resul
         Evaluated {
             value: Value::Str(s),
             kind: "STRING",
+            ..
         } => Ok(s),
         other => Err(type_failure(raw, "STRING", other.kind)),
     }
@@ -235,11 +244,22 @@ pub(crate) fn evaluate_array_of_strings(
     expr: &str,
     vars: &HashMap<String, Value>,
 ) -> Result<Vec<String>, Failure> {
-    let items = evaluate_array(expr, vars)?;
+    let evaluated = evaluate_feel(expr, vars)?;
+    let Evaluated {
+        value: Value::List(items),
+        item_kinds,
+        ..
+    } = evaluated
+    else {
+        return Err(type_failure(expr, "ARRAY", evaluated.kind));
+    };
+    // Check the *native* item kinds: a temporal item renders to `Value::Str`
+    // but is not a `STRING` (#1421 review).
     items
         .into_iter()
-        .map(|v| match v {
-            Value::Str(s) => Ok(s),
+        .zip(item_kinds)
+        .map(|(v, kind)| match (v, kind) {
+            (Value::Str(s), "STRING") => Ok(s),
             _ => Err(Failure::extract_value(format!(
                 "Expected result of the expression '{}' to be 'ARRAY' containing 'STRING' items, but was 'ARRAY' containing at least one non-'STRING' item.",
                 expr.trim()
@@ -258,10 +278,14 @@ pub(crate) fn evaluate_correlation_key(
     // reference), with or without the leading `=`.
     let evaluated = evaluate_feel(raw, vars)?;
     match (&evaluated.value, evaluated.kind) {
-        (Value::Str(s), _) => Ok(s.clone()),
+        // Only a native `STRING`: temporal results also render to
+        // `Value::Str` but are not valid keys (#1421 review).
+        (Value::Str(s), "STRING") => Ok(s.clone()),
         (Value::Int(i), _) => Ok(i.to_string()),
-        (Value::Double(d), _) if d.is_finite() && d.fract() == 0.0 => Ok((*d as i64).to_string()),
-        (Value::Double(d), _) => Ok(d.to_string()),
+        // `f64` Display already omits the fraction for integral doubles and
+        // never narrows (`1e20` stays `100000000000000000000`, no i64
+        // saturation that would collapse distinct keys).
+        (Value::Double(d), _) if d.is_finite() => Ok(d.to_string()),
         _ => Err(Failure::extract_value(format!(
             "Failed to extract the correlation key for '{}': The value must be either a string or a number, but was '{}'.",
             raw.trim(),
@@ -399,6 +423,49 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.clone()))
             .collect()
+    }
+
+    #[test]
+    fn correlation_key_rejects_temporals_and_never_narrows_doubles() {
+        let v = vars(&[("big", Value::Double(1e20)), ("three", Value::Double(3.0))]);
+        assert_eq!(
+            evaluate_correlation_key("=big", &v).unwrap(),
+            "100000000000000000000"
+        );
+        assert_ne!(
+            evaluate_correlation_key("=big", &v).unwrap(),
+            evaluate_correlation_key("=big * 2", &v).unwrap()
+        );
+        assert_eq!(evaluate_correlation_key("=three", &v).unwrap(), "3");
+        for temporal in [
+            r#"=date("2024-01-15")"#,
+            r#"=time("10:00:00")"#,
+            r#"=date and time("2024-01-15T10:00:00")"#,
+            r#"=duration("PT1H")"#,
+        ] {
+            assert!(
+                evaluate_correlation_key(temporal, &v).is_err(),
+                "{temporal} must not be a correlation key"
+            );
+        }
+    }
+
+    #[test]
+    fn array_of_strings_rejects_temporal_items() {
+        let v = HashMap::new();
+        assert_eq!(
+            evaluate_array_of_strings(r#"=["a", "b"]"#, &v).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        for list in [
+            r#"=[date("2024-01-15")]"#,
+            r#"=["a", time("10:00:00")]"#,
+            r#"=[duration("P1D")]"#,
+            "=[1]",
+        ] {
+            let f = evaluate_array_of_strings(list, &v).unwrap_err();
+            assert!(f.message.contains("non-'STRING' item"), "{list}: {f:?}");
+        }
     }
 
     #[test]
