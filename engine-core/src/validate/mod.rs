@@ -36,7 +36,7 @@ mod gateway_conditions;
 mod incoming_outgoing;
 mod references;
 mod start_events;
-mod unsupported_elements;
+pub(crate) mod unsupported_elements;
 
 /// A captured `<incoming>`/`<outgoing>` QName reference from a flow node to a
 /// `<sequenceFlow>`.

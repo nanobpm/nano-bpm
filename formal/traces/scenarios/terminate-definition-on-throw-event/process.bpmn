@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_tdte" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="terminate-definition-on-throw-event" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:intermediateThrowEvent id="throw">
+      <bpmn:terminateEventDefinition />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:serviceTask id="work">
+      <bpmn:extensionElements><zeebe:taskDefinition type="work" /></bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="throw" />
+    <bpmn:sequenceFlow id="f2" sourceRef="throw" targetRef="work" />
+    <bpmn:sequenceFlow id="f3" sourceRef="work" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="terminate-definition-on-throw-event">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="180" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="throw_di" bpmnElement="throw"><dc:Bounds x="252" y="180" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="work_di" bpmnElement="work"><dc:Bounds x="340" y="158" width="100" height="80" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="492" y="180" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="196" y="198" /><di:waypoint x="252" y="198" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="288" y="198" /><di:waypoint x="340" y="198" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3"><di:waypoint x="440" y="198" /><di:waypoint x="492" y="198" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -109,8 +109,7 @@
 //!   rejected at deploy rather than dropped (`UnsupportedExecutionListener`):
 //!   a multi-incoming parallel gateway (a *join* — both phases), the `start`
 //!   listener of a multi-incoming inclusive gateway (its `end` listener IS
-//!   supported), a compensation boundary event, the `end` listener of a
-//!   terminate end event (its `start` listener IS supported), a listener on a
+//!   supported), a compensation boundary event, a listener on a
 //!   surplus signal start event (demoted to an inert throw), a **tool of an
 //!   ad-hoc sub-process** (pruned leaf tools and directly-activated embedded
 //!   tools both bypass the listener gate), and a sequence-flow ("take") listener

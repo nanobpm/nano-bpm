@@ -1,0 +1,13 @@
+{
+  "description": "A stray terminateEventDefinition on the process start event (#985). Zeebe deploys it; this pins what creating an instance then does.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "terminate-definition-on-start-event"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}
