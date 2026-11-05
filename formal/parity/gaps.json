@@ -460,6 +460,7 @@
     "lifecycle:CALL_ACTIVITY:terminate",
     "lifecycle:END_EVENT:activate",
     "lifecycle:END_EVENT:complete",
+    "lifecycle:END_EVENT:complete-execution-listener",
     "lifecycle:END_EVENT:continue-terminating",
     "lifecycle:END_EVENT:terminate",
     "lifecycle:EVENT_BASED_GATEWAY:activate",

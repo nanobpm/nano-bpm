@@ -625,14 +625,6 @@
       "note": "No Nano test raises this Zeebe incident type yet."
     },
     {
-      "match": "lifecycle:END_EVENT:complete-execution-listener",
-      "status": "nano-tested",
-      "evidence": [
-        "engine-core/src/engine/tests/lifecycle.rs::top_level_terminate_end_runs_its_end_listener_before_terminating_siblings",
-        "engine-core/src/engine/tests/lifecycle.rs::subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope"
-      ]
-    },
-    {
       "match": "lifecycle:*",
       "status": "gap",
       "issue": 1249,
