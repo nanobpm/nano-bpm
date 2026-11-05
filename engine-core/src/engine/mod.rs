@@ -326,6 +326,15 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// Re-mint ONLY the agent job of an ad-hoc container whose agent-job
+    /// `type` / `retries` expression raised an incident
+    /// ([`state::IoMappingRedrive::AdHocAgentJob`], #1398 review): the
+    /// container's collected results and ad-hoc state are preserved.
+    MintAdHocAgentJob {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
     /// Re-mint the listener job of a user task's task-listener chain whose
     /// `type` / `retries` expression raised an incident (#1398).
     MintTaskListenerJob {
@@ -3251,6 +3260,14 @@ impl Engine {
                                 event_type,
                                 index: listener_index,
                             });
+                        } else if matches!(redrive, Some(state::IoMappingRedrive::AdHocAgentJob)) {
+                            // An agent container's agent-job property failed
+                            // (#1398 review): re-mint only the agent job.
+                            queue.push_back(Step::MintAdHocAgentJob {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
                         } else if matches!(redrive, Some(state::IoMappingRedrive::JobCreation)) {
                             // A job-property expression (type/retries) failed when
                             // a job was re-created for an already-running element
@@ -3712,6 +3729,13 @@ impl Engine {
                                 event_type,
                                 index: listener_index,
                             }),
+                            Some(state::IoMappingRedrive::AdHocAgentJob) => {
+                                Some(Step::MintAdHocAgentJob {
+                                    instance_key,
+                                    element_instance_key,
+                                    element_id,
+                                })
+                            }
                             Some(state::IoMappingRedrive::JobCreation) => Some(Step::CreateJob {
                                 instance_key,
                                 element_instance_key,
@@ -5819,6 +5843,11 @@ impl Engine {
                 element_instance_key,
                 ..
             }
+            | Step::MintAdHocAgentJob {
+                instance_key,
+                element_instance_key,
+                ..
+            }
             | Step::RerunActivationBody {
                 instance_key,
                 element_instance_key,
@@ -6078,6 +6107,14 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.create_job_for(instance_key, element_instance_key, element_id),
+            Step::MintAdHocAgentJob {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => (
+                self.adhoc_agent_job_events(instance_key, element_instance_key, element_id),
+                Vec::new(),
+            ),
             Step::MintTaskListenerJob {
                 user_task_key,
                 event_type,
@@ -10560,15 +10597,15 @@ impl Engine {
             Err(reason) => {
                 // #1390 / #1398: a failed container job-type / retries expression parks the
                 // container on an EXTRACT_VALUE_ERROR incident — no agent job.
-                // `redrive: None` resolves via `Step::Complete`, which routes a
-                // JOB_WORKER container back through `complete_adhoc_container`,
-                // whose turn loop re-mints the agent job via this function.
+                // The `AdHocAgentJob` redrive re-mints ONLY the agent job on
+                // resolution, preserving the container's collected results and
+                // ad-hoc state (re-running its activation would reset them).
                 return vec![self.expression_incident(
                     instance_key,
                     container_key,
                     container_element_id,
                     reason,
-                    None,
+                    Some(state::IoMappingRedrive::AdHocAgentJob),
                 )];
             }
         };

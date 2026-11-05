@@ -989,6 +989,15 @@ pub enum IoMappingRedrive {
     /// job creation (engine `Step::CreateJob`) against the then-current
     /// variables. Additive brand-new variant — old journals never carry it.
     JobCreation,
+    /// An ad-hoc (agent) container's agent-job `type` / `retries` expression
+    /// failed when the job for the next agent turn was to be minted (#1398
+    /// review). The container stays activated with its collected results,
+    /// active tools and iteration state intact; resolution re-mints ONLY the
+    /// agent job (engine `Step::MintAdHocAgentJob`) — re-running the
+    /// container's activation would reset its `outputCollection` and
+    /// `AdHocState`. Covers nested containers (the job type is resolved off the
+    /// parent catalog). Additive brand-new variant — old journals never carry it.
+    AdHocAgentJob,
     /// A multi-instance **child**'s job properties (type / retries) failed to
     /// evaluate after its per-child input mappings were already applied (#1390,
     /// #1399 review): resolution re-runs only the child's behaviour against its

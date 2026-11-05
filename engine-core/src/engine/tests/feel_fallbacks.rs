@@ -1234,3 +1234,96 @@ fn sequential_mi_completion_latch_completes_without_spawning_remaining_items() {
     );
     assert!(engine.pending_jobs().is_empty());
 }
+
+#[test]
+fn resolved_agent_job_retries_failure_preserves_container_results() {
+    // The agent job's `retries` expression fails when the job for the NEXT turn
+    // is minted (after a tool drained). Resolution must re-mint only the agent
+    // job — not re-run the container's activation, which would reset its
+    // `outputCollection` and ad-hoc state (#1398 review).
+    let def = parse(
+        r#"<bpmn:process id="agentr" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" retries="=agentRetries" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(def, vars(&[("agentRetries", Value::Int(3))]));
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("turn-1 agent job");
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    // Break the agent's retries expression, then drain the tool: the turn-2
+    // agent job cannot be minted.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            vars(&[("agentRetries", Value::Str("bad".into()))]),
+        ))
+        .unwrap();
+    let tool = engine
+        .activate_jobs("tool", "W", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("tool job");
+    engine
+        .apply_command(Command::complete_job_with(
+            tool.key,
+            vars(&[("result", Value::Str("A".into()))]),
+        ))
+        .unwrap();
+    let collected = |engine: &Engine| {
+        engine
+            .instance(inst)
+            .unwrap()
+            .scope_variables
+            .get(&container)
+            .and_then(|m| m.get("results"))
+            .cloned()
+    };
+    assert_eq!(
+        collected(&engine),
+        Some(Value::List(vec![Value::Str("A".into())]))
+    );
+    let incident = extract_value_incident(&engine, "agent", "agentRetries");
+    set_and_resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("agentRetries", Value::Int(3))],
+    );
+    assert_eq!(
+        collected(&engine),
+        Some(Value::List(vec![Value::Str("A".into())])),
+        "the collected tool result survives the retry"
+    );
+    let agents: Vec<_> = engine
+        .pending_jobs()
+        .into_iter()
+        .filter(|j| j.job_type == "agent-worker")
+        .collect();
+    assert_eq!(agents.len(), 1, "exactly one turn-2 agent job is minted");
+    assert_eq!(agents[0].element_instance_key, container);
+}
