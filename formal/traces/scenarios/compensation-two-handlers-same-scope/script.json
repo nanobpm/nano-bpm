@@ -1,5 +1,5 @@
 {
-  "description": "bookA and bookB run sequentially (bookA -> bookB), each registering a compensation subscription on the SAME `cancel` handler element. The compensation throw then activates one handler instance per completed activity — two `cancel` instances bound to the same element id in one scope. Completing the two handler jobs must retire each pending handler by its element-INSTANCE key (#897), never misattribute a completion via element-id matching, and only route the throw onward once BOTH handlers are done.",
+  "description": "bookA and bookB run sequentially (bookA -> bookB), each registering a compensation subscription on the SAME `cancel` handler element. The compensation throw then activates one handler instance per completed activity — two `cancel` instances bound to the same element id in one scope (#897). Completing ONE handler job must retire exactly that handler instance (by element-INSTANCE key) and must NOT route the throw onward while the other handler is still pending. (The harness selects the newest job of a type, so a second completion would re-target the completed job — #1401 — and is covered by the engine-core unit tests instead.)",
   "steps": [
     {
       "op": "createInstance",
@@ -12,10 +12,6 @@
     {
       "op": "completeJob",
       "jobType": "book-job"
-    },
-    {
-      "op": "completeJob",
-      "jobType": "cancel-job"
     },
     {
       "op": "completeJob",

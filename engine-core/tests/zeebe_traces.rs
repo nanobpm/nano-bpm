@@ -1367,12 +1367,78 @@ fn verdict(outcomes: &BTreeMap<String, Option<String>>, allowlist: &J) -> Result
     }
 }
 
+/// Does `record` match `matcher` (every matcher field equal)?
+fn record_matches(record: &J, matcher: &J) -> bool {
+    matcher
+        .as_object()
+        .is_some_and(|m| !m.is_empty() && m.iter().all(|(k, v)| &record[k] == v))
+}
+
+/// `steps` with every record matching one of `ignore` removed.
+fn mask_records(steps: &[J], ignore: &[J]) -> Vec<J> {
+    steps
+        .iter()
+        .map(|step| {
+            let mut step = step.clone();
+            if let Some(rs) = step["records"].as_array_mut() {
+                rs.retain(|r| !ignore.iter().any(|m| record_matches(r, m)));
+            }
+            step
+        })
+        .collect()
+}
+
+/// Narrow allow-listing: an entry may carry `ignoreRecords` (record-field
+/// matchers). Its scenario is then allowed to diverge ONLY in records those
+/// matchers select — with them masked out of both sides, every step must
+/// still equal Zeebe exactly. Returns one error per residual divergence.
+fn masked_residuals(
+    allowlist: &J,
+    traces: &BTreeMap<String, (Vec<J>, Option<Vec<J>>)>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for entry in allowlist["entries"].as_array().expect("allowlist.entries") {
+        let Some(ignore) = entry["ignoreRecords"].as_array() else {
+            continue;
+        };
+        let scenario = entry["scenario"].as_str().unwrap_or_default();
+        if ignore
+            .iter()
+            .any(|m| m.as_object().is_none_or(|o| o.is_empty()))
+        {
+            errors.push(format!(
+                "allow-list entry `{scenario}`: every ignoreRecords matcher must be a non-empty object"
+            ));
+            continue;
+        }
+        if let Some((golden, Some(nano))) = traces.get(scenario) {
+            if let Some(d) = diff(&mask_records(golden, ignore), &mask_records(nano, ignore)) {
+                errors.push(format!(
+                    "scenario `{scenario}` diverges from Zeebe beyond its allow-listed \
+                     ignoreRecords:\n{d}"
+                ));
+            }
+        }
+    }
+    errors
+}
+
 fn load_spec() -> J {
     read_json(&traces_dir().join("normaliser.json"))
 }
 
 /// Run every scenario: `name -> Some(diff)` when nano diverges from the golden.
 fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
+    run_corpus_traces(spec)
+        .into_iter()
+        .map(|(n, (d, _))| (n, d))
+        .collect()
+}
+
+/// Every scenario's verdict plus its (golden, nano) traces; the nano trace is
+/// `None` when nano could not replay the script.
+#[allow(clippy::type_complexity)]
+fn run_corpus_traces(spec: &J) -> BTreeMap<String, (Option<String>, (Vec<J>, Option<Vec<J>>))> {
     let goldens = traces_dir().join("goldens");
     scenario_dirs()
         .iter()
@@ -1380,6 +1446,7 @@ fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
             let sc = load_scenario(dir).unwrap_or_else(|e| panic!("{e}"));
             let golden = read_json(&goldens.join(format!("{}.trace.json", sc.name)));
             let steps = golden["steps"].as_array().expect("golden steps").clone();
+            let mut nano = None;
             let d = rejection_expectation_mismatch(&sc, &steps).or_else(|| {
                 // A script nano cannot even replay (e.g. it resolves an
                 // incident nano never raised) is a divergence, not a crash of
@@ -1387,7 +1454,11 @@ fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     nano_trace(spec, &sc)
                 })) {
-                    Ok(trace) => diff(&steps, &trace),
+                    Ok(trace) => {
+                        let d = diff(&steps, &trace);
+                        nano = Some(trace);
+                        d
+                    }
                     Err(p) => Some(format!(
                         "nano could not replay the script: {}",
                         p.downcast_ref::<String>()
@@ -1397,7 +1468,7 @@ fn run_corpus(spec: &J) -> BTreeMap<String, Option<String>> {
                     )),
                 }
             });
-            (sc.name, d)
+            (sc.name, (d, (steps, nano)))
         })
         .collect()
 }
@@ -1419,10 +1490,17 @@ fn corpus_matches_zeebe_goldens() {
         regen_goldens(&spec);
         return;
     }
-    let outcomes = run_corpus(&spec);
-    assert!(!outcomes.is_empty(), "the trace corpus is empty");
+    let runs = run_corpus_traces(&spec);
+    assert!(!runs.is_empty(), "the trace corpus is empty");
     let allowlist = read_json(&traces_dir().join("allowlist.json"));
-    if let Err(errors) = verdict(&outcomes, &allowlist) {
+    let outcomes = runs
+        .iter()
+        .map(|(n, (d, _))| (n.clone(), d.clone()))
+        .collect();
+    let traces = runs.into_iter().map(|(n, (_, t))| (n, t)).collect();
+    let mut errors = verdict(&outcomes, &allowlist).err().unwrap_or_default();
+    errors.extend(masked_residuals(&allowlist, &traces));
+    if !errors.is_empty() {
         panic!(
             "Zeebe differential traces failed:\n\n{}\n\nSee formal/traces/README.md.",
             errors.join("\n\n")
@@ -1848,6 +1926,29 @@ fn stale_allow_list_entry_fails_the_runner() {
     assert!(err[0].starts_with("STALE allow-list entry"), "{err:?}");
     let unknown = json!({"entries": [{"scenario": "no-such-scenario", "issue": "#1391"}]});
     assert!(verdict(&outcomes, &unknown).unwrap_err()[0].contains("no such scenario"));
+}
+
+/// An `ignoreRecords` allow-list entry tolerates ONLY the matched records: a
+/// divergence elsewhere in the scenario still fails the gate.
+#[test]
+fn ignore_records_masks_only_the_matched_records() {
+    let (spec, sc, mut golden) = first_scenario();
+    let nano = nano_trace(&spec, &sc);
+    let job = golden[0]["records"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r["valueType"] == "JOB")
+        .unwrap();
+    job["retries"] = json!(4);
+    let traces = BTreeMap::from([(sc.name.clone(), (golden.clone(), Some(nano.clone())))]);
+    let entry =
+        |m: J| json!({"entries": [{"scenario": sc.name, "issue": "#1424", "ignoreRecords": m}]});
+    assert!(masked_residuals(&entry(json!([{"valueType": "JOB"}])), &traces).is_empty());
+    let err = masked_residuals(&entry(json!([{"valueType": "VARIABLE"}])), &traces);
+    assert!(err[0].contains("beyond its allow-listed"), "{err:?}");
+    let err = masked_residuals(&entry(json!([{}])), &traces);
+    assert!(err[0].contains("non-empty object"), "{err:?}");
 }
 
 /// Editing a script's `expectRejection` without recapturing must fail the

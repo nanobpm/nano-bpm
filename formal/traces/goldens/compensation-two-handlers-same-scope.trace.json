@@ -304,14 +304,5 @@
       "processInstanceKey" : 1,
       "elementInstanceKey" : 5
     } ]
-  }, {
-    "step" : 4,
-    "op" : "completeJob",
-    "records" : [ {
-      "recordType" : "COMMAND_REJECTION",
-      "valueType" : "JOB",
-      "intent" : "COMPLETE",
-      "rejectionType" : "NOT_FOUND"
-    } ]
   } ]
 }

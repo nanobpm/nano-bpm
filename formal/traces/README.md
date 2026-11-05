@@ -193,7 +193,14 @@ cases:
 - an allow-list entry lacks an issue reference (`#N` or an issues URL).
 
 Allow-list entry shape:
-`{ "scenario": "<name>", "issue": "#N", "reason": "..." }`.
+`{ "scenario": "<name>", "issue": "#N", "reason": "...", "ignoreRecords": [ {...} ] }`.
+
+`ignoreRecords` is optional and narrows the entry: each matcher is a non-empty
+object of record fields (e.g. `{"bpmnElementType": "BOUNDARY_EVENT",
+"elementId": "compA"}`). With the matched records masked out of both traces,
+every step must still equal Zeebe exactly — a divergence anywhere else fails
+the gate. Prefer it over a whole-scenario entry whenever the divergence is
+confined to identifiable records.
 
 ## Adding a scenario
 
@@ -205,7 +212,7 @@ Allow-list entry shape:
 
 ## Divergences this harness found but did not seed
 
-The seeded corpus is all-passing, and the allow-list is empty. Two real
+The seeded corpus is all-passing except for the narrowly masked #1424 entry (compensation boundary-event lifecycle records). Two real
 divergences were found while building the harness. They are tracked
 separately, and their scenarios should be added once the fixes land:
 
