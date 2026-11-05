@@ -25,7 +25,7 @@
       "sync-task": [
         [
           -50,
-          29
+          30
         ]
       ],
       "whole-cancel-job": [
@@ -613,6 +613,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 2,
         "process_id": "order",
         "scope_parents": {},
@@ -646,6 +647,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 17,
         "process_id": "dup",
         "scope_parents": {},
@@ -659,8 +661,8 @@
       },
       "25": {
         "active": {
-          "28": "t",
-          "30": "join"
+          "28": "join",
+          "29": "t"
         },
         "adhoc_instances": {},
         "agent_history": {},
@@ -684,12 +686,15 @@
           ]
         },
         "join_instances": {
-          "join": 30
+          "join": 28
         },
         "key": 25,
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [
+          28
+        ],
         "process_definition_key": 19,
         "process_id": "sync",
         "scope_parents": {},
@@ -738,6 +743,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 32,
         "process_id": "trip",
         "scope_parents": {
@@ -796,6 +802,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 40,
         "process_id": "whole",
         "scope_parents": {
@@ -831,6 +838,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 51,
         "process_id": "whole-done",
         "scope_parents": {},
@@ -860,6 +868,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 66,
         "process_id": "decide",
         "scope_parents": {},
@@ -889,6 +898,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 2,
         "process_id": "order",
         "scope_parents": {},
@@ -922,6 +932,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 66,
         "process_id": "decide",
         "scope_parents": {},
@@ -959,6 +970,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 2,
         "process_id": "order",
         "scope_parents": {},
@@ -990,6 +1002,7 @@
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
+        "parked_joins": [],
         "process_definition_key": 88,
         "process_id": "order-v2",
         "scope_parents": {},
@@ -1045,19 +1058,19 @@
         "state": "Created",
         "worker": null
       },
-      "29": {
+      "30": {
         "activated": false,
         "activated_at": null,
         "activation_timeout": null,
         "created_at": 1700000000010,
         "deadline": null,
         "element_id": "t",
-        "element_instance_key": 28,
+        "element_instance_key": 29,
         "error_code": null,
         "error_message": null,
         "instance_key": 25,
         "job_type": "sync-task",
-        "key": 29,
+        "key": 30,
         "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
@@ -1153,7 +1166,7 @@
         15
       ],
       "25": [
-        29
+        30
       ],
       "33": [
         38

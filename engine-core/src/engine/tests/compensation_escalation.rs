@@ -2039,6 +2039,7 @@ fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subproce
                     output_collection: None,
                     output_element: None,
                     completion_condition: None,
+                    cancel_remaining_instances: true,
                     sequential,
                 },
             )
@@ -2203,6 +2204,7 @@ fn whole_scope_throw_reaches_the_explicit_handler_of_a_completed_multi_instance_
                     output_collection: None,
                     output_element: None,
                     completion_condition: None,
+                    cancel_remaining_instances: true,
                     sequential,
                 },
             )
@@ -2297,6 +2299,7 @@ fn whole_scope_throw_runs_an_explicit_handler_on_each_completed_mi_child() {
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -2412,6 +2415,7 @@ fn whole_scope_throw_reaches_the_explicit_handler_after_the_mi_body_end_listener
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -2599,6 +2603,7 @@ fn mi_sub_process_handler_def(with_body_end_listener: bool) -> crate::model::Pro
                 output_collection: None,
                 output_element: None,
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
@@ -2731,6 +2736,7 @@ fn run_mi_handler_output_mapping(with_body_end_listener: bool) {
                 output_collection: Some("results".to_string()),
                 output_element: Some("=item".to_string()),
                 completion_condition: None,
+                cancel_remaining_instances: true,
                 sequential: false,
             },
         )
