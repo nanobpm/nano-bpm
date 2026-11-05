@@ -6790,3 +6790,152 @@ fn scoped_terminate_drops_a_join_arrival_whose_activation_was_still_queued() {
         );
     }
 }
+
+/// A terminate end event carrying an `end` execution listener (#985).
+/// `inner` wraps the fork in an embedded sub-process when true (scoped
+/// terminate), else the fork sits at the process root (top-level terminate).
+fn terminate_end_with_end_listener_xml(scoped: bool) -> String {
+    let fork = r#"
+        <bpmn:parallelGateway id="fork" />
+        <bpmn:serviceTask id="work">
+          <bpmn:extensionElements><zeebe:taskDefinition type="work-job" /></bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="stop-end" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f2" sourceRef="fork" targetRef="work" />
+        <bpmn:sequenceFlow id="f3" sourceRef="fork" targetRef="stop" />"#;
+    let body = if scoped {
+        format!(
+            r#"<bpmn:startEvent id="s" />
+            <bpmn:subProcess id="sub">
+              <bpmn:startEvent id="s2" />
+              {fork}
+              <bpmn:sequenceFlow id="f1" sourceRef="s2" targetRef="fork" />
+            </bpmn:subProcess>
+            <bpmn:serviceTask id="after">
+              <bpmn:extensionElements><zeebe:taskDefinition type="after-job" /></bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:endEvent id="e" />
+            <bpmn:sequenceFlow id="g1" sourceRef="s" targetRef="sub" />
+            <bpmn:sequenceFlow id="g2" sourceRef="sub" targetRef="after" />
+            <bpmn:sequenceFlow id="g3" sourceRef="after" targetRef="e" />"#
+        )
+    } else {
+        format!(
+            r#"<bpmn:startEvent id="s" />
+            {fork}
+            <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="fork" />"#
+        )
+    };
+    format!(
+        r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+           <bpmn:process id="term-el" isExecutable="true">{body}</bpmn:process>
+         </bpmn:definitions>"#
+    )
+}
+
+/// Deploys the #985 fixture and starts an instance, returning its key.
+fn start_terminate_end_with_end_listener(engine: &mut Engine, scoped: bool) -> Key {
+    let def = crate::bpmn::parse_bpmn(&terminate_end_with_end_listener_xml(scoped))
+        .expect("Zeebe accepts an end execution listener on a terminate end (#985)")
+        .remove(0);
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("term-el"))
+        .unwrap();
+    created.iter().find_map(|e| e.instance_key()).unwrap()
+}
+
+// zeebe-cells: event:end:terminate lifecycle:END_EVENT:complete-execution-listener
+#[test]
+fn top_level_terminate_end_runs_its_end_listener_before_terminating_siblings() {
+    // Zeebe `TerminateEndEventBehavior` (#985): the terminate end completes
+    // through the normal completion path — it rests in COMPLETING while its
+    // `end` listener job runs, and the sibling teardown + process completion
+    // happen only once that chain drains. Previously the listener was rejected
+    // at deploy because the inline teardown bypassed the chain.
+    let mut engine = Engine::new();
+    let instance_key = start_terminate_end_with_end_listener(&mut engine, false);
+
+    // The terminate end is parked behind its end listener; the sibling `work`
+    // token is still alive and the instance has not completed.
+    let mut types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    types.sort();
+    assert_eq!(types, vec!["stop-end".to_string(), "work-job".to_string()]);
+    assert!(!engine.is_completed(instance_key));
+    let work_job = engine.activate_jobs("work-job", "w", 1, 60_000, 0)[0].key;
+
+    // Draining the listener chain completes the terminate end, kills the
+    // sibling (its job cancelled) and COMPLETES the instance.
+    let events = complete_one(&mut engine, "stop-end");
+    let completed_at = events
+        .iter()
+        .position(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "stop"))
+        .expect("the terminate end records ElementCompleted once its end listener drains");
+    let canceled_at = events
+        .iter()
+        .position(|e| {
+            *e == Event::JobCanceled {
+                job_key: work_job,
+                instance_key,
+            }
+        })
+        .expect("the sibling job is cancelled");
+    assert!(
+        completed_at < canceled_at,
+        "Zeebe: COMPLETED, then siblings terminate"
+    );
+    assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    // Exactly one COMPLETING for the terminate end across the whole journal.
+    assert!(!events.iter().any(
+        |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+    ));
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().active.is_empty());
+}
+
+// zeebe-cells: event:end:terminate lifecycle:END_EVENT:complete-execution-listener
+#[test]
+fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope() {
+    // The scoped variant (#985): the end listener runs first, then only the
+    // sub-process's tokens die and the parent continues on its outgoing flow.
+    let mut engine = Engine::new();
+    let instance_key = start_terminate_end_with_end_listener(&mut engine, true);
+    assert!(engine
+        .activate_jobs("after-job", "w", 1, 60_000, 0)
+        .is_empty());
+    let work_job = engine.activate_jobs("work-job", "w", 1, 60_000, 0)[0].key;
+
+    let events = complete_one(&mut engine, "stop-end");
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: work_job,
+        instance_key
+    }));
+    // The terminate end was already COMPLETING (before its listener ran): the
+    // scope teardown must not record a second COMPLETING for it.
+    assert!(!events.iter().any(
+        |e| matches!(e, Event::ElementCompleting { element_id, .. } if element_id.as_str() == "stop")
+    ));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::ElementCompleted { element_id, .. } if element_id.as_str() == "stop"))
+            .count(),
+        1
+    );
+    // The parent continues past the completed sub-process.
+    assert!(!engine.is_completed(instance_key));
+    complete_one(&mut engine, "after-job");
+    assert!(engine.is_completed(instance_key));
+}

@@ -1,0 +1,13 @@
+{
+  "description": "A stray terminateEventDefinition on an intermediateThrowEvent (#985). Zeebe deploys it and runs the throw event as a pass-through; it does NOT terminate the scope.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "terminate-definition-on-throw-event"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}

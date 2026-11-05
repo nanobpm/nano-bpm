@@ -1,0 +1,13 @@
+{
+  "description": "A terminate end event with an end execution listener (#985). Zeebe completes the terminate end through the normal completion path \u2014 it rests in COMPLETING while its end listener job runs \u2014 and only then terminates the sibling task (whose own end listener never runs: it is terminated, not completed); the process then COMPLETES.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "terminate-end-execution-listeners"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "killEnd"
+    }
+  ]
+}

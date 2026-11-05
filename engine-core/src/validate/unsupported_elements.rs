@@ -62,7 +62,19 @@ use super::ValidationInput;
 /// we reject with an actionable [`ParseError::UnsupportedElement`] naming the
 /// offending tag and element id.
 pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
-    if let Some(unsupported) = input.capture.unmodelled.first() {
+    reject_unmodelled(input.capture)
+}
+
+/// The capture-only core of [`validate`], also consulted by the parser when a
+/// process's model assembly fails (#985). An unmodelled
+/// construct is the root cause of any downstream build failure it induces —
+/// e.g. a boundary event whose only definition is unmodelled is not built, so
+/// its outgoing flow would otherwise fail first with a misleading "unknown
+/// source element" error. Preferring this over the build error guarantees the
+/// actionable [`ParseError::UnsupportedElement`] always wins, for every
+/// unmodelled placement, from one implementation.
+pub(crate) fn reject_unmodelled(capture: &super::ProcessCapture) -> Result<(), ParseError> {
+    if let Some(unsupported) = capture.unmodelled.first() {
         return Err(ParseError::UnsupportedElement {
             tag: unsupported.tag.clone(),
             element_id: unsupported.element_id.clone(),

@@ -768,10 +768,26 @@ impl<'a> NanoRun<'a> {
                     .get(instance_key)
                     .cloned()
                     .unwrap_or_else(|| format!("?{instance_key}"));
-                vec![
-                    self.lifecycle("ELEMENT_COMPLETING", &pid, *instance_key, *instance_key),
-                    self.lifecycle("ELEMENT_COMPLETED", &pid, *instance_key, *instance_key),
-                ]
+                // A top-level terminate end (#985/#1085) completes the process
+                // while sibling tokens are still live: nano's journal drops
+                // them with the instance (no per-element record), whereas
+                // Zeebe writes TERMINATING/TERMINATED for each before the
+                // process completes. Derive those records from the tokens
+                // still active — exactly as the `ProcessInstanceTerminated`
+                // arm does. A normal completion has none left, so it renders
+                // unchanged.
+                let (doomed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.active_elements)
+                    .into_iter()
+                    .partition(|(_, _, pi)| pi == instance_key);
+                self.active_elements = kept;
+                let mut out = Vec::new();
+                for (eik, id, pi) in doomed.into_iter().rev() {
+                    out.push(self.lifecycle("ELEMENT_TERMINATING", &id, eik, pi));
+                    out.push(self.lifecycle("ELEMENT_TERMINATED", &id, eik, pi));
+                }
+                out.push(self.lifecycle("ELEMENT_COMPLETING", &pid, *instance_key, *instance_key));
+                out.push(self.lifecycle("ELEMENT_COMPLETED", &pid, *instance_key, *instance_key));
+                out
             }
             Event::ProcessInstanceTerminating { instance_key } => {
                 let pid = self
@@ -975,7 +991,19 @@ impl<'a> NanoRun<'a> {
                     .unwrap_or_else(|| format!("?{scope_key}"));
                 self.variable_records(*scope_key, scope, variables, *instance_key)
             }
+            // An execution-listener job (ADR 0037) is an ordinary Zeebe JOB
+            // record (`jobKind = EXECUTION_LISTENER`, not projected), so it
+            // renders exactly like a task job and is completed by type (#985).
             Event::JobCreated {
+                job_key,
+                instance_key,
+                element_instance_key,
+                element_id,
+                job_type,
+                retries,
+                ..
+            }
+            | Event::ExecutionListenerJobCreated {
                 job_key,
                 instance_key,
                 element_instance_key,

@@ -28,6 +28,7 @@
     "event:intermediate-throw:link",
     "incident:CALLED_DECISION_ERROR",
     "incident:CALLED_ELEMENT_ERROR",
-    "incident:UNHANDLED_ERROR_EVENT"
+    "incident:UNHANDLED_ERROR_EVENT",
+    "lifecycle:END_EVENT:complete-execution-listener"
   ]
 }

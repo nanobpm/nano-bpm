@@ -11761,6 +11761,9 @@ impl Engine {
             Some(ElementKind::SubProcess { .. }) => {
                 self.finalize_subprocess(instance_key, element_instance_key, element_id, scope)
             }
+            Some(ElementKind::TerminateEndEvent) => {
+                self.finalize_terminate_end(instance_key, element_instance_key, element_id, scope)
+            }
             _ => self.finalize_completion(instance_key, element_instance_key, element_id, scope),
         }
     }
@@ -12295,6 +12298,71 @@ impl Engine {
         element_id: String,
         scope: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        // End execution listeners (#985). Zeebe's `TerminateEndEventBehavior`
+        // completes the terminate end through the NORMAL completion path — the
+        // element enters COMPLETING, its `end` listener chain runs, and only
+        // `finalizeCompletion` (after the chain drains) records COMPLETED and
+        // terminates the sibling instances. So when the element declares `end`
+        // listeners, rest it in COMPLETING behind the first listener job and
+        // defer the scope-wide teardown to `finalize_terminate_end`, dispatched
+        // by `finalize_end_transition` once the chain drains. A listener-free
+        // terminate end keeps its byte-identical inline journal.
+        let has_end_listeners = !self
+            .listeners_of(
+                instance_key,
+                &element_id,
+                crate::model::ListenerEventType::End,
+            )
+            .is_empty();
+        let listener = if has_end_listeners {
+            let vars = self.variables_for_element(instance_key, element_instance_key);
+            self.begin_end_listener_chain(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                scope,
+                &vars,
+            )
+        } else {
+            None
+        };
+        if let Some(listener) = listener {
+            return (
+                vec![
+                    Event::ElementCompleting {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    },
+                    listener,
+                ],
+                Vec::new(),
+            );
+        }
+        let mut events = vec![Event::ElementCompleting {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        let (tail, steps) =
+            self.finalize_terminate_end(instance_key, element_instance_key, element_id, scope);
+        events.extend(tail);
+        (events, steps)
+    }
+
+    /// The COMPLETED tail of a terminate end event (#985): records the terminate
+    /// end's own `ElementCompleted`, then kills every other token in its scope
+    /// and completes that scope (see [`complete_terminate_end`]). Runs inline for
+    /// a listener-free terminate end, or from [`finalize_end_transition`] once
+    /// its `end` execution-listener chain has drained — the element then already
+    /// rests in COMPLETING, so this emits no second `ElementCompleting`.
+    fn finalize_terminate_end(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
         if scope == 0 {
             // Top-level terminate end: complete the terminate-end itself, then
             // discard every remaining token and COMPLETE the whole instance.
@@ -12308,18 +12376,11 @@ impl Engine {
             // while the child's variables and the parent's call-activity token
             // are still live — the events below are decided, not yet applied.
             let release_parent = self.call_activity_completion_step(instance_key);
-            let mut events = vec![
-                Event::ElementCompleting {
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                },
-                Event::ElementCompleted {
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                },
-            ];
+            let mut events = vec![Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id,
+            }];
             events.extend(self.discard_instance_token_events(instance_key));
             // Resolve every incident still open on the instance before the
             // terminal record. The `ProcessInstanceTerminated` reducer used to
@@ -12346,8 +12407,25 @@ impl Engine {
         // token inside the dead scope (which would keep the sub-process from ever
         // draining) — the sub-process token stays active until the sweep, so the
         // dead-scope guard needs this marker, not just the `active` map.
+        //
+        // The terminate end is itself a descendant of `scope`, so the teardown
+        // sweep records its completion too; it already rests in COMPLETING (the
+        // caller wrote that record, before any `end` listener chain), so its
+        // duplicate `ElementCompleting` is dropped and only `ElementCompleted`
+        // remains — one COMPLETING per element instance, as in Zeebe.
         self.torn_down_scopes.insert(scope);
-        (self.scope_teardown_events(instance_key, scope), Vec::new())
+        let events = self
+            .scope_teardown_events(instance_key, scope)
+            .into_iter()
+            .filter(|event| {
+                !matches!(
+                    event,
+                    Event::ElementCompleting { element_instance_key: eik, .. }
+                        if *eik == element_instance_key
+                )
+            })
+            .collect();
+        (events, Vec::new())
     }
 
     /// The `start` execution-listener index a resolved mid-chain job-type

@@ -288,15 +288,14 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   and is never ridden by a token, so *neither* phase fires), and a
   **sequence-flow ("take") listener** (a sequence flow is
   modelled as an edge, not an `Element`, so it has no lifecycle to run a listener
-  on). Two more placements reject only their *dead* phase, mirroring the
-  inclusive-join treatment: the **`end` listener of a terminate end event** (completing
-  a terminate end drives a scope-wide teardown that emits completion directly,
-  bypassing the end-listener chain — but its **`start` listener IS supported**, firing
-  through the activation start-listener gate), and **any execution listener on a
+  on). One more placement is rejected: **any execution listener on a
   surplus (non-designated) signal start event** (a process may have only one real
   start, so extra signal starts are demoted to an inert `IntermediateThrowEvent`
   with no incoming flow that is never activated or completed, so *neither* phase
-  could fire). **Sequence-flow ("take") listeners
+  could fire). (A terminate end event's listeners are both supported since #985:
+  like Zeebe's `TerminateEndEventBehavior`, the terminate end rests in COMPLETING
+  while its `end` listener chain runs, and the scope-wide teardown runs only once
+  the chain drains.) **Sequence-flow ("take") listeners
   remain deferred:** firing a take listener between source completion and target
   activation needs a model + runtime design and is tracked separately in #1198 —
   until then a listener nested in a `<sequenceFlow>` is rejected at deploy (naming
