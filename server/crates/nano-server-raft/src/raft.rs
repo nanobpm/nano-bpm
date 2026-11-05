@@ -398,7 +398,13 @@ pub fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, Strin
         | E::MigrationFlowScopeChanged { .. }
         | E::MigrationMultiInstanceMismatch { .. }
         | E::MigrationCatchEventDetached { .. }
-        | E::MigrationCatchEventsMerged { .. } => (409, e.to_string()),
+        | E::MigrationCatchEventsMerged { .. }
+        // A target catch event whose subscription expression fails to evaluate
+        // (Zeebe `ProcessInstanceMigrationCatchEventBehaviour`, INVALID_STATE).
+        | E::MigrationCatchEventSubscriptionFailed { .. } => (409, e.to_string()),
+        // A start event whose message-name / timer expression cannot be
+        // evaluated at deploy time (Zeebe INVALID_ARGUMENT, #1398).
+        E::StartEventExpressionInvalid { .. } => (400, e.to_string()),
         other => (500, other.to_string()),
     }
 }
@@ -2687,6 +2693,23 @@ mod tests {
                     source_catch_event_ids: vec!["t1".into(), "t1b".into()],
                 },
                 409,
+            ),
+            (
+                E::MigrationCatchEventSubscriptionFailed {
+                    instance_key: 1,
+                    element_id: "a".into(),
+                    target_element_id: "b".into(),
+                    reason: "boom".into(),
+                },
+                409,
+            ),
+            (
+                E::StartEventExpressionInvalid {
+                    process_id: "p".into(),
+                    element_id: "s".into(),
+                    reason: "boom".into(),
+                },
+                400,
             ),
         ];
         for (err, want) in cases {

@@ -56,7 +56,9 @@
       "match": "failure:ExpressionProcessor.createFailureMessage:EXTRACT_VALUE_ERROR",
       "status": "parity",
       "evidence": [
-        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK"
+        "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK",
+        "traces:mi-input-collection-not-a-list",
+        "traces:user-task-assignee-null"
       ]
     },
     {
@@ -150,7 +152,9 @@
       "match": "incident:EXTRACT_VALUE_ERROR",
       "status": "parity",
       "evidence": [
-        "traces:job-type-expression-failure"
+        "traces:job-type-expression-failure",
+        "traces:mi-input-collection-not-a-list",
+        "traces:user-task-assignee-null"
       ]
     },
     {
@@ -349,7 +353,8 @@
       "match": "element:UserTask",
       "status": "parity",
       "evidence": [
-        "traces:user-task-complete"
+        "traces:user-task-complete",
+        "traces:user-task-assignee-null"
       ]
     },
     {

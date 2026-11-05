@@ -50,7 +50,7 @@ impl Engine {
     /// anything (Zeebe validation order: activate targets, ancestors, variable
     /// scopes, terminate targets, then flow-scope/termination conflicts).
     pub(super) fn plan_modification(
-        &self,
+        &mut self,
         instance_key: Key,
         activate_instructions: &[ActivateElementInstruction],
         terminate_instructions: &[Key],
@@ -356,6 +356,40 @@ impl Engine {
             }
         }
 
+        // Scopes an activation creates arm their boundary events (Zeebe
+        // `ElementActivationBehavior.activateFlowScope` → `subscribeToEvents`);
+        // a failing boundary expression rejects the whole command —
+        // "Expected to subscribe to catch event(s) of '<scope>' but <failure>"
+        // — before anything is emitted (#1398).
+        for planned in &activations {
+            if planned.resolution.to_create.is_empty() {
+                continue;
+            }
+            let mut host_vars =
+                (*self.variables_for_element(instance_key, planned.resolution.existing)).clone();
+            for variables in &planned.global {
+                host_vars.extend(variables.clone());
+            }
+            for scope_id in &planned.resolution.to_create {
+                for (id, variables) in &planned.scoped {
+                    if id == scope_id {
+                        host_vars.extend(variables.clone());
+                    }
+                }
+                if let Err(failure) = self.check_boundary_arming(instance_key, scope_id, &host_vars)
+                {
+                    return Err(invalid(
+                        instance_key,
+                        &process_id,
+                        format!(
+                            "Expected to subscribe to catch event(s) of '{scope_id}' but {}",
+                            failure.message
+                        ),
+                    ));
+                }
+            }
+        }
+
         Ok(ModificationPlan {
             activations,
             terminations,
@@ -429,8 +463,13 @@ impl Engine {
             }
 
             for (key, scope_id, parent) in fresh {
-                for event in self.arm_boundary_events(instance_key, key, parent, &scope_id) {
-                    self.emit(log, event);
+                // Validated by `plan_modification` (`check_boundary_arming`),
+                // so arming cannot fail here; an Err would be a planning
+                // defect, and arms nothing rather than half-arming.
+                if let Ok(armed) = self.arm_boundary_events(instance_key, key, parent, &scope_id) {
+                    for event in armed {
+                        self.emit(log, event);
+                    }
                 }
             }
 
@@ -564,27 +603,36 @@ impl Engine {
         // evaluates input mappings / input collection in the seeded body view.
         let is_multi_instance = self.multi_instance_of(instance_key, &element_id).is_some();
         let eik = self.mint_key();
-        for event in [
+        self.emit(
+            log,
             Event::ElementActivating {
                 instance_key,
                 element_instance_key: eik,
                 element_id: element_id.clone(),
                 scope,
             },
-            Event::ElementActivated {
-                instance_key,
-                element_instance_key: eik,
-                element_id: element_id.clone(),
-                scope,
-            },
+        );
+        // A multi-instance body becomes ACTIVATED in its fan-out
+        // (`run_mi_body_activation`), once its activation-time expressions held.
+        if !is_multi_instance {
+            self.emit(
+                log,
+                Event::ElementActivated {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id: element_id.clone(),
+                    scope,
+                },
+            );
+        }
+        self.emit(
+            log,
             Event::VariableScopeCreated {
                 instance_key,
                 scope_key: eik,
                 parent_scope_key: scope,
             },
-        ] {
-            self.emit(log, event);
-        }
+        );
         for variables in locals {
             for event in self.propagated_updates(instance_key, eik, variables, true) {
                 self.emit(log, event);

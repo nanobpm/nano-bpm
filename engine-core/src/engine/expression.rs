@@ -185,6 +185,202 @@ pub(crate) fn evaluate_long(raw: &str, vars: &HashMap<String, Value>) -> Result<
     }
 }
 
+/// Evaluates `expr` as FEEL **unconditionally** (a leading `=` is optional):
+/// for model attributes that are always expressions — a multi-instance
+/// `inputCollection` / `outputElement` / `completionCondition`, an ad-hoc
+/// `activeElementsCollection` / `completionCondition` — which the parser may
+/// store without the `=` marker (Zeebe parses them with
+/// `ExpressionLanguage.parseExpression`, never as static values).
+pub(crate) fn evaluate_feel(
+    expr: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<Evaluated, Failure> {
+    let trimmed = expr.trim();
+    if is_expression(trimmed) {
+        evaluate_or_failure(trimmed, vars)
+    } else {
+        evaluate_or_failure(&format!("={trimmed}"), vars)
+    }
+}
+
+/// Zeebe `evaluateBooleanExpression`: the result must be a `BOOLEAN` (a `null`
+/// result is a failure — a completion condition is never "silently false").
+pub(crate) fn evaluate_bool(expr: &str, vars: &HashMap<String, Value>) -> Result<bool, Failure> {
+    match evaluate_feel(expr, vars)? {
+        Evaluated {
+            value: Value::Bool(b),
+            ..
+        } => Ok(b),
+        other => Err(type_failure(expr, "BOOLEAN", other.kind)),
+    }
+}
+
+/// Zeebe `evaluateArrayExpression`: the result must be an `ARRAY`.
+pub(crate) fn evaluate_array(
+    expr: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<Vec<Value>, Failure> {
+    match evaluate_feel(expr, vars)? {
+        Evaluated {
+            value: Value::List(items),
+            ..
+        } => Ok(items),
+        other => Err(type_failure(expr, "ARRAY", other.kind)),
+    }
+}
+
+/// Zeebe `evaluateArrayOfStringsExpression`: an `ARRAY` whose items are all
+/// `STRING`s.
+pub(crate) fn evaluate_array_of_strings(
+    expr: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<Vec<String>, Failure> {
+    let items = evaluate_array(expr, vars)?;
+    items
+        .into_iter()
+        .map(|v| match v {
+            Value::Str(s) => Ok(s),
+            _ => Err(Failure::extract_value(format!(
+                "Expected result of the expression '{}' to be 'ARRAY' containing 'STRING' items, but was 'ARRAY' containing at least one non-'STRING' item.",
+                expr.trim()
+            ))),
+        })
+        .collect()
+}
+
+/// Zeebe `evaluateMessageCorrelationKeyExpression`: a `STRING` or a `NUMBER`
+/// (rendered as its integer / decimal text); anything else is a failure.
+pub(crate) fn evaluate_correlation_key(
+    raw: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<String, Failure> {
+    // A correlation key is always FEEL (a bare `orderId` is a variable
+    // reference), with or without the leading `=`.
+    let evaluated = evaluate_feel(raw, vars)?;
+    match (&evaluated.value, evaluated.kind) {
+        (Value::Str(s), _) => Ok(s.clone()),
+        (Value::Int(i), _) => Ok(i.to_string()),
+        (Value::Double(d), _) if d.is_finite() && d.fract() == 0.0 => Ok((*d as i64).to_string()),
+        (Value::Double(d), _) => Ok(d.to_string()),
+        _ => Err(Failure::extract_value(format!(
+            "Failed to extract the correlation key for '{}': The value must be either a string or a number, but was '{}'.",
+            raw.trim(),
+            evaluated.kind
+        ))),
+    }
+}
+
+/// Zeebe `evaluateDateTimeExpression(.., isNullable = true)` (user-task due /
+/// follow-up dates): `null` is "no date"; a `DATE_TIME` or an ISO-8601
+/// date-time `STRING` is the date; anything else is a failure.
+pub(crate) fn evaluate_nullable_date_time(
+    raw: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<Option<String>, Failure> {
+    if !is_expression(raw) {
+        return Ok(Some(raw.to_string()).filter(|s| !s.trim().is_empty()));
+    }
+    let evaluated = evaluate_or_failure(raw, vars)?;
+    match (evaluated.value, evaluated.kind) {
+        (Value::Null, _) => Ok(None),
+        (Value::Str(s), "DATE_TIME") => Ok(Some(s)),
+        (Value::Str(s), "STRING") => {
+            if crate::feel::temporal::DateTime::parse(s.trim()).is_some() {
+                Ok(Some(s))
+            } else {
+                Err(Failure::extract_value(format!(
+                    "Expected result of the expression '{}' to be a valid DateTime String, but was '{}'.",
+                    raw.trim(),
+                    s
+                )))
+            }
+        }
+        (_, kind) => Err(Failure::extract_value(format!(
+            "Expected result of the expression '{}' to be one of '[DATE_TIME, STRING, NULL]', but was '{}'.",
+            raw.trim(),
+            kind
+        ))),
+    }
+}
+
+/// Zeebe `BpmnUserTaskBehavior.evaluatePriorityExpression`: an integral
+/// `NUMBER` in `[0,100]`.
+pub(crate) fn evaluate_user_task_priority(
+    raw: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<i32, Failure> {
+    let n = evaluate_long(raw, vars)?;
+    if !(0..=100).contains(&n) {
+        return Err(Failure::extract_value(format!(
+            "Expected priority to be in the range [0,100] but was '{n}'."
+        )));
+    }
+    Ok(n as i32)
+}
+
+/// Zeebe `BpmnJobBehavior.evalPriorityExp`: an integral `NUMBER` (a decimal
+/// with no fraction, e.g. `1.0`, is accepted), clamped into `i32`.
+pub(crate) fn evaluate_job_priority(
+    raw: &str,
+    vars: &HashMap<String, Value>,
+) -> Result<i32, Failure> {
+    let integral = |d: f64| d.is_finite() && d.fract() == 0.0;
+    let wrong = |kind: &str| {
+        Failure::extract_value(format!(
+            "Expected result of the expression '{}' for the job priority to be 'NUMBER' with an integer value, but was '{}'.",
+            raw.trim(),
+            kind
+        ))
+    };
+    let n = if is_expression(raw) {
+        match evaluate_or_failure(raw, vars)? {
+            Evaluated {
+                value: Value::Int(i),
+                ..
+            } => i,
+            Evaluated {
+                value: Value::Double(d),
+                ..
+            } if integral(d) => d as i64,
+            other => return Err(wrong(other.kind)),
+        }
+    } else {
+        raw.trim().parse::<i64>().map_err(|_| wrong("STRING"))?
+    };
+    Ok(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+}
+
+/// A timer definition's text (Zeebe `CatchEventBehavior` timer evaluation): a
+/// static value is used verbatim; an expression must yield a temporal or a
+/// `STRING` (rendered as text); then `parse` must accept it. Either failure is
+/// an `EXTRACT_VALUE_ERROR`.
+pub(crate) fn evaluate_timer<T>(
+    raw: &str,
+    vars: &HashMap<String, Value>,
+    what: &str,
+    parse: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, Failure> {
+    let text = if is_expression(raw) {
+        match evaluate_or_failure(raw, vars)? {
+            Evaluated {
+                value: Value::Str(s),
+                ..
+            } => s,
+            other => return Err(type_failure(raw, what, other.kind)),
+        }
+    } else {
+        raw.to_string()
+    };
+    parse(text.trim()).ok_or_else(|| {
+        Failure::extract_value(format!(
+            "Expected result of the expression '{}' to be a valid {}, but was '{}'.",
+            raw.trim(),
+            what,
+            text.trim()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

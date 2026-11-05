@@ -1976,10 +1976,11 @@ fn errored_correlation_key_raises_incident_and_reopens_on_resolve() {
         .find_map(|e| match e {
             Event::IncidentRaised {
                 incident_key, kind, ..
-            } if *kind == state::IncidentKind::ExpressionEvaluation => Some(*incident_key),
+            } if *kind == state::IncidentKind::ExtractValueError => Some(*incident_key),
             _ => None,
         })
-        .expect("an ExpressionEvaluation incident is raised");
+        // Zeebe `evaluateMessageCorrelationKeyExpression` fails EXTRACT_VALUE_ERROR.
+        .expect("an ExtractValueError incident is raised");
     assert!(
         !engine.is_completed(instance_key),
         "the token must still be parked"

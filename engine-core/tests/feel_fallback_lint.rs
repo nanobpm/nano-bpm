@@ -13,12 +13,11 @@
 //!   returns `Result<T, Failure>` like Zeebe's `ExpressionProcessor`.
 //! - **`fallback`** — `.ok()` / `.unwrap_or(..)` / `.unwrap_or_else(..)` /
 //!   `.unwrap_or_default()` applied to an evaluation result (a `feel::eval*`,
-//!   `expression::evaluate*` / `evaluate_or_failure`, `resolve_*_checked`,
-//!   `resolve_job_type` or `resolve_job_retries` call in the same statement).
+//!   `expression::evaluate*` / `evaluate_or_failure` or `Engine::resolve_*`
+//!   resolver call in the same statement).
 //!
 //! A site may only remain if it is on [`ALLOW`] with an exact match count and a
-//! justification: either the **Zeebe** behaviour it mirrors, or a **Tracked**
-//! known divergence with its follow-up issue. A stale entry (its site moved,
+//! justification: the **Zeebe** behaviour it mirrors (with its source). A stale entry (its site moved,
 //! was fixed, or its count changed) also fails, so the list cannot rot.
 #![allow(
     clippy::unwrap_used,
@@ -48,10 +47,11 @@ impl Rule {
 #[derive(Clone, Copy, Debug)]
 #[allow(dead_code, reason = "the payloads are documentation read by humans")]
 enum Why {
-    /// The site matches Zeebe's behaviour (cite the Zeebe source).
+    /// The site matches Zeebe's behaviour (cite the Zeebe source). There is
+    /// deliberately no "tracked divergence" category (#1398): a silent
+    /// fallback that diverges from Zeebe is converted to an incident, never
+    /// parked on this list.
     Zeebe(&'static str),
-    /// A known Zeebe divergence, tracked in the given nano-bpm issue.
-    Tracked(u32, &'static str),
 }
 
 struct Allow {
@@ -64,8 +64,6 @@ struct Allow {
     count: usize,
     why: Why,
 }
-
-const T: u32 = 1398;
 
 /// Every remaining site. Keep sorted by file.
 const ALLOW: &[Allow] = &[
@@ -84,66 +82,11 @@ const ALLOW: &[Allow] = &[
         contains: "crate::feel::eval_bool(&condition, &",
         rule: Rule::DirectFeel,
         count: 2,
-        why: Why::Tracked(
-            T,
-            "conditional-event condition error treated as not-yet-satisfied",
+        why: Why::Zeebe(
+            "conditional event: an evaluation failure is not-yet-satisfied, no incident \
+             (Zeebe BpmnConditionalBehavior.shouldTrigger / \
+             CatchEventBehavior.tryEvaluateSubscription ignore the Failure)",
         ),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "match crate::feel::eval(&mi.input_collection, &vars)",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "MI inputCollection non-list -> empty"),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "crate::feel::eval(expr, &vars).ok()",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "MI / ad-hoc outputElement error -> null"),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "crate::feel::eval(expr, &vars).ok()",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(T, "MI / ad-hoc outputElement error -> null"),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "crate::feel::eval(expr, view).ok()",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "MI outputElement error -> null"),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "crate::feel::eval(expr, view).ok()",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(T, "MI outputElement error -> null"),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "crate::feel::eval_bool(c, view)",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "MI completionCondition error -> false"),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "match crate::feel::eval(expr, vars)",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "ad-hoc activeElementsCollection error -> no elements"),
-    },
-    Allow {
-        file: "mod.rs",
-        contains: "matches!(crate::feel::eval_bool(cond, &ctx), Ok(true))",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "ad-hoc completionCondition error -> false"),
     },
     Allow {
         file: "mod.rs",
@@ -154,104 +97,12 @@ const ALLOW: &[Allow] = &[
     },
     Allow {
         file: "resolve.rs",
-        contains: "crate::feel::eval_string(correlation_key, vars).map_err",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Zeebe("correlation key: the error is propagated (caller raises the incident)"),
-    },
-    Allow {
-        file: "resolve.rs",
         contains: "crate::feel::eval(source.trim(), vars)",
         rule: Rule::DirectFeel,
         count: 1,
         why: Why::Zeebe(
             "ioMapping source: the error is propagated and raised as IO_MAPPING_ERROR \
              (Zeebe BpmnVariableMappingBehavior)",
-        ),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "crate::feel::eval_string(trimmed, vars).ok()",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(
-            T,
-            "user-task assignee/dates error -> unset (Zeebe: only null)",
-        ),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "crate::feel::eval_string(trimmed, vars).ok()",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(
-            T,
-            "user-task assignee/dates error -> unset (Zeebe: only null)",
-        ),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "match crate::feel::eval(trimmed, vars)",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "user-task candidate list error -> empty"),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "match crate::feel::eval(expr, vars)",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "job / user-task priority error -> default 50"),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "crate::feel::eval_string(&def.expr, vars).ok()",
-        rule: Rule::DirectFeel,
-        count: 1,
-        why: Why::Tracked(T, "timer definition error"),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "crate::feel::eval_string(&def.expr, vars).ok()",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(T, "timer definition error"),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "self.resolve_correlation_value_checked(vars, correlation_key)",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(T, "boundary correlation key error -> empty string"),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "self.resolve_job_type(vars, job_type)",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(
-            T,
-            "listener / ad-hoc job type error -> literal (resolve_job_type_lenient)",
-        ),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "self.resolve_job_retries(vars, raw)",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(
-            T,
-            "listener / ad-hoc job retries error -> default (resolve_retries)",
-        ),
-    },
-    Allow {
-        file: "resolve.rs",
-        contains: "self.resolve_event_name_checked(vars, raw)",
-        rule: Rule::Fallback,
-        count: 1,
-        why: Why::Tracked(
-            T,
-            "boundary / start / signal name error -> literal (resolve_event_name)",
         ),
     },
 ];
@@ -270,9 +121,10 @@ const EVAL_CALLS: &[&str] = &[
     "feel::eval_bool(",
     "expression::evaluate",
     "evaluate_or_failure(",
-    "_checked(",
-    ".resolve_job_type(",
-    ".resolve_job_retries(",
+    // Every fallible `Engine::resolve_*` expression resolver (#1398): the
+    // whole family returns `Result<_, expression::Failure>`, so a fallback on
+    // ANY of them is a silent default.
+    ".resolve_",
 ];
 const FALLBACKS: &[&str] = &[
     ".ok()",

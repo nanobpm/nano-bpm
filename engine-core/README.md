@@ -103,8 +103,12 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   to `COMPLETING` when a `CompleteJob` command arrives. This is how asynchronous
   work is modelled with no background thread. A task's job type may be a FEEL
   expression (`type="=jobType"`, `type='="worker-" + region'`); it is evaluated
-  against the instance variables at job-creation time (an expression that cannot
-  be evaluated falls back to the literal text).
+  against the instance variables at job-creation time. As in Zeebe, an
+  expression that cannot be evaluated (or yields the wrong type) raises an
+  `EXTRACT_VALUE_ERROR` incident; resolving it re-evaluates. The same holds for
+  every other element expression (retries, priority, user-task assignment and
+  dates, timers, message names / correlation keys, multi-instance and ad-hoc
+  collections and conditions) — there is no silent fallback.
 - A **user task** (`<bpmn:userTask>` with a `<zeebe:userTask/>`, i.e. a native
   Zeebe user task) rests in `ACTIVATED` after the engine creates the task, and
   advances only when a `CompleteUserTask` command arrives. Unlike jobs there is

@@ -2,46 +2,60 @@
 
 use super::*;
 
+/// The priority of a job / user task that declares none.
+pub(crate) const DEFAULT_PRIORITY: i32 = 50;
+
+/// A user task's evaluated assignment / scheduling / priority properties
+/// ([`Engine::resolve_user_task_props`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedUserTask {
+    pub(crate) assignee: Option<String>,
+    pub(crate) candidate_groups: Vec<String>,
+    pub(crate) candidate_users: Vec<String>,
+    pub(crate) due_date: Option<String>,
+    pub(crate) follow_up_date: Option<String>,
+    pub(crate) priority: i32,
+}
+
+/// A job's evaluated creation properties ([`Engine::resolve_job_props`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct JobProps {
+    pub(crate) job_type: String,
+    pub(crate) retries: i32,
+    pub(crate) priority: i32,
+}
+
+impl JobProps {
+    /// A job with no retries / priority expressions: the engine defaults.
+    pub(crate) fn defaults(job_type: String) -> Self {
+        JobProps {
+            job_type,
+            retries: crate::state::DEFAULT_JOB_RETRIES,
+            priority: DEFAULT_PRIORITY,
+        }
+    }
+}
+
 impl Engine {
     /// Resolves the correlation value a subscription captures at open time by
-    /// evaluating the stored `correlation_key` FEEL expression against the
-    /// instance variables (a bare name like `orderId` is just a variable
-    /// reference; `order.id` reads a context member). A missing variable, an
-    /// empty key, or an evaluation error yields the empty string. That silent
-    /// fallback is a known Zeebe divergence (Zeebe raises an incident), tracked
-    /// in #1398; callers that can raise the incident use
-    /// [`Self::resolve_correlation_value_checked`] instead.
+    /// evaluating the stored `correlation_key` FEEL expression against `vars`
+    /// (a bare name like `orderId` is just a variable reference; `order.id`
+    /// reads a context member). Zeebe `evaluateMessageCorrelationKeyExpression`:
+    /// the result must be a `STRING` or a `NUMBER`; anything else (a missing
+    /// variable, `null`, a type error) is an `EXTRACT_VALUE_ERROR`
+    /// [`expression::Failure`] the caller raises as an incident — never a
+    /// silently unmatchable empty key (#1398). An absent declaration (empty or
+    /// whitespace-only) resolves to `Ok("")`, matching the REST default
+    /// `correlationKey` of `""`.
     pub(crate) fn resolve_correlation_value(
         &self,
         vars: &HashMap<String, Value>,
         correlation_key: &str,
-    ) -> String {
-        self.resolve_correlation_value_checked(vars, correlation_key)
-            .unwrap_or_default()
-    }
-
-    /// Like [`Self::resolve_correlation_value`] but distinguishes an
-    /// *evaluation failure* from a legitimately empty key.
-    ///
-    /// A declared (non-empty) correlation-key expression that fails to evaluate
-    /// — a missing variable, a `null` result, or a type error such as
-    /// concatenating a string with `null` — returns `Err(reason)` so the caller
-    /// can raise an incident instead of silently opening an unmatchable
-    /// subscription with an empty key (Zeebe raises a correlation-key incident
-    /// in exactly this case). An absent declaration (empty or whitespace-only
-    /// string) resolves to `Ok("")`, matching the REST default `correlationKey`
-    /// of `""`.
-    pub(crate) fn resolve_correlation_value_checked(
-        &self,
-        vars: &HashMap<String, Value>,
-        correlation_key: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, expression::Failure> {
         if correlation_key.trim().is_empty() {
             return Ok(String::new());
         }
-        crate::feel::eval_string(correlation_key, vars).map_err(|e| {
-            format!("failed to evaluate correlation key expression '{correlation_key}': {e}")
-        })
+        expression::evaluate_correlation_key(correlation_key, vars)
     }
 
     /// Resolves a message or signal event `name` at subscription-open time
@@ -50,37 +64,14 @@ impl Engine {
     /// leading `=`, e.g. `="order " + awaitingAction`) must evaluate to a
     /// `STRING` against `vars` (the scoped view the subscribing element sees),
     /// else an `EXTRACT_VALUE_ERROR` [`expression::Failure`] the caller raises
-    /// as an incident — never a subscription named after the expression text.
-    pub(crate) fn resolve_event_name_checked(
+    /// as an incident (or, for a start event, a deploy rejection) — never a
+    /// subscription named after the expression text (#1398).
+    pub(crate) fn resolve_event_name(
         &self,
         vars: &HashMap<String, Value>,
         raw: &str,
     ) -> Result<String, expression::Failure> {
         expression::evaluate_string(raw, vars)
-    }
-
-    /// The **lenient** event-name resolution still used by subscription sites
-    /// with no incident path yet (boundary events, message start events, signal
-    /// catches): on failure it falls back to the literal text. A known Zeebe
-    /// divergence tracked in #1398 (allow-listed in `tests/feel_fallback_lint.rs`);
-    /// a message intermediate catch uses [`Self::resolve_event_name_checked`].
-    ///
-    /// A message-start-event name is evaluated by Zeebe at deploy time against an
-    /// empty context, so its caller passes an empty `vars`.
-    pub(crate) fn resolve_event_name(&self, vars: &HashMap<String, Value>, raw: &str) -> String {
-        self.resolve_event_name_checked(vars, raw)
-            .unwrap_or_else(|_| raw.to_string())
-    }
-
-    /// The **lenient** retry-count resolution still used by job-creation sites
-    /// with no incident path yet (listener / ad-hoc jobs): an unresolvable
-    /// expression falls back to [`crate::state::DEFAULT_JOB_RETRIES`]. A known
-    /// Zeebe divergence tracked in #1398 (allow-listed in
-    /// `tests/feel_fallback_lint.rs`); element jobs use
-    /// [`Self::resolve_job_retries`], which fails instead.
-    pub(crate) fn resolve_retries(&self, vars: &HashMap<String, Value>, raw: Option<&str>) -> i32 {
-        self.resolve_job_retries(vars, raw)
-            .unwrap_or(crate::state::DEFAULT_JOB_RETRIES)
     }
 
     /// The raw `retries` expression declared on `element_id` (if any).
@@ -584,118 +575,128 @@ impl Engine {
         Ok(n.clamp(0, i64::from(i32::MAX)) as i32)
     }
 
-    /// The **lenient** job-type resolution still used by job-creation sites that
-    /// have no incident path yet (execution/task listener jobs, ad-hoc tool and
-    /// agent jobs): on failure it falls back to the literal text. This is a
-    /// known Zeebe divergence (Zeebe raises `EXTRACT_VALUE_ERROR` there too),
-    /// tracked in #1398 and allow-listed in `tests/feel_fallback_lint.rs` — do
-    /// not add new callers.
-    pub(crate) fn resolve_job_type_lenient(
-        &self,
-        vars: &HashMap<String, Value>,
-        job_type: &str,
-    ) -> String {
-        self.resolve_job_type(vars, job_type)
-            .unwrap_or_else(|_| job_type.to_string())
-    }
-
-    /// Resolves a user-task string attribute (assignee, due/follow-up date)
-    /// declared on the BPMN element. A literal (no leading `=`) is returned
-    /// verbatim. A FEEL expression (leading `=`) is evaluated against `vars`
-    /// (the element's scoped view): a string result yields `Some(string)`, while
-    /// a **null** result or an **evaluation failure** (parse/runtime error,
-    /// unresolved variable) yields `None` — the attribute is treated as absent
-    /// (the task is created unassigned / with no date), matching Zeebe, which
-    /// creates the task unassigned when the assignee expression resolves to null.
-    /// `None` (the attribute was not declared) resolves to `None`.
-    ///
-    /// The raw `=expr` text is **never** stored: a value beginning with `=` is a
-    /// FEEL expression, never a valid literal assignee/date, so falling back to
-    /// it can only ever produce garbage that hides the task from assignee-aware
-    /// views. The invariant callers rely on is that a resolved user-task string
-    /// attribute never begins with `=`.
-    pub(crate) fn resolve_user_task_string(
+    /// Resolves a user task's assignee (Zeebe
+    /// `BpmnUserTaskBehavior.evaluateAssigneeExpression` ->
+    /// `evaluateStringExpression`). An absent declaration (or an empty static
+    /// value) is unassigned; an expression must yield a `STRING` — a `null`
+    /// result is an `EXTRACT_VALUE_ERROR`, like any other failure (#1398). The
+    /// raw `=expr` text is never returned.
+    pub(crate) fn resolve_user_task_assignee(
         &self,
         vars: &HashMap<String, Value>,
         raw: Option<&str>,
-    ) -> Option<String> {
-        let raw = raw?;
-        let trimmed = raw.trim();
-        if !trimmed.starts_with('=') {
-            return Some(raw.to_string());
-        }
-        // A FEEL expression: a null result or an evaluation error means the
-        // attribute is absent. `eval_string` returns `Err` for a null result as
-        // well as for parse/runtime errors, so both collapse to `None` — never
-        // the raw `=expr`.
-        crate::feel::eval_string(trimmed, vars).ok()
+    ) -> Result<Option<String>, expression::Failure> {
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        Ok(Some(expression::evaluate_string(raw, vars)?).filter(|s| !s.is_empty()))
     }
 
-    /// Resolves a user-task candidate list (groups or users). A literal is a
-    /// comma-separated list. A FEEL expression (leading `=`) is evaluated against
-    /// `vars` (the element's scoped view); a list result yields its string items,
-    /// a string result is split on commas, anything else (or a failure) yields an
-    /// empty list. `None` resolves to an empty list.
+    /// Resolves a user task's due / follow-up date (Zeebe
+    /// `evaluateDateTimeExpression(.., isNullable = true)`): absent or `null` is
+    /// no date; otherwise a `DATE_TIME` or ISO-8601 date-time `STRING`, else an
+    /// `EXTRACT_VALUE_ERROR` (#1398).
+    pub(crate) fn resolve_user_task_date(
+        &self,
+        vars: &HashMap<String, Value>,
+        raw: Option<&str>,
+    ) -> Result<Option<String>, expression::Failure> {
+        match raw {
+            None => Ok(None),
+            Some(raw) => expression::evaluate_nullable_date_time(raw, vars),
+        }
+    }
+
+    /// Resolves a user-task candidate list (groups or users). A static value is
+    /// a comma-separated list; an expression must yield an `ARRAY` of `STRING`s
+    /// (Zeebe `evaluateArrayOfStringsExpression`), else an
+    /// `EXTRACT_VALUE_ERROR` (#1398). `None` resolves to an empty list.
     pub(crate) fn resolve_user_task_list(
         &self,
         vars: &HashMap<String, Value>,
         raw: Option<&str>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, expression::Failure> {
         let Some(raw) = raw else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        let trimmed = raw.trim();
-        let split = |s: &str| -> Vec<String> {
-            s.split(',')
-                .map(str::trim)
-                .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        if !trimmed.starts_with('=') {
-            return split(raw);
+        if expression::is_expression(raw) {
+            return expression::evaluate_array_of_strings(raw, vars);
         }
-        match crate::feel::eval(trimmed, vars) {
-            Ok(Value::List(items)) => items
-                .into_iter()
-                .filter_map(|v| match v {
-                    Value::Str(s) => Some(s),
-                    Value::Int(i) => Some(i.to_string()),
-                    _ => None,
-                })
-                .filter(|s| !s.is_empty())
-                .collect(),
-            Ok(Value::Str(s)) => split(&s),
-            _ => Vec::new(),
+        Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
+    /// Resolves a user task's priority (Zeebe
+    /// `BpmnUserTaskBehavior.evaluatePriorityExpression`): an integral `NUMBER`
+    /// in `[0,100]`, else an `EXTRACT_VALUE_ERROR` (#1398). Absent is
+    /// [`DEFAULT_PRIORITY`].
+    pub(crate) fn resolve_user_task_priority(
+        &self,
+        vars: &HashMap<String, Value>,
+        raw: Option<&str>,
+    ) -> Result<i32, expression::Failure> {
+        match raw {
+            None => Ok(DEFAULT_PRIORITY),
+            Some(raw) => expression::evaluate_user_task_priority(raw, vars),
         }
     }
 
-    /// Resolves a user-task priority expression. A literal integer or a FEEL
-    /// expression yielding a number is clamped to `0..=100`; anything
-    /// unresolvable (or absent) defaults to `50`.
-    /// Resolves a raw priority expression (literal or `=FEEL`) against `vars`
-    /// (the element's scoped view) to a `0..=100` value, defaulting to 50 when
-    /// absent or unresolvable. Shared by user-task scheduling priority and
-    /// service-task job (activation) priority.
-    pub(crate) fn resolve_priority(&self, vars: &HashMap<String, Value>, raw: Option<&str>) -> i32 {
-        const DEFAULT_PRIORITY: i32 = 50;
-        let Some(raw) = raw else {
-            return DEFAULT_PRIORITY;
-        };
-        let trimmed = raw.trim();
-        let value = if let Some(expr) = trimmed.strip_prefix('=') {
-            match crate::feel::eval(expr, vars) {
-                Ok(Value::Int(i)) => i as i32,
-                Ok(Value::Double(d)) => d as i32,
-                _ => return DEFAULT_PRIORITY,
-            }
-        } else {
-            match trimmed.parse::<i32>() {
-                Ok(i) => i,
-                Err(_) => return DEFAULT_PRIORITY,
-            }
-        };
-        value.clamp(0, 100)
+    /// Resolves a job's priority (Zeebe `BpmnJobBehavior.evalPriorityExp`): an
+    /// integral `NUMBER`, else an `EXTRACT_VALUE_ERROR` (#1398). Absent is
+    /// [`DEFAULT_PRIORITY`].
+    pub(crate) fn resolve_job_priority(
+        &self,
+        vars: &HashMap<String, Value>,
+        raw: Option<&str>,
+    ) -> Result<i32, expression::Failure> {
+        match raw {
+            None => Ok(DEFAULT_PRIORITY),
+            Some(raw) => expression::evaluate_job_priority(raw, vars),
+        }
+    }
+
+    /// Resolves every user-task property expression (Zeebe
+    /// `BpmnUserTaskBehavior.evaluateUserTaskExpressions`): the first failure
+    /// is the task's `EXTRACT_VALUE_ERROR` and no task is created (#1398). The
+    /// single resolution path for element user tasks and ad-hoc user-task
+    /// tools.
+    pub(crate) fn resolve_user_task_props(
+        &self,
+        vars: &HashMap<String, Value>,
+        props: &crate::model::UserTaskProps,
+    ) -> Result<ResolvedUserTask, expression::Failure> {
+        Ok(ResolvedUserTask {
+            assignee: self.resolve_user_task_assignee(vars, props.assignee.as_deref())?,
+            candidate_groups: self
+                .resolve_user_task_list(vars, props.candidate_groups.as_deref())?,
+            candidate_users: self.resolve_user_task_list(vars, props.candidate_users.as_deref())?,
+            due_date: self.resolve_user_task_date(vars, props.due_date.as_deref())?,
+            follow_up_date: self.resolve_user_task_date(vars, props.follow_up_date.as_deref())?,
+            priority: self.resolve_user_task_priority(vars, props.priority.as_deref())?,
+        })
+    }
+
+    /// Resolves the full job-creation properties (Zeebe
+    /// `BpmnJobBehavior.evaluateJobExpressions`): type, retries and priority.
+    /// The single resolution path for every job the engine mints (element,
+    /// listener, ad-hoc tool / agent jobs), so no job site can fall back
+    /// silently (#1398).
+    pub(crate) fn resolve_job_props(
+        &self,
+        vars: &HashMap<String, Value>,
+        job_type: &str,
+        retries: Option<&str>,
+        priority: Option<&str>,
+    ) -> Result<JobProps, expression::Failure> {
+        Ok(JobProps {
+            job_type: self.resolve_job_type(vars, job_type)?,
+            retries: self.resolve_job_retries(vars, retries)?,
+            priority: self.resolve_job_priority(vars, priority)?,
+        })
     }
 
     /// Resolves a user task's form linkage from its `zeebe:formDefinition`,
@@ -728,59 +729,54 @@ impl Engine {
     /// Resolves a timer's due time (and, for a cycle, its re-arm interval) at
     /// timer-creation time, honouring a FEEL timer expression
     /// ([`crate::model::TimerDef`]) when one is declared on the element, and
-    /// falling back to the statically-parsed `fallback_millis` otherwise.
+    /// using the statically-parsed `fallback_millis` only when none is.
     ///
     /// Returns `(due_at, interval_millis)` where `due_at` is an absolute epoch
     /// time in the engine's millisecond clock and `interval_millis` is the delay
     /// used to re-arm a repeating (cycle) timer (0 for an absolute date). `vars`
     /// is the scoped view the timer's element sees (empty for a process-level
-    /// start timer evaluated at deploy against an empty context).
+    /// start timer evaluated at deploy against an empty context). A declared
+    /// expression that fails to evaluate, or whose result is not a valid
+    /// duration / cycle / date-time, is an `EXTRACT_VALUE_ERROR`
+    /// [`expression::Failure`] (Zeebe `CatchEventBehavior` timer evaluation) —
+    /// never the static fallback (#1398).
     pub(crate) fn resolve_timer(
         &self,
         vars: &HashMap<String, Value>,
         def: Option<&crate::model::TimerDef>,
         base_now: u64,
         fallback_millis: u64,
-    ) -> (u64, u64) {
-        let default = (base_now.saturating_add(fallback_millis), fallback_millis);
+    ) -> Result<(u64, u64), expression::Failure> {
         let Some(def) = def else {
-            return default;
+            return Ok((base_now.saturating_add(fallback_millis), fallback_millis));
         };
-
-        // A `=`-prefixed expression is FEEL, evaluated against the scoped view (or
-        // an empty context at deploy); a bare value (only for a literal timeDate)
-        // is used directly. An evaluation failure falls back to the static
-        // timer — a known Zeebe divergence (Zeebe raises EXTRACT_VALUE_ERROR),
-        // tracked in #1398.
-        let evaluated: Option<String> = if def.expr.trim_start().starts_with('=') {
-            crate::feel::eval_string(&def.expr, vars).ok()
-        } else {
-            Some(def.expr.clone())
-        };
-        let Some(text) = evaluated else {
-            return default;
-        };
-        let text = text.trim();
-
         match def.kind {
             crate::model::TimerDefKind::Duration => {
-                match crate::temporal::parse_duration_millis(text) {
-                    Some(ms) => (base_now.saturating_add(ms), ms),
-                    None => default,
-                }
+                let ms = expression::evaluate_timer(
+                    &def.expr,
+                    vars,
+                    "duration",
+                    crate::temporal::parse_duration_millis,
+                )?;
+                Ok((base_now.saturating_add(ms), ms))
             }
-            crate::model::TimerDefKind::Cycle => match crate::temporal::parse_cycle_millis(text) {
-                Some(ms) => (base_now.saturating_add(ms), ms),
-                None => default,
-            },
+            crate::model::TimerDefKind::Cycle => {
+                let ms = expression::evaluate_timer(
+                    &def.expr,
+                    vars,
+                    "cycle",
+                    crate::temporal::parse_cycle_millis,
+                )?;
+                Ok((base_now.saturating_add(ms), ms))
+            }
             crate::model::TimerDefKind::Date => {
-                match crate::feel::temporal::DateTime::parse(text) {
-                    Some(dt) => {
-                        let millis = (dt.epoch_nanos() / 1_000_000).max(0) as u64;
-                        (millis, 0)
-                    }
-                    None => default,
-                }
+                let dt = expression::evaluate_timer(
+                    &def.expr,
+                    vars,
+                    "date-time",
+                    crate::feel::temporal::DateTime::parse,
+                )?;
+                Ok(((dt.epoch_nanos() / 1_000_000).max(0) as u64, 0))
             }
         }
     }
@@ -897,98 +893,81 @@ mod tests {
     use super::*;
 
     #[test]
-    fn checked_correlation_treats_whitespace_only_key_as_absent() {
+    fn correlation_treats_whitespace_only_key_as_absent() {
         // A whitespace-only declaration is not a real correlation-key
         // expression; it must resolve to Ok("") (absent) rather than being fed
         // to the FEEL parser and raising a spurious incident.
         let engine = Engine::new();
         let vars = HashMap::new();
         assert_eq!(
-            engine.resolve_correlation_value_checked(&vars, "   "),
+            engine.resolve_correlation_value(&vars, "   "),
             Ok(String::new())
         );
         assert_eq!(
-            engine.resolve_correlation_value_checked(&vars, ""),
+            engine.resolve_correlation_value(&vars, ""),
             Ok(String::new())
         );
     }
 
     #[test]
-    fn checked_correlation_surfaces_unevaluable_declared_key() {
+    fn correlation_surfaces_unevaluable_declared_key() {
         // A genuinely declared key that cannot evaluate (missing variable)
         // must return Err so the caller can raise an incident.
         let engine = Engine::new();
         let vars = HashMap::new();
         assert!(engine
-            .resolve_correlation_value_checked(&vars, "missingVar")
+            .resolve_correlation_value(&vars, "missingVar")
             .is_err());
     }
 
     #[test]
-    fn user_task_string_null_expression_resolves_absent() {
-        // A `=FEEL` attribute whose expression evaluates to null must resolve to
-        // None (attribute absent / task unassigned), NOT the raw `=expr` — this
-        // is the red test for #900 (a null `=escalationAssignee` was stored as
-        // the literal "=escalationAssignee").
+    fn correlation_accepts_string_and_number_only() {
+        // Zeebe `evaluateMessageCorrelationKeyExpression`.
         let engine = Engine::new();
         let mut vars = HashMap::new();
-        vars.insert("x".to_string(), Value::Null);
-        assert_eq!(engine.resolve_user_task_string(&vars, Some("=x")), None);
+        vars.insert("n".to_string(), Value::Int(42));
+        vars.insert("s".to_string(), Value::Str("k".to_string()));
+        vars.insert("b".to_string(), Value::Bool(true));
+        assert_eq!(
+            engine.resolve_correlation_value(&vars, "n"),
+            Ok("42".into())
+        );
+        assert_eq!(
+            engine.resolve_correlation_value(&vars, "=s"),
+            Ok("k".into())
+        );
+        let f = engine.resolve_correlation_value(&vars, "b").unwrap_err();
+        assert!(f.message.contains("'BOOLEAN'"), "{}", f.message);
     }
 
     #[test]
-    fn user_task_string_missing_variable_resolves_absent() {
-        // An unset/missing variable in the expression must resolve to None, not
-        // the raw `=x`.
-        let engine = Engine::new();
-        let vars = HashMap::new();
-        assert_eq!(engine.resolve_user_task_string(&vars, Some("=x")), None);
-    }
-
-    #[test]
-    fn user_task_string_expression_resolves_to_string() {
-        // A `=FEEL` expression yielding a real string is surfaced as that string.
+    fn user_task_assignee_null_or_failure_is_an_error_never_the_expression_text() {
+        // #900 then #1398: a `=FEEL` assignee that is null, missing or
+        // malformed is an EXTRACT_VALUE_ERROR (Zeebe `evaluateStringExpression`)
+        // — and never the raw `=expr` stored as the assignee.
         let engine = Engine::new();
         let mut vars = HashMap::new();
+        vars.insert("nullVar".to_string(), Value::Null);
         vars.insert("x".to_string(), Value::Str("alice".to_string()));
+        for raw in ["=nullVar", "=missing", "=1 + "] {
+            assert!(
+                engine.resolve_user_task_assignee(&vars, Some(raw)).is_err(),
+                "{raw}"
+            );
+        }
         assert_eq!(
-            engine.resolve_user_task_string(&vars, Some("=x")),
-            Some("alice".to_string())
+            engine.resolve_user_task_assignee(&vars, Some("=x")),
+            Ok(Some("alice".to_string()))
         );
-    }
-
-    #[test]
-    fn user_task_string_literal_is_verbatim() {
-        // A plain literal (no leading `=`) is returned unchanged.
-        let engine = Engine::new();
-        let vars = HashMap::new();
         assert_eq!(
-            engine.resolve_user_task_string(&vars, Some("alice")),
-            Some("alice".to_string())
+            engine.resolve_user_task_assignee(&vars, Some("bob")),
+            Ok(Some("bob".to_string()))
         );
+        assert_eq!(engine.resolve_user_task_assignee(&vars, None), Ok(None));
     }
 
     #[test]
-    fn user_task_string_malformed_expression_resolves_absent() {
-        // A malformed expression must resolve to None, never the raw `=1 + `.
-        let engine = Engine::new();
-        let vars = HashMap::new();
-        assert_eq!(engine.resolve_user_task_string(&vars, Some("=1 + ")), None);
-    }
-
-    #[test]
-    fn user_task_string_none_stays_none() {
-        // An undeclared attribute resolves to None.
-        let engine = Engine::new();
-        let vars = HashMap::new();
-        assert_eq!(engine.resolve_user_task_string(&vars, None), None);
-    }
-
-    #[test]
-    fn user_task_string_never_begins_with_equals() {
-        // The categorical invariant: a resolved user-task string attribute is
-        // never a value beginning with `=`. Covers assignee + both dates (all
-        // routed through resolve_user_task_string) against re-introduction.
+    fn user_task_date_is_nullable() {
         let engine = Engine::new();
         let mut vars = HashMap::new();
         vars.insert("nullVar".to_string(), Value::Null);
@@ -996,22 +975,21 @@ mod tests {
             "dateStr".to_string(),
             Value::Str("2026-01-01T00:00:00Z".to_string()),
         );
-        let cases = [
-            Some("=escalationAssignee"), // missing var -> None
-            Some("=nullVar"),            // null -> None
-            Some("=dateStr"),            // string -> the date, no leading '='
-            Some("=1 + "),               // malformed -> None
-            Some("alice"),               // literal -> verbatim
-            None,
-        ];
-        for raw in cases {
-            if let Some(resolved) = engine.resolve_user_task_string(&vars, raw) {
-                assert!(
-                    !resolved.starts_with('='),
-                    "resolved user-task string attribute {resolved:?} must never begin with '='"
-                );
-            }
-        }
+        vars.insert("bad".to_string(), Value::Str("soon".to_string()));
+        assert_eq!(
+            engine.resolve_user_task_date(&vars, Some("=nullVar")),
+            Ok(None)
+        );
+        assert_eq!(
+            engine.resolve_user_task_date(&vars, Some("=missing")),
+            Ok(None)
+        );
+        assert_eq!(
+            engine.resolve_user_task_date(&vars, Some("=dateStr")),
+            Ok(Some("2026-01-01T00:00:00Z".to_string()))
+        );
+        assert!(engine.resolve_user_task_date(&vars, Some("=bad")).is_err());
+        assert!(engine.resolve_user_task_date(&vars, Some("=1 + ")).is_err());
     }
 
     #[test]

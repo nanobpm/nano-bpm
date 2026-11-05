@@ -325,8 +325,8 @@ impl Engine {
         &self,
         vars: &HashMap<String, Value>,
         target: &Element,
-    ) -> Option<TriggerFingerprint> {
-        match &target.kind {
+    ) -> Result<Option<TriggerFingerprint>, expression::Failure> {
+        Ok(match &target.kind {
             ElementKind::MessageBoundaryEvent {
                 message_name,
                 correlation_key,
@@ -336,19 +336,19 @@ impl Engine {
                 message_name,
                 correlation_key,
             } => Some(TriggerFingerprint::Message(
-                self.resolve_event_name(vars, message_name),
-                self.resolve_correlation_value(vars, correlation_key),
+                self.resolve_event_name(vars, message_name)?,
+                self.resolve_correlation_value(vars, correlation_key)?,
             )),
             ElementKind::SignalBoundaryEvent { signal_name, .. }
             | ElementKind::SignalIntermediateCatchEvent { signal_name } => Some(
-                TriggerFingerprint::Signal(self.resolve_event_name(vars, signal_name)),
+                TriggerFingerprint::Signal(self.resolve_event_name(vars, signal_name)?),
             ),
             ElementKind::ConditionalBoundaryEvent { condition, .. }
             | ElementKind::ConditionalIntermediateCatchEvent { condition } => {
                 Some(TriggerFingerprint::Conditional(condition.clone()))
             }
             _ => timer_fingerprint(target),
-        }
+        })
     }
 
     /// The audit form of a freshly armed trigger event.
@@ -391,13 +391,38 @@ impl Engine {
     /// Plans the subscription and flow-scope side effects of migrating
     /// `instance_key` onto `target` under `mapped`. Every precondition has
     /// already passed; this only mints keys for the triggers it (re-)arms.
+    ///
+    /// A target catch event whose expression (message / signal name,
+    /// correlation key, timer) fails to evaluate rejects the migration (Zeebe
+    /// `ProcessInstanceMigrationCatchEventBehavior`: "... must be subscribed to
+    /// a catch event. <failure>", `INVALID_STATE`, #1398) — no key is consumed.
     pub(crate) fn plan_migration(
         &mut self,
         instance_key: Key,
         source: &ProcessDefinition,
         target: &ProcessDefinition,
         mapped: &HashMap<String, String>,
-    ) -> MigrationPlan {
+    ) -> Result<MigrationPlan, EngineError> {
+        let key_mark = self.next_local;
+        let planned = self.plan_migration_inner(instance_key, source, target, mapped);
+        planned.map_err(|(element_id, target_element_id, failure)| {
+            self.next_local = key_mark;
+            EngineError::MigrationCatchEventSubscriptionFailed {
+                instance_key,
+                element_id,
+                target_element_id,
+                reason: failure.message,
+            }
+        })
+    }
+
+    fn plan_migration_inner(
+        &mut self,
+        instance_key: Key,
+        source: &ProcessDefinition,
+        target: &ProcessDefinition,
+        mapped: &HashMap<String, String>,
+    ) -> Result<MigrationPlan, (ElementId, ElementId, expression::Failure)> {
         let mut plan = MigrationPlan::default();
         let mut active: Vec<(Key, ElementId)> = self
             .state
@@ -435,6 +460,7 @@ impl Engine {
             // element is never "new": if its source trigger is no longer armed
             // (a one-shot non-interrupting timer that already fired) it must not
             // be re-armed, or the side path would run twice.
+            let fail = |f: expression::Failure| (source_id.clone(), target_id.clone(), f);
             let mut covered: Vec<ElementId> = Self::armable_boundaries(source, &source_id)
                 .iter()
                 .filter_map(|b| mapped.get(&b.id).cloned())
@@ -467,7 +493,10 @@ impl Engine {
                     Some(_) => boundary_interrupting(&target_catch.kind),
                     None => None,
                 };
-                let unchanged = self.target_fingerprint(vars, &target_catch).as_ref()
+                let unchanged = self
+                    .target_fingerprint(vars, &target_catch)
+                    .map_err(fail)?
+                    .as_ref()
                     == Some(&armed.fingerprint)
                     && target_interrupting == armed.interrupting;
                 if unchanged {
@@ -493,10 +522,12 @@ impl Engine {
                 }
                 let armed_events = if armed.interrupting.is_some() {
                     self.arm_boundary(instance_key, eik, &target_id, vars, &target_catch)
+                        .map_err(fail)?
                         .into_iter()
                         .collect()
                 } else {
                     self.arm_catch_event(instance_key, eik, vars, &target_catch)
+                        .map_err(fail)?
                 };
                 for event in armed_events {
                     if let Some(trigger) = Self::report_of(&event) {
@@ -525,8 +556,9 @@ impl Engine {
                 if covered.contains(&boundary.id) {
                     continue;
                 }
-                if let Some(event) =
-                    self.arm_boundary(instance_key, eik, &target_id, &boundary_vars, &boundary)
+                if let Some(event) = self
+                    .arm_boundary(instance_key, eik, &target_id, &boundary_vars, &boundary)
+                    .map_err(fail)?
                 {
                     if let Some(trigger) = Self::report_of(&event) {
                         plan.subscriptions.push(MigratedSubscription {
@@ -540,7 +572,7 @@ impl Engine {
                 }
             }
         }
-        plan
+        Ok(plan)
     }
 
     /// The `hosts` NOT in their steady active phase (computed in one pass), i.e. a

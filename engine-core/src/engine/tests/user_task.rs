@@ -192,19 +192,19 @@ fn should_create_a_user_task_with_resolved_attributes() {
 }
 
 #[test]
-fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
+fn should_raise_an_incident_when_assignee_expression_is_null() {
     use crate::model::UserTaskProps;
-    // Reproduces merlin instance 19153 (#900): a `=FEEL` assignee whose
-    // variable is null must create the task UNASSIGNED (assignee None) rather
-    // than storing the raw "=maybeNull" literal, which hides the task from
-    // assignee-aware operator views. candidateGroups must survive so the task
-    // stays claimable by the group.
+    // #900 stopped storing the raw "=who" literal as the assignee. Zeebe
+    // (`BpmnUserTaskBehavior.evaluateAssigneeExpression` ->
+    // `evaluateStringExpression`) goes further: a NULL assignee is an
+    // EXTRACT_VALUE_ERROR incident — no task is created until the operator
+    // fixes the variable (#1398). The nullable dates stay absent.
     let def = ProcessBuilder::new("escalation")
         .start_event("start")
         .user_task_with(
             "review",
             UserTaskProps {
-                assignee: Some("=maybeNull".to_string()),
+                assignee: Some("=who".to_string()),
                 candidate_groups: Some("operators".to_string()),
                 candidate_users: None,
                 due_date: Some("=maybeNull".to_string()),
@@ -224,7 +224,10 @@ fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
     engine.apply_command(Command::DeployProcess(def)).unwrap();
 
     // maybeNull is explicitly null (intent: escalate unassigned).
-    let vars = HashMap::from([("maybeNull".to_string(), Value::Null)]);
+    let vars = HashMap::from([
+        ("maybeNull".to_string(), Value::Null),
+        ("who".to_string(), Value::Null),
+    ]);
     let created = engine
         .apply_command(Command::CreateInstance {
             process_id: "escalation".to_string(),
@@ -235,21 +238,38 @@ fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
             version: None,
         })
         .unwrap();
-    let user_task_key = created
-        .iter()
-        .find_map(|e| match e {
-            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
-            _ => None,
-        })
-        .expect("user task created");
-
-    let task = &engine.state().user_tasks[&user_task_key];
-    // The categorical fix: the null-resolving expressions are absent, never the
-    // raw "=maybeNull".
-    assert_eq!(
-        task.assignee, None,
-        "null assignee expression must be absent"
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert!(
+        !created
+            .iter()
+            .any(|e| matches!(e, Event::UserTaskCreated { .. })),
+        "no user task is created on an unevaluable assignee"
     );
+    let incident = engine.active_incidents()[0].clone();
+    assert_eq!(incident.kind, state::IncidentKind::ExtractValueError);
+    assert!(
+        incident.reason.contains("but was 'NULL'"),
+        "{}",
+        incident.reason
+    );
+
+    // The operator supplies the assignee and resolves: the task is created.
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            HashMap::from([("who".to_string(), Value::Str("operator-1".into()))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+    let task = engine
+        .state()
+        .user_tasks
+        .values()
+        .next()
+        .expect("user task created on resolve");
+    assert_eq!(task.assignee.as_deref(), Some("operator-1"));
     assert_eq!(
         task.due_date, None,
         "null dueDate expression must be absent"
@@ -258,19 +278,7 @@ fn should_create_a_user_task_unassigned_when_assignee_expression_is_null() {
         task.follow_up_date, None,
         "null followUpDate expression must be absent"
     );
-    // The candidate group survives, so the unassigned task is still claimable.
     assert_eq!(task.candidate_groups, vec!["operators"]);
-
-    // And it is claimable via assign_user_task (the manual unblock in #900).
-    engine
-        .apply_command(Command::assign_user_task(user_task_key, "operator-1"))
-        .unwrap();
-    assert_eq!(
-        engine.state().user_tasks[&user_task_key]
-            .assignee
-            .as_deref(),
-        Some("operator-1")
-    );
 }
 
 #[test]

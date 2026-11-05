@@ -1,0 +1,23 @@
+{
+  "description": "#1398: a user task whose assignee expression evaluates to null -> EXTRACT_VALUE_ERROR incident (Zeebe evaluateStringExpression), no user task; setting the variable and resolving the incident creates the task, which then completes.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "user-task-assignee-null"
+    },
+    {
+      "op": "updateVariables",
+      "variables": {
+        "who": "alice"
+      }
+    },
+    {
+      "op": "resolveIncident",
+      "elementId": "review"
+    },
+    {
+      "op": "completeUserTask",
+      "elementId": "review"
+    }
+  ]
+}

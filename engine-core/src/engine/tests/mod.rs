@@ -14,6 +14,7 @@ mod call_activity;
 mod compensation_escalation;
 mod execution_order;
 mod expression_failures;
+mod feel_fallbacks;
 mod incidents;
 mod jobs;
 mod lifecycle;

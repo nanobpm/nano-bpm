@@ -91,10 +91,15 @@ public final class CellIds {
    * The {@code element:} cell a PROCESS_INSTANCE record touches, or null when the record is the
    * process instance itself: {@code extract.mjs} (the shared grammar's source of truth) emits no
    * {@code element:Process} cell — BPMN {@code <process>} is the container, not a flow element — so
-   * recording one here would be grammar drift the parity guard rejects.
+   * recording one here would be grammar drift the parity guard rejects. Likewise {@code
+   * MULTI_INSTANCE_BODY}: a runtime wrapper Zeebe puts around a multi-instance activity, not a
+   * BPMN flow element ({@code FlowElementValidator} has no such class) — the activity's own cell
+   * is touched by its children.
    */
   public static String elementCellOrNull(final String bpmnElementType) {
-    return "PROCESS".equals(bpmnElementType) ? null : elementCell(bpmnElementType);
+    return "PROCESS".equals(bpmnElementType) || "MULTI_INSTANCE_BODY".equals(bpmnElementType)
+        ? null
+        : elementCell(bpmnElementType);
   }
 
   /**

@@ -659,14 +659,18 @@ impl Engine {
     /// attached to `element_id` (a service task or sub-process), returning the
     /// `TimerCreated`/`MessageSubscriptionCreated` events. Firing one later
     /// interrupts the activity (interrupting) or spawns a parallel token beside
-    /// it (non-interrupting).
+    /// it (non-interrupting). A boundary expression (timer, message / signal
+    /// name, correlation key) that fails to evaluate is the host's
+    /// `EXTRACT_VALUE_ERROR` (Zeebe `BpmnEventSubscriptionBehavior
+    /// .subscribeToEvents` fails the host's activation, #1398): the caller
+    /// raises it as an incident and arms nothing.
     pub(crate) fn arm_boundary_events(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         scope: Key,
         element_id: &str,
-    ) -> Vec<Event> {
+    ) -> Result<Vec<Event>, expression::Failure> {
         // The scoped view the host activity's boundary expressions (timer/message
         // /signal names, correlation keys) evaluate against — its flow scope, so a
         // boundary on an activity nested in a sub-process sees the enclosing
@@ -676,18 +680,47 @@ impl Engine {
             .process_of_instance(instance_key)
             .map(|p| Self::armable_boundaries(p, element_id))
             .unwrap_or_default();
-        boundaries
-            .iter()
-            .filter_map(|b| {
-                self.arm_boundary(
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    &host_vars,
-                    b,
-                )
-            })
-            .collect()
+        let mut events = Vec::new();
+        for b in &boundaries {
+            if let Some(event) = self.arm_boundary(
+                instance_key,
+                element_instance_key,
+                element_id,
+                &host_vars,
+                b,
+            )? {
+                events.push(event);
+            }
+        }
+        Ok(events)
+    }
+
+    /// Dry-runs the arming of `element_id`'s boundary events against
+    /// `host_vars` WITHOUT emitting anything (minted keys are rewound): the
+    /// first expression failure, if any. Lets an all-or-nothing command
+    /// (process-instance modification) reject up front exactly when arming
+    /// would fail — through the single arming implementation, not a parallel
+    /// validator (#1398).
+    pub(crate) fn check_boundary_arming(
+        &mut self,
+        instance_key: Key,
+        element_id: &str,
+        host_vars: &HashMap<String, Value>,
+    ) -> Result<(), expression::Failure> {
+        let boundaries = self
+            .process_of_instance(instance_key)
+            .map(|p| Self::armable_boundaries(p, element_id))
+            .unwrap_or_default();
+        let mark = self.next_local;
+        let mut result = Ok(());
+        for b in &boundaries {
+            if let Err(failure) = self.arm_boundary(instance_key, 0, element_id, host_vars, b) {
+                result = Err(failure);
+                break;
+            }
+        }
+        self.next_local = mark;
+        result
     }
 
     /// Arms ONE boundary event `boundary` attached to the host element instance
@@ -695,7 +728,8 @@ impl Engine {
     /// expressions against `host_vars`. `None` for a boundary kind that arms no
     /// runtime trigger. The single arming implementation shared by activation
     /// ([`Self::arm_boundary_events`]) and migration (#1374), which arms the
-    /// boundaries of the *target* definition before it is pinned.
+    /// boundaries of the *target* definition before it is pinned. An
+    /// expression failure is returned for the caller to raise (#1398).
     pub(crate) fn arm_boundary(
         &mut self,
         instance_key: Key,
@@ -703,7 +737,7 @@ impl Engine {
         host_element_id: &str,
         host_vars: &HashMap<String, Value>,
         boundary: &crate::model::Element,
-    ) -> Option<Event> {
+    ) -> Result<Option<Event>, expression::Failure> {
         let boundary_kind = |interrupting: bool| {
             let boundary_element_id = boundary.id.clone();
             if interrupting {
@@ -722,13 +756,13 @@ impl Engine {
                 interrupting,
                 ..
             } => {
-                let timer_key = self.mint_key();
                 let (due_at, _) = self.resolve_timer(
                     host_vars,
                     boundary.timer.as_ref(),
                     self.now,
                     *duration_millis,
-                );
+                )?;
+                let timer_key = self.mint_key();
                 let boundary_element_id = boundary.id.clone();
                 let kind = if *interrupting {
                     state::TimerKind::InterruptingBoundary {
@@ -739,14 +773,14 @@ impl Engine {
                         boundary_element_id,
                     }
                 };
-                Some(Event::TimerCreated {
+                Ok(Some(Event::TimerCreated {
                     timer_key,
                     instance_key,
                     element_instance_key,
                     element_id: host_element_id.to_string(),
                     due_at,
                     kind,
-                })
+                }))
             }
             ElementKind::MessageBoundaryEvent {
                 message_name,
@@ -754,57 +788,60 @@ impl Engine {
                 interrupting,
                 ..
             } => {
-                let subscription_key = self.mint_key();
                 // The message name may be a FEEL expression evaluated on activation
                 // (when the boundary subscription opens) against the instance
-                // variables (Zeebe parity).
-                let message_name = self.resolve_event_name(host_vars, message_name);
-                let correlation_value = self.resolve_correlation_value(host_vars, correlation_key);
+                // variables (Zeebe parity); a failure fails the host (#1398).
+                let message_name = self.resolve_event_name(host_vars, message_name)?;
+                let correlation_value =
+                    self.resolve_correlation_value(host_vars, correlation_key)?;
+                let subscription_key = self.mint_key();
                 let kind = boundary_kind(*interrupting);
                 // Placement matches the intermediate catch: a boundary subscription
                 // whose correlation key hashes off-partition is opened on the message
                 // partition; locally we keep only an `Opening` record (the host routes
                 // the open). Single-partition always opens locally.
-                if self.subscription_partition(&correlation_value) == self.partition_id {
-                    Some(Event::MessageSubscriptionCreated {
-                        subscription_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: host_element_id.to_string(),
-                        message_name,
-                        correlation_key: correlation_value,
-                        kind,
-                    })
-                } else {
-                    Some(Event::MessageSubscriptionOpening {
-                        subscription_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id: host_element_id.to_string(),
-                        message_name,
-                        correlation_key: correlation_value,
-                        kind,
-                    })
-                }
+                Ok(Some(
+                    if self.subscription_partition(&correlation_value) == self.partition_id {
+                        Event::MessageSubscriptionCreated {
+                            subscription_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id: host_element_id.to_string(),
+                            message_name,
+                            correlation_key: correlation_value,
+                            kind,
+                        }
+                    } else {
+                        Event::MessageSubscriptionOpening {
+                            subscription_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id: host_element_id.to_string(),
+                            message_name,
+                            correlation_key: correlation_value,
+                            kind,
+                        }
+                    },
+                ))
             }
             ElementKind::SignalBoundaryEvent {
                 signal_name,
                 interrupting,
                 ..
             } => {
-                let subscription_key = self.mint_key();
                 // The signal name may be a FEEL expression evaluated on activation
                 // (when the boundary subscription opens) against the instance
-                // variables (Zeebe parity).
-                let signal_name = self.resolve_event_name(host_vars, signal_name);
-                Some(Event::SignalSubscriptionCreated {
+                // variables (Zeebe parity); a failure fails the host (#1398).
+                let signal_name = self.resolve_event_name(host_vars, signal_name)?;
+                let subscription_key = self.mint_key();
+                Ok(Some(Event::SignalSubscriptionCreated {
                     subscription_key,
                     instance_key,
                     element_instance_key,
                     element_id: host_element_id.to_string(),
                     signal_name,
                     kind: boundary_kind(*interrupting),
-                })
+                }))
             }
             ElementKind::ConditionalBoundaryEvent {
                 condition,
@@ -816,7 +853,7 @@ impl Engine {
                 // referenced variable by the re-evaluation pass in `run`; opening
                 // the subscription here is enough (an already-true condition fires
                 // on the first pass, right after this activation command drains).
-                Some(Event::ConditionalSubscriptionCreated {
+                Ok(Some(Event::ConditionalSubscriptionCreated {
                     subscription_key,
                     instance_key,
                     element_instance_key,
@@ -824,33 +861,35 @@ impl Engine {
                     condition: condition.clone(),
                     referenced_vars: super::sorted_referenced_vars(condition),
                     kind: boundary_kind(*interrupting),
-                })
+                }))
             }
-            _ => None,
+            _ => Ok(None),
         }
     }
 
     /// Arms the trigger of the intermediate catch event `element` on which the
-    /// token `element_instance_key` rests: a timer, a message subscription
-    /// (or an `ExpressionEvaluation` incident when its correlation key fails
-    /// to evaluate — never a silently unmatchable empty key), a signal
-    /// subscription, or a conditional subscription. Expressions evaluate
-    /// against `vars` (the element's scoped view). Empty for any other kind.
-    /// The single arming implementation shared by activation and migration
-    /// (#1374), which re-subscribes a catch event whose trigger changed.
+    /// token `element_instance_key` rests: a timer, a message subscription, a
+    /// signal subscription, or a conditional subscription. Expressions evaluate
+    /// against `vars` (the element's scoped view); a failure (timer, message /
+    /// signal name, correlation key) is returned as an `EXTRACT_VALUE_ERROR`
+    /// [`expression::Failure`] for the caller to raise (Zeebe
+    /// `CatchEventBehavior.subscribeToEvents`, #1398) — never a silently
+    /// unmatchable subscription. Empty for any other kind. The single arming
+    /// implementation shared by activation and migration (#1374), which
+    /// re-subscribes a catch event whose trigger changed.
     pub(crate) fn arm_catch_event(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         vars: &HashMap<String, Value>,
         element: &crate::model::Element,
-    ) -> Vec<Event> {
+    ) -> Result<Vec<Event>, expression::Failure> {
         let element_id = element.id.clone();
-        match &element.kind {
+        Ok(match &element.kind {
             ElementKind::TimerIntermediateCatchEvent { duration_millis } => {
-                let timer_key = self.mint_key();
                 let (due_at, _) =
-                    self.resolve_timer(vars, element.timer.as_ref(), self.now, *duration_millis);
+                    self.resolve_timer(vars, element.timer.as_ref(), self.now, *duration_millis)?;
+                let timer_key = self.mint_key();
                 vec![Event::TimerCreated {
                     timer_key,
                     instance_key,
@@ -864,81 +903,40 @@ impl Engine {
                 message_name,
                 correlation_key,
             } => {
-                // The message name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity). A
-                // failure is an EXTRACT_VALUE_ERROR incident (Zeebe
-                // `BpmnEventSubscriptionBehavior` -> `evaluateStringExpression`),
-                // never a subscription named after the expression text;
-                // resolving it re-opens the subscription.
-                let message_name = match self.resolve_event_name_checked(vars, message_name) {
-                    Ok(name) => name,
-                    Err(failure) => {
-                        return vec![self.expression_incident(
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                            failure,
-                            None,
-                        )];
-                    }
-                };
+                let message_name = self.resolve_event_name(vars, message_name)?;
+                let correlation_value = self.resolve_correlation_value(vars, correlation_key)?;
                 let subscription_key = self.mint_key();
-                // A declared correlation-key expression that fails to evaluate
-                // (missing variable, `null`, or a type error like `str + null`)
-                // must NOT silently open a subscription with an empty key — that
-                // key can never be matched by a published message, so the token
-                // would park forever with no error. Raise an ExpressionEvaluation
-                // incident instead (Zeebe parity); resolving it re-opens the
-                // subscription (see the `ResolveIncident` re-drive).
-                match self.resolve_correlation_value_checked(vars, correlation_key) {
-                    Err(reason) => vec![Event::IncidentRaised {
-                        incident_key: subscription_key,
+                let kind = state::MessageSubscriptionKind::IntermediateCatch;
+                // Zeebe-style placement: the canonical subscription lives on the
+                // partition owning `hash(correlation_key)`. When that is this
+                // partition (always so single-partition), open it locally; else
+                // park the token on an `Opening` record and let the host route an
+                // `OpenMessageSubscription` to the message partition.
+                if self.subscription_partition(&correlation_value) == self.partition_id {
+                    vec![Event::MessageSubscriptionCreated {
+                        subscription_key,
                         instance_key,
                         element_instance_key,
                         element_id,
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        redrive: None,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    }],
-                    Ok(correlation_value) => {
-                        let kind = state::MessageSubscriptionKind::IntermediateCatch;
-                        // Zeebe-style placement: the canonical subscription lives
-                        // on the partition owning `hash(correlation_key)`. When
-                        // that is this partition (always so single-partition),
-                        // open it locally; else park the token on an `Opening`
-                        // record and let the host route an
-                        // `OpenMessageSubscription` to the message partition.
-                        if self.subscription_partition(&correlation_value) == self.partition_id {
-                            vec![Event::MessageSubscriptionCreated {
-                                subscription_key,
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                message_name,
-                                correlation_key: correlation_value,
-                                kind,
-                            }]
-                        } else {
-                            vec![Event::MessageSubscriptionOpening {
-                                subscription_key,
-                                instance_key,
-                                element_instance_key,
-                                element_id,
-                                message_name,
-                                correlation_key: correlation_value,
-                                kind,
-                            }]
-                        }
-                    }
+                        message_name,
+                        correlation_key: correlation_value,
+                        kind,
+                    }]
+                } else {
+                    vec![Event::MessageSubscriptionOpening {
+                        subscription_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        message_name,
+                        correlation_key: correlation_value,
+                        kind,
+                    }]
                 }
             }
             ElementKind::SignalIntermediateCatchEvent { signal_name } => {
+                let signal_name = self.resolve_event_name(vars, signal_name)?;
                 let subscription_key = self.mint_key();
-                // The signal name may be a FEEL expression evaluated on
-                // activation against the instance variables (Zeebe parity).
-                let signal_name = self.resolve_event_name(vars, signal_name);
                 vec![Event::SignalSubscriptionCreated {
                     subscription_key,
                     instance_key,
@@ -961,7 +959,7 @@ impl Engine {
                 }]
             }
             _ => Vec::new(),
-        }
+        })
     }
 
     /// Whether `element_id` is an embedded sub-process (interrupting it must tear

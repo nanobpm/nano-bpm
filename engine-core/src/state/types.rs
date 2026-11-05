@@ -980,6 +980,17 @@ pub enum IoMappingRedrive {
         element_id: ElementId,
         variables: HashMap<String, Value>,
     },
+    /// A task-listener job's `type` / `retries` expression failed (#1398): the
+    /// user task rests with its deferred transition and no listener job; the
+    /// incident sits on the user task's element instance. Resolution re-mints
+    /// the job of listener `listener_index` of the `event_type` chain on task
+    /// `user_task_key` (Zeebe raises the task-listener job's
+    /// `EXTRACT_VALUE_ERROR` and retries the job creation on resolution).
+    TaskListenerJob {
+        user_task_key: Key,
+        event_type: crate::model::TaskListenerEventType,
+        listener_index: usize,
+    },
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as
