@@ -5815,10 +5815,20 @@ impl Engine {
             // `isFlowScopeWithSubscriptions`). Emitted right after
             // `ElementCompleted`, mirroring where `finalize_completion` records
             // a leaf activity's boundary subscription.
-            for sub in
-                self.subprocess_compensation_subscriptions(instance_key, eik, &element_id, scope)
-            {
-                self.emit(log, sub);
+            // Review r4478182821 (#901): a sub-process that IS a compensation
+            // handler routes back to the throw waiting on it (never along
+            // outgoing flows, and it records no subscription of its own).
+            let handler_throw =
+                self.sub_process_handler_throw(instance_key, eik, &element_id, scope);
+            if handler_throw.is_none() {
+                for sub in self.subprocess_compensation_subscriptions(
+                    instance_key,
+                    eik,
+                    &element_id,
+                    scope,
+                ) {
+                    self.emit(log, sub);
+                }
             }
             // Completing normally disarms any boundary timers/subscriptions on it.
             for event in self.cancel_boundary_timers_on(eik) {
@@ -5838,6 +5848,15 @@ impl Engine {
                     self.emit(log, event);
                 }
             }
+            if let Some(throw_eik) = handler_throw {
+                let (resume_events, resume_followups) =
+                    self.resume_compensation_throw(instance_key, &element_id, throw_eik, eik);
+                for event in resume_events {
+                    self.emit(log, event);
+                }
+                followups.extend(resume_followups);
+                continue;
+            }
             for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
                 for event in taken {
                     self.emit(log, event);
@@ -5846,6 +5865,23 @@ impl Engine {
             }
         }
         followups
+    }
+
+    /// The compensation throw waiting on the completing sub-process `eik`, when
+    /// that sub-process is itself a compensation handler (matched by
+    /// element-instance key, #897, with the pre-#897 element-id fallback) —
+    /// the single routing decision shared by every sub-process completion path
+    /// (`complete_drained_subprocesses`, `finalize_subprocess`), mirroring the
+    /// leaf-activity routing in `complete`.
+    fn sub_process_handler_throw(
+        &self,
+        instance_key: Key,
+        eik: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Option<Key> {
+        self.pending_compensation_handler_by_instance(instance_key, eik)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, element_id, scope))
     }
 
     /// Whether a queued step would (re)create work on an instance that has
@@ -12361,6 +12397,20 @@ impl Engine {
         // records its own handlerless scope subscription — or its explicit
         // boundary subscriptions instead (mirrors the listener-free path in
         // `complete_drained_subprocesses`).
+        // Review r4478182821: a sub-process compensation handler resumes its
+        // throw instead of recording subscriptions / taking flows.
+        if let Some(throw_eik) =
+            self.sub_process_handler_throw(instance_key, element_instance_key, &element_id, scope)
+        {
+            let (resume_events, followups) = self.resume_compensation_throw(
+                instance_key,
+                &element_id,
+                throw_eik,
+                element_instance_key,
+            );
+            events.extend(resume_events);
+            return (events, followups);
+        }
         events.extend(self.subprocess_compensation_subscriptions(
             instance_key,
             element_instance_key,

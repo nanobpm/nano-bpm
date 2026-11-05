@@ -2488,3 +2488,81 @@ fn whole_scope_throw_reaches_the_explicit_handler_after_the_mi_body_end_listener
         .compensation_waits
         .is_empty());
 }
+
+/// Review r4478182821 (#901): a compensation handler that is itself an
+/// embedded sub-process must, on completion, retire the throw's wait (routing
+/// through `resume_compensation_throw`) — on both the listener-free drained
+/// path and the end-listener (`finalize_subprocess`) path.
+///
+/// ```text
+/// start -> book(svc, comp -> undo[ u_start -> undoTask -> u_end ]) -> throw -> done
+/// ```
+fn sub_process_handler_def(with_end_listener: bool) -> crate::model::ProcessDefinition {
+    let mut b = ProcessBuilder::new("comp-sub-handler")
+        .start_event("start")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("comp", "book", "undo")
+        .sub_process("undo", "u_start")
+        .start_event("u_start")
+        .contained_in("u_start", "undo")
+        .service_task("undoTask", "undo-job")
+        .contained_in("undoTask", "undo")
+        .end_event("u_end")
+        .contained_in("u_end", "undo")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "book")
+        .connect("book", "throw")
+        .connect("u_start", "undoTask")
+        .connect("undoTask", "u_end")
+        .connect("throw", "done");
+    if with_end_listener {
+        b = b.with_listeners(
+            "undo",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "undo-audit")],
+        );
+    }
+    b.build().unwrap()
+}
+
+fn run_sub_process_handler(with_end_listener: bool) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(sub_process_handler_def(
+            with_end_listener,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-sub-handler"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    complete_one(&mut engine, "book-job");
+    let mut events = complete_one(&mut engine, "undo-job");
+    if with_end_listener {
+        assert!(!engine.is_completed(instance_key));
+        events = complete_one(&mut engine, "undo-audit");
+    }
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationHandlerCompleted { handler_element_id, .. }
+            if handler_element_id == "undo"
+    )));
+    assert!(
+        engine.is_completed(instance_key),
+        "the throw resumes and the instance completes"
+    );
+    let inst = engine.instance(instance_key).unwrap();
+    assert!(inst.compensation_waits.is_empty());
+    assert!(inst.incidents.is_empty());
+}
+
+#[test]
+fn sub_process_compensation_handler_retires_the_throw_wait() {
+    run_sub_process_handler(false);
+}
+
+#[test]
+fn sub_process_compensation_handler_with_end_listener_retires_the_throw_wait() {
+    run_sub_process_handler(true);
+}
