@@ -426,6 +426,15 @@ struct NanoRun<'a> {
     /// activity's BPMN element id, so the type lookup alone cannot tell
     /// them apart.
     mi_bodies: HashMap<Key, Key>,
+    /// Each element instance's FLOW SCOPE (the enclosing sub-process element
+    /// instance, from `ElementActivating.scope`; absent = the process root).
+    /// Zeebe's `flowScopeKey` for an element inside a sub-process is the
+    /// sub-process instance, not the process instance (#1335).
+    flow_scopes: HashMap<Key, Key>,
+    /// The flow scope of the most recent activation of each element id: a
+    /// `SequenceFlowTaken` names only its source/target ids, and a flow lives
+    /// in its source element's scope.
+    scope_by_element_id: HashMap<(Key, String), Key>,
     /// Element instances activated but not yet completed, in activation
     /// order: `(element-instance key, element id, process-instance key)`.
     /// nano's `ProcessInstanceTerminated` carries the whole termination
@@ -480,6 +489,8 @@ impl<'a> NanoRun<'a> {
             process_id: String::new(),
             element_ids: HashMap::new(),
             mi_bodies: HashMap::new(),
+            flow_scopes: HashMap::new(),
+            scope_by_element_id: HashMap::new(),
             active_elements: Vec::new(),
             terminating: HashSet::new(),
             jobs_by_type: HashMap::new(),
@@ -655,7 +666,14 @@ impl<'a> NanoRun<'a> {
                 "bpmnElementType": self.element_type_of(element_instance_key, id),
                 "processInstanceKey": instance,
                 // Zeebe's process-root record has no flow scope: -1.
-                "flowScopeKey": if element_instance_key == instance { -1 } else { instance as i64 },
+                "flowScopeKey": if element_instance_key == instance {
+                    -1
+                } else {
+                    self.flow_scopes
+                        .get(&element_instance_key)
+                        .copied()
+                        .unwrap_or(instance) as i64
+                },
             }),
         )
     }
@@ -792,8 +810,12 @@ impl<'a> NanoRun<'a> {
                 instance_key,
                 element_instance_key,
                 element_id,
-                ..
+                scope,
             } => {
+                let flow_scope = if *scope == 0 { *instance_key } else { *scope };
+                self.flow_scopes.insert(*element_instance_key, flow_scope);
+                self.scope_by_element_id
+                    .insert((*instance_key, element_id.to_string()), flow_scope);
                 // The FIRST activation of an MI-enabled element id is its body:
                 // `activate_multi_instance_body` (engine/mod.rs) mints the body
                 // key and emits the body's lifecycle before the fan-out's
@@ -890,7 +912,11 @@ impl<'a> NanoRun<'a> {
                         "elementId": id,
                         "bpmnElementType": "SEQUENCE_FLOW",
                         "processInstanceKey": instance_key,
-                        "flowScopeKey": instance_key,
+                        "flowScopeKey": self
+                            .scope_by_element_id
+                            .get(&(*instance_key, from.to_string()))
+                            .copied()
+                            .unwrap_or(*instance_key),
                     }),
                 )]
             }

@@ -1,0 +1,16 @@
+{
+  "description": "#1335: an exclusive gateway inside a sub-process sees the sub-process-local `status` (declared by an input mapping `=null`, written by the inner job's result, which propagates to the nearest defining scope) and takes the conditional flow, not the default.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "exclusive-gateway-subprocess-scope"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work",
+      "variables": {
+        "status": "done"
+      }
+    }
+  ]
+}

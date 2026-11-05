@@ -81,7 +81,7 @@ const ALLOW: &[Allow] = &[
     },
     Allow {
         file: "mod.rs",
-        contains: "crate::feel::eval_bool(&condition, &vars), Ok(true)",
+        contains: "crate::feel::eval_bool(&condition, &",
         rule: Rule::DirectFeel,
         count: 2,
         why: Why::Tracked(
@@ -126,7 +126,7 @@ const ALLOW: &[Allow] = &[
     },
     Allow {
         file: "mod.rs",
-        contains: "crate::feel::eval_bool(c, &self.variables(instance_key))",
+        contains: "crate::feel::eval_bool(c, &child_vars)",
         rule: Rule::DirectFeel,
         count: 1,
         why: Why::Tracked(T, "MI completionCondition error -> false"),

@@ -4782,6 +4782,14 @@ impl Engine {
                 Event::VariablesUpdated {
                     instance_key,
                     variables,
+                }
+                // A write into a sub-process / multi-instance scope is a variable
+                // change too (#1335): a conditional event parked inside that scope
+                // must be re-evaluated, exactly as for a root write.
+                | Event::ScopedVariablesUpdated {
+                    instance_key,
+                    variables,
+                    ..
                 } => {
                     let entry = changed.entry(*instance_key).or_default();
                     for name in variables.keys() {
@@ -4842,7 +4850,10 @@ impl Engine {
             let element_id = sub.element_id.clone();
             let condition = sub.condition.clone();
             let kind = sub.kind.clone();
-            let vars = self.variables(instance_key);
+            // Evaluate against the variables visible from the subscribed element's
+            // scope (its sub-process / multi-instance locals layered over the
+            // root), never the root alone (#1335, Zeebe parity).
+            let vars = self.variables_for_element(instance_key, element_instance_key);
             if !matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
                 continue;
             }
@@ -6474,8 +6485,9 @@ impl Engine {
             // conditional event is a wait-until, not an incident (a deliberate
             // flat-scope choice).
             Some(ElementKind::ConditionalIntermediateCatchEvent { condition }) => {
-                let vars = self.variables(instance_key);
-                if matches!(crate::feel::eval_bool(&condition, &vars), Ok(true)) {
+                // The enclosing-scope view (#1335): a sub-process-local variable
+                // the condition reads is visible here, as in Zeebe.
+                if matches!(crate::feel::eval_bool(&condition, &element_vars), Ok(true)) {
                     followups.push(Step::Complete {
                         instance_key,
                         element_instance_key,
@@ -7520,10 +7532,11 @@ impl Engine {
         let completion_now = completion_condition
             .as_deref()
             .map(|c| {
-                matches!(
-                    crate::feel::eval_bool(c, &self.variables(instance_key)),
-                    Ok(true)
-                )
+                // Zeebe evaluates the completion condition in the completing
+                // CHILD's scope (#1335): `inputElement` / `loopCounter` and child
+                // locals are visible, layered over the body's ancestors.
+                let child_vars = self.variables_for_element(instance_key, child_eik);
+                matches!(crate::feel::eval_bool(c, &child_vars), Ok(true))
             })
             .unwrap_or(false);
 

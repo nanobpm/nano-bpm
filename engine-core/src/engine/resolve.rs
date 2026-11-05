@@ -249,6 +249,13 @@ impl Engine {
             .unwrap_or(0)
     }
 
+    /// The ROOT (process-instance) scope only — test-only by design (#1335).
+    /// Production code must read through [`Engine::variables_for_element`], the
+    /// scope-aware view: evaluating a condition (gateway, conditional event,
+    /// completion condition) against the root alone hides sub-process and
+    /// multi-instance locals. Gating this accessor to `cfg(test)` makes that
+    /// whole defect class a compile error rather than a review catch.
+    #[cfg(test)]
     pub(crate) fn variables(&self, instance_key: Key) -> Arc<HashMap<String, Value>> {
         let base = self
             .state
