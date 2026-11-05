@@ -23,6 +23,7 @@ mod migration;
 mod migration_scopes;
 mod modify_scopes;
 mod multi_instance;
+mod retry_phases;
 mod scoped_conditions;
 mod timers_catch;
 mod user_task;
