@@ -1367,11 +1367,17 @@ fn verdict(outcomes: &BTreeMap<String, Option<String>>, allowlist: &J) -> Result
     }
 }
 
-/// Does `record` match `matcher` (every matcher field equal)?
+/// Does `record` match `matcher` (every matcher field present and equal)? A
+/// field ABSENT from the record never matches — indexing a missing field
+/// yields `Null`, so without the presence check a matcher such as
+/// `{"elementID": null}` would match every record and silently widen into a
+/// whole-scenario exemption.
 fn record_matches(record: &J, matcher: &J) -> bool {
-    matcher
-        .as_object()
-        .is_some_and(|m| !m.is_empty() && m.iter().all(|(k, v)| &record[k] == v))
+    matcher.as_object().is_some_and(|m| {
+        !m.is_empty()
+            && m.iter()
+                .all(|(k, v)| record.as_object().is_some_and(|r| r.get(k) == Some(v)))
+    })
 }
 
 /// `steps` with every record matching one of `ignore` removed.
@@ -1971,6 +1977,57 @@ fn ignore_records_masks_only_the_matched_records() {
     let failed = BTreeMap::from([(sc.name.clone(), (golden, None))]);
     let err = masked_residuals(&entry(json!([{"valueType": "JOB"}])), &failed);
     assert!(err[0].contains("no nano trace"), "{err:?}");
+    // A matcher field ABSENT from a record never matches it: indexing a missing
+    // field yields Null, so a `{"noSuchField": null}` matcher must not widen
+    // into a whole-scenario exemption that masks every record.
+    let err = masked_residuals(&entry(json!([{"noSuchField": null}])), &traces);
+    assert!(err[0].contains("beyond its allow-listed"), "{err:?}");
+}
+
+/// A null-valued matcher field matches only a record that CARRIES the field
+/// with value null — never a record where the field is absent (indexing a
+/// missing field yields `Null`, which used to match and silently widen the
+/// exemption to every record).
+#[test]
+fn ignore_records_null_matcher_requires_the_field_to_exist() {
+    let step = |v: J| {
+        json!({"op": "cancelJob", "records": [
+            {"valueType": "JOB", "intent": "CANCELED", "elementId": "task", "marker": "m", "retries": v}
+        ], "step": 0})
+    };
+    let traces = BTreeMap::from([(
+        "s".to_string(),
+        (
+            vec![step(json!(null)), step(json!(null))],
+            Some(vec![step(json!(42)), step(json!(null))]),
+        ),
+    )]);
+    let entry =
+        |m: J| json!({"entries": [{"scenario": "s", "issue": "#1424", "ignoreRecords": m}]});
+    // Masking both records by their shared fields leaves no residual...
+    let err = masked_residuals(
+        &entry(json!([{"valueType": "JOB", "marker": "m"}])),
+        &traces,
+    );
+    assert!(err.is_empty(), "{err:?}");
+    // ... and the null matcher masks ONLY the golden record, whose `retries`
+    // field is present and null — nano's `retries: 42` survives and the
+    // divergence is reported.
+    let err = masked_residuals(
+        &entry(json!([{"valueType": "JOB", "marker": "m", "retries": null}])),
+        &traces,
+    );
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].contains("beyond its allow-listed"), "{err:?}");
+    // A null matcher on a field NEITHER record carries masks nothing at all:
+    // indexing a missing field yields `Null`, which must NOT satisfy the
+    // matcher (that would silently widen the exemption to every record).
+    let err = masked_residuals(
+        &entry(json!([{"valueType": "JOB", "marker": "m", "noSuchField": null}])),
+        &traces,
+    );
+    assert_eq!(err.len(), 1, "{err:?}");
+    assert!(err[0].contains("beyond its allow-listed"), "{err:?}");
 }
 
 /// Editing a script's `expectRejection` without recapturing must fail the

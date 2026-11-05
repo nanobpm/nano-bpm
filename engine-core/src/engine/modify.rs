@@ -215,6 +215,41 @@ impl Engine {
             fresh
         });
 
+        // A compensation handler instance a throw event is still waiting on may
+        // not be terminated: the throw's wait is bound to that exact handler
+        // instance (`pending_handler_keys`, #897), so terminating it leaves the
+        // throw waiting on a key nothing can ever complete — a re-activation of
+        // the same handler element gets a NEW key and retires nothing. There is
+        // no binding-replacement event to re-point the wait at, so fail closed
+        // (the modification is validated completely before anything is emitted,
+        // so this rejection is atomic). The check sits on the final termination
+        // list, so it covers by-key and by-id instructions alike — and a handler
+        // inside a sub-process being terminated goes with it, which the
+        // descendant check below covers.
+        let bound_to_wait = |eik: Key| {
+            instance
+                .compensation_waits
+                .values()
+                .any(|w| w.pending_handler_keys.contains(&eik))
+        };
+        if let Some(&eik) = terminations.iter().find(|&&eik| {
+            bound_to_wait(eik)
+                || self
+                    .scope_descendants(instance_key, eik)
+                    .iter()
+                    .any(|&d| bound_to_wait(d))
+        }) {
+            return Err(invalid(
+                instance_key,
+                &process_id,
+                format!(
+                    "a terminate instruction for element instance '{eik}', which is (or \
+                     contains) a compensation handler a compensation throw event is still \
+                     waiting on: terminating it would leave the throw waiting forever"
+                ),
+            ));
+        }
+
         // An activation may not land in a flow-scope instance this command
         // terminates (Zeebe `ERROR_MESSAGE_ACTIVATION_FLOW_SCOPE_TERMINATED`).
         for planned in &activations {

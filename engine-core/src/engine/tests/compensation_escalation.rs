@@ -1072,3 +1072,210 @@ fn legacy_unbound_wait_completes_when_its_handlers_finish() {
     );
     assert!(engine.is_completed(instance_key));
 }
+
+/// One throw waiting on TWO handlers of the same element id, keyed by handler
+/// element-instance key (#897): completing them in REVERSE activation order
+/// must retire exactly the completed instance's key each time — the throw stays
+/// parked on the still-running handler after the first completion and drains
+/// only after the second. (The two-throw test exercises one handler per wait;
+/// the legacy test clears the keys; this is the keyed single-throw case.)
+#[test]
+fn single_throw_with_two_keyed_handlers_completes_in_reverse_order() {
+    let def = ProcessBuilder::new("comp-two-handlers")
+        .start_event("s")
+        .service_task("bookA", "book-job")
+        .compensation_boundary_event("compA", "bookA", "cancel")
+        .service_task("bookB", "book-job")
+        .compensation_boundary_event("compB", "bookB", "cancel")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .service_task("cancel", "cancel-job")
+        .connect("s", "bookA")
+        .connect("bookA", "bookB")
+        .connect("bookB", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-two-handlers"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    for _ in 0..2 {
+        let job = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+        engine.apply_command(Command::complete_job(job)).unwrap();
+    }
+    let (throw_eik, bound) = {
+        let (throw_eik, wait) = engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .iter()
+            .next()
+            .expect("the throw is waiting on both handlers");
+        assert_eq!(wait.pending_handlers, vec!["cancel".to_string(); 2]);
+        assert_eq!(wait.pending_handler_keys.len(), 2);
+        (*throw_eik, wait.pending_handler_keys.clone())
+    };
+    // The handler jobs' element-instance keys ARE the keys the throw is bound
+    // to; complete them in reverse activation order.
+    let cancel_jobs = engine.activate_jobs("cancel-job", "w", 2, 60_000, 0);
+    assert_eq!(
+        cancel_jobs.len(),
+        2,
+        "one handler instance per subscription"
+    );
+    assert_eq!(
+        cancel_jobs
+            .iter()
+            .map(|j| j.element_instance_key)
+            .collect::<std::collections::BTreeSet<_>>(),
+        bound
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the wait is bound to exactly the two activated handler instances"
+    );
+
+    // First completion (the SECOND-activated handler): exactly its key is
+    // retired; the throw stays parked on the first handler's key.
+    let events = engine
+        .apply_command(Command::complete_job(cancel_jobs[1].key))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationHandlerCompleted {
+            throw_element_instance_key,
+            handler_element_instance_key: Some(k),
+            ..
+        } if *throw_element_instance_key == throw_eik && *k == cancel_jobs[1].element_instance_key
+    )));
+    let wait = &engine.instance(instance_key).unwrap().compensation_waits[&throw_eik];
+    assert_eq!(
+        wait.pending_handler_keys,
+        vec![cancel_jobs[0].element_instance_key],
+        "only the completed handler's key was retired"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == "throw")),
+        "the throw is still waiting on the first handler"
+    );
+
+    // Second completion drains the wait and routes the throw onward.
+    let events = engine
+        .apply_command(Command::complete_job(cancel_jobs[0].key))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
+    )));
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .is_empty()
+    );
+    assert!(engine.is_completed(instance_key));
+}
+
+/// A `ModifyInstance` that terminates (or replaces) a compensation handler a
+/// throw event is still waiting on would leave the throw bound to the
+/// terminated handler's element-instance key forever: the replacement gets a
+/// NEW key, so its completion retires nothing (#897). The modification is
+/// rejected outright — there is no binding-replacement event to re-point the
+/// wait at — and, being validated before anything is emitted, applies nothing.
+#[test]
+fn modify_rejects_terminating_a_handler_a_throw_is_waiting_on() {
+    let def = ProcessBuilder::new("comp-modify")
+        .start_event("s")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("comp", "book", "cancel")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .service_task("cancel", "cancel-job")
+        .connect("s", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-modify"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    engine.apply_command(Command::complete_job(book)).unwrap();
+    let handler = engine.activate_jobs("cancel-job", "w", 1, 60_000, 0)[0].clone();
+    let handler_eik = handler.element_instance_key;
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .values()
+            .any(|w| w.pending_handler_keys == vec![handler_eik])
+    );
+
+    // The replacement attempt: terminate the waiting handler and activate a
+    // fresh one in its place. Rejected — the throw's binding would dangle.
+    let err = engine
+        .apply_command(Command::modify_instance(
+            instance_key,
+            vec![ActivateElementInstruction::new("cancel")],
+            vec![handler_eik],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::ModificationInstructionInvalid { .. }),
+        "terminating a handler a throw waits on is rejected: {err:?}"
+    );
+    // A bare terminate (no replacement) is rejected too, and by-id termination
+    // resolves to the same bound instance, so it is rejected as well.
+    for cmd in [
+        Command::modify_instance(instance_key, vec![], vec![handler_eik]),
+        Command::ModifyInstance {
+            instance_key,
+            activate_instructions: vec![],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec!["cancel".to_string()],
+            move_instructions: vec![],
+        },
+    ] {
+        assert!(
+            matches!(
+                engine.apply_command(cmd),
+                Err(EngineError::ModificationInstructionInvalid { .. })
+            ),
+            "every terminate path that reaches the bound handler is rejected"
+        );
+    }
+
+    // The rejection applied nothing: the handler is still active, the wait is
+    // intact, and completing the handler still drains the throw normally.
+    let inst = engine.instance(instance_key).unwrap();
+    assert_eq!(inst.compensation_waits.len(), 1);
+    assert!(
+        inst.compensation_waits
+            .values()
+            .next()
+            .unwrap()
+            .pending_handler_keys
+            == vec![handler_eik]
+    );
+    engine
+        .apply_command(Command::complete_job(handler.key))
+        .unwrap();
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .is_empty()
+    );
+    assert!(engine.is_completed(instance_key));
+}
