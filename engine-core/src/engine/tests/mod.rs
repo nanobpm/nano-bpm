@@ -60,7 +60,7 @@ fn subprocess_with_input_mapping(output: Vec<crate::model::Mapping>) -> ProcessD
             "sub",
             crate::model::IoMapping {
                 inputs: vec![crate::model::Mapping {
-                    source: "=seed + 1".to_string(),
+                    source: "=assert(seed, seed instance of number) + 1".to_string(),
                     target: "scoped".to_string(),
                 }],
                 outputs: output,
@@ -1133,7 +1133,7 @@ fn adhoc_agent_with_tool_input_mapping() -> ProcessDefinition {
               <bpmn:extensionElements>
                 <zeebe:taskDefinition type="tool" />
                 <zeebe:ioMapping>
-                  <zeebe:input source="=base + 1" target="weighted" />
+                  <zeebe:input source="=assert(base, base instance of number) + 1" target="weighted" />
                 </zeebe:ioMapping>
               </bpmn:extensionElements>
             </bpmn:serviceTask>
@@ -2619,7 +2619,7 @@ fn adhoc_agent_with_failing_output_call_activity_tool() -> Vec<ProcessDefinition
                     propagateAllChildVariables="false"
                     propagateAllParentVariables="false" />
                 <zeebe:ioMapping>
-                  <zeebe:output source="=status + 1" target="toolCallResult" />
+                  <zeebe:output source="=assert(status, status instance of number) + 1" target="toolCallResult" />
                 </zeebe:ioMapping>
               </bpmn:extensionElements>
             </bpmn:callActivity>

@@ -308,11 +308,92 @@ mod tests {
     }
 
     #[test]
-    fn type_errors_are_reported() {
-        let c = ctx(&[("name", Value::Str("ann".into()))]);
-        assert!(eval("name + 1", &c).is_err());
+    fn syntax_errors_are_reported() {
+        let c = ctx(&[]);
         assert!(eval("1 +", &c).is_err());
         assert!(eval("(1 + 2", &c).is_err());
+    }
+
+    /// Defect-class guard for #1392 / #1393 / #1394: an operator applied to
+    /// ill-typed operands is a *suppressed failure* in feel-scala 1.22.1 (the
+    /// version the pinned Zeebe embeds) — the result is `null`, never an
+    /// evaluation error — and a non-boolean `if` condition takes the `else`
+    /// branch. Every expected outcome below was captured from feel-scala 1.22.1
+    /// (`formal/feel-scala/FeelScalaEval.java`), so the table *is* the Zeebe
+    /// oracle for every operator family, not only the fuzzed subset.
+    #[test]
+    fn ill_typed_operators_yield_null_like_feel_scala() {
+        let c = ctx(&[("name", Value::Str("ann".into()))]);
+        let null = Ok(Value::Null);
+        let t = Ok(Value::Bool(true));
+        let f = Ok(Value::Bool(false));
+        let two = Ok(Value::Int(2));
+        let cases: &[(&str, &Result<Value, FeelError>)] = &[
+            // #1392 — arithmetic, unary and comparison type errors → null.
+            ("name + 1", &null),
+            ("1 + true", &null),
+            ("-false", &null),
+            (r#"-"a""#, &null),
+            ("- null", &null),
+            ("not(5)", &null),
+            ("not(5) = 6", &f),
+            (r#""a" * 2"#, &null),
+            (r#"2 ** "a""#, &null),
+            ("2 ** null", &null),
+            (r#""a" - "b""#, &null),
+            (r#"1 / "a""#, &null),
+            ("null + 1", &null),
+            (r#"@"P1D" + 1"#, &null),
+            (r#"date("2020-01-01") + 1"#, &null),
+            (r#"1 < "a""#, &null),
+            ("1 < null", &null),
+            ("null < null", &null),
+            (r#"date("2020-01-01") < 1"#, &null),
+            (r#"1 between "a" and 3"#, &null),
+            ("1 between null and 3", &null),
+            ("null between 1 and 2", &null),
+            (r#""a" in (2..5)"#, &null),
+            (r#"1 in "a""#, &null),
+            ("(1 + true) = null", &t),
+            ("true and 5", &null),
+            ("false and 5", &f),
+            ("5 or true", &t),
+            // #1393 — a non-boolean `if` condition takes the else branch.
+            ("if 5 then 1 else 2", &two),
+            ("if null then 1 else 2", &two),
+            (r#"if "x" then 1 else 2"#, &two),
+            ("if 1 + true then 1 else 2", &two),
+            // #1394 — `=` / `!=` across mismatched non-null types → null.
+            (r#"1 = "1""#, &null),
+            (r#"false = "ab""#, &null),
+            (r#"1 != "a""#, &null),
+            ("1 = true", &null),
+            ("true != 1", &null),
+            ("[1] = 1", &null),
+            ("{a:1} = 1", &null),
+            (r#"date("2020-01-01") = 1"#, &null),
+            // ...while null against a value, and nested mismatches, stay boolean.
+            ("null = 1", &f),
+            ("null != 1", &t),
+            ("null = null", &t),
+            (r#"[1,2] = [1,"a"]"#, &f),
+            (r#"{a:1} = {a:"x"}"#, &f),
+            ("[1] = [1]", &t),
+            // List membership tolerates mismatched items.
+            (r#"1 in [1,"a"]"#, &t),
+            (r#""a" in [1,2]"#, &f),
+            ("5 in null", &f),
+            ("null in [1]", &f),
+            ("1 in 1", &t),
+        ];
+        let mut failures = Vec::new();
+        for (expr, want) in cases {
+            let got = eval(expr, &c);
+            if &got != *want {
+                failures.push(format!("{expr}: got {got:?}, feel-scala {want:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]

@@ -173,7 +173,8 @@ fn multi_instance_child_job_type_failure_raises_incident_on_the_child() {
         .connect("work", "end")
         .build()
         .unwrap();
-    // `item` 7 makes `"w-" + 7` fail to evaluate (string + number).
+    // `item` 7 makes `"w-" + 7` a type error, which feel-scala suppresses to
+    // `null` (#1392) — not a string, so the job type is rejected.
     let (engine, _) = start(
         def,
         "mi-jt",
@@ -182,7 +183,7 @@ fn multi_instance_child_job_type_failure_raises_incident_on_the_child() {
     assert!(engine.pending_jobs().is_empty());
     let incident = extract_value_incident(&engine, "work");
     assert!(
-        incident.reason.contains("Expected to evaluate expression"),
+        incident.reason.contains("to be 'STRING', but was 'NULL'"),
         "{}",
         incident.reason
     );
@@ -386,7 +387,7 @@ fn input_mapping_failure_parks_the_element_in_activating() {
     <bpmn:serviceTask id="work">
       <bpmn:extensionElements>
         <zeebe:taskDefinition type="w"/>
-        <zeebe:ioMapping><zeebe:input source="=missing.x + 1" target="y"/></zeebe:ioMapping>
+        <zeebe:ioMapping><zeebe:input source="=assert(missing.x, missing.x != null) + 1" target="y"/></zeebe:ioMapping>
       </bpmn:extensionElements>
     </bpmn:serviceTask>
     <bpmn:endEvent id="end"/>

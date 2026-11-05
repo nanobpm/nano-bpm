@@ -195,14 +195,13 @@ impl Engine {
         }
     }
 
-    /// Like [`Self::eval_io_mappings_in`], but *tolerates* a mapping whose source
-    /// references any name in `tolerated` when it fails to evaluate — that mapping
-    /// is skipped rather than raising a failure. Used at the multi-instance
+    /// Like [`Self::eval_io_mappings_in`], but *skips* a mapping whose source
+    /// references a name in `tolerated` that is absent from `vars` — that mapping
+    /// is not evaluated at all. Used at the multi-instance
     /// **body** level, where the activity's own mappings legitimately reference
     /// per-child bindings (`loopCounter` / the configured `inputElement`) that do
     /// not exist until a child is instantiated: those are authoritatively applied
-    /// (and their failures raised) per child. A mapping that fails **without**
-    /// referencing a tolerated binding is a *genuine* failure and is returned as
+    /// (and their failures raised) per child. Any other mapping that fails is a *genuine* failure and is returned as
     /// `Err`, so the body raises an `IO_MAPPING_ERROR` incident rather than
     /// silently projecting an empty result (#946).
     pub(crate) fn eval_io_mappings_tolerating(
@@ -213,15 +212,22 @@ impl Engine {
     ) -> Result<HashMap<String, Value>, IoMappingFailure> {
         let mut result: HashMap<String, Value> = HashMap::new();
         for m in mappings {
+            // A mapping that reads a per-child binding absent at the body level is
+            // skipped up front; the per-child pass applies it authoritatively.
+            // Decided from the references, not from an evaluation failure: an
+            // ill-typed FEEL operation on the absent (null) binding is a
+            // suppressed failure yielding `null`, not an error (#1392), so a
+            // failure-based check would project that `null` into the parent.
+            let refs = crate::feel::referenced_variables(m.source.trim());
+            if refs
+                .iter()
+                .any(|r| tolerated.contains(r) && !vars.contains_key(r))
+            {
+                continue;
+            }
             match Self::eval_io_mapping_source(&m.source, vars) {
                 Ok(value) => Self::assign_io_target(&mut result, vars, &m.target, value),
                 Err(err) => {
-                    let refs = crate::feel::referenced_variables(m.source.trim());
-                    if refs.iter().any(|r| tolerated.contains(r)) {
-                        // An expected per-child-binding failure at the body level:
-                        // skip it; the per-child pass applies it authoritatively.
-                        continue;
-                    }
                     return Err(IoMappingFailure {
                         reason: format!(
                             "failed to evaluate io mapping source '{}' for target '{}': {}",

@@ -1315,7 +1315,7 @@ fn migration_defers_boundary_arming_for_input_mapping_incident() {
                 "a",
                 crate::model::IoMapping {
                     inputs: vec![crate::model::Mapping {
-                        source: "=\"x\" + missingVar".to_string(),
+                        source: "=\"x\" + assert(missingVar, missingVar != null)".to_string(),
                         target: "y".to_string(),
                     }],
                     outputs: Vec::new(),

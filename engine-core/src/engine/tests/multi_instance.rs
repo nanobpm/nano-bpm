@@ -363,7 +363,7 @@ fn multi_instance_child_input_mapping_failure_raises_io_mapping_and_reactivates(
                 // References the per-child binding `item` (tolerated at the body
                 // level) and the root `factor` (a string ⇒ per-child eval fails).
                 inputs: vec![crate::model::Mapping {
-                    source: "=factor + item".to_string(),
+                    source: "=assert(factor, factor instance of number) + item".to_string(),
                     target: "weighted".to_string(),
                 }],
                 outputs: Vec::new(),

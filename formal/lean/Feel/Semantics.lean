@@ -9,17 +9,20 @@ Rust `engine-core::feel` evaluator (`engine-core/src/feel/eval.rs`) rule for
 rule. The correspondences the differential fuzz pins:
 
 * arithmetic `+ - * /` over numbers; `+` also concatenates strings; every other
-  operand pairing is a type error;
+  operand pairing is a type error, which — as in feel-scala, the FEEL engine
+  Zeebe embeds — is a *suppressed failure* yielding `null`, never an
+  evaluation error (#1392);
 * division by zero yields `null` (not an error);
-* `= !=` use FEEL equality (numbers by value, then structural; cross-type is
-  `false`, never an error); `< <= > >=` are defined only for two numbers or two
-  strings and are a type error otherwise;
+* `= !=` use FEEL equality (numbers by value, then structural); `null` against
+  any value is a boolean, but two non-null values of different types yield
+  `null` (#1394); `< <= > >=` are defined only for two numbers or two strings
+  and yield `null` otherwise;
 * `and`/`or` are three-valued **and short-circuit**, so an error in the
   right operand is masked once the left operand already decides the result
   (`false and (1 + true)` is `false`, not an error);
-* `not` maps `null` to `null`; unary `-` and `not` on a wrong type are errors;
-* `if` with a non-boolean (including `null`) condition yields `null`, while an
-  *error* in the condition propagates;
+* `not` maps `null` to `null`; unary `-` and `not` on a wrong type yield `null`;
+* `if` with a non-boolean (including `null`) condition takes the `else` branch
+  (#1393);
 * an unbound variable is `null` (the generator never uses builtin names, for
   which the Rust engine would instead yield a function value).
 -/
@@ -50,8 +53,9 @@ def strCompare (a b : String) : Ordering :=
       | o => o
   go a.toList b.toList
 
-/-- FEEL equality: numbers by value, then structural equality per type;
-cross-type comparisons are `false` and never an error. -/
+/-- FEEL equality: numbers by value, then structural equality per type. Only
+reached by `evalBin` for same-type or `null`-involving pairs; a cross-type pair
+here is `false`. -/
 def feelEq : Val → Val → Bool
   | .num a, .num b => a == b
   | .str a, .str b => a == b
@@ -60,7 +64,7 @@ def feelEq : Val → Val → Bool
   | _, _ => false
 
 /-- Total order on comparable pairs (two numbers or two strings); `none` marks
-an incomparable pair, which the caller turns into a type error. -/
+an incomparable pair, which the caller turns into `null`. -/
 def cmpVals : Val → Val → Option Ordering
   | .num a, .num b => some (compare a b)
   | .str a, .str b => some (strCompare a b)
@@ -87,30 +91,49 @@ def ternaryOr (l r : Val) : Outcome :=
   | some false, some false => .ok (.bool false)
   | _, _ => .ok .null
 
-/-- Applies a comparison predicate to two values, erroring on an incomparable
-pair. -/
+/-- Applies a comparison predicate to two values; an incomparable pair is a
+suppressed failure (`null`, #1392). -/
 def cmpOp (l r : Val) (f : Ordering → Bool) : Outcome :=
   match cmpVals l r with
   | some o => .ok (.bool (f o))
-  | none => .err
+  | none => .ok .null
+
+/-- The FEEL type of a value, for the `=` / `!=` type check. -/
+def Val.typeTag : Val → Nat
+  | .null => 0
+  | .bool _ => 1
+  | .num _ => 2
+  | .str _ => 3
+
+/-- The `=` operator: `null` against anything is a boolean; two non-null values
+of different types are a suppressed failure (`null`, #1394). -/
+def eqOp (l r : Val) : Val :=
+  if l == .null || r == .null || l.typeTag == r.typeTag then .bool (feelEq l r)
+  else .null
+
+/-- `!=`: the negation of `eqOp`, keeping its `null`. -/
+def neOp (l r : Val) : Val :=
+  match eqOp l r with
+  | .bool b => .bool (!b)
+  | v => v
 
 /-- Evaluates a non-short-circuiting binary operator on two values. -/
 def evalBin : BinOp → Val → Val → Outcome
   | .add, .num a, .num b => .ok (.num (a + b))
   | .add, .str a, .str b => .ok (.str (a ++ b))
-  | .add, _, _ => .err
+  | .add, _, _ => .ok .null
   | .sub, .num a, .num b => .ok (.num (a - b))
-  | .sub, _, _ => .err
+  | .sub, _, _ => .ok .null
   | .mul, .num a, .num b => .ok (.num (a * b))
-  | .mul, _, _ => .err
+  | .mul, _, _ => .ok .null
   | .div, .num a, .num b => if b == 0 then .ok .null else .ok (.num (a / b))
-  | .div, _, _ => .err
+  | .div, _, _ => .ok .null
   | .lt, a, b => cmpOp a b (· == .lt)
   | .le, a, b => cmpOp a b (· != .gt)
   | .gt, a, b => cmpOp a b (· == .gt)
   | .ge, a, b => cmpOp a b (· != .lt)
-  | .eq, a, b => .ok (.bool (feelEq a b))
-  | .ne, a, b => .ok (.bool (!feelEq a b))
+  | .eq, a, b => .ok (eqOp a b)
+  | .ne, a, b => .ok (neOp a b)
   -- `and`/`or` short-circuit, so they are handled in `eval` and never reach here.
   | .and, _, _ => .err
   | .or, _, _ => .err
@@ -126,20 +149,18 @@ def eval (ctx : Ctx) : Expr → Outcome
   | .neg e =>
     match eval ctx e with
     | .ok (.num n) => .ok (.num (-n))
-    | .ok _ => .err
+    | .ok _ => .ok .null
     | .err => .err
   | .lnot e =>
     match eval ctx e with
     | .ok (.bool b) => .ok (.bool (!b))
-    | .ok .null => .ok .null
-    | .ok _ => .err
+    | .ok _ => .ok .null
     | .err => .err
   | .cond c t e =>
     match eval ctx c with
     | .err => .err
     | .ok (.bool true) => eval ctx t
-    | .ok (.bool false) => eval ctx e
-    | .ok _ => .ok .null
+    | .ok _ => eval ctx e
   | .bin .and l r =>
     match eval ctx l with
     | .err => .err
