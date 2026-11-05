@@ -8433,6 +8433,15 @@ impl Engine {
                 element_id: element_id.clone(),
             },
         ];
+        // #901: a completing multi-instance sub-process CHILD is a flow scope
+        // like any other — it records its own scope subscription (recorded in
+        // the body's scope) so a later whole-scope throw reaches the
+        // subscriptions nested inside it.
+        if let Some(scope_sub) =
+            self.scope_subscription_event(instance_key, child_eik, &element_id, body_key)
+        {
+            events.push(scope_sub);
+        }
 
         // Snapshot the loop configuration and this child's index before evaluating.
         let (
@@ -8882,6 +8891,12 @@ impl Engine {
             instance_key,
             body_key,
         });
+        // #901: the body records its scope subscription over its children's.
+        if let Some(scope_sub) =
+            self.scope_subscription_event(instance_key, body_key, &element_id, scope)
+        {
+            events.push(scope_sub);
+        }
         // Output mappings likewise propagate their projected result to the parent
         // (flow) scope.
         if !output_updates.is_empty() {
@@ -8941,6 +8956,12 @@ impl Engine {
                 body_key,
             },
         ];
+        // #901: as in `complete_multi_instance_body`.
+        if let Some(scope_sub) =
+            self.scope_subscription_event(instance_key, body_key, &element_id, scope)
+        {
+            events.push(scope_sub);
+        }
         // A multi-instance COMPENSATION HANDLER body completes back to the throw
         // event waiting on it, not along (non-existent) outgoing flows (#897) —
         // mirrors the listener-free tail in `complete_multi_instance_body`. The

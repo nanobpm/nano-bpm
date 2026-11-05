@@ -2014,3 +2014,104 @@ fn scoped_compensation_clear_retires_only_the_torn_down_scope_reference() {
     }
     check(&replayed);
 }
+
+/// Review r4477622238 (#901): a COMPLETED multi-instance sub-process must
+/// record scope subscriptions for each child (in the body's scope) and for the
+/// body (in its own scope), so a later whole-scope throw reaches the handlers
+/// nested inside every child. The MI child / body completion paths bypass the
+/// plain sub-process completion that records them.
+///
+/// ```text
+/// start -> each*[ sub_start -> bookB(svc, comp -> cancelB) -> sub_end ]
+///       -> throw(compensation) -> done
+/// ```
+#[test]
+fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subprocess() {
+    for sequential in [true, false] {
+        let def = ProcessBuilder::new("comp-mi-sub")
+            .start_event("start")
+            .sub_process("each", "sub_start")
+            .with_multi_instance(
+                "each",
+                crate::model::MultiInstance {
+                    input_collection: "=items".to_string(),
+                    input_element: Some("item".to_string()),
+                    output_collection: None,
+                    output_element: None,
+                    completion_condition: None,
+                    sequential,
+                },
+            )
+            .start_event("sub_start")
+            .contained_in("sub_start", "each")
+            .service_task("bookB", "book-b-job")
+            .contained_in("bookB", "each")
+            .compensation_boundary_event("compB", "bookB", "cancelB")
+            .contained_in("compB", "each")
+            .service_task("cancelB", "cancel-b-job")
+            .contained_in("cancelB", "each")
+            .end_event("sub_end")
+            .contained_in("sub_end", "each")
+            .compensation_throw_event("throw")
+            .end_event("done")
+            .connect("start", "each")
+            .connect("sub_start", "bookB")
+            .connect("bookB", "sub_end")
+            .connect("each", "throw")
+            .connect("throw", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let mut items = HashMap::new();
+        items.insert(
+            "items".to_string(),
+            Value::List(vec![Value::Int(1), Value::Int(2)]),
+        );
+        let created = engine
+            .apply_command(Command::create_instance_with("comp-mi-sub", items))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        let activate_all = |engine: &mut Engine, job_type: &str| -> Vec<Key> {
+            engine
+                .activate_jobs(job_type, "test-worker", 10, 60_000, 0)
+                .into_iter()
+                .map(|j| j.key)
+                .collect()
+        };
+        // Sequential children run one at a time, parallel ones together.
+        loop {
+            let jobs = activate_all(&mut engine, "book-b-job");
+            if jobs.is_empty() {
+                break;
+            }
+            for job in jobs {
+                engine.apply_command(Command::complete_job(job)).unwrap();
+            }
+        }
+        assert!(
+            !engine.is_completed(instance_key),
+            "sequential={sequential}: the throw must rest on both nested cancelB handlers"
+        );
+        let handlers = activate_all(&mut engine, "cancel-b-job");
+        assert_eq!(
+            handlers.len(),
+            2,
+            "sequential={sequential}: one cancelB per completed child"
+        );
+        engine
+            .apply_command(Command::complete_job(handlers[0]))
+            .unwrap();
+        assert!(!engine.is_completed(instance_key));
+        engine
+            .apply_command(Command::complete_job(handlers[1]))
+            .unwrap();
+        assert!(engine.is_completed(instance_key), "sequential={sequential}");
+        assert!(engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .is_empty());
+    }
+}
