@@ -1426,3 +1426,425 @@ fn multi_instance_compensation_handler_completion_retires_the_throw_wait() {
     assert!(engine.is_completed(instance_key));
     assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
 }
+
+/// #901 (Zeebe `BpmnCompensationSubscriptionBehaviour.triggerCompensation`): a
+/// compensation throw with no `activityRef` compensates the WHOLE scope it runs
+/// in — every compensable activity recorded in that scope, not only the ones
+/// sitting directly in it. A completed sub-process that contains compensable
+/// activities records its own (handlerless) *scope subscription*; the throw
+/// triggers it and, through it, every subscription nested inside
+/// (`triggerCompensationFromTopToBottom`), running each activity's handler. The
+/// throw rests until every triggered handler has completed.
+///
+/// Topology (mirrors Zeebe's `compensation-embedded-subprocess.bpmn` /
+/// `shouldTriggerCompensationHandlerInSubprocesses`):
+///
+/// ```text
+/// start -> sub[ sub_start -> split =< bookA(svc, comp -> cancelA),
+///                                   sub2[ sub2_start -> bookB(svc, comp -> cancelB) -> sub2_end ] >
+///                join -> sub_end ]
+///       -> throw(compensation) -> done
+/// ```
+// zeebe-cells: event:boundary:compensation event:intermediate-throw:compensation
+#[test]
+fn whole_scope_throw_triggers_handlers_in_nested_subprocesses() {
+    let def = ProcessBuilder::new("comp-whole-scope")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("bookA", "book-a-job")
+        .contained_in("bookA", "sub")
+        .compensation_boundary_event("compA", "bookA", "cancelA")
+        .contained_in("compA", "sub")
+        .service_task("cancelA", "cancel-a-job")
+        .contained_in("cancelA", "sub")
+        .sub_process("sub2", "sub2_start")
+        .contained_in("sub2", "sub")
+        .start_event("sub2_start")
+        .contained_in("sub2_start", "sub2")
+        .service_task("bookB", "book-b-job")
+        .contained_in("bookB", "sub2")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .contained_in("compB", "sub2")
+        .service_task("cancelB", "cancel-b-job")
+        .contained_in("cancelB", "sub2")
+        .end_event("sub2_end")
+        .contained_in("sub2_end", "sub2")
+        .parallel_gateway("join")
+        .contained_in("join", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "bookA")
+        .connect("bookA", "join")
+        .connect("split", "sub2")
+        .connect("sub2_start", "bookB")
+        .connect("bookB", "sub2_end")
+        .connect("sub2", "join")
+        .connect("join", "sub_end")
+        .connect("sub", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-whole-scope"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Complete both compensable activities (bookA in `sub`, bookB in the nested
+    // `sub2`). Each records its subscription in its OWN scope; each enclosing
+    // sub-process that holds a subscription records its own scope subscription
+    // on completion (Zeebe `isFlowScopeWithSubscriptions`). The sub-process
+    // completing routes the token to the throw, which must trigger BOTH
+    // handlers — bookB's nested one included — through the scope subscriptions.
+    complete_one(&mut engine, "book-a-job");
+    assert!(
+        !engine.is_completed(instance_key),
+        "the parallel sibling branch is still running"
+    );
+    let events = complete_one(&mut engine, "book-b-job");
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::CompensationTriggered { throw_element_id, handlers, .. }
+                if throw_element_id == "throw"
+                    && handlers.len() == 2
+                    && handlers.iter().any(|h| h == "cancelA")
+                    && handlers.iter().any(|h| h == "cancelB")
+        )),
+        "the whole-scope throw must trigger BOTH in-scope handlers, including the nested one"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == "throw")),
+        "the throw rests until every triggered handler completes"
+    );
+
+    // Both handler jobs are live; completing only the first must NOT route the
+    // throw onward.
+    let mut cancels = engine.activate_jobs("cancel-a-job", "w", 10, 60_000, 0);
+    cancels.extend(engine.activate_jobs("cancel-b-job", "w", 10, 60_000, 0));
+    assert_eq!(cancels.len(), 2, "one handler job per compensable activity");
+    let events = engine
+        .apply_command(Command::complete_job(cancels[0].key))
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == "throw")),
+        "one handler still outstanding: the throw must keep waiting"
+    );
+
+    // Completing the second handler retires the wait and routes the throw
+    // onward; the instance finishes.
+    let events = engine
+        .apply_command(Command::complete_job(cancels[1].key))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
+    )));
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .is_empty(),
+        "no throw is left waiting once every handler completed"
+    );
+    assert!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensable
+            .is_empty(),
+        "every subscription in the compensated scope was consumed"
+    );
+    assert!(engine.is_completed(instance_key));
+    assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+}
+
+/// #901 ordering: within one scope the handlers run in subscription-creation
+/// order (Zeebe iterates its compensation-subscription column family by record
+/// key — the order the activities completed and recorded their subscriptions) —
+/// and the throw still rests until ALL of them complete.
+///
+/// ```text
+/// start -> bookA(svc, comp -> cancelA) -> bookB(svc, comp -> cancelB)
+///       -> throw(compensation) -> done
+/// ```
+#[test]
+fn whole_scope_throw_runs_handlers_in_creation_order_and_rests_for_all() {
+    let def = ProcessBuilder::new("comp-scope-order")
+        .start_event("s")
+        .service_task("bookA", "book-a-job")
+        .compensation_boundary_event("compA", "bookA", "cancelA")
+        .service_task("cancelA", "cancel-a-job")
+        .service_task("bookB", "book-b-job")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .service_task("cancelB", "cancel-b-job")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("s", "bookA")
+        .connect("bookA", "bookB")
+        .connect("bookB", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-scope-order"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    complete_one(&mut engine, "book-a-job");
+    let events = complete_one(&mut engine, "book-b-job");
+    let triggered = events
+        .iter()
+        .find_map(|e| match e {
+            Event::CompensationTriggered {
+                throw_element_id,
+                handlers,
+                ..
+            } if throw_element_id == "throw" => Some(handlers.clone()),
+            _ => None,
+        })
+        .expect("the throw triggers both handlers");
+    assert_eq!(
+        triggered,
+        vec!["cancelA".to_string(), "cancelB".to_string()],
+        "handlers run in subscription-creation order (Zeebe column-family order)"
+    );
+
+    // Both handler jobs are live at once (the whole scope is triggered, not one
+    // activity per throw): one `cancel-a-job` and one `cancel-b-job`.
+    let cancel_a_jobs = engine.activate_jobs("cancel-a-job", "w", 10, 60_000, 0);
+    assert_eq!(cancel_a_jobs.len(), 1, "cancelA was activated");
+    let cancel_b_jobs = engine.activate_jobs("cancel-b-job", "w", 10, 60_000, 0);
+    assert_eq!(cancel_b_jobs.len(), 1, "cancelB was activated");
+    // The throw rests until BOTH handlers have completed: it has not routed
+    // onward yet, and its wait tracks both outstanding handler instances.
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == "throw")),
+        "the throw rests until every triggered handler completes"
+    );
+    let wait = engine
+        .instance(instance_key)
+        .unwrap()
+        .compensation_waits
+        .values()
+        .next()
+        .expect("the throw is waiting on its handlers")
+        .clone();
+    assert_eq!(wait.pending_handlers.len(), 2);
+
+    // Completing the first (newest) handler alone does not route it onward.
+    let cancel_b = cancel_b_jobs[0].key;
+    let events = engine
+        .apply_command(Command::complete_job(cancel_b))
+        .unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == "throw")),
+        "cancelA is still outstanding: the throw must keep waiting"
+    );
+    assert!(!engine.is_completed(instance_key));
+
+    let cancel_a = cancel_a_jobs[0].key;
+    let events = engine
+        .apply_command(Command::complete_job(cancel_a))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
+    )));
+    assert!(engine.is_completed(instance_key));
+}
+
+/// Defect-class guard for the whole-scope wait (#901): a throw that fans out
+/// into a NESTED scope tracks not just its handler instances but the in-flight
+/// *scope subscriptions* it triggered. A scoped terminate that tears down the
+/// nested scope while the throw is still waiting must retire the throw's whole
+/// wait — otherwise the throw would stay parked on a scope that no longer
+/// exists and the instance would hang `Active` forever.
+///
+/// ```text
+/// start -> split =< sub[ sub_start -> bookB(svc, comp -> cancelB) -> sub_end ],
+///                   killer(svc) -> throw(compensation) -> stop(terminate) >
+/// ```
+/// `bookB` completes (recording its subscription inside `sub`), then the
+/// sibling branch drives the root token into the compensation throw: the throw
+/// triggers `cancelB` THROUGH the sub-process's scope subscription and rests on
+/// it. Cancelling the instance while that handler is still running must not
+/// strand the throw's wait.
+#[test]
+fn terminate_while_a_whole_scope_throw_is_in_flight_leaves_no_wait_behind() {
+    let def = ProcessBuilder::new("comp-throw-terminated")
+        .start_event("start")
+        .parallel_gateway("split")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("bookB", "book-b-job")
+        .contained_in("bookB", "sub")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .contained_in("compB", "sub")
+        .service_task("cancelB", "cancel-b-job")
+        .contained_in("cancelB", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .service_task("killer", "killer-job")
+        .terminate_end_event("stop")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "split")
+        .connect("split", "sub")
+        .connect("sub_start", "bookB")
+        .connect("bookB", "sub_end")
+        .connect("split", "killer")
+        .connect("killer", "throw")
+        .connect("throw", "stop")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-throw-terminated"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Complete the compensable activity inside `sub`: its subscription is
+    // recorded in the sub-process scope, and `sub` records its own scope
+    // subscription when it drains.
+    complete_one(&mut engine, "book-b-job");
+    // The sibling branch drives the root token into the compensation throw:
+    // the throw triggers cancelB THROUGH the sub-process scope subscription and
+    // rests on it.
+    let events = complete_one(&mut engine, "killer-job");
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationTriggered { throw_element_id, handlers, .. }
+            if throw_element_id == "throw" && handlers == &vec!["cancelB".to_string()]
+    )));
+    assert!(
+        !engine.is_completed(instance_key),
+        "the throw rests on the in-flight handler"
+    );
+
+    // Now cancel the whole instance while the throw is still resting on the
+    // in-flight handler: the in-flight compensation must not strand the wait.
+    let events = engine
+        .apply_command(Command::CancelInstance { instance_key })
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(
+        engine.instance(instance_key).is_none()
+            || engine
+                .instance(instance_key)
+                .unwrap()
+                .compensation_waits
+                .is_empty(),
+        "no compensation wait survives the terminate"
+    );
+}
+
+/// #901 scope isolation (Zeebe `shouldNotTriggerCompensationOnParentScope`): a
+/// throw inside a sub-process scope compensates only THAT scope — the
+/// already-completed compensable activity in the PARENT scope is untouched and
+/// its handler never runs.
+///
+/// ```text
+/// start -> bookA(svc, comp -> cancelA)          (root scope)
+///       -> sub[ sub_start -> bookB(svc, comp -> cancelB) -> throw(comp) -> sub_end ]
+///       -> done
+/// ```
+#[test]
+fn throw_inside_a_subprocess_compensates_only_its_own_scope() {
+    let def = ProcessBuilder::new("comp-scope-isolation")
+        .start_event("start")
+        .service_task("bookA", "book-a-job")
+        .compensation_boundary_event("compA", "bookA", "cancelA")
+        .service_task("cancelA", "cancel-a-job")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("bookB", "book-b-job")
+        .contained_in("bookB", "sub")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .contained_in("compB", "sub")
+        .service_task("cancelB", "cancel-b-job")
+        .contained_in("cancelB", "sub")
+        .compensation_throw_event("throw")
+        .contained_in("throw", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "bookA")
+        .connect("bookA", "sub")
+        .connect("sub_start", "bookB")
+        .connect("bookB", "throw")
+        .connect("throw", "sub_end")
+        .connect("sub", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-scope-isolation"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    complete_one(&mut engine, "book-a-job");
+    let events = complete_one(&mut engine, "book-b-job");
+    let triggered = events
+        .iter()
+        .find_map(|e| match e {
+            Event::CompensationTriggered {
+                throw_element_id,
+                handlers,
+                ..
+            } if throw_element_id == "throw" => Some(handlers.clone()),
+            _ => None,
+        })
+        .expect("the inner throw fires");
+    assert_eq!(
+        triggered,
+        vec!["cancelB".to_string()],
+        "only the in-scope handler is triggered; the parent-scope activity is not compensable from here"
+    );
+
+    // Completing the inner handler drains the inner throw; the sub-process
+    // drains and completes, and the instance finishes WITHOUT ever activating
+    // cancelA. bookA's subscription is consumed by the sub-process's own
+    // completion (Zeebe deletes a flow scope's subscriptions when the scope
+    // finishes uncompensated) — critically, WITHOUT running its handler.
+    let cancel_b = engine.activate_jobs("cancel-b-job", "w", 1, 60_000, 0)[0].key;
+    let events = engine
+        .apply_command(Command::complete_job(cancel_b))
+        .unwrap();
+    assert!(
+        events.contains(&Event::ProcessInstanceCompleted { instance_key }),
+        "the sub-process completes and the instance finishes"
+    );
+    assert!(
+        engine
+            .activate_jobs("cancel-a-job", "w", 1, 60_000, 0)
+            .is_empty(),
+        "the parent-scope handler never ran"
+    );
+}

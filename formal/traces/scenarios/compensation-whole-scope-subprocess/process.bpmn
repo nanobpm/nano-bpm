@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_comp_whole_scope" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="comp-whole-scope" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:subProcess id="sub">
+      <bpmn:startEvent id="sub_start" />
+      <bpmn:serviceTask id="bookA" name="Book A">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="book-a-job" retries="3" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:boundaryEvent id="compA" attachedToRef="bookA">
+        <bpmn:compensateEventDefinition id="compA-def" />
+      </bpmn:boundaryEvent>
+      <bpmn:serviceTask id="cancelA" name="Cancel A" isForCompensation="true">
+        <bpmn:extensionElements>
+          <zeebe:taskDefinition type="cancel-a-job" retries="3" />
+        </bpmn:extensionElements>
+      </bpmn:serviceTask>
+      <bpmn:subProcess id="sub2">
+        <bpmn:startEvent id="sub2_start" />
+        <bpmn:serviceTask id="bookB" name="Book B">
+          <bpmn:extensionElements>
+            <zeebe:taskDefinition type="book-b-job" retries="3" />
+          </bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:boundaryEvent id="compB" attachedToRef="bookB">
+          <bpmn:compensateEventDefinition id="compB-def" />
+        </bpmn:boundaryEvent>
+        <bpmn:serviceTask id="cancelB" name="Cancel B" isForCompensation="true">
+          <bpmn:extensionElements>
+            <zeebe:taskDefinition type="cancel-b-job" retries="3" />
+          </bpmn:extensionElements>
+        </bpmn:serviceTask>
+        <bpmn:endEvent id="sub2_end" />
+        <bpmn:sequenceFlow id="sf1" sourceRef="sub2_start" targetRef="bookB" />
+        <bpmn:sequenceFlow id="sf2" sourceRef="bookB" targetRef="sub2_end" />
+        <bpmn:association id="assocB" sourceRef="compB" targetRef="cancelB" />
+      </bpmn:subProcess>
+      <bpmn:endEvent id="sub_end" />
+      <bpmn:sequenceFlow id="f1" sourceRef="sub_start" targetRef="bookA" />
+      <bpmn:sequenceFlow id="f2" sourceRef="bookA" targetRef="sub2" />
+      <bpmn:sequenceFlow id="f3" sourceRef="sub2" targetRef="sub_end" />
+      <bpmn:association id="assocA" sourceRef="compA" targetRef="cancelA" />
+    </bpmn:subProcess>
+    <bpmn:intermediateThrowEvent id="throw">
+      <bpmn:compensateEventDefinition id="throw-def" />
+    </bpmn:intermediateThrowEvent>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="g1" sourceRef="start" targetRef="sub" />
+    <bpmn:sequenceFlow id="g2" sourceRef="sub" targetRef="throw" />
+    <bpmn:sequenceFlow id="g3" sourceRef="throw" targetRef="done" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="comp-whole-scope">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="100" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub_di" bpmnElement="sub" isExpanded="true">
+        <dc:Bounds x="200" y="100" width="980" height="500" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub_start_di" bpmnElement="sub_start">
+        <dc:Bounds x="230" y="330" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="bookA_di" bpmnElement="bookA">
+        <dc:Bounds x="330" y="308" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="compA_di" bpmnElement="compA">
+        <dc:Bounds x="360" y="370" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="cancelA_di" bpmnElement="cancelA">
+        <dc:Bounds x="330" y="140" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub2_di" bpmnElement="sub2" isExpanded="true">
+        <dc:Bounds x="500" y="240" width="520" height="320" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub2_start_di" bpmnElement="sub2_start">
+        <dc:Bounds x="530" y="380" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="bookB_di" bpmnElement="bookB">
+        <dc:Bounds x="630" y="358" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="compB_di" bpmnElement="compB">
+        <dc:Bounds x="660" y="420" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="cancelB_di" bpmnElement="cancelB">
+        <dc:Bounds x="630" y="270" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub2_end_di" bpmnElement="sub2_end">
+        <dc:Bounds x="930" y="380" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="sub_end_di" bpmnElement="sub_end">
+        <dc:Bounds x="1080" y="330" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="throw_di" bpmnElement="throw">
+        <dc:Bounds x="1230" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="done_di" bpmnElement="done">
+        <dc:Bounds x="1330" y="300" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="g1_di" bpmnElement="g1">
+        <di:waypoint x="136" y="318" />
+        <di:waypoint x="200" y="318" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="266" y="348" />
+        <di:waypoint x="330" y="348" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="430" y="348" />
+        <di:waypoint x="500" y="398" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="sf1_di" bpmnElement="sf1">
+        <di:waypoint x="566" y="398" />
+        <di:waypoint x="630" y="398" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="sf2_di" bpmnElement="sf2">
+        <di:waypoint x="730" y="398" />
+        <di:waypoint x="930" y="398" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f3_di" bpmnElement="f3">
+        <di:waypoint x="1020" y="398" />
+        <di:waypoint x="1080" y="348" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="g2_di" bpmnElement="g2">
+        <di:waypoint x="1180" y="318" />
+        <di:waypoint x="1230" y="318" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="g3_di" bpmnElement="g3">
+        <di:waypoint x="1266" y="318" />
+        <di:waypoint x="1330" y="318" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

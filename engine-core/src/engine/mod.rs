@@ -5809,6 +5809,17 @@ impl Engine {
                     element_id: element_id.clone(),
                 },
             );
+            // #901: a completing sub-process that holds compensable
+            // subscriptions records its own handlerless scope subscription, so
+            // a later whole-scope throw can fan out into them (Zeebe
+            // `isFlowScopeWithSubscriptions`). Emitted right after
+            // `ElementCompleted`, mirroring where `finalize_completion` records
+            // a leaf activity's boundary subscription.
+            if let Some(scope_sub) =
+                self.scope_subscription_event(instance_key, eik, &element_id, scope)
+            {
+                self.emit(log, scope_sub);
+            }
             // Completing normally disarms any boundary timers/subscriptions on it.
             for event in self.cancel_boundary_timers_on(eik) {
                 self.emit(log, event);
@@ -7465,29 +7476,49 @@ impl Engine {
             // compensable activities in its scope, running each one's handler,
             // and rests until they finish. With nothing to compensate it is a
             // pass-through.
+            //
+            // #901 (Zeebe `BpmnCompensationSubscriptionBehaviour.
+            // triggerCompensation`): a throw with no `activityRef` compensates
+            // the WHOLE scope it runs in. The direct subscriptions of the throw
+            // scope are triggered newest-first; a *scope subscription* among
+            // them (a completed sub-process that holds nested compensable
+            // activities) runs no handler of its own — it fans the trigger out
+            // top-to-bottom into the subscriptions recorded inside ITS scope
+            // (`triggerCompensationFromTopToBottom`), recursively. The throw
+            // rests until every triggered handler instance AND every triggered
+            // scope subscription has drained.
             Some(ElementKind::CompensationThrowEvent) => {
-                let targets = self.compensable_in_scope(instance_key, scope);
-                if targets.is_empty() {
+                // The whole fan-out, computed up front: `(handler element id,
+                // minted handler key)` for every handler to activate and
+                // `scope_subs` for the triggered scope subscriptions, in
+                // trigger order. `consumed` is every subscription the trigger
+                // removes (boundary AND scope subscriptions).
+                let mut handlers: Vec<ElementId> = Vec::new();
+                let mut handler_keys: Vec<Key> = Vec::new();
+                let mut scope_subs: Vec<Key> = Vec::new();
+                let mut consumed: Vec<Key> = Vec::new();
+                self.plan_compensation_fanout(
+                    instance_key,
+                    scope,
+                    &mut handlers,
+                    &mut handler_keys,
+                    &mut scope_subs,
+                    &mut consumed,
+                );
+                if consumed.is_empty() {
                     followups.push(Step::Complete {
                         instance_key,
                         element_instance_key,
                         element_id,
                     });
                 } else {
-                    // Compensate newest-first (reverse completion order). Mint
-                    // each handler's element-instance key NOW and journal it with
-                    // the trigger (#897): the wait binds the throw to the exact
-                    // handler instances it activated, so a handler completion
-                    // later routes back to THIS throw even when another throw in
-                    // the same scope waits on the same handler element id.
-                    let mut handlers = Vec::new();
-                    let mut handler_keys = Vec::new();
-                    let mut consumed = Vec::new();
-                    for target in targets.iter().rev() {
-                        handlers.push(target.handler.clone());
-                        handler_keys.push(self.mint_key());
-                        consumed.push(target.element_instance_key);
-                    }
+                    // Compensate newest-first (reverse completion order). Each
+                    // handler's element-instance key was minted NOW and is
+                    // journaled with the trigger (#897): the wait binds the
+                    // throw to the exact handler instances it activated, so a
+                    // handler completion later routes back to THIS throw even
+                    // when another throw in the same scope waits on the same
+                    // handler element id.
                     events.push(Event::CompensationTriggered {
                         instance_key,
                         throw_element_instance_key: element_instance_key,
@@ -7496,6 +7527,7 @@ impl Engine {
                         handlers: handlers.clone(),
                         consumed,
                         handler_instance_keys: handler_keys.clone(),
+                        scope_subscriptions: scope_subs,
                     });
                     for (handler, handler_key) in handlers.into_iter().zip(handler_keys) {
                         let (handler_events, handler_followups) =
@@ -11557,7 +11589,16 @@ impl Engine {
                 element_id: element_id.clone(),
                 handler,
                 scope,
+                scope_subscription: false,
             });
+        }
+        // #901: a completing sub-process that holds compensable subscriptions
+        // records its own handlerless scope subscription, so a later
+        // whole-scope throw can fan out into them.
+        if let Some(scope_sub) =
+            self.scope_subscription_event(instance_key, element_instance_key, &element_id, scope)
+        {
+            events.push(scope_sub);
         }
 
         // A link intermediate *throw* event has no outgoing sequence flow: it
@@ -11839,7 +11880,16 @@ impl Engine {
                 element_id: element_id.clone(),
                 handler,
                 scope,
+                scope_subscription: false,
             });
+        }
+        // #901: a completing sub-process that holds compensable subscriptions
+        // records its own handlerless scope subscription, so a later
+        // whole-scope throw can fan out into them.
+        if let Some(scope_sub) =
+            self.scope_subscription_event(instance_key, element_instance_key, &element_id, scope)
+        {
+            events.push(scope_sub);
         }
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -12044,6 +12094,13 @@ impl Engine {
     /// `handler_eik` binds the completion to the exact handler instance (#897),
     /// so the reducer retires that instance's outstanding entry — never another
     /// handler's that merely shares the element id.
+    ///
+    /// #901: after the handler retires, any **scope subscription** whose scope
+    /// has now fully drained (no triggered subscription left inside it) is
+    /// completed bottom-to-top (Zeebe
+    /// `completeFlowScopeSubscriptionFromBottomToTop`), which can cascade up
+    /// through enclosing scope subscriptions. The throw completes only when
+    /// both its handler instances AND its scope subscriptions have drained.
     fn resume_compensation_throw(
         &self,
         instance_key: Key,
@@ -12056,21 +12113,61 @@ impl Engine {
             .instances
             .get(&instance_key)
             .and_then(|i| i.compensation_waits.get(&throw_eik));
-        let (throw_element_id, last_handler) = match wait {
+        let (throw_element_id, last_outstanding) = match wait {
             Some(wait) => (
                 wait.throw_element_id.clone(),
-                wait.pending_handlers.len() == 1,
+                // The handler being retired is still counted in
+                // `pending_handlers` (the reducer removes it when the event
+                // below applies), so "last" means: this is the final handler
+                // AND no scope subscription is still outstanding.
+                wait.pending_handlers.len() == 1 && wait.pending_scope_subscriptions.is_empty(),
             ),
             None => return (Vec::new(), Vec::new()),
         };
-        let events = vec![Event::CompensationHandlerCompleted {
+        let mut events = vec![Event::CompensationHandlerCompleted {
             instance_key,
             throw_element_instance_key: throw_eik,
             handler_element_id: handler_element_id.to_string(),
             handler_element_instance_key: Some(handler_eik),
         }];
+        // Bottom-to-top scope-subscription completion (#901): retire every
+        // scope subscription this throw waits on whose nested fan-out has now
+        // fully drained. `CompensationHandlerCompleted` has not applied yet, so
+        // the just-completed handler's subscription is still in `compensable`;
+        // exclude it from the "still in flight" scan.
+        let mut drained = Vec::new();
+        let mut pending_scope_subs = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.compensation_waits.get(&throw_eik))
+            .map(|w| w.pending_scope_subscriptions.clone())
+            .unwrap_or_default();
+        while let Some(scope_sub_key) = pending_scope_subs.pop() {
+            if self.scope_subscription_drained(instance_key, scope_sub_key, handler_eik) {
+                drained.push(scope_sub_key);
+                events.push(Event::CompensationScopeSubscriptionCompleted {
+                    instance_key,
+                    throw_element_instance_key: throw_eik,
+                    scope_subscription_key: scope_sub_key,
+                });
+            }
+        }
+        // The throw completes when this was its last handler AND every scope
+        // subscription it waited on drained (either already, or just now).
+        let all_scope_subs_drained = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.compensation_waits.get(&throw_eik))
+            .map(|w| {
+                w.pending_scope_subscriptions
+                    .iter()
+                    .all(|k| drained.contains(k))
+            })
+            .unwrap_or(true);
         let mut followups = Vec::new();
-        if last_handler {
+        if last_outstanding && all_scope_subs_drained {
             // The throw's outstanding handlers are all done: complete it through
             // the normal completion pipeline (`Step::Complete`), exactly like the
             // nothing-to-compensate pass-through path (see `run_activation_body`).
@@ -12085,6 +12182,27 @@ impl Engine {
             });
         }
         (events, followups)
+    }
+
+    /// Whether the triggered scope subscription `scope_sub_key` (#901) has
+    /// fully drained: no compensable subscription remains inside its scope
+    /// (`compensable` entries whose `scope` is the scope subscription's own
+    /// element instance). `just_completed_handler_eik` is the handler instance
+    /// whose `ElementCompleted` triggered this scan — its subscription is
+    /// still recorded (its `CompensationHandlerCompleted` has not applied
+    /// yet), so it is excluded from the scan.
+    fn scope_subscription_drained(
+        &self,
+        instance_key: Key,
+        scope_sub_key: Key,
+        just_completed_handler_eik: Key,
+    ) -> bool {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return false;
+        };
+        !instance.compensable.iter().any(|c| {
+            c.scope == scope_sub_key && c.element_instance_key != just_completed_handler_eik
+        })
     }
 
     /// Withdraws the losing siblings of an event-based gateway's deferred choice.
@@ -12249,6 +12367,14 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         }];
+        // #901: a completing sub-process that holds compensable subscriptions
+        // records its own handlerless scope subscription (mirrors the
+        // listener-free path in `complete_drained_subprocesses`).
+        if let Some(scope_sub) =
+            self.scope_subscription_event(instance_key, element_instance_key, &element_id, scope)
+        {
+            events.push(scope_sub);
+        }
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);

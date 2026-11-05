@@ -6399,6 +6399,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         | Event::AdHocToolCompleted { .. }
         | Event::AgentHistoryDeduplicated { .. }
         | Event::CompensationHandlerCompleted { .. }
+        | Event::CompensationScopeSubscriptionCompleted { .. }
         | Event::CompensationSubscriptionCreated { .. }
         | Event::CompensationTriggered { .. }
         | Event::DeploymentCreated { .. }

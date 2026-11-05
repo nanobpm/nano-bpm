@@ -47,6 +47,97 @@ impl Engine {
             .collect()
     }
 
+    /// Computes the full fan-out of a whole-scope compensation throw running in
+    /// `scope` (#901, Zeebe `triggerCompensation` +
+    /// `triggerCompensationFromTopToBottom`): the subscriptions recorded
+    /// directly in `scope`, in subscription-creation order (Zeebe iterates its
+    /// subscription column family by record key — creation order), recursing
+    /// through each **scope subscription** into the subscriptions recorded
+    /// inside that sub-process's scope. Appends, in trigger order:
+    ///
+    /// * `handlers` / `handler_keys` — one entry per handler to activate (its
+    ///   element id and the freshly minted element-instance key it will be
+    ///   activated with, #897);
+    /// * `scope_subs` — the compensable element-instance key of each triggered
+    ///   scope subscription (the throw rests on these until the nested fan-out
+    ///   drains, Zeebe `completeFlowScopeSubscriptionFromBottomToTop`);
+    /// * `consumed` — every subscription the trigger removes (boundary and
+    ///   scope subscriptions alike).
+    ///
+    /// A subscription already consumed by an earlier throw is gone from
+    /// `compensable`, so it is never re-triggered (Zeebe's
+    /// `notTriggeredSubscriptions` filter).
+    pub(crate) fn plan_compensation_fanout(
+        &mut self,
+        instance_key: Key,
+        scope: Key,
+        handlers: &mut Vec<ElementId>,
+        handler_keys: &mut Vec<Key>,
+        scope_subs: &mut Vec<Key>,
+        consumed: &mut Vec<Key>,
+    ) {
+        for target in self.compensable_in_scope(instance_key, scope).iter() {
+            consumed.push(target.element_instance_key);
+            if target.scope_subscription {
+                // A completed flow scope: no handler of its own — fan the
+                // trigger out into the subscriptions nested inside it.
+                scope_subs.push(target.element_instance_key);
+                self.plan_compensation_fanout(
+                    instance_key,
+                    target.element_instance_key,
+                    handlers,
+                    handler_keys,
+                    scope_subs,
+                    consumed,
+                );
+            } else {
+                handlers.push(target.handler.clone());
+                handler_keys.push(self.mint_key());
+            }
+        }
+    }
+
+    /// The `CompensationSubscriptionCreated` event a completing **flow scope**
+    /// (an embedded sub-process) records when it holds at least one compensable
+    /// subscription (#901, Zeebe
+    /// `BpmnCompensationSubscriptionBehaviour.isFlowScopeWithSubscriptions`):
+    /// the scope's own handlerless *scope subscription*, so a later whole-scope
+    /// throw can trigger the nested subscriptions through it. `None` for any
+    /// other element, and for a sub-process whose scope holds no subscription
+    /// (nothing to compensate inside it).
+    ///
+    /// `element_instance_key` is the sub-process's own element instance (the
+    /// scope the nested subscriptions are recorded in); `scope` is the scope
+    /// the sub-process itself completed in.
+    pub(crate) fn scope_subscription_event(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Option<Event> {
+        if !self.is_subprocess(instance_key, element_id) {
+            return None;
+        }
+        let instance = self.state.instances.get(&instance_key)?;
+        if instance
+            .compensable
+            .iter()
+            .any(|c| c.scope == element_instance_key)
+        {
+            Some(Event::CompensationSubscriptionCreated {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                handler: String::new(),
+                scope,
+                scope_subscription: true,
+            })
+        } else {
+            None
+        }
+    }
+
     /// If the completing element instance `element_instance_key` is a
     /// compensation handler a compensation throw event is still waiting on,
     /// returns that throw event's element instance key. The match is on the

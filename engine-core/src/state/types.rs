@@ -723,10 +723,20 @@ pub struct CompensationSubscription {
     pub element_instance_key: Key,
     /// The completed activity's element id.
     pub element_id: ElementId,
-    /// The compensation handler activity run to compensate it.
+    /// The compensation handler activity run to compensate it. Empty for a
+    /// **scope subscription** (#901): a completed flow scope (sub-process)
+    /// whose compensation is the fan-out into its nested subscriptions, not a
+    /// handler of its own.
     pub handler: ElementId,
     /// The scope the activity completed in (`0` for the root scope).
     pub scope: Key,
+    /// `true` for a flow-scope subscription (#901): recorded when a sub-process
+    /// that holds at least one compensable subscription completes (Zeebe
+    /// `isFlowScopeWithSubscriptions`), so a whole-scope throw can trigger the
+    /// nested subscriptions through it. `serde(default)` decodes pre-#901
+    /// snapshots as `false` — every pre-#901 subscription was a boundary one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scope_subscription: bool,
 }
 
 /// A compensation throw event's outstanding wait: the handler activities it
@@ -750,6 +760,16 @@ pub struct CompensationWait {
     /// matching, exactly the pre-#897 behaviour for that journal.
     #[cfg_attr(feature = "serde", serde(default))]
     pub pending_handler_keys: Vec<Key>,
+    /// The compensable element-instance keys of the **scope subscriptions**
+    /// (#901) this throw triggered and is still waiting on: completed
+    /// sub-processes whose nested compensation fan-out has not fully drained.
+    /// A scope subscription retires bottom-to-top (Zeebe
+    /// `completeFlowScopeSubscriptionFromBottomToTop`) once every subscription
+    /// inside its scope has completed; the throw completes only when both this
+    /// list and `pending_handlers` are empty. `serde(default)` decodes
+    /// pre-#901 waits with an empty list.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_scope_subscriptions: Vec<Key>,
 }
 
 /// Runtime state of an active multi-instance body (the element instance carrying
