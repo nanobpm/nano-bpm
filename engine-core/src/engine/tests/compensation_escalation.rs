@@ -2175,3 +2175,316 @@ fn whole_scope_throw_honours_an_explicit_subprocess_handler_over_nested_ones() {
     complete_one(&mut engine, "cancel-sub-job");
     assert!(engine.is_completed(instance_key));
 }
+
+/// Review r4477894358 (#901): a completed MULTI-INSTANCE sub-process whose
+/// activity carries its OWN compensation handler must record that explicit
+/// boundary subscription when the BODY completes — the body completion paths
+/// bypass the plain sub-process registration, and `scope_subscription_event`
+/// returns `None` for an explicitly-handled element, so without routing through
+/// `subprocess_compensation_subscriptions` a later whole-scope throw skips the
+/// handler entirely. Covers the listener-free body completion
+/// (`complete_multi_instance_body`), sequential and parallel.
+///
+/// ```text
+/// start -> each*[ sub_start -> bookB(svc) -> sub_end ]  (compSub on `each` -> cancelSub)
+///       -> throw(compensation) -> done
+/// ```
+#[test]
+fn whole_scope_throw_reaches_the_explicit_handler_of_a_completed_multi_instance_subprocess() {
+    for sequential in [true, false] {
+        let def = ProcessBuilder::new("comp-mi-explicit")
+            .start_event("start")
+            .sub_process("each", "sub_start")
+            .with_multi_instance(
+                "each",
+                crate::model::MultiInstance {
+                    input_collection: "=items".to_string(),
+                    input_element: Some("item".to_string()),
+                    output_collection: None,
+                    output_element: None,
+                    completion_condition: None,
+                    sequential,
+                },
+            )
+            .start_event("sub_start")
+            .contained_in("sub_start", "each")
+            .service_task("bookB", "book-b-job")
+            .contained_in("bookB", "each")
+            .end_event("sub_end")
+            .contained_in("sub_end", "each")
+            .compensation_boundary_event("compSub", "each", "cancelSub")
+            .service_task("cancelSub", "cancel-sub-job")
+            .compensation_throw_event("throw")
+            .end_event("done")
+            .connect("start", "each")
+            .connect("sub_start", "bookB")
+            .connect("bookB", "sub_end")
+            .connect("each", "throw")
+            .connect("throw", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "comp-mi-explicit",
+                HashMap::from([(
+                    "items".to_string(),
+                    Value::List(vec![Value::Int(1), Value::Int(2)]),
+                )]),
+            ))
+            .unwrap();
+        let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Run both children to completion; the body then completes and must
+        // record the explicit `cancelSub` boundary subscription (never a
+        // handlerless scope subscription — the explicit handler overrides).
+        loop {
+            let jobs: Vec<Key> = engine
+                .activate_jobs("book-b-job", "test-worker", 10, 60_000, 0)
+                .into_iter()
+                .map(|j| j.key)
+                .collect();
+            if jobs.is_empty() {
+                break;
+            }
+            for job in jobs {
+                engine.apply_command(Command::complete_job(job)).unwrap();
+            }
+        }
+        assert!(
+            !engine.is_completed(instance_key),
+            "sequential={sequential}: the throw must rest on the body's cancelSub handler"
+        );
+        let handlers = engine.activate_jobs("cancel-sub-job", "test-worker", 10, 60_000, 0);
+        assert_eq!(
+            handlers.len(),
+            1,
+            "sequential={sequential}: the explicit handler runs exactly once for the body"
+        );
+        engine
+            .apply_command(Command::complete_job(handlers[0].key))
+            .unwrap();
+        assert!(engine.is_completed(instance_key), "sequential={sequential}");
+        assert!(engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .is_empty());
+    }
+}
+
+/// Review r4477894358 (#901), sibling sweep: a multi-instance CHILD carrying
+/// its own compensation boundary records the explicit handler subscription (in
+/// the body's scope) on completion — never the handlerless scope subscription
+/// alongside it — so a later whole-scope throw runs the child's handler once
+/// per completed child and never fans out into the child's nested handlers.
+///
+/// ```text
+/// start -> each*[ sub_start -> bookB(svc, comp -> cancelB) -> sub_end ]
+///         (compChild on `each` -> cancelChild) -> throw(compensation) -> done
+/// ```
+#[test]
+fn whole_scope_throw_runs_an_explicit_handler_on_each_completed_mi_child() {
+    let def = ProcessBuilder::new("comp-mi-child-explicit")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("bookB", "book-b-job")
+        .contained_in("bookB", "each")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .contained_in("compB", "each")
+        .service_task("cancelB", "cancel-b-job")
+        .contained_in("cancelB", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .compensation_boundary_event("compChild", "each", "cancelChild")
+        .service_task("cancelChild", "cancel-child-job")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("sub_start", "bookB")
+        .connect("bookB", "sub_end")
+        .connect("each", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "comp-mi-child-explicit",
+            HashMap::from([(
+                "items".to_string(),
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+            )]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let children: Vec<Key> = engine
+        .activate_jobs("book-b-job", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .map(|j| j.key)
+        .collect();
+    assert_eq!(children.len(), 2);
+    let mut child_subscriptions = 0usize;
+    let mut scope_subscriptions = 0usize;
+    for job in children {
+        let events = engine.apply_command(Command::complete_job(job)).unwrap();
+        for event in &events {
+            match event {
+                // The child's explicit boundary subscription, recorded in the
+                // BODY's scope — one per completed child.
+                Event::CompensationSubscriptionCreated {
+                    handler,
+                    scope,
+                    scope_subscription: false,
+                    ..
+                } if handler == "cancelChild" && *scope != 0 => child_subscriptions += 1,
+                // The explicit handler overrides the nested ones: no child
+                // ever records a handlerless scope subscription.
+                Event::CompensationSubscriptionCreated {
+                    scope_subscription: true,
+                    ..
+                } => scope_subscriptions += 1,
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        child_subscriptions, 2,
+        "each completed child records its explicit handler subscription"
+    );
+    assert_eq!(scope_subscriptions, 0);
+
+    // The whole-scope throw compensates the body through its OWN explicit
+    // handler exactly once: a scope carrying an explicit handler compensates
+    // only through it (BPMN 2.0 §10.6.5) — the throw never reaches past it
+    // into the children's subscriptions, so neither a second cancelChild nor
+    // the nested cancelB is activated.
+    let handlers = engine.activate_jobs("cancel-child-job", "test-worker", 10, 60_000, 0);
+    assert_eq!(
+        handlers.len(),
+        1,
+        "the body's explicit handler compensates the whole activity once"
+    );
+    assert!(engine
+        .activate_jobs("cancel-b-job", "test-worker", 10, 60_000, 0)
+        .is_empty());
+    engine
+        .apply_command(Command::complete_job(handlers[0].key))
+        .unwrap();
+    assert!(engine.is_completed(instance_key));
+    assert!(engine
+        .instance(instance_key)
+        .unwrap()
+        .compensation_waits
+        .is_empty());
+}
+
+/// Review r4477894358 (#901): the END-LISTENER body completion path
+/// (`finalize_multi_instance_body`) must register the explicit handler the same
+/// way — the body parks in COMPLETING while its `end` chain drains, so the
+/// subscription is journaled only when the deferred completion fires.
+#[test]
+fn whole_scope_throw_reaches_the_explicit_handler_after_the_mi_body_end_listener_drains() {
+    let def = ProcessBuilder::new("comp-mi-explicit-listener")
+        .start_event("start")
+        .sub_process("each", "sub_start")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_listeners(
+            "each",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "mi-audit")],
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "each")
+        .service_task("bookB", "book-b-job")
+        .contained_in("bookB", "each")
+        .end_event("sub_end")
+        .contained_in("sub_end", "each")
+        .compensation_boundary_event("compSub", "each", "cancelSub")
+        .service_task("cancelSub", "cancel-sub-job")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "each")
+        .connect("sub_start", "bookB")
+        .connect("bookB", "sub_end")
+        .connect("each", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "comp-mi-explicit-listener",
+            HashMap::from([(
+                "items".to_string(),
+                Value::List(vec![Value::Int(1), Value::Int(2)]),
+            )]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Activate both children up front: completing the first child re-locks the
+    // sibling's job, so a complete-one/activate-one loop starves the second.
+    let children: Vec<Key> = engine
+        .activate_jobs("book-b-job", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .map(|j| j.key)
+        .collect();
+    assert_eq!(children.len(), 2);
+    for job in children {
+        engine.apply_command(Command::complete_job(job)).unwrap();
+    }
+    // Both children done: the body parks in COMPLETING on its end listener —
+    // the throw has not fired and no handler subscription exists yet.
+    assert!(engine
+        .pending_jobs()
+        .iter()
+        .any(|j| j.job_type == "mi-audit"));
+    assert!(!engine
+        .pending_jobs()
+        .iter()
+        .any(|j| j.job_type == "cancel-sub-job"));
+
+    // Draining the end listener fires the deferred body completion, which must
+    // record the explicit boundary subscription; the throw then activates it.
+    complete_one(&mut engine, "mi-audit");
+    let handler = complete_one(&mut engine, "cancel-sub-job");
+    assert!(handler.iter().any(|e| matches!(
+        e,
+        Event::CompensationHandlerCompleted { handler_element_id, .. }
+            if handler_element_id == "cancelSub"
+    )));
+    assert!(engine.is_completed(instance_key));
+    assert!(engine
+        .instance(instance_key)
+        .unwrap()
+        .compensation_waits
+        .is_empty());
+}
