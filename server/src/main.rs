@@ -9051,6 +9051,7 @@ impl ServerImpl {
                 tags,
                 business_id,
                 target_partition,
+                message_start,
             } => {
                 let command = Command::DispatchStartInstance {
                     process_id: process_id.clone(),
@@ -9058,6 +9059,7 @@ impl ServerImpl {
                     variables: variables.clone(),
                     tags: tags.clone(),
                     business_id: business_id.clone(),
+                    message_start: message_start.clone(),
                 };
                 Some((*target_partition, command))
             }
@@ -12416,7 +12418,8 @@ impl ServerImpl {
     /// `searchCorrelatedMessageSubscriptions`).
     ///
     /// Backed by the `correlated_message_subscriptions` read-model history table,
-    /// materialised from `MessageCorrelated`/`RemoteMessageCorrelation` events for
+    /// materialised from `MessageCorrelated`/`RemoteMessageCorrelation` events
+    /// (and `MessageStartEventCorrelated` for message start events, #1300) for
     /// instance-scoped subscriptions. Process-definition attributes are resolved by
     /// joining each correlation's instance to `process_instances`. Honours the Zeebe
     /// filter, sort and cursor-pagination contract.
@@ -12574,9 +12577,15 @@ impl ServerImpl {
                     correlation_key: types::Nullable::Present(e.correlation_key),
                     correlation_time,
                     element_id: e.element_id,
-                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
-                        e.element_instance_key.to_string(),
-                    )),
+                    // A message-start correlation (#1300) is recorded before its
+                    // start event activates, so it has no element instance (0).
+                    element_instance_key: if e.element_instance_key == 0 {
+                        types::Nullable::Null
+                    } else {
+                        types::Nullable::Present(models::ElementInstanceKey(
+                            e.element_instance_key.to_string(),
+                        ))
+                    },
                     message_key: models::MessageKey(e.message_key.to_string()),
                     message_name: e.message_name,
                     partition_id: e.partition_id,
@@ -28301,6 +28310,76 @@ mod clustered_startup_tests {
             stamped
                 .iter()
                 .any(|(_, b)| b.as_deref() == Some("via-publish"))
+        );
+    }
+
+    /// #1300: a message that starts an instance through a message start event
+    /// is returned by `/correlated-message-subscriptions/search`, with the
+    /// businessId stamped on the created instance (returned and filterable).
+    #[tokio::test]
+    async fn message_start_correlations_are_searchable_with_business_id() {
+        use apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("order-flow")
+            .message_start_event("start", "order-placed")
+            .user_task("review")
+            .end_event("end")
+            .connect("start", "review")
+            .connect("review", "end")
+            .build()
+            .expect("valid message-start process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("order-flow".to_string(), "order.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let publish: models::MessagePublicationRequest =
+            serde_json::from_value(serde_json::json!({
+            "name": "order-placed", "correlationKey": "c-9", "businessId": "biz-9"}))
+            .expect("valid publication");
+        assert!(matches!(
+            server.publish_message_impl(&publish).await.unwrap(),
+            apis::message::PublishMessageResponse::Status200_TheMessageWasPublished(_)
+        ));
+
+        let query: models::CorrelatedMessageSubscriptionSearchQuery =
+            serde_json::from_value(serde_json::json!({"filter": {"businessId": "biz-9"}}))
+                .expect("valid query");
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            let Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(r) = server
+                .search_correlated_message_subscriptions_impl(&Some(query.clone()))
+                .await
+                .unwrap()
+            else {
+                panic!("expected a search result");
+            };
+            items = r.items;
+            if !items.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(items.len(), 1, "the message-start correlation is recorded");
+        let item = &items[0];
+        assert_eq!(item.message_name, "order-placed");
+        assert_eq!(item.element_id, "start");
+        assert_eq!(item.process_definition_id, "order-flow");
+        assert_eq!(
+            item.correlation_key,
+            types::Nullable::Present("c-9".to_string())
+        );
+        assert_eq!(item.element_instance_key, types::Nullable::Null);
+        assert_eq!(
+            item.business_id,
+            nullable_business_id(Some("biz-9".to_string()))
         );
     }
 

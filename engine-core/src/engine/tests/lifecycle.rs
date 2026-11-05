@@ -2736,6 +2736,7 @@ fn dispatch_start_instance_mints_the_instance_locally() {
             variables: vars(&[("amount", Value::Int(9))]),
             tags: Vec::new(),
             business_id: None,
+            message_start: None,
         })
         .unwrap();
 
@@ -7613,4 +7614,95 @@ fn terminate_end_listener_completion_variables_are_not_shadowed_for_later_listen
         vec!["next".to_string()],
         "listener 1 must read listener 0's returned value, not the stale mirrored local"
     );
+}
+
+/// #1300: a message that starts an instance via a message start event is a
+/// correlation (Zeebe records it as a correlated message subscription). The
+/// engine must emit a durable [`Event::MessageStartEventCorrelated`] tying the
+/// message to the created instance, after the instance is created.
+#[test]
+fn message_start_correlation_is_recorded() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let def_key = engine.state().processes["order-flow"].key;
+    let events = engine
+        .apply_command(Command::CorrelateMessage {
+            message_name: "order-placed".into(),
+            correlation_key: "c-1".into(),
+            variables: HashMap::new(),
+            business_id: Some("biz-1".into()),
+        })
+        .unwrap();
+    let message_key = events
+        .iter()
+        .find_map(|e| match e {
+            Event::MessagePublished { message_key, .. } => Some(*message_key),
+            _ => None,
+        })
+        .expect("published");
+    let created_at = events
+        .iter()
+        .position(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+        .expect("instance created");
+    let instance = match &events[created_at] {
+        Event::ProcessInstanceCreated { instance_key, .. } => *instance_key,
+        _ => unreachable!(),
+    };
+    let correlated: Vec<(usize, &Event)> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| matches!(e, Event::MessageStartEventCorrelated { .. }))
+        .collect();
+    assert_eq!(correlated.len(), 1, "exactly one start correlation");
+    let (pos, ev) = correlated[0];
+    assert!(pos > created_at, "recorded after the instance exists");
+    assert_eq!(
+        ev,
+        &Event::MessageStartEventCorrelated {
+            message_key,
+            subscription_key: def_key,
+            process_definition_key: def_key,
+            process_id: "order-flow".into(),
+            instance_key: instance,
+            element_id: "start".into(),
+            message_name: "order-placed".into(),
+            correlation_key: "c-1".into(),
+        }
+    );
+}
+
+/// #1300 (multi-partition): a dispatched message-start instance records the
+/// correlation on the partition that mints the instance.
+#[test]
+fn dispatched_message_start_records_the_correlation_on_the_target() {
+    let mut target = Engine::with_partition(2);
+    target.set_num_partitions(4);
+    target
+        .apply_command(Command::DeployProcess(process_with_message_start()))
+        .unwrap();
+    let fired = target
+        .apply_command(Command::DispatchStartInstance {
+            process_id: "order-flow".into(),
+            start_element_id: "start".into(),
+            variables: HashMap::new(),
+            tags: Vec::new(),
+            business_id: None,
+            message_start: Some(crate::MessageStartCorrelation {
+                message_key: 42,
+                process_definition_key: 7,
+                message_name: "order-placed".into(),
+                correlation_key: "c".into(),
+            }),
+        })
+        .unwrap();
+    assert!(fired.iter().any(|e| matches!(
+        e,
+        Event::MessageStartEventCorrelated {
+            message_key: 42,
+            subscription_key: 7,
+            ..
+        }
+    )));
 }
