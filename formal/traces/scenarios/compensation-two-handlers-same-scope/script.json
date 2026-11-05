@@ -1,0 +1,25 @@
+{
+  "description": "bookA and bookB run sequentially (bookA -> bookB), each registering a compensation subscription on the SAME `cancel` handler element. The compensation throw then activates one handler instance per completed activity — two `cancel` instances bound to the same element id in one scope. Completing the two handler jobs must retire each pending handler by its element-INSTANCE key (#897), never misattribute a completion via element-id matching, and only route the throw onward once BOTH handlers are done.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "comp-two-handler"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "book-job"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "book-job"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "cancel-job"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "cancel-job"
+    }
+  ]
+}
