@@ -1511,6 +1511,18 @@ fn whole_scope_throw_triggers_handlers_in_nested_subprocesses() {
         "the parallel sibling branch is still running"
     );
     let events = complete_one(&mut engine, "book-b-job");
+    // Trigger order is top-to-bottom: [sub, sub2].
+    let scope_subs: Vec<Key> = events
+        .iter()
+        .find_map(|e| match e {
+            Event::CompensationTriggered {
+                scope_subscriptions,
+                ..
+            } => Some(scope_subscriptions.clone()),
+            _ => None,
+        })
+        .expect("the throw fires");
+    assert_eq!(scope_subs.len(), 2, "sub and the nested sub2 are triggered");
     assert!(
         events.iter().any(|e| matches!(
             e,
@@ -1543,12 +1555,37 @@ fn whole_scope_throw_triggers_handlers_in_nested_subprocesses() {
             .any(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == "throw")),
         "one handler still outstanding: the throw must keep waiting"
     );
+    // cancelB (inside sub2, inside sub) is still running, so NEITHER scope
+    // subscription may be reported drained yet (review r4477477377).
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, Event::CompensationScopeSubscriptionCompleted { .. })),
+        "a scope subscription must not complete while a handler inside it is running"
+    );
 
     // Completing the second handler retires the wait and routes the throw
     // onward; the instance finishes.
     let events = engine
         .apply_command(Command::complete_job(cancels[1].key))
         .unwrap();
+    // Bottom-to-top: the innermost scope (sub2) retires before its parent (sub).
+    let retired: Vec<Key> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::CompensationScopeSubscriptionCompleted {
+                scope_subscription_key,
+                ..
+            } => Some(*scope_subscription_key),
+            _ => None,
+        })
+        .collect();
+    let mut expected = scope_subs.clone();
+    expected.reverse();
+    assert_eq!(
+        retired, expected,
+        "scope subscriptions retire bottom-to-top"
+    );
     assert!(events.iter().any(|e| matches!(
         e,
         Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
@@ -1847,4 +1884,133 @@ fn throw_inside_a_subprocess_compensates_only_its_own_scope() {
             .is_empty(),
         "the parent-scope handler never ran"
     );
+}
+
+/// Review r4477477333 (#901): a whole-scope throw whose ONLY handler sits in a
+/// nested sub-process must still resume when that sole handler completes — the
+/// scope subscription drains in the same batch, so the throw completes rather
+/// than being left parked with no wait to resume it.
+///
+/// ```text
+/// start -> sub[ sub_start -> bookB(svc, comp -> cancelB) -> sub_end ]
+///       -> throw(compensation) -> done
+/// ```
+#[test]
+fn whole_scope_throw_resumes_when_its_sole_nested_handler_completes() {
+    let def = ProcessBuilder::new("comp-sole-nested")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("bookB", "book-b-job")
+        .contained_in("bookB", "sub")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .contained_in("compB", "sub")
+        .service_task("cancelB", "cancel-b-job")
+        .contained_in("cancelB", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "bookB")
+        .connect("bookB", "sub_end")
+        .connect("sub", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-sole-nested"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    complete_one(&mut engine, "book-b-job");
+    assert!(
+        !engine.is_completed(instance_key),
+        "the throw rests on cancelB"
+    );
+    let events = complete_one(&mut engine, "cancel-b-job");
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::CompensationScopeSubscriptionCompleted { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "throw" && to == "done"
+    )));
+    assert!(engine.is_completed(instance_key));
+    assert!(engine
+        .instance(instance_key)
+        .unwrap()
+        .compensation_waits
+        .is_empty());
+}
+
+/// Review r4477477412 (#901): `ScopedCompensationCleared` on a SURVIVING
+/// parent wait must drop only the torn-down scope-subscription reference
+/// (keeping its parent alignment), preserve unrelated outstanding work, and
+/// drop a wait it leaves with nothing outstanding. Exercised on the reducer
+/// directly (and via replay into a fresh state) — whole-instance cancel clears
+/// every wait regardless, so it cannot witness this path.
+#[test]
+fn scoped_compensation_clear_retires_only_the_torn_down_scope_reference() {
+    let def = ProcessBuilder::new("p")
+        .start_event("s")
+        .service_task("work", "work-job")
+        .end_event("e")
+        .connect("s", "work")
+        .connect("work", "e")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let out = engine.apply_command(Command::create_instance("p")).unwrap();
+    let instance_key = out.iter().find_map(|e| e.instance_key()).unwrap();
+    let mut state = engine.state.clone();
+    let created = engine.state.clone();
+    assert!(state.instances.contains_key(&instance_key));
+    let trigger = |throw: Key, handlers: Vec<&str>, keys: Vec<Key>, subs: Vec<Key>| {
+        Event::CompensationTriggered {
+            instance_key,
+            throw_element_instance_key: throw,
+            throw_element_id: format!("throw{throw}"),
+            scope: 0,
+            handlers: handlers.into_iter().map(String::from).collect(),
+            consumed: vec![],
+            handler_scopes: vec![0; keys.len()],
+            handler_instance_keys: keys,
+            scope_subscription_parents: vec![0; subs.len()],
+            scope_subscriptions: subs,
+        }
+    };
+    // Wait 10: rests on a handler AND scope subs 50 (torn down) + 60 (kept).
+    // Wait 20: rests ONLY on scope sub 50 (torn down) -> emptied -> dropped.
+    let journal = vec![
+        trigger(10, vec!["h"], vec![11], vec![50, 60]),
+        trigger(20, vec![], vec![], vec![50]),
+        Event::ScopedCompensationCleared {
+            instance_key,
+            scopes: vec![50],
+        },
+    ];
+    for event in &journal {
+        crate::state::apply(&mut state, event);
+    }
+    let check = |state: &State| {
+        let waits = &state.instances[&instance_key].compensation_waits;
+        assert!(!waits.contains_key(&20), "an emptied wait is dropped");
+        let w = waits.get(&10).expect("the surviving wait is kept");
+        assert_eq!(w.pending_scope_subscriptions, vec![60]);
+        assert_eq!(w.pending_scope_subscription_parents, vec![0]);
+        assert_eq!(w.pending_handlers, vec!["h".to_string()]);
+        assert_eq!(w.pending_handler_keys, vec![11]);
+    };
+    check(&state);
+    // Replay parity: the same journal over the pre-trigger state again.
+    let mut replayed = created;
+    for event in &journal {
+        crate::state::apply(&mut replayed, event);
+    }
+    check(&replayed);
 }

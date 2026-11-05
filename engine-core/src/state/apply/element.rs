@@ -205,6 +205,8 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             consumed,
             handler_instance_keys,
             scope_subscriptions,
+            handler_scopes,
+            scope_subscription_parents,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance
@@ -218,6 +220,8 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                         pending_handlers: handlers.clone(),
                         pending_handler_keys: handler_instance_keys.clone(),
                         pending_scope_subscriptions: scope_subscriptions.clone(),
+                        pending_handler_scopes: handler_scopes.clone(),
+                        pending_scope_subscription_parents: scope_subscription_parents.clone(),
                     },
                 );
             }
@@ -255,6 +259,9 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                         if pos < wait.pending_handler_keys.len() {
                             wait.pending_handler_keys.remove(pos);
                         }
+                        if pos < wait.pending_handler_scopes.len() {
+                            wait.pending_handler_scopes.remove(pos);
+                        }
                     }
                     wait.pending_handlers.is_empty() && wait.pending_scope_subscriptions.is_empty()
                 } else {
@@ -289,6 +296,9 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                         .position(|k| k == scope_subscription_key)
                     {
                         wait.pending_scope_subscriptions.remove(pos);
+                        if pos < wait.pending_scope_subscription_parents.len() {
+                            wait.pending_scope_subscription_parents.remove(pos);
+                        }
                     }
                     wait.pending_handlers.is_empty() && wait.pending_scope_subscriptions.is_empty()
                 } else {
@@ -329,8 +339,20 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 // waits, then drop any wait left with nothing outstanding.
                 let mut emptied = Vec::new();
                 for (throw_eik, wait) in instance.compensation_waits.iter_mut() {
-                    wait.pending_scope_subscriptions
-                        .retain(|k| !scope_set.contains(k));
+                    // Keep the parent list positionally aligned (#901).
+                    let aligned = wait.pending_scope_subscription_parents.len()
+                        == wait.pending_scope_subscriptions.len();
+                    let mut i = 0;
+                    while i < wait.pending_scope_subscriptions.len() {
+                        if scope_set.contains(&wait.pending_scope_subscriptions[i]) {
+                            wait.pending_scope_subscriptions.remove(i);
+                            if aligned {
+                                wait.pending_scope_subscription_parents.remove(i);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
                     if wait.pending_handlers.is_empty()
                         && wait.pending_scope_subscriptions.is_empty()
                     {

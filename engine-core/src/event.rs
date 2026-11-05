@@ -1273,6 +1273,17 @@ pub enum Event {
         handler_instance_keys: Vec<Key>,
         #[cfg_attr(feature = "serde", serde(default))]
         scope_subscriptions: Vec<Key>,
+        /// Aligned with `handler_instance_keys` (#901): the scope each
+        /// triggered handler's subscription was recorded in — the durable
+        /// handler -> scope relationship that decides when an enclosing scope
+        /// subscription has drained. Additive (`serde(default)`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        handler_scopes: Vec<Key>,
+        /// Aligned with `scope_subscriptions` (#901): the scope each triggered
+        /// scope subscription was recorded in (its parent scope subscription,
+        /// or the throw's scope). Additive (`serde(default)`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope_subscription_parents: Vec<Key>,
     },
     /// One compensation handler triggered by a compensation throw event
     /// completed. Removes the handler from the throw's outstanding set; when it
@@ -1967,6 +1978,8 @@ impl Event {
                 consumed,
                 handler_instance_keys,
                 scope_subscriptions,
+                handler_scopes,
+                scope_subscription_parents,
                 ..
             } => {
                 m = m.max(*throw_element_instance_key).max(*scope);
@@ -1974,6 +1987,8 @@ impl Event {
                     .iter()
                     .chain(handler_instance_keys)
                     .chain(scope_subscriptions)
+                    .chain(handler_scopes)
+                    .chain(scope_subscription_parents)
                 {
                     m = m.max(*key);
                 }

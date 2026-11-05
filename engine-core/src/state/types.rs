@@ -770,6 +770,18 @@ pub struct CompensationWait {
     /// pre-#901 waits with an empty list.
     #[cfg_attr(feature = "serde", serde(default))]
     pub pending_scope_subscriptions: Vec<Key>,
+    /// Positionally aligned with `pending_handler_keys` (#901): the scope each
+    /// outstanding handler's subscription was recorded in. A scope
+    /// subscription is drained only once no outstanding handler sits in its
+    /// scope. `serde(default)` decodes older waits with an empty list.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_handler_scopes: Vec<Key>,
+    /// Positionally aligned with `pending_scope_subscriptions` (#901): the
+    /// scope each outstanding scope subscription was recorded in (its parent),
+    /// so a parent scope drains only after its nested scope subscriptions.
+    /// `serde(default)` decodes older waits with an empty list.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_scope_subscription_parents: Vec<Key>,
 }
 
 /// Runtime state of an active multi-instance body (the element instance carrying

@@ -58,6 +58,12 @@ impl Engine {
     /// * `handlers` / `handler_keys` — one entry per handler to activate (its
     ///   element id and the freshly minted element-instance key it will be
     ///   activated with, #897);
+    /// * `handler_scopes` — aligned with `handler_keys`: the scope each
+    ///   handler's subscription was recorded in (the durable handler -> scope
+    ///   relationship bottom-to-top scope completion needs);
+    /// * `scope_sub_parents` — aligned with `scope_subs`: the scope each scope
+    ///   subscription was recorded in (its enclosing scope subscription, or the
+    ///   throw's own scope);
     /// * `scope_subs` — the compensable element-instance key of each triggered
     ///   scope subscription (the throw rests on these until the nested fan-out
     ///   drains, Zeebe `completeFlowScopeSubscriptionFromBottomToTop`);
@@ -67,13 +73,19 @@ impl Engine {
     /// A subscription already consumed by an earlier throw is gone from
     /// `compensable`, so it is never re-triggered (Zeebe's
     /// `notTriggeredSubscriptions` filter).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "fan-out accumulators, all appended in lock-step"
+    )]
     pub(crate) fn plan_compensation_fanout(
         &mut self,
         instance_key: Key,
         scope: Key,
         handlers: &mut Vec<ElementId>,
         handler_keys: &mut Vec<Key>,
+        handler_scopes: &mut Vec<Key>,
         scope_subs: &mut Vec<Key>,
+        scope_sub_parents: &mut Vec<Key>,
         consumed: &mut Vec<Key>,
     ) {
         for target in self.compensable_in_scope(instance_key, scope).iter() {
@@ -82,17 +94,21 @@ impl Engine {
                 // A completed flow scope: no handler of its own — fan the
                 // trigger out into the subscriptions nested inside it.
                 scope_subs.push(target.element_instance_key);
+                scope_sub_parents.push(scope);
                 self.plan_compensation_fanout(
                     instance_key,
                     target.element_instance_key,
                     handlers,
                     handler_keys,
+                    handler_scopes,
                     scope_subs,
+                    scope_sub_parents,
                     consumed,
                 );
             } else {
                 handlers.push(target.handler.clone());
                 handler_keys.push(self.mint_key());
+                handler_scopes.push(scope);
             }
         }
     }

@@ -7495,14 +7495,18 @@ impl Engine {
                 // removes (boundary AND scope subscriptions).
                 let mut handlers: Vec<ElementId> = Vec::new();
                 let mut handler_keys: Vec<Key> = Vec::new();
+                let mut handler_scopes: Vec<Key> = Vec::new();
                 let mut scope_subs: Vec<Key> = Vec::new();
+                let mut scope_sub_parents: Vec<Key> = Vec::new();
                 let mut consumed: Vec<Key> = Vec::new();
                 self.plan_compensation_fanout(
                     instance_key,
                     scope,
                     &mut handlers,
                     &mut handler_keys,
+                    &mut handler_scopes,
                     &mut scope_subs,
+                    &mut scope_sub_parents,
                     &mut consumed,
                 );
                 if consumed.is_empty() {
@@ -7528,6 +7532,8 @@ impl Engine {
                         consumed,
                         handler_instance_keys: handler_keys.clone(),
                         scope_subscriptions: scope_subs,
+                        handler_scopes,
+                        scope_subscription_parents: scope_sub_parents,
                     });
                     for (handler, handler_key) in handlers.into_iter().zip(handler_keys) {
                         let (handler_events, handler_followups) =
@@ -12108,22 +12114,18 @@ impl Engine {
         throw_eik: Key,
         handler_eik: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let wait = self
+        let Some(wait) = self
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.compensation_waits.get(&throw_eik));
-        let (throw_element_id, last_outstanding) = match wait {
-            Some(wait) => (
-                wait.throw_element_id.clone(),
-                // The handler being retired is still counted in
-                // `pending_handlers` (the reducer removes it when the event
-                // below applies), so "last" means: this is the final handler
-                // AND no scope subscription is still outstanding.
-                wait.pending_handlers.len() == 1 && wait.pending_scope_subscriptions.is_empty(),
-            ),
-            None => return (Vec::new(), Vec::new()),
+            .and_then(|i| i.compensation_waits.get(&throw_eik))
+        else {
+            return (Vec::new(), Vec::new());
         };
+        let throw_element_id = wait.throw_element_id.clone();
+        // The handler being retired is still counted in `pending_handlers`
+        // (the reducer removes it when the event below applies).
+        let last_handler = wait.pending_handlers.len() == 1;
         let mut events = vec![Event::CompensationHandlerCompleted {
             instance_key,
             throw_element_instance_key: throw_eik,
@@ -12132,42 +12134,17 @@ impl Engine {
         }];
         // Bottom-to-top scope-subscription completion (#901): retire every
         // scope subscription this throw waits on whose nested fan-out has now
-        // fully drained. `CompensationHandlerCompleted` has not applied yet, so
-        // the just-completed handler's subscription is still in `compensable`;
-        // exclude it from the "still in flight" scan.
-        let mut drained = Vec::new();
-        let mut pending_scope_subs = self
-            .state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.compensation_waits.get(&throw_eik))
-            .map(|w| w.pending_scope_subscriptions.clone())
-            .unwrap_or_default();
-        while let Some(scope_sub_key) = pending_scope_subs.pop() {
-            if self.scope_subscription_drained(instance_key, scope_sub_key, handler_eik) {
-                drained.push(scope_sub_key);
-                events.push(Event::CompensationScopeSubscriptionCompleted {
-                    instance_key,
-                    throw_element_instance_key: throw_eik,
-                    scope_subscription_key: scope_sub_key,
-                });
-            }
+        // fully drained, then cascade upward through enclosing scopes.
+        let (drained, open) = drain_scope_subscriptions(wait, handler_eik);
+        for scope_sub_key in drained {
+            events.push(Event::CompensationScopeSubscriptionCompleted {
+                instance_key,
+                throw_element_instance_key: throw_eik,
+                scope_subscription_key: scope_sub_key,
+            });
         }
-        // The throw completes when this was its last handler AND every scope
-        // subscription it waited on drained (either already, or just now).
-        let all_scope_subs_drained = self
-            .state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.compensation_waits.get(&throw_eik))
-            .map(|w| {
-                w.pending_scope_subscriptions
-                    .iter()
-                    .all(|k| drained.contains(k))
-            })
-            .unwrap_or(true);
         let mut followups = Vec::new();
-        if last_outstanding && all_scope_subs_drained {
+        if last_handler && open == 0 {
             // The throw's outstanding handlers are all done: complete it through
             // the normal completion pipeline (`Step::Complete`), exactly like the
             // nothing-to-compensate pass-through path (see `run_activation_body`).
@@ -12182,27 +12159,6 @@ impl Engine {
             });
         }
         (events, followups)
-    }
-
-    /// Whether the triggered scope subscription `scope_sub_key` (#901) has
-    /// fully drained: no compensable subscription remains inside its scope
-    /// (`compensable` entries whose `scope` is the scope subscription's own
-    /// element instance). `just_completed_handler_eik` is the handler instance
-    /// whose `ElementCompleted` triggered this scan — its subscription is
-    /// still recorded (its `CompensationHandlerCompleted` has not applied
-    /// yet), so it is excluded from the scan.
-    fn scope_subscription_drained(
-        &self,
-        instance_key: Key,
-        scope_sub_key: Key,
-        just_completed_handler_eik: Key,
-    ) -> bool {
-        let Some(instance) = self.state.instances.get(&instance_key) else {
-            return false;
-        };
-        !instance.compensable.iter().any(|c| {
-            c.scope == scope_sub_key && c.element_instance_key != just_completed_handler_eik
-        })
     }
 
     /// Withdraws the losing siblings of an event-based gateway's deferred choice.
@@ -15863,4 +15819,58 @@ fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Ev
         events.insert(at.min(events.len()), activated);
     }
     events
+}
+
+/// Bottom-to-top scope-subscription drain (#901, Zeebe
+/// `completeFlowScopeSubscriptionFromBottomToTop`) for a compensation wait
+/// whose handler instance `completing_handler_eik` has just completed.
+///
+/// A triggered scope subscription is drained when no still-outstanding handler
+/// was recorded inside its scope AND no still-outstanding scope subscription
+/// is nested directly inside it. This uses the durable handler -> scope and
+/// scope-subscription -> parent relationships journaled on the trigger — NOT
+/// `compensable`, which the trigger already emptied for every consumed
+/// subscription. Retiring an inner scope can make its parent drained, so this
+/// iterates to a fixpoint. Returns the drained keys in bottom-to-top order and
+/// the count of scope subscriptions that remain outstanding.
+fn drain_scope_subscriptions(
+    wait: &crate::state::CompensationWait,
+    completing_handler_eik: Key,
+) -> (Vec<Key>, usize) {
+    // Scopes of the handler instances still outstanding once the completing
+    // one retires. A wait without the aligned binding (pre-#901 journal)
+    // carries no scope subscriptions, so the empty fallback is never consulted.
+    let remaining_handler_scopes: Vec<Key> =
+        if wait.pending_handler_scopes.len() == wait.pending_handler_keys.len() {
+            wait.pending_handler_keys
+                .iter()
+                .zip(&wait.pending_handler_scopes)
+                .filter(|(k, _)| **k != completing_handler_eik)
+                .map(|(_, s)| *s)
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let aligned =
+        wait.pending_scope_subscription_parents.len() == wait.pending_scope_subscriptions.len();
+    let mut open: Vec<(Key, Option<Key>)> = wait
+        .pending_scope_subscriptions
+        .iter()
+        .enumerate()
+        .map(|(i, k)| {
+            let parent = if aligned {
+                Some(wait.pending_scope_subscription_parents[i])
+            } else {
+                None
+            };
+            (*k, parent)
+        })
+        .collect();
+    let mut drained = Vec::new();
+    while let Some(pos) = open.iter().position(|(key, _)| {
+        !remaining_handler_scopes.contains(key) && !open.iter().any(|(_, p)| *p == Some(*key))
+    }) {
+        drained.push(open.remove(pos).0);
+    }
+    (drained, open.len())
 }
