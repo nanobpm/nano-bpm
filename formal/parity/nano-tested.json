@@ -6,7 +6,6 @@
     "element:CallActivity",
     "element:EventBasedGateway",
     "element:ManualTask",
-    "element:ParallelGateway",
     "element:ReceiveTask",
     "element:Task",
     "event:boundary:compensation",

@@ -292,6 +292,16 @@ impl Engine {
             let element_id = self
                 .element_id_of_instance(instance_key, eik)
                 .unwrap_or_default();
+            // A parked join (#1244) never activated and owns no resource: its
+            // waiting tokens just vanish with the scope, writing no
+            // element-instance record (Zeebe has none to terminate).
+            if self.is_parked_join(instance_key, eik) {
+                events.push(Event::ParallelJoinReset {
+                    instance_key,
+                    element_id,
+                });
+                continue;
+            }
             // Terminate any call-activity child process instance parked on this
             // element instance before the parent token is removed — the child is
             // a separate instance `scope_descendants` cannot see, so completing
@@ -1379,6 +1389,18 @@ impl Engine {
         element_instance_key: Key,
         element_id: &str,
     ) {
+        // A parked join (#1244) never activated: drop its waiting tokens
+        // without an element-instance record.
+        if self.is_parked_join(instance_key, element_instance_key) {
+            self.emit(
+                log,
+                Event::ParallelJoinReset {
+                    instance_key,
+                    element_id: element_id.to_string(),
+                },
+            );
+            return;
+        }
         // Any element instance that owns an inner scope — a sub-process, a
         // multi-instance body (its children), an ad-hoc container (its tools) —
         // has that whole scope torn down; a call activity's child process

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_ijpt" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="inclusive-join-pass-through-race" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:parallelGateway id="fork" />
+    <bpmn:exclusiveGateway id="gw1" />
+    <bpmn:exclusiveGateway id="gw2" />
+    <bpmn:inclusiveGateway id="join" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f0" sourceRef="start" targetRef="fork" />
+    <bpmn:sequenceFlow id="direct" sourceRef="fork" targetRef="join" />
+    <bpmn:sequenceFlow id="toGw1" sourceRef="fork" targetRef="gw1" />
+    <bpmn:sequenceFlow id="toGw2" sourceRef="gw1" targetRef="gw2" />
+    <bpmn:sequenceFlow id="chain" sourceRef="gw2" targetRef="join" />
+    <bpmn:sequenceFlow id="out" sourceRef="join" targetRef="end" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="inclusive-join-pass-through-race">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="180" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="fork_di" bpmnElement="fork"><dc:Bounds x="245" y="173" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="gw1_di" bpmnElement="gw1" isMarkerVisible="true"><dc:Bounds x="345" y="263" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="gw2_di" bpmnElement="gw2" isMarkerVisible="true"><dc:Bounds x="445" y="263" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="join_di" bpmnElement="join"><dc:Bounds x="545" y="173" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end"><dc:Bounds x="652" y="180" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f0_di" bpmnElement="f0"><di:waypoint x="196" y="198" /><di:waypoint x="245" y="198" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="direct_di" bpmnElement="direct"><di:waypoint x="295" y="198" /><di:waypoint x="545" y="198" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toGw1_di" bpmnElement="toGw1"><di:waypoint x="270" y="223" /><di:waypoint x="270" y="288" /><di:waypoint x="345" y="288" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toGw2_di" bpmnElement="toGw2"><di:waypoint x="395" y="288" /><di:waypoint x="445" y="288" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="chain_di" bpmnElement="chain"><di:waypoint x="495" y="288" /><di:waypoint x="570" y="288" /><di:waypoint x="570" y="223" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="out_di" bpmnElement="out"><di:waypoint x="595" y="198" /><di:waypoint x="652" y="198" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

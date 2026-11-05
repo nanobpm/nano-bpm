@@ -31,6 +31,8 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 if *scope != 0 {
                     instance.scopes.insert(*element_instance_key, *scope);
                 }
+                // A parked join activating is no longer parked (#1244).
+                instance.parked_joins.remove(element_instance_key);
             }
         }
 
@@ -42,6 +44,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.active.remove(element_instance_key);
                 instance.scopes.remove(element_instance_key);
+                instance.parked_joins.remove(element_instance_key);
                 // Zeebe drops a scope's local variables (an activity's input
                 // mappings, a sub-process's or multi-instance child's locals) when
                 // the element completes. A no-op for elements that never opened a
@@ -78,11 +81,24 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             instance_key,
             element_instance_key,
             element_id,
+            scope,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance
                     .join_instances
                     .insert(element_id.clone(), *element_instance_key);
+                // A parked join (#1244) holds its tokens in its flow scope
+                // without activating: register the key as live, but not as an
+                // activated element instance.
+                if let Some(scope) = scope {
+                    instance
+                        .active
+                        .insert(*element_instance_key, element_id.clone());
+                    if *scope != 0 {
+                        instance.scopes.insert(*element_instance_key, *scope);
+                    }
+                    instance.parked_joins.insert(*element_instance_key);
+                }
             }
         }
 
@@ -110,7 +126,32 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.join_counts.remove(element_id);
                 instance.join_flow_arrivals.remove(element_id);
+                // A reset parked join (#1244) never activated, so its tokens
+                // simply vanish with it: nothing completes or terminates.
+                // Drop EVERY parked key of this element, not just the one
+                // `join_instances` names: migration can merge two waiting
+                // joins onto one target, keeping both keys in `active` but
+                // only one in `join_instances`.
                 instance.join_instances.remove(element_id);
+                let parked: Vec<_> = instance
+                    .parked_joins
+                    .iter()
+                    .copied()
+                    .filter(|eik| instance.active.get(eik) == Some(element_id))
+                    .collect();
+                for eik in parked {
+                    instance.parked_joins.remove(&eik);
+                    instance.active.remove(&eik);
+                    instance.scopes.remove(&eik);
+                    // A modification's seeded join activation opens a
+                    // variable scope on the parked key before the guard
+                    // evaluates; the reset bypasses `ElementCompleted`
+                    // (which drops scopes), so drop them here or the
+                    // seeded locals orphan in `scope_parents` /
+                    // `scope_variables` and leak into snapshots.
+                    instance.scope_parents.remove(&eik);
+                    instance.scope_variables.remove(&eik);
+                }
             }
         }
 

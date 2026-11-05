@@ -101,16 +101,21 @@ fn two_throws_in_one_scope_route_each_handler_completion_to_its_own_throw() {
         .unwrap();
     let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
 
-    // Complete bookA first: throw1 fires with only bookA's subscription in the
-    // scope and rests on its `cancel` handler. Then bookB: throw2 fires with
-    // only bookB's subscription left and rests on its own `cancel` handler.
-    // (One job at a time: `activate_jobs` LOCKS what it returns, so a second
-    // batch at the same logical instant would not see a job locked by the
-    // first.)
-    let book_a = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
-    engine.apply_command(Command::complete_job(book_a)).unwrap();
-    let book_b = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
-    engine.apply_command(Command::complete_job(book_b)).unwrap();
+    // Complete the two book jobs one at a time (`activate_jobs` LOCKS what it
+    // returns, so a second batch at the same logical instant would not see a
+    // job locked by the first). Each completion fires that branch's throw,
+    // which rests on its own `cancel` handler instance. The fork takes its
+    // flows in Zeebe's reverse document order (#1244), so the branch that
+    // activates first is NOT necessarily `bookA` — read back which throw each
+    // completion fired instead of assuming the declaration order.
+    let first_book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::complete_job(first_book))
+        .unwrap();
+    let second_book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    engine
+        .apply_command(Command::complete_job(second_book))
+        .unwrap();
 
     let throw_of = |engine: &Engine, element_id: &str| {
         engine
@@ -122,19 +127,50 @@ fn two_throws_in_one_scope_route_each_handler_completion_to_its_own_throw() {
             .map(|(k, _)| *k)
             .unwrap_or_else(|| panic!("{element_id} is waiting on its `cancel` handler"))
     };
-    let t1 = throw_of(&engine, "throw1");
-    let t2 = throw_of(&engine, "throw2");
 
-    // Complete the two handler jobs in REVERSE activation order: throw2's
-    // handler finishes while throw1's is still running. The completion must
-    // retire throw2 (the throw that activated THAT handler instance) — an
-    // `element_id` + `.min()` lookup instead attributes it to throw1, which
-    // then completes early while its own handler is still running, and throw2
-    // is left waiting on a handler instance that no longer exists.
+    // Complete the two handler jobs in REVERSE activation order: the second
+    // throw's handler finishes while the first throw's is still running. The
+    // completion must retire the throw that activated THAT handler instance —
+    // an `element_id` + `.min()` lookup instead attributes it to the other
+    // throw, which then completes early while its own handler is still
+    // running, and the second throw is left waiting on a handler instance
+    // that no longer exists. Map each handler job to the throw that activated
+    // it through the wait's `pending_handler_keys` (#897), so the scenario
+    // does not depend on which branch the fork happened to activate first.
     let cancel_jobs = engine.activate_jobs("cancel-job", "w", 2, 60_000, 0);
     assert_eq!(cancel_jobs.len(), 2, "one handler instance per throw");
+    let owner_throw_of = |engine: &Engine, handler_instance_key: Key| {
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .compensation_waits
+            .iter()
+            .find(|(_, w)| w.pending_handler_keys.contains(&handler_instance_key))
+            .map(|(k, _)| *k)
+            .unwrap_or_else(|| {
+                panic!("handler instance {handler_instance_key} has an owning throw")
+            })
+    };
+    // `activate_jobs` plans in priority-descending, key-ascending order, so
+    // index 1 is the SECOND-activated handler — completing it first is the
+    // reverse-activation-order race this scenario needs.
+    let first_done = &cancel_jobs[1];
+    let first_throw = owner_throw_of(&engine, first_done.element_instance_key);
+    let first_throw_id = engine.instance(instance_key).unwrap().compensation_waits[&first_throw]
+        .throw_element_id
+        .clone();
+    let second_done = &cancel_jobs[0];
+    let second_throw = owner_throw_of(&engine, second_done.element_instance_key);
+    let second_throw_id = engine.instance(instance_key).unwrap().compensation_waits[&second_throw]
+        .throw_element_id
+        .clone();
+    assert_ne!(
+        first_throw, second_throw,
+        "the two handler jobs belong to the two distinct throws"
+    );
+
     let first = engine
-        .apply_command(Command::complete_job(cancel_jobs[1].key))
+        .apply_command(Command::complete_job(first_done.key))
         .unwrap();
     assert!(
         first.iter().any(|e| matches!(
@@ -143,25 +179,26 @@ fn two_throws_in_one_scope_route_each_handler_completion_to_its_own_throw() {
                 throw_element_instance_key,
                 handler_element_id,
                 ..
-            } if *throw_element_instance_key == t2 && handler_element_id == "cancel"
+            } if *throw_element_instance_key == first_throw && handler_element_id == "cancel"
         )),
-        "throw2's handler completion retires throw2, the throw that activated it"
+        "the completed handler retires the throw that activated it"
     );
     assert!(
         first.iter().any(|e| matches!(
             e,
-            Event::SequenceFlowTaken { from, to, .. } if from == "throw2" && to == "done2"
+            Event::SequenceFlowTaken { from, to, .. }
+                if *from == first_throw_id && to == &format!("done{}", &first_throw_id[5..])
         )),
-        "throw2 routes onward once its own handler is done"
+        "that throw routes onward once its own handler is done"
     );
     assert_eq!(
-        throw_of(&engine, "throw1"),
-        t1,
-        "throw1 is still waiting on its own (still-running) handler"
+        throw_of(&engine, &second_throw_id),
+        second_throw,
+        "the other throw is still waiting on its own (still-running) handler"
     );
 
     let second = engine
-        .apply_command(Command::complete_job(cancel_jobs[0].key))
+        .apply_command(Command::complete_job(second_done.key))
         .unwrap();
     assert!(second.iter().any(|e| matches!(
         e,
@@ -169,7 +206,7 @@ fn two_throws_in_one_scope_route_each_handler_completion_to_its_own_throw() {
             throw_element_instance_key,
             handler_element_id,
             ..
-        } if *throw_element_instance_key == t1 && handler_element_id == "cancel"
+        } if *throw_element_instance_key == second_throw && handler_element_id == "cancel"
     )));
     assert!(
         engine

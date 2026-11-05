@@ -603,7 +603,6 @@
     "rejection:BatchOperationLifecycleManagementResumeProcessor.rejectNotFound:NOT_FOUND",
     "rejection:BatchOperationLifecycleManagementSuspendProcessor.rejectInvalidState:INVALID_STATE",
     "rejection:BatchOperationLifecycleManagementSuspendProcessor.rejectNotFound:NOT_FOUND",
-    "rejection:BpmnStreamProcessor.processRecord:INVALID_STATE",
     "rejection:BpmnUserTaskBehavior.rejectOngoingRequestsForUserTaskBeforeCancellation:INVALID_STATE",
     "rejection:BufferedCommandDrainProcessor.advanceOrWait:INVALID_STATE",
     "rejection:ClockPinProcessor.processNewCommand:INVALID_ARGUMENT",

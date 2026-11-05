@@ -627,7 +627,9 @@ impl<'a> NanoRun<'a> {
                         }
                     }
                 }
-                events.iter().flat_map(|e| self.render(e)).collect()
+                let mut records: Vec<J> = events.iter().flat_map(|e| self.render(e)).collect();
+                records.extend(join_activation_rejections(&events));
+                records
             }
             Err(err) => {
                 let (value_type, intent) = command_of(op);
@@ -1290,6 +1292,36 @@ fn diff(golden: &[J], nano: &[J]) -> Option<String> {
         }
     }
     None
+}
+
+/// The `ACTIVATE_ELEMENT` rejections Zeebe writes at joins during one command.
+/// Zeebe takes a flow into a join by writing an `ACTIVATE_ELEMENT` command, and
+/// `ProcessInstanceStateTransitionGuard` (`canActivateParallelGateway` /
+/// `canActivateInclusiveGateway`) rejects that command with `INVALID_STATE`
+/// while the join is not ready. The arrival that makes the join ready is
+/// accepted and activates it. Nano records every arrival
+/// (`ParallelJoinTokenArrived`) and every firing (`ParallelJoinFired`), so the
+/// rejections are the arrivals that did not fire a join (#1244).
+fn join_activation_rejections(events: &[Event]) -> Vec<J> {
+    let arrivals = events
+        .iter()
+        .filter(|e| matches!(e, Event::ParallelJoinTokenArrived { .. }))
+        .count();
+    let fires = events
+        .iter()
+        .filter(|e| matches!(e, Event::ParallelJoinFired { .. }))
+        .count();
+    (0..arrivals.saturating_sub(fires))
+        .map(|_| {
+            json!({
+                "recordType": "COMMAND_REJECTION",
+                "valueType": "PROCESS_INSTANCE",
+                "intent": "ACTIVATE_ELEMENT",
+                "rejectionType": "INVALID_STATE",
+                "value": {},
+            })
+        })
+        .collect()
 }
 
 /// A step whose `expectRejection` flag does not match the rejection outcome

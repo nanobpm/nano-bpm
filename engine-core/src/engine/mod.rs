@@ -4546,11 +4546,27 @@ impl Engine {
                             .zip(target_flows.iter())
                             .all(|(sf, tf)| same_flow(sf, tf));
                     if !flows_preserved {
+                        // Name the lowest-declared carried flow with no equal
+                        // flow at its index on the target: independent of the
+                        // order the route was journaled in (execution order,
+                        // #1244).
+                        let missing = |i: &usize| {
+                            !source_flows
+                                .get(*i)
+                                .zip(target_flows.get(*i))
+                                .is_some_and(|(sf, tf)| same_flow(sf, tf))
+                        };
+                        let flow_index = carried_flows
+                            .iter()
+                            .copied()
+                            .filter(missing)
+                            .min()
+                            .unwrap_or(carried_flows[0]);
                         return Err(EngineError::MigratedGatewayRouteMissing {
                             instance_key,
                             source_element_id: src.clone(),
                             target_element_id: tgt.clone(),
-                            flow_index: carried_flows[0],
+                            flow_index,
                         });
                     }
                 }
@@ -4824,8 +4840,19 @@ impl Engine {
                 for event in events {
                     self.emit(log, event);
                 }
+                // Zeebe's command semantics: a follow-up *command* goes to the
+                // back of the log, but a gateway completes *inside* its
+                // activation's batch, so its completion runs next (#1244).
+                let mut inline = Vec::new();
                 for f in followups {
-                    queue.push_back(f);
+                    if self.completes_inline(&f) {
+                        inline.push(f);
+                    } else {
+                        queue.push_back(f);
+                    }
+                }
+                for f in inline.into_iter().rev() {
+                    queue.push_front(f);
                 }
                 // Consult the driver with exactly the events this step emitted.
                 if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
@@ -4886,6 +4913,35 @@ impl Engine {
             self.debug_assert_join_bookkeeping_coherent(log);
             return None;
         }
+    }
+
+    /// Whether `step` is a gateway's own completion, which Zeebe runs inline in
+    /// the activation's command batch rather than as a queued
+    /// `COMPLETE_ELEMENT` command: `ExclusiveGatewayProcessor`,
+    /// `ParallelGatewayProcessor` and `InclusiveGatewayProcessor` transition
+    /// `ACTIVATED -> COMPLETING -> COMPLETED` and take their flows in
+    /// `onActivate`, while start, none end and none throw events append
+    /// `COMPLETE_ELEMENT`. So the gateway's outgoing `SEQUENCE_FLOW_TAKEN`
+    /// records exist, and its targets' activations are queued, before any
+    /// other queued step runs; a join guard evaluated in between therefore sees
+    /// the same live paths as Zeebe's (#1244).
+    fn completes_inline(&self, step: &Step) -> bool {
+        let Step::Complete {
+            instance_key,
+            element_id,
+            ..
+        } = step
+        else {
+            return false;
+        };
+        matches!(
+            self.element_kind(*instance_key, element_id),
+            Some(
+                ElementKind::ExclusiveGateway
+                    | ElementKind::ParallelGateway
+                    | ElementKind::InclusiveGateway
+            )
+        )
     }
 
     /// Re-evaluates open conditional-event subscriptions against the variable
@@ -12032,11 +12088,16 @@ impl Engine {
     }
 
     /// Exclusive gateway: take exactly one outgoing flow — the first whose
-    /// condition holds (an unconditional flow is the default). If none qualifies,
-    /// raise an incident and park the token.
+    /// condition holds. If none qualifies, raise an incident and park the token.
     /// Selects the outgoing flow an exclusive gateway takes, evaluating each
-    /// conditional flow in document order against the instance variables and
-    /// falling back to the explicit `default` flow when none matches. Returns the
+    /// conditional flow in execution order
+    /// ([`crate::model::Element::outgoing_in_execution_order`]: reverse document
+    /// order, so of two matching conditions the one declared last wins, as in
+    /// Zeebe's `findSequenceFlowToTake`) against the element's variables. A
+    /// non-default flow **without** a condition is a nano extension (Zeebe
+    /// rejects it at deploy unless it is the gateway's only flow): it is a
+    /// fallback taken only when no condition holds, the first declared one
+    /// first, ahead of the explicit `default` flow. Returns the
     /// chosen flow's index in the outgoing list, or the [`RoutingFailure`] (no
     /// match and no default, or a condition that failed to evaluate) the caller
     /// raises as an incident via [`Engine::routing_incident`].
@@ -12062,20 +12123,18 @@ impl Engine {
             }
         };
         let mut default_flow = None;
-        for (index, flow) in self
-            .outgoing(instance_key, element_id)
-            .into_iter()
-            .enumerate()
-        {
+        let mut unconditional = None;
+        for (index, flow) in self.outgoing_in_execution_order(instance_key, element_id) {
             // The explicit `default` flow is a fallback only: it is never taken
-            // by document order, but kept aside in case no conditional flow
-            // matches.
+            // by position, but kept aside in case no conditional flow matches.
             if flow.is_default {
                 default_flow = Some(index);
                 continue;
             }
             match &flow.condition {
-                None => return Ok(index),
+                // Iterating in reverse document order, the last one kept is
+                // the first declared.
+                None => unconditional = Some(index),
                 Some(condition) => match condition.eval(variables) {
                     Ok(true) => return Ok(index),
                     Ok(false) => continue,
@@ -12090,7 +12149,9 @@ impl Engine {
                 },
             }
         }
-        default_flow.ok_or_else(|| RoutingFailure::no_match("exclusive", element_id))
+        unconditional
+            .or(default_flow)
+            .ok_or_else(|| RoutingFailure::no_match("exclusive", element_id))
     }
 
     /// The outgoing-flow selection a split gateway completion must take: the
@@ -12246,11 +12307,9 @@ impl Engine {
         };
         let mut default_flow = None;
         let mut selected = Vec::new();
-        for (index, flow) in self
-            .outgoing(instance_key, element_id)
-            .into_iter()
-            .enumerate()
-        {
+        // Execution order (reverse document order): the order Zeebe evaluates
+        // the conditions in and takes the selected flows in.
+        for (index, flow) in self.outgoing_in_execution_order(instance_key, element_id) {
             if flow.is_default {
                 default_flow = Some(index);
                 continue;
@@ -12518,11 +12577,13 @@ impl Engine {
         )
     }
 
-    /// [`Engine::take_flow`] for every outgoing flow of `from`, in document
-    /// order (a pass-through element or a parallel split).
+    /// [`Engine::take_flow`] for every outgoing flow of `from`, in execution
+    /// order (reverse document order, as Zeebe's `takeOutgoingSequenceFlows`;
+    /// a pass-through element or a parallel split).
     fn take_all_flows(&self, instance_key: Key, from: &str, scope: Key) -> Vec<(Vec<Event>, Step)> {
-        (0..self.outgoing(instance_key, from).len())
-            .map(|index| self.take_flow(instance_key, from, index, scope))
+        self.outgoing_in_execution_order(instance_key, from)
+            .into_iter()
+            .map(|(index, _)| self.take_flow(instance_key, from, index, scope))
             .collect()
     }
 
@@ -12540,8 +12601,9 @@ impl Engine {
     /// An accepted join activates, consumes one token per taken flow and keeps
     /// the surplus (Zeebe's "Tetris principle",
     /// `ProcessInstanceElementActivatingV3Applier`), then completes and routes.
-    /// A rejected activation changes nothing; tokens still counted wait on an
-    /// open join instance, which keeps the process instance alive as Zeebe's
+    /// A rejected activation writes no element-instance record; tokens still
+    /// counted wait on a **parked** join ([`Engine::open_join`], #1244), which
+    /// keeps the flow scope and the process instance alive as Zeebe's
     /// active-sequence-flow count does. The guard runs only here, so a join is
     /// re-evaluated only when another activation reaches it: a surplus nothing
     /// follows, or a competing path that ends elsewhere, strands the waiting
@@ -12597,11 +12659,15 @@ impl Engine {
         }
 
         // The accepted activation takes over the join instance holding the
-        // waiting tokens, or activates a fresh one if none waited.
+        // waiting tokens, or activates a fresh one if none waited. A parked
+        // join (#1244) activates now: this is its first lifecycle record, as
+        // in Zeebe, where only the accepted `ACTIVATE_ELEMENT` creates the join.
+        // A join opened before #1244 already activated visibly.
+        let parked = open.filter(|eik| self.is_parked_join(instance_key, *eik));
         let element_instance_key = match open {
-            Some(eik) => eik,
-            None => {
-                let eik = self.mint_key();
+            Some(eik) if parked.is_none() => eik,
+            _ => {
+                let eik = parked.unwrap_or_else(|| self.mint_key());
                 events.push(Event::ElementActivating {
                     instance_key,
                     element_instance_key: eik,
@@ -12729,8 +12795,18 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// Open a join (parallel or inclusive): a fresh element instance that holds
-    /// its waiting tokens. Returns its key.
+    /// Whether `element_instance_key` is a parked join: one holding waiting
+    /// tokens that has not activated ([`state::ProcessInstance::parked_joins`]).
+    pub(crate) fn is_parked_join(&self, instance_key: Key, element_instance_key: Key) -> bool {
+        self.state
+            .instances
+            .get(&instance_key)
+            .is_some_and(|i| i.parked_joins.contains(&element_instance_key))
+    }
+
+    /// Open a join (parallel or inclusive) on a token that did not make it
+    /// ready: a fresh key, **parked** in `scope`, that holds the waiting tokens
+    /// without activating (#1244). Returns its key.
     fn open_join(
         &mut self,
         instance_key: Key,
@@ -12739,22 +12815,11 @@ impl Engine {
         events: &mut Vec<Event>,
     ) -> Key {
         let eik = self.mint_key();
-        events.push(Event::ElementActivating {
-            instance_key,
-            element_instance_key: eik,
-            element_id: element_id.to_string(),
-            scope,
-        });
-        events.push(Event::ElementActivated {
-            instance_key,
-            element_instance_key: eik,
-            element_id: element_id.to_string(),
-            scope,
-        });
         events.push(Event::ParallelJoinOpened {
             instance_key,
             element_instance_key: eik,
             element_id: element_id.to_string(),
+            scope: Some(scope),
         });
         eik
     }

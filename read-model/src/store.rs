@@ -4078,8 +4078,17 @@ fn project_engine_state(
     }
 
     // 6) Live element instances (all ACTIVE — the engine only tracks open tokens).
+    // A parked join (#1244) is registered in `active` to hold its waiting
+    // tokens but never activated, so it has no element-instance record (Zeebe
+    // rejects the `ACTIVATE_ELEMENT` command): skip it here, or recovery would
+    // resurrect an ACTIVE row the event stream never wrote — and the projector
+    // ignores `ParallelJoinReset`, so the row would stay ACTIVE even after the
+    // join is torn down.
     for inst in state.instances.values() {
         for (eik, element_id) in &inst.active {
+            if inst.parked_joins.contains(eik) {
+                continue;
+            }
             upsert_element_instance(
                 tx,
                 now_ms,
@@ -7918,6 +7927,7 @@ mod definition_xml_tests {
             join_counts: Default::default(),
             join_flow_arrivals: Default::default(),
             join_instances: Default::default(),
+            parked_joins: Default::default(),
             gateway_routes: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
@@ -8185,6 +8195,7 @@ mod definition_xml_tests {
             join_counts: Default::default(),
             join_flow_arrivals: Default::default(),
             join_instances: Default::default(),
+            parked_joins: Default::default(),
             gateway_routes: Default::default(),
             incidents: Vec::new(),
             variables_spilled: false,
@@ -8251,6 +8262,107 @@ mod definition_xml_tests {
         assert_eq!(
             seeded.deadline_ms, None,
             "the retained deadline is already gone from engine state"
+        );
+    }
+
+    /// Defect-class guard (#1244 review): a parked join is registered in the
+    /// engine's `active` set (to hold its waiting tokens) but never activated,
+    /// so it has no element-instance record — Zeebe rejects the unready
+    /// `ACTIVATE_ELEMENT` command. `seed_from_engine_state` must NOT project it
+    /// as an ACTIVE row: the projector ignores `ParallelJoinReset`, so a seeded
+    /// row would stay ACTIVE even after the join is torn down. Drive a real
+    /// engine to a parked join, snapshot-seed, and assert no row exists for the
+    /// parked key — before and after a teardown reseed.
+    #[test]
+    fn seed_from_engine_state_skips_parked_joins() {
+        use nanobpmn_engine_core::{Command, Engine, ProcessBuilder};
+
+        // start -> fork -> {a(ja), b(jb)} -> join(parallel) -> done
+        let def = ProcessBuilder::new("parked-join-seed")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("b", "jb")
+            .parallel_gateway("join")
+            .end_event("done")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "b")
+            .connect("a", "join")
+            .connect("b", "join")
+            .connect("join", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.apply_command(Command::DeployProcess(def)).unwrap();
+        let created = engine
+            .apply_command(Command::create_instance_with(
+                "parked-join-seed".to_string(),
+                Default::default(),
+            ))
+            .unwrap();
+        let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+        // One branch arrives: the join parks (no lifecycle record).
+        let job = engine
+            .activate_jobs("ja", "w", 1, 60_000, 0)
+            .into_iter()
+            .next()
+            .unwrap();
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+        let parked = *engine
+            .state()
+            .instances
+            .get(&inst)
+            .unwrap()
+            .parked_joins
+            .iter()
+            .next()
+            .expect("the join is parked after the first arrival");
+
+        // Snapshot recovery: the parked join must not surface as an
+        // element-instance row.
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(engine.state()).unwrap();
+        assert!(
+            store.element_instance(parked).is_none(),
+            "a parked join has no element-instance record to recover"
+        );
+        assert!(
+            store
+                .element_instances()
+                .iter()
+                .all(|r| r.element_id != "join"),
+            "no ACTIVE row for the join (found {} element-instance rows)",
+            store.element_instances().len()
+        );
+
+        // Tear the join down and reseed: still no row (previously a seeded
+        // ACTIVE row would have survived the reset, which the projector
+        // ignores).
+        engine
+            .apply_command(Command::ModifyInstance {
+                instance_key: inst,
+                activate_instructions: vec![],
+                terminate_instructions: vec![],
+                terminate_element_ids: vec!["join".into()],
+                move_instructions: vec![],
+            })
+            .unwrap();
+        assert!(
+            engine
+                .state()
+                .instances
+                .get(&inst)
+                .unwrap()
+                .parked_joins
+                .is_empty()
+        );
+        store.seed_from_engine_state(engine.state()).unwrap();
+        assert!(
+            store.element_instance(parked).is_none(),
+            "a reset parked join leaves no element-instance row"
         );
     }
 

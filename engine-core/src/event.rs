@@ -500,12 +500,23 @@ pub enum Event {
         to: ElementId,
     },
 
-    /// A parallel-gateway join element instance was opened on the first arriving
-    /// token; subsequent tokens accumulate against it.
+    /// A parallel- or inclusive-gateway join was opened on the first arriving
+    /// token that did not make it ready; later tokens accumulate against it.
+    ///
+    /// Since #1244 the join is **parked** (`scope` is `Some`): its key holds the
+    /// waiting tokens in its flow scope without activating, so no
+    /// `ElementActivating`/`ElementActivated` precedes the join's readiness,
+    /// as in Zeebe, where a not-ready join only rejects the `ACTIVATE_ELEMENT`
+    /// command. A journal written before #1244 has `scope: None` and activated
+    /// the join visibly right before this event.
     ParallelJoinOpened {
         instance_key: Key,
         element_instance_key: Key,
         element_id: ElementId,
+        /// The flow scope the parked join waits in (`0` = process root);
+        /// `None` for a join opened (and activated) before #1244.
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope: Option<Key>,
     },
     /// A token arrived at an open join. `flow` is the incoming sequence flow it
     /// arrived over, so a parallel join can require every incoming flow (not just
