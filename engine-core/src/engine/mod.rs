@@ -5930,7 +5930,7 @@ impl Engine {
             let handler_throw =
                 self.sub_process_handler_throw(instance_key, eik, &element_id, scope);
             if handler_throw.is_none() {
-                for sub in self.subprocess_compensation_subscriptions(
+                for sub in self.completion_compensation_subscriptions(
                     instance_key,
                     eik,
                     &element_id,
@@ -8582,20 +8582,18 @@ impl Engine {
         // like any other — it records its own scope subscription (recorded in
         // the body's scope) so a later whole-scope throw reaches the
         // subscriptions nested inside it. Routed through
-        // `subprocess_compensation_subscriptions` so a child carrying its OWN
+        // `completion_compensation_subscriptions` so a child carrying its OWN
         // compensation boundary records the explicit handler subscription
         // instead — never both, and never neither.
-        // Review r4478383154: unless the owning body IS a compensation handler
-        // a throw is waiting on — then the child is undo work and registers
-        // nothing.
-        if !self.is_within_pending_compensation_handler(instance_key, child_eik) {
-            events.extend(self.subprocess_compensation_subscriptions(
-                instance_key,
-                child_eik,
-                &element_id,
-                body_key,
-            ));
-        }
+        // Review r4478383154: when the owning body IS a compensation handler a
+        // throw is waiting on, the child is undo work and registers nothing
+        // (enforced inside `completion_compensation_subscriptions`).
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            child_eik,
+            &element_id,
+            body_key,
+        ));
 
         // Snapshot the loop configuration and this child's index before evaluating.
         let (
@@ -9073,10 +9071,10 @@ impl Engine {
         // #901: the body records its scope subscription over its children's —
         // or, when the MI activity carries its OWN compensation boundary, its
         // explicit handler subscription instead (never both, never neither:
-        // `subprocess_compensation_subscriptions` is the single source of truth
+        // `completion_compensation_subscriptions` is the single source of truth
         // for that either/or, shared with every other sub-process completion
         // path).
-        events.extend(self.subprocess_compensation_subscriptions(
+        events.extend(self.completion_compensation_subscriptions(
             instance_key,
             body_key,
             &element_id,
@@ -9141,7 +9139,7 @@ impl Engine {
         // #901: as in `complete_multi_instance_body` — explicit handler
         // subscription when the MI activity carries its own compensation
         // boundary, otherwise the handlerless scope subscription.
-        events.extend(self.subprocess_compensation_subscriptions(
+        events.extend(self.completion_compensation_subscriptions(
             instance_key,
             body_key,
             &element_id,
@@ -11780,33 +11778,15 @@ impl Engine {
             events.extend(resume_events);
             return (events, resume_followups);
         }
-        // Review r4478383154: nothing registers when the element completes
-        // INSIDE a compensation handler a throw is waiting on (e.g. the undo
-        // work of a multi-instance handler body) — undo work is not
-        // compensable, so a later throw must never re-trigger it.
-        if !self.is_within_pending_compensation_handler(instance_key, element_instance_key) {
-            for handler in self.compensation_handlers_for(instance_key, &element_id) {
-                events.push(Event::CompensationSubscriptionCreated {
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    handler,
-                    scope,
-                    scope_subscription: false,
-                });
-            }
-            // #901: a completing sub-process that holds compensable
-            // subscriptions records its own handlerless scope subscription, so
-            // a later whole-scope throw can fan out into them.
-            if let Some(scope_sub) = self.scope_subscription_event(
-                instance_key,
-                element_instance_key,
-                &element_id,
-                scope,
-            ) {
-                events.push(scope_sub);
-            }
-        }
+        // #901: compensation registration (explicit boundary subscription, or
+        // a sub-process's scope subscription, and nothing at all for undo work
+        // inside a pending handler) has one canonical home.
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
 
         // A link intermediate *throw* event has no outgoing sequence flow: it
         // hands its token to the matching link *catch* event (same link name,
@@ -12099,33 +12079,15 @@ impl Engine {
                 events,
             );
         }
-        // Review r4478383154: nothing registers when the element completes
-        // INSIDE a compensation handler a throw is waiting on (e.g. the undo
-        // work of a multi-instance handler body) — undo work is not
-        // compensable, so a later throw must never re-trigger it.
-        if !self.is_within_pending_compensation_handler(instance_key, element_instance_key) {
-            for handler in self.compensation_handlers_for(instance_key, &element_id) {
-                events.push(Event::CompensationSubscriptionCreated {
-                    instance_key,
-                    element_instance_key,
-                    element_id: element_id.clone(),
-                    handler,
-                    scope,
-                    scope_subscription: false,
-                });
-            }
-            // #901: a completing sub-process that holds compensable
-            // subscriptions records its own handlerless scope subscription, so
-            // a later whole-scope throw can fan out into them.
-            if let Some(scope_sub) = self.scope_subscription_event(
-                instance_key,
-                element_instance_key,
-                &element_id,
-                scope,
-            ) {
-                events.push(scope_sub);
-            }
-        }
+        // #901: compensation registration (explicit boundary subscription, or
+        // a sub-process's scope subscription, and nothing at all for undo work
+        // inside a pending handler) has one canonical home.
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
             followups.push(step);
@@ -12570,7 +12532,7 @@ impl Engine {
             events.extend(resume_events);
             return (events, followups);
         }
-        events.extend(self.subprocess_compensation_subscriptions(
+        events.extend(self.completion_compensation_subscriptions(
             instance_key,
             element_instance_key,
             &element_id,

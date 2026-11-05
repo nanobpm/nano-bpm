@@ -209,6 +209,10 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             scope_subscription_parents,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                // A whole-scope fan-out consumes every nested subscription, so
+                // index it once: a per-subscription linear scan would make this
+                // reducer quadratic in the number of compensable children.
+                let consumed: std::collections::HashSet<Key> = consumed.iter().copied().collect();
                 instance
                     .compensable
                     .retain(|c| !consumed.contains(&c.element_instance_key));

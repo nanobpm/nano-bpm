@@ -2182,7 +2182,7 @@ fn whole_scope_throw_honours_an_explicit_subprocess_handler_over_nested_ones() {
 /// boundary subscription when the BODY completes — the body completion paths
 /// bypass the plain sub-process registration, and `scope_subscription_event`
 /// returns `None` for an explicitly-handled element, so without routing through
-/// `subprocess_compensation_subscriptions` a later whole-scope throw skips the
+/// `completion_compensation_subscriptions` a later whole-scope throw skips the
 /// handler entirely. Covers the listener-free body completion
 /// (`complete_multi_instance_body`), sequential and parallel.
 ///
@@ -2816,4 +2816,97 @@ fn mi_handler_body_output_mapping_propagates_before_throw_resumes() {
 #[test]
 fn mi_handler_body_with_end_listener_output_mapping_propagates() {
     run_mi_handler_output_mapping(true);
+}
+
+/// Review thread PRRT_kwDOS5PLLs60AxHh (#901): an explicitly compensable
+/// sub-process that completes INSIDE a running compensation handler is undo
+/// work, so it must register no compensation subscription — on the drained
+/// (listener-free) path and the end-listener (`finalize_subprocess`) path alike.
+/// A throw later inside that handler must therefore find nothing to compensate.
+///
+/// ```text
+/// start -> book(svc, comp -> undo[ u_start -> inner[ i_start -> innerTask -> i_end ](comp -> innerUndo)
+///                                   -> innerThrow -> u_end ]) -> throw -> done
+/// ```
+fn run_compensable_sub_process_inside_handler(with_inner_end_listener: bool) {
+    let mut b = ProcessBuilder::new("comp-inside-handler")
+        .start_event("start")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("comp", "book", "undo")
+        .sub_process("undo", "u_start")
+        .start_event("u_start")
+        .contained_in("u_start", "undo")
+        .sub_process("inner", "i_start")
+        .contained_in("inner", "undo")
+        .start_event("i_start")
+        .contained_in("i_start", "inner")
+        .service_task("innerTask", "inner-job")
+        .contained_in("innerTask", "inner")
+        .end_event("i_end")
+        .contained_in("i_end", "inner")
+        .compensation_boundary_event("innerComp", "inner", "innerUndo")
+        .service_task("innerUndo", "inner-undo-job")
+        .contained_in("innerUndo", "undo")
+        .compensation_throw_event("innerThrow")
+        .contained_in("innerThrow", "undo")
+        .end_event("u_end")
+        .contained_in("u_end", "undo")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .connect("u_start", "inner")
+        .connect("inner", "innerThrow")
+        .connect("innerThrow", "u_end")
+        .connect("i_start", "innerTask")
+        .connect("innerTask", "i_end");
+    if with_inner_end_listener {
+        b = b.with_listeners(
+            "inner",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "inner-audit")],
+        );
+    }
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(b.build().unwrap()))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-inside-handler"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // `book` completes and the throw activates the `undo` handler sub-process.
+    complete_one(&mut engine, "book-job");
+    complete_one(&mut engine, "inner-job");
+    if with_inner_end_listener {
+        complete_one(&mut engine, "inner-audit");
+    }
+    // `inner` completed inside the running handler: it is undo work and must
+    // register nothing, so `innerThrow` compensates nothing.
+    assert!(
+        engine
+            .activate_jobs("inner-undo-job", "w", 1, 60_000, 0)
+            .is_empty(),
+        "a throw inside a compensation handler must not compensate undo work"
+    );
+    assert!(
+        engine.is_completed(instance_key),
+        "innerThrow drains, the handler retires the outer throw, the instance completes"
+    );
+    let inst = engine.instance(instance_key).unwrap();
+    assert!(inst.compensable.is_empty(), "{:?}", inst.compensable);
+    assert!(inst.compensation_waits.is_empty());
+    assert!(inst.incidents.is_empty());
+}
+
+#[test]
+fn compensable_sub_process_inside_a_handler_registers_no_subscription() {
+    run_compensable_sub_process_inside_handler(false);
+}
+
+#[test]
+fn compensable_sub_process_with_end_listener_inside_a_handler_registers_no_subscription() {
+    run_compensable_sub_process_inside_handler(true);
 }

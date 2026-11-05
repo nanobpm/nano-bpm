@@ -114,20 +114,33 @@ impl Engine {
         }
     }
 
-    /// Every `CompensationSubscriptionCreated` a completing **sub-process**
-    /// records (#901): its explicit compensation-boundary subscriptions when it
-    /// carries any, otherwise its handlerless scope subscription (if it holds
-    /// nested subscriptions) — never both. The single source of truth for the
-    /// sub-process-only completion paths (`complete_drained_subprocesses`,
-    /// `finalize_subprocess`), which bypass `finalize_completion`'s leaf
-    /// registration.
-    pub(crate) fn subprocess_compensation_subscriptions(
+    /// Every `CompensationSubscriptionCreated` a completing element records —
+    /// the single canonical registration point for EVERY completion path (leaf
+    /// `complete` / `finalize_completion`, the drained sub-process path,
+    /// `finalize_subprocess`, and the multi-instance body / child paths):
+    ///
+    /// - nothing at all when the element completes as, or inside, a compensation
+    ///   handler a throw is still waiting on: undo work is not compensable, so a
+    ///   later throw must never re-trigger it (review r4478383154 and thread
+    ///   PRRT_kwDOS5PLLs60AxHh, #901). Both the completing instance AND its
+    ///   enclosing `scope` are checked, because the drained sub-process path has
+    ///   already removed the completing instance's own ancestry by the time it
+    ///   registers;
+    /// - otherwise its explicit compensation-boundary subscriptions when it
+    ///   carries any, else its handlerless scope subscription (a sub-process
+    ///   holding nested subscriptions) — never both (#901).
+    pub(crate) fn completion_compensation_subscriptions(
         &self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: &str,
         scope: Key,
     ) -> Vec<Event> {
+        if self.is_within_pending_compensation_handler(instance_key, element_instance_key)
+            || self.is_within_pending_compensation_handler(instance_key, scope)
+        {
+            return Vec::new();
+        }
         let explicit: Vec<Event> = self
             .compensation_handlers_for(instance_key, element_id)
             .into_iter()
