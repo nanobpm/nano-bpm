@@ -2115,3 +2115,63 @@ fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subproce
             .is_empty());
     }
 }
+
+/// Review r4477754066 (#901): a sub-process with its OWN compensation handler
+/// (explicit boundary) must not also record a handlerless scope subscription —
+/// the explicit handler overrides the nested ones, so a whole-scope throw runs
+/// only `cancelSub`, never the nested `cancelB`.
+#[test]
+fn whole_scope_throw_honours_an_explicit_subprocess_handler_over_nested_ones() {
+    let def = ProcessBuilder::new("comp-explicit-sub")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("bookB", "book-b-job")
+        .contained_in("bookB", "sub")
+        .compensation_boundary_event("compB", "bookB", "cancelB")
+        .contained_in("compB", "sub")
+        .service_task("cancelB", "cancel-b-job")
+        .contained_in("cancelB", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .compensation_boundary_event("compSub", "sub", "cancelSub")
+        .service_task("cancelSub", "cancel-sub-job")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "bookB")
+        .connect("bookB", "sub_end")
+        .connect("sub", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-explicit-sub"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let events = complete_one(&mut engine, "book-b-job");
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            Event::CompensationSubscriptionCreated {
+                scope_subscription: true,
+                ..
+            }
+        )),
+        "an explicitly-handled sub-process records no scope subscription"
+    );
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::ElementActivated { element_id, .. } if element_id == "cancelB"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::ElementActivated { element_id, .. } if element_id == "cancelSub"
+    )));
+    complete_one(&mut engine, "cancel-sub-job");
+    assert!(engine.is_completed(instance_key));
+}

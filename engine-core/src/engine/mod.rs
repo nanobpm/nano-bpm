@@ -5815,10 +5815,10 @@ impl Engine {
             // `isFlowScopeWithSubscriptions`). Emitted right after
             // `ElementCompleted`, mirroring where `finalize_completion` records
             // a leaf activity's boundary subscription.
-            if let Some(scope_sub) =
-                self.scope_subscription_event(instance_key, eik, &element_id, scope)
+            for sub in
+                self.subprocess_compensation_subscriptions(instance_key, eik, &element_id, scope)
             {
-                self.emit(log, scope_sub);
+                self.emit(log, sub);
             }
             // Completing normally disarms any boundary timers/subscriptions on it.
             for event in self.cancel_boundary_timers_on(eik) {
@@ -12345,13 +12345,15 @@ impl Engine {
             element_id: element_id.clone(),
         }];
         // #901: a completing sub-process that holds compensable subscriptions
-        // records its own handlerless scope subscription (mirrors the
-        // listener-free path in `complete_drained_subprocesses`).
-        if let Some(scope_sub) =
-            self.scope_subscription_event(instance_key, element_instance_key, &element_id, scope)
-        {
-            events.push(scope_sub);
-        }
+        // records its own handlerless scope subscription — or its explicit
+        // boundary subscriptions instead (mirrors the listener-free path in
+        // `complete_drained_subprocesses`).
+        events.extend(self.subprocess_compensation_subscriptions(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -15874,24 +15876,54 @@ fn drain_scope_subscriptions(
         };
     let aligned =
         wait.pending_scope_subscription_parents.len() == wait.pending_scope_subscriptions.len();
-    let mut open: Vec<(Key, Option<Key>)> = wait
-        .pending_scope_subscriptions
-        .iter()
-        .enumerate()
-        .map(|(i, k)| {
-            let parent = if aligned {
-                Some(wait.pending_scope_subscription_parents[i])
-            } else {
-                None
-            };
-            (*k, parent)
-        })
-        .collect();
-    let mut drained = Vec::new();
-    while let Some(pos) = open.iter().position(|(key, _)| {
-        !remaining_handler_scopes.contains(key) && !open.iter().any(|(_, p)| *p == Some(*key))
-    }) {
-        drained.push(open.remove(pos).0);
+    let subs = &wait.pending_scope_subscriptions;
+    let parent_of = |i: usize| -> Option<Key> {
+        if aligned {
+            Some(wait.pending_scope_subscription_parents[i])
+        } else {
+            None
+        }
+    };
+    // Hash-based membership + per-scope open-child counts derived once, so the
+    // fixpoint is O(n log n) instead of rescanning every open entry per step.
+    let handler_scope_set: HashSet<Key> = remaining_handler_scopes.into_iter().collect();
+    let mut index_of: HashMap<Key, usize> = HashMap::with_capacity(subs.len());
+    for (i, k) in subs.iter().enumerate() {
+        index_of.entry(*k).or_insert(i);
     }
-    (drained, open.len())
+    let mut open_children: HashMap<Key, usize> = HashMap::new();
+    for i in 0..subs.len() {
+        if let Some(p) = parent_of(i) {
+            *open_children.entry(p).or_default() += 1;
+        }
+    }
+    let eligible = |k: &Key, open_children: &HashMap<Key, usize>| {
+        !handler_scope_set.contains(k) && open_children.get(k).copied().unwrap_or(0) == 0
+    };
+    // Lowest-index eligible entry first — the same retirement order as the
+    // former "first eligible position" scan (eligibility only ever grows).
+    let mut ready: std::collections::BTreeSet<usize> = (0..subs.len())
+        .filter(|&i| eligible(&subs[i], &open_children))
+        .collect();
+    let mut done = vec![false; subs.len()];
+    let mut drained = Vec::new();
+    while let Some(i) = ready.pop_first() {
+        if done[i] {
+            continue;
+        }
+        done[i] = true;
+        drained.push(subs[i]);
+        if let Some(p) = parent_of(i) {
+            if let Some(n) = open_children.get_mut(&p) {
+                *n = n.saturating_sub(1);
+            }
+            if let Some(&pi) = index_of.get(&p) {
+                if !done[pi] && eligible(&p, &open_children) {
+                    ready.insert(pi);
+                }
+            }
+        }
+    }
+    let open = subs.len() - drained.len();
+    (drained, open)
 }

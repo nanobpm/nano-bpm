@@ -29,24 +29,6 @@ impl Engine {
         wired.into_iter().map(|(_, handler)| handler).collect()
     }
 
-    /// The compensable activities recorded in `scope` (completion order, oldest
-    /// first). A compensation throw event consumes these newest-first.
-    pub(crate) fn compensable_in_scope(
-        &self,
-        instance_key: Key,
-        scope: Key,
-    ) -> Vec<crate::state::CompensationSubscription> {
-        let Some(instance) = self.state.instances.get(&instance_key) else {
-            return Vec::new();
-        };
-        instance
-            .compensable
-            .iter()
-            .filter(|c| c.scope == scope)
-            .cloned()
-            .collect()
-    }
-
     /// Computes the full fan-out of a whole-scope compensation throw running in
     /// `scope` (#901, Zeebe `triggerCompensation` +
     /// `triggerCompensationFromTopToBottom`): the subscriptions recorded
@@ -88,29 +70,82 @@ impl Engine {
         scope_sub_parents: &mut Vec<Key>,
         consumed: &mut Vec<Key>,
     ) {
-        for target in self.compensable_in_scope(instance_key, scope).iter() {
+        // Index the instance's subscriptions by scope ONCE per throw (creation
+        // order preserved within each scope), so the recursive traversal is
+        // linear in the subscription count rather than re-filtering the whole
+        // `compensable` list per nested scope.
+        let mut by_scope: HashMap<Key, Vec<crate::state::CompensationSubscription>> =
+            HashMap::new();
+        if let Some(instance) = self.state.instances.get(&instance_key) {
+            for c in &instance.compensable {
+                by_scope.entry(c.scope).or_default().push(c.clone());
+            }
+        }
+        // Explicit stack (no recursion) so a deeply nested scope chain cannot
+        // overflow; LIFO of per-scope cursors reproduces depth-first order.
+        let mut stack: Vec<(
+            Key,
+            std::vec::IntoIter<crate::state::CompensationSubscription>,
+        )> = vec![(
+            scope,
+            by_scope.remove(&scope).unwrap_or_default().into_iter(),
+        )];
+        while let Some((current, iter)) = stack.last_mut() {
+            let current = *current;
+            let Some(target) = iter.next() else {
+                stack.pop();
+                continue;
+            };
             consumed.push(target.element_instance_key);
             if target.scope_subscription {
                 // A completed flow scope: no handler of its own — fan the
                 // trigger out into the subscriptions nested inside it.
                 scope_subs.push(target.element_instance_key);
-                scope_sub_parents.push(scope);
-                self.plan_compensation_fanout(
-                    instance_key,
-                    target.element_instance_key,
-                    handlers,
-                    handler_keys,
-                    handler_scopes,
-                    scope_subs,
-                    scope_sub_parents,
-                    consumed,
-                );
+                scope_sub_parents.push(current);
+                let nested = by_scope
+                    .remove(&target.element_instance_key)
+                    .unwrap_or_default();
+                stack.push((target.element_instance_key, nested.into_iter()));
             } else {
                 handlers.push(target.handler.clone());
                 handler_keys.push(self.mint_key());
-                handler_scopes.push(scope);
+                handler_scopes.push(current);
             }
         }
+    }
+
+    /// Every `CompensationSubscriptionCreated` a completing **sub-process**
+    /// records (#901): its explicit compensation-boundary subscriptions when it
+    /// carries any, otherwise its handlerless scope subscription (if it holds
+    /// nested subscriptions) — never both. The single source of truth for the
+    /// sub-process-only completion paths (`complete_drained_subprocesses`,
+    /// `finalize_subprocess`), which bypass `finalize_completion`'s leaf
+    /// registration.
+    pub(crate) fn subprocess_compensation_subscriptions(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Vec<Event> {
+        let explicit: Vec<Event> = self
+            .compensation_handlers_for(instance_key, element_id)
+            .into_iter()
+            .map(|handler| Event::CompensationSubscriptionCreated {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+                handler,
+                scope,
+                scope_subscription: false,
+            })
+            .collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        self.scope_subscription_event(instance_key, element_instance_key, element_id, scope)
+            .into_iter()
+            .collect()
     }
 
     /// The `CompensationSubscriptionCreated` event a completing **flow scope**
@@ -133,6 +168,18 @@ impl Engine {
         scope: Key,
     ) -> Option<Event> {
         if !self.is_subprocess(instance_key, element_id) {
+            return None;
+        }
+        // A sub-process with its OWN compensation handler (an explicit
+        // compensation boundary event) records that boundary subscription
+        // instead: the explicit handler overrides the nested ones, so a
+        // whole-scope throw must run only it — never both (BPMN 2.0 §10.6.5,
+        // Zeebe `createCompensationSubscription`). Centralised here so every
+        // sub-process completion path inherits the rule.
+        if !self
+            .compensation_handlers_for(instance_key, element_id)
+            .is_empty()
+        {
             return None;
         }
         let instance = self.state.instances.get(&instance_key)?;
