@@ -206,8 +206,11 @@ fn collect_vars(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
 /// variable, not the absent child binding. The binding walk mirrors the
 /// evaluator's scoping exactly: a `for`/`some`/`every` clause name binds from
 /// the NEXT clause onward (its own source list is evaluated outside it), a
-/// context entry key binds from the next entry onward, and a `function(...)`
-/// parameter binds over the whole body. Returns an empty set if the expression
+/// context entry key binds from the next entry onward, a `function(...)`
+/// parameter binds over the whole body, and a list filter (`base[predicate]`)
+/// binds `item` over the predicate — except a BARE variable index
+/// (`orders[item]`), which resolves numerically from the current scope and so
+/// keeps `item` free. Returns an empty set if the expression
 /// cannot be parsed — the caller then sees no external reference (the
 /// evaluation itself surfaces the parse error).
 pub fn free_variables(expr: &str) -> std::collections::HashSet<String> {
@@ -242,7 +245,26 @@ fn collect_free_vars(
         Node::Member(base, _) => collect_free_vars(base, bound, out),
         Node::Index(base, idx) => {
             collect_free_vars(base, bound, out);
-            collect_free_vars(idx, bound, out);
+            // `base[idx]` is a numeric index when `idx` evaluates to a number
+            // in the CURRENT scope, otherwise a boolean filter evaluated per
+            // element with `item` bound to the element under test (eval_index).
+            // A static walk cannot know the base's elements, so it cannot
+            // foresee the context-entry names a filter would also bind — but
+            // it can settle `item`: a BARE variable index (`orders[item]`)
+            // resolves numerically whenever the outer scope supplies the name,
+            // so it is a genuine outer reference and stays free; any other
+            // index shape is treated as a filter, binding `item` over the
+            // predicate. That mirrors the dependency question this walk
+            // answers: with `inputElement="item"` absent at the body level,
+            // `orders[item]` MUST stay free (skipping the mapping is exactly
+            // the tolerated case), while `[1, 2][item > 0]` must not skip.
+            if matches!(idx.as_ref(), Node::Var(_)) {
+                collect_free_vars(idx, bound, out);
+            } else {
+                let mut inner = bound.clone();
+                inner.insert("item".to_string());
+                collect_free_vars(idx, &mut inner, out);
+            }
         }
         Node::Neg(inner) | Node::Not(inner) => collect_free_vars(inner, bound, out),
         Node::Bin(_, l, r) => {
@@ -394,6 +416,14 @@ mod tests {
         // A function parameter binds over the body.
         assert!(free("=function(item) item + 1").is_empty());
         assert_eq!(free("=function(item) item + k"), vec!["k"]);
+        // A list FILTER (`base[predicate]`) binds `item` to the element under
+        // test over the predicate (eval_index): a predicate whose only use of
+        // the name is that filter-local binding is self-contained.
+        assert!(free("=[1, 2][item > 0]").is_empty());
+        assert_eq!(free("=orders[item.price > limit]"), vec!["limit", "orders"]);
+        // A bare numeric index is NOT a filter: `item` there is a genuine
+        // outer reference and stays free.
+        assert_eq!(free("=orders[item]"), vec!["item", "orders"]);
         // An unparsable expression has no known free reference.
         assert!(free("=for in").is_empty());
     }

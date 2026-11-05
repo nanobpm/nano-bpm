@@ -1281,3 +1281,57 @@ fn multi_instance_body_input_mapping_with_local_binding_shadowing_input_element_
     assert_eq!(jobs[0].variables.get("item"), Some(&Value::Int(1)));
     assert_eq!(jobs[1].variables.get("item"), Some(&Value::Int(2)));
 }
+
+#[test]
+fn multi_instance_body_input_mapping_with_filter_local_item_binding_runs() {
+    // A list filter binds `item` to the element under test over its predicate
+    // (eval_index), so `=[1, 2][item > 0]` is self-contained even when the
+    // `inputElement` is also named `item`: the predicate does not read the
+    // per-child binding. The body must evaluate the mapping rather than skip
+    // it — skipping it here would drop the input collection's provider and
+    // silently fan out zero children (Copilot review 5778200940).
+    let def = ProcessBuilder::new("mi-filter-bind")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=[1, 2][item > 0]".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("mi-filter-bind", vars(&[])))
+        .unwrap();
+
+    // The filter-local mapping supplies the input collection: two children.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        2,
+        "a filter-local use of the inputElement name must not skip the mapping"
+    );
+    assert_eq!(jobs[0].variables.get("item"), Some(&Value::Int(1)));
+    assert_eq!(jobs[1].variables.get("item"), Some(&Value::Int(2)));
+}
