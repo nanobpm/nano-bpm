@@ -661,12 +661,34 @@ pub(crate) fn parse_with_captures(
                             // completes that scope (Zeebe/Camunda terminate
                             // semantics). Recorded on the owning end-event node so
                             // the build step maps it to
-                            // `ElementKind::TerminateEndEvent`. It is only
-                            // meaningful on an `endEvent`; anywhere else it is
-                            // ignored (deploy-parity leniency).
+                            // `ElementKind::TerminateEndEvent`.
+                            //
+                            // Off an `endEvent`, the placement follows the pinned
+                            // Zeebe deploy validation exactly (#985, probed against
+                            // `EngineRule` and pinned by the
+                            // `terminate-definition-on-*` traces):
+                            // - on an `intermediateCatchEvent` or `boundaryEvent`
+                            //   Zeebe REJECTS the deployment, so the placement is
+                            //   recorded as unmodelled and the #853 validator
+                            //   rejects it naming the element (never a silent drop
+                            //   — a catch whose only definition was dropped would
+                            //   otherwise build as a zero-duration timer);
+                            // - on an `intermediateThrowEvent` or `startEvent`
+                            //   Zeebe ACCEPTS it and runs the event as an inert
+                            //   none event, so it is deliberately ignored here.
                             "terminateEventDefinition" => {
                                 if let Some(idx) = cur_end {
                                     acc.nodes[idx].is_terminate = true;
+                                } else if let Some(boundary) = cur_boundary.as_ref() {
+                                    acc.unmodelled.push((
+                                        "terminateEventDefinition".to_string(),
+                                        boundary.id.clone(),
+                                    ));
+                                } else if let Some(idx) = cur_intermediate {
+                                    acc.unmodelled.push((
+                                        "terminateEventDefinition".to_string(),
+                                        acc.nodes[idx].id.clone(),
+                                    ));
                                 }
                             }
                             // `<association sourceRef=… targetRef=…>` — wires a
@@ -1897,7 +1919,17 @@ pub(crate) fn parse_with_captures(
             // Snapshot the raw parse data for post-parse validation before the
             // builder consumes the accumulator.
             let capture = acc.capture(&errors, &messages, &signals, &escalations);
-            let def = acc.build(&errors, &messages, &signals, &escalations)?;
+            // An unmodelled construct must be reported as itself, never masked
+            // by the build fallout it causes (#985): when `build` fails and the
+            // capture holds an unmodelled construct, that construct is the root
+            // cause, so its `UnsupportedElement` wins over the build error.
+            let def = acc
+                .build(&errors, &messages, &signals, &escalations)
+                .map_err(|build_err| {
+                    crate::validate::unsupported_elements::reject_unmodelled(&capture)
+                        .err()
+                        .unwrap_or(build_err)
+                })?;
             // Retain the verbatim source XML on each parsed definition so it can
             // be served back (getProcessDefinitionXML / console diagram). Every
             // process in one resource shares that resource's XML.

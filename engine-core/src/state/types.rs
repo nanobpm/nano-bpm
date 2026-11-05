@@ -1014,6 +1014,17 @@ pub enum IoMappingRedrive {
         listener_index: usize,
         scope: Key,
     },
+    /// A terminate end event's `end` execution-listener chain parked on an
+    /// incident (#985, #1430 review) — a listener job-type `EXTRACT_VALUE_ERROR`
+    /// or an output-mapping `IO_MAPPING_ERROR`. `outputs_applied` records whether
+    /// the terminate end's (single-pass, possibly non-idempotent) `zeebe:output`
+    /// projection already succeeded on the failed pass: the redrive re-applies it
+    /// only when `false`, so a listener-chain failure (`true`) never re-projects
+    /// `=x + 1 -> x` into `x = 2`, while an output-mapping failure (`false`) still
+    /// re-projects the now-fixed mapping. The marker also suppresses a duplicate
+    /// `ElementCompleting` on the re-drive. Additive brand-new variant — old
+    /// journals never carry it.
+    TerminateEndCompletion { outputs_applied: bool },
     /// A multi-instance **child**'s job properties (type / retries) failed to
     /// evaluate after its per-child input mappings were already applied (#1390,
     /// #1399 review): resolution re-runs only the child's behaviour against its
