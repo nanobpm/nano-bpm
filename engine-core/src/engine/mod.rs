@@ -2266,6 +2266,46 @@ impl Engine {
                     },
                 );
                 if !variables.is_empty() {
+                    // #985 / #1430: a terminate end's end chain mirrors its output
+                    // projection onto shadowing element locals so later listeners
+                    // read it. A listener's own result must be mirrored the same
+                    // way, or the stale local shadows it for listeners 1..n and an
+                    // incident resume (the propagation below starts at the flow
+                    // scope and never touches the element's own scope).
+                    if matches!(
+                        job_kind,
+                        state::JobKind::ExecutionListener {
+                            event_type: crate::model::ListenerEventType::End,
+                            ..
+                        }
+                    ) && matches!(
+                        self.element_kind(instance_key, &element_id),
+                        Some(ElementKind::TerminateEndEvent)
+                    ) {
+                        let shadowed: HashMap<String, Value> = self
+                            .state
+                            .instances
+                            .get(&instance_key)
+                            .and_then(|i| i.scope_variables.get(&element_instance_key))
+                            .map(|local| {
+                                variables
+                                    .iter()
+                                    .filter(|(k, _)| local.contains_key(*k))
+                                    .map(|(k, v)| (k.clone(), v.clone()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if !shadowed.is_empty() {
+                            self.emit(
+                                &mut log,
+                                Event::ScopedVariablesUpdated {
+                                    instance_key,
+                                    scope_key: element_instance_key,
+                                    variables: shadowed,
+                                },
+                            );
+                        }
+                    }
                     // Job result variables propagate from the task's enclosing
                     // (flow) scope upward — each name updates the nearest ancestor
                     // scope that defines it, defaulting to root. For a root-only

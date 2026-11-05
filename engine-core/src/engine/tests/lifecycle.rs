@@ -7562,3 +7562,55 @@ fn terminate_end_output_mapping_is_not_shadowed_by_input_local_for_later_listene
         "listener 1 must read the output-mapped value, not the stale input local"
     );
 }
+
+/// #1430 review: a listener's completion variables must also reach the mirrored
+/// element-local view, or the stale local shadows them for the next listener.
+#[test]
+fn terminate_end_listener_completion_variables_are_not_shadowed_for_later_listeners() {
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-shadow2" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:input source="=&quot;old&quot;" target="listenerType" />
+              <zeebe:output source="=&quot;new&quot;" target="listenerType" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).expect("parses").remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("term-el-shadow2"))
+        .unwrap();
+    let job = engine
+        .activate_jobs("new", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("listener 0 job");
+    let mut vars = HashMap::new();
+    vars.insert("listenerType".to_string(), Value::Str("next".into()));
+    engine
+        .apply_command(Command::complete_job_with(job.key, vars))
+        .unwrap();
+    let types: Vec<String> = engine
+        .pending_jobs()
+        .iter()
+        .map(|j| j.job_type.clone())
+        .collect();
+    assert_eq!(
+        types,
+        vec!["next".to_string()],
+        "listener 1 must read listener 0's returned value, not the stale mirrored local"
+    );
+}
