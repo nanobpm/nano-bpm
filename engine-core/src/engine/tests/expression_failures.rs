@@ -1030,3 +1030,274 @@ fn exclusive_gateway_retry_redrives_the_gated_activation() {
 fn inclusive_split_retry_redrives_the_gated_activation() {
     assert_retry_redrives_the_gated_activation(SplitGateway::Inclusive);
 }
+
+// ---------------------------------------------------------------------------
+// Round-4 review hardening (#1402): the gateway retry must (a) RESUME a
+// partially-drained `start` listener chain instead of re-running the whole
+// gated activation, and (b) evaluate against the element-local view the
+// non-gateway retry path uses.
+// ---------------------------------------------------------------------------
+
+/// `start → g (split, two `start` listeners: `l0` then `=nextType`) → e/f`,
+/// two conditional flows `amount > 100` → `e` and `amount > 5` → `f`, no
+/// default. With `amount = 10` the gate selects `f` (only `amount > 5`
+/// matches); listener `l0` then bumps `amount` past 100, and listener #1's
+/// job-type expression fails. Resolving THAT incident must resume the chain —
+/// keeping the carried route to `f` — not re-run the gate (which would now
+/// select `e`) nor re-emit `ElementActivated`.
+fn two_listener_split_gateway_process(gateway: SplitGateway) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("split-two-listeners").start_event("s");
+    let builder = match gateway {
+        SplitGateway::Exclusive => builder.exclusive_gateway("g"),
+        SplitGateway::Inclusive => builder.inclusive_gateway("g"),
+    };
+    builder
+        .with_listeners(
+            "g",
+            vec![
+                el(ListenerEventType::Start, "l0"),
+                ExecutionListener {
+                    event_type: ListenerEventType::Start,
+                    job_type: "=nextType".to_string(),
+                    retries: None,
+                },
+            ],
+            Vec::new(),
+        )
+        .end_event("e")
+        .end_event("f")
+        .connect("s", "g")
+        .connect_when("g", "e", "amount > 100")
+        .connect_when("g", "f", "amount > 5")
+        .build()
+        .unwrap()
+}
+
+fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_listener_split_gateway_process(
+            gateway,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "split-two-listeners",
+            HashMap::from([("amount".to_string(), Value::Int(10))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        lifecycle_of(&created, "g"),
+        vec!["Activating", "Activated"],
+        "{gateway:?}: the gate passes (`amount > 5` → `f`) and the listener \
+         chain opens: {created:?}"
+    );
+    assert!(
+        created.iter().any(|e| matches!(
+            e,
+            Event::GatewayRouteSelected { element_id, .. } if element_id == "g"
+        )),
+        "{gateway:?}: the activation-time selection is journaled: {created:?}"
+    );
+
+    // Listener #0 completes, bumping `amount` past 100; listener #1's job-type
+    // expression (`=nextType`, unbound) fails — the element parks on an
+    // EXTRACT_VALUE_ERROR incident mid-chain.
+    let l0 = engine.activate_jobs("l0", "W", 10, 1_000, 0);
+    assert_eq!(l0.len(), 1, "{gateway:?}: one l0 listener job");
+    let advanced = engine
+        .apply_command(Command::complete_job_with(
+            l0[0].key,
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+    assert!(
+        !advanced
+            .iter()
+            .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })),
+        "{gateway:?}: the failing second listener mints no job: {advanced:?}"
+    );
+    let incident = extract_value_incident(&engine, "g");
+    assert_eq!(
+        incident.redrive,
+        Some(state::IoMappingRedrive::Activation),
+        "{gateway:?}: a mid-chain listener failure is an activation-phase \
+         incident: {:?}",
+        incident
+    );
+
+    // Resolve: the retry must RESUME the chain at listener #1 — the carried
+    // route (to `f`) is not re-selected even though `amount = 500` now matches
+    // the `e` branch, and `ElementActivated` (emitted on the first pass) is
+    // not repeated.
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("nextType".to_string(), Value::Str("l1".into()))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&resolved, "g"),
+        Vec::<&'static str>::new(),
+        "{gateway:?}: resolving a mid-chain listener failure resumes the \
+         chain — no second `ElementActivated`: {resolved:?}"
+    );
+    assert!(
+        !resolved
+            .iter()
+            .any(|e| matches!(e, Event::GatewayRouteSelected { .. })),
+        "{gateway:?}: the carried route is kept — the gate does not re-run: \
+         {resolved:?}"
+    );
+    let l1 = engine.activate_jobs("l1", "W", 10, 1_000, 0);
+    assert_eq!(
+        l1.len(),
+        1,
+        "{gateway:?}: the resumed chain mints listener #1's job"
+    );
+    let drained = engine
+        .apply_command(Command::complete_job(l1[0].key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&drained, "g"),
+        vec!["Completing", "Completed"],
+        "{gateway:?}: the drained chain completes the gateway: {drained:?}"
+    );
+    assert!(
+        drained.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "g" && to == "f"
+        )),
+        "{gateway:?}: the completion takes the route journaled at activation \
+         (to `f`), not the route the listener's write would now select: \
+         {drained:?}"
+    );
+    assert!(engine.active_incidents().is_empty(), "{gateway:?}");
+    assert!(engine.is_completed(inst), "{gateway:?}");
+}
+
+#[test]
+fn exclusive_gateway_listener_failure_retry_resumes_the_chain() {
+    assert_listener_failure_retry_resumes_the_chain(SplitGateway::Exclusive);
+}
+
+#[test]
+fn inclusive_split_listener_failure_retry_resumes_the_chain() {
+    assert_listener_failure_retry_resumes_the_chain(SplitGateway::Inclusive);
+}
+
+/// `start → g (split) → e`, one conditional flow `amount > 100`, no default.
+/// A modification activates `g` with the element-local `amount = 5` while the
+/// root scope carries `amount = 500`: the gate must evaluate against the
+/// SEEDED view (no flow matches → the gateway parks ACTIVATING), and resolving
+/// the incident unchanged must re-evaluate against that same element-local
+/// view — re-raising the incident — never falling back to the root value.
+fn assert_gateway_retry_uses_the_element_local_view(gateway: SplitGateway) {
+    // The straight-through token would route `g` to `e` (root 500 > 100) and
+    // complete the instance — a modification cannot target a completed
+    // instance — so the fixture parks the instance on a user task first; the
+    // modification then activates `g` as a SECOND token seeded with the local.
+    let mut engine = Engine::new();
+    let def = {
+        let builder = ProcessBuilder::new("split-parked").start_event("s");
+        let builder = match gateway {
+            SplitGateway::Exclusive => builder.exclusive_gateway("g"),
+            SplitGateway::Inclusive => builder.inclusive_gateway("g"),
+        };
+        builder
+            .user_task("park")
+            .end_event("e")
+            .connect("s", "park")
+            .connect_when("g", "e", "amount > 100")
+            .build()
+            .unwrap()
+    };
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "split-parked",
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let modified = engine
+        .apply_command(Command::ModifyInstance {
+            instance_key: inst,
+            activate_instructions: vec![crate::command::ActivateElementInstruction {
+                element_id: "g".into(),
+                variable_instructions: vec![crate::command::VariableInstruction {
+                    variables: HashMap::from([("amount".to_string(), Value::Int(5))]),
+                    scope_id: Some("g".to_string()),
+                }],
+                ..Default::default()
+            }],
+            terminate_instructions: vec![],
+            terminate_element_ids: vec![],
+            move_instructions: vec![],
+        })
+        .unwrap();
+    let incidents = engine.active_incidents();
+    assert_eq!(
+        incidents.len(),
+        1,
+        "{gateway:?}: the seeded activation's gate sees the element-local \
+         `amount = 5`, not the root 500 — no flow matches: {modified:?}"
+    );
+    assert_eq!(
+        incidents[0].kind,
+        state::IncidentKind::NoMatchingSequenceFlow,
+        "{gateway:?}"
+    );
+    assert_eq!(
+        incidents[0].redrive,
+        // A modification's seeded activation emits `ElementActivated` up front
+        // (the seed precedes the activation body), so the gate failure is
+        // `Activation`-phase, not `ActivationPending`.
+        Some(state::IoMappingRedrive::Activation),
+        "{gateway:?}: {:?}",
+        incidents[0]
+    );
+
+    // Resolving unchanged must re-evaluate against the SAME element-local
+    // view: the local `amount = 5` still matches nothing, so the retry
+    // re-raises the incident instead of routing on the root `amount = 500`.
+    let resolved = engine
+        .apply_command(Command::resolve_incident(incidents[0].key))
+        .unwrap();
+    let incidents = engine.active_incidents();
+    assert_eq!(
+        incidents.len(),
+        1,
+        "{gateway:?}: the retry re-evaluates against the element-local view \
+         and re-raises the incident: {resolved:?}"
+    );
+    assert_eq!(
+        incidents[0].kind,
+        state::IncidentKind::NoMatchingSequenceFlow,
+        "{gateway:?}"
+    );
+    assert!(
+        !resolved.iter().any(|e| matches!(
+            e,
+            Event::ElementActivated { element_id, .. } if element_id == "g"
+        )),
+        "{gateway:?}: a still-failing retry never emits `ElementActivated`: \
+         {resolved:?}"
+    );
+}
+
+#[test]
+fn exclusive_gateway_retry_uses_the_element_local_view() {
+    assert_gateway_retry_uses_the_element_local_view(SplitGateway::Exclusive);
+}
+
+#[test]
+fn inclusive_split_retry_uses_the_element_local_view() {
+    assert_gateway_retry_uses_the_element_local_view(SplitGateway::Inclusive);
+}

@@ -357,6 +357,14 @@ enum Step {
         /// raised before `ElementActivated`, [`state::IoMappingRedrive::ActivationPending`]):
         /// a successful re-run then emits `ElementActivated` first.
         pending: bool,
+        /// `Some(n)` resumes a partially-drained `start` execution-listener
+        /// chain at listener index `n` (a mid-chain listener job-type failure,
+        /// #1390): the activation-time work before the chain — input mappings
+        /// and a split gateway's routing gate (#1402) — already succeeded, so
+        /// the retry must NOT re-run it (a gateway's journaled selection is
+        /// kept verbatim and its `ElementActivated` is not repeated). `None`
+        /// re-drives the full activation body.
+        resume_listener_at: Option<usize>,
     },
     /// Run the activation body of an element a process-instance modification
     /// already activated and seeded with element-local variables (Zeebe sets a
@@ -3100,6 +3108,10 @@ impl Engine {
                                     redrive,
                                     Some(state::IoMappingRedrive::ActivationPending)
                                 ),
+                                // A routing-gate incident is raised before any
+                                // listener job, so there is never a chain to
+                                // resume.
+                                resume_listener_at: None,
                             });
                         } else if matches!(
                             redrive,
@@ -3282,6 +3294,25 @@ impl Engine {
                     // failures re-drive uniformly by lifecycle phase — `ACTIVATING`
                     // re-applies inputs, `COMPLETING` re-applies outputs).
                     state::IncidentKind::IoMapping | state::IncidentKind::ExtractValueError => {
+                        // A mid-chain `start` listener's job-type failure
+                        // (#1390) parks the element with the pre-chain
+                        // activation already done; the retry resumes the chain
+                        // at the failed listener rather than re-running the
+                        // activation body (which would re-apply inputs and, for
+                        // a split gateway, re-select the journaled route and
+                        // repeat `ElementActivated`, #1402).
+                        let resume_listener_at =
+                            if matches!(redrive, Some(state::IoMappingRedrive::Activation))
+                                && matches!(kind, state::IncidentKind::ExtractValueError)
+                            {
+                                self.listener_resume_index(
+                                    instance_key,
+                                    element_instance_key,
+                                    &element_id,
+                                )
+                            } else {
+                                None
+                            };
                         let step: Option<Step> = match redrive {
                             // Mainstream input: re-run the activation body so the
                             // now-fixed inputs are re-applied before the element's
@@ -3293,6 +3324,7 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                     pending: false,
+                                    resume_listener_at,
                                 })
                             }
                             // The same, for a token still in ACTIVATING: the
@@ -3303,6 +3335,7 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                     pending: true,
+                                    resume_listener_at,
                                 })
                             }
                             // Output re-projection. A mainstream leaf element
@@ -5792,51 +5825,19 @@ impl Engine {
                 element_instance_key,
                 element_id,
                 pending: activation_pending,
+                resume_listener_at,
             } => {
                 // The element instance is parked on the resolved activation-time
                 // incident; re-drive the activation so the now-fixed input
                 // mappings / routing conditions are re-applied before the
-                // element's behaviour runs. A split gateway (exclusive, or an
-                // inclusive fork) re-runs the FULL gated activation
-                // (`Step::Activate`, #1402): the routing gate, the journaled
-                // selection, and the `start` listener chain the failed attempt
-                // never opened. A bare body redrive would activate a retry that
-                // still matches no flow (raising the routing incident AFTER
-                // `ElementActivated`) and would skip the listener chain on a
-                // successful one.
-                let kind = self.element_kind(instance_key, &element_id);
-                let is_split_gateway = matches!(
-                    kind,
-                    Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway)
-                ) && self.join_kind(instance_key, &element_id).is_none();
-                if is_split_gateway {
-                    let scope = self.scope_of(instance_key, element_instance_key);
-                    // Re-drive the gated activation ON the parked element
-                    // instance (Zeebe's resolve re-runs `onActivate` on the same
-                    // element instance — no second `ELEMENT_ACTIVATING`). The
-                    // parked token was never observable (no `ElementActivated`,
-                    // no listener job, no scope writes precede the incident, and
-                    // a gateway arms no boundary events), so reusing it carries
-                    // nothing stale: the gate re-selects and re-journals the
-                    // route, overwriting any carried selection the failed attempt
-                    // recorded.
-                    return self.activate_reusing(
-                        instance_key,
-                        element_id,
-                        scope,
-                        None,
-                        pending,
-                        Some(element_instance_key),
-                    );
-                }
-                // Any other element: reconstruct its enclosing scope and re-run
-                // the activation body.
+                // element's behaviour runs.
                 let scope = self.scope_of(instance_key, element_instance_key);
                 // Re-evaluate in the same view as the first attempt: an element
                 // whose own scope is already registered (a modification seeded
                 // element-local variables, or a sub-process scope that holds no
                 // locals yet) evaluates in that scope; otherwise the enclosing
-                // scope.
+                // scope. This applies to split gateways too — a
+                // modification-seeded gateway's gate must see its locals.
                 let registered = self
                     .state
                     .instances
@@ -5848,6 +5849,76 @@ impl Engine {
                 } else {
                     scope
                 };
+                // A mid-chain `start` listener failure resumes the chain at the
+                // failed listener: the pre-chain activation (input mappings, a
+                // split gateway's routing gate) already succeeded, so it is NOT
+                // re-run — the gateway keeps its journaled selection and its
+                // already-emitted `ElementActivated` is repeated only when the
+                // token is still ACTIVATING (`pending`).
+                if let Some(resume_at) = resume_listener_at {
+                    let activated = Event::ElementActivated {
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        scope,
+                    };
+                    let mut events = Vec::new();
+                    if activation_pending {
+                        events.push(activated);
+                    }
+                    let (chain_events, chain_followups) = self.advance_listener(
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        crate::model::ListenerEventType::Start,
+                        resume_at.saturating_sub(1),
+                        scope,
+                    );
+                    events.extend(chain_events);
+                    return (events, chain_followups);
+                }
+                // A split gateway (exclusive, or an inclusive fork) re-runs the
+                // FULL gated activation (`Step::Activate`, #1402): the routing
+                // gate, the journaled selection, and the `start` listener chain
+                // the failed attempt never opened. A bare body redrive would
+                // activate a retry that still matches no flow (raising the
+                // routing incident AFTER `ElementActivated`) and would skip the
+                // listener chain on a successful one.
+                let kind = self.element_kind(instance_key, &element_id);
+                let is_split_gateway = matches!(
+                    kind,
+                    Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway)
+                ) && self.join_kind(instance_key, &element_id).is_none();
+                if is_split_gateway {
+                    // Re-drive the gated activation ON the parked element
+                    // instance (Zeebe's resolve re-runs `onActivate` on the same
+                    // element instance — no second `ELEMENT_ACTIVATING`). The
+                    // parked token was never observable (no `ElementActivated`,
+                    // no listener job, no scope writes precede the incident, and
+                    // a gateway arms no boundary events), so reusing it carries
+                    // nothing stale: the gate re-selects and re-journals the
+                    // route, overwriting any carried selection the failed attempt
+                    // recorded.
+                    let activated = Event::ElementActivated {
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        scope,
+                    };
+                    let (events, followups) = self.activate_body_in(
+                        instance_key,
+                        element_id,
+                        element_instance_key,
+                        scope,
+                        view,
+                    );
+                    return if activation_pending {
+                        (gate_activated(events, activated, 0), followups)
+                    } else {
+                        (events, followups)
+                    };
+                }
+                // Any other element: re-run the activation body.
                 let activated = Event::ElementActivated {
                     instance_key,
                     element_instance_key,
@@ -5996,25 +6067,6 @@ impl Engine {
         via: Option<IncomingFlow>,
         pending: &VecDeque<Step>,
     ) -> (Vec<Event>, Vec<Step>) {
-        self.activate_reusing(instance_key, element_id, scope, via, pending, None)
-    }
-
-    /// [`activate`] with an optional parked element instance to re-drive: a
-    /// split-gateway routing-gate retry (#1402) resolves the incident on the
-    /// token that parked ACTIVATING, so the retry re-runs the gated activation
-    /// ON that instance (Zeebe's resolve re-drives `onActivate` on the same
-    /// element instance — no second `ELEMENT_ACTIVATING` is written). `None`
-    /// mints a fresh instance and emits `ElementActivating`, exactly as
-    /// [`activate`] always has.
-    fn activate_reusing(
-        &mut self,
-        instance_key: Key,
-        element_id: String,
-        scope: Key,
-        via: Option<IncomingFlow>,
-        pending: &VecDeque<Step>,
-        reuse: Option<Key>,
-    ) -> (Vec<Event>, Vec<Step>) {
         // A parallel or inclusive gateway with more than one incoming flow is a
         // join: its activation is guarded instead of running per arrival.
         if let Some(join) = self.join_kind(instance_key, &element_id) {
@@ -6041,24 +6093,19 @@ impl Engine {
             }
         }
 
-        // A retry re-drives the parked instance; a fresh activation mints one
-        // and records its `ElementActivating`.
-        let element_instance_key = reuse.unwrap_or_else(|| self.mint_key());
+        let element_instance_key = self.mint_key();
         let activated = Event::ElementActivated {
             instance_key,
             element_instance_key,
             element_id: element_id.clone(),
             scope,
         };
-        let mut events = Vec::new();
-        if reuse.is_none() {
-            events.push(Event::ElementActivating {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-                scope,
-            });
-        }
+        let mut events = vec![Event::ElementActivating {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+            scope,
+        }];
         let mut followups = Vec::new();
 
         // A sub-process is itself a variable scope: it always registers its scope
@@ -6086,11 +6133,9 @@ impl Engine {
             self.activate_body(instance_key, element_id, element_instance_key, scope);
         events.extend(body_events);
         followups.extend(body_followups);
-        // `ElementActivated` sits right after `ElementActivating` (or first,
-        // for a re-driven parked instance) — unless the activation body parked
-        // the token on an activation-time incident.
-        let at = if reuse.is_some() { 0 } else { 1 };
-        (gate_activated(events, activated, at), followups)
+        // `ElementActivated` sits right after `ElementActivating` — unless the
+        // activation body parked the token on an activation-time incident.
+        (gate_activated(events, activated, 1), followups)
     }
 
     /// The element's activation body: everything between `ElementActivated` and
@@ -11314,6 +11359,40 @@ impl Engine {
         self.torn_down_scopes.insert(scope);
         (self.scope_teardown_events(instance_key, scope), Vec::new())
     }
+
+    /// The `start` execution-listener index a resolved mid-chain job-type
+    /// failure (#1390) resumes at: one past the highest-index listener job the
+    /// element already minted, or `None` when no `start` listener job exists
+    /// (the failure preceded the chain — e.g. the first listener's job type —
+    /// so the full activation body re-runs). Counting minted jobs — not
+    /// completions — keeps the index correct when a completed listener's
+    /// writes are what the failed expression referenced.
+    fn listener_resume_index(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) -> Option<usize> {
+        self.state
+            .jobs
+            .values()
+            .filter(|j| {
+                j.instance_key == instance_key
+                    && j.element_instance_key == element_instance_key
+                    && j.element_id == element_id
+            })
+            .filter_map(|j| match j.kind {
+                state::JobKind::ExecutionListener {
+                    event_type: crate::model::ListenerEventType::Start,
+                    index,
+                    ..
+                } => Some(index),
+                _ => None,
+            })
+            .max()
+            .map(|i| i + 1)
+    }
+
     /// completed (ADR 0037). If another listener remains in the chain, its job is
     /// created; otherwise the chain has drained and the deferred lifecycle
     /// transition runs — a `Start` chain enacts the element's activation
