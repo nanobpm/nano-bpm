@@ -208,9 +208,12 @@ fn collect_vars(node: &ast::Node, out: &mut std::collections::HashSet<String>) {
 /// the NEXT clause onward (its own source list is evaluated outside it), a
 /// context entry key binds from the next entry onward, a `function(...)`
 /// parameter binds over the whole body, and a list filter (`base[predicate]`)
-/// binds `item` over the predicate — except a BARE variable index
-/// (`orders[item]`), which resolves numerically from the current scope and so
-/// keeps `item` free. Returns an empty set if the expression
+/// binds `item` over the predicate — plus, for a filter over literal context
+/// elements, each element's entry keys (`=[{price: 1}][price > 0]` binds
+/// `price`). A BARE variable index stays a genuine outer reference only when
+/// the name is already in scope (`orders[item]` with an outer `item` resolves
+/// numerically); out of scope it is a filter and binds `item`
+/// (`=[true, false][item]`). Returns an empty set if the expression
 /// cannot be parsed — the caller then sees no external reference (the
 /// evaluation itself surfaces the parse error).
 pub fn free_variables(expr: &str) -> std::collections::HashSet<String> {
@@ -247,23 +250,54 @@ fn collect_free_vars(
             collect_free_vars(base, bound, out);
             // `base[idx]` is a numeric index when `idx` evaluates to a number
             // in the CURRENT scope, otherwise a boolean filter evaluated per
-            // element with `item` bound to the element under test (eval_index).
-            // A static walk cannot know the base's elements, so it cannot
-            // foresee the context-entry names a filter would also bind — but
-            // it can settle `item`: a BARE variable index (`orders[item]`)
-            // resolves numerically whenever the outer scope supplies the name,
-            // so it is a genuine outer reference and stays free; any other
-            // index shape is treated as a filter, binding `item` over the
-            // predicate. That mirrors the dependency question this walk
-            // answers: with `inputElement="item"` absent at the body level,
-            // `orders[item]` MUST stay free (skipping the mapping is exactly
-            // the tolerated case), while `[1, 2][item > 0]` must not skip.
-            if matches!(idx.as_ref(), Node::Var(_)) {
-                collect_free_vars(idx, bound, out);
-            } else {
-                let mut inner = bound.clone();
-                inner.insert("item".to_string());
-                collect_free_vars(idx, &mut inner, out);
+            // element (eval_index). eval_node NEVER errors on a Var (an
+            // unknown name yields Null, or the builtin function value), so
+            // the numeric probe fails exactly when `idx` does not evaluate
+            // to a number in the current scope — and the filter frame then
+            // binds `item` to the element under test plus, for a context
+            // element, every entry key of that element. A static walk cannot
+            // know a variable base's elements, so it cannot foresee which
+            // entry names a filter would bind: it settles what it can and
+            // treats the rest as a filter, mirroring the dependency question
+            // this walk answers — with `inputElement="item"` absent at the
+            // body level, skipping the mapping is exactly the tolerated case
+            // for a genuine outer reference, while a self-contained filter
+            // must not skip.
+            match idx.as_ref() {
+                // A literal number is always a numeric index: no filter, no
+                // binding.
+                Node::NumLit(..) => {}
+                // A BARE variable index resolves numerically whenever the
+                // current scope supplies the name, so an IN-SCOPE use
+                // (`orders[item]` with an outer `item`) is a genuine outer
+                // reference and stays free. An OUT-OF-SCOPE bare variable is
+                // never numeric (eval_node yields Null for it), so the
+                // subscript is a filter and binds `item` over it —
+                // `=[true, false][item]` is self-contained.
+                Node::Var(name) => {
+                    if !bound.contains(name) {
+                        let mut inner = bound.clone();
+                        inner.insert("item".to_string());
+                        collect_free_vars(idx, &mut inner, out);
+                    }
+                }
+                // Any other index shape is treated as a filter: bind `item`
+                // over the predicate, plus the entry keys of literal context
+                // elements in the base (`=[{price: 1}][price > 0]` binds
+                // `price`). A variable base's elements are unknowable
+                // statically, so its entry names cannot be settled here.
+                _ => {
+                    let mut inner = bound.clone();
+                    inner.insert("item".to_string());
+                    if let Node::List(items) = base.as_ref() {
+                        for item in items {
+                            if let Node::Context(entries) = item {
+                                inner.extend(entries.iter().map(|(key, _)| key.clone()));
+                            }
+                        }
+                    }
+                    collect_free_vars(idx, &mut inner, out);
+                }
             }
         }
         Node::Neg(inner) | Node::Not(inner) => collect_free_vars(inner, bound, out),
@@ -421,9 +455,23 @@ mod tests {
         // the name is that filter-local binding is self-contained.
         assert!(free("=[1, 2][item > 0]").is_empty());
         assert_eq!(free("=orders[item.price > limit]"), vec!["limit", "orders"]);
-        // A bare numeric index is NOT a filter: `item` there is a genuine
-        // outer reference and stays free.
-        assert_eq!(free("=orders[item]"), vec!["item", "orders"]);
+        // A bare variable index that is NOT in scope is not numeric, so the
+        // subscript is a filter at runtime and binds `item` over it
+        // (eval_index): `=[true, false][item]` is self-contained.
+        assert!(free("=[true, false][item]").is_empty());
+        // The same holds for a list base: with `item` absent the subscript is
+        // a filter, so `orders[item]` reads only the base (probe-verified:
+        // an unbound `item` yields `List([])`, never a numeric index).
+        assert_eq!(free("=orders[item]"), vec!["orders"]);
+        // A filter over context elements also binds each element's entries,
+        // so `=[{price: 1}][price > 0]` reads nothing from the outer scope.
+        assert!(free("=[{price: 1}][price > 0]").is_empty());
+        // A filter over a VARIABLE base cannot settle the elements' entry
+        // names statically (their values are unknowable), so a name colliding
+        // with an entry stays free: with `orders = [{price: …}]` the runtime
+        // binds `price`, but the walk must keep it free — the base alone is
+        // not proof the binding exists.
+        assert_eq!(free("=orders[price > 0]"), vec!["orders", "price"]);
         // An unparsable expression has no known free reference.
         assert!(free("=for in").is_empty());
     }

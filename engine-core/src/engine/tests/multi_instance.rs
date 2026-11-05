@@ -1335,3 +1335,112 @@ fn multi_instance_body_input_mapping_with_filter_local_item_binding_runs() {
     assert_eq!(jobs[0].variables.get("item"), Some(&Value::Int(1)));
     assert_eq!(jobs[1].variables.get("item"), Some(&Value::Int(2)));
 }
+
+#[test]
+fn multi_instance_body_input_mapping_with_filter_over_context_elements_runs() {
+    // A filter over context elements binds each element's entries over the
+    // predicate (eval_index), so `=[{price: 1}, {price: 2}][price > 1]` is
+    // self-contained even when the `inputElement` is also named `price`: the
+    // predicate reads the element's own `price`, not the per-child binding.
+    // The body must evaluate the mapping rather than skip it — skipping it
+    // here would drop the input collection's provider and silently fan out
+    // zero children (Copilot review 5778355773).
+    let def = ProcessBuilder::new("mi-filter-ctx")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("price".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=[{price: 1}, {price: 2}][price > 1]".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with("mi-filter-ctx", vars(&[])))
+        .unwrap();
+
+    // The context-filter mapping supplies the input collection: one child
+    // (only the {price: 2} element survives the filter), and the surviving
+    // element — a context — is the child's `price` binding.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "a filter over context elements must not skip the mapping"
+    );
+    let expected: crate::Value =
+        Value::Map([("price".to_string(), Value::Int(2))].into_iter().collect());
+    assert_eq!(jobs[0].variables.get("price"), Some(&expected));
+}
+
+#[test]
+fn multi_instance_body_input_mapping_with_bare_var_filter_runs() {
+    // A bare-variable subscript that is NOT in scope is not numeric, so the
+    // subscript is a filter at runtime and binds `item` over it (eval_index):
+    // `=[true, false][item]` is self-contained even when the `inputElement`
+    // is also named `item`. The body must evaluate the mapping rather than
+    // skip it (Copilot review 5778355773).
+    let def = ProcessBuilder::new("mi-bare-var-filter")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=payloads".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=[true, false][item]".to_string(),
+                    target: "payloads".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-bare-var-filter",
+            vars(&[]),
+        ))
+        .unwrap();
+
+    // The bare-var filter keeps only the `true` element: one child.
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 1, "a bare-var filter must not skip the mapping");
+    assert_eq!(jobs[0].variables.get("item"), Some(&Value::Bool(true)));
+}
