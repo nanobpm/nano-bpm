@@ -874,6 +874,15 @@ impl<'a> NanoRun<'a> {
             } => {
                 self.active_elements
                     .retain(|(eik, _, _)| eik != element_instance_key);
+                // The outgoing flow is taken from the instance that just
+                // COMPLETED. An MI body and its children share an element id, so
+                // a later child activation overwrote the body's entry; refresh it
+                // from this completing instance so the body's outgoing flow is
+                // labelled with the body's enclosing scope, not the body key.
+                if let Some(&scope) = self.flow_scopes.get(element_instance_key) {
+                    self.scope_by_element_id
+                        .insert((*instance_key, element_id.to_string()), scope);
+                }
                 vec![self.lifecycle(
                     "ELEMENT_COMPLETED",
                     element_id,
@@ -2674,3 +2683,39 @@ const CALL_ACTIVITY_BOUNDARY_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"
   </bpmndi:BPMNDiagram>
 </bpmn:definitions>
 "#;
+
+/// An MI body and its children share an element id, so a child activation
+/// overwrites the body's `scope_by_element_id` entry. The body's OUTGOING flow
+/// must still carry the body's enclosing scope (refreshed from the completing
+/// instance), not the body key.
+#[test]
+fn multi_instance_body_outgoing_flow_uses_the_enclosing_scope() {
+    let sc =
+        load_scenario(&traces_dir().join("scenarios/exclusive-gateway-subprocess-scope")).unwrap();
+    let mut run = NanoRun::new(&sc);
+    let (inst, sub, body, child) = (1_000_u64, 1_001_u64, 1_002_u64, 1_003_u64);
+    let activating = |eik, scope| Event::ElementActivating {
+        instance_key: inst,
+        element_instance_key: eik,
+        element_id: "mi".into(),
+        scope,
+    };
+    run.render(&activating(body, sub));
+    run.render(&activating(child, body));
+    run.render(&Event::ElementCompleted {
+        instance_key: inst,
+        element_instance_key: child,
+        element_id: "mi".into(),
+    });
+    run.render(&Event::ElementCompleted {
+        instance_key: inst,
+        element_instance_key: body,
+        element_id: "mi".into(),
+    });
+    let out = run.render(&Event::SequenceFlowTaken {
+        instance_key: inst,
+        from: "mi".into(),
+        to: "next".into(),
+    });
+    assert_eq!(out[0]["value"]["flowScopeKey"], json!(sub), "{out:?}");
+}

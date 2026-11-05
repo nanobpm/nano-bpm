@@ -270,3 +270,132 @@ fn multi_instance_completion_condition_sees_child_scope() {
         "third child must not start"
     );
 }
+
+/// A non-interrupting root boundary `=ping = true` whose handler sub-process
+/// writes a sub-process-LOCAL `ping`: that write is invisible to the boundary's
+/// (root) scope, so it must not re-trigger it. Before the fix the scoped write
+/// re-fired the unchanged root condition, spawning a new handler per write.
+#[test]
+fn local_write_invisible_to_a_root_boundary_does_not_retrigger_it() {
+    let def = ProcessBuilder::new("ni-cond-local")
+        .start_event("start")
+        .service_task("t", "t-work")
+        .non_interrupting_conditional_boundary_event("b", "t", "=ping = true")
+        .sub_process("h", "h_start")
+        .with_io(
+            "h",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=null".to_string(),
+                    target: "ping".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .start_event("h_start")
+        .contained_in("h_start", "h")
+        .service_task("hw", "h-work")
+        .contained_in("hw", "h")
+        .end_event("h_end")
+        .contained_in("h_end", "h")
+        .end_event("t_end")
+        .end_event("b_end")
+        .connect("start", "t")
+        .connect("t", "t_end")
+        .connect("b", "h")
+        .connect("h_start", "hw")
+        .connect("hw", "h_end")
+        .connect("h", "b_end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let ik = create_instance_key(&mut engine, "ni-cond-local");
+    let fired = engine
+        .apply_command(Command::set_variables(
+            ik,
+            vars(&[("ping", Value::Bool(true))]),
+        ))
+        .unwrap();
+    let triggers = |evs: &[Event]| {
+        evs.iter()
+            .filter(|e| matches!(e, Event::ConditionalTriggered { .. }))
+            .count()
+    };
+    assert_eq!(triggers(&fired), 1, "one root change fires exactly once");
+    let job = engine
+        .activate_jobs("h-work", "w", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("handler job");
+    let out = engine
+        .apply_command(Command::complete_job_with(
+            job.key,
+            vars(&[("ping", Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert_eq!(
+        triggers(&out),
+        0,
+        "a handler-local `ping` write must not re-trigger the root boundary"
+    );
+}
+
+/// The completion condition reads the same post-output view as
+/// `outputElement`: a value produced only by the MI element's output mapping
+/// must be visible to it.
+#[test]
+fn multi_instance_completion_condition_sees_output_mapped_value() {
+    let def = ProcessBuilder::new("mi-cc-output")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: Some("=stop = true".to_string()),
+                sequential: true,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=item = 2".to_string(),
+                    target: "stop".to_string(),
+                }],
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-cc-output",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    complete_one(&mut engine, "handle");
+    complete_one(&mut engine, "handle");
+    assert!(
+        has_job(&mut engine, "sink-work"),
+        "completion condition must see the output-mapped `stop`"
+    );
+    assert!(
+        !has_job(&mut engine, "handle"),
+        "third child must not start"
+    );
+}

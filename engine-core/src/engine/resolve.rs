@@ -312,6 +312,36 @@ impl Engine {
         }
     }
 
+    /// The scope that `name` resolves to when read from `element_instance_key`:
+    /// the innermost scope on its chain holding a local `name`, else the root
+    /// (instance key). `None` when the instance is unknown. This is the
+    /// visibility/shadowing rule of [`Self::visible_variables`], for one name.
+    pub(crate) fn resolving_scope(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        name: &str,
+    ) -> Option<Key> {
+        let instance = self.state.instances.get(&instance_key)?;
+        let mut cur = self.variable_scope_of(instance, element_instance_key);
+        let mut steps = 0usize;
+        while cur != instance.key && steps <= instance.scope_parents.len() {
+            if instance
+                .scope_variables
+                .get(&cur)
+                .is_some_and(|l| l.contains_key(name))
+            {
+                return Some(cur);
+            }
+            match instance.scope_parents.get(&cur) {
+                Some(&parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+            steps += 1;
+        }
+        Some(instance.key)
+    }
+
     /// The variables visible in `scope_key`, resolving each name from the scope
     /// upward to the root (a local binding shadows an ancestor's). The root scope
     /// with no child scopes is the hot path: it returns the shared `variables`
