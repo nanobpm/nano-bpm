@@ -534,7 +534,10 @@ fn assert_routing_failure_parks_activating(
     assert_eq!(
         lifecycle_of(&resolved, "g"),
         vec!["Activated", "Completing", "Completed"],
-        "{gateway:?}: resolution activates then completes: {resolved:?}"
+        "{gateway:?}: resolution re-runs the full gated activation ON the \
+         parked element instance (Zeebe's resolve re-drives `onActivate` on \
+         the same element instance — no second `ELEMENT_ACTIVATING`): \
+         {resolved:?}"
     );
     assert!(engine.active_incidents().is_empty());
     assert!(
@@ -857,10 +860,32 @@ fn assert_start_listener_defers_the_routing_gate(gateway: SplitGateway) {
         .unwrap();
     assert_eq!(
         lifecycle_of(&resolved, "g"),
-        vec!["Activated", "Completing", "Completed"],
-        "{gateway:?}: resolution activates then completes the gateway through \
-         the fresh selection (the listener chain is not re-opened on the \
-         retry): {resolved:?}"
+        vec!["Activated"],
+        "{gateway:?}: resolution re-runs the full gated activation on the \
+         parked instance: the gate passes, the gateway activates, and the \
+         `start` listener chain the failed attempt never opened runs before \
+         the behaviour: {resolved:?}"
+    );
+    assert!(
+        resolved.iter().any(|e| matches!(
+            e,
+            Event::ExecutionListenerJobCreated {
+                event_type: ListenerEventType::Start,
+                ..
+            }
+        )),
+        "{gateway:?}: the retry opens the start-listener chain: {resolved:?}"
+    );
+    let listener = engine.activate_jobs("gate-listener", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "{gateway:?}: one start-listener job");
+    let drained = engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&drained, "g"),
+        vec!["Completing", "Completed"],
+        "{gateway:?}: the drained listener completes the gateway through the \
+         retry's journaled selection: {drained:?}"
     );
     assert!(engine.active_incidents().is_empty());
     assert!(engine.is_completed(inst), "{gateway:?}");
@@ -874,4 +899,134 @@ fn exclusive_gateway_start_listener_defers_the_routing_gate() {
 #[test]
 fn inclusive_split_start_listener_defers_the_routing_gate() {
     assert_start_listener_defers_the_routing_gate(SplitGateway::Inclusive);
+}
+
+/// `start → g (split, `start` execution listener) → end`, one conditional
+/// flow `amount > 100` — the retry-companion of
+/// [`start_listener_split_gateway_process`]: the routing incident's resolution
+/// must re-run the SAME gated activation (routing gate, then the unopened
+/// start-listener chain), not a bare behaviour redrive.
+fn assert_retry_redrives_the_gated_activation(gateway: SplitGateway) {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            start_listener_split_gateway_process(gateway),
+        ))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "split-listener",
+            HashMap::from([("amount".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        lifecycle_of(&created, "g"),
+        vec!["Activating"],
+        "{gateway:?}: parked ACTIVATING on the routing incident: {created:?}"
+    );
+    let incident_key = engine.active_incidents()[0].key;
+
+    // Resolve with variables that STILL match nothing: the retry must re-run
+    // the routing gate and park again while ACTIVATING — never emitting
+    // `ElementActivated`, and never minting the start-listener job for a
+    // gateway that still cannot route.
+    let retried = engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&retried, "g"),
+        Vec::<&'static str>::new(),
+        "{gateway:?}: a still-failing retry re-runs the gate on the same \
+         parked instance and re-raises the incident — no `ElementActivated`, \
+         no second `ElementActivating`: {retried:?}"
+    );
+    assert!(
+        !retried
+            .iter()
+            .any(|e| matches!(e, Event::ExecutionListenerJobCreated { .. })),
+        "{gateway:?}: no listener job for a retry that still cannot route: \
+         {retried:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(
+        incidents.len(),
+        1,
+        "{gateway:?}: the retry re-raises the routing incident: {incidents:?}"
+    );
+    assert_eq!(
+        incidents[0].kind,
+        state::IncidentKind::NoMatchingSequenceFlow,
+        "{gateway:?}"
+    );
+    assert_eq!(
+        incidents[0].redrive,
+        Some(state::IoMappingRedrive::ActivationPending),
+        "{gateway:?}: the re-raised incident stays activation-phase: {:?}",
+        incidents[0]
+    );
+
+    // Now fix the variable and resolve: the retry re-runs the gate, which
+    // passes — so the gateway activates and its `start` listener chain (never
+    // opened on the failed attempts) runs before the behaviour completes
+    // through the freshly journaled selection.
+    let retry_incident_key = incidents[0].key;
+    drop(incidents);
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+    let resolved = engine
+        .apply_command(Command::resolve_incident(retry_incident_key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&resolved, "g"),
+        vec!["Activated"],
+        "{gateway:?}: the successful retry re-runs the gated activation on the \
+         parked instance and parks on its start listener: {resolved:?}"
+    );
+    assert!(
+        resolved.iter().any(|e| matches!(
+            e,
+            Event::ExecutionListenerJobCreated {
+                event_type: ListenerEventType::Start,
+                ..
+            }
+        )),
+        "{gateway:?}: the retry opens the start-listener chain the failed \
+         attempts never reached: {resolved:?}"
+    );
+
+    let listener = engine.activate_jobs("gate-listener", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "{gateway:?}: one start-listener job");
+    let drained = engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert_eq!(
+        lifecycle_of(&drained, "g"),
+        vec!["Completing", "Completed"],
+        "{gateway:?}: the drained listener completes the gateway through the \
+         retry's journaled selection: {drained:?}"
+    );
+    assert!(
+        drained.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "g" && to == "e"
+        )),
+        "{gateway:?}: the retry's selection routes to `e`: {drained:?}"
+    );
+    assert!(engine.active_incidents().is_empty(), "{gateway:?}");
+    assert!(engine.is_completed(inst), "{gateway:?}");
+}
+
+#[test]
+fn exclusive_gateway_retry_redrives_the_gated_activation() {
+    assert_retry_redrives_the_gated_activation(SplitGateway::Exclusive);
+}
+
+#[test]
+fn inclusive_split_retry_redrives_the_gated_activation() {
+    assert_retry_redrives_the_gated_activation(SplitGateway::Inclusive);
 }

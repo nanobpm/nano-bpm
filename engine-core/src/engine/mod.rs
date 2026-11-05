@@ -3078,6 +3078,31 @@ impl Engine {
                             });
                         } else if matches!(
                             redrive,
+                            Some(
+                                state::IoMappingRedrive::Activation
+                                    | state::IoMappingRedrive::ActivationPending
+                            )
+                        ) {
+                            // An activation-phase failure on these kinds — the
+                            // split-gateway routing gate (#1402): the token is
+                            // still ACTIVATING, so re-drive the gated activation
+                            // (input re-application, routing gate, the unopened
+                            // `start` listener chain). Re-driving `Complete`
+                            // would bypass the gate: a still-failing retry would
+                            // raise the routing incident AFTER `ElementActivated`,
+                            // and a successful one would skip the listener jobs
+                            // the failed attempt never created.
+                            queue.push_back(Step::RetryActivation {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                pending: matches!(
+                                    redrive,
+                                    Some(state::IoMappingRedrive::ActivationPending)
+                                ),
+                            });
+                        } else if matches!(
+                            redrive,
                             Some(state::IoMappingRedrive::CallActivitySpawn)
                                 | Some(state::IoMappingRedrive::AdHocCallActivitySpawn { .. })
                         ) {
@@ -4424,6 +4449,79 @@ impl Engine {
                     }
                 }
 
+                // 5c. A split gateway paused mid-activation (a `start` listener
+                //     chain is draining) carries its activation-time outgoing-flow
+                //     selection as SOURCE-definition indices (`gateway_routes`,
+                //     #1402), which the applier cannot remap — a sequence-flow
+                //     index is a document-order position, not an id, and the
+                //     mapping instructions name elements, not flows. Migration
+                //     swaps the definition those indices are read against, so a
+                //     reordered, removed, or rewired target flow would complete
+                //     the migrated gateway onto the wrong branch (or panic
+                //     `take_flow` on an index the target no longer has). Require
+                //     the target gateway's outgoing list to carry the SAME flows
+                //     in the SAME order — each target flow's condition, default
+                //     flag, and (mapped) target equal to the source's — so every
+                //     carried index resolves identically. This is the flow-level
+                //     analogue of the `MigratedJoinFlowMissing` guard above; a
+                //     migration that rewires a paused gateway's flows is rejected
+                //     until flow-index remapping lands.
+                let mut carried: Vec<(String, Vec<usize>)> = instance
+                    .gateway_routes
+                    .iter()
+                    .filter(|(_, flows)| !flows.is_empty())
+                    .filter_map(|(eik, flows)| {
+                        instance
+                            .active
+                            .get(eik)
+                            .map(|eid| (eid.clone(), flows.clone()))
+                    })
+                    .collect();
+                carried.sort();
+                for (src, carried_flows) in carried {
+                    #[allow(
+                        clippy::expect_used,
+                        reason = "a carried route's gateway is active, so step 5 guarantees it is mapped"
+                    )]
+                    let tgt = mapped.get(&src).expect(
+                        "a carried route's gateway is active, so step 5 guarantees it is mapped",
+                    );
+                    let source_flows = source_def
+                        .definition
+                        .element(&src)
+                        .map(|e| e.outgoing.clone())
+                        .unwrap_or_default();
+                    let target_flows = target
+                        .definition
+                        .element(tgt)
+                        .map(|e| e.outgoing.clone())
+                        .unwrap_or_default();
+                    // The source flow's target migrates by the element mapping;
+                    // an unmapped flow target keeps its id (the applier's
+                    // `remap_id` does the same).
+                    let remap_target =
+                        |to: &str| mapped.get(to).cloned().unwrap_or_else(|| to.to_string());
+                    let same_flow = |sf: &SequenceFlow, tf: &SequenceFlow| {
+                        remap_target(&sf.to) == tf.to
+                            && sf.is_default == tf.is_default
+                            && sf.condition.as_ref().map(|c| &c.expression)
+                                == tf.condition.as_ref().map(|c| &c.expression)
+                    };
+                    let flows_preserved = source_flows.len() == target_flows.len()
+                        && source_flows
+                            .iter()
+                            .zip(target_flows.iter())
+                            .all(|(sf, tf)| same_flow(sf, tf));
+                    if !flows_preserved {
+                        return Err(EngineError::MigratedGatewayRouteMissing {
+                            instance_key,
+                            source_element_id: src.clone(),
+                            target_element_id: tgt.clone(),
+                            flow_index: carried_flows[0],
+                        });
+                    }
+                }
+
                 // 6. All preconditions hold: emit the migration fact. The applier
                 //    rewrites the instance's process id and re-points every active
                 //    element instance and its attached runtime.
@@ -5693,12 +5791,46 @@ impl Engine {
                 instance_key,
                 element_instance_key,
                 element_id,
-                pending,
+                pending: activation_pending,
             } => {
-                // The element instance is already ACTIVATED (parked on the
-                // resolved input-mapping incident); reconstruct its enclosing
-                // scope and re-run the activation body so the now-fixed input
-                // mappings are re-applied before the element's behaviour runs.
+                // The element instance is parked on the resolved activation-time
+                // incident; re-drive the activation so the now-fixed input
+                // mappings / routing conditions are re-applied before the
+                // element's behaviour runs. A split gateway (exclusive, or an
+                // inclusive fork) re-runs the FULL gated activation
+                // (`Step::Activate`, #1402): the routing gate, the journaled
+                // selection, and the `start` listener chain the failed attempt
+                // never opened. A bare body redrive would activate a retry that
+                // still matches no flow (raising the routing incident AFTER
+                // `ElementActivated`) and would skip the listener chain on a
+                // successful one.
+                let kind = self.element_kind(instance_key, &element_id);
+                let is_split_gateway = matches!(
+                    kind,
+                    Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway)
+                ) && self.join_kind(instance_key, &element_id).is_none();
+                if is_split_gateway {
+                    let scope = self.scope_of(instance_key, element_instance_key);
+                    // Re-drive the gated activation ON the parked element
+                    // instance (Zeebe's resolve re-runs `onActivate` on the same
+                    // element instance — no second `ELEMENT_ACTIVATING`). The
+                    // parked token was never observable (no `ElementActivated`,
+                    // no listener job, no scope writes precede the incident, and
+                    // a gateway arms no boundary events), so reusing it carries
+                    // nothing stale: the gate re-selects and re-journals the
+                    // route, overwriting any carried selection the failed attempt
+                    // recorded.
+                    return self.activate_reusing(
+                        instance_key,
+                        element_id,
+                        scope,
+                        None,
+                        pending,
+                        Some(element_instance_key),
+                    );
+                }
+                // Any other element: reconstruct its enclosing scope and re-run
+                // the activation body.
                 let scope = self.scope_of(instance_key, element_instance_key);
                 // Re-evaluate in the same view as the first attempt: an element
                 // whose own scope is already registered (a modification seeded
@@ -5729,7 +5861,7 @@ impl Engine {
                     scope,
                     view,
                 );
-                if pending {
+                if activation_pending {
                     (gate_activated(events, activated, 0), followups)
                 } else {
                     (events, followups)
@@ -5864,6 +5996,25 @@ impl Engine {
         via: Option<IncomingFlow>,
         pending: &VecDeque<Step>,
     ) -> (Vec<Event>, Vec<Step>) {
+        self.activate_reusing(instance_key, element_id, scope, via, pending, None)
+    }
+
+    /// [`activate`] with an optional parked element instance to re-drive: a
+    /// split-gateway routing-gate retry (#1402) resolves the incident on the
+    /// token that parked ACTIVATING, so the retry re-runs the gated activation
+    /// ON that instance (Zeebe's resolve re-drives `onActivate` on the same
+    /// element instance — no second `ELEMENT_ACTIVATING` is written). `None`
+    /// mints a fresh instance and emits `ElementActivating`, exactly as
+    /// [`activate`] always has.
+    fn activate_reusing(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        scope: Key,
+        via: Option<IncomingFlow>,
+        pending: &VecDeque<Step>,
+        reuse: Option<Key>,
+    ) -> (Vec<Event>, Vec<Step>) {
         // A parallel or inclusive gateway with more than one incoming flow is a
         // join: its activation is guarded instead of running per arrival.
         if let Some(join) = self.join_kind(instance_key, &element_id) {
@@ -5890,19 +6041,24 @@ impl Engine {
             }
         }
 
-        let element_instance_key = self.mint_key();
+        // A retry re-drives the parked instance; a fresh activation mints one
+        // and records its `ElementActivating`.
+        let element_instance_key = reuse.unwrap_or_else(|| self.mint_key());
         let activated = Event::ElementActivated {
             instance_key,
             element_instance_key,
             element_id: element_id.clone(),
             scope,
         };
-        let mut events = vec![Event::ElementActivating {
-            instance_key,
-            element_instance_key,
-            element_id: element_id.clone(),
-            scope,
-        }];
+        let mut events = Vec::new();
+        if reuse.is_none() {
+            events.push(Event::ElementActivating {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+                scope,
+            });
+        }
         let mut followups = Vec::new();
 
         // A sub-process is itself a variable scope: it always registers its scope
@@ -5930,9 +6086,11 @@ impl Engine {
             self.activate_body(instance_key, element_id, element_instance_key, scope);
         events.extend(body_events);
         followups.extend(body_followups);
-        // `ElementActivated` sits right after `ElementActivating` — unless the
-        // activation body parked the token on an activation-time incident.
-        (gate_activated(events, activated, 1), followups)
+        // `ElementActivated` sits right after `ElementActivating` (or first,
+        // for a re-driven parked instance) — unless the activation body parked
+        // the token on an activation-time incident.
+        let at = if reuse.is_some() { 0 } else { 1 };
+        (gate_activated(events, activated, at), followups)
     }
 
     /// The element's activation body: everything between `ElementActivated` and
@@ -13581,6 +13739,21 @@ pub enum EngineError {
         flow_source_element_id: String,
         flow_ordinal: usize,
     },
+    /// A `MigrateInstance` moved a split gateway (exclusive, or an inclusive
+    /// fork) whose activation-time outgoing-flow selection is still carried
+    /// ([`Event::GatewayRouteSelected`], #1402) onto a target gateway whose
+    /// outgoing flows no longer contain that selection: the carried indices are
+    /// source-definition positions, so a reordered, removed, or differently
+    /// routed target flow would complete the migrated gateway onto the wrong
+    /// branch (or panic `take_flow`). Every carried flow must exist in the
+    /// target with the same condition, the same default flag, and a target
+    /// element the source flow's target maps to. Maps to HTTP 409.
+    MigratedGatewayRouteMissing {
+        instance_key: Key,
+        source_element_id: String,
+        target_element_id: String,
+        flow_index: usize,
+    },
     /// A `MigrateInstance` targeted an instance that contains an active element
     /// class this phase does not yet support migrating (boundary events, event
     /// subprocesses, multi-instance bodies, call activities, event-based-gateway
@@ -14081,6 +14254,20 @@ impl std::fmt::Display for EngineError {
                     "migration of instance {instance_key} maps open join {source_element_id} \
                      to {target_element_id}, but the join holds a token on flow #{flow_ordinal} from \
                      {flow_source_element_id}, which is not an incoming flow of {target_element_id}"
+                )
+            }
+            EngineError::MigratedGatewayRouteMissing {
+                instance_key,
+                source_element_id,
+                target_element_id,
+                flow_index,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} maps split gateway {source_element_id} \
+                     to {target_element_id}, but the gateway's carried activation-time selection \
+                     names source outgoing flow #{flow_index}, which has no equal outgoing flow \
+                     (same condition, default flag, and mapped target) on {target_element_id}"
                 )
             }
             EngineError::UnsupportedMigration {

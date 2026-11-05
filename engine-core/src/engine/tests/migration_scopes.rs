@@ -1508,3 +1508,326 @@ fn migration_rejects_parallel_to_sequential_multi_instance() {
 fn migration_rejects_sequential_to_parallel_multi_instance() {
     assert_loop_kind_change_rejected(true, false);
 }
+
+// ---------------------------------------------------------------------------
+// #1402 — a split gateway paused mid-activation (its `start` listener chain is
+// draining) carries its activation-time outgoing-flow selection as
+// source-definition indices (`gateway_routes`). Migration swaps the definition
+// those indices are read against, so a target whose outgoing flows no longer
+// contain the selection is rejected (`MigratedGatewayRouteMissing`) instead of
+// completing the migrated gateway onto the wrong branch (or panicking
+// `take_flow`); a target that preserves the carried flow migrates cleanly.
+// ---------------------------------------------------------------------------
+
+/// `start → g (split, `start` listener) → a / b`: source and target differ only
+/// in the process id and the gateway id (the target's outgoing flows are
+/// document-order identical, so the carried selection survives).
+/// Which split-gateway kind the migration fixtures use (a plain enum:
+/// `ElementKind` is not `Clone`-free to pass around).
+#[derive(Clone, Copy)]
+enum SplitGw {
+    Exclusive,
+    Inclusive,
+}
+
+fn listener_split_gateway_pair(
+    gateway: SplitGw,
+    source_gw: &str,
+    target_gw: &str,
+) -> (ProcessDefinition, ProcessDefinition) {
+    let build = |id: &str, gw: &str| {
+        let builder = ProcessBuilder::new(id).start_event("start");
+        let builder = match gateway {
+            SplitGw::Exclusive => builder.exclusive_gateway(gw),
+            SplitGw::Inclusive => builder.inclusive_gateway(gw),
+        };
+        builder
+            .with_listeners(
+                gw,
+                vec![el(ListenerEventType::Start, "gate-listener")],
+                Vec::new(),
+            )
+            .service_task("a", "work_a")
+            .service_task("b", "work_b")
+            .end_event("end")
+            .connect("start", gw)
+            .connect_when(gw, "a", "amount > 100")
+            .connect(gw, "b")
+            .connect("a", "end")
+            .connect("b", "end")
+            .build()
+            .unwrap()
+    };
+    (build("source", source_gw), build("target", target_gw))
+}
+
+/// Deploys the pair, starts an instance with `amount = 500` (the gateway
+/// selects flow #0 → `a`), and parks the gateway on its `start` listener with
+/// the selection journaled. Returns `(engine, instance_key, target_key)`.
+fn gateway_paused_on_listener(gateway: SplitGw) -> (Engine, Key, Key) {
+    let (source, target) = listener_split_gateway_pair(gateway, "g", "g2");
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, source);
+    let target_key = deploy_for_migration(&mut engine, target);
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "source",
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    // An exclusive gateway selects only the first matching flow (#0 → `a`); an
+    // inclusive fork also takes the unconditional `b` flow (#1).
+    let expected = match gateway {
+        SplitGw::Exclusive => vec![0],
+        SplitGw::Inclusive => vec![0, 1],
+    };
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.gateway_routes.values().collect::<Vec<_>>(),
+        vec![&expected],
+        "the activation-time selection is journaled while the gateway parks \
+         on its start listener"
+    );
+    (engine, inst, target_key)
+}
+
+fn assert_carried_route_survives_compatible_migration(gateway: SplitGw) {
+    let (mut engine, inst, target_key) = gateway_paused_on_listener(gateway);
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[
+                ("g", "g2"),
+                ("a", "a"),
+                ("b", "b"),
+                ("start", "start"),
+                ("end", "end"),
+            ]),
+        ))
+        .unwrap();
+
+    // The carried selection still routes the drained listener's completion to
+    // `a` under the target definition.
+    let listener = engine.activate_jobs("gate-listener", "W", 10, 1_000, 0);
+    assert_eq!(
+        listener.len(),
+        1,
+        "the start-listener job survives migration"
+    );
+    let drained = engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert!(
+        drained.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "g2" && to == "a"
+        )),
+        "the migrated gateway completes through its carried selection: {drained:?}"
+    );
+    complete_one(&mut engine, "work_a");
+    if matches!(gateway, SplitGw::Inclusive) {
+        // The inclusive fork's carried selection also took the unconditional
+        // `b` flow.
+        assert!(
+            drained.iter().any(|e| matches!(
+                e,
+                Event::SequenceFlowTaken { from, to, .. } if from == "g2" && to == "b"
+            )),
+            "the inclusive fork's carried selection keeps both flows: {drained:?}"
+        );
+        complete_one(&mut engine, "work_b");
+    }
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Completed
+    );
+}
+
+#[test]
+fn exclusive_gateway_carried_route_survives_compatible_migration() {
+    assert_carried_route_survives_compatible_migration(SplitGw::Exclusive);
+}
+
+#[test]
+fn inclusive_split_carried_route_survives_compatible_migration() {
+    assert_carried_route_survives_compatible_migration(SplitGw::Inclusive);
+}
+
+/// Target variant whose gateway drops the conditional flow the source selected
+/// (only the unconditional `b` flow remains).
+fn listener_split_gateway_target_without_selected_flow(gateway: SplitGw) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("target").start_event("start");
+    let builder = match gateway {
+        SplitGw::Exclusive => builder.exclusive_gateway("g2"),
+        SplitGw::Inclusive => builder.inclusive_gateway("g2"),
+    };
+    builder
+        .with_listeners(
+            "g2",
+            vec![el(ListenerEventType::Start, "gate-listener")],
+            Vec::new(),
+        )
+        .service_task("b", "work_b")
+        .end_event("end")
+        .connect("start", "g2")
+        .connect("g2", "b")
+        .connect("b", "end")
+        .build()
+        .unwrap()
+}
+
+fn assert_migration_rejects_a_missing_carried_route(gateway: SplitGw) {
+    let (source, _) = listener_split_gateway_pair(gateway, "g", "g2");
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, source);
+    let target_key = deploy_for_migration(
+        &mut engine,
+        listener_split_gateway_target_without_selected_flow(gateway),
+    );
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "source",
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let expected = match gateway {
+        SplitGw::Exclusive => vec![0],
+        SplitGw::Inclusive => vec![0, 1],
+    };
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .gateway_routes
+            .values()
+            .collect::<Vec<_>>(),
+        vec![&expected],
+        "the activation-time selection is carried"
+    );
+
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[("g", "g2"), ("b", "b"), ("start", "start"), ("end", "end")]),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::MigratedGatewayRouteMissing {
+                ref source_element_id,
+                ref target_element_id,
+                flow_index: 0,
+                ..
+            } if source_element_id == "g" && target_element_id == "g2"
+        ),
+        "the carried flow #0 (→ `a`) has no equal outgoing flow on the target: {err:?}"
+    );
+}
+
+#[test]
+fn exclusive_gateway_migration_rejects_a_missing_carried_route() {
+    assert_migration_rejects_a_missing_carried_route(SplitGw::Exclusive);
+}
+
+#[test]
+fn inclusive_split_migration_rejects_a_missing_carried_route() {
+    assert_migration_rejects_a_missing_carried_route(SplitGw::Inclusive);
+}
+
+/// Target variant whose gateway keeps both flows but REORDERED (the
+/// unconditional `b` flow first, the conditional `a` flow second), so source
+/// index 0 would resolve to the wrong branch.
+fn listener_split_gateway_target_reordered(gateway: SplitGw) -> ProcessDefinition {
+    let builder = ProcessBuilder::new("target").start_event("start");
+    let builder = match gateway {
+        SplitGw::Exclusive => builder.exclusive_gateway("g2"),
+        SplitGw::Inclusive => builder.inclusive_gateway("g2"),
+    };
+    builder
+        .with_listeners(
+            "g2",
+            vec![el(ListenerEventType::Start, "gate-listener")],
+            Vec::new(),
+        )
+        .service_task("a", "work_a")
+        .service_task("b", "work_b")
+        .end_event("end")
+        .connect("start", "g2")
+        .connect("g2", "b")
+        .connect_when("g2", "a", "amount > 100")
+        .connect("a", "end")
+        .connect("b", "end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn exclusive_gateway_migration_rejects_a_reordered_carried_route() {
+    let (source, _) = listener_split_gateway_pair(SplitGw::Exclusive, "g", "g2");
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, source);
+    let target_key = deploy_for_migration(
+        &mut engine,
+        listener_split_gateway_target_reordered(SplitGw::Exclusive),
+    );
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "source",
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // The reordered target's index 0 is now the unconditional `b` flow, so the
+    // carried index would resolve to the wrong branch: the migration is
+    // rejected rather than silently re-reading the source position.
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            pairs(&[
+                ("g", "g2"),
+                ("a", "a"),
+                ("b", "b"),
+                ("start", "start"),
+                ("end", "end"),
+            ]),
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            EngineError::MigratedGatewayRouteMissing {
+                ref source_element_id,
+                ref target_element_id,
+                flow_index: 0,
+                ..
+            } if source_element_id == "g" && target_element_id == "g2"
+        ),
+        "a reordered target flow must not silently re-read source index 0: {err:?}"
+    );
+    // The instance is unmigrated: the gateway is still parked on its listener
+    // under the source definition, and completing it routes to `a`.
+    let listener = engine.activate_jobs("gate-listener", "W", 10, 1_000, 0);
+    let drained = engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert!(
+        drained.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "g" && to == "a"
+        )),
+        "the rejected migration leaves the source route intact: {drained:?}"
+    );
+}
