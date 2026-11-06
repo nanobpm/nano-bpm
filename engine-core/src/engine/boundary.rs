@@ -3,14 +3,17 @@
 use super::*;
 
 impl Engine {
-    /// The compensation handler activity ids wired — via a compensation boundary
-    /// event — to the completed activity `element_id`. Sorted by boundary id so
-    /// selection stays deterministic when an activity carries several.
-    pub(crate) fn compensation_handlers_for(
+    /// The compensation boundary events attached to the completed activity
+    /// `element_id`, as `(boundary id, handler id)` pairs sorted by boundary id
+    /// so selection stays deterministic when an activity carries several. The
+    /// single model query behind both subscription registration
+    /// ([`compensation_handlers_for`]) and the boundary lifecycle a
+    /// compensation trigger journals (#1424).
+    pub(crate) fn compensation_boundaries_for(
         &self,
         instance_key: Key,
         element_id: &str,
-    ) -> Vec<ElementId> {
+    ) -> Vec<(ElementId, ElementId)> {
         let Some(process) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
@@ -26,7 +29,36 @@ impl Engine {
             })
             .collect();
         wired.sort();
-        wired.into_iter().map(|(_, handler)| handler).collect()
+        wired
+    }
+
+    /// The compensation handler activity ids wired — via a compensation boundary
+    /// event — to the completed activity `element_id`, in boundary-id order.
+    pub(crate) fn compensation_handlers_for(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Vec<ElementId> {
+        self.compensation_boundaries_for(instance_key, element_id)
+            .into_iter()
+            .map(|(_, handler)| handler)
+            .collect()
+    }
+
+    /// The compensation boundary event that wires `handler` to the completed
+    /// activity `attached_to` — the element Zeebe activates and completes
+    /// before the handler when compensation is triggered (#1424). `None` only
+    /// if the model no longer carries the wiring.
+    pub(crate) fn compensation_boundary_of(
+        &self,
+        instance_key: Key,
+        attached_to: &str,
+        handler: &str,
+    ) -> Option<ElementId> {
+        self.compensation_boundaries_for(instance_key, attached_to)
+            .into_iter()
+            .find(|(_, h)| h == handler)
+            .map(|(boundary, _)| boundary)
     }
 
     /// Computes the full fan-out of a whole-scope compensation throw running in
@@ -43,6 +75,11 @@ impl Engine {
     /// * `handler_scopes` — aligned with `handler_keys`: the scope each
     ///   handler's subscription was recorded in (the durable handler -> scope
     ///   relationship bottom-to-top scope completion needs);
+    /// * `boundaries` — the compensation boundary event (element id + freshly
+    ///   minted element-instance key) each triggered boundary subscription
+    ///   fires through, in trigger order (#1424): Zeebe journals its full
+    ///   ACTIVATING/ACTIVATED/COMPLETING/COMPLETED lifecycle before the
+    ///   handlers activate;
     /// * `scope_sub_parents` — aligned with `scope_subs`: the scope each scope
     ///   subscription was recorded in (its enclosing scope subscription, or the
     ///   throw's own scope);
@@ -66,6 +103,7 @@ impl Engine {
         handlers: &mut Vec<ElementId>,
         handler_keys: &mut Vec<Key>,
         handler_scopes: &mut Vec<Key>,
+        boundaries: &mut Vec<(ElementId, Key)>,
         scope_subs: &mut Vec<Key>,
         scope_sub_parents: &mut Vec<Key>,
         consumed: &mut Vec<Key>,
@@ -107,6 +145,11 @@ impl Engine {
                     .unwrap_or_default();
                 stack.push((target.element_instance_key, nested.into_iter()));
             } else {
+                if let Some(boundary) =
+                    self.compensation_boundary_of(instance_key, &target.element_id, &target.handler)
+                {
+                    boundaries.push((boundary, self.mint_key()));
+                }
                 handlers.push(target.handler.clone());
                 handler_keys.push(self.mint_key());
                 handler_scopes.push(current);

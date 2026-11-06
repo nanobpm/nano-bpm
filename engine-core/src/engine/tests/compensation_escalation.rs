@@ -30,6 +30,7 @@ fn should_run_the_compensation_handler_when_a_compensation_throw_event_fires() {
         Event::CompensationTriggered { throw_element_id, handlers, .. }
             if throw_element_id == "throw" && handlers == &vec!["cancel".to_string()]
     )));
+    assert_boundary_lifecycles_journaled(&engine, instance_key, &events, &["book-comp"]);
     // the throw's outgoing flow has NOT been taken yet
     assert!(!events
         .iter()
@@ -1534,6 +1535,7 @@ fn whole_scope_throw_triggers_handlers_in_nested_subprocesses() {
         )),
         "the whole-scope throw must trigger BOTH in-scope handlers, including the nested one"
     );
+    assert_boundary_lifecycles_journaled(&engine, instance_key, &events, &["compA", "compB"]);
     assert!(
         !events
             .iter()
@@ -2909,4 +2911,84 @@ fn compensable_sub_process_inside_a_handler_registers_no_subscription() {
 #[test]
 fn compensable_sub_process_with_end_listener_inside_a_handler_registers_no_subscription() {
     run_compensable_sub_process_inside_handler(true);
+}
+
+/// Defect class (#1424): when a compensation throw triggers its handlers, Zeebe
+/// journals each triggered compensation **boundary event**'s full element
+/// lifecycle — ACTIVATING, ACTIVATED, COMPLETING, COMPLETED, in that order —
+/// before any handler activates. Guards every trigger path (single-activity
+/// #897 and whole-scope #901): each `expected` boundary runs exactly one such
+/// lifecycle under one element-instance key, all of them precede the first
+/// handler activation, and no boundary token is left live afterwards.
+fn assert_boundary_lifecycles_journaled(
+    engine: &Engine,
+    instance_key: Key,
+    events: &[Event],
+    expected: &[&str],
+) {
+    let handlers: Vec<String> = events
+        .iter()
+        .find_map(|e| match e {
+            Event::CompensationTriggered { handlers, .. } => Some(handlers.clone()),
+            _ => None,
+        })
+        .expect("the throw triggers compensation");
+    let first_handler = events
+        .iter()
+        .position(|e| {
+            matches!(e, Event::ElementActivating { element_id, .. } if handlers.contains(element_id))
+        })
+        .expect("a handler activates");
+    for boundary in expected {
+        let lifecycle: Vec<(&str, Key, usize)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Event::ElementActivating {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("ACTIVATING", *element_instance_key, i)),
+                Event::ElementActivated {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("ACTIVATED", *element_instance_key, i)),
+                Event::ElementCompleting {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("COMPLETING", *element_instance_key, i)),
+                Event::ElementCompleted {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("COMPLETED", *element_instance_key, i)),
+                _ => None,
+            })
+            .collect();
+        let intents: Vec<&str> = lifecycle.iter().map(|(intent, _, _)| *intent).collect();
+        assert_eq!(
+            intents,
+            ["ACTIVATING", "ACTIVATED", "COMPLETING", "COMPLETED"],
+            "boundary `{boundary}` must journal its full lifecycle exactly once"
+        );
+        let key = lifecycle[0].1;
+        assert!(
+            lifecycle.iter().all(|(_, k, _)| *k == key),
+            "boundary `{boundary}` lifecycle must use one element-instance key"
+        );
+        assert!(
+            lifecycle.iter().all(|(_, _, i)| *i < first_handler),
+            "boundary `{boundary}` must complete before any handler activates (Zeebe order)"
+        );
+        assert!(
+            !engine
+                .instance(instance_key)
+                .unwrap()
+                .active
+                .contains_key(&key),
+            "boundary `{boundary}` must not be left live"
+        );
+    }
 }
