@@ -2302,54 +2302,40 @@ impl Engine {
                     },
                 );
                 if !variables.is_empty() {
-                    // #985 / #1430: a terminate end's end chain mirrors its output
-                    // projection onto shadowing element locals so later listeners
-                    // read it. A listener's own result must be mirrored the same
-                    // way, or the stale local shadows it for listeners 1..n and an
-                    // incident resume (the propagation below starts at the flow
-                    // scope and never touches the element's own scope).
-                    if matches!(
-                        job_kind,
-                        state::JobKind::ExecutionListener {
-                            event_type: crate::model::ListenerEventType::End,
-                            ..
-                        }
-                    ) && matches!(
-                        self.element_kind(instance_key, &element_id),
-                        Some(ElementKind::TerminateEndEvent)
-                    ) {
-                        let shadowed: HashMap<String, Value> = self
-                            .state
-                            .instances
-                            .get(&instance_key)
-                            .and_then(|i| i.scope_variables.get(&element_instance_key))
-                            .map(|local| {
-                                variables
-                                    .iter()
-                                    .filter(|(k, _)| local.contains_key(*k))
-                                    .map(|(k, v)| (k.clone(), v.clone()))
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        if !shadowed.is_empty() {
-                            self.emit(
-                                &mut log,
-                                Event::ScopedVariablesUpdated {
-                                    instance_key,
-                                    scope_key: element_instance_key,
-                                    variables: shadowed,
-                                },
-                            );
-                        }
-                    }
                     // #1437 (Zeebe parity): an execution-listener job's completion
                     // variables are written as LOCAL variables of the listener's
                     // element instance (Zeebe VARIABLE CREATED at the element's
                     // scopeKey) — they do NOT propagate to the defining ancestor
                     // or the process root. Later listeners in the chain and the
                     // element's own behaviour still read them through the scope
-                    // chain (an element-local binding shadows the root).
+                    // chain (an element-local binding shadows the root). This is
+                    // also the sole local writer for a terminate end's end chain:
+                    // the #985/#1430 shadow-mirror it replaces would journal the
+                    // same write a second time.
                     if matches!(job_kind, state::JobKind::ExecutionListener { .. }) {
+                        // An element parked mid-chain on a journal from BEFORE
+                        // listener-scope registration existed (or a join opened
+                        // before its accepted activation registered one) has no
+                        // scope yet: register it idempotently, or the local
+                        // write below would be unreadable to the rest of the
+                        // chain. A registered scope emits nothing.
+                        let scope_registered = self
+                            .state
+                            .instances
+                            .get(&instance_key)
+                            .map(|i| i.scope_parents.contains_key(&element_instance_key))
+                            .unwrap_or(false);
+                        if !scope_registered {
+                            self.emit(
+                                &mut log,
+                                Event::VariableScopeCreated {
+                                    instance_key,
+                                    scope_key: element_instance_key,
+                                    parent_scope_key: self
+                                        .scope_of(instance_key, element_instance_key),
+                                },
+                            );
+                        }
                         self.emit(
                             &mut log,
                             Event::ScopedVariablesUpdated {
@@ -14246,6 +14232,18 @@ impl Engine {
                     element_id: element_id.clone(),
                     scope,
                 });
+                // #1437: a join bypasses `activate_with_key`, so the
+                // listener-scope registration there never runs for it — register
+                // the accepted join's scope here when it declares execution
+                // listeners, or a listener's element-local completion write
+                // would be unreadable to the rest of the chain.
+                if self.has_execution_listeners(instance_key, &element_id) {
+                    events.push(Event::VariableScopeCreated {
+                        instance_key,
+                        scope_key: eik,
+                        parent_scope_key: scope,
+                    });
+                }
                 events.push(Event::ElementActivated {
                     instance_key,
                     element_instance_key: eik,
@@ -14264,6 +14262,22 @@ impl Engine {
                     element_instance_key,
                     element_id: element_id.clone(),
                 });
+                // A parallel join's `end` execution-listener chain gates the
+                // completion exactly like every other element's (ADR 0037):
+                // `ElementCompleted` and the outgoing flows are deferred to
+                // `finalize_completion` once the chain drains. The listener
+                // resolves its FEEL attributes against the join's scope view.
+                let vars = self.variables_for_element(instance_key, element_instance_key);
+                if let Some(job) = self.begin_end_listener_chain(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    scope,
+                    &vars,
+                ) {
+                    events.push(job);
+                    return (events, Vec::new());
+                }
                 events.push(Event::ElementCompleted {
                     instance_key,
                     element_instance_key,
