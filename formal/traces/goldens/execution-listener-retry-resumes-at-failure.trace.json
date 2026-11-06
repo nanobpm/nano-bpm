@@ -1,0 +1,380 @@
+{
+  "scenario" : "execution-listener-retry-resumes-at-failure",
+  "zeebePin" : "5a3c4a1ca7cd9a0c50be34227fe3b4d8bf731dcf",
+  "steps" : [ {
+    "step" : 0,
+    "op" : "createInstance",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "execution-listener-retry-resumes-at-failure",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "execution-listener-retry-resumes-at-failure",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "start",
+      "bpmnElementType" : "START_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f1",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "inc",
+      "bpmnElementType" : "SCRIPT_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "inc",
+      "bpmnElementType" : "SCRIPT_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "inc",
+      "bpmnElementType" : "SCRIPT_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "CREATED",
+      "elementId" : "inc",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "counter",
+      "value" : 0,
+      "scopeElementId" : "execution-listener-retry-resumes-at-failure",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "counter",
+      "value" : 1,
+      "scopeElementId" : "execution-listener-retry-resumes-at-failure",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 1,
+    "op" : "resolveIncident",
+    "records" : [ {
+      "valueType" : "INCIDENT",
+      "intent" : "RESOLVED",
+      "elementId" : "inc",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "CREATED",
+      "elementId" : "inc",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    } ]
+  }, {
+    "step" : 2,
+    "op" : "updateVariables",
+    "records" : [ {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "auditType",
+      "value" : "audit",
+      "scopeElementId" : "execution-listener-retry-resumes-at-failure",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 3,
+    "op" : "resolveIncident",
+    "records" : [ {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "inc",
+      "type" : "audit",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "RESOLVED",
+      "elementId" : "inc",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    } ]
+  }, {
+    "step" : 4,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "inc",
+      "bpmnElementType" : "SCRIPT_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f2",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "work",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "work",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "inc",
+      "type" : "audit",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 2
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "work",
+      "type" : "work",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    } ]
+  }, {
+    "step" : 5,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "work",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "work",
+      "type" : "work",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "work",
+      "type" : "first",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "counter",
+      "value" : 101,
+      "scopeElementId" : "execution-listener-retry-resumes-at-failure",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 6,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "work",
+      "type" : "first",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "CREATED",
+      "elementId" : "work",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    } ]
+  }, {
+    "step" : 7,
+    "op" : "updateVariables",
+    "records" : [ {
+      "valueType" : "VARIABLE",
+      "intent" : "CREATED",
+      "name" : "secondType",
+      "value" : "second",
+      "scopeElementId" : "execution-listener-retry-resumes-at-failure",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 8,
+    "op" : "resolveIncident",
+    "records" : [ {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "work",
+      "type" : "first",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "INCIDENT",
+      "intent" : "RESOLVED",
+      "elementId" : "work",
+      "errorType" : "EXTRACT_VALUE_ERROR",
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "VARIABLE",
+      "intent" : "UPDATED",
+      "name" : "counter",
+      "value" : 201,
+      "scopeElementId" : "execution-listener-retry-resumes-at-failure",
+      "processInstanceKey" : 1,
+      "scopeKey" : 1
+    } ]
+  }, {
+    "step" : 9,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "work",
+      "type" : "first",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    }, {
+      "valueType" : "JOB",
+      "intent" : "CREATED",
+      "elementId" : "work",
+      "type" : "second",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    } ]
+  }, {
+    "step" : 10,
+    "op" : "completeJob",
+    "records" : [ {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "work",
+      "bpmnElementType" : "SERVICE_TASK",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "SEQUENCE_FLOW_TAKEN",
+      "elementId" : "f3",
+      "bpmnElementType" : "SEQUENCE_FLOW",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_ACTIVATED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "end",
+      "bpmnElementType" : "END_EVENT",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : 1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETING",
+      "elementId" : "execution-listener-retry-resumes-at-failure",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "PROCESS_INSTANCE",
+      "intent" : "ELEMENT_COMPLETED",
+      "elementId" : "execution-listener-retry-resumes-at-failure",
+      "bpmnElementType" : "PROCESS",
+      "processInstanceKey" : 1,
+      "flowScopeKey" : -1
+    }, {
+      "valueType" : "JOB",
+      "intent" : "COMPLETED",
+      "elementId" : "work",
+      "type" : "second",
+      "retries" : 3,
+      "processInstanceKey" : 1,
+      "elementInstanceKey" : 3
+    } ]
+  } ]
+}

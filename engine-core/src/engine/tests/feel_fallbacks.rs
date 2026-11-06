@@ -1334,9 +1334,12 @@ fn resolved_agent_job_retries_failure_preserves_container_results() {
 }
 
 // ---------------------------------------------------------------------------
-// Execution-listener job-property retry re-mints ONLY the failed listener
-// (#1398 review): a lifecycle-phase restart would replay completed listeners,
-// non-idempotent input/output mappings or boundary arming.
+// Execution-listener job-property retry RESTARTS the chain at listener 0
+// (Zeebe parity, #1406 finding 7 — pinned traces
+// `execution-listener-retry-resumes-at-failure` /
+// `start-listener-retry-restarts-chain`): resolving re-runs the lifecycle
+// step, so a start chain re-applies the input mappings and an end chain
+// re-projects the output mappings before listener 0 is minted again.
 // ---------------------------------------------------------------------------
 
 /// `work` declares a non-idempotent mapping (`input`: `=n + 1 -> n` local,
@@ -1376,7 +1379,7 @@ fn complete_only_job(engine: &mut Engine, job_type: &str) {
 
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
-fn later_start_listener_failure_retries_only_that_listener() {
+fn later_start_listener_failure_restarts_the_chain_and_reapplies_inputs() {
     let (mut engine, inst) = start(
         task_with_two_listeners("start"),
         vars(&[("n", Value::Int(0))]),
@@ -1389,18 +1392,20 @@ fn later_start_listener_failure_retries_only_that_listener() {
         &incident,
         &[("second", Value::Str("second".into()))],
     );
-    // Only the failed listener is re-minted — `first` does not run again.
-    assert_eq!(job_types(&engine), vec!["second".to_string()]);
+    // The chain restarts at listener 0 — `first` runs again.
+    assert_eq!(job_types(&engine), vec!["first".to_string()]);
+    complete_only_job(&mut engine, "first");
     complete_only_job(&mut engine, "second");
-    // The input mapping ran exactly once (0 + 1), not again on the retry.
+    // The input mapping was re-applied on the restart: the local `n` went
+    // 0 + 1 = 1 on activation, then 1 + 1 = 2 (Zeebe: 11 -> 21).
     let jobs = engine.activate_jobs("work", "W", 10, 1_000, 0);
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].variables.get("n"), Some(&Value::Int(1)));
+    assert_eq!(jobs[0].variables.get("n"), Some(&Value::Int(2)));
 }
 
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
-fn later_end_listener_failure_retries_only_that_listener() {
+fn later_end_listener_failure_restarts_the_chain_and_reprojects_outputs() {
     let (mut engine, inst) = start(
         task_with_two_listeners("end"),
         vars(&[("n", Value::Int(0))]),
@@ -1414,19 +1419,22 @@ fn later_end_listener_failure_retries_only_that_listener() {
         &incident,
         &[("second", Value::Str("second".into()))],
     );
-    assert_eq!(job_types(&engine), vec!["second".to_string()]);
-    // The input (0 + 1) and output mappings ran exactly once.
+    // The chain restarts at listener 0.
+    assert_eq!(job_types(&engine), vec!["first".to_string()]);
+    // The input mapping (0 + 1) ran once; the output mapping (`=n -> n`) was
+    // re-projected on the restart (Zeebe re-runs the completing step).
     assert_eq!(
         engine.instance(inst).unwrap().variables.get("n"),
         Some(&Value::Int(1))
     );
+    complete_only_job(&mut engine, "first");
     complete_only_job(&mut engine, "second");
     assert!(engine.pending_jobs().is_empty());
 }
 
 // zeebe-cells: incident:EXTRACT_VALUE_ERROR
 #[test]
-fn first_start_listener_failure_does_not_reapply_input_mappings() {
+fn first_start_listener_failure_retry_mints_the_listener_then_the_work() {
     let (mut engine, inst) = start(task_with_start_listener(r#"type="=audit""#), HashMap::new());
     let incident = extract_value_incident(&engine, "work", "audit");
     set_and_resolve(

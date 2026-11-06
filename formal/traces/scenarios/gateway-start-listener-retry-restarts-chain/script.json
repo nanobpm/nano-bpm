@@ -1,0 +1,11 @@
+{
+  "description": "Incident resolve on a split gateway's START execution-listener chain (#1406 finding 7, the #1402 gateway shape). `amount = 10` would route `g` to `f`; listener `l0` writes `amount = 500`, then listener `=nextType` fails. Resolving restarts the chain at listener 0 (Zeebe re-creates `l0`'s job); the route is taken once the chain drains.",
+  "steps": [
+    { "op": "createInstance", "bpmnProcessId": "gateway-start-listener-retry-restarts-chain", "variables": { "amount": 10 } },
+    { "op": "completeJob", "jobType": "l0", "variables": { "amount": 500 } },
+    { "op": "updateVariables", "variables": { "nextType": "l1" } },
+    { "op": "resolveIncident", "elementId": "g" },
+    { "op": "completeJob", "jobType": "l0" },
+    { "op": "completeJob", "jobType": "l1" }
+  ]
+}

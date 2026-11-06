@@ -56,8 +56,10 @@
       "match": "failure:ExpressionProcessor.createFailureMessage:EXTRACT_VALUE_ERROR",
       "status": "parity",
       "evidence": [
+        "traces:execution-listener-retry-resumes-at-failure",
         "traces:h-JobWorkerElementIncidentTest-shouldResolveIncidentIfTaskIsTerminated-BUSINESS-RULE-TASK",
         "traces:mi-input-collection-not-a-list",
+        "traces:start-listener-retry-restarts-chain",
         "traces:user-task-assignee-null"
       ]
     },
@@ -152,8 +154,10 @@
       "match": "incident:EXTRACT_VALUE_ERROR",
       "status": "parity",
       "evidence": [
+        "traces:execution-listener-retry-resumes-at-failure",
         "traces:job-type-expression-failure",
         "traces:mi-input-collection-not-a-list",
+        "traces:start-listener-retry-restarts-chain",
         "traces:user-task-assignee-null"
       ]
     },
@@ -168,7 +172,9 @@
       "match": "intent:Incident:RESOLVED",
       "status": "parity",
       "evidence": [
-        "traces:job-type-expression-failure"
+        "traces:execution-listener-retry-resumes-at-failure",
+        "traces:job-type-expression-failure",
+        "traces:start-listener-retry-restarts-chain"
       ]
     },
     {

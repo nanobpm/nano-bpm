@@ -138,6 +138,11 @@ The heart of the change. Split the two atomic transitions:
   many completion sites consistent.
 - **Failure/incident.** A listener job that exhausts retries raises an incident like
   any job (existing machinery); the element stays parked in `ACTIVATING`/`COMPLETING`.
+  A listener whose job *properties* fail to evaluate (e.g. a `=type` expression,
+  `EXTRACT_VALUE_ERROR`) parks the element on an incident; resolving it re-runs the
+  lifecycle step exactly as Zeebe does (#1406): the chain **restarts at listener 0**,
+  and the element's input (start chain) or output (end chain) mappings are
+  re-applied. A split gateway keeps the route journaled at activation.
 - **Interruption.** If an interrupting boundary event / terminate fires while a
   listener chain is outstanding, cancel the in-flight listener job and drop the cursor
   as part of the element's termination (must be handled so a pending listener can't

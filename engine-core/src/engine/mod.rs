@@ -335,15 +335,17 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
-    /// Re-mint ONLY execution listener `index` of an element's `event_type`
-    /// chain whose `type` / `retries` expression raised an incident
-    /// ([`state::IoMappingRedrive::ExecutionListenerJob`], #1398 review).
-    MintExecutionListenerJob {
+    /// Restart an element's `event_type` execution-listener chain at listener
+    /// 0 after its incident was resolved
+    /// ([`state::IoMappingRedrive::ExecutionListenerJob`], #1406). An `end`
+    /// chain re-projects the element's output mappings first (Zeebe re-runs
+    /// the completing step); a multi-instance body's `start` chain just
+    /// re-mints listener 0. See [`Engine::restart_listener_chain_step`].
+    RestartExecutionListenerChain {
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
         event_type: crate::model::ListenerEventType,
-        index: usize,
         scope: Key,
     },
     /// Re-mint the listener job of a user task's task-listener chain whose
@@ -386,14 +388,6 @@ enum Step {
         /// raised before `ElementActivated`, [`state::IoMappingRedrive::ActivationPending`]):
         /// a successful re-run then emits `ElementActivated` first.
         pending: bool,
-        /// `Some(n)` resumes a partially-drained `start` execution-listener
-        /// chain at listener index `n` (a mid-chain listener job-type failure,
-        /// #1390): the activation-time work before the chain — input mappings
-        /// and a split gateway's routing gate (#1402) — already succeeded, so
-        /// the retry must NOT re-run it (a gateway's journaled selection is
-        /// kept verbatim and its `ElementActivated` is not repeated). `None`
-        /// re-drives the full activation body.
-        resume_listener_at: Option<usize>,
     },
     /// Resume arming a host's boundary events at the one whose timer expression
     /// failed while the host was activating
@@ -3303,10 +3297,6 @@ impl Engine {
                                     redrive,
                                     Some(state::IoMappingRedrive::ActivationPending)
                                 ),
-                                // A routing-gate incident is raised before any
-                                // listener job, so there is never a chain to
-                                // resume.
-                                resume_listener_at: None,
                             });
                         } else if matches!(
                             redrive,
@@ -3356,20 +3346,19 @@ impl Engine {
                             });
                         } else if let Some(state::IoMappingRedrive::ExecutionListenerJob {
                             event_type,
-                            listener_index,
+                            listener_index: _,
                             scope,
                         }) = redrive
                         {
-                            // An execution-listener job property failed (#1398
-                            // review): re-mint only that listener's job.
-                            queue.push_back(Step::MintExecutionListenerJob {
+                            // An execution-listener job property failed: restart
+                            // the chain (Zeebe parity, #1406 finding 7).
+                            queue.push_back(self.restart_listener_chain_step(
                                 instance_key,
                                 element_instance_key,
                                 element_id,
                                 event_type,
-                                index: listener_index,
                                 scope,
-                            });
+                            ));
                         } else if matches!(redrive, Some(state::IoMappingRedrive::AdHocAgentJob)) {
                             // An agent container's agent-job property failed
                             // (#1398 review): re-mint only the agent job.
@@ -3575,25 +3564,9 @@ impl Engine {
                     // failures re-drive uniformly by lifecycle phase — `ACTIVATING`
                     // re-applies inputs, `COMPLETING` re-applies outputs).
                     state::IncidentKind::IoMapping | state::IncidentKind::ExtractValueError => {
-                        // A mid-chain `start` listener's job-type failure
-                        // (#1390) parks the element with the pre-chain
-                        // activation already done; the retry resumes the chain
-                        // at the failed listener rather than re-running the
-                        // activation body (which would re-apply inputs and, for
-                        // a split gateway, re-select the journaled route and
-                        // repeat `ElementActivated`, #1402).
-                        let resume_listener_at =
-                            if matches!(redrive, Some(state::IoMappingRedrive::Activation))
-                                && matches!(kind, state::IncidentKind::ExtractValueError)
-                            {
-                                self.listener_resume_index(
-                                    instance_key,
-                                    element_instance_key,
-                                    &element_id,
-                                )
-                            } else {
-                                None
-                            };
+                        // A listener job-type failure (#1390) restarts its
+                        // chain at listener 0 (Zeebe parity, #1406 finding 7)
+                        // — see `restart_listener_chain_step`.
                         let step: Option<Step> = match redrive {
                             // Mainstream input: re-run the activation body so the
                             // now-fixed inputs are re-applied before the element's
@@ -3605,7 +3578,6 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                     pending: false,
-                                    resume_listener_at,
                                 })
                             }
                             // The same, for a token still in ACTIVATING: the
@@ -3616,7 +3588,6 @@ impl Engine {
                                     element_instance_key,
                                     element_id,
                                     pending: true,
-                                    resume_listener_at,
                                 })
                             }
                             // The activation BODY failed after the element's
@@ -3696,11 +3667,10 @@ impl Engine {
                                 }
                             }
                             // A terminate end's end-listener chain parked on an
-                            // incident (#985, #1430): re-drive its completion. The
-                            // terminate path reads the retained incident's
-                            // `outputs_applied` marker to decide whether to
-                            // re-project its single-pass output mappings and to
-                            // suppress a duplicate `ElementCompleting`.
+                            // incident (#985, #1430): re-drive its completion
+                            // (outputs re-projected, chain restarted at listener 0,
+                            // #1406). The retained marker suppresses a duplicate
+                            // `ElementCompleting`.
                             Some(state::IoMappingRedrive::TerminateEndCompletion { .. }) => {
                                 Some(Step::Complete {
                                     instance_key,
@@ -3854,16 +3824,15 @@ impl Engine {
                             }),
                             Some(state::IoMappingRedrive::ExecutionListenerJob {
                                 event_type,
-                                listener_index,
+                                listener_index: _,
                                 scope,
-                            }) => Some(Step::MintExecutionListenerJob {
+                            }) => Some(self.restart_listener_chain_step(
                                 instance_key,
                                 element_instance_key,
                                 element_id,
                                 event_type,
-                                index: listener_index,
                                 scope,
-                            }),
+                            )),
                             Some(state::IoMappingRedrive::AdHocAgentJob) => {
                                 Some(Step::MintAdHocAgentJob {
                                     instance_key,
@@ -6043,7 +6012,7 @@ impl Engine {
                 element_instance_key,
                 ..
             }
-            | Step::MintExecutionListenerJob {
+            | Step::RestartExecutionListenerChain {
                 instance_key,
                 element_instance_key,
                 ..
@@ -6315,28 +6284,22 @@ impl Engine {
                 self.adhoc_agent_job_events(instance_key, element_instance_key, element_id),
                 Vec::new(),
             ),
-            Step::MintExecutionListenerJob {
+            Step::RestartExecutionListenerChain {
                 instance_key,
                 element_instance_key,
                 element_id,
                 event_type,
-                index,
                 scope,
-            } => {
-                let vars = self.variables_for_element(instance_key, element_instance_key);
-                (
-                    vec![self.execution_listener_job_event(
-                        instance_key,
-                        element_instance_key,
-                        &element_id,
-                        event_type,
-                        index,
-                        scope,
-                        &vars,
-                    )],
-                    Vec::new(),
-                )
-            }
+            } => (
+                self.restart_listener_chain_events(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    event_type,
+                    scope,
+                ),
+                Vec::new(),
+            ),
             Step::MintTaskListenerJob {
                 user_task_key,
                 event_type,
@@ -6452,7 +6415,6 @@ impl Engine {
                 element_instance_key,
                 element_id,
                 pending: activation_pending,
-                resume_listener_at,
             } => {
                 // The element instance is parked on the resolved activation-time
                 // incident; re-drive the activation so the now-fixed input
@@ -6476,27 +6438,6 @@ impl Engine {
                 } else {
                     scope
                 };
-                // A mid-chain `start` listener failure resumes the chain at the
-                // failed listener: the pre-chain activation (input mappings, a
-                // split gateway's routing gate) already succeeded, so it is NOT
-                // re-run — the gateway keeps its journaled selection and its
-                // already-emitted `ElementActivated` is repeated only when the
-                // token is still ACTIVATING (`pending`).
-                if let Some(resume_at) = resume_listener_at {
-                    // The resumed chain re-emits `ElementActivated` itself when
-                    // it drains (the token is still ACTIVATING — the incident
-                    // parked it before any listener completed, #1429); pushing
-                    // it here too would double the record.
-                    let (chain_events, chain_followups) = self.advance_listener(
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        crate::model::ListenerEventType::Start,
-                        resume_at.saturating_sub(1),
-                        scope,
-                    );
-                    return (chain_events, chain_followups);
-                }
                 // A split gateway (exclusive, or an inclusive fork) re-runs the
                 // FULL gated activation (`Step::Activate`, #1402): the routing
                 // gate, the journaled selection, and the `start` listener chain
@@ -6504,12 +6445,7 @@ impl Engine {
                 // activate a retry that still matches no flow (raising the
                 // routing incident AFTER `ElementActivated`) and would skip the
                 // listener chain on a successful one.
-                let kind = self.element_kind(instance_key, &element_id);
-                let is_split_gateway = matches!(
-                    kind,
-                    Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway)
-                ) && self.join_kind(instance_key, &element_id).is_none();
-                if is_split_gateway {
+                if self.is_split_gateway(instance_key, &element_id) {
                     // Re-drive the gated activation ON the parked element
                     // instance (Zeebe's resolve re-runs `onActivate` on the same
                     // element instance — no second `ELEMENT_ACTIVATING`). The
@@ -8911,18 +8847,56 @@ impl Engine {
     /// early completion-condition fire), writes the aggregated output collection
     /// (padding uncollected slots with `null`) into the instance scope, applies
     /// the activity's output mappings, and takes its outgoing flow.
+    /// The per-child bindings absent at an MI body's level, whose output
+    /// mappings the body skips (the per-child pass applies them).
+    fn mi_body_tolerated_bindings(
+        input_element: Option<&str>,
+    ) -> std::collections::HashSet<String> {
+        let mut tolerated = std::collections::HashSet::from(["loopCounter".to_string()]);
+        if let Some(name) = input_element {
+            tolerated.insert(name.to_string());
+        }
+        tolerated
+    }
+
+    /// The aggregated `outputCollection` of the MI body `body_key` (uncollected
+    /// slots padded with `null`), ready to overlay onto a body-scope evaluation
+    /// view — `None` when the element instance is not an MI body or the body
+    /// declares no `outputCollection`. Body completion
+    /// ([`Self::complete_multi_instance_body`]) and the end-listener restart
+    /// ([`Self::restart_listener_chain_events`]) must evaluate the activity's
+    /// output mappings against the SAME aggregate view, or the restart reads a
+    /// stale body-local binding of the collection name (review r5796393495).
+    fn mi_body_collection_overlay(
+        &self,
+        instance_key: Key,
+        body_key: Key,
+    ) -> Option<HashMap<String, Value>> {
+        let mi = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .multi_instances
+            .get(&body_key)?;
+        mi.output_collection.as_ref().map(|name| {
+            HashMap::from([(
+                name.clone(),
+                Value::List(
+                    mi.output_values
+                        .iter()
+                        .map(|o| o.clone().unwrap_or(Value::Null))
+                        .collect(),
+                ),
+            )])
+        })
+    }
+
     fn complete_multi_instance_body(
         &mut self,
         instance_key: Key,
         body_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let (element_id, input_element, output_collection, output_values, active): (
-            ElementId,
-            Option<String>,
-            Option<String>,
-            Vec<Value>,
-            Vec<Key>,
-        ) = match self
+        let (element_id, input_element, active): (ElementId, Option<String>, Vec<Key>) = match self
             .state
             .instances
             .get(&instance_key)
@@ -8931,11 +8905,6 @@ impl Engine {
             Some(mi) => (
                 mi.element_id.clone(),
                 mi.input_element.clone(),
-                mi.output_collection.clone(),
-                mi.output_values
-                    .iter()
-                    .map(|o| o.clone().unwrap_or(Value::Null))
-                    .collect(),
                 mi.active.iter().copied().collect(),
             ),
             None => return (Vec::new(), Vec::new()),
@@ -8946,8 +8915,7 @@ impl Engine {
         // null) and evaluate the activity's output mappings against the body-scope
         // view overlaid with that collection — all while the body scope is still
         // resident (its `ElementCompleted` below tears it down).
-        let collection_map: Option<HashMap<String, Value>> =
-            output_collection.map(|name| HashMap::from([(name, Value::List(output_values))]));
+        let collection_map = self.mi_body_collection_overlay(instance_key, body_key);
         let outputs = self.io_outputs(instance_key, &element_id);
         let output_updates = if outputs.is_empty() {
             HashMap::new()
@@ -8965,12 +8933,11 @@ impl Engine {
             // for any other reason is a genuine failure: park the body on an
             // `IO_MAPPING_ERROR` incident whose resolution re-drives this body
             // completion (#946), rather than silently completing with no incident.
-            let mut tolerated = std::collections::HashSet::new();
-            tolerated.insert("loopCounter".to_string());
-            if let Some(name) = &input_element {
-                tolerated.insert(name.clone());
-            }
-            match self.eval_io_mappings_tolerating(&ctx, &outputs, &tolerated) {
+            match self.eval_io_mappings_tolerating(
+                &ctx,
+                &outputs,
+                &Self::mi_body_tolerated_bindings(input_element.as_deref()),
+            ) {
                 Ok(updates) => updates,
                 Err(failure) => {
                     let event = self.io_mapping_incident(
@@ -11892,14 +11859,169 @@ impl Engine {
         (events, followups)
     }
 
+    /// Whether `element_id` is a SPLIT gateway — an exclusive gateway, or an
+    /// inclusive gateway that is not a join — whose route is selected and
+    /// journaled at activation (#1402).
+    fn is_split_gateway(&self, instance_key: Key, element_id: &str) -> bool {
+        matches!(
+            self.element_kind(instance_key, element_id),
+            Some(ElementKind::ExclusiveGateway | ElementKind::InclusiveGateway)
+        ) && self.join_kind(instance_key, element_id).is_none()
+    }
+
+    /// The re-drive of a resolved execution-listener job incident
+    /// ([`state::IoMappingRedrive::ExecutionListenerJob`]) — the single place
+    /// that decides it. Zeebe parity (#1406 finding 7, pinned traces
+    /// `execution-listener-retry-resumes-at-failure` and
+    /// `start-listener-retry-restarts-chain`): resolving re-runs the lifecycle
+    /// command, so the chain RESTARTS at listener 0 — it never resumes at the
+    /// failed listener, even when earlier listeners already completed.
+    ///
+    /// - A `start` chain re-runs the element's activation
+    ///   ([`Step::RetryActivation`]): input mappings are re-applied, then the
+    ///   chain re-opens at listener 0 (`ElementActivated` stays deferred to
+    ///   its drain, #1429). A multi-instance body's start chain gates only the
+    ///   child fan-out (its activation already completed), and a split
+    ///   gateway (which has no input mappings) keeps the route journaled at
+    ///   activation — Zeebe still takes it after the restart (pinned trace
+    ///   `gateway-start-listener-retry-restarts-chain`) — so both re-mint
+    ///   listener 0 only.
+    /// - An `end` chain re-mints listener 0. The completion-time work before
+    ///   the chain (a script / job result, output mappings) is NOT re-run
+    ///   (finding 5).
+    fn restart_listener_chain_step(
+        &self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        event_type: crate::model::ListenerEventType,
+        scope: Key,
+    ) -> Step {
+        let instance = self.state.instances.get(&instance_key);
+        let is_mi_body =
+            instance.is_some_and(|i| i.multi_instances.contains_key(&element_instance_key));
+        if event_type == crate::model::ListenerEventType::Start
+            && !is_mi_body
+            && !self.is_split_gateway(instance_key, &element_id)
+        {
+            return Step::RetryActivation {
+                instance_key,
+                element_instance_key,
+                element_id,
+                pending: instance.is_some_and(|i| i.activating.contains(&element_instance_key)),
+            };
+        }
+        Step::RestartExecutionListenerChain {
+            instance_key,
+            element_instance_key,
+            element_id,
+            event_type,
+            scope,
+        }
+    }
+
+    /// Enacts [`Step::RestartExecutionListenerChain`]: re-mints listener 0 of
+    /// the chain. For an `end` chain the element's `zeebe:output` mappings are
+    /// re-projected into the flow `scope` first and listener 0 resolves against
+    /// that output-mapped view — Zeebe's resolve re-runs the completing step
+    /// (pinned trace `execution-listener-retry-resumes-at-failure`: a
+    /// `=counter + 100 -> counter` output goes 101 -> 201), while the job /
+    /// script result merged before COMPLETING is not re-run (finding 5). A
+    /// failing re-projection parks the element again on an IO_MAPPING_ERROR
+    /// incident whose resolution restarts the chain the same way.
+    fn restart_listener_chain_events(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        event_type: crate::model::ListenerEventType,
+        scope: Key,
+    ) -> Vec<Event> {
+        let mut vars = (*self.variables_for_element(instance_key, element_instance_key)).clone();
+        let mut events = Vec::new();
+        if event_type == crate::model::ListenerEventType::End {
+            let outputs = self.io_outputs(instance_key, &element_id);
+            if !outputs.is_empty() {
+                // An MI body projects its outputs body-aware — the single
+                // projection `complete_multi_instance_body` uses — so a
+                // child-only mapping (`inputElement`/`loopCounter`) is skipped
+                // rather than leaking `null` into the parent scope, and a
+                // mapping that reads the `outputCollection` resolves against
+                // the AGGREGATED collection overlaid on the body view, never a
+                // stale body-local binding of that name (review r5796393495).
+                let mi_overlay =
+                    self.mi_body_collection_overlay(instance_key, element_instance_key);
+                let tolerated = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.multi_instances.get(&element_instance_key))
+                    .map(|mi| Self::mi_body_tolerated_bindings(mi.input_element.as_deref()));
+                let projected = match tolerated {
+                    Some(tolerated) => {
+                        let mut ctx = vars.clone();
+                        if let Some(map) = &mi_overlay {
+                            ctx.extend(map.clone());
+                        }
+                        self.eval_io_mappings_tolerating(&ctx, &outputs, &tolerated)
+                    }
+                    None => self.eval_io_mappings_in(&vars, &outputs),
+                };
+                match projected {
+                    Ok(updates) => {
+                        vars.extend(updates.clone());
+                        events.extend(self.propagated_updates(instance_key, scope, updates, false));
+                    }
+                    Err(failure) => {
+                        return vec![self.io_mapping_incident(
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            failure,
+                            state::IoMappingRedrive::ExecutionListenerJob {
+                                event_type,
+                                listener_index: 0,
+                                scope,
+                            },
+                        )];
+                    }
+                }
+            }
+        }
+        // The re-minted listener 0 of an END chain resolves against the same
+        // aggregate view the projection used: an MI body's listener
+        // `type`/`retries` expression reading the `outputCollection` sees the
+        // aggregated list, not a stale body-local binding (mirrors the
+        // listener-vars overlay in `complete_multi_instance_body`). A START
+        // chain gets NO overlay: its retry is an activation re-drive, not a
+        // completion, so an uncollected (null-padded) aggregate must not
+        // overwrite a live body-local binding of the collection name — a
+        // listener `=results[1]` would otherwise fail or select the wrong
+        // worker (review r5796573293).
+        if event_type == crate::model::ListenerEventType::End {
+            if let Some(map) = self.mi_body_collection_overlay(instance_key, element_instance_key) {
+                vars.extend(map);
+            }
+        }
+        events.push(self.execution_listener_job_event(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            event_type,
+            0,
+            scope,
+            &vars,
+        ));
+        events
+    }
+
     /// Mints execution listener `index` of `element_id`'s `event_type` chain
     /// (ADR 0037) — the single minting path for every execution-listener job.
     /// `vars` is the view its FEEL `type` / `retries` resolve against. A failed
     /// expression yields an EXTRACT_VALUE_ERROR incident whose redrive
-    /// ([`state::IoMappingRedrive::ExecutionListenerJob`]) re-mints ONLY this
-    /// listener on resolution — never restarting the lifecycle phase, which
-    /// would replay completed listeners, mappings or boundary arming (#1398
-    /// review). The caller must have checked that listener `index` exists; a
+    /// ([`state::IoMappingRedrive::ExecutionListenerJob`]) restarts the chain
+    /// on resolution ([`Self::restart_listener_chain_step`], Zeebe parity
+    /// #1406). The caller must have checked that listener `index` exists; a
     /// missing one (model changed under a redrive) mints nothing useful, so it
     /// is reported as the same incident class rather than silently dropped.
     #[allow(clippy::too_many_arguments)]
@@ -11914,11 +12036,12 @@ impl Engine {
         vars: &HashMap<String, Value>,
     ) -> Event {
         let listeners = self.listeners_of(instance_key, element_id, event_type);
-        // #1398: a failed listener job re-mints ONLY that listener on resume
-        // (`ExecutionListenerJob`), not the whole phase. The single exception is
-        // a terminate end's `end` chain (#985, #1430): its single-pass output
-        // projection already ran before the chain opened, so the resume must
-        // carry `outputs_applied: true` and not re-apply it or repeat
+        // A failed listener job restarts its chain on resolution
+        // (`ExecutionListenerJob`, #1406). A terminate end's `end` chain (#985,
+        // #1430) re-drives through its own completion path instead; like every
+        // other `end` restart it re-projects the output mappings (Zeebe re-runs
+        // the completing step, #1406), so it carries `outputs_applied: false`
+        // — the retained marker still suppresses a duplicate
         // `ElementCompleting`.
         let redrive = if event_type == crate::model::ListenerEventType::End
             && matches!(
@@ -11926,7 +12049,7 @@ impl Engine {
                 Some(ElementKind::TerminateEndEvent)
             ) {
             state::IoMappingRedrive::TerminateEndCompletion {
-                outputs_applied: true,
+                outputs_applied: false,
             }
         } else {
             state::IoMappingRedrive::ExecutionListenerJob {
@@ -12658,39 +12781,21 @@ impl Engine {
             )
             .is_empty();
         if has_end_listeners {
-            // Replay-safe recovery progress. `ElementCompleting` is a transient
-            // transition with no state footprint, and the resume index
-            // (`end_listener_resume_index`) is `None` whenever the failure preceded
-            // the chain — the output projection, or listener 0's own job type — so
-            // neither can tell a first completion pass from a re-drive after such
-            // a failure. The retained terminate-end incident can: every re-drive
-            // follows a resolved `TerminateEndCompletion` incident on this element
-            // instance (incidents are kept as `Resolved` for audit, so the marker
-            // survives the resolution that triggered the re-drive, and replays
-            // identically from the journal). Its `outputs_applied` flag records
-            // whether the single-pass output projection already succeeded, so the
-            // re-drive re-applies it only when the failed pass never did.
-            let prior = self
-                .state
-                .incidents
-                .values()
-                .filter(|i| i.element_instance_key == element_instance_key)
-                .filter_map(|i| {
-                    if let Some(state::IoMappingRedrive::TerminateEndCompletion {
-                        outputs_applied,
-                    }) = i.redrive
-                    {
-                        Some((i.key, outputs_applied))
-                    } else {
-                        None
-                    }
-                })
-                // The most recent terminate-end completion incident is the
-                // authoritative progress marker (monotone keys = creation order).
-                .max_by_key(|(key, _)| *key)
-                .map(|(_, outputs_applied)| outputs_applied);
-            let completing_already_open = prior.is_some();
-            let outputs_applied = prior.unwrap_or(false);
+            // Replay-safe recovery marker. `ElementCompleting` is a transient
+            // transition with no state footprint, so it cannot tell a first
+            // completion pass from a re-drive. The retained terminate-end
+            // incident can: every re-drive follows a resolved
+            // `TerminateEndCompletion` incident on this element instance
+            // (incidents are kept as `Resolved` for audit, so the marker survives
+            // the resolution that triggered the re-drive, and replays identically
+            // from the journal).
+            let completing_already_open = self.state.incidents.values().any(|i| {
+                i.element_instance_key == element_instance_key
+                    && matches!(
+                        i.redrive,
+                        Some(state::IoMappingRedrive::TerminateEndCompletion { .. })
+                    )
+            });
             // ADR 0037 (ordering pinned against Zeebe's `BpmnStreamProcessor`):
             // `end` listeners run AFTER the element's `zeebe:output` mappings,
             // and the listener job's own FEEL attributes resolve against the
@@ -12699,14 +12804,14 @@ impl Engine {
             // (The listener-free path keeps its byte-identical journal, so the
             // projection lives behind this gate.)
             //
-            // The projection is single-pass (#1171): re-applying a non-idempotent
-            // mapping (`=x + 1 -> x`) on a re-drive would double-apply it and
-            // overwrite completed listeners' writes. Skip it once it has been
-            // applied — a listener-chain failure parks with `outputs_applied =
-            // true`, so its re-drive resumes against the already-projected view.
+            // A re-drive re-projects them and restarts the chain at listener 0
+            // (Zeebe parity, #1406 finding 7: its resolve re-runs the completing
+            // step — pinned trace `execution-listener-retry-resumes-at-failure`).
+            // `TerminateEndCompletion::outputs_applied` is therefore no longer
+            // consulted; it is kept only so older journals still decode.
             let outputs = self.io_outputs(instance_key, &element_id);
             let mut output_updates = HashMap::new();
-            if !outputs.is_empty() && !outputs_applied {
+            if !outputs.is_empty() {
                 let visible = self.variables_for_element(instance_key, element_instance_key);
                 match self.eval_io_mappings_in(&visible, &outputs) {
                     Ok(updates) => output_updates = updates,
@@ -12721,8 +12826,6 @@ impl Engine {
                         // instance: a re-drive after resolution re-enters here
                         // with the element already resting in COMPLETING (the
                         // retained `TerminateEndCompletion` marker is the signal).
-                        // The output projection failed, so the redrive carries
-                        // `outputs_applied: false` and re-projects on resolution.
                         let mut events = Vec::new();
                         if !completing_already_open {
                             events.push(Event::ElementCompleting {
@@ -12754,23 +12857,6 @@ impl Engine {
             let mut listener_vars =
                 (*self.variables_for_element(instance_key, element_instance_key)).clone();
             listener_vars.extend(output_updates.clone());
-            // A mid-chain listener's job-type failure (#1390) parks the element
-            // on an EXTRACT_VALUE_ERROR incident with redrive `Completion`; the
-            // resolution re-enters HERE via `Step::Complete`. Resume the chain
-            // one past the highest-index listener job already minted (the same
-            // replay-safe progress signal the `start` side uses) so resolving
-            // never repeats a completed listener's side effects. `None` means
-            // no listener job exists yet — the failure preceded the chain (the
-            // output projection above, or listener 0's own type), so the chain
-            // opens at listener 0.
-            let resume_at = self
-                .end_listener_resume_index(instance_key, element_instance_key, &element_id)
-                .unwrap_or(0);
-            let end_listeners = self.listeners_of(
-                instance_key,
-                &element_id,
-                crate::model::ListenerEventType::End,
-            );
             // `ElementCompleting` is written once per element instance: on the
             // first completion pass. A re-drive after an incident resolution
             // re-enters here with the element already resting in COMPLETING —
@@ -12827,52 +12913,16 @@ impl Engine {
                     false,
                 ));
             }
-            if resume_at >= end_listeners.len() {
-                // Every listener job was already minted (the chain drained
-                // without the deferred completion running — only reachable by a
-                // re-drive after the last listener's completion): run the
-                // deferred completion tail directly.
-                let (tail, steps) = self.finalize_terminate_end(
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                    scope,
-                );
-                events.extend(tail);
-                return (events, steps);
-            }
-            if resume_at == 0 {
-                // The output projection already succeeded this pass (it runs
-                // before the chain opens), so a listener-0 job-type failure parks
-                // with `outputs_applied: true` — the resume must not re-apply the
-                // (single-pass) mappings.
-                if let Some(first) = self.begin_end_listener_chain(
-                    instance_key,
-                    element_instance_key,
-                    &element_id,
-                    scope,
-                    &listener_vars,
-                ) {
-                    events.push(first);
-                }
-            } else {
-                // Resume mid-chain: mint the failed listener's job (its
-                // type/retries resolved against the output-mapped view), or —
-                // when its expression still fails — re-raise the incident.
-                // `execution_listener_job_event` resolves strictly (#1398) and
-                // carries the terminate end's `TerminateEndCompletion` redrive
-                // (`outputs_applied: true` — the single-pass projection already
-                // ran before the chain opened), so the resume neither re-applies
-                // the mappings nor repeats `ElementCompleting` (#1430).
-                events.push(self.execution_listener_job_event(
-                    instance_key,
-                    element_instance_key,
-                    &element_id,
-                    crate::model::ListenerEventType::End,
-                    resume_at,
-                    scope,
-                    &listener_vars,
-                ));
+            // The chain always (re)starts at listener 0 (#1406); the outputs were
+            // (re-)projected above.
+            if let Some(first) = self.begin_end_listener_chain(
+                instance_key,
+                element_instance_key,
+                &element_id,
+                scope,
+                &listener_vars,
+            ) {
+                events.push(first);
             }
             return (events, Vec::new());
         }
@@ -12976,78 +13026,8 @@ impl Engine {
         (events, Vec::new())
     }
 
-    /// The `start` execution-listener index a resolved mid-chain job-type
-    /// failure (#1390) resumes at: one past the highest-index listener job the
-    /// element already minted, or `None` when no `start` listener job exists
-    /// (the failure preceded the chain — e.g. the first listener's job type —
-    /// so the full activation body re-runs). Counting minted jobs — not
-    /// completions — keeps the index correct when a completed listener's
-    /// writes are what the failed expression referenced.
-    fn listener_resume_index(
-        &self,
-        instance_key: Key,
-        element_instance_key: Key,
-        element_id: &str,
-    ) -> Option<usize> {
-        self.listener_resume_index_for(
-            instance_key,
-            element_instance_key,
-            element_id,
-            crate::model::ListenerEventType::Start,
-        )
-    }
-
-    /// The `end` execution-listener index a resolved mid-chain job-type failure
-    /// (#1390) resumes at: one past the highest-index `end` listener job the
-    /// element already minted, or `None` when no `end` listener job exists (the
-    /// failure preceded the chain — the output projection or the first
-    /// listener's job type — so the chain opens at listener 0). Same
-    /// minted-not-completed counting as [`listener_resume_index`].
-    fn end_listener_resume_index(
-        &self,
-        instance_key: Key,
-        element_instance_key: Key,
-        element_id: &str,
-    ) -> Option<usize> {
-        self.listener_resume_index_for(
-            instance_key,
-            element_instance_key,
-            element_id,
-            crate::model::ListenerEventType::End,
-        )
-    }
-
-    /// Shared resume-index computation behind [`listener_resume_index`] and
-    /// [`end_listener_resume_index`]: one past the highest-index listener job
-    /// of `event_type` minted for this element instance.
-    fn listener_resume_index_for(
-        &self,
-        instance_key: Key,
-        element_instance_key: Key,
-        element_id: &str,
-        event_type: crate::model::ListenerEventType,
-    ) -> Option<usize> {
-        self.state
-            .jobs
-            .values()
-            .filter(|j| {
-                j.instance_key == instance_key
-                    && j.element_instance_key == element_instance_key
-                    && j.element_id == element_id
-            })
-            .filter_map(|j| match j.kind {
-                state::JobKind::ExecutionListener {
-                    event_type: kind,
-                    index,
-                    ..
-                } if kind == event_type => Some(index),
-                _ => None,
-            })
-            .max()
-            .map(|i| i + 1)
-    }
-
-    /// completed (ADR 0037). If another listener remains in the chain, its job is
+    /// Advances `element_id`'s `event_type` execution-listener chain after
+    /// listener `index` completed (ADR 0037). If another listener remains in the chain, its job is
     /// created; otherwise the chain has drained and the deferred lifecycle
     /// transition runs — a `Start` chain enacts the element's activation
     /// behaviour ([`run_activation_body`]), an `End` chain emits the deferred
@@ -13070,8 +13050,8 @@ impl Engine {
             // attributes resolve against. `execution_listener_job_event` resolves
             // the listener's job props strictly (#1398) and, on failure, parks the
             // element with the chain-appropriate redrive — `ExecutionListenerJob`
-            // to re-mint only this listener, or a terminate end's
-            // `TerminateEndCompletion` (#985, #1430).
+            // (resolution restarts the chain at listener 0, #1406), or a
+            // terminate end's `TerminateEndCompletion` (#985, #1430).
             let listener_vars = self.variables_for_element(instance_key, element_instance_key);
             return (
                 vec![self.execution_listener_job_event(

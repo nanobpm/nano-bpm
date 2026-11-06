@@ -1225,11 +1225,12 @@ pub enum IoMappingRedrive {
     AdHocAgentJob,
     /// An **execution listener**'s job `type` / `retries` expression failed
     /// when listener `listener_index` of the element's `event_type` chain was
-    /// to be minted (#1398 review). Everything before that listener (input /
-    /// output mappings, boundary arming, earlier completed listeners) already
-    /// happened; resolution re-mints ONLY that listener's job (engine
-    /// `Step::MintExecutionListenerJob`) instead of restarting the lifecycle
-    /// phase. Additive brand-new variant — old journals never carry it.
+    /// to be minted (#1398 review). Resolution RESTARTS the chain at listener 0
+    /// (Zeebe parity, #1406 finding 7): a `start` chain re-runs the activation
+    /// (input mappings re-applied), an `end` chain re-mints listener 0 without
+    /// re-running the completion-time work. `listener_index` is kept as the
+    /// diagnostic record of which listener failed. Additive brand-new variant
+    /// — old journals never carry it.
     ExecutionListenerJob {
         event_type: crate::model::ListenerEventType,
         listener_index: usize,
@@ -1237,14 +1238,15 @@ pub enum IoMappingRedrive {
     },
     /// A terminate end event's `end` execution-listener chain parked on an
     /// incident (#985, #1430 review) — a listener job-type `EXTRACT_VALUE_ERROR`
-    /// or an output-mapping `IO_MAPPING_ERROR`. `outputs_applied` records whether
-    /// the terminate end's (single-pass, possibly non-idempotent) `zeebe:output`
-    /// projection already succeeded on the failed pass: the redrive re-applies it
-    /// only when `false`, so a listener-chain failure (`true`) never re-projects
-    /// `=x + 1 -> x` into `x = 2`, while an output-mapping failure (`false`) still
-    /// re-projects the now-fixed mapping. The marker also suppresses a duplicate
-    /// `ElementCompleting` on the re-drive. Additive brand-new variant — old
-    /// journals never carry it.
+    /// or an output-mapping `IO_MAPPING_ERROR`. Resolution re-drives the
+    /// terminate end's completion: output mappings are re-projected and the
+    /// chain restarts at listener 0 (Zeebe parity, #1406 finding 7). The marker
+    /// also suppresses a duplicate `ElementCompleting` on the re-drive.
+    /// `outputs_applied` is historical (it recorded whether the projection had
+    /// already run, back when the re-drive skipped it); it is still written —
+    /// always `false` now — and decoded so the persisted shape is unchanged, but
+    /// is no longer consulted. Additive brand-new variant — old journals never
+    /// carry it.
     TerminateEndCompletion { outputs_applied: bool },
     /// A multi-instance **child**'s job properties (type / retries) failed to
     /// evaluate after its per-child input mappings were already applied (#1390,
