@@ -14,7 +14,7 @@ impl Engine {
         instance_key: Key,
         element_id: &str,
     ) -> Vec<(ElementId, ElementId)> {
-        self.compensation_boundary_wiring(instance_key)
+        self.compensation_boundary_wiring(instance_key, Some(element_id))
             .remove(element_id)
             .unwrap_or_default()
     }
@@ -25,10 +25,13 @@ impl Engine {
     /// by boundary id. Subscription registration (via
     /// [`compensation_boundaries_for`]) and trigger resolution
     /// ([`plan_compensation_fanout`], indexed once per throw) both derive from
-    /// this single implementation of the wiring rules.
+    /// this single implementation of the wiring rules. `only_activity`
+    /// restricts the index to one attached activity *before* allocating, so
+    /// ordinary element completion pays no cost for unrelated boundaries.
     pub(crate) fn compensation_boundary_wiring(
         &self,
         instance_key: Key,
+        only_activity: Option<&str>,
     ) -> HashMap<ElementId, Vec<(ElementId, ElementId)>> {
         let mut wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
         if let Some(process) = self.process_of_instance(instance_key) {
@@ -38,6 +41,9 @@ impl Engine {
                     handler,
                 } = &e.kind
                 {
+                    if only_activity.is_some_and(|a| a != attached_to.as_str()) {
+                        continue;
+                    }
                     wiring
                         .entry(attached_to.clone())
                         .or_default()
@@ -129,7 +135,7 @@ impl Engine {
         // model-wide scan per subscription (the same canonical query
         // registration uses). This model wiring stays REUSABLE:
         // it is never consumed.
-        let boundary_wiring = self.compensation_boundary_wiring(instance_key);
+        let boundary_wiring = self.compensation_boundary_wiring(instance_key, None);
         // Boundary-occurrence consumption is tracked PER ACTIVITY INSTANCE
         // (`(element id, element instance key)`), not per model element: every
         // execution of an activity registers its OWN subscription, so each must
