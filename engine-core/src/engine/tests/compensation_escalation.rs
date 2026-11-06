@@ -2151,14 +2151,17 @@ fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subproce
                 .map(|j| j.key)
                 .collect()
         };
-        // Sequential children run one at a time, parallel ones together.
+        // Sequential children run one at a time, parallel ones together. The
+        // throw fires on the LAST child's completion, so accumulate every
+        // completion's events and assert the boundary lifecycles against them.
+        let mut fired: Vec<Event> = Vec::new();
         loop {
             let jobs = activate_all(&mut engine, "book-b-job");
             if jobs.is_empty() {
                 break;
             }
             for job in jobs {
-                engine.apply_command(Command::complete_job(job)).unwrap();
+                fired.extend(engine.apply_command(Command::complete_job(job)).unwrap());
             }
         }
         assert!(
@@ -2184,6 +2187,18 @@ fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subproce
             .unwrap()
             .compensation_waits
             .is_empty());
+
+        // #1424 (review): each completed `bookB` child carries its OWN
+        // subscription, so the throw must journal the shared `compB` boundary's
+        // full lifecycle once PER CHILD — two occurrences under two distinct
+        // element-instance keys, not one consumed model wiring shared across
+        // every execution of `bookB`.
+        assert_boundary_lifecycle_occurrences(
+            &fired,
+            "compB",
+            2,
+            &format!("sequential={sequential}"),
+        );
     }
 }
 
@@ -3057,6 +3072,97 @@ fn assert_boundary_lifecycles_journaled(
                 .active
                 .contains_key(&key),
             "boundary `{boundary}` must not be left live"
+        );
+    }
+}
+
+/// Asserts a boundary shared by several completed activity instances (a
+/// multi-instance child's `compB`, say) journals its full lifecycle once PER
+/// completed instance — `expected` occurrences, each a complete
+/// ACTIVATING/ACTIVATED/COMPLETING/COMPLETED under its OWN distinct
+/// element-instance key. The per-id sibling
+/// [`assert_boundary_lifecycles_journaled`] cannot see this: it asserts one
+/// lifecycle per boundary ID, which a single shared-model wiring consumed
+/// across every execution of the activity would still satisfy (#1424 review).
+fn assert_boundary_lifecycle_occurrences(
+    events: &[Event],
+    boundary: &str,
+    expected: usize,
+    context: &str,
+) {
+    let mut keys_in_order: Vec<Key> = Vec::new();
+    for e in events {
+        let (intent, key) = match e {
+            Event::ElementActivating {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("ACTIVATING", *element_instance_key),
+            Event::ElementActivated {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("ACTIVATED", *element_instance_key),
+            Event::ElementCompleting {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("COMPLETING", *element_instance_key),
+            Event::ElementCompleted {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("COMPLETED", *element_instance_key),
+            _ => continue,
+        };
+        if intent == "ACTIVATING" {
+            keys_in_order.push(key);
+        }
+    }
+    assert_eq!(
+        keys_in_order.len(),
+        expected,
+        "{context}: boundary `{boundary}` must journal one lifecycle per completed instance"
+    );
+    // Distinct occurrences run under distinct element-instance keys.
+    let distinct: std::collections::HashSet<Key> = keys_in_order.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        expected,
+        "{context}: each `{boundary}` occurrence must use its OWN element-instance key"
+    );
+    // Each occurrence journals its full lifecycle exactly once, in order.
+    for key in &keys_in_order {
+        let intents: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ElementActivating {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("ACTIVATING"),
+                Event::ElementActivated {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("ACTIVATED"),
+                Event::ElementCompleting {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("COMPLETING"),
+                Event::ElementCompleted {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("COMPLETED"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            intents,
+            ["ACTIVATING", "ACTIVATED", "COMPLETING", "COMPLETED"],
+            "{context}: boundary `{boundary}` occurrence under key {key} must journal its full lifecycle exactly once"
         );
     }
 }

@@ -107,11 +107,8 @@ impl Engine {
         // (`attached_to` -> its `(boundary id, handler)` pairs in boundary-id
         // order, one entry per boundary OCCURRENCE), so resolving each
         // triggered subscription's boundary is a hash lookup instead of a
-        // model-wide scan per subscription. The per-activity list is a
-        // consumption queue: a throw pops the first remaining boundary wired
-        // to the subscription's handler, so two boundaries on one activity
-        // sharing a handler each journal their OWN lifecycle rather than the
-        // first boundary's twice (#1424 review).
+        // model-wide scan per subscription. This model wiring stays REUSABLE:
+        // it is never consumed.
         let mut boundary_wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
         if let Some(process) = self.process_of_instance(instance_key) {
             for e in process.elements.values() {
@@ -130,6 +127,17 @@ impl Engine {
                 wired.sort();
             }
         }
+        // Boundary-occurrence consumption is tracked PER ACTIVITY INSTANCE
+        // (`(element id, element instance key)`), not per model element: every
+        // execution of an activity registers its OWN subscription, so each must
+        // consume its own boundary occurrence — a multi-instance activity's two
+        // completed children share the one model wiring of `attached_to`, and
+        // consuming that per element id would journal the boundary's lifecycle
+        // for the first child only (#1424 review). Within one instance, two
+        // boundaries sharing a handler each journal their OWN lifecycle
+        // (boundary-id order).
+        let mut consumed_wiring: HashMap<(ElementId, Key), Vec<(ElementId, ElementId)>> =
+            HashMap::new();
         // Explicit stack (no recursion) so a deeply nested scope chain cannot
         // overflow; LIFO of per-scope cursors reproduces depth-first order.
         let mut stack: Vec<(
@@ -156,19 +164,23 @@ impl Engine {
                     .unwrap_or_default();
                 stack.push((target.element_instance_key, nested.into_iter()));
             } else {
-                // Consume this subscription's boundary occurrence from the
-                // wiring index: the first remaining boundary on the activity
-                // wired to this handler (boundary-id order). A subscription
-                // whose boundary vanished from the model journals no
-                // lifecycle.
-                let boundary = boundary_wiring
-                    .get_mut(&target.element_id)
-                    .and_then(|wired| {
-                        wired
-                            .iter()
-                            .position(|(_, h)| h == &target.handler)
-                            .map(|i| wired.remove(i).0)
-                    });
+                // Consume this subscription's boundary occurrence from its OWN
+                // activity instance's wiring (a per-instance copy of the shared
+                // model wiring, populated on first use): the first remaining
+                // boundary on the activity wired to this handler (boundary-id
+                // order). A subscription whose boundary vanished from the model
+                // journals no lifecycle.
+                let wiring_key = (target.element_id.clone(), target.element_instance_key);
+                let wired = consumed_wiring.entry(wiring_key).or_insert_with(|| {
+                    boundary_wiring
+                        .get(&target.element_id)
+                        .cloned()
+                        .unwrap_or_default()
+                });
+                let boundary = wired
+                    .iter()
+                    .position(|(_, h)| h == &target.handler)
+                    .map(|i| wired.remove(i).0);
                 if let Some(boundary) = boundary {
                     boundaries.push((boundary, self.mint_key()));
                 }
