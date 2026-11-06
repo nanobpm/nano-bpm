@@ -1403,6 +1403,27 @@ pub struct Incident {
     pub operation_reference: Option<i64>,
 }
 
+impl Incident {
+    /// The element instance this incident leaves owed an `ElementActivated` at its
+    /// listener-chain drain (#1429), if it does. Some only while the incident is
+    /// [`IncidentState::Active`] and its redrive parks the token in ACTIVATING
+    /// ([`IoMappingRedrive::parks_in_activating`]) — the single predicate behind
+    /// [`reconstruct_owed_activations`], so a legacy snapshot's restore and a
+    /// per-instance rehydrate can never drift on what counts as an owed marker.
+    pub(crate) fn owed_activation(&self) -> Option<Key> {
+        if self.state == IncidentState::Active
+            && self
+                .redrive
+                .as_ref()
+                .is_some_and(IoMappingRedrive::parks_in_activating)
+        {
+            Some(self.element_instance_key)
+        } else {
+            None
+        }
+    }
+}
+
 /// Lifecycle state of a timer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2137,14 +2158,10 @@ pub(crate) fn reconstruct_owed_activations<'a>(
     incidents: impl IntoIterator<Item = &'a Incident>,
 ) {
     for incident in incidents {
-        if incident.instance_key == instance.key
-            && incident.state == IncidentState::Active
-            && incident
-                .redrive
-                .as_ref()
-                .is_some_and(IoMappingRedrive::parks_in_activating)
-        {
-            instance.activating.insert(incident.element_instance_key);
+        if incident.instance_key == instance.key {
+            if let Some(element_key) = incident.owed_activation() {
+                instance.activating.insert(element_key);
+            }
         }
     }
 }
