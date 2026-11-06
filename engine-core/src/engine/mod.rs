@@ -8859,18 +8859,44 @@ impl Engine {
         tolerated
     }
 
+    /// The aggregated `outputCollection` of the MI body `body_key` (uncollected
+    /// slots padded with `null`), ready to overlay onto a body-scope evaluation
+    /// view — `None` when the element instance is not an MI body or the body
+    /// declares no `outputCollection`. Body completion
+    /// ([`Self::complete_multi_instance_body`]) and the end-listener restart
+    /// ([`Self::restart_listener_chain_events`]) must evaluate the activity's
+    /// output mappings against the SAME aggregate view, or the restart reads a
+    /// stale body-local binding of the collection name (review r5796393495).
+    fn mi_body_collection_overlay(
+        &self,
+        instance_key: Key,
+        body_key: Key,
+    ) -> Option<HashMap<String, Value>> {
+        let mi = self
+            .state
+            .instances
+            .get(&instance_key)?
+            .multi_instances
+            .get(&body_key)?;
+        mi.output_collection.as_ref().map(|name| {
+            HashMap::from([(
+                name.clone(),
+                Value::List(
+                    mi.output_values
+                        .iter()
+                        .map(|o| o.clone().unwrap_or(Value::Null))
+                        .collect(),
+                ),
+            )])
+        })
+    }
+
     fn complete_multi_instance_body(
         &mut self,
         instance_key: Key,
         body_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let (element_id, input_element, output_collection, output_values, active): (
-            ElementId,
-            Option<String>,
-            Option<String>,
-            Vec<Value>,
-            Vec<Key>,
-        ) = match self
+        let (element_id, input_element, active): (ElementId, Option<String>, Vec<Key>) = match self
             .state
             .instances
             .get(&instance_key)
@@ -8879,11 +8905,6 @@ impl Engine {
             Some(mi) => (
                 mi.element_id.clone(),
                 mi.input_element.clone(),
-                mi.output_collection.clone(),
-                mi.output_values
-                    .iter()
-                    .map(|o| o.clone().unwrap_or(Value::Null))
-                    .collect(),
                 mi.active.iter().copied().collect(),
             ),
             None => return (Vec::new(), Vec::new()),
@@ -8894,8 +8915,7 @@ impl Engine {
         // null) and evaluate the activity's output mappings against the body-scope
         // view overlaid with that collection — all while the body scope is still
         // resident (its `ElementCompleted` below tears it down).
-        let collection_map: Option<HashMap<String, Value>> =
-            output_collection.map(|name| HashMap::from([(name, Value::List(output_values))]));
+        let collection_map = self.mi_body_collection_overlay(instance_key, body_key);
         let outputs = self.io_outputs(instance_key, &element_id);
         let output_updates = if outputs.is_empty() {
             HashMap::new()
@@ -11925,18 +11945,26 @@ impl Engine {
                 // An MI body projects its outputs body-aware — the single
                 // projection `complete_multi_instance_body` uses — so a
                 // child-only mapping (`inputElement`/`loopCounter`) is skipped
-                // rather than leaking `null` into the parent scope.
-                let projected = match self
+                // rather than leaking `null` into the parent scope, and a
+                // mapping that reads the `outputCollection` resolves against
+                // the AGGREGATED collection overlaid on the body view, never a
+                // stale body-local binding of that name (review r5796393495).
+                let mi_overlay =
+                    self.mi_body_collection_overlay(instance_key, element_instance_key);
+                let tolerated = self
                     .state
                     .instances
                     .get(&instance_key)
                     .and_then(|i| i.multi_instances.get(&element_instance_key))
-                {
-                    Some(mi) => self.eval_io_mappings_tolerating(
-                        &vars,
-                        &outputs,
-                        &Self::mi_body_tolerated_bindings(mi.input_element.as_deref()),
-                    ),
+                    .map(|mi| Self::mi_body_tolerated_bindings(mi.input_element.as_deref()));
+                let projected = match tolerated {
+                    Some(tolerated) => {
+                        let mut ctx = vars.clone();
+                        if let Some(map) = &mi_overlay {
+                            ctx.extend(map.clone());
+                        }
+                        self.eval_io_mappings_tolerating(&ctx, &outputs, &tolerated)
+                    }
                     None => self.eval_io_mappings_in(&vars, &outputs),
                 };
                 match projected {
@@ -11959,6 +11987,14 @@ impl Engine {
                     }
                 }
             }
+        }
+        // The re-minted listener 0 resolves against the same aggregate view the
+        // projection used: an MI body's listener `type`/`retries` expression
+        // reading the `outputCollection` sees the aggregated list, not a stale
+        // body-local binding (mirrors the listener-vars overlay in
+        // `complete_multi_instance_body`).
+        if let Some(map) = self.mi_body_collection_overlay(instance_key, element_instance_key) {
+            vars.extend(map);
         }
         events.push(self.execution_listener_job_event(
             instance_key,

@@ -259,6 +259,76 @@ fn mi_body_end_listener_retry_uses_body_completion() {
     assert!(engine.is_completed(inst), "{:?}", job_types(&engine));
 }
 
+// Finding 6 (review r5796393495): the same restart must evaluate the body's
+// output mappings against the AGGREGATE view `complete_multi_instance_body`
+// uses — the body scope overlaid with the aggregated `outputCollection`. A
+// stale body-local `results` (the input-collection name shadowing the output
+// collection) must not win: without the overlay `=results -> summary` would
+// read the local list and overwrite the collected `summary` with `[]`.
+#[test]
+fn mi_body_end_listener_retry_overlays_aggregated_collection() {
+    let def = parse(
+        r#"<bpmn:process id="mib" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="each">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="handle" />
+              <zeebe:ioMapping><zeebe:output source="=results" target="summary" /></zeebe:ioMapping>
+              <zeebe:executionListeners>
+                <zeebe:executionListener eventType="end" type="=lt" />
+              </zeebe:executionListeners>
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" outputCollection="results" outputElement="=&quot;done:&quot; + item" />
+              </bpmn:extensionElements>
+            </bpmn:multiInstanceLoopCharacteristics>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="each" />
+          <bpmn:sequenceFlow id="f2" sourceRef="each" targetRef="e" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(def, items());
+    assert_eq!(complete_all(&mut engine, "handle", &[]), 2);
+    let incident = only_incident(&engine, "each");
+    // The shadowing body-local collection: `results` defined in the BODY scope
+    // (so a body-level read sees it) but nowhere the restart's projection would
+    // propagate it to. The aggregate overlay must win over this stale local.
+    engine
+        .apply_command(Command::set_variables_scoped(
+            incident.element_instance_key,
+            vars(&[("results", Value::List(Vec::new()))]),
+            true,
+        ))
+        .unwrap();
+    resolve(&mut engine, inst, &incident, &[]);
+    let incident = only_incident(&engine, "each");
+    resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("lt", Value::Str("audit".into()))],
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "{:?}",
+        engine.active_incidents()
+    );
+    let collected = Value::List(vec![
+        Value::Str("done:a".into()),
+        Value::Str("done:b".into()),
+    ]);
+    assert_eq!(root_var(&engine, inst, "results"), Some(collected.clone()));
+    assert_eq!(
+        root_var(&engine, inst, "summary"),
+        Some(collected),
+        "the restart re-projection reads the aggregated collection, not the stale body-local"
+    );
+    assert_eq!(complete_all(&mut engine, "audit", &[]), 1);
+    assert!(engine.is_completed(inst), "{:?}", job_types(&engine));
+}
+
 // Finding 3 (nested container): a nested AGENTIC container whose catalog job
 // type fails parks the outer container BEFORE any child is created; a re-raise
 // keeps it parked, and the fixed resolve mints exactly one nested agent job.
