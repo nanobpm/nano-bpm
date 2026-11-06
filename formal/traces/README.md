@@ -220,7 +220,7 @@ confined to identifiable records.
 
 ## Divergences this harness found but did not seed
 
-The seeded corpus is all-passing except for the narrowly masked #1424 entry (compensation boundary-event lifecycle records). Two real
+The seeded corpus is all-passing with an empty allowlist (#1424 retired the last masked entry). Two real
 divergences were found while building the harness. They are tracked
 separately, and their scenarios should be added once the fixes land:
 

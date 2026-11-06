@@ -7641,6 +7641,7 @@ impl Engine {
                 let mut handlers: Vec<ElementId> = Vec::new();
                 let mut handler_keys: Vec<Key> = Vec::new();
                 let mut handler_scopes: Vec<Key> = Vec::new();
+                let mut boundaries: Vec<(ElementId, Key)> = Vec::new();
                 let mut scope_subs: Vec<Key> = Vec::new();
                 let mut scope_sub_parents: Vec<Key> = Vec::new();
                 let mut consumed: Vec<Key> = Vec::new();
@@ -7650,6 +7651,7 @@ impl Engine {
                     &mut handlers,
                     &mut handler_keys,
                     &mut handler_scopes,
+                    &mut boundaries,
                     &mut scope_subs,
                     &mut scope_sub_parents,
                     &mut consumed,
@@ -7680,6 +7682,20 @@ impl Engine {
                         handler_scopes,
                         scope_subscription_parents: scope_sub_parents,
                     });
+                    // #1424 (Zeebe parity): every triggered compensation
+                    // boundary event runs its full element lifecycle — in the
+                    // throw's scope, in trigger order — before any handler
+                    // activates. A boundary is a pass-through here: it opens
+                    // no scope and carries no state beyond the live token the
+                    // lifecycle registers and retires.
+                    for (boundary, boundary_key) in boundaries {
+                        events.extend(Self::pass_through_lifecycle(
+                            instance_key,
+                            boundary_key,
+                            boundary,
+                            scope,
+                        ));
+                    }
                     for (handler, handler_key) in handlers.into_iter().zip(handler_keys) {
                         let (handler_events, handler_followups) =
                             self.activate_with_key(instance_key, handler, scope, handler_key);
@@ -7728,6 +7744,41 @@ impl Engine {
         }
 
         Ok((events, followups))
+    }
+
+    /// The full ACTIVATING → ACTIVATED → COMPLETING → COMPLETED record run of
+    /// an element that does no work of its own when it fires (a triggered
+    /// compensation boundary event, #1424).
+    fn pass_through_lifecycle(
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        scope: Key,
+    ) -> [Event; 4] {
+        [
+            Event::ElementActivating {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+                scope,
+            },
+            Event::ElementActivated {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+                scope,
+            },
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+            },
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id,
+            },
+        ]
     }
 
     /// Opens a multi-instance body: evaluates the input collection and fans out

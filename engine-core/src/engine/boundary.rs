@@ -3,30 +3,71 @@
 use super::*;
 
 impl Engine {
+    /// The compensation boundary events attached to the completed activity
+    /// `element_id`, as `(boundary id, handler id)` pairs sorted by boundary id
+    /// so selection stays deterministic when an activity carries several. The
+    /// single model query behind both subscription registration
+    /// ([`compensation_handlers_for`]) and the boundary lifecycle a
+    /// compensation trigger journals (#1424).
+    pub(crate) fn compensation_boundaries_for(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Vec<(ElementId, ElementId)> {
+        self.compensation_boundary_wiring(instance_key, Some(element_id))
+            .remove(element_id)
+            .unwrap_or_default()
+    }
+
+    /// The canonical compensation-boundary wiring query (#1424): every
+    /// compensation boundary event of the instance's process, indexed by the
+    /// activity it is attached to, as `(boundary id, handler id)` pairs sorted
+    /// by boundary id. Subscription registration (via
+    /// [`compensation_boundaries_for`]) and trigger resolution
+    /// ([`plan_compensation_fanout`], indexed once per throw) both derive from
+    /// this single implementation of the wiring rules. `only_activity`
+    /// restricts the index to one attached activity *before* allocating, so
+    /// ordinary element completion pays no cost for unrelated boundaries.
+    pub(crate) fn compensation_boundary_wiring(
+        &self,
+        instance_key: Key,
+        only_activity: Option<&str>,
+    ) -> HashMap<ElementId, Vec<(ElementId, ElementId)>> {
+        let mut wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
+        if let Some(process) = self.process_of_instance(instance_key) {
+            for e in process.elements.values() {
+                if let ElementKind::CompensationBoundaryEvent {
+                    attached_to,
+                    handler,
+                } = &e.kind
+                {
+                    if only_activity.is_some_and(|a| a != attached_to.as_str()) {
+                        continue;
+                    }
+                    wiring
+                        .entry(attached_to.clone())
+                        .or_default()
+                        .push((e.id.clone(), handler.clone()));
+                }
+            }
+        }
+        for wired in wiring.values_mut() {
+            wired.sort();
+        }
+        wiring
+    }
+
     /// The compensation handler activity ids wired — via a compensation boundary
-    /// event — to the completed activity `element_id`. Sorted by boundary id so
-    /// selection stays deterministic when an activity carries several.
+    /// event — to the completed activity `element_id`, in boundary-id order.
     pub(crate) fn compensation_handlers_for(
         &self,
         instance_key: Key,
         element_id: &str,
     ) -> Vec<ElementId> {
-        let Some(process) = self.process_of_instance(instance_key) else {
-            return Vec::new();
-        };
-        let mut wired: Vec<(ElementId, ElementId)> = process
-            .elements
-            .values()
-            .filter_map(|e| match &e.kind {
-                ElementKind::CompensationBoundaryEvent {
-                    attached_to,
-                    handler,
-                } if attached_to == element_id => Some((e.id.clone(), handler.clone())),
-                _ => None,
-            })
-            .collect();
-        wired.sort();
-        wired.into_iter().map(|(_, handler)| handler).collect()
+        self.compensation_boundaries_for(instance_key, element_id)
+            .into_iter()
+            .map(|(_, handler)| handler)
+            .collect()
     }
 
     /// Computes the full fan-out of a whole-scope compensation throw running in
@@ -43,6 +84,11 @@ impl Engine {
     /// * `handler_scopes` — aligned with `handler_keys`: the scope each
     ///   handler's subscription was recorded in (the durable handler -> scope
     ///   relationship bottom-to-top scope completion needs);
+    /// * `boundaries` — the compensation boundary event (element id + freshly
+    ///   minted element-instance key) each triggered boundary subscription
+    ///   fires through, in trigger order (#1424): Zeebe journals its full
+    ///   ACTIVATING/ACTIVATED/COMPLETING/COMPLETED lifecycle before the
+    ///   handlers activate;
     /// * `scope_sub_parents` — aligned with `scope_subs`: the scope each scope
     ///   subscription was recorded in (its enclosing scope subscription, or the
     ///   throw's own scope);
@@ -66,6 +112,7 @@ impl Engine {
         handlers: &mut Vec<ElementId>,
         handler_keys: &mut Vec<Key>,
         handler_scopes: &mut Vec<Key>,
+        boundaries: &mut Vec<(ElementId, Key)>,
         scope_subs: &mut Vec<Key>,
         scope_sub_parents: &mut Vec<Key>,
         consumed: &mut Vec<Key>,
@@ -81,6 +128,25 @@ impl Engine {
                 by_scope.entry(c.scope).or_default().push(c.clone());
             }
         }
+        // Index the model's compensation boundary wiring ONCE per throw
+        // (`attached_to` -> its `(boundary id, handler)` pairs in boundary-id
+        // order, one entry per boundary OCCURRENCE), so resolving each
+        // triggered subscription's boundary is a hash lookup instead of a
+        // model-wide scan per subscription (the same canonical query
+        // registration uses). This model wiring stays REUSABLE:
+        // it is never consumed.
+        let boundary_wiring = self.compensation_boundary_wiring(instance_key, None);
+        // Boundary-occurrence consumption is tracked PER ACTIVITY INSTANCE
+        // (`(element id, element instance key)`), not per model element: every
+        // execution of an activity registers its OWN subscription, so each must
+        // consume its own boundary occurrence — a multi-instance activity's two
+        // completed children share the one model wiring of `attached_to`, and
+        // consuming that per element id would journal the boundary's lifecycle
+        // for the first child only (#1424 review). Within one instance, two
+        // boundaries sharing a handler each journal their OWN lifecycle
+        // (boundary-id order).
+        let mut consumed_wiring: HashMap<(ElementId, Key), Vec<(ElementId, ElementId)>> =
+            HashMap::new();
         // Explicit stack (no recursion) so a deeply nested scope chain cannot
         // overflow; LIFO of per-scope cursors reproduces depth-first order.
         let mut stack: Vec<(
@@ -107,6 +173,26 @@ impl Engine {
                     .unwrap_or_default();
                 stack.push((target.element_instance_key, nested.into_iter()));
             } else {
+                // Consume this subscription's boundary occurrence from its OWN
+                // activity instance's wiring (a per-instance copy of the shared
+                // model wiring, populated on first use): the first remaining
+                // boundary on the activity wired to this handler (boundary-id
+                // order). A subscription whose boundary vanished from the model
+                // journals no lifecycle.
+                let wiring_key = (target.element_id.clone(), target.element_instance_key);
+                let wired = consumed_wiring.entry(wiring_key).or_insert_with(|| {
+                    boundary_wiring
+                        .get(&target.element_id)
+                        .cloned()
+                        .unwrap_or_default()
+                });
+                let boundary = wired
+                    .iter()
+                    .position(|(_, h)| h == &target.handler)
+                    .map(|i| wired.remove(i).0);
+                if let Some(boundary) = boundary {
+                    boundaries.push((boundary, self.mint_key()));
+                }
                 handlers.push(target.handler.clone());
                 handler_keys.push(self.mint_key());
                 handler_scopes.push(current);

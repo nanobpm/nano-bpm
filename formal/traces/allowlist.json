@@ -1,23 +1,4 @@
 {
   "doc": "Known nano-vs-Zeebe trace divergences. Each entry: {scenario, issue: \"#N\", reason, ignoreRecords?}. A listed scenario that no longer diverges is STALE and fails engine-core/tests/zeebe_traces.rs — delete it. `ignoreRecords` (record-field matchers) narrows the entry: only matching records may differ; every other record of every step must still equal Zeebe.",
-  "entries": [
-    {
-      "scenario": "compensation-two-handlers-same-scope",
-      "issue": "#1424",
-      "reason": "Zeebe activates and completes each compensation boundary event (ELEMENT_ACTIVATING/ACTIVATED/COMPLETING/COMPLETED) before activating its handler; nano activates the handler directly without boundary-event lifecycle records.",
-      "ignoreRecords": [
-        { "valueType": "PROCESS_INSTANCE", "bpmnElementType": "BOUNDARY_EVENT", "elementId": "compA" },
-        { "valueType": "PROCESS_INSTANCE", "bpmnElementType": "BOUNDARY_EVENT", "elementId": "compB" }
-      ]
-    },
-    {
-      "scenario": "compensation-whole-scope-subprocess",
-      "issue": "#1424",
-      "reason": "Same boundary-event lifecycle divergence as compensation-two-handlers-same-scope: Zeebe journals ELEMENT_ACTIVATING/ACTIVATED/COMPLETING/COMPLETED for each compensation boundary event (compA, compB) before activating its handler; nano activates the handler directly.",
-      "ignoreRecords": [
-        { "valueType": "PROCESS_INSTANCE", "bpmnElementType": "BOUNDARY_EVENT", "elementId": "compA" },
-        { "valueType": "PROCESS_INSTANCE", "bpmnElementType": "BOUNDARY_EVENT", "elementId": "compB" }
-      ]
-    }
-  ]
+  "entries": []
 }

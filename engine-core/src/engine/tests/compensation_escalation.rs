@@ -30,6 +30,7 @@ fn should_run_the_compensation_handler_when_a_compensation_throw_event_fires() {
         Event::CompensationTriggered { throw_element_id, handlers, .. }
             if throw_element_id == "throw" && handlers == &vec!["cancel".to_string()]
     )));
+    assert_boundary_lifecycles_journaled(&engine, instance_key, &events, &["book-comp"]);
     // the throw's outgoing flow has NOT been taken yet
     assert!(!events
         .iter()
@@ -1219,6 +1220,74 @@ fn single_throw_with_two_keyed_handlers_completes_in_reverse_order() {
     assert!(engine.is_completed(instance_key));
 }
 
+/// Defect class (#1424 review): two compensation boundary events on the SAME
+/// activity can be wired to the SAME handler. Selecting the boundary by
+/// `(attached_to, handler)` then always resolves the first boundary, so a throw
+/// journals two lifecycles for the first boundary and none for the second.
+/// Every boundary occurrence must get its own lifecycle — one element-instance
+/// key each, in boundary-id order — and both handlers still activate.
+///
+/// ```text
+/// start -> book(svc, comp-boundary compA -> cancel, comp-boundary compB -> cancel) -> throw -> done
+/// ```
+#[test]
+fn shared_handler_boundaries_each_journal_their_own_lifecycle() {
+    let def = ProcessBuilder::new("comp-shared-handler")
+        .start_event("s")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("compA", "book", "cancel")
+        .compensation_boundary_event("compB", "book", "cancel")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .service_task("cancel", "cancel-job")
+        .connect("s", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-shared-handler"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    let events = engine.apply_command(Command::complete_job(book)).unwrap();
+
+    // One subscription per boundary — both wired to the same handler.
+    let subscriptions: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Event::CompensationSubscriptionCreated { .. }))
+        .collect();
+    assert_eq!(
+        subscriptions.len(),
+        2,
+        "one compensation subscription per boundary"
+    );
+    // The throw activates the handler once per subscription and journals BOTH
+    // boundary lifecycles — compA's AND compB's, each under its own key.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationTriggered { handlers, .. }
+            if handlers == &vec!["cancel".to_string(), "cancel".to_string()]
+    )));
+    assert_boundary_lifecycles_journaled(&engine, instance_key, &events, &["compA", "compB"]);
+
+    // Both handler instances complete; the throw then routes onward.
+    let cancel_jobs = engine.activate_jobs("cancel-job", "w", 2, 60_000, 0);
+    assert_eq!(cancel_jobs.len(), 2, "one handler instance per boundary");
+    for job in &cancel_jobs {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    assert!(engine.is_completed(instance_key));
+    let inst = engine.instance(instance_key).unwrap();
+    assert!(inst.compensable.is_empty(), "{:?}", inst.compensable);
+    assert!(inst.compensation_waits.is_empty());
+}
+
 /// A `ModifyInstance` that terminates (or replaces) a compensation handler a
 /// throw event is still waiting on would leave the throw bound to the
 /// terminated handler's element-instance key forever: the replacement gets a
@@ -1534,6 +1603,7 @@ fn whole_scope_throw_triggers_handlers_in_nested_subprocesses() {
         )),
         "the whole-scope throw must trigger BOTH in-scope handlers, including the nested one"
     );
+    assert_boundary_lifecycles_journaled(&engine, instance_key, &events, &["compA", "compB"]);
     assert!(
         !events
             .iter()
@@ -2081,14 +2151,17 @@ fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subproce
                 .map(|j| j.key)
                 .collect()
         };
-        // Sequential children run one at a time, parallel ones together.
+        // Sequential children run one at a time, parallel ones together. The
+        // throw fires on the LAST child's completion, so accumulate every
+        // completion's events and assert the boundary lifecycles against them.
+        let mut fired: Vec<Event> = Vec::new();
         loop {
             let jobs = activate_all(&mut engine, "book-b-job");
             if jobs.is_empty() {
                 break;
             }
             for job in jobs {
-                engine.apply_command(Command::complete_job(job)).unwrap();
+                fired.extend(engine.apply_command(Command::complete_job(job)).unwrap());
             }
         }
         assert!(
@@ -2114,6 +2187,18 @@ fn whole_scope_throw_reaches_handlers_inside_a_completed_multi_instance_subproce
             .unwrap()
             .compensation_waits
             .is_empty());
+
+        // #1424 (review): each completed `bookB` child carries its OWN
+        // subscription, so the throw must journal the shared `compB` boundary's
+        // full lifecycle once PER CHILD — two occurrences under two distinct
+        // element-instance keys, not one consumed model wiring shared across
+        // every execution of `bookB`.
+        assert_boundary_lifecycle_occurrences(
+            &fired,
+            "compB",
+            2,
+            &format!("sequential={sequential}"),
+        );
     }
 }
 
@@ -2909,4 +2994,175 @@ fn compensable_sub_process_inside_a_handler_registers_no_subscription() {
 #[test]
 fn compensable_sub_process_with_end_listener_inside_a_handler_registers_no_subscription() {
     run_compensable_sub_process_inside_handler(true);
+}
+
+/// Defect class (#1424): when a compensation throw triggers its handlers, Zeebe
+/// journals each triggered compensation **boundary event**'s full element
+/// lifecycle — ACTIVATING, ACTIVATED, COMPLETING, COMPLETED, in that order —
+/// before any handler activates. Guards every trigger path (single-activity
+/// #897 and whole-scope #901): each `expected` boundary runs exactly one such
+/// lifecycle under one element-instance key, all of them precede the first
+/// handler activation, and no boundary token is left live afterwards.
+fn assert_boundary_lifecycles_journaled(
+    engine: &Engine,
+    instance_key: Key,
+    events: &[Event],
+    expected: &[&str],
+) {
+    let handlers: Vec<String> = events
+        .iter()
+        .find_map(|e| match e {
+            Event::CompensationTriggered { handlers, .. } => Some(handlers.clone()),
+            _ => None,
+        })
+        .expect("the throw triggers compensation");
+    let first_handler = events
+        .iter()
+        .position(|e| {
+            matches!(e, Event::ElementActivating { element_id, .. } if handlers.contains(element_id))
+        })
+        .expect("a handler activates");
+    for boundary in expected {
+        let lifecycle: Vec<(&str, Key, usize)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                Event::ElementActivating {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("ACTIVATING", *element_instance_key, i)),
+                Event::ElementActivated {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("ACTIVATED", *element_instance_key, i)),
+                Event::ElementCompleting {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("COMPLETING", *element_instance_key, i)),
+                Event::ElementCompleted {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary => Some(("COMPLETED", *element_instance_key, i)),
+                _ => None,
+            })
+            .collect();
+        let intents: Vec<&str> = lifecycle.iter().map(|(intent, _, _)| *intent).collect();
+        assert_eq!(
+            intents,
+            ["ACTIVATING", "ACTIVATED", "COMPLETING", "COMPLETED"],
+            "boundary `{boundary}` must journal its full lifecycle exactly once"
+        );
+        let key = lifecycle[0].1;
+        assert!(
+            lifecycle.iter().all(|(_, k, _)| *k == key),
+            "boundary `{boundary}` lifecycle must use one element-instance key"
+        );
+        assert!(
+            lifecycle.iter().all(|(_, _, i)| *i < first_handler),
+            "boundary `{boundary}` must complete before any handler activates (Zeebe order)"
+        );
+        assert!(
+            !engine
+                .instance(instance_key)
+                .unwrap()
+                .active
+                .contains_key(&key),
+            "boundary `{boundary}` must not be left live"
+        );
+    }
+}
+
+/// Asserts a boundary shared by several completed activity instances (a
+/// multi-instance child's `compB`, say) journals its full lifecycle once PER
+/// completed instance — `expected` occurrences, each a complete
+/// ACTIVATING/ACTIVATED/COMPLETING/COMPLETED under its OWN distinct
+/// element-instance key. The per-id sibling
+/// [`assert_boundary_lifecycles_journaled`] cannot see this: it asserts one
+/// lifecycle per boundary ID, which a single shared-model wiring consumed
+/// across every execution of the activity would still satisfy (#1424 review).
+fn assert_boundary_lifecycle_occurrences(
+    events: &[Event],
+    boundary: &str,
+    expected: usize,
+    context: &str,
+) {
+    let mut keys_in_order: Vec<Key> = Vec::new();
+    for e in events {
+        let (intent, key) = match e {
+            Event::ElementActivating {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("ACTIVATING", *element_instance_key),
+            Event::ElementActivated {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("ACTIVATED", *element_instance_key),
+            Event::ElementCompleting {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("COMPLETING", *element_instance_key),
+            Event::ElementCompleted {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == boundary => ("COMPLETED", *element_instance_key),
+            _ => continue,
+        };
+        if intent == "ACTIVATING" {
+            keys_in_order.push(key);
+        }
+    }
+    assert_eq!(
+        keys_in_order.len(),
+        expected,
+        "{context}: boundary `{boundary}` must journal one lifecycle per completed instance"
+    );
+    // Distinct occurrences run under distinct element-instance keys.
+    let distinct: std::collections::HashSet<Key> = keys_in_order.iter().copied().collect();
+    assert_eq!(
+        distinct.len(),
+        expected,
+        "{context}: each `{boundary}` occurrence must use its OWN element-instance key"
+    );
+    // Each occurrence journals its full lifecycle exactly once, in order.
+    for key in &keys_in_order {
+        let intents: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::ElementActivating {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("ACTIVATING"),
+                Event::ElementActivated {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("ACTIVATED"),
+                Event::ElementCompleting {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("COMPLETING"),
+                Event::ElementCompleted {
+                    element_id,
+                    element_instance_key,
+                    ..
+                } if element_id == boundary && element_instance_key == key => Some("COMPLETED"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            intents,
+            ["ACTIVATING", "ACTIVATED", "COMPLETING", "COMPLETED"],
+            "{context}: boundary `{boundary}` occurrence under key {key} must journal its full lifecycle exactly once"
+        );
+    }
 }
