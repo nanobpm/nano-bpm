@@ -14,22 +14,41 @@ impl Engine {
         instance_key: Key,
         element_id: &str,
     ) -> Vec<(ElementId, ElementId)> {
-        let Some(process) = self.process_of_instance(instance_key) else {
-            return Vec::new();
-        };
-        let mut wired: Vec<(ElementId, ElementId)> = process
-            .elements
-            .values()
-            .filter_map(|e| match &e.kind {
-                ElementKind::CompensationBoundaryEvent {
+        self.compensation_boundary_wiring(instance_key)
+            .remove(element_id)
+            .unwrap_or_default()
+    }
+
+    /// The canonical compensation-boundary wiring query (#1424): every
+    /// compensation boundary event of the instance's process, indexed by the
+    /// activity it is attached to, as `(boundary id, handler id)` pairs sorted
+    /// by boundary id. Subscription registration (via
+    /// [`compensation_boundaries_for`]) and trigger resolution
+    /// ([`plan_compensation_fanout`], indexed once per throw) both derive from
+    /// this single implementation of the wiring rules.
+    pub(crate) fn compensation_boundary_wiring(
+        &self,
+        instance_key: Key,
+    ) -> HashMap<ElementId, Vec<(ElementId, ElementId)>> {
+        let mut wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
+        if let Some(process) = self.process_of_instance(instance_key) {
+            for e in process.elements.values() {
+                if let ElementKind::CompensationBoundaryEvent {
                     attached_to,
                     handler,
-                } if attached_to == element_id => Some((e.id.clone(), handler.clone())),
-                _ => None,
-            })
-            .collect();
-        wired.sort();
-        wired
+                } = &e.kind
+                {
+                    wiring
+                        .entry(attached_to.clone())
+                        .or_default()
+                        .push((e.id.clone(), handler.clone()));
+                }
+            }
+        }
+        for wired in wiring.values_mut() {
+            wired.sort();
+        }
+        wiring
     }
 
     /// The compensation handler activity ids wired — via a compensation boundary
@@ -107,26 +126,10 @@ impl Engine {
         // (`attached_to` -> its `(boundary id, handler)` pairs in boundary-id
         // order, one entry per boundary OCCURRENCE), so resolving each
         // triggered subscription's boundary is a hash lookup instead of a
-        // model-wide scan per subscription. This model wiring stays REUSABLE:
+        // model-wide scan per subscription (the same canonical query
+        // registration uses). This model wiring stays REUSABLE:
         // it is never consumed.
-        let mut boundary_wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
-        if let Some(process) = self.process_of_instance(instance_key) {
-            for e in process.elements.values() {
-                if let ElementKind::CompensationBoundaryEvent {
-                    attached_to,
-                    handler,
-                } = &e.kind
-                {
-                    boundary_wiring
-                        .entry(attached_to.clone())
-                        .or_default()
-                        .push((e.id.clone(), handler.clone()));
-                }
-            }
-            for wired in boundary_wiring.values_mut() {
-                wired.sort();
-            }
-        }
+        let boundary_wiring = self.compensation_boundary_wiring(instance_key);
         // Boundary-occurrence consumption is tracked PER ACTIVITY INSTANCE
         // (`(element id, element instance key)`), not per model element: every
         // execution of an activity registers its OWN subscription, so each must
