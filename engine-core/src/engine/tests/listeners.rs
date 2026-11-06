@@ -489,12 +489,23 @@ fn multiple_start_listeners_run_sequentially_in_declaration_order() {
 
 #[test]
 fn listener_variables_merge_into_the_element_scope() {
-    // A start listener that returns a variable makes it visible to the service
-    // job that follows (Zeebe parity: listener completions merge forward).
+    // A start listener that returns a variable makes it visible to the NEXT
+    // listener in the chain (Zeebe #1437: the completion variables are written
+    // element-LOCAL, and the element's scope chain reads them from there).
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(task_with_listeners(
-            vec![el(ListenerEventType::Start, "audit")],
+            vec![
+                el(ListenerEventType::Start, "audit"),
+                // The second listener's job TYPE is a FEEL read of the first
+                // listener's result: it only mints `payment-ok` when `approved`
+                // is visible to the chain.
+                ExecutionListener {
+                    event_type: ListenerEventType::Start,
+                    job_type: "= if approved then \"payment-ok\" else \"payment-no\"".to_string(),
+                    retries: None,
+                },
+            ],
             Vec::new(),
         )))
         .unwrap();
@@ -507,11 +518,390 @@ fn listener_variables_merge_into_the_element_scope() {
     engine
         .apply_command(Command::complete_job_with(listener[0].key, vars))
         .unwrap();
-    let payment = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+    let next = engine.activate_jobs("payment-ok", "W", 10, 1_000, 0);
     assert_eq!(
-        payment[0].variables.get("approved"),
-        Some(&Value::Bool(true)),
-        "start-listener variable is visible to the service job"
+        next.len(),
+        1,
+        "listener 1's FEEL type reads listener 0's element-local variable"
+    );
+}
+
+#[test]
+fn start_listener_completion_variables_are_element_local() {
+    // #1437 (Zeebe parity): a completed execution-listener job's variables are
+    // written as LOCAL variables of the listener's element instance (Zeebe
+    // VARIABLE CREATED at the element's scopeKey), NOT propagated to the
+    // process root — even when the root already defines the name. The gateway
+    // still routes on the value visible at its ACTIVATION (`amount = 10` →
+    // `toF`); the listener's `amount = 500` lands in the gateway's own scope
+    // and does not rewrite the root variable.
+    let def = ProcessBuilder::new("listener-local")
+        .start_event("s")
+        .exclusive_gateway("g")
+        .end_event("f")
+        .end_event("t")
+        .connect("s", "g")
+        .connect_when("g", "t", "= amount > 100")
+        .connect_default("g", "f")
+        .with_listeners("g", vec![el(ListenerEventType::Start, "l0")], Vec::new())
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "listener-local",
+            HashMap::from([("amount".to_string(), Value::Int(10))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let listener = engine.activate_jobs("l0", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "one start-listener job on g");
+    let gateway_eik = listener[0].element_instance_key;
+    assert_ne!(
+        gateway_eik, instance_key,
+        "the gateway's element instance is not the process root"
+    );
+    let done = engine
+        .apply_command(Command::complete_job_with(
+            listener[0].key,
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+
+    // The listener's variable lands in the gateway's own scope…
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::ScopedVariablesUpdated { scope_key, variables, .. }
+                if *scope_key == gateway_eik
+                    && variables.get("amount") == Some(&Value::Int(500))
+        )),
+        "listener completion variables are written to the element's local scope: {done:?}"
+    );
+    // …and NOT propagated to the process root (no root-scope write of amount).
+    assert!(
+        !done.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { variables, .. } if variables.contains_key("amount")
+        )),
+        "listener completion variables must not propagate to the process root: {done:?}"
+    );
+
+    // The gateway still routes on the activation-time value (amount = 10 → f).
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { from, to, .. } if from == "g" && to == "f"
+        )),
+        "gateway routes on the activation-time amount (10 → f): {done:?}"
+    );
+    // The root variable is untouched: the listener's write stayed in the
+    // gateway's local scope (the completed instance's variables are dropped,
+    // so assert on the journal instead — no root-scope write of `amount`).
+    assert_eq!(
+        done.iter()
+            .filter(|e| matches!(e, Event::VariablesUpdated { .. }))
+            .count(),
+        0,
+        "no root-scope variable write at all on listener completion: {done:?}"
+    );
+}
+
+#[test]
+fn end_listener_completion_variables_are_element_local() {
+    // #1437 (Zeebe parity): an END execution-listener job's completion
+    // variables are likewise element-local — written to the listener's element
+    // instance scope, not propagated to the process root.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            Vec::new(),
+            vec![el(ListenerEventType::End, "audit")],
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    complete_one(&mut engine, "payment");
+
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "one end-listener job on charge");
+    let task_eik = listener[0].element_instance_key;
+    let done = engine
+        .apply_command(Command::complete_job_with(
+            listener[0].key,
+            HashMap::from([("audited".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::ScopedVariablesUpdated { scope_key, variables, .. }
+                if *scope_key == task_eik
+                    && variables.get("audited") == Some(&Value::Bool(true))
+        )),
+        "end-listener completion variables are written to the element's local scope: {done:?}"
+    );
+    assert!(
+        !done.iter().any(|e| matches!(
+            e,
+            Event::VariablesUpdated { variables, .. } if variables.contains_key("audited")
+        )),
+        "end-listener completion variables must not propagate to the process root: {done:?}"
+    );
+    let inst = engine.state.instances.get(&instance_key).unwrap();
+    assert_eq!(
+        inst.variables.get("audited"),
+        None,
+        "the process root does not gain the end listener's variable"
+    );
+}
+
+#[test]
+fn join_listener_completion_variables_are_element_local() {
+    // #1437 defect class (review): a multi-incoming join activates through
+    // `activate_join`, not `activate_with_key` — the listener-scope
+    // registration must hold there too, or an END listener's element-local
+    // write is unreadable and the NEXT listener's FEEL attributes resolve
+    // against the enclosing scope instead.
+    let def = ProcessBuilder::new("join-listener-local")
+        .start_event("s")
+        .parallel_gateway("split")
+        .service_task("a", "ja")
+        .service_task("b", "jb")
+        .parallel_gateway("join")
+        .end_event("e")
+        .connect("s", "split")
+        .connect("split", "a")
+        .connect("split", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "e")
+        .with_listeners(
+            "join",
+            Vec::new(),
+            vec![
+                el(ListenerEventType::End, "j0"),
+                ExecutionListener {
+                    event_type: ListenerEventType::End,
+                    job_type: "= if approved then \"j1-ok\" else \"j1-no\"".to_string(),
+                    retries: None,
+                },
+            ],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("join-listener-local"))
+        .unwrap();
+    complete_one(&mut engine, "ja");
+    complete_one(&mut engine, "jb");
+
+    let listener = engine.activate_jobs("j0", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "one end-listener job on the join");
+    let join_eik = listener[0].element_instance_key;
+    let done = engine
+        .apply_command(Command::complete_job_with(
+            listener[0].key,
+            HashMap::from([("approved".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::ScopedVariablesUpdated { scope_key, variables, .. }
+                if *scope_key == join_eik
+                    && variables.get("approved") == Some(&Value::Bool(true))
+        )),
+        "the join listener's completion variables land in the join's local scope: {done:?}"
+    );
+    // The next listener's FEEL job type reads the element-local write.
+    assert_eq!(
+        engine.activate_jobs("j1-ok", "W", 10, 1_000, 0).len(),
+        1,
+        "listener 1 on a join reads listener 0's element-local variable"
+    );
+}
+
+#[test]
+fn terminate_end_listener_completion_is_journaled_once() {
+    // #1437 defect class (review): with listener completion variables written
+    // element-local, the terminate-end shadow-mirror that preceded it would
+    // journal the same local write TWICE. There must be exactly one
+    // element-local write per returned variable.
+    let xml = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+       <bpmn:process id="term-el-once" isExecutable="true">
+        <bpmn:startEvent id="s" />
+        <bpmn:endEvent id="stop">
+          <bpmn:extensionElements>
+            <zeebe:ioMapping>
+              <zeebe:input source="=&quot;old&quot;" target="listenerType" />
+            </zeebe:ioMapping>
+            <zeebe:executionListeners>
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+              <zeebe:executionListener eventType="end" type="=listenerType" />
+            </zeebe:executionListeners>
+          </bpmn:extensionElements>
+          <bpmn:terminateEventDefinition />
+        </bpmn:endEvent>
+        <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="stop" />
+      </bpmn:process>
+    </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).expect("parses").remove(0);
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("term-el-once"))
+        .unwrap();
+    let job = engine
+        .activate_jobs("old", "test-worker", 10, 60_000, 0)
+        .into_iter()
+        .next()
+        .expect("listener 0 job");
+    let done = engine
+        .apply_command(Command::complete_job_with(
+            job.key,
+            HashMap::from([("listenerType".to_string(), Value::Str("next".into()))]),
+        ))
+        .unwrap();
+    let writes = done
+        .iter()
+        .filter(|e| matches!(
+            e,
+            Event::ScopedVariablesUpdated { variables, .. } if variables.contains_key("listenerType")
+        ))
+        .count();
+    assert_eq!(
+        writes, 1,
+        "a terminate-end listener's completion variable is journaled exactly once: {done:?}"
+    );
+    // …and the next listener still reads it (the single write is visible).
+    let next = engine.activate_jobs("next", "test-worker", 10, 60_000, 0);
+    assert_eq!(next.len(), 1, "listener 1 reads listener 0's local write");
+}
+
+#[test]
+fn listener_completion_on_an_unregistered_legacy_scope_still_reads_back() {
+    // #1437 defect class (review): an element parked mid-chain on a journal
+    // from BEFORE listener-scope registration existed has no registered scope.
+    // The completion must register it idempotently so the element-local write
+    // is readable by the rest of the chain. Simulated here by surgically
+    // dropping the scope registration after listener 0's job exists.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![
+                el(ListenerEventType::Start, "audit"),
+                ExecutionListener {
+                    event_type: ListenerEventType::Start,
+                    job_type: "= if approved then \"payment-ok\" else \"payment-no\"".to_string(),
+                    retries: None,
+                },
+            ],
+            Vec::new(),
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    let eik = listener[0].element_instance_key;
+    let ik = listener[0].instance_key;
+    // Simulate the legacy journal: the element's scope was never registered.
+    engine
+        .state
+        .instances
+        .get_mut(&ik)
+        .unwrap()
+        .scope_parents
+        .remove(&eik);
+    engine
+        .apply_command(Command::complete_job_with(
+            listener[0].key,
+            HashMap::from([("approved".to_string(), Value::Bool(true))]),
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.activate_jobs("payment-ok", "W", 10, 1_000, 0).len(),
+        1,
+        "listener 1 reads listener 0's local write even on a legacy (unregistered) scope"
+    );
+}
+
+#[test]
+fn fresh_join_listener_resolves_against_the_enclosing_subprocess_scope() {
+    // #1437 defect class (review): when a split inside a sub-process makes a
+    // fresh parallel join ready, the join's activation events (including its
+    // listener-scope registration) are not yet APPLIED when the end-listener
+    // job's FEEL attributes resolve — so the view must come from the enclosing
+    // (sub-process) scope, or a sub-process-local variable is invisible and
+    // the listener type resolves against the process root instead.
+    let def = ProcessBuilder::new("join-in-sub")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=true".to_string(),
+                    target: "approved".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("a", "ja")
+        .contained_in("a", "sub")
+        .service_task("b", "jb")
+        .contained_in("b", "sub")
+        .parallel_gateway("join")
+        .contained_in("join", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "a")
+        .connect("split", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "sub_end")
+        .connect("sub", "done")
+        .with_listeners(
+            "join",
+            Vec::new(),
+            vec![ExecutionListener {
+                event_type: ListenerEventType::End,
+                // Reads the sub-process-local `approved`: resolves to the
+                // `j-ok` job type only if the view includes the sub-process
+                // scope; at the process root `approved` is undefined.
+                job_type: "= if approved then \"j-ok\" else \"j-no\"".to_string(),
+                retries: None,
+            }],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("join-in-sub"))
+        .unwrap();
+    complete_one(&mut engine, "ja");
+    complete_one(&mut engine, "jb");
+    assert_eq!(
+        engine.activate_jobs("j-ok", "W", 10, 1_000, 0).len(),
+        1,
+        "the fresh join's end listener resolves its type against the enclosing sub-process scope"
     );
 }
 
