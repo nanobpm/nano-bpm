@@ -594,6 +594,7 @@
     },
     "instances": {
       "12": {
+        "activating": [],
         "active": {
           "14": "charge"
         },
@@ -630,6 +631,7 @@
         "variables_spilled": false
       },
       "20": {
+        "activating": [],
         "active": {},
         "adhoc_instances": {},
         "agent_history": {},
@@ -660,6 +662,7 @@
         "variables_spilled": false
       },
       "25": {
+        "activating": [],
         "active": {
           "28": "join",
           "29": "t"
@@ -707,6 +710,7 @@
         "variables_spilled": false
       },
       "33": {
+        "activating": [],
         "active": {
           "36": "throw",
           "38": "cancel"
@@ -762,6 +766,7 @@
         "variables_spilled": false
       },
       "42": {
+        "activating": [],
         "active": {
           "48": "throw",
           "50": "cancel"
@@ -821,6 +826,7 @@
         "variables_spilled": false
       },
       "54": {
+        "activating": [],
         "active": {},
         "adhoc_instances": {},
         "agent_history": {},
@@ -851,6 +857,7 @@
         "variables_spilled": false
       },
       "7": {
+        "activating": [],
         "active": {},
         "adhoc_instances": {},
         "agent_history": {},
@@ -881,6 +888,7 @@
         "variables_spilled": false
       },
       "70": {
+        "activating": [],
         "active": {},
         "adhoc_instances": {},
         "agent_history": {},
@@ -911,6 +919,7 @@
         "variables_spilled": false
       },
       "75": {
+        "activating": [],
         "active": {
           "77": "brt"
         },
@@ -949,6 +958,7 @@
         "variables_spilled": false
       },
       "81": {
+        "activating": [],
         "active": {
           "83": "charge"
         },
@@ -983,6 +993,7 @@
         "variables_spilled": false
       },
       "86": {
+        "activating": [],
         "active": {
           "88": "charge2"
         },

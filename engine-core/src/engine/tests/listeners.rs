@@ -1875,3 +1875,164 @@ fn initial_assignee_without_assigning_listener_stays_byte_identical() {
         Some("alice")
     );
 }
+
+/// Every `ElementActivated` / `ElementActivating` record for `element_id`.
+fn activation_markers(events: &[Event], element_id: &str) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementActivating { element_id: id, .. } if id == element_id => {
+                Some("Activating")
+            }
+            Event::ElementActivated { element_id: id, .. } if id == element_id => Some("Activated"),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn start_listener_creation_incident_defers_activated_until_the_chain_drains() {
+    // #1429 review: the FIRST start listener's job-type expression fails, so the
+    // activation raises an incident instead of `ExecutionListenerJobCreated`.
+    // The element must still stay ACTIVATING (no marker before the incident),
+    // and resolving + draining must write exactly one `ElementActivated`.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![ExecutionListener {
+                event_type: ListenerEventType::Start,
+                job_type: "=listenerType".to_string(),
+                retries: None,
+            }],
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut all = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let inst = all.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        activation_markers(&all, "charge"),
+        vec!["Activating"],
+        "a failed first start listener leaves the element ACTIVATING: {all:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    let incident_key = incidents[0].key;
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("listenerType".to_string(), Value::Str("ls".into()))]),
+        ))
+        .unwrap();
+    all.extend(
+        engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap(),
+    );
+    assert_eq!(activation_markers(&all, "charge"), vec!["Activating"]);
+    all.extend(complete_one(&mut engine, "ls"));
+    assert_eq!(
+        activation_markers(&all, "charge"),
+        vec!["Activating", "Activated"],
+        "exactly one ElementActivated, written at the drain: {all:?}"
+    );
+    assert_eq!(engine.activate_jobs("payment", "W", 10, 1_000, 0).len(), 1);
+}
+
+#[test]
+fn modification_seeded_start_listener_chain_writes_one_activated() {
+    // #1429 review: a modification-seeded activation writes `ElementActivated`
+    // before opening the start chain; the drain must not write a second one.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![el(ListenerEventType::Start, "ls")],
+            Vec::new(),
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // Drain the original token's chain so only the seeded one remains.
+    complete_one(&mut engine, "ls");
+    let mut all = engine
+        .apply_command(Command::modify_instance(
+            inst,
+            vec![crate::command::ActivateElementInstruction {
+                element_id: "charge".into(),
+                variable_instructions: vec![crate::command::VariableInstruction {
+                    variables: HashMap::from([("x".to_string(), Value::Int(1))]),
+                    scope_id: Some("charge".into()),
+                }],
+                ..Default::default()
+            }],
+            vec![],
+        ))
+        .unwrap();
+    let seeded = all
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivating {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == "charge" => Some(*element_instance_key),
+            _ => None,
+        })
+        .unwrap();
+    all.extend(complete_one(&mut engine, "ls"));
+    let seeded_activated = all
+        .iter()
+        .filter(|e| {
+            matches!(e, Event::ElementActivated { element_instance_key, .. }
+                if *element_instance_key == seeded)
+        })
+        .count();
+    assert_eq!(
+        seeded_activated, 1,
+        "one marker for the seeded token: {all:?}"
+    );
+}
+
+#[test]
+fn compensation_throw_writes_activated_when_its_handler_has_a_start_listener() {
+    // #1429 review: a compensation throw's activation carries its handler's
+    // records; the handler's start-listener chain must not suppress the
+    // THROW's own `ElementActivated`.
+    let def = ProcessBuilder::new("comp-listener")
+        .start_event("start")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("comp", "book", "undo")
+        .service_task("undo", "undo-job")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .with_listeners("undo", vec![el(ListenerEventType::Start, "ls")], Vec::new())
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("comp-listener"))
+        .unwrap();
+    let mut all = complete_one(&mut engine, "book-job");
+    assert_eq!(
+        activation_markers(&all, "throw"),
+        vec!["Activating", "Activated"],
+        "the throw is ACTIVATED even though its handler's chain opened: {all:?}"
+    );
+    assert_eq!(activation_markers(&all, "undo"), vec!["Activating"]);
+    all.extend(complete_one(&mut engine, "ls"));
+    assert_eq!(
+        activation_markers(&all, "undo"),
+        vec!["Activating", "Activated"]
+    );
+    assert_eq!(
+        activation_markers(&all, "throw"),
+        vec!["Activating", "Activated"]
+    );
+}

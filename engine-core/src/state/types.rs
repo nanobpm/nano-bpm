@@ -621,6 +621,16 @@ pub struct ProcessInstance {
     /// open joins were activated visibly), hence `serde(default)`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub parked_joins: std::collections::HashSet<Key>,
+    /// Element instances that are ACTIVATING but not yet ACTIVATED: inserted by
+    /// `ElementActivating`, removed by `ElementActivated` (and on completion /
+    /// teardown). The single source of truth for "is `ElementActivated` still
+    /// owed?" (#1429): a drained `start` execution-listener chain writes the
+    /// marker only for a key still in this set, so a modification-seeded
+    /// activation, or a chain opened under a pre-#1429 build (which wrote the
+    /// marker before the chain), never gets a second one. Absent from older
+    /// snapshots (`serde(default)`), which therefore owe no marker.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub activating: std::collections::HashSet<Key>,
     /// The outgoing-flow selection a split gateway (exclusive, or an inclusive
     /// fork) made while ACTIVATING (#1402), keyed by the gateway's element
     /// instance. Completion takes exactly these flows instead of re-evaluating

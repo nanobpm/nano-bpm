@@ -6534,7 +6534,9 @@ impl Engine {
                     );
                     // A re-opened `start` listener chain defers the marker to
                     // its drain (#1429) — exactly as a fresh activation does.
-                    return if activation_pending && !opens_start_chain(&events) {
+                    return if activation_pending
+                        && !opens_start_chain(&events, element_instance_key)
+                    {
                         (gate_activated(events, activated, 0), followups)
                     } else {
                         (events, followups)
@@ -6554,7 +6556,7 @@ impl Engine {
                     scope,
                     view,
                 );
-                if activation_pending && !opens_start_chain(&events) {
+                if activation_pending && !opens_start_chain(&events, element_instance_key) {
                     (gate_activated(events, activated, 0), followups)
                 } else {
                     (events, followups)
@@ -6784,7 +6786,7 @@ impl Engine {
         // activation body parked the token on an activation-time incident, or a
         // `start` execution-listener chain opened (#1429: the element then stays
         // ACTIVATING and the drained chain writes `ElementActivated`).
-        if opens_start_chain(&events) {
+        if opens_start_chain(&events, element_instance_key) {
             return (events, followups);
         }
         let activated = Event::ElementActivated {
@@ -13117,6 +13119,14 @@ impl Engine {
                         element_id: element_id.clone(),
                         scope,
                     };
+                    // Written only while the marker is still owed: a
+                    // modification-seeded activation, or a chain opened by a
+                    // pre-#1429 build, already wrote it before the chain.
+                    let owed = self
+                        .state
+                        .instances
+                        .get(&instance_key)
+                        .is_some_and(|i| i.activating.contains(&element_instance_key));
                     let vars = self.variables_for_element(instance_key, element_instance_key);
                     let (events, followups) = self.run_activation_body(
                         instance_key,
@@ -13125,7 +13135,11 @@ impl Engine {
                         scope,
                         vars,
                     );
-                    (gate_activated(events, activated, 0), followups)
+                    if owed {
+                        (gate_activated(events, activated, 0), followups)
+                    } else {
+                        (events, followups)
+                    }
                 }
             }
             crate::model::ListenerEventType::End => {
@@ -16365,19 +16379,32 @@ impl RoutingFailure {
     }
 }
 
-/// Whether `events` open a `start` execution-listener chain (ADR 0037): an
-/// `ExecutionListenerJobCreated { event_type: Start, .. }` record means the
-/// element stays ACTIVATING behind the chain, so its `ElementActivated` is
-/// deferred to the chain's drain (#1429) — the caller must NOT insert it.
-fn opens_start_chain(events: &[Event]) -> bool {
-    events.iter().any(|e| {
-        matches!(
-            e,
-            Event::ExecutionListenerJobCreated {
-                event_type: crate::model::ListenerEventType::Start,
-                ..
-            }
-        )
+/// Whether `events` open a `start` execution-listener chain (ADR 0037) on the
+/// element instance `eik`: an `ExecutionListenerJobCreated { event_type: Start }`
+/// record — or an incident raised while creating the chain's first listener job
+/// (`IoMappingRedrive::ExecutionListenerJob { event_type: Start }`), whose
+/// resolution mints that job — means the element stays ACTIVATING behind the
+/// chain, so its `ElementActivated` is deferred to the chain's drain (#1429) and
+/// the caller must NOT insert it. Matches are restricted to `eik`: an activation
+/// can carry OTHER element instances' records (a compensation throw appends its
+/// handlers' activations), whose chains must not suppress this marker.
+fn opens_start_chain(events: &[Event], eik: state::Key) -> bool {
+    events.iter().any(|e| match e {
+        Event::ExecutionListenerJobCreated {
+            element_instance_key,
+            event_type: crate::model::ListenerEventType::Start,
+            ..
+        } => *element_instance_key == eik,
+        Event::IncidentRaised {
+            element_instance_key,
+            redrive:
+                Some(state::IoMappingRedrive::ExecutionListenerJob {
+                    event_type: crate::model::ListenerEventType::Start,
+                    ..
+                }),
+            ..
+        } => *element_instance_key == eik,
+        _ => false,
     })
 }
 
