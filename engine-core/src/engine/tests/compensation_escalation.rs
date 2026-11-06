@@ -1220,6 +1220,74 @@ fn single_throw_with_two_keyed_handlers_completes_in_reverse_order() {
     assert!(engine.is_completed(instance_key));
 }
 
+/// Defect class (#1424 review): two compensation boundary events on the SAME
+/// activity can be wired to the SAME handler. Selecting the boundary by
+/// `(attached_to, handler)` then always resolves the first boundary, so a throw
+/// journals two lifecycles for the first boundary and none for the second.
+/// Every boundary occurrence must get its own lifecycle — one element-instance
+/// key each, in boundary-id order — and both handlers still activate.
+///
+/// ```text
+/// start -> book(svc, comp-boundary compA -> cancel, comp-boundary compB -> cancel) -> throw -> done
+/// ```
+#[test]
+fn shared_handler_boundaries_each_journal_their_own_lifecycle() {
+    let def = ProcessBuilder::new("comp-shared-handler")
+        .start_event("s")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("compA", "book", "cancel")
+        .compensation_boundary_event("compB", "book", "cancel")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .service_task("cancel", "cancel-job")
+        .connect("s", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("comp-shared-handler"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let book = engine.activate_jobs("book-job", "w", 1, 60_000, 0)[0].key;
+    let events = engine.apply_command(Command::complete_job(book)).unwrap();
+
+    // One subscription per boundary — both wired to the same handler.
+    let subscriptions: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Event::CompensationSubscriptionCreated { .. }))
+        .collect();
+    assert_eq!(
+        subscriptions.len(),
+        2,
+        "one compensation subscription per boundary"
+    );
+    // The throw activates the handler once per subscription and journals BOTH
+    // boundary lifecycles — compA's AND compB's, each under its own key.
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::CompensationTriggered { handlers, .. }
+            if handlers == &vec!["cancel".to_string(), "cancel".to_string()]
+    )));
+    assert_boundary_lifecycles_journaled(&engine, instance_key, &events, &["compA", "compB"]);
+
+    // Both handler instances complete; the throw then routes onward.
+    let cancel_jobs = engine.activate_jobs("cancel-job", "w", 2, 60_000, 0);
+    assert_eq!(cancel_jobs.len(), 2, "one handler instance per boundary");
+    for job in &cancel_jobs {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+    assert!(engine.is_completed(instance_key));
+    let inst = engine.instance(instance_key).unwrap();
+    assert!(inst.compensable.is_empty(), "{:?}", inst.compensable);
+    assert!(inst.compensation_waits.is_empty());
+}
+
 /// A `ModifyInstance` that terminates (or replaces) a compensation handler a
 /// throw event is still waiting on would leave the throw bound to the
 /// terminated handler's element-instance key forever: the replacement gets a

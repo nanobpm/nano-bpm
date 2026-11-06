@@ -45,22 +45,6 @@ impl Engine {
             .collect()
     }
 
-    /// The compensation boundary event that wires `handler` to the completed
-    /// activity `attached_to` — the element Zeebe activates and completes
-    /// before the handler when compensation is triggered (#1424). `None` only
-    /// if the model no longer carries the wiring.
-    pub(crate) fn compensation_boundary_of(
-        &self,
-        instance_key: Key,
-        attached_to: &str,
-        handler: &str,
-    ) -> Option<ElementId> {
-        self.compensation_boundaries_for(instance_key, attached_to)
-            .into_iter()
-            .find(|(_, h)| h == handler)
-            .map(|(boundary, _)| boundary)
-    }
-
     /// Computes the full fan-out of a whole-scope compensation throw running in
     /// `scope` (#901, Zeebe `triggerCompensation` +
     /// `triggerCompensationFromTopToBottom`): the subscriptions recorded
@@ -119,6 +103,33 @@ impl Engine {
                 by_scope.entry(c.scope).or_default().push(c.clone());
             }
         }
+        // Index the model's compensation boundary wiring ONCE per throw
+        // (`attached_to` -> its `(boundary id, handler)` pairs in boundary-id
+        // order, one entry per boundary OCCURRENCE), so resolving each
+        // triggered subscription's boundary is a hash lookup instead of a
+        // model-wide scan per subscription. The per-activity list is a
+        // consumption queue: a throw pops the first remaining boundary wired
+        // to the subscription's handler, so two boundaries on one activity
+        // sharing a handler each journal their OWN lifecycle rather than the
+        // first boundary's twice (#1424 review).
+        let mut boundary_wiring: HashMap<ElementId, Vec<(ElementId, ElementId)>> = HashMap::new();
+        if let Some(process) = self.process_of_instance(instance_key) {
+            for e in process.elements.values() {
+                if let ElementKind::CompensationBoundaryEvent {
+                    attached_to,
+                    handler,
+                } = &e.kind
+                {
+                    boundary_wiring
+                        .entry(attached_to.clone())
+                        .or_default()
+                        .push((e.id.clone(), handler.clone()));
+                }
+            }
+            for wired in boundary_wiring.values_mut() {
+                wired.sort();
+            }
+        }
         // Explicit stack (no recursion) so a deeply nested scope chain cannot
         // overflow; LIFO of per-scope cursors reproduces depth-first order.
         let mut stack: Vec<(
@@ -145,9 +156,20 @@ impl Engine {
                     .unwrap_or_default();
                 stack.push((target.element_instance_key, nested.into_iter()));
             } else {
-                if let Some(boundary) =
-                    self.compensation_boundary_of(instance_key, &target.element_id, &target.handler)
-                {
+                // Consume this subscription's boundary occurrence from the
+                // wiring index: the first remaining boundary on the activity
+                // wired to this handler (boundary-id order). A subscription
+                // whose boundary vanished from the model journals no
+                // lifecycle.
+                let boundary = boundary_wiring
+                    .get_mut(&target.element_id)
+                    .and_then(|wired| {
+                        wired
+                            .iter()
+                            .position(|(_, h)| h == &target.handler)
+                            .map(|i| wired.remove(i).0)
+                    });
+                if let Some(boundary) = boundary {
                     boundaries.push((boundary, self.mint_key()));
                 }
                 handlers.push(target.handler.clone());
