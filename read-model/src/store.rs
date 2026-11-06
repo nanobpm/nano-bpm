@@ -6435,6 +6435,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         | Event::AdHocToolCompleted { .. }
         | Event::AgentHistoryDeduplicated { .. }
         | Event::CompensationHandlerCompleted { .. }
+        | Event::CompensationScopeSubscriptionCompleted { .. }
         | Event::CompensationSubscriptionCreated { .. }
         | Event::CompensationTriggered { .. }
         | Event::DeploymentCreated { .. }
@@ -7972,7 +7973,7 @@ mod definition_xml_tests {
             adhoc_instances: Default::default(),
             scope_parents: Default::default(),
             scope_variables: Default::default(),
-            compensable: Vec::new(),
+            compensable: Default::default(),
             compensation_waits: Default::default(),
             agent_instances: Default::default(),
             agent_history: Default::default(),
@@ -8240,7 +8241,7 @@ mod definition_xml_tests {
             adhoc_instances: Default::default(),
             scope_parents: Default::default(),
             scope_variables: Default::default(),
-            compensable: Vec::new(),
+            compensable: Default::default(),
             compensation_waits: Default::default(),
             agent_instances: Default::default(),
             agent_history: Default::default(),

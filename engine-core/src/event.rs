@@ -1248,6 +1248,18 @@ pub enum Event {
     /// Records the completed activity's element instance, its compensation
     /// `handler` activity id, and the scope it completed in.
     ///
+    /// `scope_subscription` (#901) marks a **flow-scope** subscription: a
+    /// completed sub-process (or other scope-owning activity) that contains at
+    /// least one compensable subscription records its own handlerless
+    /// subscription (Zeebe
+    /// `BpmnCompensationSubscriptionBehaviour.isFlowScopeWithSubscriptions`),
+    /// so a whole-scope throw can trigger the nested subscriptions through it
+    /// (`triggerCompensationFromTopToBottom`). A scope subscription has an
+    /// empty `handler` and runs no handler itself; it completes
+    /// bottom-to-top once every subscription inside its scope has completed.
+    /// Additive: `serde(default)` decodes pre-#901 records as `false` (a
+    /// boundary subscription), exactly what every pre-#901 record was.
+    ///
     /// [`CompensationBoundaryEvent`]: crate::model::ElementKind::CompensationBoundaryEvent
     /// [`CompensationThrowEvent`]: crate::model::ElementKind::CompensationThrowEvent
     CompensationSubscriptionCreated {
@@ -1256,6 +1268,8 @@ pub enum Event {
         element_id: ElementId,
         handler: ElementId,
         scope: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope_subscription: bool,
     },
     /// A compensation throw event fired: it consumed the compensable
     /// subscriptions in its `scope` and triggered their handlers. `handlers`
@@ -1271,6 +1285,15 @@ pub enum Event {
     /// happens to wait on the same handler element id (the `element_id` + `min()`
     /// misattribution). Additive: `serde(default)` decodes pre-#897 records with
     /// an empty list, and the reducer falls back to id-only waits for them.
+    ///
+    /// `scope_subscriptions` (#901) lists the compensable element-instance keys
+    /// of the triggered **flow-scope** subscriptions (completed sub-processes
+    /// whose own compensation is the fan-out into their nested subscriptions,
+    /// Zeebe `triggerCompensationFromTopToBottom`). A scope subscription runs
+    /// no handler: it retires bottom-to-top once every subscription inside its
+    /// scope has completed, and the throw rests until both its handler
+    /// instances AND its scope subscriptions have drained. Additive:
+    /// `serde(default)` decodes pre-#901 records with an empty list.
     CompensationTriggered {
         instance_key: Key,
         throw_element_instance_key: Key,
@@ -1280,6 +1303,19 @@ pub enum Event {
         consumed: Vec<Key>,
         #[cfg_attr(feature = "serde", serde(default))]
         handler_instance_keys: Vec<Key>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope_subscriptions: Vec<Key>,
+        /// Aligned with `handler_instance_keys` (#901): the scope each
+        /// triggered handler's subscription was recorded in — the durable
+        /// handler -> scope relationship that decides when an enclosing scope
+        /// subscription has drained. Additive (`serde(default)`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        handler_scopes: Vec<Key>,
+        /// Aligned with `scope_subscriptions` (#901): the scope each triggered
+        /// scope subscription was recorded in (its parent scope subscription,
+        /// or the throw's scope). Additive (`serde(default)`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        scope_subscription_parents: Vec<Key>,
     },
     /// One compensation handler triggered by a compensation throw event
     /// completed. Removes the handler from the throw's outstanding set; when it
@@ -1296,6 +1332,21 @@ pub enum Event {
         handler_element_id: ElementId,
         #[cfg_attr(feature = "serde", serde(default))]
         handler_element_instance_key: Option<Key>,
+    },
+    /// A triggered **scope subscription** (#901) completed: the compensation
+    /// fan-out inside the completed sub-process it stands for has fully
+    /// drained (every nested handler done, every nested scope subscription
+    /// completed). Retires the scope subscription from the throw's outstanding
+    /// set — bottom-to-top (Zeebe
+    /// `completeFlowScopeSubscriptionFromBottomToTop`); when the throw's
+    /// handlers AND scope subscriptions are all drained the throw event
+    /// completes and routes onward. `scope_subscription_key` is the
+    /// compensable element-instance key of the completed scope subscription
+    /// (the sub-process's element instance).
+    CompensationScopeSubscriptionCompleted {
+        instance_key: Key,
+        throw_element_instance_key: Key,
+        scope_subscription_key: Key,
     },
     /// A sub-process scope was torn down (by a scoped terminate end or an
     /// interrupting boundary), so the compensation state scoped to it must be
@@ -1672,6 +1723,7 @@ impl Event {
             | Event::CompensationSubscriptionCreated { instance_key, .. }
             | Event::CompensationTriggered { instance_key, .. }
             | Event::CompensationHandlerCompleted { instance_key, .. }
+            | Event::CompensationScopeSubscriptionCompleted { instance_key, .. }
             | Event::ScopedCompensationCleared { instance_key, .. }
             | Event::MultiInstanceActivated { instance_key, .. }
             | Event::MultiInstanceCompletionConditionFulfilled { instance_key, .. }
@@ -1962,10 +2014,19 @@ impl Event {
                 scope,
                 consumed,
                 handler_instance_keys,
+                scope_subscriptions,
+                handler_scopes,
+                scope_subscription_parents,
                 ..
             } => {
                 m = m.max(*throw_element_instance_key).max(*scope);
-                for key in consumed.iter().chain(handler_instance_keys) {
+                for key in consumed
+                    .iter()
+                    .chain(handler_instance_keys)
+                    .chain(scope_subscriptions)
+                    .chain(handler_scopes)
+                    .chain(scope_subscription_parents)
+                {
                     m = m.max(*key);
                 }
             }
@@ -1973,6 +2034,15 @@ impl Event {
                 throw_element_instance_key,
                 ..
             } => m = m.max(*throw_element_instance_key),
+            Event::CompensationScopeSubscriptionCompleted {
+                throw_element_instance_key,
+                scope_subscription_key,
+                ..
+            } => {
+                m = m
+                    .max(*throw_element_instance_key)
+                    .max(*scope_subscription_key)
+            }
             Event::MultiInstanceActivated { body_key, .. }
             | Event::MultiInstanceCompletionConditionFulfilled { body_key, .. }
             | Event::MultiInstanceCompleted { body_key, .. } => m = m.max(*body_key),

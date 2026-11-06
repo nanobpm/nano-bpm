@@ -5918,6 +5918,27 @@ impl Engine {
                     element_id: element_id.clone(),
                 },
             );
+            // #901: a completing sub-process that holds compensable
+            // subscriptions records its own handlerless scope subscription, so
+            // a later whole-scope throw can fan out into them (Zeebe
+            // `isFlowScopeWithSubscriptions`). Emitted right after
+            // `ElementCompleted`, mirroring where `finalize_completion` records
+            // a leaf activity's boundary subscription.
+            // Review r4478182821 (#901): a sub-process that IS a compensation
+            // handler routes back to the throw waiting on it (never along
+            // outgoing flows, and it records no subscription of its own).
+            let handler_throw =
+                self.sub_process_handler_throw(instance_key, eik, &element_id, scope);
+            if handler_throw.is_none() {
+                for sub in self.completion_compensation_subscriptions(
+                    instance_key,
+                    eik,
+                    &element_id,
+                    scope,
+                ) {
+                    self.emit(log, sub);
+                }
+            }
             // Completing normally disarms any boundary timers/subscriptions on it.
             for event in self.cancel_boundary_timers_on(eik) {
                 self.emit(log, event);
@@ -5936,6 +5957,15 @@ impl Engine {
                     self.emit(log, event);
                 }
             }
+            if let Some(throw_eik) = handler_throw {
+                let (resume_events, resume_followups) =
+                    self.resume_compensation_throw(instance_key, &element_id, throw_eik, eik);
+                for event in resume_events {
+                    self.emit(log, event);
+                }
+                followups.extend(resume_followups);
+                continue;
+            }
             for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
                 for event in taken {
                     self.emit(log, event);
@@ -5944,6 +5974,23 @@ impl Engine {
             }
         }
         followups
+    }
+
+    /// The compensation throw waiting on the completing sub-process `eik`, when
+    /// that sub-process is itself a compensation handler (matched by
+    /// element-instance key, #897, with the pre-#897 element-id fallback) —
+    /// the single routing decision shared by every sub-process completion path
+    /// (`complete_drained_subprocesses`, `finalize_subprocess`), mirroring the
+    /// leaf-activity routing in `complete`.
+    fn sub_process_handler_throw(
+        &self,
+        instance_key: Key,
+        eik: Key,
+        element_id: &str,
+        scope: Key,
+    ) -> Option<Key> {
+        self.pending_compensation_handler_by_instance(instance_key, eik)
+            .or_else(|| self.pending_compensation_handler_by_id(instance_key, element_id, scope))
     }
 
     /// Whether a queued step would (re)create work on an instance that has
@@ -7574,29 +7621,53 @@ impl Engine {
             // compensable activities in its scope, running each one's handler,
             // and rests until they finish. With nothing to compensate it is a
             // pass-through.
+            //
+            // #901 (Zeebe `BpmnCompensationSubscriptionBehaviour.
+            // triggerCompensation`): a throw with no `activityRef` compensates
+            // the WHOLE scope it runs in. The direct subscriptions of the throw
+            // scope are triggered newest-first; a *scope subscription* among
+            // them (a completed sub-process that holds nested compensable
+            // activities) runs no handler of its own — it fans the trigger out
+            // top-to-bottom into the subscriptions recorded inside ITS scope
+            // (`triggerCompensationFromTopToBottom`), recursively. The throw
+            // rests until every triggered handler instance AND every triggered
+            // scope subscription has drained.
             Some(ElementKind::CompensationThrowEvent) => {
-                let targets = self.compensable_in_scope(instance_key, scope);
-                if targets.is_empty() {
+                // The whole fan-out, computed up front: `(handler element id,
+                // minted handler key)` for every handler to activate and
+                // `scope_subs` for the triggered scope subscriptions, in
+                // trigger order. `consumed` is every subscription the trigger
+                // removes (boundary AND scope subscriptions).
+                let mut handlers: Vec<ElementId> = Vec::new();
+                let mut handler_keys: Vec<Key> = Vec::new();
+                let mut handler_scopes: Vec<Key> = Vec::new();
+                let mut scope_subs: Vec<Key> = Vec::new();
+                let mut scope_sub_parents: Vec<Key> = Vec::new();
+                let mut consumed: Vec<Key> = Vec::new();
+                self.plan_compensation_fanout(
+                    instance_key,
+                    scope,
+                    &mut handlers,
+                    &mut handler_keys,
+                    &mut handler_scopes,
+                    &mut scope_subs,
+                    &mut scope_sub_parents,
+                    &mut consumed,
+                );
+                if consumed.is_empty() {
                     followups.push(Step::Complete {
                         instance_key,
                         element_instance_key,
                         element_id,
                     });
                 } else {
-                    // Compensate newest-first (reverse completion order). Mint
-                    // each handler's element-instance key NOW and journal it with
-                    // the trigger (#897): the wait binds the throw to the exact
-                    // handler instances it activated, so a handler completion
-                    // later routes back to THIS throw even when another throw in
-                    // the same scope waits on the same handler element id.
-                    let mut handlers = Vec::new();
-                    let mut handler_keys = Vec::new();
-                    let mut consumed = Vec::new();
-                    for target in targets.iter().rev() {
-                        handlers.push(target.handler.clone());
-                        handler_keys.push(self.mint_key());
-                        consumed.push(target.element_instance_key);
-                    }
+                    // Compensate newest-first (reverse completion order). Each
+                    // handler's element-instance key was minted NOW and is
+                    // journaled with the trigger (#897): the wait binds the
+                    // throw to the exact handler instances it activated, so a
+                    // handler completion later routes back to THIS throw even
+                    // when another throw in the same scope waits on the same
+                    // handler element id.
                     events.push(Event::CompensationTriggered {
                         instance_key,
                         throw_element_instance_key: element_instance_key,
@@ -7605,6 +7676,9 @@ impl Engine {
                         handlers: handlers.clone(),
                         consumed,
                         handler_instance_keys: handler_keys.clone(),
+                        scope_subscriptions: scope_subs,
+                        handler_scopes,
+                        scope_subscription_parents: scope_sub_parents,
                     });
                     for (handler, handler_key) in handlers.into_iter().zip(handler_keys) {
                         let (handler_events, handler_followups) =
@@ -8504,6 +8578,22 @@ impl Engine {
                 element_id: element_id.clone(),
             },
         ];
+        // #901: a completing multi-instance sub-process CHILD is a flow scope
+        // like any other — it records its own scope subscription (recorded in
+        // the body's scope) so a later whole-scope throw reaches the
+        // subscriptions nested inside it. Routed through
+        // `completion_compensation_subscriptions` so a child carrying its OWN
+        // compensation boundary records the explicit handler subscription
+        // instead — never both, and never neither.
+        // Review r4478383154: when the owning body IS a compensation handler a
+        // throw is waiting on, the child is undo work and registers nothing
+        // (enforced inside `completion_compensation_subscriptions`).
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            child_eik,
+            &element_id,
+            body_key,
+        ));
 
         // Snapshot the loop configuration and this child's index before evaluating.
         let (
@@ -8953,17 +9043,22 @@ impl Engine {
             instance_key,
             body_key,
         });
-        // Output mappings likewise propagate their projected result to the parent
-        // (flow) scope.
-        if !output_updates.is_empty() {
-            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
-        }
         // A multi-instance COMPENSATION HANDLER body completes back to the throw
         // event waiting on it, not along (non-existent) outgoing flows — a
         // handler has no incoming sequence flow, so it is only ever activated by
         // compensation (#897). The match is by the body's element-INSTANCE key
         // (the key the throw journaled in `handler_instance_keys`), with the
         // element-id lookup only for waits replayed from pre-#897 journals.
+        // Review r4478383154: this routing runs BEFORE any subscription
+        // registration — a handler body is undo work, so it records nothing
+        // compensable (mirrors the leaf-activity routing order in `complete`).
+        // Review r4478697236: output mappings, however, are NOT registration —
+        // they propagate to the parent (flow) scope first, so a handler body's
+        // mapped result is visible before its throw resumes (matching the
+        // end-listener path, which propagated them when the body parked).
+        if !output_updates.is_empty() {
+            events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
+        }
         if let Some(throw_eik) = self
             .pending_compensation_handler_by_instance(instance_key, body_key)
             .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
@@ -8973,6 +9068,18 @@ impl Engine {
             events.extend(resume_events);
             return (events, resume_followups);
         }
+        // #901: the body records its scope subscription over its children's —
+        // or, when the MI activity carries its OWN compensation boundary, its
+        // explicit handler subscription instead (never both, never neither:
+        // `completion_compensation_subscriptions` is the single source of truth
+        // for that either/or, shared with every other sub-process completion
+        // path).
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            body_key,
+            &element_id,
+            scope,
+        ));
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -9017,6 +9124,9 @@ impl Engine {
         // mirrors the listener-free tail in `complete_multi_instance_body`. The
         // match is by the body's element-INSTANCE key, with the element-id
         // lookup only for waits replayed from pre-#897 journals.
+        // Review r4478383154: this routing runs BEFORE any subscription
+        // registration — a handler body is undo work, so it records nothing
+        // compensable.
         if let Some(throw_eik) = self
             .pending_compensation_handler_by_instance(instance_key, body_key)
             .or_else(|| self.pending_compensation_handler_by_id(instance_key, &element_id, scope))
@@ -9026,6 +9136,15 @@ impl Engine {
             events.extend(resume_events);
             return (events, resume_followups);
         }
+        // #901: as in `complete_multi_instance_body` — explicit handler
+        // subscription when the MI activity carries its own compensation
+        // boundary, otherwise the handlerless scope subscription.
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            body_key,
+            &element_id,
+            scope,
+        ));
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -11659,15 +11778,15 @@ impl Engine {
             events.extend(resume_events);
             return (events, resume_followups);
         }
-        for handler in self.compensation_handlers_for(instance_key, &element_id) {
-            events.push(Event::CompensationSubscriptionCreated {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-                handler,
-                scope,
-            });
-        }
+        // #901: compensation registration (explicit boundary subscription, or
+        // a sub-process's scope subscription, and nothing at all for undo work
+        // inside a pending handler) has one canonical home.
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
 
         // A link intermediate *throw* event has no outgoing sequence flow: it
         // hands its token to the matching link *catch* event (same link name,
@@ -11960,15 +12079,15 @@ impl Engine {
                 events,
             );
         }
-        for handler in self.compensation_handlers_for(instance_key, &element_id) {
-            events.push(Event::CompensationSubscriptionCreated {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-                handler,
-                scope,
-            });
-        }
+        // #901: compensation registration (explicit boundary subscription, or
+        // a sub-process's scope subscription, and nothing at all for undo work
+        // inside a pending handler) has one canonical home.
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
             followups.push(step);
@@ -12172,6 +12291,13 @@ impl Engine {
     /// `handler_eik` binds the completion to the exact handler instance (#897),
     /// so the reducer retires that instance's outstanding entry — never another
     /// handler's that merely shares the element id.
+    ///
+    /// #901: after the handler retires, any **scope subscription** whose scope
+    /// has now fully drained (no triggered subscription left inside it) is
+    /// completed bottom-to-top (Zeebe
+    /// `completeFlowScopeSubscriptionFromBottomToTop`), which can cascade up
+    /// through enclosing scope subscriptions. The throw completes only when
+    /// both its handler instances AND its scope subscriptions have drained.
     fn resume_compensation_throw(
         &self,
         instance_key: Key,
@@ -12179,26 +12305,37 @@ impl Engine {
         throw_eik: Key,
         handler_eik: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let wait = self
+        let Some(wait) = self
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.compensation_waits.get(&throw_eik));
-        let (throw_element_id, last_handler) = match wait {
-            Some(wait) => (
-                wait.throw_element_id.clone(),
-                wait.pending_handlers.len() == 1,
-            ),
-            None => return (Vec::new(), Vec::new()),
+            .and_then(|i| i.compensation_waits.get(&throw_eik))
+        else {
+            return (Vec::new(), Vec::new());
         };
-        let events = vec![Event::CompensationHandlerCompleted {
+        let throw_element_id = wait.throw_element_id.clone();
+        // The handler being retired is still counted in `pending_handlers`
+        // (the reducer removes it when the event below applies).
+        let last_handler = wait.pending_handlers.len() == 1;
+        let mut events = vec![Event::CompensationHandlerCompleted {
             instance_key,
             throw_element_instance_key: throw_eik,
             handler_element_id: handler_element_id.to_string(),
             handler_element_instance_key: Some(handler_eik),
         }];
+        // Bottom-to-top scope-subscription completion (#901): retire every
+        // scope subscription this throw waits on whose nested fan-out has now
+        // fully drained, then cascade upward through enclosing scopes.
+        let (drained, open) = drain_scope_subscriptions(wait, handler_eik);
+        for scope_sub_key in drained {
+            events.push(Event::CompensationScopeSubscriptionCompleted {
+                instance_key,
+                throw_element_instance_key: throw_eik,
+                scope_subscription_key: scope_sub_key,
+            });
+        }
         let mut followups = Vec::new();
-        if last_handler {
+        if last_handler && open == 0 {
             // The throw's outstanding handlers are all done: complete it through
             // the normal completion pipeline (`Step::Complete`), exactly like the
             // nothing-to-compensate pass-through path (see `run_activation_body`).
@@ -12377,6 +12514,30 @@ impl Engine {
             element_instance_key,
             element_id: element_id.clone(),
         }];
+        // #901: a completing sub-process that holds compensable subscriptions
+        // records its own handlerless scope subscription — or its explicit
+        // boundary subscriptions instead (mirrors the listener-free path in
+        // `complete_drained_subprocesses`).
+        // Review r4478182821: a sub-process compensation handler resumes its
+        // throw instead of recording subscriptions / taking flows.
+        if let Some(throw_eik) =
+            self.sub_process_handler_throw(instance_key, element_instance_key, &element_id, scope)
+        {
+            let (resume_events, followups) = self.resume_compensation_throw(
+                instance_key,
+                &element_id,
+                throw_eik,
+                element_instance_key,
+            );
+            events.extend(resume_events);
+            return (events, followups);
+        }
+        events.extend(self.completion_compensation_subscriptions(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
         let mut followups = Vec::new();
         for (taken, step) in self.take_all_flows(instance_key, &element_id, scope) {
             events.extend(taken);
@@ -16187,4 +16348,88 @@ fn gate_activated(mut events: Vec<Event>, activated: Event, at: usize) -> Vec<Ev
         events.insert(at.min(events.len()), activated);
     }
     events
+}
+
+/// Bottom-to-top scope-subscription drain (#901, Zeebe
+/// `completeFlowScopeSubscriptionFromBottomToTop`) for a compensation wait
+/// whose handler instance `completing_handler_eik` has just completed.
+///
+/// A triggered scope subscription is drained when no still-outstanding handler
+/// was recorded inside its scope AND no still-outstanding scope subscription
+/// is nested directly inside it. This uses the durable handler -> scope and
+/// scope-subscription -> parent relationships journaled on the trigger — NOT
+/// `compensable`, which the trigger already emptied for every consumed
+/// subscription. Retiring an inner scope can make its parent drained, so this
+/// iterates to a fixpoint. Returns the drained keys in bottom-to-top order and
+/// the count of scope subscriptions that remain outstanding.
+fn drain_scope_subscriptions(
+    wait: &crate::state::CompensationWait,
+    completing_handler_eik: Key,
+) -> (Vec<Key>, usize) {
+    // Scopes of the handler instances still outstanding once the completing
+    // one retires. A wait without the aligned binding (pre-#901 journal)
+    // carries no scope subscriptions, so the empty fallback is never consulted.
+    let remaining_handler_scopes: Vec<Key> =
+        if wait.pending_handler_scopes.len() == wait.pending_handler_keys.len() {
+            wait.pending_handler_keys
+                .iter()
+                .zip(&wait.pending_handler_scopes)
+                .filter(|(k, _)| **k != completing_handler_eik)
+                .map(|(_, s)| *s)
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let aligned =
+        wait.pending_scope_subscription_parents.len() == wait.pending_scope_subscriptions.len();
+    let subs = &wait.pending_scope_subscriptions;
+    let parent_of = |i: usize| -> Option<Key> {
+        if aligned {
+            Some(wait.pending_scope_subscription_parents[i])
+        } else {
+            None
+        }
+    };
+    // Hash-based membership + per-scope open-child counts derived once, so the
+    // fixpoint is O(n log n) instead of rescanning every open entry per step.
+    let handler_scope_set: HashSet<Key> = remaining_handler_scopes.into_iter().collect();
+    let mut index_of: HashMap<Key, usize> = HashMap::with_capacity(subs.len());
+    for (i, k) in subs.iter().enumerate() {
+        index_of.entry(*k).or_insert(i);
+    }
+    let mut open_children: HashMap<Key, usize> = HashMap::new();
+    for i in 0..subs.len() {
+        if let Some(p) = parent_of(i) {
+            *open_children.entry(p).or_default() += 1;
+        }
+    }
+    let eligible = |k: &Key, open_children: &HashMap<Key, usize>| {
+        !handler_scope_set.contains(k) && open_children.get(k).copied().unwrap_or(0) == 0
+    };
+    // Lowest-index eligible entry first — the same retirement order as the
+    // former "first eligible position" scan (eligibility only ever grows).
+    let mut ready: std::collections::BTreeSet<usize> = (0..subs.len())
+        .filter(|&i| eligible(&subs[i], &open_children))
+        .collect();
+    let mut done = vec![false; subs.len()];
+    let mut drained = Vec::new();
+    while let Some(i) = ready.pop_first() {
+        if done[i] {
+            continue;
+        }
+        done[i] = true;
+        drained.push(subs[i]);
+        if let Some(p) = parent_of(i) {
+            if let Some(n) = open_children.get_mut(&p) {
+                *n = n.saturating_sub(1);
+            }
+            if let Some(&pi) = index_of.get(&p) {
+                if !done[pi] && eligible(&p, &open_children) {
+                    ready.insert(pi);
+                }
+            }
+        }
+    }
+    let open = subs.len() - drained.len();
+    (drained, open)
 }

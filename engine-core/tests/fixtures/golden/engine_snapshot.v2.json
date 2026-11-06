@@ -1,5 +1,5 @@
 {
-  "next_local": 66,
+  "next_local": 88,
   "now": 1700000000021,
   "num_partitions": 1,
   "partition_id": 0,
@@ -19,13 +19,19 @@
         ],
         [
           -50,
-          64
+          86
         ]
       ],
       "sync-task": [
         [
           -50,
           30
+        ]
+      ],
+      "whole-cancel-job": [
+        [
+          -50,
+          49
         ]
       ]
     },
@@ -36,7 +42,9 @@
       "dup": 1,
       "order": 4,
       "sync": 1,
-      "trip": 1
+      "trip": 1,
+      "whole": 1,
+      "whole-done": 1
     },
     "decision_requirements": {
       "greet": {
@@ -117,12 +125,12 @@
           "namespace": "",
           "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
         },
-        "key": 40,
+        "key": 62,
         "version": 1
       }
     },
     "decision_requirements_versions": {
-      "40": {
+      "62": {
         "drg": {
           "decisions": [
             {
@@ -200,15 +208,15 @@
           "namespace": "",
           "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
         },
-        "key": 40,
+        "key": 62,
         "version": 1
       }
     },
     "decision_versions": {
-      "41": {
+      "63": {
         "decision_id": "base",
         "decision_name": "Base",
-        "decision_requirements_key": 40,
+        "decision_requirements_key": 62,
         "drg": {
           "decisions": [
             {
@@ -286,13 +294,13 @@
           "namespace": "",
           "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
         },
-        "key": 41,
+        "key": 63,
         "version": 1
       },
-      "42": {
+      "64": {
         "decision_id": "root",
         "decision_name": "Root",
-        "decision_requirements_key": 40,
+        "decision_requirements_key": 62,
         "drg": {
           "decisions": [
             {
@@ -370,7 +378,7 @@
           "namespace": "",
           "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
         },
-        "key": 42,
+        "key": 64,
         "version": 1
       }
     },
@@ -378,7 +386,7 @@
       "base": {
         "decision_id": "base",
         "decision_name": "Base",
-        "decision_requirements_key": 40,
+        "decision_requirements_key": 62,
         "drg": {
           "decisions": [
             {
@@ -456,13 +464,13 @@
           "namespace": "",
           "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
         },
-        "key": 41,
+        "key": 63,
         "version": 1
       },
       "root": {
         "decision_id": "root",
         "decision_name": "Root",
-        "decision_requirements_key": 40,
+        "decision_requirements_key": 62,
         "drg": {
           "decisions": [
             {
@@ -540,20 +548,20 @@
           "namespace": "",
           "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
         },
-        "key": 42,
+        "key": 64,
         "version": 1
       }
     },
     "form_versions": {},
     "forms": {},
     "incidents": {
-      "54": {
+      "76": {
         "created_at": 1700000000013,
         "element_id": "brt",
-        "element_instance_key": 52,
-        "instance_key": 50,
+        "element_instance_key": 74,
+        "instance_key": 72,
         "job_key": null,
-        "key": 54,
+        "key": 76,
         "kind": "DecisionEvaluation",
         "operation_reference": null,
         "reason": "failed to evaluate decision 'root' at business rule task 'brt': hit policy UNIQUE requires at most one matching rule, but 2 rules matched",
@@ -561,13 +569,13 @@
         "resolved_at": null,
         "state": "Active"
       },
-      "60": {
+      "82": {
         "created_at": 1700000000017,
         "element_id": "charge",
-        "element_instance_key": 58,
-        "instance_key": 56,
+        "element_instance_key": 80,
+        "instance_key": 78,
         "job_key": null,
-        "key": 60,
+        "key": 82,
         "kind": "UnhandledError",
         "operation_reference": null,
         "reason": "unhandled BPMN error 'CARD_DECLINED': card declined",
@@ -581,7 +589,8 @@
       "order": 2,
       "order-v2": 1,
       "sync": 1,
-      "trip": 1
+      "trip": 1,
+      "whole": 1
     },
     "instances": {
       "12": {
@@ -712,9 +721,14 @@
             "pending_handler_keys": [
               37
             ],
+            "pending_handler_scopes": [
+              0
+            ],
             "pending_handlers": [
               "cancel"
             ],
+            "pending_scope_subscription_parents": [],
+            "pending_scope_subscriptions": [],
             "scope": 0,
             "throw_element_id": "throw"
           }
@@ -747,7 +761,96 @@
         "variables": {},
         "variables_spilled": false
       },
-      "45": {
+      "41": {
+        "active": {
+          "47": "throw",
+          "48": "cancel"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {
+          "47": {
+            "pending_handler_keys": [
+              48
+            ],
+            "pending_handler_scopes": [
+              43
+            ],
+            "pending_handlers": [
+              "cancel"
+            ],
+            "pending_scope_subscription_parents": [
+              0
+            ],
+            "pending_scope_subscriptions": [
+              43
+            ],
+            "scope": 0,
+            "throw_element_id": "throw"
+          }
+        },
+        "created_at": 1700000000013,
+        "gateway_routes": {},
+        "incidents": [],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 41,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 40,
+        "process_id": "whole",
+        "scope_parents": {
+          "48": 0
+        },
+        "scope_variables": {
+          "48": {
+            "mapped": "Null"
+          }
+        },
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
+      "52": {
+        "active": {},
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000015,
+        "gateway_routes": {},
+        "incidents": [],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 52,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 51,
+        "process_id": "whole-done",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Completed",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
+      "67": {
         "active": {},
         "adhoc_instances": {},
         "agent_history": {},
@@ -761,121 +864,17 @@
         "join_counts": {},
         "join_flow_arrivals": {},
         "join_instances": {},
-        "key": 45,
-        "multi_instances": {},
-        "parent_element_instance_key": null,
-        "parent_process_instance_key": null,
-        "parked_joins": [],
-        "process_definition_key": 44,
-        "process_id": "decide",
-        "scope_parents": {},
-        "scope_variables": {},
-        "scopes": {},
-        "state": "Completed",
-        "suspended_at": null,
-        "tags": [],
-        "variables": {},
-        "variables_spilled": false
-      },
-      "50": {
-        "active": {
-          "52": "brt"
-        },
-        "adhoc_instances": {},
-        "agent_history": {},
-        "agent_instances": {},
-        "business_id": null,
-        "compensable": [],
-        "compensation_waits": {},
-        "created_at": 1700000000013,
-        "gateway_routes": {},
-        "incidents": [
-          54
-        ],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
-        "key": 50,
-        "multi_instances": {},
-        "parent_element_instance_key": null,
-        "parent_process_instance_key": null,
-        "parked_joins": [],
-        "process_definition_key": 44,
-        "process_id": "decide",
-        "scope_parents": {},
-        "scope_variables": {},
-        "scopes": {},
-        "state": "Active",
-        "suspended_at": null,
-        "tags": [],
-        "variables": {
-          "lang": {
-            "Str": "xx"
-          }
-        },
-        "variables_spilled": false
-      },
-      "56": {
-        "active": {
-          "58": "charge"
-        },
-        "adhoc_instances": {},
-        "agent_history": {},
-        "agent_instances": {},
-        "business_id": null,
-        "compensable": [],
-        "compensation_waits": {},
-        "created_at": 1700000000015,
-        "gateway_routes": {},
-        "incidents": [
-          60
-        ],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
-        "key": 56,
-        "multi_instances": {},
-        "parent_element_instance_key": null,
-        "parent_process_instance_key": null,
-        "parked_joins": [],
-        "process_definition_key": 2,
-        "process_id": "order",
-        "scope_parents": {},
-        "scope_variables": {},
-        "scopes": {},
-        "state": "Active",
-        "suspended_at": null,
-        "tags": [],
-        "variables": {},
-        "variables_spilled": false
-      },
-      "61": {
-        "active": {
-          "63": "charge2"
-        },
-        "adhoc_instances": {},
-        "agent_history": {},
-        "agent_instances": {},
-        "business_id": null,
-        "compensable": [],
-        "compensation_waits": {},
-        "created_at": 1700000000018,
-        "gateway_routes": {},
-        "incidents": [],
-        "join_counts": {},
-        "join_flow_arrivals": {},
-        "join_instances": {},
-        "key": 61,
+        "key": 67,
         "multi_instances": {},
         "parent_element_instance_key": null,
         "parent_process_instance_key": null,
         "parked_joins": [],
         "process_definition_key": 66,
-        "process_id": "order-v2",
+        "process_id": "decide",
         "scope_parents": {},
         "scope_variables": {},
         "scopes": {},
-        "state": "Active",
+        "state": "Completed",
         "suspended_at": null,
         "tags": [],
         "variables": {},
@@ -906,6 +905,110 @@
         "scope_variables": {},
         "scopes": {},
         "state": "Completed",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
+      "72": {
+        "active": {
+          "74": "brt"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000013,
+        "gateway_routes": {},
+        "incidents": [
+          76
+        ],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 72,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 66,
+        "process_id": "decide",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {
+          "lang": {
+            "Str": "xx"
+          }
+        },
+        "variables_spilled": false
+      },
+      "78": {
+        "active": {
+          "80": "charge"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000015,
+        "gateway_routes": {},
+        "incidents": [
+          82
+        ],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 78,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
+      },
+      "83": {
+        "active": {
+          "85": "charge2"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000018,
+        "gateway_routes": {},
+        "incidents": [],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 83,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 88,
+        "process_id": "order-v2",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
         "suspended_at": null,
         "tags": [],
         "variables": {},
@@ -995,7 +1098,27 @@
         "state": "Created",
         "worker": null
       },
-      "59": {
+      "49": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000013,
+        "deadline": null,
+        "element_id": "cancel",
+        "element_instance_key": 48,
+        "error_code": null,
+        "error_message": null,
+        "instance_key": 41,
+        "job_type": "whole-cancel-job",
+        "key": 49,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
+      },
+      "81": {
         "activated": true,
         "activated_at": null,
         "activation_timeout": null,
@@ -1003,13 +1126,13 @@
         "deadline": null,
         "durable_activation": true,
         "element_id": "charge",
-        "element_instance_key": 58,
+        "element_instance_key": 80,
         "error_code": "CARD_DECLINED",
         "error_message": "card declined",
         "has_failed_with_retries_left": true,
-        "instance_key": 56,
+        "instance_key": 78,
         "job_type": "payment",
-        "key": 59,
+        "key": 81,
         "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
@@ -1017,19 +1140,19 @@
         "state": "Errored",
         "worker": "worker-3"
       },
-      "64": {
+      "86": {
         "activated": false,
         "activated_at": null,
         "activation_timeout": null,
         "created_at": 1700000000018,
         "deadline": null,
         "element_id": "charge2",
-        "element_instance_key": 63,
+        "element_instance_key": 85,
         "error_code": null,
         "error_message": null,
-        "instance_key": 61,
+        "instance_key": 83,
         "job_type": "payment",
-        "key": 64,
+        "key": 86,
         "kind": "BpmnElement",
         "lease_token": null,
         "priority": 50,
@@ -1048,14 +1171,17 @@
       "33": [
         38
       ],
-      "56": [
-        59
-      ],
-      "61": [
-        64
+      "41": [
+        49
       ],
       "7": [
         10
+      ],
+      "78": [
+        81
+      ],
+      "83": [
+        86
       ]
     },
     "message_start_subscriptions": {},
@@ -1703,41 +1829,87 @@
         "key": 4,
         "version": 1
       },
-      "44": {
+      "40": {
         "definition": {
           "adhoc": [],
           "elements": {
-            "brt": {
+            "book": {
               "end_listeners": [],
-              "id": "brt",
+              "id": "book",
               "io": {
                 "inputs": [],
                 "outputs": []
               },
-              "kind": {
-                "BusinessRuleTask": {
-                  "decision_id": "root",
-                  "result_variable": "out"
-                }
-              },
+              "kind": "Task",
               "multi_instance": null,
               "name": null,
               "outgoing": [
                 {
                   "condition": null,
                   "is_default": false,
-                  "to": "e"
+                  "to": "sub_end"
                 }
               ],
-              "parent": null,
+              "parent": "sub",
               "retries": null,
               "start_listeners": [],
               "task_listeners": [],
               "timer": null
             },
-            "e": {
+            "book-comp": {
               "end_listeners": [],
-              "id": "e",
+              "id": "book-comp",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "CompensationBoundaryEvent": {
+                  "attached_to": "book",
+                  "handler": "cancel"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "cancel": {
+              "end_listeners": [],
+              "id": "cancel",
+              "io": {
+                "inputs": [
+                  {
+                    "source": "= missing_var",
+                    "target": "mapped"
+                  }
+                ],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "whole-cancel-job",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "done": {
+              "end_listeners": [],
+              "id": "done",
               "io": {
                 "inputs": [],
                 "outputs": []
@@ -1766,7 +1938,97 @@
                 {
                   "condition": null,
                   "is_default": false,
-                  "to": "brt"
+                  "to": "sub"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub": {
+              "end_listeners": [],
+              "id": "sub",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "SubProcess": {
+                  "start_event": "sub_start"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "throw"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_end": {
+              "end_listeners": [],
+              "id": "sub_end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_start": {
+              "end_listeners": [],
+              "id": "sub_start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "book"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "throw": {
+              "end_listeners": [],
+              "id": "throw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "CompensationThrowEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "done"
                 }
               ],
               "parent": null,
@@ -1776,13 +2038,219 @@
               "timer": null
             }
           },
-          "id": "decide",
+          "id": "whole",
           "name": null,
           "start_event": "s",
           "start_form_id": null,
           "xml": ""
         },
-        "key": 44,
+        "key": 40,
+        "version": 1
+      },
+      "51": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "book": {
+              "end_listeners": [],
+              "id": "book",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "Task",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub_end"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "book-comp": {
+              "end_listeners": [],
+              "id": "book-comp",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "CompensationBoundaryEvent": {
+                  "attached_to": "book",
+                  "handler": "cancel"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "cancel": {
+              "end_listeners": [],
+              "id": "cancel",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "Task",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "done": {
+              "end_listeners": [],
+              "id": "done",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub": {
+              "end_listeners": [],
+              "id": "sub",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "SubProcess": {
+                  "start_event": "sub_start"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "throw"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_end": {
+              "end_listeners": [],
+              "id": "sub_end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_start": {
+              "end_listeners": [],
+              "id": "sub_start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "book"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "throw": {
+              "end_listeners": [],
+              "id": "throw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "CompensationThrowEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "done"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "whole-done",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 51,
         "version": 1
       },
       "6": {
@@ -2029,6 +2497,88 @@
         "definition": {
           "adhoc": [],
           "elements": {
+            "brt": {
+              "end_listeners": [],
+              "id": "brt",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "BusinessRuleTask": {
+                  "decision_id": "root",
+                  "result_variable": "out"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "e"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "e": {
+              "end_listeners": [],
+              "id": "e",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "brt"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "decide",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 66,
+        "version": 1
+      },
+      "88": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
             "charge2": {
               "end_listeners": [],
               "id": "charge2",
@@ -2106,7 +2656,7 @@
           "start_form_id": null,
           "xml": ""
         },
-        "key": 66,
+        "key": 88,
         "version": 1
       }
     },
@@ -2190,7 +2740,7 @@
           "start_form_id": null,
           "xml": ""
         },
-        "key": 44,
+        "key": 66,
         "version": 1
       },
       "dup": {
@@ -2703,7 +3253,7 @@
           "start_form_id": null,
           "xml": ""
         },
-        "key": 66,
+        "key": 88,
         "version": 1
       },
       "review": {
@@ -3157,6 +3707,430 @@
           "xml": ""
         },
         "key": 32,
+        "version": 1
+      },
+      "whole": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "book": {
+              "end_listeners": [],
+              "id": "book",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "Task",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub_end"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "book-comp": {
+              "end_listeners": [],
+              "id": "book-comp",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "CompensationBoundaryEvent": {
+                  "attached_to": "book",
+                  "handler": "cancel"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "cancel": {
+              "end_listeners": [],
+              "id": "cancel",
+              "io": {
+                "inputs": [
+                  {
+                    "source": "= missing_var",
+                    "target": "mapped"
+                  }
+                ],
+                "outputs": []
+              },
+              "kind": {
+                "ServiceTask": {
+                  "custom_headers": {},
+                  "job_type": "whole-cancel-job",
+                  "linked_resources": [],
+                  "priority": null
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "done": {
+              "end_listeners": [],
+              "id": "done",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub": {
+              "end_listeners": [],
+              "id": "sub",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "SubProcess": {
+                  "start_event": "sub_start"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "throw"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_end": {
+              "end_listeners": [],
+              "id": "sub_end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_start": {
+              "end_listeners": [],
+              "id": "sub_start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "book"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "throw": {
+              "end_listeners": [],
+              "id": "throw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "CompensationThrowEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "done"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "whole",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 40,
+        "version": 1
+      },
+      "whole-done": {
+        "definition": {
+          "adhoc": [],
+          "elements": {
+            "book": {
+              "end_listeners": [],
+              "id": "book",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "Task",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub_end"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "book-comp": {
+              "end_listeners": [],
+              "id": "book-comp",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "CompensationBoundaryEvent": {
+                  "attached_to": "book",
+                  "handler": "cancel"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "cancel": {
+              "end_listeners": [],
+              "id": "cancel",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "Task",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "done": {
+              "end_listeners": [],
+              "id": "done",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "s": {
+              "end_listeners": [],
+              "id": "s",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "sub"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub": {
+              "end_listeners": [],
+              "id": "sub",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": {
+                "SubProcess": {
+                  "start_event": "sub_start"
+                }
+              },
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "throw"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_end": {
+              "end_listeners": [],
+              "id": "sub_end",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "EndEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "sub_start": {
+              "end_listeners": [],
+              "id": "sub_start",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "StartEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "book"
+                }
+              ],
+              "parent": "sub",
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            },
+            "throw": {
+              "end_listeners": [],
+              "id": "throw",
+              "io": {
+                "inputs": [],
+                "outputs": []
+              },
+              "kind": "CompensationThrowEvent",
+              "multi_instance": null,
+              "name": null,
+              "outgoing": [
+                {
+                  "condition": null,
+                  "is_default": false,
+                  "to": "done"
+                }
+              ],
+              "parent": null,
+              "retries": null,
+              "start_listeners": [],
+              "task_listeners": [],
+              "timer": null
+            }
+          },
+          "id": "whole-done",
+          "name": null,
+          "start_event": "s",
+          "start_form_id": null,
+          "xml": ""
+        },
+        "key": 51,
         "version": 1
       }
     },

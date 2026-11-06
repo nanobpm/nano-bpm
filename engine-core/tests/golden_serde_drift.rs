@@ -466,6 +466,104 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("create trip instance"),
     );
 
+    // Whole-scope compensation witness (#901): a compensable activity nested in
+    // a sub-process, so the sub-process's completion records its handlerless
+    // **scope subscription** (`scope_subscription: true`) and the root throw's
+    // trigger pins the `CompensationTriggered` `scope_subscriptions` frame. The
+    // handler parks on an input-mapping incident (like `trip` above), leaving
+    // the wait — with `pending_scope_subscriptions` — live in the snapshot, so
+    // a later field/tag change to the #901 additive shapes cannot slip past the
+    // drift guard. `book` is a pass-through task, keeping the
+    // one-job-per-instance determinism contract.
+    let whole: ProcessDefinition = ProcessBuilder::new("whole")
+        .start_event("s")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .task("book")
+        .contained_in("book", "sub")
+        .compensation_boundary_event("book-comp", "book", "cancel")
+        .contained_in("book-comp", "sub")
+        .service_task("cancel", "whole-cancel-job")
+        .contained_in("cancel", "sub")
+        .with_io(
+            "cancel",
+            IoMapping {
+                inputs: vec![Mapping {
+                    source: "= missing_var".to_string(),
+                    target: "mapped".to_string(),
+                }],
+                outputs: vec![],
+            },
+        )
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("s", "sub")
+        .connect("sub_start", "book")
+        .connect("book", "sub_end")
+        .connect("sub", "throw")
+        .connect("throw", "done")
+        .build()
+        .expect("build whole-scope compensation process");
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(whole), T0 + 12)
+            .expect("deploy whole"),
+    );
+    // Creating the instance drives `book` to completion inside `sub` (recording
+    // its boundary subscription), drains `sub` (recording its scope
+    // subscription), and fires the root throw, which consumes BOTH and
+    // activates the handler — parked on its input-mapping incident, leaving the
+    // throw's wait (with the scope subscription) live.
+    journal.extend(
+        engine
+            .apply_command_at(Command::create_instance("whole"), T0 + 13)
+            .expect("create whole instance"),
+    );
+    // Whole-scope compensation that DRAINS (#901): the same nested shape with
+    // pass-through `task`s (no job, no incident), so the handler completes in
+    // the creating command and the journal pins the persisted
+    // `CompensationScopeSubscriptionCompleted` frame end-to-end.
+    let whole_done: ProcessDefinition = ProcessBuilder::new("whole-done")
+        .start_event("s")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .task("book")
+        .contained_in("book", "sub")
+        .compensation_boundary_event("book-comp", "book", "cancel")
+        .contained_in("book-comp", "sub")
+        .task("cancel")
+        .contained_in("cancel", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("s", "sub")
+        .connect("sub_start", "book")
+        .connect("book", "sub_end")
+        .connect("sub", "throw")
+        .connect("throw", "done")
+        .build()
+        .expect("build draining whole-scope compensation process");
+    journal.extend(
+        engine
+            .apply_command_at(Command::DeployProcess(whole_done), T0 + 14)
+            .expect("deploy whole-done"),
+    );
+    let drained = engine
+        .apply_command_at(Command::create_instance("whole-done"), T0 + 15)
+        .expect("create whole-done instance");
+    assert!(
+        drained
+            .iter()
+            .any(|e| matches!(e, Event::CompensationScopeSubscriptionCompleted { .. })),
+        "the draining whole-scope witness must journal the scope-subscription completion"
+    );
+    journal.extend(drained);
+
     // Decision-evaluation witnesses (#1292): pin `DecisionEvaluated` (its
     // `decision_evaluation_key`, `failure`, and each evaluated decision's
     // `decision_key`/`decision_version`) across a successful businessRuleTask,
@@ -637,6 +735,12 @@ fn build_event_witnesses() -> Vec<Event> {
         scope_id: Some("sub".to_string()),
     };
     vec![
+        // The #901 bottom-to-top scope-subscription completion frame.
+        Event::CompensationScopeSubscriptionCompleted {
+            instance_key: 1,
+            throw_element_instance_key: 2,
+            scope_subscription_key: 3,
+        },
         // The #1300 message-start correlation record, and the cross-partition
         // dispatch carrying the triggering message.
         Event::MessageStartEventCorrelated {
@@ -833,6 +937,9 @@ fn pre_897_compensation_records_decode_with_defaults() {
             handlers: vec!["cancel".to_string()],
             consumed: vec![3],
             handler_instance_keys: vec![],
+            scope_subscriptions: vec![],
+            handler_scopes: vec![],
+            scope_subscription_parents: vec![],
         }
     );
     let old_completed = r#"{"CompensationHandlerCompleted":{"instance_key":1,"throw_element_instance_key":2,"handler_element_id":"cancel"}}"#;

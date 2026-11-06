@@ -688,7 +688,7 @@ pub struct ProcessInstance {
     /// Empty for instances with no compensation and for snapshots written
     /// before compensation support existed (`serde(default)`).
     #[cfg_attr(feature = "serde", serde(default))]
-    pub compensable: Vec<CompensationSubscription>,
+    pub compensable: CompensationSubscriptions,
     /// In-flight compensation throw events, keyed by the throw event's element
     /// instance. Each records the handler activities it is still waiting on;
     /// when a throw's `pending_handlers` empties the throw completes. Empty for
@@ -715,6 +715,185 @@ pub struct ProcessInstance {
     pub agent_history: HashMap<Key, Vec<crate::agent::AgentHistoryRecord>>,
 }
 
+/// An instance's compensable subscriptions, in completion order (oldest
+/// first), plus a per-scope count index DERIVED from them.
+///
+/// The index answers "does scope `S` hold any subscription?" in O(1). Every
+/// completing sub-process and multi-instance child asks that question, so a
+/// linear scan would make a large sequential multi-instance run quadratic on
+/// the serialized engine path (#901 review). The index cannot drift from the
+/// list: the list is private, every mutation (`push`, `retain`, `clear`) goes
+/// through this type and updates both, and the serialized form is the plain
+/// list (`serde(from/into)`), so the index is rebuilt on every snapshot
+/// restore and the on-disk shape is unchanged. Read access is through `Deref`
+/// to a slice; there is deliberately no `DerefMut`.
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(
+        from = "Vec<CompensationSubscription>",
+        into = "Vec<CompensationSubscription>"
+    )
+)]
+pub struct CompensationSubscriptions {
+    items: Vec<CompensationSubscription>,
+    by_scope: HashMap<Key, usize>,
+}
+
+impl CompensationSubscriptions {
+    /// Appends a subscription (completion order is significant).
+    pub fn push(&mut self, subscription: CompensationSubscription) {
+        *self.by_scope.entry(subscription.scope).or_default() += 1;
+        self.items.push(subscription);
+    }
+
+    /// Keeps only the subscriptions `keep` accepts, preserving order.
+    pub fn retain(&mut self, mut keep: impl FnMut(&CompensationSubscription) -> bool) {
+        let by_scope = &mut self.by_scope;
+        self.items.retain(|c| {
+            let kept = keep(c);
+            if !kept {
+                if let Some(n) = by_scope.get_mut(&c.scope) {
+                    *n -= 1;
+                    if *n == 0 {
+                        by_scope.remove(&c.scope);
+                    }
+                }
+            }
+            kept
+        });
+    }
+
+    /// Removes every subscription.
+    pub fn clear(&mut self) {
+        self.items.clear();
+        self.by_scope.clear();
+    }
+
+    /// Whether any subscription was recorded in `scope` (O(1)).
+    pub fn has_scope(&self, scope: Key) -> bool {
+        self.by_scope.contains_key(&scope)
+    }
+}
+
+impl std::ops::Deref for CompensationSubscriptions {
+    type Target = [CompensationSubscription];
+    fn deref(&self) -> &Self::Target {
+        &self.items
+    }
+}
+
+// Equality is over the canonical list only; the index is derived from it.
+impl PartialEq for CompensationSubscriptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.items == other.items
+    }
+}
+impl Eq for CompensationSubscriptions {}
+
+impl From<Vec<CompensationSubscription>> for CompensationSubscriptions {
+    fn from(items: Vec<CompensationSubscription>) -> Self {
+        let mut out = Self::default();
+        for c in items {
+            out.push(c);
+        }
+        out
+    }
+}
+
+impl From<CompensationSubscriptions> for Vec<CompensationSubscription> {
+    fn from(subs: CompensationSubscriptions) -> Self {
+        subs.items
+    }
+}
+
+impl FromIterator<CompensationSubscription> for CompensationSubscriptions {
+    fn from_iter<I: IntoIterator<Item = CompensationSubscription>>(iter: I) -> Self {
+        iter.into_iter().collect::<Vec<_>>().into()
+    }
+}
+
+impl<'a> IntoIterator for &'a CompensationSubscriptions {
+    type Item = &'a CompensationSubscription;
+    type IntoIter = std::slice::Iter<'a, CompensationSubscription>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.items.iter()
+    }
+}
+
+#[cfg(test)]
+mod compensation_subscriptions_tests {
+    use super::*;
+
+    fn sub(key: Key, scope: Key) -> CompensationSubscription {
+        CompensationSubscription {
+            element_instance_key: key,
+            element_id: format!("a{key}"),
+            handler: "h".to_string(),
+            scope,
+            scope_subscription: false,
+        }
+    }
+
+    /// The derived index must agree with a brute-force scan of the list after
+    /// every kind of mutation.
+    fn assert_index_consistent(subs: &CompensationSubscriptions) {
+        let mut expected: HashMap<Key, usize> = HashMap::new();
+        for c in subs.iter() {
+            *expected.entry(c.scope).or_default() += 1;
+        }
+        assert_eq!(subs.by_scope, expected);
+    }
+
+    #[test]
+    fn scope_index_tracks_push_retain_and_clear() {
+        let mut subs = CompensationSubscriptions::default();
+        assert!(!subs.has_scope(1));
+        subs.push(sub(10, 1));
+        subs.push(sub(11, 1));
+        subs.push(sub(12, 2));
+        assert_index_consistent(&subs);
+        assert!(subs.has_scope(1) && subs.has_scope(2));
+
+        subs.retain(|c| c.element_instance_key != 10);
+        assert_index_consistent(&subs);
+        assert!(subs.has_scope(1), "one scope-1 subscription remains");
+
+        subs.retain(|c| c.scope != 1);
+        assert_index_consistent(&subs);
+        assert!(!subs.has_scope(1));
+        assert_eq!(subs.len(), 1);
+
+        subs.clear();
+        assert_index_consistent(&subs);
+        assert!(subs.is_empty() && !subs.has_scope(2));
+    }
+
+    #[test]
+    fn order_is_preserved_and_from_vec_rebuilds_the_index() {
+        let subs: CompensationSubscriptions = vec![sub(3, 7), sub(1, 7), sub(2, 8)].into();
+        assert_index_consistent(&subs);
+        let keys: Vec<Key> = subs.iter().map(|c| c.element_instance_key).collect();
+        assert_eq!(keys, vec![3, 1, 2]);
+    }
+
+    /// The on-disk shape is the plain list (snapshot-compatible), and decoding
+    /// rebuilds the index.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serializes_as_the_plain_list_and_rebuilds_the_index_on_decode() {
+        let subs: CompensationSubscriptions = vec![sub(1, 5), sub(2, 6)].into();
+        let json = serde_json::to_value(&subs).unwrap();
+        let plain: Vec<CompensationSubscription> = subs.iter().cloned().collect();
+        assert_eq!(json, serde_json::to_value(&plain).unwrap());
+        let back: CompensationSubscriptions = serde_json::from_value(json).unwrap();
+        assert_eq!(back, subs);
+        assert_index_consistent(&back);
+        assert!(back.has_scope(5) && back.has_scope(6));
+    }
+}
+
 /// A completed, compensable activity awaiting a possible compensation throw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -723,10 +902,20 @@ pub struct CompensationSubscription {
     pub element_instance_key: Key,
     /// The completed activity's element id.
     pub element_id: ElementId,
-    /// The compensation handler activity run to compensate it.
+    /// The compensation handler activity run to compensate it. Empty for a
+    /// **scope subscription** (#901): a completed flow scope (sub-process)
+    /// whose compensation is the fan-out into its nested subscriptions, not a
+    /// handler of its own.
     pub handler: ElementId,
     /// The scope the activity completed in (`0` for the root scope).
     pub scope: Key,
+    /// `true` for a flow-scope subscription (#901): recorded when a sub-process
+    /// that holds at least one compensable subscription completes (Zeebe
+    /// `isFlowScopeWithSubscriptions`), so a whole-scope throw can trigger the
+    /// nested subscriptions through it. `serde(default)` decodes pre-#901
+    /// snapshots as `false` — every pre-#901 subscription was a boundary one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub scope_subscription: bool,
 }
 
 /// A compensation throw event's outstanding wait: the handler activities it
@@ -750,6 +939,28 @@ pub struct CompensationWait {
     /// matching, exactly the pre-#897 behaviour for that journal.
     #[cfg_attr(feature = "serde", serde(default))]
     pub pending_handler_keys: Vec<Key>,
+    /// The compensable element-instance keys of the **scope subscriptions**
+    /// (#901) this throw triggered and is still waiting on: completed
+    /// sub-processes whose nested compensation fan-out has not fully drained.
+    /// A scope subscription retires bottom-to-top (Zeebe
+    /// `completeFlowScopeSubscriptionFromBottomToTop`) once every subscription
+    /// inside its scope has completed; the throw completes only when both this
+    /// list and `pending_handlers` are empty. `serde(default)` decodes
+    /// pre-#901 waits with an empty list.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_scope_subscriptions: Vec<Key>,
+    /// Positionally aligned with `pending_handler_keys` (#901): the scope each
+    /// outstanding handler's subscription was recorded in. A scope
+    /// subscription is drained only once no outstanding handler sits in its
+    /// scope. `serde(default)` decodes older waits with an empty list.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_handler_scopes: Vec<Key>,
+    /// Positionally aligned with `pending_scope_subscriptions` (#901): the
+    /// scope each outstanding scope subscription was recorded in (its parent),
+    /// so a parent scope drains only after its nested scope subscriptions.
+    /// `serde(default)` decodes older waits with an empty list.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending_scope_subscription_parents: Vec<Key>,
 }
 
 /// Runtime state of an active multi-instance body (the element instance carrying

@@ -1646,7 +1646,8 @@
       "element_instance_key": 35,
       "handler": "cancel",
       "instance_key": 33,
-      "scope": 0
+      "scope": 0,
+      "scope_subscription": false
     }
   },
   {
@@ -1680,11 +1681,16 @@
       "handler_instance_keys": [
         37
       ],
+      "handler_scopes": [
+        0
+      ],
       "handlers": [
         "cancel"
       ],
       "instance_key": 33,
       "scope": 0,
+      "scope_subscription_parents": [],
+      "scope_subscriptions": [],
       "throw_element_id": "throw",
       "throw_element_instance_key": 36
     }
@@ -1739,9 +1745,1118 @@
     }
   },
   {
-    "DecisionRequirementsDeployed": {
-      "decision_requirements_key": 40,
+    "ProcessDeployed": {
       "deployment_key": 39,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "book": {
+            "end_listeners": [],
+            "id": "book",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "Task",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub_end"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "book-comp": {
+            "end_listeners": [],
+            "id": "book-comp",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "CompensationBoundaryEvent": {
+                "attached_to": "book",
+                "handler": "cancel"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "cancel": {
+            "end_listeners": [],
+            "id": "cancel",
+            "io": {
+              "inputs": [
+                {
+                  "source": "= missing_var",
+                  "target": "mapped"
+                }
+              ],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "whole-cancel-job",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "done": {
+            "end_listeners": [],
+            "id": "done",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub": {
+            "end_listeners": [],
+            "id": "sub",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "SubProcess": {
+                "start_event": "sub_start"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "throw"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_end": {
+            "end_listeners": [],
+            "id": "sub_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_start": {
+            "end_listeners": [],
+            "id": "sub_start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "book"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "throw": {
+            "end_listeners": [],
+            "id": "throw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "CompensationThrowEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "done"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "whole",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 40,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000013,
+      "instance_key": 41,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 40,
+      "process_id": "whole",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 42,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 42,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 42,
+      "instance_key": 41
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 42,
+      "instance_key": 41
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 41,
+      "to": "sub"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub",
+      "element_instance_key": 43,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub",
+      "element_instance_key": 43,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 41,
+      "parent_scope_key": 0,
+      "scope_key": 43
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_start",
+      "element_instance_key": 44,
+      "instance_key": 41,
+      "scope": 43
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_start",
+      "element_instance_key": 44,
+      "instance_key": 41,
+      "scope": 43
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_start",
+      "element_instance_key": 44,
+      "instance_key": 41
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_start",
+      "element_instance_key": 44,
+      "instance_key": 41
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub_start",
+      "instance_key": 41,
+      "to": "book"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book",
+      "element_instance_key": 45,
+      "instance_key": 41,
+      "scope": 43
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book",
+      "element_instance_key": 45,
+      "instance_key": 41,
+      "scope": 43
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book",
+      "element_instance_key": 45,
+      "instance_key": 41
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book",
+      "element_instance_key": 45,
+      "instance_key": 41
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "book",
+      "element_instance_key": 45,
+      "handler": "cancel",
+      "instance_key": 41,
+      "scope": 43,
+      "scope_subscription": false
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "book",
+      "instance_key": 41,
+      "to": "sub_end"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_end",
+      "element_instance_key": 46,
+      "instance_key": 41,
+      "scope": 43
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_end",
+      "element_instance_key": 46,
+      "instance_key": 41,
+      "scope": 43
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_end",
+      "element_instance_key": 46,
+      "instance_key": 41
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_end",
+      "element_instance_key": 46,
+      "instance_key": 41
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub",
+      "element_instance_key": 43,
+      "instance_key": 41
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub",
+      "element_instance_key": 43,
+      "instance_key": 41
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "sub",
+      "element_instance_key": 43,
+      "handler": "",
+      "instance_key": 41,
+      "scope": 0,
+      "scope_subscription": true
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub",
+      "instance_key": 41,
+      "to": "throw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "throw",
+      "element_instance_key": 47,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "throw",
+      "element_instance_key": 47,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "CompensationTriggered": {
+      "consumed": [
+        43,
+        45
+      ],
+      "handler_instance_keys": [
+        48
+      ],
+      "handler_scopes": [
+        43
+      ],
+      "handlers": [
+        "cancel"
+      ],
+      "instance_key": 41,
+      "scope": 0,
+      "scope_subscription_parents": [
+        0
+      ],
+      "scope_subscriptions": [
+        43
+      ],
+      "throw_element_id": "throw",
+      "throw_element_instance_key": 47
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "cancel",
+      "element_instance_key": 48,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "cancel",
+      "element_instance_key": 48,
+      "instance_key": 41,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 41,
+      "parent_scope_key": 0,
+      "scope_key": 48
+    }
+  },
+  {
+    "ScopedVariablesUpdated": {
+      "instance_key": 41,
+      "scope_key": 48,
+      "variables": {
+        "mapped": "Null"
+      }
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000013,
+      "element_id": "cancel",
+      "element_instance_key": 48,
+      "instance_key": 41,
+      "job_key": 49,
+      "job_type": "whole-cancel-job",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 50
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 50,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "book": {
+            "end_listeners": [],
+            "id": "book",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "Task",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub_end"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "book-comp": {
+            "end_listeners": [],
+            "id": "book-comp",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "CompensationBoundaryEvent": {
+                "attached_to": "book",
+                "handler": "cancel"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "cancel": {
+            "end_listeners": [],
+            "id": "cancel",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "Task",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "done": {
+            "end_listeners": [],
+            "id": "done",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub": {
+            "end_listeners": [],
+            "id": "sub",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "SubProcess": {
+                "start_event": "sub_start"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "throw"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_end": {
+            "end_listeners": [],
+            "id": "sub_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_start": {
+            "end_listeners": [],
+            "id": "sub_start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "book"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "throw": {
+            "end_listeners": [],
+            "id": "throw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "CompensationThrowEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "done"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "whole-done",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 51,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000015,
+      "instance_key": 52,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 51,
+      "process_id": "whole-done",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 53,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 53,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 53,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 53,
+      "instance_key": 52
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 52,
+      "to": "sub"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub",
+      "element_instance_key": 54,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub",
+      "element_instance_key": 54,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 52,
+      "parent_scope_key": 0,
+      "scope_key": 54
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_start",
+      "element_instance_key": 55,
+      "instance_key": 52,
+      "scope": 54
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_start",
+      "element_instance_key": 55,
+      "instance_key": 52,
+      "scope": 54
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_start",
+      "element_instance_key": 55,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_start",
+      "element_instance_key": 55,
+      "instance_key": 52
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub_start",
+      "instance_key": 52,
+      "to": "book"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book",
+      "element_instance_key": 56,
+      "instance_key": 52,
+      "scope": 54
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book",
+      "element_instance_key": 56,
+      "instance_key": 52,
+      "scope": 54
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book",
+      "element_instance_key": 56,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book",
+      "element_instance_key": 56,
+      "instance_key": 52
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "book",
+      "element_instance_key": 56,
+      "handler": "cancel",
+      "instance_key": 52,
+      "scope": 54,
+      "scope_subscription": false
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "book",
+      "instance_key": 52,
+      "to": "sub_end"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_end",
+      "element_instance_key": 57,
+      "instance_key": 52,
+      "scope": 54
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_end",
+      "element_instance_key": 57,
+      "instance_key": 52,
+      "scope": 54
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_end",
+      "element_instance_key": 57,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_end",
+      "element_instance_key": 57,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub",
+      "element_instance_key": 54,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub",
+      "element_instance_key": 54,
+      "instance_key": 52
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "sub",
+      "element_instance_key": 54,
+      "handler": "",
+      "instance_key": 52,
+      "scope": 0,
+      "scope_subscription": true
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub",
+      "instance_key": 52,
+      "to": "throw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "throw",
+      "element_instance_key": 58,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "throw",
+      "element_instance_key": 58,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "CompensationTriggered": {
+      "consumed": [
+        54,
+        56
+      ],
+      "handler_instance_keys": [
+        59
+      ],
+      "handler_scopes": [
+        54
+      ],
+      "handlers": [
+        "cancel"
+      ],
+      "instance_key": 52,
+      "scope": 0,
+      "scope_subscription_parents": [
+        0
+      ],
+      "scope_subscriptions": [
+        54
+      ],
+      "throw_element_id": "throw",
+      "throw_element_instance_key": 58
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "cancel",
+      "element_instance_key": 59,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "cancel",
+      "element_instance_key": 59,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "cancel",
+      "element_instance_key": 59,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "cancel",
+      "element_instance_key": 59,
+      "instance_key": 52
+    }
+  },
+  {
+    "CompensationHandlerCompleted": {
+      "handler_element_id": "cancel",
+      "handler_element_instance_key": 59,
+      "instance_key": 52,
+      "throw_element_instance_key": 58
+    }
+  },
+  {
+    "CompensationScopeSubscriptionCompleted": {
+      "instance_key": 52,
+      "scope_subscription_key": 54,
+      "throw_element_instance_key": 58
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "throw",
+      "element_instance_key": 58,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "throw",
+      "element_instance_key": 58,
+      "instance_key": 52
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "throw",
+      "instance_key": 52,
+      "to": "done"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "done",
+      "element_instance_key": 60,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "done",
+      "element_instance_key": 60,
+      "instance_key": 52,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "done",
+      "element_instance_key": 60,
+      "instance_key": 52
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "done",
+      "element_instance_key": 60,
+      "instance_key": 52
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 52
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 61
+    }
+  },
+  {
+    "DecisionRequirementsDeployed": {
+      "decision_requirements_key": 62,
+      "deployment_key": 61,
       "drg": {
         "decisions": [
           {
@@ -1825,31 +2940,31 @@
   {
     "DecisionDeployed": {
       "decision_id": "base",
-      "decision_key": 41,
+      "decision_key": 63,
       "decision_name": "Base",
-      "decision_requirements_key": 40,
-      "deployment_key": 39,
+      "decision_requirements_key": 62,
+      "deployment_key": 61,
       "version": 1
     }
   },
   {
     "DecisionDeployed": {
       "decision_id": "root",
-      "decision_key": 42,
+      "decision_key": 64,
       "decision_name": "Root",
-      "decision_requirements_key": 40,
-      "deployment_key": 39,
+      "decision_requirements_key": 62,
+      "deployment_key": 61,
       "version": 1
     }
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 43
+      "deployment_key": 65
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 43,
+      "deployment_key": 65,
       "process": {
         "adhoc": [],
         "elements": {
@@ -1928,7 +3043,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 44,
+      "process_definition_key": 66,
       "version": 1
     }
   },
@@ -1936,10 +3051,10 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000012,
-      "instance_key": 45,
+      "instance_key": 67,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 44,
+      "process_definition_key": 66,
       "process_id": "decide",
       "tags": [],
       "variables": {
@@ -1953,87 +3068,87 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 46,
-      "instance_key": 45,
+      "element_instance_key": 68,
+      "instance_key": 67,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 46,
-      "instance_key": 45,
+      "element_instance_key": 68,
+      "instance_key": 67,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 46,
-      "instance_key": 45
+      "element_instance_key": 68,
+      "instance_key": 67
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 46,
-      "instance_key": 45
+      "element_instance_key": 68,
+      "instance_key": 67
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 45,
+      "instance_key": 67,
       "to": "brt"
     }
   },
   {
     "ElementActivating": {
       "element_id": "brt",
-      "element_instance_key": 47,
-      "instance_key": 45,
+      "element_instance_key": 69,
+      "instance_key": 67,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "brt",
-      "element_instance_key": 47,
-      "instance_key": 45,
+      "element_instance_key": 69,
+      "instance_key": 67,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "brt",
-      "element_instance_key": 47,
-      "instance_key": 45
+      "element_instance_key": 69,
+      "instance_key": 67
     }
   },
   {
     "ElementCompleted": {
       "element_id": "brt",
-      "element_instance_key": 47,
-      "instance_key": 45
+      "element_instance_key": 69,
+      "instance_key": 67
     }
   },
   {
     "DecisionEvaluated": {
-      "decision_evaluation_key": 48,
+      "decision_evaluation_key": 70,
       "decision_id": "root",
-      "decision_key": 42,
+      "decision_key": 64,
       "decision_output": {
         "Str": "b"
       },
       "decision_requirements_id": "greet",
-      "decision_requirements_key": 40,
+      "decision_requirements_key": 62,
       "element_id": "brt",
-      "element_instance_key": 47,
+      "element_instance_key": 69,
       "evaluated_at": 1700000000012,
       "evaluated_decisions": [
         {
           "decision_id": "base",
-          "decision_key": 41,
+          "decision_key": 63,
           "decision_name": "Base",
           "decision_output": {
             "Str": "b"
@@ -2045,7 +3160,7 @@
         },
         {
           "decision_id": "root",
-          "decision_key": 42,
+          "decision_key": 64,
           "decision_name": "Root",
           "decision_output": {
             "Str": "b"
@@ -2079,12 +3194,12 @@
         }
       ],
       "failure": null,
-      "instance_key": 45
+      "instance_key": 67
     }
   },
   {
     "VariablesUpdated": {
-      "instance_key": 45,
+      "instance_key": 67,
       "variables": {
         "out": {
           "Str": "b"
@@ -2095,53 +3210,53 @@
   {
     "SequenceFlowTaken": {
       "from": "brt",
-      "instance_key": 45,
+      "instance_key": 67,
       "to": "e"
     }
   },
   {
     "ElementActivating": {
       "element_id": "e",
-      "element_instance_key": 49,
-      "instance_key": 45,
+      "element_instance_key": 71,
+      "instance_key": 67,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "e",
-      "element_instance_key": 49,
-      "instance_key": 45,
+      "element_instance_key": 71,
+      "instance_key": 67,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "e",
-      "element_instance_key": 49,
-      "instance_key": 45
+      "element_instance_key": 71,
+      "instance_key": 67
     }
   },
   {
     "ElementCompleted": {
       "element_id": "e",
-      "element_instance_key": 49,
-      "instance_key": 45
+      "element_instance_key": 71,
+      "instance_key": 67
     }
   },
   {
     "ProcessInstanceCompleted": {
-      "instance_key": 45
+      "instance_key": 67
     }
   },
   {
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000013,
-      "instance_key": 50,
+      "instance_key": 72,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
-      "process_definition_key": 44,
+      "process_definition_key": 66,
       "process_id": "decide",
       "tags": [],
       "variables": {
@@ -2155,71 +3270,71 @@
   {
     "ElementActivating": {
       "element_id": "s",
-      "element_instance_key": 51,
-      "instance_key": 50,
+      "element_instance_key": 73,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "s",
-      "element_instance_key": 51,
-      "instance_key": 50,
+      "element_instance_key": 73,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "s",
-      "element_instance_key": 51,
-      "instance_key": 50
+      "element_instance_key": 73,
+      "instance_key": 72
     }
   },
   {
     "ElementCompleted": {
       "element_id": "s",
-      "element_instance_key": 51,
-      "instance_key": 50
+      "element_instance_key": 73,
+      "instance_key": 72
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "s",
-      "instance_key": 50,
+      "instance_key": 72,
       "to": "brt"
     }
   },
   {
     "ElementActivating": {
       "element_id": "brt",
-      "element_instance_key": 52,
-      "instance_key": 50,
+      "element_instance_key": 74,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "brt",
-      "element_instance_key": 52,
-      "instance_key": 50,
+      "element_instance_key": 74,
+      "instance_key": 72,
       "scope": 0
     }
   },
   {
     "DecisionEvaluated": {
-      "decision_evaluation_key": 53,
+      "decision_evaluation_key": 75,
       "decision_id": "root",
-      "decision_key": 42,
+      "decision_key": 64,
       "decision_output": "Null",
       "decision_requirements_id": "greet",
-      "decision_requirements_key": 40,
+      "decision_requirements_key": 62,
       "element_id": "brt",
-      "element_instance_key": 52,
+      "element_instance_key": 74,
       "evaluated_at": 1700000000013,
       "evaluated_decisions": [
         {
           "decision_id": "base",
-          "decision_key": 41,
+          "decision_key": 63,
           "decision_name": "Base",
           "decision_output": {
             "Str": "b"
@@ -2231,7 +3346,7 @@
         },
         {
           "decision_id": "root",
-          "decision_key": 42,
+          "decision_key": 64,
           "decision_name": "Root",
           "decision_output": "Null",
           "decision_type": "DecisionTable",
@@ -2244,16 +3359,16 @@
         "failed_decision_id": "root",
         "message": "hit policy UNIQUE requires at most one matching rule, but 2 rules matched"
       },
-      "instance_key": 50
+      "instance_key": 72
     }
   },
   {
     "IncidentRaised": {
       "created_at": 1700000000013,
       "element_id": "brt",
-      "element_instance_key": 52,
-      "incident_key": 54,
-      "instance_key": 50,
+      "element_instance_key": 74,
+      "incident_key": 76,
+      "instance_key": 72,
       "job_key": null,
       "kind": "DecisionEvaluation",
       "reason": "failed to evaluate decision 'root' at business rule task 'brt': hit policy UNIQUE requires at most one matching rule, but 2 rules matched",
@@ -2262,21 +3377,21 @@
   },
   {
     "DecisionEvaluated": {
-      "decision_evaluation_key": 55,
+      "decision_evaluation_key": 77,
       "decision_id": "root",
-      "decision_key": 42,
+      "decision_key": 64,
       "decision_output": {
         "Str": "b"
       },
       "decision_requirements_id": "greet",
-      "decision_requirements_key": 40,
+      "decision_requirements_key": 62,
       "element_id": "",
       "element_instance_key": 0,
       "evaluated_at": 1700000000014,
       "evaluated_decisions": [
         {
           "decision_id": "base",
-          "decision_key": 41,
+          "decision_key": 63,
           "decision_name": "Base",
           "decision_output": {
             "Str": "b"
@@ -2288,7 +3403,7 @@
         },
         {
           "decision_id": "root",
-          "decision_key": 42,
+          "decision_key": 64,
           "decision_name": "Root",
           "decision_output": {
             "Str": "b"
@@ -2329,7 +3444,7 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000015,
-      "instance_key": 56,
+      "instance_key": 78,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -2342,53 +3457,53 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 57,
-      "instance_key": 56,
+      "element_instance_key": 79,
+      "instance_key": 78,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 57,
-      "instance_key": 56,
+      "element_instance_key": 79,
+      "instance_key": 78,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 57,
-      "instance_key": 56
+      "element_instance_key": 79,
+      "instance_key": 78
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 57,
-      "instance_key": 56
+      "element_instance_key": 79,
+      "instance_key": 78
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 56,
+      "instance_key": 78,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 58,
-      "instance_key": 56,
+      "element_instance_key": 80,
+      "instance_key": 78,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 58,
-      "instance_key": 56,
+      "element_instance_key": 80,
+      "instance_key": 78,
       "scope": 0
     }
   },
@@ -2396,9 +3511,9 @@
     "JobCreated": {
       "created_at": 1700000000015,
       "element_id": "charge",
-      "element_instance_key": 58,
-      "instance_key": 56,
-      "job_key": 59,
+      "element_instance_key": 80,
+      "instance_key": 78,
+      "job_key": 81,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -2409,8 +3524,8 @@
       "activated_at": 1700000000016,
       "deadline": 1700000030016,
       "durable": true,
-      "instance_key": 56,
-      "job_key": 59,
+      "instance_key": 78,
+      "job_key": 81,
       "worker": "worker-3"
     }
   },
@@ -2418,8 +3533,8 @@
     "JobErrorThrown": {
       "error_code": "CARD_DECLINED",
       "error_message": "card declined",
-      "instance_key": 56,
-      "job_key": 59,
+      "instance_key": 78,
+      "job_key": 81,
       "worker": "worker-3"
     }
   },
@@ -2427,9 +3542,9 @@
     "IncidentRaised": {
       "created_at": 1700000000017,
       "element_id": "charge",
-      "element_instance_key": 58,
-      "incident_key": 60,
-      "instance_key": 56,
+      "element_instance_key": 80,
+      "incident_key": 82,
+      "instance_key": 78,
       "job_key": null,
       "kind": "UnhandledError",
       "reason": "unhandled BPMN error 'CARD_DECLINED': card declined",
@@ -2440,7 +3555,7 @@
     "ProcessInstanceCreated": {
       "business_id": null,
       "created_at": 1700000000018,
-      "instance_key": 61,
+      "instance_key": 83,
       "parent_element_instance_key": null,
       "parent_process_instance_key": null,
       "process_definition_key": 2,
@@ -2453,53 +3568,53 @@
   {
     "ElementActivating": {
       "element_id": "start",
-      "element_instance_key": 62,
-      "instance_key": 61,
+      "element_instance_key": 84,
+      "instance_key": 83,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "start",
-      "element_instance_key": 62,
-      "instance_key": 61,
+      "element_instance_key": 84,
+      "instance_key": 83,
       "scope": 0
     }
   },
   {
     "ElementCompleting": {
       "element_id": "start",
-      "element_instance_key": 62,
-      "instance_key": 61
+      "element_instance_key": 84,
+      "instance_key": 83
     }
   },
   {
     "ElementCompleted": {
       "element_id": "start",
-      "element_instance_key": 62,
-      "instance_key": 61
+      "element_instance_key": 84,
+      "instance_key": 83
     }
   },
   {
     "SequenceFlowTaken": {
       "from": "start",
-      "instance_key": 61,
+      "instance_key": 83,
       "to": "charge"
     }
   },
   {
     "ElementActivating": {
       "element_id": "charge",
-      "element_instance_key": 63,
-      "instance_key": 61,
+      "element_instance_key": 85,
+      "instance_key": 83,
       "scope": 0
     }
   },
   {
     "ElementActivated": {
       "element_id": "charge",
-      "element_instance_key": 63,
-      "instance_key": 61,
+      "element_instance_key": 85,
+      "instance_key": 83,
       "scope": 0
     }
   },
@@ -2507,9 +3622,9 @@
     "JobCreated": {
       "created_at": 1700000000018,
       "element_id": "charge",
-      "element_instance_key": 63,
-      "instance_key": 61,
-      "job_key": 64,
+      "element_instance_key": 85,
+      "instance_key": 83,
+      "job_key": 86,
       "job_type": "payment",
       "priority": 50,
       "retries": 3
@@ -2517,12 +3632,12 @@
   },
   {
     "DeploymentCreated": {
-      "deployment_key": 65
+      "deployment_key": 87
     }
   },
   {
     "ProcessDeployed": {
-      "deployment_key": 65,
+      "deployment_key": 87,
       "process": {
         "adhoc": [],
         "elements": {
@@ -2603,7 +3718,7 @@
         "start_form_id": null,
         "xml": ""
       },
-      "process_definition_key": 66,
+      "process_definition_key": 88,
       "version": 1
     }
   },
@@ -2616,10 +3731,10 @@
           "charge2"
         ]
       ],
-      "instance_key": 61,
+      "instance_key": 83,
       "migrated_flow_scopes": [],
       "subscriptions": [],
-      "target_process_definition_key": 66,
+      "target_process_definition_key": 88,
       "target_process_id": "order-v2"
     }
   }

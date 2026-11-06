@@ -1,0 +1,25 @@
+{
+  "description": "Whole-scope (sub-process) compensation (#901): `sub` contains compensable `bookA` and a nested `sub2` containing compensable `bookB`. When the sub-process completes, the root compensation throw (no activityRef) triggers EVERY in-scope handler — cancelA directly and cancelB through the nested scope subscriptions (Zeebe `triggerCompensationFromTopToBottom`) — and rests until both complete. Completing the first handler must NOT route the throw onward.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "comp-whole-scope"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "book-a-job"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "book-b-job"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "cancel-a-job"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "cancel-b-job"
+    }
+  ]
+}

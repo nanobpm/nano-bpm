@@ -181,6 +181,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             element_id,
             handler,
             scope,
+            scope_subscription,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.compensable.push(CompensationSubscription {
@@ -188,6 +189,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                     element_id: element_id.clone(),
                     handler: handler.clone(),
                     scope: *scope,
+                    scope_subscription: *scope_subscription,
                 });
             }
         }
@@ -202,8 +204,15 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             handlers,
             consumed,
             handler_instance_keys,
+            scope_subscriptions,
+            handler_scopes,
+            scope_subscription_parents,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                // A whole-scope fan-out consumes every nested subscription, so
+                // index it once: a per-subscription linear scan would make this
+                // reducer quadratic in the number of compensable children.
+                let consumed: std::collections::HashSet<Key> = consumed.iter().copied().collect();
                 instance
                     .compensable
                     .retain(|c| !consumed.contains(&c.element_instance_key));
@@ -214,6 +223,9 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                         scope: *scope,
                         pending_handlers: handlers.clone(),
                         pending_handler_keys: handler_instance_keys.clone(),
+                        pending_scope_subscriptions: scope_subscriptions.clone(),
+                        pending_handler_scopes: handler_scopes.clone(),
+                        pending_scope_subscription_parents: scope_subscription_parents.clone(),
                     },
                 );
             }
@@ -251,8 +263,48 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                         if pos < wait.pending_handler_keys.len() {
                             wait.pending_handler_keys.remove(pos);
                         }
+                        if pos < wait.pending_handler_scopes.len() {
+                            wait.pending_handler_scopes.remove(pos);
+                        }
                     }
-                    wait.pending_handlers.is_empty()
+                    wait.pending_handlers.is_empty() && wait.pending_scope_subscriptions.is_empty()
+                } else {
+                    false
+                };
+                if done {
+                    instance
+                        .compensation_waits
+                        .remove(throw_element_instance_key);
+                }
+            }
+        }
+
+        // A triggered scope subscription (#901) completed: the nested
+        // compensation fan-out inside its scope has fully drained. Retire it
+        // from its throw's outstanding set — bottom-to-top, exactly as Zeebe's
+        // `completeFlowScopeSubscriptionFromBottomToTop` — and drop the wait
+        // once nothing (handlers or scope subscriptions) is left outstanding.
+        Event::CompensationScopeSubscriptionCompleted {
+            instance_key,
+            throw_element_instance_key,
+            scope_subscription_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                let done = if let Some(wait) = instance
+                    .compensation_waits
+                    .get_mut(throw_element_instance_key)
+                {
+                    if let Some(pos) = wait
+                        .pending_scope_subscriptions
+                        .iter()
+                        .position(|k| k == scope_subscription_key)
+                    {
+                        wait.pending_scope_subscriptions.remove(pos);
+                        if pos < wait.pending_scope_subscription_parents.len() {
+                            wait.pending_scope_subscription_parents.remove(pos);
+                        }
+                    }
+                    wait.pending_handlers.is_empty() && wait.pending_scope_subscriptions.is_empty()
                 } else {
                     false
                 };
@@ -270,7 +322,11 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         // sub-process — `scopes` is the terminated scope plus its descendants, so
         // any completed-activity subscription or pending handler wait belonging to
         // one of them is removed, leaving the still-live parent's compensation
-        // state intact.
+        // state intact. A wait in a SURVIVING scope that was resting on a
+        // scope subscription inside the torn-down scope (#901) must also drop
+        // that dangling reference — the scope it points at no longer exists, so
+        // it can never retire — and the wait completes when nothing else is
+        // outstanding.
         Event::ScopedCompensationCleared {
             instance_key,
             scopes,
@@ -283,6 +339,33 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 instance
                     .compensation_waits
                     .retain(|_, w| !scope_set.contains(&w.scope));
+                // Retire dangling scope-subscription references on the surviving
+                // waits, then drop any wait left with nothing outstanding.
+                let mut emptied = Vec::new();
+                for (throw_eik, wait) in instance.compensation_waits.iter_mut() {
+                    // Keep the parent list positionally aligned (#901).
+                    let aligned = wait.pending_scope_subscription_parents.len()
+                        == wait.pending_scope_subscriptions.len();
+                    let mut i = 0;
+                    while i < wait.pending_scope_subscriptions.len() {
+                        if scope_set.contains(&wait.pending_scope_subscriptions[i]) {
+                            wait.pending_scope_subscriptions.remove(i);
+                            if aligned {
+                                wait.pending_scope_subscription_parents.remove(i);
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if wait.pending_handlers.is_empty()
+                        && wait.pending_scope_subscriptions.is_empty()
+                    {
+                        emptied.push(*throw_eik);
+                    }
+                }
+                for throw_eik in emptied {
+                    instance.compensation_waits.remove(&throw_eik);
+                }
             }
         }
 

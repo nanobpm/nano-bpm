@@ -1,5 +1,12 @@
 [
   {
+    "CompensationScopeSubscriptionCompleted": {
+      "instance_key": 1,
+      "scope_subscription_key": 3,
+      "throw_element_instance_key": 2
+    }
+  },
+  {
     "MessageStartEventCorrelated": {
       "correlation_key": "c",
       "element_id": "start",

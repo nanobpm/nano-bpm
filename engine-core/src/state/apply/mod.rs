@@ -72,6 +72,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::CompensationSubscriptionCreated { .. }
         | Event::CompensationTriggered { .. }
         | Event::CompensationHandlerCompleted { .. }
+        | Event::CompensationScopeSubscriptionCompleted { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::MultiInstanceActivated { .. }
         | Event::MultiInstanceCompletionConditionFulfilled { .. }
