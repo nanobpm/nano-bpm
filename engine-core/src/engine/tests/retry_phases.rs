@@ -329,6 +329,105 @@ fn mi_body_end_listener_retry_overlays_aggregated_collection() {
     assert!(engine.is_completed(inst), "{:?}", job_types(&engine));
 }
 
+// Finding 6 (review r5796573293): the aggregate overlay is restricted to END
+// chains. A START-chain retry is an activation re-drive, not a completion, so
+// the uncollected (null-padded) aggregate must NOT overwrite a live body-local
+// binding of the collection name in listener 0's variable view — otherwise a
+// listener `type =results[1]` fails or selects the wrong worker.
+#[test]
+fn mi_body_start_listener_retry_keeps_body_local_collection() {
+    let def = mi_body(
+        r#"<zeebe:executionListener eventType="start" type="=results[1]" />"#,
+        "",
+    );
+    let (mut engine, inst) = start(def, items());
+    // The listener type reads `results[1]`, unbound at activation: incident.
+    let incident = only_incident(&engine, "each");
+    // A body-local `results` (the collection name bound in the BODY scope).
+    engine
+        .apply_command(Command::set_variables_scoped(
+            incident.element_instance_key,
+            vars(&[("results", Value::List(vec![Value::Str("audit".into())]))]),
+            true,
+        ))
+        .unwrap();
+    resolve(&mut engine, inst, &incident, &[]);
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the restart resolves `=results[1]` against the body-local binding: {:?}",
+        engine.active_incidents()
+    );
+    // The overlay would have replaced `["audit"]` with the uncollected
+    // `[null, null]`, minting a `null`-typed listener job instead.
+    assert_eq!(job_types(&engine), vec!["audit".to_string()]);
+    assert_eq!(complete_all(&mut engine, "audit", &[]), 1);
+    assert_eq!(complete_all(&mut engine, "handle", &[]), 2);
+    assert!(engine.is_completed(inst), "{:?}", job_types(&engine));
+}
+
+// Finding 6 (review r5796573293): on an END-chain retry the overlay is applied
+// BEFORE the output mappings, so a mapping that targets the collection name
+// wins — exactly as in `complete_multi_instance_body`, where the aggregated
+// `results` is written after the mappings and cannot be clobbered by one.
+#[test]
+fn mi_body_end_listener_retry_output_mapping_wins_over_overlay() {
+    let def = parse(
+        r#"<bpmn:process id="mib" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="each">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="handle" />
+              <zeebe:ioMapping><zeebe:output source="=&quot;mapped&quot;" target="results" /></zeebe:ioMapping>
+              <zeebe:executionListeners>
+                <zeebe:executionListener eventType="end" type="=lt" />
+              </zeebe:executionListeners>
+            </bpmn:extensionElements>
+            <bpmn:multiInstanceLoopCharacteristics>
+              <bpmn:extensionElements>
+                <zeebe:loopCharacteristics inputCollection="=items" inputElement="item" outputCollection="results" outputElement="=&quot;done:&quot; + item" />
+              </bpmn:extensionElements>
+            </bpmn:multiInstanceLoopCharacteristics>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="each" />
+          <bpmn:sequenceFlow id="f2" sourceRef="each" targetRef="e" />
+        </bpmn:process>"#,
+    );
+    let (mut engine, inst) = start(def, items());
+    assert_eq!(complete_all(&mut engine, "handle", &[]), 2);
+    // First-pass completion order (Zeebe: mappings before listeners): the
+    // mapping's `results = "mapped"` wins over the aggregate write in the
+    // parent scope, and listener 0's view sees the mapped value.
+    assert_eq!(
+        root_var(&engine, inst, "results"),
+        Some(Value::Str("mapped".into()))
+    );
+    let incident = only_incident(&engine, "each");
+    resolve(&mut engine, inst, &incident, &[]);
+    let incident = only_incident(&engine, "each");
+    resolve(
+        &mut engine,
+        inst,
+        &incident,
+        &[("lt", Value::Str("audit".into()))],
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "{:?}",
+        engine.active_incidents()
+    );
+    // The restart re-projection applies the overlay BEFORE the output
+    // mappings, so the mapping wins identically: `results` stays "mapped" —
+    // never clobbered back to the aggregate list, never re-nulled.
+    assert_eq!(
+        root_var(&engine, inst, "results"),
+        Some(Value::Str("mapped".into())),
+        "mapping-wins-over-overlay order is preserved on the restart"
+    );
+    assert_eq!(complete_all(&mut engine, "audit", &[]), 1);
+    assert!(engine.is_completed(inst), "{:?}", job_types(&engine));
+}
+
 // Finding 3 (nested container): a nested AGENTIC container whose catalog job
 // type fails parks the outer container BEFORE any child is created; a re-raise
 // keeps it parked, and the fixed resolve mints exactly one nested agent job.

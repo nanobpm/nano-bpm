@@ -11988,13 +11988,20 @@ impl Engine {
                 }
             }
         }
-        // The re-minted listener 0 resolves against the same aggregate view the
-        // projection used: an MI body's listener `type`/`retries` expression
-        // reading the `outputCollection` sees the aggregated list, not a stale
-        // body-local binding (mirrors the listener-vars overlay in
-        // `complete_multi_instance_body`).
-        if let Some(map) = self.mi_body_collection_overlay(instance_key, element_instance_key) {
-            vars.extend(map);
+        // The re-minted listener 0 of an END chain resolves against the same
+        // aggregate view the projection used: an MI body's listener
+        // `type`/`retries` expression reading the `outputCollection` sees the
+        // aggregated list, not a stale body-local binding (mirrors the
+        // listener-vars overlay in `complete_multi_instance_body`). A START
+        // chain gets NO overlay: its retry is an activation re-drive, not a
+        // completion, so an uncollected (null-padded) aggregate must not
+        // overwrite a live body-local binding of the collection name — a
+        // listener `=results[1]` would otherwise fail or select the wrong
+        // worker (review r5796573293).
+        if event_type == crate::model::ListenerEventType::End {
+            if let Some(map) = self.mi_body_collection_overlay(instance_key, element_instance_key) {
+                vars.extend(map);
+            }
         }
         events.push(self.execution_listener_job_event(
             instance_key,
