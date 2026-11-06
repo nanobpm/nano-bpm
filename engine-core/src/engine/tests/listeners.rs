@@ -836,6 +836,76 @@ fn listener_completion_on_an_unregistered_legacy_scope_still_reads_back() {
 }
 
 #[test]
+fn fresh_join_listener_resolves_against_the_enclosing_subprocess_scope() {
+    // #1437 defect class (review): when a split inside a sub-process makes a
+    // fresh parallel join ready, the join's activation events (including its
+    // listener-scope registration) are not yet APPLIED when the end-listener
+    // job's FEEL attributes resolve — so the view must come from the enclosing
+    // (sub-process) scope, or a sub-process-local variable is invisible and
+    // the listener type resolves against the process root instead.
+    let def = ProcessBuilder::new("join-in-sub")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=true".to_string(),
+                    target: "approved".to_string(),
+                }],
+                outputs: Vec::new(),
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .parallel_gateway("split")
+        .contained_in("split", "sub")
+        .service_task("a", "ja")
+        .contained_in("a", "sub")
+        .service_task("b", "jb")
+        .contained_in("b", "sub")
+        .parallel_gateway("join")
+        .contained_in("join", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .end_event("done")
+        .connect("start", "sub")
+        .connect("sub_start", "split")
+        .connect("split", "a")
+        .connect("split", "b")
+        .connect("a", "join")
+        .connect("b", "join")
+        .connect("join", "sub_end")
+        .connect("sub", "done")
+        .with_listeners(
+            "join",
+            Vec::new(),
+            vec![ExecutionListener {
+                event_type: ListenerEventType::End,
+                // Reads the sub-process-local `approved`: resolves to the
+                // `j-ok` job type only if the view includes the sub-process
+                // scope; at the process root `approved` is undefined.
+                job_type: "= if approved then \"j-ok\" else \"j-no\"".to_string(),
+                retries: None,
+            }],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("join-in-sub"))
+        .unwrap();
+    complete_one(&mut engine, "ja");
+    complete_one(&mut engine, "jb");
+    assert_eq!(
+        engine.activate_jobs("j-ok", "W", 10, 1_000, 0).len(),
+        1,
+        "the fresh join's end listener resolves its type against the enclosing sub-process scope"
+    );
+}
+
+#[test]
 fn listener_free_model_journal_is_byte_identical() {
     // The critical invariant: a model with NO listeners must emit exactly the
     // same events as before execution-listener support existed. We assert the
