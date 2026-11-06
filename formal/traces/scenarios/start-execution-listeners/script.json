@@ -1,0 +1,13 @@
+{
+  "description": "Start execution listeners (#1429): an element with a `start` execution listener stays ACTIVATING until the start-listener chain drains — Zeebe writes ELEMENT_ACTIVATING + JOB CREATED and only then, on the listener's completion, ELEMENT_ACTIVATED (followed by ELEMENT_COMPLETING for a pass-through element). Here a parallel fork reaches a service task `work` (start listener `workStart`) and a terminate end event `kill` (start listener `killStart`): step 0 mints both listener jobs with no ELEMENT_ACTIVATED for either element; completing `killStart` then writes kill's ACTIVATED → COMPLETING → COMPLETED and terminates `work` (whose own start listener job is cancelled, never completed).",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "start-execution-listeners"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "killStart"
+    }
+  ]
+}

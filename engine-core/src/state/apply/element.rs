@@ -16,23 +16,33 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             element_instance_key,
             element_id,
             scope,
+        } => {
+            register_token(
+                state,
+                *instance_key,
+                *element_instance_key,
+                element_id,
+                *scope,
+            );
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.activating.insert(*element_instance_key);
+            }
         }
-        | Event::ElementActivated {
+        Event::ElementActivated {
             instance_key,
             element_instance_key,
             element_id,
             scope,
         } => {
+            register_token(
+                state,
+                *instance_key,
+                *element_instance_key,
+                element_id,
+                *scope,
+            );
             if let Some(instance) = state.instances.get_mut(instance_key) {
-                instance
-                    .active
-                    .insert(*element_instance_key, element_id.clone());
-                // A non-zero scope records the enclosing sub-process instance.
-                if *scope != 0 {
-                    instance.scopes.insert(*element_instance_key, *scope);
-                }
-                // A parked join activating is no longer parked (#1244).
-                instance.parked_joins.remove(element_instance_key);
+                instance.activating.remove(element_instance_key);
             }
         }
 
@@ -43,6 +53,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.active.remove(element_instance_key);
+                instance.activating.remove(element_instance_key);
                 instance.scopes.remove(element_instance_key);
                 instance.parked_joins.remove(element_instance_key);
                 // Zeebe drops a scope's local variables (an activity's input
@@ -142,6 +153,7 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
                 for eik in parked {
                     instance.parked_joins.remove(&eik);
                     instance.active.remove(&eik);
+                    instance.activating.remove(&eik);
                     instance.scopes.remove(&eik);
                     // A modification's seeded join activation opens a
                     // variable scope on the parked key before the guard
@@ -598,5 +610,26 @@ pub(super) fn apply_element(state: &mut State, event: &Event) {
             }
         }
         _ => unreachable!(),
+    }
+}
+
+/// Registers a live token (ACTIVATING or ACTIVATED — idempotent).
+fn register_token(
+    state: &mut State,
+    instance_key: crate::state::Key,
+    element_instance_key: crate::state::Key,
+    element_id: &crate::model::ElementId,
+    scope: crate::state::Key,
+) {
+    if let Some(instance) = state.instances.get_mut(&instance_key) {
+        instance
+            .active
+            .insert(element_instance_key, element_id.clone());
+        // A non-zero scope records the enclosing sub-process instance.
+        if scope != 0 {
+            instance.scopes.insert(element_instance_key, scope);
+        }
+        // A parked join activating is no longer parked (#1244).
+        instance.parked_joins.remove(&element_instance_key);
     }
 }

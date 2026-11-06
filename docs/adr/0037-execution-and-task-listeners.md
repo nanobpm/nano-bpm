@@ -348,9 +348,10 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   `end` listeners run **after** `zeebe:output` mappings (and any script/DMN
   result merge) and **before** `COMPLETED` + the outgoing flows. Nano matches
   this: the listener job's own FEEL attributes resolve against the
-  input-/output-mapped variable view. (Nano still emits its `ElementActivated`
-  early-marker at `ACTIVATING` time, ahead of Zeebe, but the *behaviour* is
-  deferred behind the `start` chain, so the observable ordering matches.)
+  input-/output-mapped variable view. (The early `ElementActivated` marker this
+  note originally called out was removed by #1429: the element now stays
+  `ACTIVATING` until the `start` chain drains, exactly as Zeebe writes
+  `ELEMENT_ACTIVATED` only after the last start listener completes.)
 - **Container start/end semantics:** for a sub-process/multi-instance body, do
   `start`/`end` listeners fire on the container boundary only, or also interleave with
   child activation? Confirm against Camunda for the container processors.

@@ -239,6 +239,136 @@ fn dead_scope_guard_rejects_task_listener_advance_for_a_canceled_task() {
 }
 
 #[test]
+fn start_listener_holds_the_element_in_activating_until_the_chain_drains() {
+    // #1429 (Zeebe parity): an element with `start` execution listeners writes
+    // `ElementActivating` + the first listener job and NOTHING else — no
+    // `ElementActivated` — until the chain drains; the drained chain then writes
+    // `ElementActivated` before the element's own behaviour (here: its job).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![
+                el(ListenerEventType::Start, "first"),
+                el(ListenerEventType::Start, "second"),
+            ],
+            Vec::new(),
+        )))
+        .unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+
+    // The task's records: Activating, then the first listener job — no
+    // Activated while the chain is open. (JobCompleted carries no element_id,
+    // so listener-job completions are excluded from the per-element view.)
+    let task_record = |e: &&Event| {
+        matches!(
+            e,
+            Event::ElementActivating { element_id, .. }
+            | Event::ElementActivated { element_id, .. }
+            | Event::ExecutionListenerJobCreated { element_id, .. }
+            | Event::JobCreated { element_id, .. }
+            if element_id == "charge"
+        )
+    };
+    let task_kinds = |events: &[Event]| {
+        kinds(
+            &events
+                .iter()
+                .filter(task_record)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        task_kinds(&create),
+        vec!["Activating", "ListenerJobCreated"],
+        "element stays ACTIVATING behind its start-listener chain (#1429)"
+    );
+
+    // Completing the first listener mints the second — still no Activated.
+    let first = engine.activate_jobs("first", "W", 10, 1_000, 0);
+    let mid = engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+    assert_eq!(
+        task_kinds(&mid),
+        vec!["ListenerJobCreated"],
+        "mid-chain: no ElementActivated yet"
+    );
+
+    // Draining the chain writes Activated, then the element's own job.
+    let second = engine.activate_jobs("second", "W", 10, 1_000, 0);
+    let drained = engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+    assert_eq!(
+        task_kinds(&drained),
+        vec!["Activated", "JobCreated"],
+        "ElementActivated only after the last start listener completes"
+    );
+}
+
+#[test]
+fn start_listener_on_a_pass_through_element_writes_activated_then_completing_on_drain() {
+    // #1429 (Zeebe parity): a pass-through element (a terminate end event)
+    // with a `start` listener stays ACTIVATING until the chain drains; the
+    // drain then writes Activated → Completing → Completed in one run.
+    let def = ProcessBuilder::new("kill-switch")
+        .start_event("s")
+        .terminate_end_event("kill")
+        .connect("s", "kill")
+        .with_listeners(
+            "kill",
+            vec![el(ListenerEventType::Start, "killStart")],
+            Vec::new(),
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("kill-switch"))
+        .unwrap();
+    let kill_record = |e: &&Event| {
+        matches!(
+            e,
+            Event::ElementActivating { element_id, .. }
+            | Event::ElementActivated { element_id, .. }
+            | Event::ElementCompleting { element_id, .. }
+            | Event::ElementCompleted { element_id, .. }
+            | Event::ExecutionListenerJobCreated { element_id, .. }
+            if element_id == "kill"
+        )
+    };
+    let kill_kinds = |events: &[Event]| {
+        kinds(
+            &events
+                .iter()
+                .filter(kill_record)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        kill_kinds(&create),
+        vec!["Activating", "ListenerJobCreated"],
+        "terminate end stays ACTIVATING behind its start listener (#1429)"
+    );
+
+    let listener = engine.activate_jobs("killStart", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "one start-listener job");
+    let done = engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert_eq!(
+        kill_kinds(&done),
+        vec!["Activated", "Completing", "Completed"],
+        "drain writes Activated, then Completing for the pass-through element"
+    );
+}
+
+#[test]
 fn start_listener_runs_before_the_service_job_is_created() {
     // A `start` execution listener defers the element's own behaviour (job
     // creation): the listener job is minted at ACTIVATED time; the service job
@@ -1743,5 +1873,267 @@ fn initial_assignee_without_assigning_listener_stays_byte_identical() {
     assert_eq!(
         engine.state().user_tasks[&key].assignee.as_deref(),
         Some("alice")
+    );
+}
+
+/// Every `ElementActivated` / `ElementActivating` record for `element_id`.
+fn activation_markers(events: &[Event], element_id: &str) -> Vec<&'static str> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::ElementActivating { element_id: id, .. } if id == element_id => {
+                Some("Activating")
+            }
+            Event::ElementActivated { element_id: id, .. } if id == element_id => Some("Activated"),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn start_listener_creation_incident_defers_activated_until_the_chain_drains() {
+    // #1429 review: the FIRST start listener's job-type expression fails, so the
+    // activation raises an incident instead of `ExecutionListenerJobCreated`.
+    // The element must still stay ACTIVATING (no marker before the incident),
+    // and resolving + draining must write exactly one `ElementActivated`.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![ExecutionListener {
+                event_type: ListenerEventType::Start,
+                job_type: "=listenerType".to_string(),
+                retries: None,
+            }],
+            Vec::new(),
+        )))
+        .unwrap();
+    let mut all = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let inst = all.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        activation_markers(&all, "charge"),
+        vec!["Activating"],
+        "a failed first start listener leaves the element ACTIVATING: {all:?}"
+    );
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    let incident_key = incidents[0].key;
+    engine
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("listenerType".to_string(), Value::Str("ls".into()))]),
+        ))
+        .unwrap();
+    all.extend(
+        engine
+            .apply_command(Command::resolve_incident(incident_key))
+            .unwrap(),
+    );
+    assert_eq!(activation_markers(&all, "charge"), vec!["Activating"]);
+    all.extend(complete_one(&mut engine, "ls"));
+    assert_eq!(
+        activation_markers(&all, "charge"),
+        vec!["Activating", "Activated"],
+        "exactly one ElementActivated, written at the drain: {all:?}"
+    );
+    assert_eq!(engine.activate_jobs("payment", "W", 10, 1_000, 0).len(), 1);
+}
+
+#[test]
+fn modification_seeded_start_listener_chain_writes_one_activated() {
+    // #1429 review: a modification-seeded activation writes `ElementActivated`
+    // before opening the start chain; the drain must not write a second one.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![el(ListenerEventType::Start, "ls")],
+            Vec::new(),
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
+    // Drain the original token's chain so only the seeded one remains.
+    complete_one(&mut engine, "ls");
+    let mut all = engine
+        .apply_command(Command::modify_instance(
+            inst,
+            vec![crate::command::ActivateElementInstruction {
+                element_id: "charge".into(),
+                variable_instructions: vec![crate::command::VariableInstruction {
+                    variables: HashMap::from([("x".to_string(), Value::Int(1))]),
+                    scope_id: Some("charge".into()),
+                }],
+                ..Default::default()
+            }],
+            vec![],
+        ))
+        .unwrap();
+    let seeded = all
+        .iter()
+        .find_map(|e| match e {
+            Event::ElementActivating {
+                element_id,
+                element_instance_key,
+                ..
+            } if element_id == "charge" => Some(*element_instance_key),
+            _ => None,
+        })
+        .unwrap();
+    all.extend(complete_one(&mut engine, "ls"));
+    let seeded_activated = all
+        .iter()
+        .filter(|e| {
+            matches!(e, Event::ElementActivated { element_instance_key, .. }
+                if *element_instance_key == seeded)
+        })
+        .count();
+    assert_eq!(
+        seeded_activated, 1,
+        "one marker for the seeded token: {all:?}"
+    );
+}
+
+#[test]
+fn compensation_throw_writes_activated_when_its_handler_has_a_start_listener() {
+    // #1429 review: a compensation throw's activation carries its handler's
+    // records; the handler's start-listener chain must not suppress the
+    // THROW's own `ElementActivated`.
+    let def = ProcessBuilder::new("comp-listener")
+        .start_event("start")
+        .service_task("book", "book-job")
+        .compensation_boundary_event("comp", "book", "undo")
+        .service_task("undo", "undo-job")
+        .compensation_throw_event("throw")
+        .end_event("done")
+        .connect("start", "book")
+        .connect("book", "throw")
+        .connect("throw", "done")
+        .with_listeners("undo", vec![el(ListenerEventType::Start, "ls")], Vec::new())
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("comp-listener"))
+        .unwrap();
+    let mut all = complete_one(&mut engine, "book-job");
+    assert_eq!(
+        activation_markers(&all, "throw"),
+        vec!["Activating", "Activated"],
+        "the throw is ACTIVATED even though its handler's chain opened: {all:?}"
+    );
+    assert_eq!(activation_markers(&all, "undo"), vec!["Activating"]);
+    all.extend(complete_one(&mut engine, "ls"));
+    assert_eq!(
+        activation_markers(&all, "undo"),
+        vec!["Activating", "Activated"]
+    );
+    assert_eq!(
+        activation_markers(&all, "throw"),
+        vec!["Activating", "Activated"]
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn legacy_snapshot_restores_owed_activation_for_a_parked_routing_incident() {
+    // #1429 review: a pre-#1429 snapshot carries a split gateway parked on an
+    // `ActivationPending` routing incident (raised while ACTIVATING, before its
+    // start listeners opened) but no `activating` set — the field did not
+    // exist. Restoring must reconstruct the owed marker from that active
+    // incident, or resolving + draining the listener chain completes the
+    // gateway without ever writing its `ElementActivated`.
+    let def = ProcessBuilder::new("split-listener")
+        .start_event("s")
+        .exclusive_gateway("g")
+        .service_task("a", "ja")
+        .end_event("e")
+        .connect("s", "g")
+        .connect_when("g", "a", "amount > 100")
+        .connect("a", "e")
+        .with_listeners("g", vec![el(ListenerEventType::Start, "ls")], Vec::new())
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "split-listener",
+            HashMap::from([("amount".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    assert_eq!(
+        incidents[0].kind,
+        state::IncidentKind::NoMatchingSequenceFlow
+    );
+    let incident_key = incidents[0].key;
+
+    // Serialize, then strip the `activating` field to emulate a pre-#1429
+    // snapshot: the parked gateway owes a marker the legacy bytes do not name.
+    let serialized = serde_json::to_value(engine.snapshot()).expect("serializes");
+    let mut legacy = serialized.clone();
+    for inst in legacy["state"]["instances"]
+        .as_object_mut()
+        .expect("instances object")
+        .values_mut()
+    {
+        inst.as_object_mut()
+            .expect("instance object")
+            .remove("activating");
+    }
+    assert!(
+        legacy.to_string().len() < serialized.to_string().len(),
+        "the field was present to strip"
+    );
+    let mut restored =
+        Engine::from_snapshot(serde_json::from_value(legacy).expect("legacy snapshot decodes"));
+
+    // The reconstruction under test: the parked gateway's owed marker is rebuilt
+    // from its active `ActivationPending` incident even though the legacy bytes
+    // carried no `activating` set.
+    let inst = restored
+        .state()
+        .instances
+        .keys()
+        .next()
+        .copied()
+        .expect("one live instance");
+    let gw = restored.state().instances[&inst]
+        .active
+        .iter()
+        .find(|(_, id)| id.as_str() == "g")
+        .map(|(k, _)| *k)
+        .expect("the gateway token is still live");
+    assert!(
+        restored.state().instances[&inst].activating.contains(&gw),
+        "restore reconstructs the owed activation from the parked incident"
+    );
+
+    // Resolve (routing now matches) and drain the start-listener chain: the
+    // gateway must get exactly one `ElementActivated`, at the drain.
+    restored
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+    let mut all = restored
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    all.extend(complete_one(&mut restored, "ls"));
+    assert_eq!(
+        activation_markers(&all, "g"),
+        vec!["Activated"],
+        "the restored legacy gateway gets exactly one ElementActivated, at the drain: {all:?}"
+    );
+    all.extend(complete_one(&mut restored, "ja"));
+    assert!(
+        restored.is_completed(inst),
+        "the token routed to the end: {all:?}"
     );
 }

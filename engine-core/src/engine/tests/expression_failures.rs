@@ -732,8 +732,9 @@ fn assert_selection_is_carried_through_completion(gateway: SplitGateway) {
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
     assert_eq!(
         lifecycle_of(&created, "g"),
-        vec!["Activating", "Activated"],
-        "{gateway:?}: the gateway parks on its start listener: {created:?}"
+        vec!["Activating"],
+        "{gateway:?}: the gateway parks on its start listener — ACTIVATING \
+         until the chain drains (#1429): {created:?}"
     );
 
     // The listener completes with a write that flips the condition variable,
@@ -863,11 +864,11 @@ fn assert_start_listener_defers_the_routing_gate(gateway: SplitGateway) {
         .unwrap();
     assert_eq!(
         lifecycle_of(&resolved, "g"),
-        vec!["Activated"],
+        Vec::<&'static str>::new(),
         "{gateway:?}: resolution re-runs the full gated activation on the \
-         parked instance: the gate passes, the gateway activates, and the \
-         `start` listener chain the failed attempt never opened runs before \
-         the behaviour: {resolved:?}"
+         parked instance: the gate passes and the `start` listener chain the \
+         failed attempt never opened now runs — the gateway stays ACTIVATING \
+         (#1429), no `ElementActivated` until the chain drains: {resolved:?}"
     );
     assert!(
         resolved.iter().any(|e| matches!(
@@ -886,9 +887,10 @@ fn assert_start_listener_defers_the_routing_gate(gateway: SplitGateway) {
         .unwrap();
     assert_eq!(
         lifecycle_of(&drained, "g"),
-        vec!["Completing", "Completed"],
-        "{gateway:?}: the drained listener completes the gateway through the \
-         retry's journaled selection: {drained:?}"
+        vec!["Activated", "Completing", "Completed"],
+        "{gateway:?}: the drained listener writes `ElementActivated` (#1429) \
+         and completes the gateway through the retry's journaled selection: \
+         {drained:?}"
     );
     assert!(engine.active_incidents().is_empty());
     assert!(engine.is_completed(inst), "{gateway:?}");
@@ -986,9 +988,10 @@ fn assert_retry_redrives_the_gated_activation(gateway: SplitGateway) {
         .unwrap();
     assert_eq!(
         lifecycle_of(&resolved, "g"),
-        vec!["Activated"],
+        Vec::<&'static str>::new(),
         "{gateway:?}: the successful retry re-runs the gated activation on the \
-         parked instance and parks on its start listener: {resolved:?}"
+         parked instance and parks on its start listener — still ACTIVATING \
+         (#1429), no `ElementActivated` until the chain drains: {resolved:?}"
     );
     assert!(
         resolved.iter().any(|e| matches!(
@@ -1009,9 +1012,10 @@ fn assert_retry_redrives_the_gated_activation(gateway: SplitGateway) {
         .unwrap();
     assert_eq!(
         lifecycle_of(&drained, "g"),
-        vec!["Completing", "Completed"],
-        "{gateway:?}: the drained listener completes the gateway through the \
-         retry's journaled selection: {drained:?}"
+        vec!["Activated", "Completing", "Completed"],
+        "{gateway:?}: the drained listener writes `ElementActivated` (#1429) \
+         and completes the gateway through the retry's journaled selection: \
+         {drained:?}"
     );
     assert!(
         drained.iter().any(|e| matches!(
@@ -1047,7 +1051,8 @@ fn inclusive_split_retry_redrives_the_gated_activation() {
 /// matches); listener `l0` then bumps `amount` past 100, and listener #1's
 /// job-type expression fails. Resolving THAT incident must resume the chain —
 /// keeping the carried route to `f` — not re-run the gate (which would now
-/// select `e`) nor re-emit `ElementActivated`.
+/// select `e`), and `ElementActivated` is written only when the resumed chain
+/// drains (#1429).
 fn two_listener_split_gateway_process(gateway: SplitGateway) -> ProcessDefinition {
     let builder = ProcessBuilder::new("split-two-listeners").start_event("s");
     let builder = match gateway {
@@ -1092,9 +1097,10 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
     assert_eq!(
         lifecycle_of(&created, "g"),
-        vec!["Activating", "Activated"],
+        vec!["Activating"],
         "{gateway:?}: the gate passes (`amount > 5` → `f`) and the listener \
-         chain opens: {created:?}"
+         chain opens — the gateway stays ACTIVATING until the chain drains \
+         (#1429): {created:?}"
     );
     assert!(
         created.iter().any(|e| matches!(
@@ -1136,8 +1142,8 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
 
     // Resolve: the retry must RESUME the chain at listener #1 — the carried
     // route (to `f`) is not re-selected even though `amount = 500` now matches
-    // the `e` branch, and `ElementActivated` (emitted on the first pass) is
-    // not repeated.
+    // the `e` branch, and `ElementActivated` is still deferred to the chain's
+    // drain (#1429).
     engine
         .apply_command(Command::set_variables(
             inst,
@@ -1171,8 +1177,9 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
         .unwrap();
     assert_eq!(
         lifecycle_of(&drained, "g"),
-        vec!["Completing", "Completed"],
-        "{gateway:?}: the drained chain completes the gateway: {drained:?}"
+        vec!["Activated", "Completing", "Completed"],
+        "{gateway:?}: the drained chain writes `ElementActivated` (#1429) and \
+         completes the gateway: {drained:?}"
     );
     assert!(
         drained.iter().any(|e| matches!(

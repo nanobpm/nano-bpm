@@ -6483,16 +6483,10 @@ impl Engine {
                 // already-emitted `ElementActivated` is repeated only when the
                 // token is still ACTIVATING (`pending`).
                 if let Some(resume_at) = resume_listener_at {
-                    let activated = Event::ElementActivated {
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                        scope,
-                    };
-                    let mut events = Vec::new();
-                    if activation_pending {
-                        events.push(activated);
-                    }
+                    // The resumed chain re-emits `ElementActivated` itself when
+                    // it drains (the token is still ACTIVATING — the incident
+                    // parked it before any listener completed, #1429); pushing
+                    // it here too would double the record.
                     let (chain_events, chain_followups) = self.advance_listener(
                         instance_key,
                         element_instance_key,
@@ -6501,8 +6495,7 @@ impl Engine {
                         resume_at.saturating_sub(1),
                         scope,
                     );
-                    events.extend(chain_events);
-                    return (events, chain_followups);
+                    return (chain_events, chain_followups);
                 }
                 // A split gateway (exclusive, or an inclusive fork) re-runs the
                 // FULL gated activation (`Step::Activate`, #1402): the routing
@@ -6539,7 +6532,11 @@ impl Engine {
                         scope,
                         view,
                     );
-                    return if activation_pending {
+                    // A re-opened `start` listener chain defers the marker to
+                    // its drain (#1429) — exactly as a fresh activation does.
+                    return if activation_pending
+                        && !opens_start_chain(&events, element_instance_key)
+                    {
                         (gate_activated(events, activated, 0), followups)
                     } else {
                         (events, followups)
@@ -6559,7 +6556,7 @@ impl Engine {
                     scope,
                     view,
                 );
-                if activation_pending {
+                if activation_pending && !opens_start_chain(&events, element_instance_key) {
                     (gate_activated(events, activated, 0), followups)
                 } else {
                     (events, followups)
@@ -6748,12 +6745,6 @@ impl Engine {
             }
         }
 
-        let activated = Event::ElementActivated {
-            instance_key,
-            element_instance_key,
-            element_id: element_id.clone(),
-            scope,
-        };
         let mut events = vec![Event::ElementActivating {
             instance_key,
             element_instance_key,
@@ -6783,12 +6774,27 @@ impl Engine {
             });
         }
 
-        let (body_events, body_followups) =
-            self.activate_body(instance_key, element_id, element_instance_key, scope);
+        let (body_events, body_followups) = self.activate_body(
+            instance_key,
+            element_id.clone(),
+            element_instance_key,
+            scope,
+        );
         events.extend(body_events);
         followups.extend(body_followups);
         // `ElementActivated` sits right after `ElementActivating` — unless the
-        // activation body parked the token on an activation-time incident.
+        // activation body parked the token on an activation-time incident, or a
+        // `start` execution-listener chain opened (#1429: the element then stays
+        // ACTIVATING and the drained chain writes `ElementActivated`).
+        if opens_start_chain(&events, element_instance_key) {
+            return (events, followups);
+        }
+        let activated = Event::ElementActivated {
+            instance_key,
+            element_instance_key,
+            element_id,
+            scope,
+        };
         (gate_activated(events, activated, 1), followups)
     }
 
@@ -6987,11 +6993,11 @@ impl Engine {
         // Start execution listeners (ADR 0037): before the element enacts its
         // own behaviour (creating a job, routing a gateway, opening a
         // sub-process) it runs a sequential chain of `start` listener jobs. The
-        // element rests in ACTIVATING — `ElementActivated` was already emitted
-        // above (nano's early-marker choice), but the *behaviour* is deferred
-        // until the chain drains (see `advance_listener`). Listener-free
-        // elements skip this entirely and fall straight through to
-        // `run_activation_body`, so their journal is byte-identical.
+        // element rests in ACTIVATING for the whole chain — `ElementActivated`
+        // is written only once the chain drains (Zeebe parity, #1429; see
+        // `advance_listener`), and the *behaviour* is deferred likewise.
+        // Listener-free elements skip this entirely and fall straight through
+        // to `run_activation_body`, so their journal is byte-identical.
         let start_listeners = self.listeners_of(
             instance_key,
             &element_id,
@@ -13087,7 +13093,9 @@ impl Engine {
                 // A multi-instance body deferred its child fan-out (not
                 // `run_activation_body`): its activation already ran in
                 // `activate_multi_instance_body`; the start chain gated only the
-                // spawn, re-derived here from the body record.
+                // spawn, re-derived here from the body record. The body's
+                // `ElementActivated` was already written before the chain opened
+                // (`run_mi_body_activation`), so nothing is prepended here.
                 if self
                     .state
                     .instances
@@ -13100,14 +13108,38 @@ impl Engine {
                         self.spawn_multi_instance_children(instance_key, element_instance_key),
                     )
                 } else {
+                    // #1429 (Zeebe parity): the element stayed ACTIVATING for the
+                    // whole chain — `ElementActivated` is written only now, ahead
+                    // of the deferred activation behaviour (a pass-through
+                    // element's `ElementCompleting` then follows it in the same
+                    // run).
+                    let activated = Event::ElementActivated {
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        scope,
+                    };
+                    // Written only while the marker is still owed: a
+                    // modification-seeded activation, or a chain opened by a
+                    // pre-#1429 build, already wrote it before the chain.
+                    let owed = self
+                        .state
+                        .instances
+                        .get(&instance_key)
+                        .is_some_and(|i| i.activating.contains(&element_instance_key));
                     let vars = self.variables_for_element(instance_key, element_instance_key);
-                    self.run_activation_body(
+                    let (events, followups) = self.run_activation_body(
                         instance_key,
                         element_id,
                         element_instance_key,
                         scope,
                         vars,
-                    )
+                    );
+                    if owed {
+                        (gate_activated(events, activated, 0), followups)
+                    } else {
+                        (events, followups)
+                    }
                 }
             }
             crate::model::ListenerEventType::End => {
@@ -16345,6 +16377,35 @@ impl RoutingFailure {
             ),
         }
     }
+}
+
+/// Whether `events` open a `start` execution-listener chain (ADR 0037) on the
+/// element instance `eik`: an `ExecutionListenerJobCreated { event_type: Start }`
+/// record — or an incident raised while creating the chain's first listener job
+/// (`IoMappingRedrive::ExecutionListenerJob { event_type: Start }`), whose
+/// resolution mints that job — means the element stays ACTIVATING behind the
+/// chain, so its `ElementActivated` is deferred to the chain's drain (#1429) and
+/// the caller must NOT insert it. Matches are restricted to `eik`: an activation
+/// can carry OTHER element instances' records (a compensation throw appends its
+/// handlers' activations), whose chains must not suppress this marker.
+fn opens_start_chain(events: &[Event], eik: state::Key) -> bool {
+    events.iter().any(|e| match e {
+        Event::ExecutionListenerJobCreated {
+            element_instance_key,
+            event_type: crate::model::ListenerEventType::Start,
+            ..
+        } => *element_instance_key == eik,
+        Event::IncidentRaised {
+            element_instance_key,
+            redrive:
+                Some(state::IoMappingRedrive::ExecutionListenerJob {
+                    event_type: crate::model::ListenerEventType::Start,
+                    ..
+                }),
+            ..
+        } => *element_instance_key == eik,
+        _ => false,
+    })
 }
 
 /// Zeebe parity for activation-time failures: `onActivate` (input mappings, job
