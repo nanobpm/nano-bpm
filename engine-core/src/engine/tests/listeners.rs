@@ -239,6 +239,136 @@ fn dead_scope_guard_rejects_task_listener_advance_for_a_canceled_task() {
 }
 
 #[test]
+fn start_listener_holds_the_element_in_activating_until_the_chain_drains() {
+    // #1429 (Zeebe parity): an element with `start` execution listeners writes
+    // `ElementActivating` + the first listener job and NOTHING else — no
+    // `ElementActivated` — until the chain drains; the drained chain then writes
+    // `ElementActivated` before the element's own behaviour (here: its job).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![
+                el(ListenerEventType::Start, "first"),
+                el(ListenerEventType::Start, "second"),
+            ],
+            Vec::new(),
+        )))
+        .unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+
+    // The task's records: Activating, then the first listener job — no
+    // Activated while the chain is open. (JobCompleted carries no element_id,
+    // so listener-job completions are excluded from the per-element view.)
+    let task_record = |e: &&Event| {
+        matches!(
+            e,
+            Event::ElementActivating { element_id, .. }
+            | Event::ElementActivated { element_id, .. }
+            | Event::ExecutionListenerJobCreated { element_id, .. }
+            | Event::JobCreated { element_id, .. }
+            if element_id == "charge"
+        )
+    };
+    let task_kinds = |events: &[Event]| {
+        kinds(
+            &events
+                .iter()
+                .filter(task_record)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        task_kinds(&create),
+        vec!["Activating", "ListenerJobCreated"],
+        "element stays ACTIVATING behind its start-listener chain (#1429)"
+    );
+
+    // Completing the first listener mints the second — still no Activated.
+    let first = engine.activate_jobs("first", "W", 10, 1_000, 0);
+    let mid = engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+    assert_eq!(
+        task_kinds(&mid),
+        vec!["ListenerJobCreated"],
+        "mid-chain: no ElementActivated yet"
+    );
+
+    // Draining the chain writes Activated, then the element's own job.
+    let second = engine.activate_jobs("second", "W", 10, 1_000, 0);
+    let drained = engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+    assert_eq!(
+        task_kinds(&drained),
+        vec!["Activated", "JobCreated"],
+        "ElementActivated only after the last start listener completes"
+    );
+}
+
+#[test]
+fn start_listener_on_a_pass_through_element_writes_activated_then_completing_on_drain() {
+    // #1429 (Zeebe parity): a pass-through element (a terminate end event)
+    // with a `start` listener stays ACTIVATING until the chain drains; the
+    // drain then writes Activated → Completing → Completed in one run.
+    let def = ProcessBuilder::new("kill-switch")
+        .start_event("s")
+        .terminate_end_event("kill")
+        .connect("s", "kill")
+        .with_listeners(
+            "kill",
+            vec![el(ListenerEventType::Start, "killStart")],
+            Vec::new(),
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("kill-switch"))
+        .unwrap();
+    let kill_record = |e: &&Event| {
+        matches!(
+            e,
+            Event::ElementActivating { element_id, .. }
+            | Event::ElementActivated { element_id, .. }
+            | Event::ElementCompleting { element_id, .. }
+            | Event::ElementCompleted { element_id, .. }
+            | Event::ExecutionListenerJobCreated { element_id, .. }
+            if element_id == "kill"
+        )
+    };
+    let kill_kinds = |events: &[Event]| {
+        kinds(
+            &events
+                .iter()
+                .filter(kill_record)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+    };
+    assert_eq!(
+        kill_kinds(&create),
+        vec!["Activating", "ListenerJobCreated"],
+        "terminate end stays ACTIVATING behind its start listener (#1429)"
+    );
+
+    let listener = engine.activate_jobs("killStart", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "one start-listener job");
+    let done = engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert_eq!(
+        kill_kinds(&done),
+        vec!["Activated", "Completing", "Completed"],
+        "drain writes Activated, then Completing for the pass-through element"
+    );
+}
+
+#[test]
 fn start_listener_runs_before_the_service_job_is_created() {
     // A `start` execution listener defers the element's own behaviour (job
     // creation): the listener job is minted at ACTIVATED time; the service job
