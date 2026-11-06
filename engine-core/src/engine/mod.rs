@@ -2342,15 +2342,34 @@ impl Engine {
                             );
                         }
                     }
-                    // Job result variables propagate from the task's enclosing
-                    // (flow) scope upward — each name updates the nearest ancestor
-                    // scope that defines it, defaulting to root. For a root-only
-                    // instance this collapses to the flat `VariablesUpdated`,
-                    // byte-identical to the pre-scoping engine.
-                    let flow_scope = self.scope_of(instance_key, element_instance_key);
-                    for event in self.propagated_updates(instance_key, flow_scope, variables, false)
-                    {
-                        self.emit(&mut log, event);
+                    // #1437 (Zeebe parity): an execution-listener job's completion
+                    // variables are written as LOCAL variables of the listener's
+                    // element instance (Zeebe VARIABLE CREATED at the element's
+                    // scopeKey) — they do NOT propagate to the defining ancestor
+                    // or the process root. Later listeners in the chain and the
+                    // element's own behaviour still read them through the scope
+                    // chain (an element-local binding shadows the root).
+                    if matches!(job_kind, state::JobKind::ExecutionListener { .. }) {
+                        self.emit(
+                            &mut log,
+                            Event::ScopedVariablesUpdated {
+                                instance_key,
+                                scope_key: element_instance_key,
+                                variables,
+                            },
+                        );
+                    } else {
+                        // Job result variables propagate from the task's enclosing
+                        // (flow) scope upward — each name updates the nearest ancestor
+                        // scope that defines it, defaulting to root. For a root-only
+                        // instance this collapses to the flat `VariablesUpdated`,
+                        // byte-identical to the pre-scoping engine.
+                        let flow_scope = self.scope_of(instance_key, element_instance_key);
+                        for event in
+                            self.propagated_updates(instance_key, flow_scope, variables, false)
+                        {
+                            self.emit(&mut log, event);
+                        }
                     }
                 }
                 // A task-listener job: its completion advances (or denies) the
@@ -6702,7 +6721,17 @@ impl Engine {
         let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
-        if is_sub_process || is_adhoc_container {
+        // #1437 (Zeebe parity): an element declaring execution listeners is a
+        // variable scope too — a listener job's completion variables are written
+        // element-LOCAL (Zeebe VARIABLE CREATED at the element's scopeKey), so
+        // the scope chain must exist for later listeners (and the element's own
+        // completion-time view) to read them through. Registered up-front (not
+        // lazily on the first listener write) so an incident-parked chain's
+        // re-drive (`RetryActivation` / `RestartExecutionListenerChain`) and the
+        // end chain see the same registered scope.
+        let has_listeners =
+            kind.is_some() && self.has_execution_listeners(instance_key, &element_id);
+        if is_sub_process || is_adhoc_container || has_listeners {
             events.push(Event::VariableScopeCreated {
                 instance_key,
                 scope_key: element_instance_key,
@@ -6780,11 +6809,13 @@ impl Engine {
         let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
         let is_adhoc_container = adhoc_def.is_some();
         // The element's own scope is registered by `activate` for a
-        // sub-process/ad-hoc container (before this body runs); a leaf activity
-        // registers it lazily below, only if its inputs produce values.
+        // sub-process/ad-hoc container or a listener-bearing element (#1437)
+        // (before this body runs); a leaf activity registers it lazily below,
+        // only if its inputs produce values.
         // A modification may have registered it already (seeded locals).
         let scope_registered = is_sub_process
             || is_adhoc_container
+            || self.has_execution_listeners(instance_key, &element_id)
             || self
                 .state
                 .instances

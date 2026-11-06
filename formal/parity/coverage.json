@@ -255,7 +255,8 @@
       "status": "parity",
       "evidence": [
         "traces:job-type-expression-failure",
-        "traces:feel-null-on-type-error"
+        "traces:feel-null-on-type-error",
+        "traces:gateway-start-listener-retry-restarts-chain"
       ]
     },
     {

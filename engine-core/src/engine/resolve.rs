@@ -100,6 +100,18 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// Whether `element_id` declares ANY execution listener (start or end) in
+    /// the given instance's process. An element that does is a variable scope
+    /// (#1437, Zeebe parity): its listener jobs' completion variables are
+    /// written element-local, so the scope chain must exist for the chain (and
+    /// the element's own views) to read them through.
+    pub(crate) fn has_execution_listeners(&self, instance_key: Key, element_id: &str) -> bool {
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.element(element_id))
+            .map(|e| !e.start_listeners.is_empty() || !e.end_listeners.is_empty())
+            .unwrap_or(false)
+    }
+
     /// The task listeners of `event_type` declared on the user-task `element_id`
     /// in the given instance's process, in declaration order (ADR 0037 §6).
     /// Empty for non-user-task elements and user tasks without listeners of that
