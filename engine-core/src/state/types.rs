@@ -1332,6 +1332,21 @@ pub enum IoMappingRedrive {
     },
 }
 
+impl IoMappingRedrive {
+    /// Whether this redrive parks its element instance in ACTIVATING — the
+    /// failure was raised before `ElementActivated`, so the token is owed that
+    /// marker once the resolved re-drive succeeds (#1429). A legacy snapshot
+    /// (written before the `activating` set existed) carries this owed state
+    /// only implicitly, in its active incidents; restore reconstructs the set
+    /// from exactly these redrives.
+    pub fn parks_in_activating(&self) -> bool {
+        matches!(
+            self,
+            IoMappingRedrive::ActivationPending | IoMappingRedrive::ActivationBodyPending
+        )
+    }
+}
+
 /// Lifecycle state of an incident. Incidents are retained after resolution (as
 /// `Resolved`) so they remain queryable as an audit trail.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2105,6 +2120,35 @@ impl State {
     }
 }
 
+/// Reconstructs the element instances a legacy snapshot leaves ACTIVATING with
+/// their `ElementActivated` still owed (#1429). The `activating` set is
+/// `serde(default)`, so a snapshot written before it existed deserializes it
+/// empty — but such a snapshot can still carry a token parked in ACTIVATING on
+/// an activation-time incident (a split gateway's routing failure, an input /
+/// job-property expression failure before `ElementActivated`). That owed state
+/// survives only implicitly, as the incident's [`IoMappingRedrive::ActivationPending`]
+/// / [`IoMappingRedrive::ActivationBodyPending`] tag. Without reconstruction the
+/// resolved re-drive defers the marker to the start-listener drain, which sees
+/// no pending key and completes the element without ever emitting it. Idempotent:
+/// keys already in the set are re-inserted, and a resolved incident contributes
+/// nothing.
+pub(crate) fn reconstruct_owed_activations<'a>(
+    instance: &mut ProcessInstance,
+    incidents: impl IntoIterator<Item = &'a Incident>,
+) {
+    for incident in incidents {
+        if incident.instance_key == instance.key
+            && incident.state == IncidentState::Active
+            && incident
+                .redrive
+                .as_ref()
+                .is_some_and(IoMappingRedrive::parks_in_activating)
+        {
+            instance.activating.insert(incident.element_instance_key);
+        }
+    }
+}
+
 /// Re-inserts a lifted-out [`InstanceSnapshot`] into `state`: the instance and
 /// every owned entity, rebuilding the derived job indices. The single canonical
 /// implementation behind both live cold rehydration
@@ -2113,7 +2157,7 @@ impl State {
 /// can never drift. Re-inserting keys that already exist overwrites them.
 pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) {
     let InstanceSnapshot {
-        instance,
+        mut instance,
         jobs,
         timers,
         message_subscriptions,
@@ -2122,6 +2166,7 @@ pub fn restore_instance_snapshot(state: &mut State, snapshot: InstanceSnapshot) 
         user_tasks,
         incidents,
     } = snapshot;
+    reconstruct_owed_activations(&mut instance, &incidents);
     let key = instance.key;
     state.instances.insert(key, instance);
     for job in jobs {

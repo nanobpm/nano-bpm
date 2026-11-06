@@ -45,6 +45,14 @@ impl Engine {
         {
             deployed.definition.normalize_legacy_agent_tasks();
         }
+        // A legacy (pre-#1429) snapshot carries a token parked ACTIVATING on an
+        // activation-time incident with no `activating` set to name it; rebuild
+        // the owed markers from those incidents so resolving one still emits the
+        // element's `ElementActivated` at its listener-chain drain.
+        let incidents = &snapshot.state.incidents;
+        for instance in snapshot.state.instances.values_mut() {
+            state::reconstruct_owed_activations(instance, incidents.values());
+        }
         Self {
             state: snapshot.state,
             partition_id: snapshot.partition_id,

@@ -2036,3 +2036,104 @@ fn compensation_throw_writes_activated_when_its_handler_has_a_start_listener() {
         vec!["Activating", "Activated"]
     );
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn legacy_snapshot_restores_owed_activation_for_a_parked_routing_incident() {
+    // #1429 review: a pre-#1429 snapshot carries a split gateway parked on an
+    // `ActivationPending` routing incident (raised while ACTIVATING, before its
+    // start listeners opened) but no `activating` set — the field did not
+    // exist. Restoring must reconstruct the owed marker from that active
+    // incident, or resolving + draining the listener chain completes the
+    // gateway without ever writing its `ElementActivated`.
+    let def = ProcessBuilder::new("split-listener")
+        .start_event("s")
+        .exclusive_gateway("g")
+        .service_task("a", "ja")
+        .end_event("e")
+        .connect("s", "g")
+        .connect_when("g", "a", "amount > 100")
+        .connect("a", "e")
+        .with_listeners("g", vec![el(ListenerEventType::Start, "ls")], Vec::new())
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "split-listener",
+            HashMap::from([("amount".to_string(), Value::Int(5))]),
+        ))
+        .unwrap();
+    let incidents = engine.active_incidents();
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    assert_eq!(
+        incidents[0].kind,
+        state::IncidentKind::NoMatchingSequenceFlow
+    );
+    let incident_key = incidents[0].key;
+
+    // Serialize, then strip the `activating` field to emulate a pre-#1429
+    // snapshot: the parked gateway owes a marker the legacy bytes do not name.
+    let serialized = serde_json::to_value(engine.snapshot()).expect("serializes");
+    let mut legacy = serialized.clone();
+    for inst in legacy["state"]["instances"]
+        .as_object_mut()
+        .expect("instances object")
+        .values_mut()
+    {
+        inst.as_object_mut()
+            .expect("instance object")
+            .remove("activating");
+    }
+    assert!(
+        legacy.to_string().len() < serialized.to_string().len(),
+        "the field was present to strip"
+    );
+    let mut restored =
+        Engine::from_snapshot(serde_json::from_value(legacy).expect("legacy snapshot decodes"));
+
+    // The reconstruction under test: the parked gateway's owed marker is rebuilt
+    // from its active `ActivationPending` incident even though the legacy bytes
+    // carried no `activating` set.
+    let inst = restored
+        .state()
+        .instances
+        .keys()
+        .next()
+        .copied()
+        .expect("one live instance");
+    let gw = restored.state().instances[&inst]
+        .active
+        .iter()
+        .find(|(_, id)| id.as_str() == "g")
+        .map(|(k, _)| *k)
+        .expect("the gateway token is still live");
+    assert!(
+        restored.state().instances[&inst].activating.contains(&gw),
+        "restore reconstructs the owed activation from the parked incident"
+    );
+
+    // Resolve (routing now matches) and drain the start-listener chain: the
+    // gateway must get exactly one `ElementActivated`, at the drain.
+    restored
+        .apply_command(Command::set_variables(
+            inst,
+            HashMap::from([("amount".to_string(), Value::Int(500))]),
+        ))
+        .unwrap();
+    let mut all = restored
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+    all.extend(complete_one(&mut restored, "ls"));
+    assert_eq!(
+        activation_markers(&all, "g"),
+        vec!["Activated"],
+        "the restored legacy gateway gets exactly one ElementActivated, at the drain: {all:?}"
+    );
+    all.extend(complete_one(&mut restored, "ja"));
+    assert!(
+        restored.is_completed(inst),
+        "the token routed to the end: {all:?}"
+    );
+}
