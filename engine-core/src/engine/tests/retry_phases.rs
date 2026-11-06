@@ -252,6 +252,9 @@ fn mi_body_end_listener_retry_uses_body_completion() {
             Value::Str("done:b".into())
         ]))
     );
+    // The child-only `label` output (reads `item`) must not leak a body-level
+    // `null` into the parent scope on the restart re-projection.
+    assert_ne!(root_var(&engine, inst, "label"), Some(Value::Null));
     assert_eq!(complete_all(&mut engine, "audit", &[]), 1);
     assert!(engine.is_completed(inst), "{:?}", job_types(&engine));
 }

@@ -4,11 +4,21 @@
     {
       "scenario": "gateway-start-listener-retry-restarts-chain",
       "issue": "#1437",
-      "reason": "Zeebe writes an execution-listener job's completion variables as element-local variables of the listener's element instance (CREATED in scope `g`); nano propagates them to the process scope (UPDATED). Only that VARIABLE record differs.",
+      "reason": "Zeebe writes an execution-listener job's completion variables as element-local variables of the listener's element instance (CREATED in scope `g`); nano propagates them to the process scope (UPDATED). Only that `amount = 500` completion record differs (CREATED in `g` vs UPDATED in the process scope); the step-0 `amount = 10` creation is still compared.",
       "ignoreRecords": [
         {
           "valueType": "VARIABLE",
-          "name": "amount"
+          "name": "amount",
+          "value": 500,
+          "intent": "CREATED",
+          "scopeElementId": "g"
+        },
+        {
+          "valueType": "VARIABLE",
+          "name": "amount",
+          "value": 500,
+          "intent": "UPDATED",
+          "scopeElementId": "gateway-start-listener-retry-restarts-chain"
         }
       ]
     }

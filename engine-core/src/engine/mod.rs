@@ -8847,6 +8847,18 @@ impl Engine {
     /// early completion-condition fire), writes the aggregated output collection
     /// (padding uncollected slots with `null`) into the instance scope, applies
     /// the activity's output mappings, and takes its outgoing flow.
+    /// The per-child bindings absent at an MI body's level, whose output
+    /// mappings the body skips (the per-child pass applies them).
+    fn mi_body_tolerated_bindings(
+        input_element: Option<&str>,
+    ) -> std::collections::HashSet<String> {
+        let mut tolerated = std::collections::HashSet::from(["loopCounter".to_string()]);
+        if let Some(name) = input_element {
+            tolerated.insert(name.to_string());
+        }
+        tolerated
+    }
+
     fn complete_multi_instance_body(
         &mut self,
         instance_key: Key,
@@ -8901,12 +8913,11 @@ impl Engine {
             // for any other reason is a genuine failure: park the body on an
             // `IO_MAPPING_ERROR` incident whose resolution re-drives this body
             // completion (#946), rather than silently completing with no incident.
-            let mut tolerated = std::collections::HashSet::new();
-            tolerated.insert("loopCounter".to_string());
-            if let Some(name) = &input_element {
-                tolerated.insert(name.clone());
-            }
-            match self.eval_io_mappings_tolerating(&ctx, &outputs, &tolerated) {
+            match self.eval_io_mappings_tolerating(
+                &ctx,
+                &outputs,
+                &Self::mi_body_tolerated_bindings(input_element.as_deref()),
+            ) {
                 Ok(updates) => updates,
                 Err(failure) => {
                     let event = self.io_mapping_incident(
@@ -11911,7 +11922,24 @@ impl Engine {
         if event_type == crate::model::ListenerEventType::End {
             let outputs = self.io_outputs(instance_key, &element_id);
             if !outputs.is_empty() {
-                match self.eval_io_mappings_in(&vars, &outputs) {
+                // An MI body projects its outputs body-aware — the single
+                // projection `complete_multi_instance_body` uses — so a
+                // child-only mapping (`inputElement`/`loopCounter`) is skipped
+                // rather than leaking `null` into the parent scope.
+                let projected = match self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.multi_instances.get(&element_instance_key))
+                {
+                    Some(mi) => self.eval_io_mappings_tolerating(
+                        &vars,
+                        &outputs,
+                        &Self::mi_body_tolerated_bindings(mi.input_element.as_deref()),
+                    ),
+                    None => self.eval_io_mappings_in(&vars, &outputs),
+                };
+                match projected {
                     Ok(updates) => {
                         vars.extend(updates.clone());
                         events.extend(self.propagated_updates(instance_key, scope, updates, false));
