@@ -1555,7 +1555,7 @@ mod tests {
                 adhoc_instances: HashMap::new(),
                 scope_parents: HashMap::new(),
                 scope_variables: HashMap::new(),
-                compensable: Vec::new(),
+                compensable: Default::default(),
                 compensation_waits: HashMap::new(),
                 agent_instances: HashMap::new(),
                 agent_history: HashMap::new(),

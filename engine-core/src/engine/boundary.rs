@@ -196,11 +196,9 @@ impl Engine {
             return None;
         }
         let instance = self.state.instances.get(&instance_key)?;
-        if instance
-            .compensable
-            .iter()
-            .any(|c| c.scope == element_instance_key)
-        {
+        // O(1) via the derived per-scope index: every completing sub-process
+        // and multi-instance child asks this, so a scan would be quadratic.
+        if instance.compensable.has_scope(element_instance_key) {
             Some(Event::CompensationSubscriptionCreated {
                 instance_key,
                 element_instance_key,
@@ -602,10 +600,7 @@ impl Engine {
             let mut scopes: Vec<Key> = self.scope_descendants(instance_key, scope_eik);
             scopes.push(scope_eik);
             let scope_set: std::collections::HashSet<Key> = scopes.iter().copied().collect();
-            let clears_any = instance
-                .compensable
-                .iter()
-                .any(|c| scope_set.contains(&c.scope))
+            let clears_any = scopes.iter().any(|s| instance.compensable.has_scope(*s))
                 || instance
                     .compensation_waits
                     .values()
