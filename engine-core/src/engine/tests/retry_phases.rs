@@ -9,10 +9,11 @@
 //! effects either. Finding 5's "the script is not re-run" is the behaviour of the
 //! pinned Zeebe engine (captured differential trace, see #1406).
 //!
-//! Deliberately NOT pinned here: whether a failed listener chain resumes at the
-//! failed index (finding 7). The pinned Zeebe restarts the chain at listener 0
-//! and re-applies input mappings on resolve, which contradicts finding 7 — that
-//! decision is tracked on #1406.
+//! Finding 7 (decided on #1406: match Zeebe) is pinned by the trace scenarios
+//! `execution-listener-retry-resumes-at-failure`,
+//! `start-listener-retry-restarts-chain` and
+//! `gateway-start-listener-retry-restarts-chain`: resolving a listener incident
+//! restarts the chain at listener 0 and re-applies the element's mappings.
 use super::*;
 
 const NS: &str = r#"xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0""#;

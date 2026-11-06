@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI"
+                  xmlns:dc="http://www.omg.org/spec/DD/20100524/DC"
+                  xmlns:di="http://www.omg.org/spec/DD/20100524/DI"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="Definitions_gslr" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="gateway-start-listener-retry-restarts-chain" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:exclusiveGateway id="g">
+      <bpmn:extensionElements>
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="l0" />
+          <zeebe:executionListener eventType="start" type="=nextType" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:exclusiveGateway>
+    <bpmn:endEvent id="e" />
+    <bpmn:endEvent id="f" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="g" />
+    <bpmn:sequenceFlow id="toE" sourceRef="g" targetRef="e">
+      <bpmn:conditionExpression>=amount &gt; 100</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="toF" sourceRef="g" targetRef="f">
+      <bpmn:conditionExpression>=amount &gt; 5</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
+    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="gateway-start-listener-retry-restarts-chain">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start"><dc:Bounds x="160" y="180" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="g_di" bpmnElement="g" isMarkerVisible="true"><dc:Bounds x="245" y="173" width="50" height="50" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="e_di" bpmnElement="e"><dc:Bounds x="382" y="102" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="f_di" bpmnElement="f"><dc:Bounds x="382" y="262" width="36" height="36" /></bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="196" y="198" /><di:waypoint x="245" y="198" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toE_di" bpmnElement="toE"><di:waypoint x="270" y="173" /><di:waypoint x="270" y="120" /><di:waypoint x="382" y="120" /></bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="toF_di" bpmnElement="toF"><di:waypoint x="270" y="223" /><di:waypoint x="270" y="280" /><di:waypoint x="382" y="280" /></bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>

@@ -1,0 +1,38 @@
+{
+  "description": "Incident resolve on a START execution-listener chain (#1406 finding 7). `work` has an input mapping `counter = counter + 10` and start listeners `first` and `=secondType`; the second fails after `first` completed. Resolving re-runs the activation: Zeebe re-applies the input mapping (local counter 11 -> 21) and restarts the chain at index 0 (re-creates `first`'s job), then `second`; ELEMENT_ACTIVATED only after the chain drains.",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "start-listener-retry-restarts-chain",
+      "variables": {
+        "counter": 0
+      }
+    },
+    {
+      "op": "completeJob",
+      "jobType": "first"
+    },
+    {
+      "op": "updateVariables",
+      "variables": {
+        "secondType": "second"
+      }
+    },
+    {
+      "op": "resolveIncident",
+      "elementId": "work"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "first"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "second"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    }
+  ]
+}

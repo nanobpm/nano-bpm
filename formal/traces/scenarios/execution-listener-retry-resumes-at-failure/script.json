@@ -1,0 +1,56 @@
+{
+  "description": "Incident resolve on an END execution-listener chain (#1406 finding 7). `inc` is a script task (`counter + 1`) whose end listener's job type `=auditType` fails: resolving re-runs the listener (incident again until `auditType` is set) but NOT the script \u2014 counter stays 1 (finding 5). `work` has end listeners `first` and `=secondType`; the second fails after `first` completed, and resolving restarts the chain at index 0 \u2014 Zeebe re-creates `first`'s job, then `second`. `work`'s non-idempotent output mapping (`counter + 100 -> counter`) IS re-applied by the restart — Zeebe re-runs the completing step (counter 101 -> 201).",
+  "steps": [
+    {
+      "op": "createInstance",
+      "bpmnProcessId": "execution-listener-retry-resumes-at-failure",
+      "variables": {
+        "counter": 0
+      }
+    },
+    {
+      "op": "resolveIncident",
+      "elementId": "inc"
+    },
+    {
+      "op": "updateVariables",
+      "variables": {
+        "auditType": "audit"
+      }
+    },
+    {
+      "op": "resolveIncident",
+      "elementId": "inc"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "audit"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "work"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "first"
+    },
+    {
+      "op": "updateVariables",
+      "variables": {
+        "secondType": "second"
+      }
+    },
+    {
+      "op": "resolveIncident",
+      "elementId": "work"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "first"
+    },
+    {
+      "op": "completeJob",
+      "jobType": "second"
+    }
+  ]
+}

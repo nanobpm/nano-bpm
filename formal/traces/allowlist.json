@@ -1,4 +1,16 @@
 {
   "doc": "Known nano-vs-Zeebe trace divergences. Each entry: {scenario, issue: \"#N\", reason, ignoreRecords?}. A listed scenario that no longer diverges is STALE and fails engine-core/tests/zeebe_traces.rs — delete it. `ignoreRecords` (record-field matchers) narrows the entry: only matching records may differ; every other record of every step must still equal Zeebe.",
-  "entries": []
+  "entries": [
+    {
+      "scenario": "gateway-start-listener-retry-restarts-chain",
+      "issue": "#1437",
+      "reason": "Zeebe writes an execution-listener job's completion variables as element-local variables of the listener's element instance (CREATED in scope `g`); nano propagates them to the process scope (UPDATED). Only that VARIABLE record differs.",
+      "ignoreRecords": [
+        {
+          "valueType": "VARIABLE",
+          "name": "amount"
+        }
+      ]
+    }
+  ]
 }

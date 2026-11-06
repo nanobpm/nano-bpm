@@ -1049,10 +1049,10 @@ fn inclusive_split_retry_redrives_the_gated_activation() {
 /// two conditional flows `amount > 100` → `e` and `amount > 5` → `f`, no
 /// default. With `amount = 10` the gate selects `f` (only `amount > 5`
 /// matches); listener `l0` then bumps `amount` past 100, and listener #1's
-/// job-type expression fails. Resolving THAT incident must resume the chain —
-/// keeping the carried route to `f` — not re-run the gate (which would now
-/// select `e`), and `ElementActivated` is written only when the resumed chain
-/// drains (#1429).
+/// job-type expression fails. Resolving THAT incident restarts the chain at
+/// listener #0 (Zeebe parity, #1406) — keeping the carried route to `f`, not
+/// re-running the gate (which would now select `e`) — and `ElementActivated`
+/// is written only when the restarted chain drains (#1429).
 fn two_listener_split_gateway_process(gateway: SplitGateway) -> ProcessDefinition {
     let builder = ProcessBuilder::new("split-two-listeners").start_event("s");
     let builder = match gateway {
@@ -1081,7 +1081,7 @@ fn two_listener_split_gateway_process(gateway: SplitGateway) -> ProcessDefinitio
         .unwrap()
 }
 
-fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
+fn assert_listener_failure_retry_restarts_the_chain(gateway: SplitGateway) {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(two_listener_split_gateway_process(
@@ -1135,15 +1135,16 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
             listener_index: 1,
             scope: 0,
         }),
-        "{gateway:?}: a mid-chain listener failure re-mints only the failed \
-         listener (#1398), not the whole activation phase: {:?}",
+        "{gateway:?}: a mid-chain listener failure is an execution-listener \
+         job incident on the failed listener: {:?}",
         incident
     );
 
-    // Resolve: the retry must RESUME the chain at listener #1 — the carried
-    // route (to `f`) is not re-selected even though `amount = 500` now matches
-    // the `e` branch, and `ElementActivated` is still deferred to the chain's
-    // drain (#1429).
+    // Resolve: Zeebe parity (#1406 finding 7, pinned trace
+    // `gateway-start-listener-retry-restarts-chain`) — the chain RESTARTS at
+    // listener #0, while the carried route (to `f`) is kept even though
+    // `amount = 500` now matches the `e` branch, and `ElementActivated` is
+    // still deferred to the chain's drain (#1429).
     engine
         .apply_command(Command::set_variables(
             inst,
@@ -1156,8 +1157,7 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
     assert_eq!(
         lifecycle_of(&resolved, "g"),
         Vec::<&'static str>::new(),
-        "{gateway:?}: resolving a mid-chain listener failure resumes the \
-         chain — no second `ElementActivated`: {resolved:?}"
+        "{gateway:?}: the restart writes no lifecycle record: {resolved:?}"
     );
     assert!(
         !resolved
@@ -1166,12 +1166,17 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
         "{gateway:?}: the carried route is kept — the gate does not re-run: \
          {resolved:?}"
     );
-    let l1 = engine.activate_jobs("l1", "W", 10, 1_000, 0);
+    let l0 = engine.activate_jobs("l0", "W", 10, 1_000, 0);
     assert_eq!(
-        l1.len(),
+        l0.len(),
         1,
-        "{gateway:?}: the resumed chain mints listener #1's job"
+        "{gateway:?}: the restarted chain re-mints listener #0's job"
     );
+    engine
+        .apply_command(Command::complete_job(l0[0].key))
+        .unwrap();
+    let l1 = engine.activate_jobs("l1", "W", 10, 1_000, 0);
+    assert_eq!(l1.len(), 1, "{gateway:?}: then listener #1's job");
     let drained = engine
         .apply_command(Command::complete_job(l1[0].key))
         .unwrap();
@@ -1195,13 +1200,13 @@ fn assert_listener_failure_retry_resumes_the_chain(gateway: SplitGateway) {
 }
 
 #[test]
-fn exclusive_gateway_listener_failure_retry_resumes_the_chain() {
-    assert_listener_failure_retry_resumes_the_chain(SplitGateway::Exclusive);
+fn exclusive_gateway_listener_failure_retry_restarts_the_chain() {
+    assert_listener_failure_retry_restarts_the_chain(SplitGateway::Exclusive);
 }
 
 #[test]
-fn inclusive_split_listener_failure_retry_resumes_the_chain() {
-    assert_listener_failure_retry_resumes_the_chain(SplitGateway::Inclusive);
+fn inclusive_split_listener_failure_retry_restarts_the_chain() {
+    assert_listener_failure_retry_restarts_the_chain(SplitGateway::Inclusive);
 }
 
 /// `start → g (split) → e`, one conditional flow `amount > 100`, no default.
