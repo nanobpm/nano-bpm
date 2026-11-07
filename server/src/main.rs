@@ -20704,6 +20704,10 @@ fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum
         IncidentKind::CalledElementError => models::IncidentErrorTypeEnum::CalledElementError,
         IncidentKind::IoMapping => models::IncidentErrorTypeEnum::IoMappingError,
         IncidentKind::ExtractValueError => models::IncidentErrorTypeEnum::ExtractValueError,
+        // A nano-internal durability incident (#1384): an off-heap orphan's spilled
+        // variables were definitively lost. The Camunda taxonomy has no analogue,
+        // so it surfaces as `UNKNOWN` (the honest catch-all), not a BPMN error.
+        IncidentKind::VariablesLost => models::IncidentErrorTypeEnum::Unknown,
     }
 }
 

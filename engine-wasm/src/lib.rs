@@ -2996,6 +2996,9 @@ fn incident_kind_tag(kind: &IncidentKind) -> &'static str {
         // A failed value-extraction expression (job type, #1390) — REST
         // `EXTRACT_VALUE_ERROR`.
         IncidentKind::ExtractValueError => "extractValueError",
+        // An off-heap orphan's spilled variables were definitively lost (#1384) —
+        // a storage-layer durability incident, not a BPMN element failure.
+        IncidentKind::VariablesLost => "variablesLost",
     }
 }
 

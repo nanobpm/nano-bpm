@@ -215,6 +215,12 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::CompleteAgentInstance { .. } => Surface::Surfaced {
             js_method: "completeAgentInstance",
         },
+        // Raised by the host's storage layer when it quarantines an off-heap
+        // orphan (#1384), never by a worker/JS caller — there is no public
+        // "quarantine" API to surface.
+        Command::QuarantineOffheapOrphan { .. } => Surface::NotSurfaced {
+            reason: "host-internal durability command raised by the storage layer, not a public worker/JS API",
+        },
     }
 }
 
