@@ -1226,40 +1226,105 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     responses.push(ReplicatedResponse::default());
                 }
                 EntryPayload::Normal(batch) => {
-                    // Phase 1: apply every command in the batch in ONE actor hop,
-                    // returning per-command (events, commit) or the engine rejection.
-                    // The command `kind` is captured alongside each outcome so the
-                    // error-mapping phase below can apply the command-specific HTTP
-                    // status contract (`engine_error_status_for`) — a rejection like
+                    // Two-phase batch apply (#1405). Phase 1 stages every command
+                    // of the batch against a SCRATCH engine (a throwaway copy of
+                    // the journal's state, wired to the same off-heap tiers) in
+                    // ONE actor hop — journaling nothing, mutating the live
+                    // journal not at all. An environmental failure
+                    // (`EngineError::is_environmental`: an off-heap row THIS
+                    // replica cannot read, #1388) aborts the entry with a
+                    // `StorageError` BEFORE anything is journaled or
+                    // `last_applied` moves: openraft treats it as fatal, this
+                    // replica's Raft core shuts down (fail-closed), and recovery
+                    // re-applies the still-unapplied entry after a snapshot
+                    // install / restart — converging with the healthy replicas
+                    // instead of silently skipping a command they applied
+                    // (replica divergence). A DETERMINISTIC rejection is a pure
+                    // function of the replicated state — every replica computes
+                    // it identically — so it stays a per-command rejection and
+                    // the entry is consumed normally.
+                    //
+                    // The command `kind` is captured alongside so the
+                    // error-mapping below keeps the command-specific HTTP status
+                    // contract (`engine_error_status_for`): a rejection like
                     // `AdHocUnknownElement` maps to a different status for
                     // `CompleteJob` than for `ActivateAdHocActivities`. #1308.
-                    type ApplyOutcome = Result<
-                        (Arc<Vec<Event>>, crate::journal::Commit),
-                        nanobpmn_engine_core::EngineError,
-                    >;
-                    let outcomes: Vec<(&'static str, ApplyOutcome)> = self
+                    let staged = self
                         .engine
                         .with(move |journal| {
-                            batch
+                            let kinds: Vec<&'static str> =
+                                batch.items.iter().map(|c| c.command.kind()).collect();
+                            let commands: Vec<(Command, u64)> = batch
                                 .items
-                                .into_iter()
-                                .map(|ReplicatedCommand { command, now }| {
-                                    // Per-command actor profiling (off unless
-                                    // NANOBPM_CMD_PROFILE): time + allocated-byte
-                                    // delta by command kind, on the engine thread.
-                                    let timer = crate::cmd_profile::start();
-                                    let kind = command.kind();
-                                    let outcome = journal.apply_command_at(command, now);
-                                    crate::cmd_profile::finish(timer, kind);
-                                    (kind, outcome)
-                                })
-                                .collect()
+                                .iter()
+                                .map(|ReplicatedCommand { command, now }| (command.clone(), *now))
+                                .collect();
+                            let staged = journal.stage_batch(commands.clone());
+                            (kinds, commands, staged)
                         })
                         .await;
+                    let (kinds, commands, staged) = staged;
 
-                    // Phase 2: await the durable barriers (now coalesced by the
-                    // group-commit writer) and build the per-command responses.
-                    let mut items = Vec::with_capacity(outcomes.len());
+                    // An environmental failure anywhere in the batch fails the
+                    // WHOLE entry closed: nothing is journaled, the live journal
+                    // was never touched (the stage ran on a scratch engine), and
+                    // `last_applied` does not move.
+                    if let Some((idx, e)) = &staged.failure
+                        && e.is_environmental()
+                    {
+                        tracing::error!(
+                            error = %e,
+                            command_index = idx,
+                            "raft apply: environmental failure staging a committed \
+                             batch; failing closed (last_applied NOT advanced, \
+                             nothing journaled) — recover this replica via \
+                             snapshot/replay (#1405)"
+                        );
+                        return Err(StorageError::from_io_error(
+                            ErrorSubject::StateMachine,
+                            ErrorVerb::Write,
+                            std::io::Error::other(format!(
+                                "environmental failure applying committed batch: {e}"
+                            )),
+                        ));
+                    }
+
+                    // Phase 2: commit the staged prefix — the whole clean batch,
+                    // or the commands before the deterministic rejection (every
+                    // replica computes the same prefix, so they consume the
+                    // entry identically). `commit_staged` re-applies those
+                    // commands on the live journal (the stage proved they
+                    // succeed and produced these events) and journals them; the
+                    // group-commit writer coalesces the per-command commits into
+                    // one fsync.
+                    let prefix_len = staged.events.len();
+                    let prefix_kinds: Vec<&'static str> = kinds[..prefix_len].to_vec();
+                    let (staged_events, commits) = self
+                        .engine
+                        .with(move |journal| {
+                            // Per-command actor profiling (off unless
+                            // NANOBPM_CMD_PROFILE): time + allocated-byte delta
+                            // by command kind, on the engine thread. The live
+                            // re-apply is where each command's engine time is
+                            // spent (the scratch stage is off the hot path's
+                            // accounting).
+                            let commits: Vec<crate::journal::Commit> = prefix_kinds
+                                .iter()
+                                .zip(commands[..prefix_len].iter().cloned())
+                                .map(|(kind, (command, now))| {
+                                    let timer = nano_server_runtime::cmd_profile::start();
+                                    let commit = journal.commit_one_staged(command, now);
+                                    nano_server_runtime::cmd_profile::finish(timer, kind);
+                                    commit
+                                })
+                                .collect();
+                            (staged.events, commits)
+                        })
+                        .await;
+                    for commit in commits {
+                        commit.wait().await;
+                    }
+
                     // A follower replica has no read-model exporter to drive
                     // hot-state eviction, so reclaim each instance's shell (+ its
                     // completed job records) the moment it reaches a terminal
@@ -1271,10 +1336,28 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     let evict_terminal =
                         self.evict_eligible && self.leader.load(Ordering::Relaxed) != self.node_id;
                     let mut terminal: Vec<nanobpmn_engine_core::Key> = Vec::new();
-                    for outcome in outcomes {
-                        match outcome {
-                            (_, Ok((events, commit))) => {
-                                commit.wait().await;
+                    let mut items = Vec::with_capacity(kinds.len());
+                    for (idx, kind) in kinds.iter().enumerate() {
+                        match &staged.failure {
+                            Some((failed_at, e)) if idx == *failed_at => {
+                                // A rejected command produced no events; the log
+                                // entry is still consumed so every replica stays
+                                // in lockstep. The leader surfaces the mapped
+                                // rejection to its client, keyed on the command
+                                // kind so each endpoint keeps its HTTP status
+                                // contract across both deployment modes. #1308.
+                                items.push(ReplicatedItem {
+                                    events: Vec::new(),
+                                    error: Some(engine_error_status_for(kind, e)),
+                                });
+                            }
+                            Some((failed_at, _)) if idx > *failed_at => {
+                                // Never evaluated on ANY replica (the batch
+                                // stopped at the rejection): no events, no error.
+                                items.push(ReplicatedItem::default());
+                            }
+                            _ => {
+                                let events = &staged_events[idx];
                                 if evict_terminal {
                                     terminal.extend(
                                         events.iter().filter_map(|e| e.terminal_instance_key()),
@@ -1283,17 +1366,6 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 items.push(ReplicatedItem {
                                     events: events.to_vec(),
                                     error: None,
-                                });
-                            }
-                            // A rejected command produced no events; the log entry is
-                            // still consumed so every replica stays in lockstep. The
-                            // leader surfaces the mapped rejection to its client,
-                            // keyed on the command kind so each endpoint keeps its
-                            // HTTP status contract across both deployment modes. #1308.
-                            (kind, Err(e)) => {
-                                items.push(ReplicatedItem {
-                                    events: Vec::new(),
-                                    error: Some(engine_error_status_for(kind, &e)),
                                 });
                             }
                         }
@@ -3857,5 +3929,878 @@ mod tests {
             .await
             .expect("empty range returns Ok");
         assert!(empty.is_empty());
+    }
+
+    // ---- #1405: an environmental (off-heap read) failure during apply must fail
+    // the replica CLOSED (StorageError → Raft core shutdown), never advance
+    // `last_applied` past a command a healthy replica applied. ----
+
+    /// A service-task process whose instance parks on the `demo-work` job (the
+    /// cold-spillable shape the #1388 journal tests use).
+    fn wait_process_command() -> Command {
+        let proc = ProcessBuilder::new("w")
+            .start_event("s")
+            .service_task("t", "demo-work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid wait process");
+        Command::DeployProcess(proc)
+    }
+
+    /// The semantic replicated state of a replica, for convergence assertions:
+    /// deployed process ids, live instances (key, state, process), and jobs
+    /// (key, state) — sorted so the comparison is order-insensitive. Deliberately
+    /// excludes the resident TERMINAL-shell set, which differs by serving role
+    /// (a leader keeps completed shells for its read path, a follower evicts
+    /// them) and is not replicated truth.
+    type SemanticState = (
+        Vec<nanobpmn_engine_core::ElementId>,
+        Vec<(
+            nanobpmn_engine_core::Key,
+            String,
+            nanobpmn_engine_core::ElementId,
+        )>,
+        Vec<(nanobpmn_engine_core::Key, String)>,
+    );
+
+    fn semantic_state(j: &Journal) -> SemanticState {
+        let s = j.state();
+        let mut procs: Vec<_> = s.processes.keys().cloned().collect();
+        procs.sort();
+        let mut instances: Vec<_> = s
+            .instances
+            .values()
+            .map(|i| (i.key, format!("{:?}", i.state), i.process_id.clone()))
+            .collect();
+        instances.sort();
+        let mut jobs: Vec<_> = s
+            .jobs
+            .values()
+            .map(|jb| (jb.key, format!("{:?}", jb.state)))
+            .collect();
+        jobs.sort();
+        (procs, instances, jobs)
+    }
+
+    /// Drives `sm.apply` with one Normal entry carrying `commands` at `index`,
+    /// returning the outcome. This is the exact function openraft calls when a
+    /// committed entry reaches a replica.
+    #[allow(
+        clippy::result_large_err,
+        reason = "test helper returning openraft's StorageError verbatim; the production apply signature is fixed by the RaftStateMachine trait"
+    )]
+    async fn apply_entry(
+        sm: &Arc<PartitionStateMachine>,
+        index: u64,
+        commands: Vec<ReplicatedCommand>,
+    ) -> Result<Vec<ReplicatedResponse>, StorageError<NodeId>> {
+        use openraft::CommittedLeaderId;
+        let entry = Entry::<RaftConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+            payload: EntryPayload::Normal(ReplicatedBatch::new(commands)),
+        };
+        let mut sm = sm.clone();
+        RaftStateMachine::apply(&mut sm, vec![entry]).await
+    }
+
+    /// The replicated state of a replica: its applied log id plus a state dump.
+    async fn replica_state(
+        sm: &Arc<PartitionStateMachine>,
+        engine: &DeepthiHandle,
+    ) -> (Option<LogId<NodeId>>, String) {
+        let (last_applied, _) = sm.clone().applied_state().await.expect("applied_state");
+        let dump = engine.with(|j| format!("{:?}", j.state())).await;
+        (last_applied, dump)
+    }
+
+    /// The defect class: a batch whose LATER command hits an unreadable cold row
+    /// on this replica (an environmental failure — `EngineError::InstanceUnavailable`,
+    /// #1388) must not be half-applied with `last_applied` advanced. Before the
+    /// fix, the earlier command's events are journaled and `last_applied` moves
+    /// while a healthy replica applies the whole batch: silent, permanent replica
+    /// divergence. After the fix the batch is staged first, the environmental
+    /// error aborts the whole entry as a `StorageError` BEFORE anything is
+    /// journaled or `last_applied` moves, and the replica halts (fail-closed) to
+    /// recover via snapshot/replay.
+    #[tokio::test]
+    async fn apply_fails_closed_on_unreadable_state_instead_of_advancing_last_applied() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "nanobpmn-raft-1405-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+
+        // Two replicas of one partition, each with its own cold-spill store file
+        // (a replica-local store is exactly the production shape: the off-heap
+        // tiers are node-local caches, not replicated state). Both apply the same
+        // committed entries 1..=3: deploy, create, and a replicated job
+        // activation (activation IS a replicated command — `Command::ActivateJobs`
+        // — so both replicas activate the same job deterministically).
+        let mut replica_engines = Vec::new();
+        let mut replica_sms = Vec::new();
+        let mut store_paths = Vec::new();
+        for id in 0..2u64 {
+            let store_path = store_dir.join(format!("replica-{id}.sqlite"));
+            let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            engine
+                .with({
+                    let store_path = store_path.clone();
+                    move |j| {
+                        let store = Arc::new(
+                            nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                                .expect("open replica spill store"),
+                        );
+                        j.set_cold_spill(store, 1, 0);
+                    }
+                })
+                .await;
+            let sm: Arc<PartitionStateMachine> =
+                Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+            replica_engines.push(engine);
+            replica_sms.push(sm);
+            store_paths.push(store_path);
+        }
+
+        // Entries 1..=3 on both replicas: deploy, create, activate. The create
+        // parks the instance on the `demo-work` job; the activation locks it.
+        let setup: Vec<(u64, ReplicatedCommand)> = vec![
+            (
+                1,
+                ReplicatedCommand {
+                    command: wait_process_command(),
+                    now: 1,
+                },
+            ),
+            (
+                2,
+                ReplicatedCommand {
+                    command: Command::create_instance("w"),
+                    now: 2,
+                },
+            ),
+            (
+                3,
+                ReplicatedCommand {
+                    command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                    now: 3,
+                },
+            ),
+        ];
+        let mut job_key = None;
+        for (idx, sm) in replica_sms.iter().enumerate() {
+            for (log_index, cmd) in &setup {
+                let outcome = apply_entry(sm, *log_index, vec![cmd.clone()])
+                    .await
+                    .expect("setup entries apply on both replicas");
+                if *log_index == 3 && idx == 0 {
+                    job_key = outcome[0].items[0].events.iter().find_map(|e| match e {
+                        Event::JobActivated { job_key, .. } => Some(*job_key),
+                        _ => None,
+                    });
+                }
+            }
+        }
+        let job_key = job_key.expect("the replicated activation produced a job");
+        let instance_key = replica_engines[0]
+            .with(|j| j.state().instances.keys().next().copied())
+            .await
+            .expect("one live instance");
+
+        // The instance goes dormant again on both replicas: its job's activation
+        // lease expires (a replicated lock-expiry tick — the deterministic sweep
+        // the host drives on every replica). With no activated job the instance
+        // is cold-spillable again.
+        for (idx, sm) in replica_sms.iter().enumerate() {
+            let outcome = apply_entry(
+                sm,
+                4,
+                vec![ReplicatedCommand {
+                    command: Command::ExpireJobs { now: 4 + 60_000 },
+                    now: 4 + 60_000,
+                }],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("lock-expiry tick applies on replica {idx}: {e:?}"));
+            let _ = outcome;
+        }
+
+        // Now both replicas cold-spill the dormant instance (a host-side memory
+        // sweep — the same seam the production OOM guard drives).
+        for engine in &replica_engines {
+            engine
+                .with(|j| {
+                    assert_eq!(j.force_cold_spill_all(), 1, "re-spilled");
+                })
+                .await;
+        }
+
+        // The impairment: replica 1's cold row becomes unreadable (a replica-local
+        // store corruption — the #1388 failure shape). Replica 0 stays healthy.
+        {
+            let conn = rusqlite::Connection::open(&store_paths[1]).expect("open replica 1 store");
+            let n = conn
+                .execute(
+                    "UPDATE cold SET snapshot = 'not-json{{' WHERE key = ?1",
+                    [instance_key as i64],
+                )
+                .expect("corrupt cold row");
+            assert_eq!(n, 1, "precondition: the cold row exists");
+        }
+
+        // The committed batch: an unrelated healthy deploy (every replica applies
+        // it) followed by the CompleteJob that must rehydrate the cold row.
+        let batch = vec![
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 5,
+            },
+            ReplicatedCommand {
+                command: Command::complete_job(job_key),
+                now: 6,
+            },
+        ];
+
+        // The healthy replica applies the whole batch: both commands succeed.
+        let healthy = apply_entry(&replica_sms[0], 7, batch.clone())
+            .await
+            .expect("healthy replica applies the batch");
+        assert_eq!(healthy.len(), 1);
+        assert_eq!(healthy[0].items.len(), 2);
+        assert!(
+            healthy[0].items.iter().all(|i| i.error.is_none()),
+            "healthy replica applied both commands (got {:?})",
+            healthy[0].items
+        );
+
+        // The impaired replica must FAIL CLOSED: the whole entry is refused with
+        // a StorageError, nothing from the batch is journaled, and `last_applied`
+        // does not move. (Before the fix this returned Ok with the deploy applied,
+        // the CompleteJob mapped to a per-command rejection, and last_applied
+        // advanced — the divergence.)
+        let impaired = apply_entry(&replica_sms[1], 7, batch).await;
+        assert!(
+            impaired.is_err(),
+            "an environmental read failure must abort the whole entry as a \
+             StorageError, not advance last_applied past a half-applied batch \
+             (got {impaired:?})"
+        );
+        let (impaired_applied, _) = replica_state(&replica_sms[1], &replica_engines[1]).await;
+        assert_eq!(
+            impaired_applied.map(|l| l.index),
+            Some(4),
+            "the impaired replica refused to advance last_applied past the \
+             half-applicable batch (it stays at the last cleanly-applied entry)"
+        );
+
+        // The impaired replica applied NOTHING from the batch DURABLY: its
+        // journal holds no entry-7 events, so a crash/restart + replay of the
+        // still-unapplied entry converges it with the healthy replica (the
+        // in-memory staged prefix is replay-identical — proven separately in
+        // `staged_prefix_is_replay_identical` below). The durable-state proof:
+        // snapshot the impaired replica's JOURNAL (the recovery source) and
+        // confirm the batch's deploy is absent from the recovered state.
+        let impaired_recovered = replica_engines[1]
+            .with(|j| {
+                let snap = j.engine_snapshot();
+                nanobpmn_engine_core::Engine::from_snapshot(snap)
+            })
+            .await;
+        assert_eq!(
+            impaired_recovered.state().processes.len(),
+            1,
+            "the journaled (durable) state carries no half-applied deploy — a              replay/snapshot recovery never sees the aborted batch"
+        );
+        let healthy_processes = replica_engines[0].with(|j| j.state().processes.len()).await;
+        assert_eq!(
+            healthy_processes, 2,
+            "precondition: the healthy replica applied the batch's deploy"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// The other half of the contract: a DETERMINISTIC engine rejection (one every
+    /// replica computes identically, e.g. completing an unknown job) still
+    /// consumes the log entry — it is a per-command rejection, never a
+    /// `StorageError`, and `last_applied` advances so every replica stays in
+    /// lockstep.
+    #[tokio::test]
+    async fn apply_still_consumes_deterministic_rejections() {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+
+        let batch = vec![
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 1,
+            },
+            ReplicatedCommand {
+                // No such job on ANY replica: a deterministic rejection.
+                command: Command::complete_job(999_999),
+                now: 2,
+            },
+        ];
+        let responses = apply_entry(&sm, 3, batch)
+            .await
+            .expect("deterministic rejections never fail the entry");
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].items.len(), 2);
+        assert!(responses[0].items[0].error.is_none(), "the deploy applied");
+        assert!(
+            responses[0].items[1].error.is_some(),
+            "the unknown-job completion is a per-command rejection"
+        );
+        let (last_applied, _) = sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(
+            last_applied.map(|l| l.index),
+            Some(3),
+            "the entry is consumed: every replica rejects the same command \
+             deterministically, so advancing keeps them in lockstep"
+        );
+    }
+
+    /// Crash/restart proof (#1405): an impaired replica that failed closed on a
+    /// committed entry must, after a restart with its off-heap store healed,
+    /// re-apply the STILL-UNAPPLIED entry and converge byte-for-byte with the
+    /// healthy replica — never skip it, never double-apply the batch's prefix.
+    #[tokio::test]
+    async fn failed_closed_replica_recovers_via_replay_after_restart() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "nanobpmn-raft-1405-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+
+        // One impaired replica: live instance cold-spilled, then the row
+        // corrupted so a CompleteJob against it fails environmentally.
+        let store_path = store_dir.join("replica.sqlite");
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with({
+                let store_path = store_path.clone();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open replica spill store"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+
+        // Entries 1..=4: deploy, create, activate, lock-expiry (the same setup
+        // as the divergence test).
+        let setup: Vec<(u64, ReplicatedCommand)> = vec![
+            (
+                1,
+                ReplicatedCommand {
+                    command: wait_process_command(),
+                    now: 1,
+                },
+            ),
+            (
+                2,
+                ReplicatedCommand {
+                    command: Command::create_instance("w"),
+                    now: 2,
+                },
+            ),
+            (
+                3,
+                ReplicatedCommand {
+                    command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                    now: 3,
+                },
+            ),
+            (
+                4,
+                ReplicatedCommand {
+                    command: Command::ExpireJobs { now: 64_000 },
+                    now: 64_000,
+                },
+            ),
+        ];
+        let mut job_key = None;
+        for (log_index, cmd) in &setup {
+            let outcome = apply_entry(&sm, *log_index, vec![cmd.clone()])
+                .await
+                .expect("setup entries apply");
+            if *log_index == 3 {
+                job_key = outcome[0].items[0].events.iter().find_map(|e| match e {
+                    Event::JobActivated { job_key, .. } => Some(*job_key),
+                    _ => None,
+                });
+            }
+        }
+        let job_key = job_key.expect("activation produced a job");
+        let instance_key = engine
+            .with(|j| j.state().instances.keys().next().copied())
+            .await
+            .expect("one live instance");
+        engine
+            .with(|j| {
+                assert_eq!(j.force_cold_spill_all(), 1, "spilled cold");
+            })
+            .await;
+        {
+            let conn = rusqlite::Connection::open(&store_path).expect("open store");
+            assert_eq!(
+                conn.execute(
+                    "UPDATE cold SET snapshot = 'not-json{{' WHERE key = ?1",
+                    [instance_key as i64],
+                )
+                .expect("corrupt"),
+                1
+            );
+        }
+
+        // The committed batch fails closed: last_applied stays at 4.
+        let batch = vec![
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 5,
+            },
+            ReplicatedCommand {
+                command: Command::complete_job(job_key),
+                now: 6,
+            },
+        ];
+        let refused = apply_entry(&sm, 7, batch.clone()).await;
+        assert!(refused.is_err(), "the impaired replica fails closed");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(applied.map(|l| l.index), Some(4));
+
+        // RESTART: heal the store (the operator restores / the transient fault
+        // clears) and boot a FRESH engine + state machine over the same store.
+        // The entry is still unapplied (last_applied=4), so recovery re-applies
+        // it — exactly openraft's `(last_applied, committed]` replay.
+        {
+            // Heal the store (the transient fault clears / the operator restores
+            // the row): write back a VALID cold row for the instance. The row's
+            // contents are the instance's spilled snapshot; rebuild them by
+            // replaying the replica's own committed history (entries 1..=4, the
+            // applied prefix) into a scratch engine and spilling the instance
+            // out of it — exactly the bytes a healthy replica holds.
+            let snap = {
+                let mut e = nanobpmn_engine_core::Engine::with_partition(0);
+                let _ = e.apply_command_at(wait_process_command(), 1).expect("d");
+                let _ = e
+                    .apply_command_at(Command::create_instance("w"), 2)
+                    .expect("c");
+                let _ = e
+                    .apply_command_at(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3)
+                    .expect("a");
+                let _ = e
+                    .apply_command_at(Command::ExpireJobs { now: 64_000 }, 64_000)
+                    .expect("x");
+                e.snapshot_instance(instance_key)
+                    .expect("instance snapshot")
+            };
+            let store = nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                .expect("reopen store");
+            store.put_cold(instance_key, &snap).expect("heal the row");
+        }
+
+        // The fresh replica (post-restart) re-applies the still-unapplied entry:
+        // it now succeeds, and the resulting state matches what a healthy replica
+        // computed for the same entry.
+        let engine2 = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine2
+            .with({
+                let store_path = store_path.clone();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open healed store"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+        let sm2: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine2.clone(), 0).expect("sm2"));
+        // Replay entries 1..=4 (the applied prefix), then the retried entry 7.
+        for (log_index, cmd) in &setup {
+            apply_entry(&sm2, *log_index, vec![cmd.clone()])
+                .await
+                .expect("prefix replays");
+        }
+        let recovered = apply_entry(&sm2, 7, batch)
+            .await
+            .expect("the healed replica re-applies the entry");
+        assert!(
+            recovered[0].items.iter().all(|i| i.error.is_none()),
+            "both commands apply after recovery (got {:?})",
+            recovered[0].items
+        );
+        let (recovered_applied, _) = sm2.clone().applied_state().await.expect("applied_state");
+        assert_eq!(recovered_applied.map(|l| l.index), Some(7));
+
+        // Convergence: the recovered replica's state equals the healthy outcome —
+        // the deploy landed and the job completed (instance terminal).
+        let recovered_processes = engine2.with(|j| j.state().processes.len()).await;
+        assert_eq!(
+            recovered_processes, 2,
+            "the retried deploy landed exactly once"
+        );
+        let instance_state = engine2
+            .with(move |j| j.state().instances.get(&instance_key).map(|i| i.state))
+            .await;
+        assert!(
+            matches!(
+                instance_state,
+                Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
+            ),
+            "the retried CompleteJob drove the instance to completion (got {instance_state:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+    /// The determinism invariant the two-phase apply rests on (#1405): a staged
+    /// batch's events are byte-for-byte the events a fresh, direct apply of the
+    /// same commands produces — so committing the staged events onto the live
+    /// engine (via the replay applier) reproduces the exact post-batch state,
+    /// and every replica that stages the same entry journals identical bytes.
+    #[tokio::test]
+    async fn staged_events_are_replay_identical_to_a_direct_apply() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "nanobpmn-raft-1405-determinism-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with({
+                let store_path = store_path.clone();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open store"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+
+        // Setup entries: deploy, create, activate, expire — then cold-spill.
+        let setup = [
+            (wait_process_command(), 1u64),
+            (Command::create_instance("w"), 2),
+            (Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3),
+            (Command::ExpireJobs { now: 64_000 }, 64_000),
+        ];
+        let mut job_key = None;
+        for (cmd, now) in &setup {
+            let events = engine
+                .with({
+                    let cmd = cmd.clone();
+                    let now = *now;
+                    move |j| j.apply_command_at(cmd, now).expect("setup applies").0
+                })
+                .await;
+            if job_key.is_none() {
+                job_key = events.iter().find_map(|e| match e {
+                    Event::JobActivated { job_key, .. } => Some(*job_key),
+                    _ => None,
+                });
+            }
+        }
+        let job_key = job_key.expect("activation produced a job");
+        engine
+            .with(|j| {
+                assert_eq!(j.force_cold_spill_all(), 1, "spilled cold");
+            })
+            .await;
+
+        // The batch to stage: a deploy + the CompleteJob that rehydrates the cold
+        // row.
+        let batch: Vec<(Command, u64)> =
+            vec![(deploy_command(), 5), (Command::complete_job(job_key), 6)];
+
+        // Stage it (scratch evaluation, live journal untouched)…
+        let staged = engine
+            .with({
+                let batch = batch.clone();
+                move |j| j.stage_batch(batch)
+            })
+            .await;
+        assert!(staged.failure.is_none(), "the batch stages cleanly");
+        let staged_flat: Vec<Event> = staged
+            .events
+            .iter()
+            .flat_map(|e| e.iter().cloned())
+            .collect();
+
+        // …and apply it directly on a SECOND journal built to the identical
+        // state (same setup, same spill). The two event streams must be equal.
+        let store_path2 = store_dir.join("replica2.sqlite");
+        let engine2 = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine2
+            .with({
+                let store_path = store_path2.clone();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open store 2"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+        for (cmd, now) in &setup {
+            engine2
+                .with({
+                    let cmd = cmd.clone();
+                    let now = *now;
+                    move |j| j.apply_command_at(cmd, now).expect("setup applies").0
+                })
+                .await;
+        }
+        engine2
+            .with(|j| {
+                assert_eq!(j.force_cold_spill_all(), 1, "spilled cold");
+            })
+            .await;
+        let mut direct_flat: Vec<Event> = Vec::new();
+        for (cmd, now) in batch.iter().cloned() {
+            let events = engine2
+                .with(move |j| j.apply_command_at(cmd, now).expect("direct applies").0)
+                .await;
+            direct_flat.extend(events.iter().cloned());
+        }
+
+        assert_eq!(
+            staged_flat, direct_flat,
+            "staged events are replay-identical to the direct apply"
+        );
+
+        // And committing the staged events onto the live engine reproduces the
+        // direct-apply state: same deployed processes, same terminal instance,
+        // same settled job. (Terminal-shell RETENTION differs by serving role —
+        // a leader keeps the completed shell for its read path, a follower
+        // evicts it — so compare the semantic state, not the resident set.)
+        engine
+            .with(move |j| {
+                let _ = j.commit_staged(batch.clone(), &staged.events);
+            })
+            .await;
+        let staged_state = engine.with(|j| semantic_state(j)).await;
+        let direct_state = engine2.with(|j| semantic_state(j)).await;
+        assert_eq!(
+            staged_state, direct_state,
+            "committing the staged events reproduces the direct-apply state"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Snapshot+recovery proof (#1405): a replica that failed closed (its Raft
+    /// core shut down on the environmental error) catches up via a snapshot
+    /// install from a healthy peer — the snapshot covers the entry the impaired
+    /// replica refused, and the install converges it without the entry ever
+    /// being re-evaluated against the (still unreadable) local row.
+    #[tokio::test]
+    async fn failed_closed_replica_converges_via_snapshot_install() {
+        let store_dir = std::env::temp_dir().join(format!(
+            "nanobpmn-raft-1405-snapshot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+
+        // Healthy replica: applies the full history INCLUDING the batch the
+        // impaired replica will refuse.
+        let healthy = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let healthy_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(healthy.clone(), 0).expect("sm"));
+        let setup = [
+            (wait_process_command(), 1u64),
+            (Command::create_instance("w"), 2),
+            (Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3),
+            (Command::ExpireJobs { now: 64_000 }, 64_000),
+        ];
+        let mut job_key = None;
+        for (idx, (cmd, now)) in setup.iter().enumerate() {
+            let outcome = apply_entry(
+                &healthy_sm,
+                (idx + 1) as u64,
+                vec![ReplicatedCommand {
+                    command: cmd.clone(),
+                    now: *now,
+                }],
+            )
+            .await
+            .expect("setup applies");
+            if job_key.is_none() {
+                job_key = outcome[0].items[0].events.iter().find_map(|e| match e {
+                    Event::JobActivated { job_key, .. } => Some(*job_key),
+                    _ => None,
+                });
+            }
+        }
+        let job_key = job_key.expect("job");
+        // The batch (entry 7): deploy + CompleteJob — the healthy replica applies
+        // it (its store is healthy; the instance is resident there).
+        let batch = vec![
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 5,
+            },
+            ReplicatedCommand {
+                command: Command::complete_job(job_key),
+                now: 6,
+            },
+        ];
+        let healthy_outcome = apply_entry(&healthy_sm, 7, batch.clone())
+            .await
+            .expect("healthy applies the batch");
+        assert!(healthy_outcome[0].items.iter().all(|i| i.error.is_none()));
+
+        // Impaired replica: same prefix (1..=4), but its cold row is corrupt and
+        // it refused entry 7 (fail-closed, last_applied=4).
+        let impaired_store_path = store_dir.join("impaired.sqlite");
+        let impaired = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        impaired
+            .with({
+                let store_path = impaired_store_path.clone();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open impaired store"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+        let impaired_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(impaired.clone(), 0).expect("sm"));
+        for (idx, (cmd, now)) in setup.iter().enumerate() {
+            apply_entry(
+                &impaired_sm,
+                (idx + 1) as u64,
+                vec![ReplicatedCommand {
+                    command: cmd.clone(),
+                    now: *now,
+                }],
+            )
+            .await
+            .expect("prefix applies");
+        }
+        let instance_key = impaired
+            .with(|j| j.state().instances.keys().next().copied())
+            .await
+            .expect("one live instance");
+        impaired
+            .with(|j| {
+                assert_eq!(j.force_cold_spill_all(), 1, "spilled cold");
+            })
+            .await;
+        {
+            let conn =
+                rusqlite::Connection::open(&impaired_store_path).expect("open impaired store");
+            assert_eq!(
+                conn.execute(
+                    "UPDATE cold SET snapshot = 'not-json{{' WHERE key = ?1",
+                    [instance_key as i64],
+                )
+                .expect("corrupt"),
+                1
+            );
+        }
+        // The impairment: with the row corrupted, entry 7 fails closed on the
+        // impaired replica (last_applied stays at 4) — the replica is now
+        // halted, unable to apply the entry its healthy peer applied.
+        let refused = apply_entry(&impaired_sm, 7, batch.clone()).await;
+        assert!(refused.is_err(), "the impaired replica fails closed");
+        let (impaired_applied, _) = impaired_sm.clone().applied_state().await.expect("applied");
+        assert_eq!(impaired_applied.map(|l| l.index), Some(4));
+
+        // The healthy leader builds a snapshot covering entry 7 and the impaired
+        // replica installs it — the catch-up path openraft drives for a halted
+        // replica.
+        let mut builder = healthy_sm.clone().get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("build snapshot");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        let mut received = impaired_sm
+            .clone()
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving");
+        {
+            use tokio::io::AsyncWriteExt;
+            received.write_all(&bytes).await.expect("write body");
+            received.flush().await.expect("flush");
+        }
+        impaired_sm
+            .clone()
+            .install_snapshot(&snap.meta, received)
+            .await
+            .expect("install snapshot");
+
+        // Convergence: the impaired replica's state now matches the healthy one
+        // (the snapshot is self-contained — every cold row folded in — so the
+        // corrupt local row is irrelevant) and last_applied covers entry 7.
+        let (installed_applied, _) = impaired_sm.clone().applied_state().await.expect("applied");
+        assert_eq!(
+            installed_applied.map(|l| l.index),
+            Some(7),
+            "the snapshot install covers the refused entry"
+        );
+        // The canonical post-install state: a THIRD, pristine replica installing
+        // the same snapshot. The impaired replica must match it exactly (the
+        // snapshot is self-contained; the corrupt local row is irrelevant).
+        let pristine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let pristine_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(pristine.clone(), 0).expect("sm"));
+        let mut received2 = pristine_sm
+            .clone()
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving 2");
+        {
+            use tokio::io::AsyncWriteExt;
+            received2.write_all(&bytes).await.expect("write body 2");
+            received2.flush().await.expect("flush 2");
+        }
+        pristine_sm
+            .clone()
+            .install_snapshot(&snap.meta, received2)
+            .await
+            .expect("install snapshot 2");
+        let pristine_state = pristine.with(|j| semantic_state(j)).await;
+        let impaired_state = impaired.with(|j| semantic_state(j)).await;
+        assert_eq!(
+            impaired_state, pristine_state,
+            "the failed-closed replica converged to the canonical installed state"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 }

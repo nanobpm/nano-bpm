@@ -972,6 +972,16 @@ impl SharedWriter {
     }
 }
 
+/// The outcome of [`Journal::stage_batch`] (#1405): the staged events of every
+/// command that evaluated cleanly (in batch order), plus — when the batch
+/// stopped at a failure — the index and error of the command that failed.
+/// `events.len()` equals the failed command's index on failure (the prefix), or
+/// the batch length on a clean stage.
+pub struct StagedBatch {
+    pub events: Vec<Arc<Vec<Event>>>,
+    pub failure: Option<(usize, EngineError)>,
+}
+
 impl Journal {
     /// A non-persistent journal: the engine runs purely in memory and nothing is
     /// written. Used for tests and ephemeral runs.
@@ -1838,7 +1848,10 @@ impl Journal {
     /// Test hook: cold-spills every currently dormant instance regardless of the
     /// memory watermark, returning the number shed. Lets tests exercise the
     /// spill/rehydrate seams deterministically without driving real RAM pressure.
-    #[cfg(test)]
+    // Also compiled under `test-hooks` so the raft crate's fail-closed apply tests
+    // (#1405) — which link this crate as a non-test library — can drive the
+    // spill/rehydrate seam deterministically.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn force_cold_spill_all(&mut self) -> usize {
         let store = match self.cold.as_ref() {
             Some(cold) => Arc::clone(&cold.store),
@@ -2131,6 +2144,359 @@ impl Journal {
         let commit = self.persist(&events);
         self.maybe_spill();
         Ok((events, commit))
+    }
+
+    /// **Staged** batch evaluation (#1405): the Raft apply path's phase 1.
+    ///
+    /// Evaluates every command of one committed batch against a **scratch
+    /// engine** — a throwaway copy of this journal's current state (snapshot →
+    /// `from_snapshot`), wired to the same off-heap tiers — journaling NOTHING
+    /// and mutating NOTHING on this journal. The scratch's rehydration gate
+    /// reads the same cold/spill stores, so an unreadable off-heap row fails
+    /// the stage with the same [`EngineError::InstanceUnavailable`] the real
+    /// apply would hit — but here it fails BEFORE any of the batch is durable
+    /// or observable, and this journal's state is untouched (no half-applied
+    /// prefix in memory either), so the replica can fail closed and recover via
+    /// snapshot/replay without any divergence window.
+    ///
+    /// Returns either every command's events (in batch order), or the first
+    /// failure as `(index, error)` — the index lets the caller record a
+    /// deterministic rejection against the right command. The caller (the Raft
+    /// apply path) decides: environmental → abort the entry fail-closed;
+    /// deterministic → re-apply the prefix + record the rejection (every replica
+    /// computes the same prefix, so they consume the entry identically).
+    ///
+    /// The fold into the scratch snapshot is fail-closed
+    /// ([`try_engine_snapshot`](Self::try_engine_snapshot)): an off-heap payload
+    /// that will not read fails the stage as `InstanceUnavailable` even when no
+    /// command of the batch targets it — a replica that cannot even READ its
+    /// state back cannot certify any apply outcome.
+    pub fn stage_batch(&self, commands: Vec<(Command, u64)>) -> StagedBatch {
+        // The scratch engine evaluates against a snapshot of the live state, so
+        // its key generator starts where the live engine's did and mints the
+        // same keys — the staged events are replay-identical to what the real
+        // apply produces.
+        let Some(snapshot) = self.try_engine_snapshot() else {
+            return StagedBatch {
+                events: Vec::new(),
+                failure: Some((0, EngineError::InstanceUnavailable { instance_key: 0 })),
+            };
+        };
+        let mut scratch = Engine::from_snapshot(snapshot);
+        scratch.set_lenient_completion(self.engine.lenient_completion());
+        scratch.set_cluster_variables(self.cluster_variables.clone());
+        let mut staged = Vec::with_capacity(commands.len());
+        for (idx, (command, now)) in commands.into_iter().enumerate() {
+            // The scratch engine has no off-heap tiers of its own, so a command
+            // targeting a cold instance must page it in through the SAME gate
+            // the real apply uses — against this journal's shared stores. The
+            // rehydration lands in the scratch (not the live engine): a failed
+            // stage leaves the live journal untouched, and a successful one is
+            // re-done by the real apply (idempotent — the second read finds the
+            // row already resident or re-reads it).
+            if let Err(e) = self.ensure_resident_on(&mut scratch, &command) {
+                return StagedBatch {
+                    events: staged,
+                    failure: Some((idx, e)),
+                };
+            }
+            match scratch.apply_command_at(command, now) {
+                Ok(events) => staged.push(Arc::new(events)),
+                Err(e) => {
+                    return StagedBatch {
+                        events: staged,
+                        failure: Some((idx, e)),
+                    };
+                }
+            }
+        }
+        StagedBatch {
+            events: staged,
+            failure: None,
+        }
+    }
+
+    /// [`ensure_resident_for_command`](Self::ensure_resident_for_command) against
+    /// an arbitrary engine (the staging scratch, #1405): pages every cold
+    /// instance / spilled variable map the command targets into `engine` from
+    /// this journal's shared off-heap stores, failing closed with
+    /// [`EngineError::InstanceUnavailable`] when a row will not read. The live
+    /// engine is never touched.
+    fn ensure_resident_on(
+        &self,
+        engine: &mut Engine,
+        command: &Command,
+    ) -> Result<(), EngineError> {
+        // Variable-spill restore (migrate/modify read root variables): the
+        // scratch's `is_variables_spilled` comes from the snapshot, so the same
+        // gate applies — but the restore must land in the scratch.
+        let spill_target = match command {
+            Command::MigrateInstance { instance_key, .. }
+            | Command::ModifyInstance { instance_key, .. } => Some(*instance_key),
+            _ => None,
+        };
+        if let Some(instance_key) = spill_target
+            && engine.is_variables_spilled(instance_key)
+        {
+            self.restore_spilled_variables_on(engine, instance_key)
+                .map_err(|err| {
+                    tracing::error!(
+                        instance_key,
+                        error = %err,
+                        "stage: spilled instance's variable row could not be read; the                          command fails closed (row kept)"
+                    );
+                    EngineError::InstanceUnavailable { instance_key }
+                })?;
+        }
+
+        let Some(cold) = self.cold.as_ref() else {
+            return Ok(());
+        };
+        let mut targets: Vec<Key> = Vec::new();
+        match command {
+            Command::CompleteJob { job_key, .. }
+            | Command::FailJob { job_key, .. }
+            | Command::ThrowJobError { job_key, .. }
+            | Command::UpdateJobRetries { job_key, .. }
+            | Command::UpdateJobTimeout { job_key, .. }
+            | Command::UpdateJob { job_key, .. } => {
+                targets.extend(cold.index.instance_for_job(*job_key));
+            }
+            // Opportunistic batch commands (#1388): an unreadable candidate must
+            // not fail the whole poll/tick closed. Best-effort on the scratch —
+            // the unreadable instance stays cold and is retried next time.
+            Command::ActivateJobs {
+                job_type, max_jobs, ..
+            } => {
+                // Best-effort (mirrors `rehydrate_activation_candidates`): page
+                // up to `max_jobs` cold candidates of this type into the
+                // scratch, rotating past the last unreadable row so a bad row
+                // cannot starve healthy later ones.
+                let budget = max_jobs.saturating_add(ACTIVATION_EXTRA_READS);
+                let after = self.activation_cursor.get(job_type).copied();
+                let candidates = cold
+                    .index
+                    .instances_for_job_type_rotated(job_type, after, budget);
+                let mut restored = 0usize;
+                for key in candidates {
+                    if restored >= *max_jobs {
+                        break;
+                    }
+                    if self.rehydrate_cold_on(engine, key) == ColdRehydration::Restored {
+                        restored += 1;
+                    }
+                }
+                return Ok(());
+            }
+            Command::ActivateJobsByKey { job_keys, .. } => {
+                targets.extend(
+                    job_keys
+                        .iter()
+                        .filter_map(|key| cold.index.instance_for_job(*key)),
+                );
+            }
+            Command::AssignUserTask { user_task_key, .. }
+            | Command::UnassignUserTask { user_task_key }
+            | Command::UpdateUserTask { user_task_key, .. }
+            | Command::CompleteUserTask { user_task_key, .. } => {
+                targets.extend(cold.index.instance_for_user_task(*user_task_key));
+            }
+            Command::ResolveIncident { incident_key, .. } => {
+                targets.extend(cold.index.instance_for_incident(*incident_key));
+            }
+            Command::SetVariables { scope_key, .. } => {
+                if cold.index.contains(*scope_key) {
+                    targets.push(*scope_key);
+                } else {
+                    targets.extend(cold.index.instance_for_scope(*scope_key));
+                }
+            }
+            Command::CancelInstance { instance_key } => {
+                if cold.index.contains(*instance_key) {
+                    targets.push(*instance_key);
+                }
+            }
+            Command::ModifyInstance { instance_key, .. }
+            | Command::MigrateInstance { instance_key, .. } => {
+                if cold.index.contains(*instance_key) {
+                    targets.push(*instance_key);
+                }
+            }
+            Command::CorrelateMessage {
+                message_name,
+                correlation_key,
+                ..
+            } => {
+                targets.extend(
+                    cold.index
+                        .instances_for_message(message_name, correlation_key),
+                );
+            }
+            Command::TriggerTimers { now } => {
+                for key in cold.index.instances_due(*now) {
+                    let _ = self.rehydrate_cold_on(engine, key);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        let mut unavailable = None;
+        for key in targets {
+            if self.rehydrate_cold_on(engine, key) == ColdRehydration::Unreadable {
+                unavailable.get_or_insert(key);
+            }
+        }
+        // Instance-wide teardown/restructuring commands also reach the
+        // instance's call-activity descendants: page every cold descendant into
+        // the scratch too (mirrors `ensure_resident_for_command`).
+        if let Command::ModifyInstance { instance_key, .. }
+        | Command::MigrateInstance { instance_key, .. }
+        | Command::CancelInstance { instance_key } = command
+            && let Some(key) = self.rehydrate_cold_descendants_on(engine, *instance_key)
+        {
+            unavailable.get_or_insert(key);
+        }
+        match unavailable {
+            Some(instance_key) => Err(EngineError::InstanceUnavailable { instance_key }),
+            None => Ok(()),
+        }
+    }
+
+    /// [`rehydrate_cold`](Self::rehydrate_cold) against an arbitrary engine (the
+    /// staging scratch, #1405). Reads the shared cold store; on success the
+    /// instance lands in `engine` (the scratch), NOT the live engine, and the
+    /// routing-index entry + row are LEFT in place — the real apply's own
+    /// rehydration consumes them, and a failed stage must not destroy them.
+    fn rehydrate_cold_on(&self, engine: &mut Engine, key: Key) -> ColdRehydration {
+        let store = match self.cold.as_ref() {
+            Some(cold) if cold.index.contains(key) => Arc::clone(&cold.store),
+            _ => return ColdRehydration::NotCold,
+        };
+        match store.try_get_cold(key) {
+            Ok(Some(snapshot)) => {
+                engine.rehydrate_instance(snapshot);
+                ColdRehydration::Restored
+            }
+            Ok(None) => ColdRehydration::Absent,
+            Err(err) => {
+                self.offheap_read_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    instance_key = key,
+                    error = %err,
+                    "stage: cold instance's row could not be read; failing closed"
+                );
+                ColdRehydration::Unreadable
+            }
+        }
+    }
+
+    /// [`rehydrate_cold_descendants`](Self::rehydrate_cold_descendants) against
+    /// the staging scratch (#1405). Returns the first descendant whose row is
+    /// unreadable, if any.
+    fn rehydrate_cold_descendants_on(&self, engine: &mut Engine, root: Key) -> Option<Key> {
+        let mut unavailable = None;
+        let mut frontier = vec![root];
+        let mut seen: HashSet<Key> = HashSet::new();
+        while let Some(parent) = frontier.pop() {
+            if !seen.insert(parent) {
+                continue;
+            }
+            let cold_children = self
+                .cold
+                .as_ref()
+                .map(|cold| cold.index.children_of(parent))
+                .unwrap_or_default();
+            for child in cold_children {
+                match self.rehydrate_cold_on(engine, child) {
+                    ColdRehydration::Unreadable => {
+                        unavailable.get_or_insert(child);
+                    }
+                    _ => frontier.push(child),
+                }
+            }
+            // Resident-parent → children edges are read from the scratch's state
+            // (it holds the same instances as the live engine at stage time).
+            frontier.extend(
+                engine
+                    .state()
+                    .instances
+                    .values()
+                    .filter(|i| i.parent_process_instance_key == Some(parent))
+                    .map(|i| i.key),
+            );
+        }
+        unavailable
+    }
+
+    /// [`restore_spilled_variables`](Self::restore_spilled_variables) against the
+    /// staging scratch (#1405): reads the shared store, writes into `engine`.
+    fn restore_spilled_variables_on(&self, engine: &mut Engine, key: Key) -> Result<(), String> {
+        match self.peek_spilled_variables(key)? {
+            Some(vars) => {
+                engine.rehydrate_variables(key, Arc::new(vars));
+                Ok(())
+            }
+            // Definitive absence is quarantined by the LIVE path, not a stage
+            // failure: the scratch restore proceeds with the surviving resident
+            // variables exactly as `restore_spilled_variables` does.
+            None => {
+                let resident = engine
+                    .state()
+                    .instances
+                    .get(&key)
+                    .map(|i| Arc::clone(&i.variables))
+                    .unwrap_or_default();
+                engine.rehydrate_variables(key, resident);
+                Ok(())
+            }
+        }
+    }
+
+    /// Commits a staged batch (#1405 phase 2): re-applies the staged `commands`
+    /// on the live journal via the normal [`apply_command_at`](Self::apply_command_at)
+    /// path, journaling each command's events. The stage (on the scratch engine)
+    /// already proved every command succeeds against this exact state and
+    /// produced `staged.events`; the engine is deterministic, so the re-apply
+    /// reproduces them — the debug assertion below pins that invariant. The
+    /// per-command `Commit`s are coalesced by the group-commit writer into one
+    /// fsync, exactly as the pre-#1405 per-command apply did; the difference is
+    /// that NOTHING is journaled unless the WHOLE batch staged cleanly first.
+    ///
+    /// Returns the per-command commits in batch order (the caller awaits them
+    /// together). A re-apply that fails after the stage succeeded is a
+    /// determinism bug, not an environmental fault: it is surfaced as a panic
+    /// (the staged events are the proof the command applies).
+    pub fn commit_staged(
+        &mut self,
+        commands: Vec<(Command, u64)>,
+        staged: &[Arc<Vec<Event>>],
+    ) -> Vec<Commit> {
+        debug_assert_eq!(
+            commands.len(),
+            staged.len(),
+            "commit_staged commits exactly the staged prefix"
+        );
+        commands
+            .into_iter()
+            .map(|(command, now)| self.commit_one_staged(command, now))
+            .collect()
+    }
+
+    /// Re-applies one staged command on the live journal
+    /// ([`apply_command_at`](Self::apply_command_at)), journaling its events and
+    /// returning the [`Commit`]. The stage (on the scratch engine) already proved
+    /// the command succeeds against this exact state; a failure here is a
+    /// determinism defect, not an environmental fault, so it panics rather than
+    /// surface a typed error the caller cannot act on.
+    pub fn commit_one_staged(&mut self, command: Command, now: u64) -> Commit {
+        let (_events, commit) = self
+            .apply_command_at(command, now)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "staged command failed its live re-apply ({e:?}): the scratch                      stage proved it applies — a determinism defect"
+                )
+            });
+        commit
     }
 
     /// The authoritative ownership tuple `(element_id, process_instance_key)` of
