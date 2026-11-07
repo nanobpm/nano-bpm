@@ -1137,6 +1137,9 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         // A failed value-extraction expression (job type, #1390) — Zeebe
         // `EXTRACT_VALUE_ERROR`.
         IncidentKind::ExtractValueError => 8,
+        // An off-heap orphan's spilled variables were definitively lost
+        // (#1384) — raised by the storage layer, not a BPMN element.
+        IncidentKind::VariablesLost => 9,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
@@ -1150,6 +1153,7 @@ fn incident_kind_from(code: i64) -> IncidentKind {
         // `IoMapping` kind in #946) both map to `IoMapping`.
         6 | 7 => IncidentKind::IoMapping,
         8 => IncidentKind::ExtractValueError,
+        9 => IncidentKind::VariablesLost,
         _ => IncidentKind::JobNoRetries,
     }
 }

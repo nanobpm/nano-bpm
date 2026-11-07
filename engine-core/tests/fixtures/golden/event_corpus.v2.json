@@ -3827,5 +3827,97 @@
       "target_process_definition_key": 91,
       "target_process_id": "order-v2"
     }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000022,
+      "instance_key": 92,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 92,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 94,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 94,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000022,
+      "element_id": "charge",
+      "element_instance_key": 94,
+      "instance_key": 92,
+      "job_key": 95,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "IncidentRaised": {
+      "created_at": 1700000000023,
+      "element_id": "order",
+      "element_instance_key": 92,
+      "incident_key": 96,
+      "instance_key": 92,
+      "job_key": null,
+      "kind": "VariablesLost",
+      "reason": "variables lost: spill row missing",
+      "redrive": null
+    }
   }
 ]

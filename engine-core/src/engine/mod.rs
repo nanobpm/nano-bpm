@@ -3855,6 +3855,12 @@ impl Engine {
                             queue.push_back(step);
                         }
                     }
+                    // An off-heap orphan's spilled variables are **gone** (#1384):
+                    // there is no failed work to retry, so resolving the incident
+                    // only clears the record (the applier transitions it to
+                    // `Resolved`). The instance keeps its surviving resident
+                    // variables and continues; nothing is enqueued.
+                    state::IncidentKind::VariablesLost => {}
                 }
             }
 
@@ -5131,6 +5137,10 @@ impl Engine {
             }
             Command::CompleteAgentInstance { agent_instance_key } => {
                 self.process_complete_agent_instance(&mut log, agent_instance_key)?;
+            }
+
+            Command::QuarantineOffheapOrphan { instance_key } => {
+                self.process_quarantine_offheap_orphan(&mut log, instance_key);
             }
         }
 
@@ -7058,6 +7068,54 @@ impl Engine {
             job_key: None,
             created_at: self.now,
         }
+    }
+
+    /// Process a [`Command::QuarantineOffheapOrphan`] (#1384): raise a durable,
+    /// replicated [`state::IncidentKind::VariablesLost`] incident on an instance
+    /// whose off-heap variable payload the host's storage layer found definitively
+    /// absent (a readable store with no row). The incident parks on the instance
+    /// root (`element_instance_key == instance_key`, `element_id == process_id`):
+    /// the loss is instance-scoped, not tied to any single token, and the instance
+    /// is not operator-resolvable into a retry (the data is gone), so the incident
+    /// carries no `redrive` and no `job_key`.
+    ///
+    /// **Idempotent** (at-least-once safe across a leader retry / replay): a
+    /// second application for an instance that already carries an active
+    /// `VariablesLost` incident is a no-op, and an unknown or terminal instance
+    /// (the orphan may have been cancelled between the quarantine note and this
+    /// command landing) is a no-op too. Emits nothing in either case.
+    fn process_quarantine_offheap_orphan(&mut self, log: &mut Vec<Event>, instance_key: Key) {
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return;
+        };
+        if instance.state != ProcessInstanceState::Active {
+            return;
+        }
+        let already_raised = instance.incidents.iter().any(|k| {
+            self.state.incidents.get(k).is_some_and(|i| {
+                i.state == state::IncidentState::Active
+                    && i.kind == state::IncidentKind::VariablesLost
+            })
+        });
+        if already_raised {
+            return;
+        }
+        let element_id = instance.process_id.clone();
+        let incident_key = self.mint_key();
+        self.emit(
+            log,
+            Event::IncidentRaised {
+                incident_key,
+                instance_key,
+                element_instance_key: instance_key,
+                element_id,
+                kind: state::IncidentKind::VariablesLost,
+                redrive: None,
+                reason: "variables lost: spill row missing".to_string(),
+                job_key: None,
+                created_at: self.now,
+            },
+        );
     }
 
     /// Runs an element's own activation behaviour — everything after

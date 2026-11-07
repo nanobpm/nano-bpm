@@ -1,6 +1,6 @@
 {
-  "next_local": 91,
-  "now": 1700000000021,
+  "next_local": 96,
+  "now": 1700000000023,
   "num_partitions": 1,
   "partition_id": 0,
   "start_dispatch_rr": 0,
@@ -20,6 +20,10 @@
         [
           -50,
           89
+        ],
+        [
+          -50,
+          95
         ]
       ],
       "sync-task": [
@@ -40,7 +44,7 @@
     "created_by_process": {
       "decide": 2,
       "dup": 1,
-      "order": 4,
+      "order": 5,
       "sync": 1,
       "trip": 1,
       "whole": 1,
@@ -582,11 +586,25 @@
         "redrive": null,
         "resolved_at": null,
         "state": "Active"
+      },
+      "96": {
+        "created_at": 1700000000023,
+        "element_id": "order",
+        "element_instance_key": 92,
+        "instance_key": 92,
+        "job_key": null,
+        "key": 96,
+        "kind": "VariablesLost",
+        "operation_reference": null,
+        "reason": "variables lost: spill row missing",
+        "redrive": null,
+        "resolved_at": null,
+        "state": "Active"
       }
     },
     "inflight_by_process": {
       "decide": 1,
-      "order": 2,
+      "order": 3,
       "order-v2": 1,
       "sync": 1,
       "trip": 1,
@@ -1024,6 +1042,41 @@
         "tags": [],
         "variables": {},
         "variables_spilled": false
+      },
+      "92": {
+        "activating": [],
+        "active": {
+          "94": "charge"
+        },
+        "adhoc_instances": {},
+        "agent_history": {},
+        "agent_instances": {},
+        "business_id": null,
+        "compensable": [],
+        "compensation_waits": {},
+        "created_at": 1700000000022,
+        "gateway_routes": {},
+        "incidents": [
+          96
+        ],
+        "join_counts": {},
+        "join_flow_arrivals": {},
+        "join_instances": {},
+        "key": 92,
+        "multi_instances": {},
+        "parent_element_instance_key": null,
+        "parent_process_instance_key": null,
+        "parked_joins": [],
+        "process_definition_key": 2,
+        "process_id": "order",
+        "scope_parents": {},
+        "scope_variables": {},
+        "scopes": {},
+        "state": "Active",
+        "suspended_at": null,
+        "tags": [],
+        "variables": {},
+        "variables_spilled": false
       }
     },
     "jobs": {
@@ -1170,6 +1223,26 @@
         "retries": 3,
         "state": "Created",
         "worker": null
+      },
+      "95": {
+        "activated": false,
+        "activated_at": null,
+        "activation_timeout": null,
+        "created_at": 1700000000022,
+        "deadline": null,
+        "element_id": "charge",
+        "element_instance_key": 94,
+        "error_code": null,
+        "error_message": null,
+        "instance_key": 92,
+        "job_type": "payment",
+        "key": 95,
+        "kind": "BpmnElement",
+        "lease_token": null,
+        "priority": 50,
+        "retries": 3,
+        "state": "Created",
+        "worker": null
       }
     },
     "jobs_by_instance": {
@@ -1193,6 +1266,9 @@
       ],
       "86": [
         89
+      ],
+      "92": [
+        95
       ]
     },
     "message_start_subscriptions": {},

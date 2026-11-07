@@ -801,6 +801,17 @@ fn journal_linger_from_env() -> Duration {
     }
 }
 
+/// Wall-clock milliseconds since the Unix epoch, for stamping the timestamped
+/// events a host-injected command raises (e.g. the #1384 `VariablesLost`
+/// incident) when no upstream command supplied a clock reading. A clock before
+/// the epoch surfaces as `0`.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Durability mode for the journal writer.
 ///
 /// - [`Sync`](DurabilityMode::Sync) (default): a write is acknowledged only
@@ -2577,6 +2588,19 @@ impl Journal {
                     .map(|i| Arc::clone(&i.variables))
                     .unwrap_or_default();
                 self.engine.rehydrate_variables(instance_key, resident);
+                // Raise the durable, replicated incident (#1384) — idempotent, so
+                // a repeated activation/reconcile does not double-raise.
+                if let Err(error) = self.apply_command_at(
+                    Command::QuarantineOffheapOrphan { instance_key },
+                    now_millis(),
+                ) {
+                    tracing::error!(
+                        instance_key,
+                        error = %error,
+                        "{context}: failed to raise the VariablesLost incident for a \
+                         quarantined orphan (will retry on the next quarantine path)"
+                    );
+                }
             }
         }
         Ok(())
@@ -2905,6 +2929,25 @@ impl Journal {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .insert(key);
+                // Raise the durable, replicated incident (#1384): route the
+                // quarantine through the engine command path so the
+                // `VariablesLost` incident is journaled (and, under Raft,
+                // replicated) like any other — not just a local log line. The
+                // command is idempotent, so a repeated reconcile after a crash
+                // between the note and the journal write does not double-raise.
+                if let Err(error) = self.apply_command_at(
+                    Command::QuarantineOffheapOrphan { instance_key: key },
+                    now_millis(),
+                ) {
+                    // A no-op outcome (unknown/terminal instance) is not an error;
+                    // a real engine rejection is logged and retried next boot.
+                    tracing::error!(
+                        instance_key = key,
+                        error = %error,
+                        "boot reconciliation: failed to raise the VariablesLost incident \
+                         for a quarantined orphan (will retry on next boot)"
+                    );
+                }
                 orphans.push(key);
             }
         }
@@ -4825,6 +4868,159 @@ mod tests {
         assert!(rebooted.try_engine_snapshot().is_some());
 
         drop(rebooted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+    }
+
+    // #1384: a quarantined off-heap orphan must carry a durable, replicated
+    // incident ("variables lost: spill row missing") — the loss is today only
+    // logged, never recorded on the instance, so an operator cannot see it via
+    // the incidents API. The incident must survive snapshot+recovery (it is
+    // journaled engine state, not a host-side note).
+    #[test]
+    fn quarantined_orphan_carries_a_durable_incident() {
+        let old_path = restart_store_path("orphan-incident-old");
+        let (journal, keys) = spilled_journal(&old_path, 2);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+
+        let new_path = restart_store_path("orphan-incident-new");
+        let mut rebooted = reboot_from(&new_path, legacy);
+        let mut orphans = rebooted.reconcile_offheap_orphans();
+        orphans.sort_unstable();
+        let mut expected = keys.clone();
+        expected.sort_unstable();
+        assert_eq!(orphans, expected, "every spilled orphan is quarantined");
+
+        // Every quarantined orphan carries an active VariablesLost incident.
+        let active = rebooted.engine.active_incidents();
+        let mut incidented: Vec<Key> = active
+            .iter()
+            .filter(|i| i.kind == nanobpmn_engine_core::IncidentKind::VariablesLost)
+            .map(|i| i.instance_key)
+            .collect();
+        incidented.sort_unstable();
+        assert_eq!(
+            incidented, expected,
+            "each quarantined orphan must carry an active VariablesLost incident"
+        );
+        for key in &expected {
+            let incident = active
+                .iter()
+                .find(|i| i.instance_key == *key)
+                .expect("orphan incident present");
+            assert_eq!(incident.state, nanobpmn_engine_core::IncidentState::Active);
+            assert!(
+                incident.reason.contains("spill row missing"),
+                "incident reason names the loss, got: {}",
+                incident.reason
+            );
+        }
+
+        // The incident is durable journaled state: it survives a snapshot+recovery
+        // round-trip (crash/restart), still active, still pinned to the instance.
+        let snap = rebooted
+            .try_engine_snapshot()
+            .expect("snapshot succeeds after quarantine");
+        let restart_path = restart_store_path("orphan-incident-restart");
+        let restarted = reboot_from(&restart_path, snap);
+        let active_after = restarted.engine.active_incidents();
+        let mut incidented_after: Vec<Key> = active_after
+            .iter()
+            .filter(|i| i.kind == nanobpmn_engine_core::IncidentKind::VariablesLost)
+            .map(|i| i.instance_key)
+            .collect();
+        incidented_after.sort_unstable();
+        assert_eq!(
+            incidented_after, expected,
+            "the VariablesLost incident survives snapshot+recovery"
+        );
+
+        drop(rebooted);
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(restart_path.parent().unwrap());
+    }
+
+    // #1384 durability: the `VariablesLost` incident is *journaled* (persisted to
+    // the event log by `apply_command_at` → `persist`), not just held in memory.
+    // After the boot reconcile raises it on a file-backed journal, the persisted
+    // journal contains the `IncidentRaised` frame, and replaying that frame into a
+    // fresh engine reconstructs the identical incident (the follower-replay /
+    // crash-recovery contract the issue requires).
+    #[test]
+    fn quarantine_incident_is_journaled_and_replays() {
+        // Build a legacy snapshot holding a spilled orphan (variables_spilled=true
+        // over a store whose row is then wiped).
+        let old_path = restart_store_path("orphan-journal-old");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let legacy = journal.engine.snapshot();
+        let key = keys[0];
+        drop(journal);
+
+        // Restore the orphan into a FILE-BACKED journal and reconcile: the
+        // incident must be raised AND persisted to the journal on disk.
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-orphan-incident-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal_path = dir.join("test.journal");
+        let new_path = restart_store_path("orphan-journal-new");
+        {
+            let mut journal = Journal::open(&journal_path).unwrap();
+            let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&new_path)).unwrap());
+            journal.set_spill(store, usize::MAX);
+            journal.restore_engine_from_snapshot(legacy);
+            assert!(
+                journal.engine.is_variables_spilled(key),
+                "precondition: orphan"
+            );
+            assert_eq!(journal.reconcile_offheap_orphans(), vec![key]);
+            // The reconcile persists synchronously through the writer; drop to
+            // flush+close before reading the file back.
+        }
+
+        // The durable journal on disk contains the IncidentRaised frame.
+        let persisted = Journal::read_events(&journal_path).unwrap();
+        let raised: Vec<_> = persisted
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::IncidentRaised {
+                        kind: nanobpmn_engine_core::IncidentKind::VariablesLost,
+                        instance_key,
+                        ..
+                    } if *instance_key == key
+                )
+            })
+            .collect();
+        assert_eq!(
+            raised.len(),
+            1,
+            "the VariablesLost IncidentRaised is persisted to the journal"
+        );
+
+        // Replaying the persisted journal reconstructs the incident on a fresh
+        // engine (follower replay / crash recovery), identical to the leader's.
+        let replayed = nanobpmn_engine_core::Engine::replay(persisted);
+        let active = replayed.active_incidents();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].kind,
+            nanobpmn_engine_core::IncidentKind::VariablesLost
+        );
+        assert_eq!(active[0].instance_key, key);
+        assert!(active[0].reason.contains("spill row missing"));
+
+        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
     }
