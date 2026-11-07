@@ -2763,6 +2763,62 @@ impl Journal {
         Some(snap)
     }
 
+    /// The sealing counterpart of
+    /// [`try_engine_snapshot_quarantining`](Journal::try_engine_snapshot_quarantining)
+    /// (#1384 review): identical capture, but a definitively-absent spill row is
+    /// first routed through the durable [`Command::QuarantineOffheapOrphan`] so the
+    /// `VariablesLost` incident is **journaled** (and, under Raft, replicated)
+    /// before the snapshot seals and the covered log compacts away. Without this a
+    /// snapshot-first discovery cleared the spilled flag and sealed the snapshot
+    /// with no incident, so a restart restored the cleared flag and boot
+    /// reconciliation never reported the loss. The command is idempotent, so a
+    /// re-raised orphan (or one already incidented by boot reconciliation) is a
+    /// no-op. `&mut self` because raising the incident mutates engine state.
+    pub fn try_engine_snapshot_quarantining_with_incidents(
+        &mut self,
+    ) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        let snap = self.try_engine_snapshot_quarantining()?;
+        // Raise the durable incident for every orphan this capture quarantined.
+        // The fold cleared the flag only in the SNAPSHOT copy; the live engine
+        // still has it set, so a `false` (snapshot) / `true` (live) pair names
+        // exactly the instances folded to quarantine on this pass. Doing it after
+        // the capture keeps the borrow simple and is safe: the command is
+        // idempotent, so an orphan already carrying an active incident (e.g. from
+        // boot reconciliation) re-raises nothing.
+        let mut raised_any = false;
+        for instance in snap.state.instances.values() {
+            let quarantined_this_pass =
+                !instance.variables_spilled && self.engine.is_variables_spilled(instance.key);
+            if quarantined_this_pass {
+                raised_any = true;
+                if let Err(error) = self.apply_command_at(
+                    Command::QuarantineOffheapOrphan {
+                        instance_key: instance.key,
+                    },
+                    now_millis(),
+                ) {
+                    tracing::error!(
+                        instance_key = instance.key,
+                        error = %error,
+                        "snapshot: failed to raise the VariablesLost incident for a \
+                         quarantined orphan before sealing (will retry on the next \
+                         quarantine path)"
+                    );
+                }
+            }
+        }
+        // Re-capture so the snapshot returned for sealing CARRIES the incident(s)
+        // just raised — otherwise a restart from it would restore the cleared
+        // spill flag with no incident and the loss would go unreported. The
+        // re-capture re-folds (now a no-op: the orphans are already quarantined
+        // and their incidents active), so it cannot fail or double-raise.
+        if raised_any {
+            self.try_engine_snapshot_quarantining()
+        } else {
+            Some(snap)
+        }
+    }
+
     /// Folds cold instances and spilled variable payloads into `snap` (see
     /// [`engine_snapshot`](Journal::engine_snapshot)). Fail-closed: returns `None`
     /// the moment any indexed payload cannot be folded in (a cold row that will
@@ -3102,14 +3158,17 @@ impl Journal {
     /// already enqueued — makes the sealed boundary line up exactly with the
     /// snapshot. No command runs between the snapshot and the seal because the
     /// actor is single-threaded.
-    pub fn snapshot_and_rotate(&self) -> Option<(nanobpmn_engine_core::EngineSnapshot, u64)> {
+    pub fn snapshot_and_rotate(&mut self) -> Option<(nanobpmn_engine_core::EngineSnapshot, u64)> {
         self.seg.as_ref()?;
-        let writer = self.writer.as_ref()?;
         // Fail-closed: abort the rotation (returning `None` before the seal) if any
         // off-heap payload could not be folded in, so an incomplete snapshot is
         // never sealed/written and its covered prefix never becomes eligible for
-        // compaction — the caller skips this tick and retries.
-        let snap = self.try_engine_snapshot_quarantining()?;
+        // compaction — the caller skips this tick and retries. A definitively
+        // absent spill row is quarantined AND its `VariablesLost` incident is
+        // journaled before the seal (#1384 review), so the loss survives restart.
+        // The capture borrows `self` mutably, so it runs before the `writer` borrow.
+        let snap = self.try_engine_snapshot_quarantining_with_incidents()?;
+        let writer = self.writer.as_ref()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
             return None;
@@ -5137,6 +5196,69 @@ mod tests {
         drop(rebooted);
         let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+    }
+
+    // #1384 review: a snapshot-first discovery must raise the durable
+    // `VariablesLost` incident BEFORE the snapshot seals. Previously the rotation
+    // fold only recorded the orphan locally and cleared its spilled flag in the
+    // sealed snapshot, so a restart restored the cleared flag with no incident and
+    // boot reconciliation never reported the loss. The capture-and-incident path
+    // (`try_engine_snapshot_quarantining_with_incidents`) closes that gap.
+    #[test]
+    fn snapshot_first_discovery_raises_a_durable_incident() {
+        let old_path = restart_store_path("orphan-snapfirst-old");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let key = keys[0];
+
+        // Reboot over a store whose row was wiped, then take the QUARANTINING
+        // capture directly (snapshot discovers the loss before any boot
+        // reconciliation runs).
+        let new_path = restart_store_path("orphan-snapfirst-new");
+        let mut rebooted = reboot_from(&new_path, legacy);
+        assert!(
+            rebooted.engine.is_variables_spilled(key),
+            "precondition: orphan still spilled in live state"
+        );
+
+        let snap = rebooted
+            .try_engine_snapshot_quarantining_with_incidents()
+            .expect("quarantining capture succeeds");
+
+        // The snapshot sealed the orphan with its spilled flag cleared...
+        assert!(
+            !snap.state.instances[&key].variables_spilled,
+            "snapshot clears the lost spill flag"
+        );
+        // ...AND the live engine now carries the durable incident.
+        let active = rebooted.engine.active_incidents();
+        let incident = active
+            .iter()
+            .find(|i| {
+                i.instance_key == key && i.kind == nanobpmn_engine_core::IncidentKind::VariablesLost
+            })
+            .expect("snapshot-first discovery raises the VariablesLost incident");
+        assert_eq!(incident.state, nanobpmn_engine_core::IncidentState::Active);
+        assert!(incident.reason.contains("spill row missing"));
+
+        // The captured snapshot ALSO carries the incident, so a restart from it
+        // restores the report (no dependence on a second reconciliation pass).
+        let restart_path = restart_store_path("orphan-snapfirst-restart");
+        let restarted = reboot_from(&restart_path, snap);
+        let active_after = restarted.engine.active_incidents();
+        assert!(
+            active_after.iter().any(|i| {
+                i.instance_key == key && i.kind == nanobpmn_engine_core::IncidentKind::VariablesLost
+            }),
+            "the incident survives the snapshot it was raised into"
+        );
+
+        drop(rebooted);
+        drop(restarted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(restart_path.parent().unwrap());
     }
 
     // Copilot review on #1387: with NO spill store wired, absence cannot be

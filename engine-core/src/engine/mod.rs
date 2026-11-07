@@ -7088,7 +7088,16 @@ impl Engine {
         let Some(instance) = self.state.instances.get(&instance_key) else {
             return;
         };
-        if instance.state != ProcessInstanceState::Active {
+        // Live states only (`Active` or `Suspended`): a suspended instance is
+        // resumable and retains all its runtime state, so its lost payload must
+        // still surface as an incident — boot reconciliation clears the orphan's
+        // spilled flag when it quarantines, making the loss undetectable after a
+        // resume if it is skipped here. Terminal states are a no-op (the orphan
+        // may have been cancelled between the quarantine note and this command).
+        if !matches!(
+            instance.state,
+            ProcessInstanceState::Active | ProcessInstanceState::Suspended
+        ) {
             return;
         }
         let already_raised = instance.incidents.iter().any(|k| {

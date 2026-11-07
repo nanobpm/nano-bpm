@@ -3909,6 +3909,64 @@ fn quarantine_offheap_orphan_raises_a_durable_variables_lost_incident() {
     assert!(unknown.is_empty(), "unknown instance is a no-op");
 }
 
+// #1384 review: a *suspended* instance is a live, resumable state that retains
+// all its runtime state — quarantining its lost spill payload must still raise
+// the `VariablesLost` incident. Guarding on `Active` alone skipped it, and boot
+// reconciliation clears the orphan's spilled flag when it quarantines, so the
+// loss could never be detected again once the instance resumed. Terminal states
+// (Completed/Terminated) remain a no-op: the orphan may have been cancelled
+// between the quarantine note and this command landing.
+#[test]
+fn quarantine_offheap_orphan_raises_for_a_suspended_instance() {
+    let def = ProcessBuilder::new("orphan-suspended")
+        .start_event("start")
+        .service_task("work", "demo-work")
+        .end_event("end")
+        .connect("start", "work")
+        .connect("work", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("orphan-suspended"))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Suspend the live instance, then quarantine its lost payload.
+    engine
+        .apply_command(Command::SuspendInstance { instance_key: key })
+        .unwrap();
+    let events = engine
+        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .unwrap();
+    let raised: Vec<&Event> = events
+        .iter()
+        .filter(|e| matches!(e, Event::IncidentRaised { .. }))
+        .collect();
+    assert_eq!(
+        raised.len(),
+        1,
+        "a suspended instance still gets its VariablesLost incident"
+    );
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].kind, state::IncidentKind::VariablesLost);
+    assert_eq!(active[0].instance_key, key);
+
+    // Idempotent across the suspend/quarantine pair too.
+    let again = engine
+        .apply_command(Command::QuarantineOffheapOrphan { instance_key: key })
+        .unwrap();
+    assert!(
+        again
+            .iter()
+            .all(|e| !matches!(e, Event::IncidentRaised { .. })),
+        "re-quarantine of a suspended instance is a no-op"
+    );
+    assert_eq!(engine.active_incidents().len(), 1);
+}
+
 // #1384 follower/leader replay parity: the events a leader emits for a
 // `QuarantineOffheapOrphan` replay into the IDENTICAL incident on a fresh
 // engine (the Raft follower / crash-recovery path), so the durable incident
