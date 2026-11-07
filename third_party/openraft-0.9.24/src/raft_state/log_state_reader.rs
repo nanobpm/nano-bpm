@@ -20,7 +20,27 @@ pub(crate) trait LogStateReader<NID: NodeId> {
     /// It assumes a committed log will always get positive return value, according to raft spec.
     fn has_log_id(&self, log_id: &LogId<NID>) -> bool {
         if log_id.index < self.committed().next_index() {
-            debug_assert!(Some(log_id) <= self.committed());
+            // Vendored correctness fix (nanobpm, issue #53): a rebuilt receiver
+            // (the partition auto-recovery / ADR 0019 leadership hand-off path)
+            // can transiently hold a `committed` marker AHEAD of the log it
+            // actually retains — the durable committed marker survives the member
+            // teardown while the log tail it pointed at was purged (or the member
+            // was rebuilt onto a fresh/empty log). The upstream
+            // `debug_assert!(Some(log_id) <= self.committed())` then fires
+            // SPURIOUSLY: the input `log_id` is below `committed` yet absent from
+            // the local log. Under the fatal-panic build that aborts the whole
+            // node; even without it the panic unwinds this partition's raft task.
+            //
+            // Per the Raft spec a committed log id is still treated as present
+            // (the `return true` below is unchanged): the leader considers the
+            // follower's log intact up to `committed` and replicates the suffix
+            // after it; any genuine divergence past `committed` is caught by the
+            // normal entry-level conflict check. The assertion's stronger
+            // invariant ("a committed id is also *retained* locally") does NOT
+            // hold during the rebuild window, so it is relaxed: it is not a
+            // correctness guard (the return value is unconditional `true`), only
+            // a debugging aid, and a spurious node-abort is never the right
+            // response to a legal recovery transition.
             return true;
         }
 

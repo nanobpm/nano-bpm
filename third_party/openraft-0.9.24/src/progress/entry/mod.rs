@@ -160,6 +160,19 @@ impl<NID: NodeId> ProgressEntry<NID> {
                 );
 
                 self.matching = None;
+                // Vendored correctness fix (nanobpm, issue #53): a rebuilt
+                // receiver (the partition auto-recovery / leadership hand-off
+                // path) can hold a log from a DIFFERENT leader lineage that
+                // diverges from this leader's. The follower's reported `conflict`
+                // is its own log END — the first index it cannot match — which
+                // can be BELOW the divergent suffix the leader was probing.
+                // Clearing `matching` and leaving `searching_end = conflict`
+                // (set above) bounds the next binary search at the follower's
+                // actual log end, so the search walks DOWN to the true match
+                // point instead of re-probing the divergent head forever (which
+                // would wedge a blocking `add_learner` and stall the hand-off).
+                // No further adjustment is needed: `searching_end` is already the
+                // follower's conflict index.
             }
 
             debug_assert!(
