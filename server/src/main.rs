@@ -38466,6 +38466,78 @@ mod clustered_startup_tests {
         assert_eq!(g.failed.count, 1, "a replayed failure is not recounted");
     }
 
+    /// A leased REST throw-error replayed under its recorded token is a 204 that
+    /// records the error statistic only once (#1181).
+    #[tokio::test]
+    async fn rest_thrown_error_replay_under_the_same_lease_is_an_idempotent_204() {
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("erroring-replay")
+            .start_event("s")
+            .service_task("work", "err-replay")
+            .error_boundary_event("catch", "work", "E_BOOM")
+            .end_event("e")
+            .end_event("caught")
+            .connect("s", "work")
+            .connect("work", "e")
+            .connect("catch", "caught")
+            .build()
+            .expect("valid error-boundary process");
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "erroring-replay".to_string(),
+            "erroring-replay.bpmn".to_string(),
+        );
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        server
+            .create_for_stream(Some("erroring-replay".into()), None, Default::default())
+            .await
+            .expect("create the instance");
+        await_job_key(&server, "err-replay").await;
+        let jobs = server
+            .activate_for_stream_with_lease("err-replay", "worker-e", 10, 60_000, None, true)
+            .await;
+        assert_eq!(jobs.len(), 1, "the err-replay job is activatable");
+        let token = serde_json::to_value(&jobs[0]).unwrap()["jobLeaseToken"]
+            .as_str()
+            .expect("a leased activation carries a token")
+            .to_owned();
+
+        use apis::job::ThrowJobErrorResponse as ThResp;
+        let path = models::ThrowJobErrorPathParams {
+            job_key: jobs[0].job_key.0.clone(),
+        };
+        let req: models::JobErrorRequest = serde_json::from_value(serde_json::json!({
+            "errorCode": "E_BOOM",
+            "errorMessage": "kaboom",
+            "jobLeaseToken": token,
+        }))
+        .unwrap();
+        let before = server.job_statistics.lock_errors().len();
+        for attempt in ["first", "replayed"] {
+            assert!(
+                matches!(
+                    server.throw_job_error_impl(&path, &req).await.unwrap(),
+                    ThResp::Status204_AnErrorIsThrownForTheJob
+                ),
+                "the {attempt} throw under the recorded lease is a 204"
+            );
+        }
+        assert_eq!(
+            server.job_statistics.lock_errors().len() - before,
+            1,
+            "a replayed throw-error is not recounted in error statistics"
+        );
+    }
+
     #[tokio::test]
     async fn rest_job_statistics_count_a_completed_job() {
         let server = ServerImpl::default();

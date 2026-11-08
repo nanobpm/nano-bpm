@@ -484,3 +484,62 @@ fn replaying_a_settlement_frame_advances_the_lease_allocator() {
     );
     assert_eq!(follower.job(job_key).unwrap().retries, 1);
 }
+
+fn throw(job_key: Key, token: &str, code: &str) -> Command {
+    Command::throw_job_error_with(job_key, code.to_string(), "m".to_string(), HashMap::new())
+        .with_lease_token(Some(token.to_string()))
+}
+
+/// A leased `ThrowJobError` replayed under its recorded token must be a no-op
+/// for both the caught (boundary) and uncaught (incident) paths — never a
+/// second `JobErrorThrown`, boundary activation, or incident — including after
+/// the finished instance is evicted from hot state.
+#[test]
+fn replayed_thrown_error_with_the_recorded_lease_is_an_idempotent_no_op() {
+    for (code, caught) in [("CARD_DECLINED", true), ("UNHANDLED", false)] {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(process_with_error_boundary()))
+            .unwrap();
+        engine
+            .apply_command(Command::create_instance("payment"))
+            .unwrap();
+        let (job_key, token) = leased(&mut engine, "w1", 0);
+        let first = engine.apply_command(throw(job_key, &token, code)).unwrap();
+        assert!(first
+            .iter()
+            .any(|e| matches!(e, Event::JobErrorThrown { .. })));
+        assert!(first
+            .iter()
+            .any(|e| matches!(e, Event::JobSettlementRecorded { .. })));
+        assert_eq!(
+            first
+                .iter()
+                .any(|e| matches!(e, Event::IncidentRaised { .. })),
+            !caught,
+            "{code}: incident only when uncaught"
+        );
+
+        assert_eq!(
+            engine.apply_command(throw(job_key, &token, code)).unwrap(),
+            Vec::<Event>::new(),
+            "{code}: replay emits no second error/boundary/incident"
+        );
+        // A different outcome under the same token is a conflict.
+        assert_eq!(
+            engine.apply_command(complete(job_key, &token)),
+            Err(EngineError::JobLeaseMismatch { job_key })
+        );
+
+        if caught {
+            // The instance finished via the boundary; replay survives eviction.
+            let instance_key = engine.job(job_key).unwrap().instance_key;
+            assert!(engine.evict_instance(instance_key));
+            assert_eq!(
+                engine.apply_command(throw(job_key, &token, code)).unwrap(),
+                Vec::<Event>::new(),
+                "{code}: replay survives instance eviction"
+            );
+        }
+    }
+}
