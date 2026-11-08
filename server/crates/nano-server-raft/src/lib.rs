@@ -22,7 +22,7 @@
 // Lower-layer modules the consensus stack reaches into, re-exported at the crate
 // root so the moved files' existing `crate::…` paths keep resolving without
 // per-line edits — the same seam the gateway binary uses for the storage crate.
-pub(crate) use nano_server_runtime::{cluster, deepthi};
+pub(crate) use nano_server_runtime::{cluster, cmd_profile, deepthi};
 pub(crate) use nano_server_storage::{journal, metrics};
 
 pub mod fence;
