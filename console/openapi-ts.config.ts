@@ -57,4 +57,17 @@ export default defineConfig([
       "@hey-api/typescript",
     ],
   },
+  // The same two specs, types only, for the shared Process Explorer package
+  // (`@nanobpm/process-explorer`, ../process-explorer): its data-source seam
+  // speaks this wire model, so it derives from the same source of truth.
+  {
+    input: "../spec-console/console-api.yaml",
+    output: { path: "../process-explorer/src/gen" },
+    plugins: ["@hey-api/typescript"],
+  },
+  {
+    input: c8Spec,
+    output: { path: "../process-explorer/src/gen-c8" },
+    plugins: ["@hey-api/typescript"],
+  },
 ]);

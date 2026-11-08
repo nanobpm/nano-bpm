@@ -9,41 +9,30 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  cancelInstance,
-  getInstance,
-  getTrace,
-  resolveIncident,
-  resumeInstance,
-  setInstanceVariables,
-  suspendInstance,
-  type InstanceTrace,
-  type Variable,
-} from "../gen";
-import { fetchProcessXml } from "../lib/api";
+import type {
+  InstanceDetail as InstanceDetailData,
+  InstanceTrace,
+  Variable,
+} from "./gen";
+import { useExplorerData, useLiveInvalidation } from "./dataSource.tsx";
 import {
   isCancellable,
   isResumable,
   isSuspendable,
   cancelConfirmMessage,
-} from "../lib/instanceActions";
-import { useLiveInvalidation } from "../lib/useLiveInvalidation";
-import { usePaneResize } from "../lib/usePaneResize";
-import { ResizeHandle } from "../components/ResizeHandle";
-import BpmnViewer from "../components/BpmnViewer";
-import AgentSessionPanel from "../components/AgentSessionPanel";
-import { agentBadge, agentsByElement } from "../lib/agentHistory";
+} from "./instanceActions";
+import { usePaneResize } from "./usePaneResize";
+import { ResizeHandle } from "./ResizeHandle";
+import BpmnViewer from "./BpmnViewer";
+import AgentSessionPanel from "./AgentSessionPanel";
+import { agentBadge, agentsByElement } from "./agentHistory";
 import {
   AGENT_HISTORY_KEY,
   AGENT_INSTANCES_KEY,
   useAgentInstances,
-} from "../lib/useAgentSessions";
-import { IncidentReason } from "../components/IncidentReason";
-import {
-  TraceTimeline,
-  fmtClock,
-  fmtDuration,
-} from "../components/TraceTimeline";
+} from "./useAgentSessions";
+import { IncidentReason } from "./IncidentReason";
+import { TraceTimeline, fmtClock, fmtDuration } from "./TraceTimeline";
 import {
   Badge,
   Button,
@@ -53,7 +42,7 @@ import {
   SectionLabel,
   inputClass,
   useIsNarrow,
-} from "../components/ui";
+} from "./ui";
 import {
   VALUE_JSON_ERROR,
   scopeKeyOptions,
@@ -95,6 +84,7 @@ export default function InstanceDetail({
     AGENT_HISTORY_KEY,
   ]);
   const qc = useQueryClient();
+  const source = useExplorerData();
   const narrow = useIsNarrow();
   // Which drill-down is open full-screen on mobile (Model / Variables / Trace).
   const [panel, setPanel] = useState<null | "model" | "variables" | "trace">(
@@ -159,15 +149,13 @@ export default function InstanceDetail({
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["instance", instanceKey],
-    queryFn: async () =>
-      (await getInstance({ path: { key: instanceKey }, throwOnError: true }))
-        .data,
+    queryFn: () => source.getInstance(instanceKey),
   });
 
   const defKey = data?.instance.process_definition_key;
   const { data: xml } = useQuery({
     queryKey: ["process-xml", defKey],
-    queryFn: () => fetchProcessXml(defKey!),
+    queryFn: () => source.getProcessXml(defKey!),
     enabled: !!defKey,
     staleTime: Infinity,
   });
@@ -189,15 +177,12 @@ export default function InstanceDetail({
         // stale and refetch each hop (including the currently viewed
         // instance). Read the cache first and only hit the network for hops we
         // haven't loaded yet, so the climb dedupes as intended.
-        const cached = qc.getQueryData<
-          Awaited<ReturnType<typeof getInstance>>["data"]
-        >(["instance", key]);
+        const cached = qc.getQueryData<InstanceDetailData>(["instance", key]);
         const detail =
           cached ??
           (await qc.fetchQuery({
             queryKey: ["instance", key],
-            queryFn: async () =>
-              (await getInstance({ path: { key }, throwOnError: true })).data,
+            queryFn: () => source.getInstance(key),
           }));
         return detail?.instance ?? null;
       }),
@@ -221,12 +206,7 @@ export default function InstanceDetail({
     error: traceError,
   } = useQuery({
     queryKey: ["trace", instanceKey],
-    queryFn: async () => {
-      const result = await getTrace({ path: { key: instanceKey } });
-      if (result.response?.status === 404) return undefined;
-      if (result.error) throw result.error;
-      return result.data;
-    },
+    queryFn: () => source.getTrace(instanceKey),
     enabled: !!instanceKey,
     retry: false,
   });
@@ -242,10 +222,7 @@ export default function InstanceDetail({
   const onResolve = (incidentKey: string) => {
     setBusy(true);
     setActionError(null);
-    resolveIncident({
-      path: { key: instanceKey, incidentKey },
-      throwOnError: true,
-    })
+    source.resolveIncident!(instanceKey, incidentKey)
       .then(refresh)
       .catch((e) => setActionError(String(e)))
       .finally(() => setBusy(false));
@@ -254,10 +231,9 @@ export default function InstanceDetail({
   const onSetVariable = (scopeKey: string, name: string, value: unknown) => {
     setBusy(true);
     setActionError(null);
-    return setInstanceVariables({
-      path: { key: instanceKey },
-      body: { scopeKey, variables: { [name]: value } },
-      throwOnError: true,
+    return source.setVariables!(instanceKey, {
+      scopeKey,
+      variables: { [name]: value },
     })
       .then(refresh)
       .catch((e) => {
@@ -275,10 +251,10 @@ export default function InstanceDetail({
   const onCreateVariable = (scopeKey: string, name: string, value: unknown) => {
     setBusy(true);
     setActionError(null);
-    return setInstanceVariables({
-      path: { key: instanceKey },
-      body: { scopeKey, variables: { [name]: value }, local: true },
-      throwOnError: true,
+    return source.setVariables!(instanceKey, {
+      scopeKey,
+      variables: { [name]: value },
+      local: true,
     })
       .then(refresh)
       .catch((e) => {
@@ -293,7 +269,7 @@ export default function InstanceDetail({
     if (!window.confirm(cancelConfirmMessage(processId, instanceKey))) return;
     setBusy(true);
     setActionError(null);
-    cancelInstance({ path: { key: instanceKey }, throwOnError: true })
+    source.cancelInstance!(instanceKey)
       .then(refresh)
       .catch((e) => setActionError(String(e)))
       .finally(() => setBusy(false));
@@ -305,7 +281,7 @@ export default function InstanceDetail({
   const onSuspendInstance = () => {
     setBusy(true);
     setActionError(null);
-    suspendInstance({ path: { key: instanceKey }, throwOnError: true })
+    source.suspendInstance!(instanceKey)
       .then(refresh)
       .catch((e) => setActionError(String(e)))
       .finally(() => setBusy(false));
@@ -314,7 +290,7 @@ export default function InstanceDetail({
   const onResumeInstance = () => {
     setBusy(true);
     setActionError(null);
-    resumeInstance({ path: { key: instanceKey }, throwOnError: true })
+    source.resumeInstance!(instanceKey)
       .then(refresh)
       .catch((e) => setActionError(String(e)))
       .finally(() => setBusy(false));
@@ -401,7 +377,7 @@ export default function InstanceDetail({
         <Badge tone="neutral">{instance.state}</Badge>
         {instance.has_incident && <Badge tone="danger">Incident</Badge>}
         <div className="ml-auto flex shrink-0 items-center gap-2">
-          {isSuspendable(instance.state) && (
+          {source.suspendInstance && isSuspendable(instance.state) && (
             <Button
               size="sm"
               variant="secondary"
@@ -411,7 +387,7 @@ export default function InstanceDetail({
               Suspend
             </Button>
           )}
-          {isResumable(instance.state) && (
+          {source.resumeInstance && isResumable(instance.state) && (
             <Button
               size="sm"
               variant="primary"
@@ -421,7 +397,7 @@ export default function InstanceDetail({
               Resume
             </Button>
           )}
-          {isCancellable(instance.state) && (
+          {source.cancelInstance && isCancellable(instance.state) && (
             <Button
               size="sm"
               variant="danger"
@@ -513,8 +489,8 @@ export default function InstanceDetail({
       instanceKey={instance.key}
       variables={variables}
       busy={busy}
-      onCreate={onCreateVariable}
-      onSetVariable={onSetVariable}
+      onCreate={source.setVariables && onCreateVariable}
+      onSetVariable={source.setVariables && onSetVariable}
     />
   );
 
@@ -535,7 +511,7 @@ export default function InstanceDetail({
                 <IncidentReason reason={i.reason} />
               </Td>
               <Td className="text-right">
-                {i.state === "Active" && (
+                {source.resolveIncident && i.state === "Active" && (
                   <Button
                     size="sm"
                     disabled={busy}
@@ -855,12 +831,13 @@ function VariablesPanel({
   instanceKey: string;
   variables: Variable[];
   busy: boolean;
-  onCreate: (
+  /** Both absent when the data source can't write variables (read-only). */
+  onCreate?: (
     scopeKey: string,
     name: string,
     value: unknown,
   ) => Promise<unknown>;
-  onSetVariable: (
+  onSetVariable?: (
     scopeKey: string,
     name: string,
     value: unknown,
@@ -869,7 +846,7 @@ function VariablesPanel({
   const [adding, setAdding] = useState(false);
   const scopes = scopeKeyOptions(instanceKey, variables);
 
-  const addButton = (
+  const addButton = onCreate && (
     <Button
       size="sm"
       variant="secondary"
@@ -880,7 +857,7 @@ function VariablesPanel({
     </Button>
   );
 
-  const form = adding && (
+  const form = adding && onCreate && (
     <NewVariableForm
       instanceKey={instanceKey}
       scopes={scopes}
@@ -914,7 +891,10 @@ function VariablesPanel({
                 value={v.value}
                 scopeKey={v.scope_key}
                 busy={busy}
-                onSave={(parsed) => onSetVariable(v.scope_key, v.name, parsed)}
+                onSave={
+                  onSetVariable &&
+                  ((parsed) => onSetVariable(v.scope_key, v.name, parsed))
+                }
               />
             ))}
           </Table>
@@ -1060,7 +1040,8 @@ function VariableRow({
   value: string;
   scopeKey: string;
   busy: boolean;
-  onSave: (parsed: unknown) => Promise<unknown>;
+  /** Absent when the data source can't write variables: no Edit button. */
+  onSave?: (parsed: unknown) => Promise<unknown>;
 }) {
   const [editing, setEditing] = useState(false);
   // Collapse the row whenever the underlying value changes (switching instances
@@ -1103,7 +1084,7 @@ function VariableRow({
       setParseError(VALUE_JSON_ERROR);
       return;
     }
-    onSave(parsed)
+    onSave!(parsed)
       .then(() => setEditing(false))
       .catch(() => {
         /* surfaced by the parent's action error banner */
@@ -1144,9 +1125,11 @@ function VariableRow({
         </Td>
         <Td className="font-mono text-fg-faint">{scopeKey}</Td>
         <Td className="text-right">
-          <Button size="sm" variant="ghost" disabled={busy} onClick={start}>
-            Edit
-          </Button>
+          {onSave && (
+            <Button size="sm" variant="ghost" disabled={busy} onClick={start}>
+              Edit
+            </Button>
+          )}
         </Td>
       </tr>
     );

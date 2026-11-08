@@ -6,7 +6,7 @@ import {
   groupCalledInstances,
   resolveCallActivitySelection,
 } from "./calledInstances.ts";
-import type { CalledInstance } from "../gen";
+import type { CalledInstance } from "./gen";
 
 /** Build a `CalledInstance` row with sensible defaults for the fields a test
  * doesn't care about. */

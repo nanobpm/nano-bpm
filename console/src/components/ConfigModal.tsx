@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { ProjectConfig } from "../gen";
-import { Button, inputClass, Modal } from "./ui";
+import { Button, inputClass, Modal } from "@nanobpm/process-explorer/ui";
 
 const inputCls = `mt-1 w-full ${inputClass}`;
 

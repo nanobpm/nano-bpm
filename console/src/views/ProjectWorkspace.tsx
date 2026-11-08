@@ -61,7 +61,7 @@ import {
   type ProjectLogLine,
   type ProjectFile,
 } from "../lib/api";
-import { Button, inputClass, Modal } from "../components/ui";
+import { Button, inputClass, Modal } from "@nanobpm/process-explorer/ui";
 import { useTemplateUpdate } from "../components/TemplateUpdate";
 import { toUpdateTarget } from "../lib/templateUpdate";
 import { appIsRunning } from "../lib/appRunning";

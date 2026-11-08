@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type {
   AgentInstanceMessageContent,
   AgentInstanceResult,
-} from "../gen-c8/types.gen";
+} from "./gen-c8/types.gen";
 import {
   chapterAt,
   chapters as chaptersOf,
@@ -20,8 +20,8 @@ import {
   type Playhead,
   type ScrubAction,
   type Span,
-} from "../lib/agentHistory.ts";
-import { useAgentHistory } from "../lib/useAgentSessions.ts";
+} from "./agentHistory";
+import { useAgentHistory } from "./useAgentSessions";
 import { Badge, Button, Spinner } from "./ui.tsx";
 
 /// The agent-session scrubber (nano-bpm#1314): one AgentInstance's committed
@@ -29,7 +29,7 @@ import { Badge, Button, Spinner } from "./ui.tsx";
 /// model/tool span timeline, the transcript up to the playhead and running
 /// totals. "Live at turn": the history query is refetched on every SSE edge
 /// (InstanceDetail's useLiveInvalidation) and a playhead parked at the end
-/// follows new turns. All state logic is in lib/agentHistory.ts.
+/// follows new turns. All state logic is in agentHistory.ts.
 export default function AgentSessionPanel({
   elementId,
   instances,

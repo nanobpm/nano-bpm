@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type {
   AgentInstanceHistoryItemResult,
   AgentInstanceResult,
-} from "../gen-c8/types.gen";
+} from "./gen-c8/types.gen";
 import {
   agentBadge,
   agentsByElement,

@@ -1,0 +1,27 @@
+{
+  "name": "@nanobpm/process-explorer",
+  "version": "0.1.0",
+  "description": "The nano console's Process Explorer (instance list, BPMN diagram with live tokens, variables, incidents, execution trace, agent sessions) as React components over a pluggable data source.",
+  "type": "module",
+  "private": true,
+  "exports": {
+    ".": "./src/index.ts",
+    "./ui": "./src/ui.tsx",
+    "./filters": "./src/explorerFilters.ts",
+    "./clipboard": "./src/clipboard.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "npm --prefix ../console run test:explorer"
+  },
+  "peerDependencies": {
+    "@nanobpm/nano-app-schema": ">=0.11.0",
+    "@tanstack/react-query": "^5.0.0",
+    "bpmn-js": ">=17",
+    "react": ">=18",
+    "react-dom": ">=18"
+  }
+}

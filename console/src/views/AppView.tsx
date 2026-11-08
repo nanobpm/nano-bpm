@@ -10,7 +10,12 @@ import {
 import { projectLogs, type ProjectLogLine } from "../lib/api";
 import { isAssetIcon } from "../lib/appRailIcon";
 import { AppIcon } from "../components/AppIcon";
-import { CardGrid, NavCard, SectionLabel, useIsNarrow } from "../components/ui";
+import {
+  CardGrid,
+  NavCard,
+  SectionLabel,
+  useIsNarrow,
+} from "@nanobpm/process-explorer/ui";
 import { cssVar, TOKEN_KEYS } from "../theme/themes";
 import { decideAppViewMessage } from "../lib/appViewMessage";
 

@@ -15,6 +15,9 @@
 @import "tailwindcss";
 @import "@nanobpm/nano-app-schema/tokens.css";
 @import "./theme/tokens.css";
+/* The shared Process Explorer package (../process-explorer) is styled with these
+ * same utilities; Tailwind doesn't scan outside this project on its own. */
+@source "../../process-explorer/src";
 
 html,
 body,
@@ -269,7 +272,7 @@ body {
  * Keep palette/token definitions out of here — they live in the shared
  * `@nanobpm/nano-app-schema/tokens.css` imported at the top of this file.
  *
- * These primitives (consumed via src/components/ui.tsx) are self-contained: a
+ * These primitives (consumed via process-explorer/src/ui.tsx, the shared UI kit) are self-contained: a
  * consumer at 375×812 gets no horizontal scroll from them. The single JS
  * breakpoint lives in `MOBILE_MAX_WIDTH`; the layout rules below stay
  * breakpoint-free (intrinsic auto-fill / safe-area) so no second `640px`

@@ -20,7 +20,7 @@ import type {
   AgentInstanceHistoryItemResult,
   AgentInstanceResult,
   AgentInstanceStatusEnum,
-} from "../gen-c8/types.gen";
+} from "./gen-c8/types.gen";
 
 export type HistoryItem = AgentInstanceHistoryItemResult;
 
