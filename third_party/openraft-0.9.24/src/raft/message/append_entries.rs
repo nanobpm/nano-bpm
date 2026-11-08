@@ -83,7 +83,13 @@ pub enum AppendEntriesResponse<NID: NodeId> {
 
     /// The first log id([`AppendEntriesRequest::prev_log_id`]) of the entries to send does not
     /// match on the remote target node.
-    Conflict,
+    ///
+    /// It carries the follower's REAL last log id as a hint, so the leader can shrink its
+    /// replication search window directly to the follower's actual frontier instead of walking
+    /// down one RPC per step. A same-term divergent lineage (a two-lineage hand-off, or a
+    /// follower rebuilt as a fresh receiver) then converges deterministically. `None` means the
+    /// follower's log is empty.
+    Conflict(Option<LogId<NID>>),
 
     /// Seen a vote `v` that does not hold `mine_vote >= v`.
     /// And a leader's vote(committed vote) must be total order with other vote.
@@ -97,7 +103,7 @@ impl<NID: NodeId> AppendEntriesResponse<NID> {
     }
 
     pub fn is_conflict(&self) -> bool {
-        matches!(*self, AppendEntriesResponse::Conflict)
+        matches!(*self, AppendEntriesResponse::Conflict(_))
     }
 }
 
@@ -109,7 +115,7 @@ impl<NID: NodeId> fmt::Display for AppendEntriesResponse<NID> {
                 write!(f, "PartialSuccess({})", m.display())
             }
             AppendEntriesResponse::HigherVote(vote) => write!(f, "Higher vote, {}", vote),
-            AppendEntriesResponse::Conflict => write!(f, "Conflict"),
+            AppendEntriesResponse::Conflict(last) => write!(f, "Conflict({})", last.display()),
         }
     }
 }

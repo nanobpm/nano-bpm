@@ -708,7 +708,12 @@ impl<NID: NodeId> From<Result<(), RejectAppendEntries<NID>>> for AppendEntriesRe
             Ok(_) => AppendEntriesResponse::Success,
             Err(e) => match e {
                 RejectAppendEntries::ByVote(v) => AppendEntriesResponse::HigherVote(v),
-                RejectAppendEntries::ByConflictingLogId { expect: _, local: _ } => AppendEntriesResponse::Conflict,
+                // The hint (the follower's real last log id) is filled in by the
+                // engine's `handle_append_entries`, which has the follower's state;
+                // this bare `From` conversion has no access to it, so it yields `None`.
+                RejectAppendEntries::ByConflictingLogId { expect: _, local: _ } => {
+                    AppendEntriesResponse::Conflict(None)
+                }
             },
         }
     }

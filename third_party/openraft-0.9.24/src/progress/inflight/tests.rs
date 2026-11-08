@@ -148,13 +148,13 @@ fn test_inflight_conflict() -> anyhow::Result<()> {
         assert_eq!(Inflight::None, f, "valid conflict");
     }
 
+    // With a conflict hint, the conflict index is the follower's REAL last-log
+    // frontier, which may be BELOW the request's `prev_log_id` (the leader's
+    // guess). That is valid and clears the inflight.
     {
-        let res = std::panic::catch_unwind(|| {
-            let mut f = Inflight::logs(Some(log_id(5)), Some(log_id(10)));
-            f.conflict(f.id(), 4).unwrap();
-        });
-        tracing::info!("res: {:?}", res);
-        assert!(res.is_err(), "non-matching conflict < prev_log_id");
+        let mut f = Inflight::logs(Some(log_id(5)), Some(log_id(10)));
+        f.conflict(f.id(), 4)?;
+        assert_eq!(Inflight::None, f, "a conflict hint below prev_log_id is valid");
     }
 
     {

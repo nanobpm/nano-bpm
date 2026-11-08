@@ -66,6 +66,38 @@ fn test_raft_state_has_log_id_committed_gets_true() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The committed fast-path must not panic on a same-term divergent lineage.
+///
+/// During a two-lineage hand-off a follower can receive an AppendEntries whose
+/// `prev_log_id` sits below its committed index but on a DIFFERENT (same-term
+/// divergent) lineage: the entry at that index was committed under another
+/// leader id. `has_log_id`'s committed fast-path asserted
+/// `Some(log_id) <= committed`, which is false for such a log id, and panicked
+/// (the CI failure on
+/// `recovery_tick_hands_off_a_boot_deferred_partition_from_the_epoch_map`).
+/// The fast-path must instead fall through to the log-id comparison, which
+/// correctly reports the divergent entry as not-present (a conflict to
+/// resolve), never a panic.
+#[test]
+fn test_raft_state_has_log_id_divergent_committed_lineage_does_not_panic() -> anyhow::Result<()> {
+    // Committed at index 1 under leader term 2; the local log at index 1 is
+    // (term 2). An AppendEntries arrives whose prev_log_id is index 1 but on a
+    // divergent lineage (term 3 — same index, different committed leader id).
+    let rs = RaftState::<u64, (), TokioInstant> {
+        committed: Some(log_id(2, 1)),
+        log_ids: LogIdList::new(vec![log_id(2, 1)]),
+        ..Default::default()
+    };
+
+    // Same index as a committed entry, but a different (divergent) leader id:
+    // must return false (a conflict to resolve), NOT panic.
+    assert!(!rs.has_log_id(&log_id(3, 1)));
+    // The genuinely-committed log id still returns true.
+    assert!(rs.has_log_id(&log_id(2, 1)));
+
+    Ok(())
+}
+
 #[test]
 fn test_raft_state_has_log_id_in_log_id_list() -> anyhow::Result<()> {
     let rs = RaftState::<u64, (), TokioInstant> {

@@ -481,11 +481,32 @@ where
                     sender_vote: self.session_id.vote_ref().clone(),
                 }))
             }
-            AppendEntriesResponse::Conflict => {
-                let conflict = sending_range.prev.clone();
-                debug_assert!(conflict.is_some(), "prev_log_id=None never conflict");
-
-                let conflict = conflict.unwrap();
+            AppendEntriesResponse::Conflict(follower_last) => {
+                // The follower's real last log id is the conflict hint: the leader
+                // shrinks its search window to the follower's actual frontier (plus
+                // one, the next index to probe) instead of walking down one RPC per
+                // step. With no hint (an older/empty follower), fall back to the
+                // request's own prev log id — the previous behaviour.
+                let conflict = match follower_last {
+                    Some(last) => {
+                        let hint_next = last.index + 1;
+                        // Never shrink past the follower's frontier, but also never
+                        // report a conflict ABOVE the range we actually sent.
+                        let prev_next = sending_range.prev.index().unwrap_or(0);
+                        let index = std::cmp::min(hint_next, prev_next);
+                        let leader_id = sending_range
+                            .prev
+                            .clone()
+                            .map(|p| p.committed_leader_id().clone())
+                            .unwrap_or_default();
+                        LogId::new(leader_id, index)
+                    }
+                    None => {
+                        let conflict = sending_range.prev.clone();
+                        debug_assert!(conflict.is_some(), "prev_log_id=None never conflict");
+                        conflict.unwrap()
+                    }
+                };
                 self.send_progress(request_id, ReplicationResult::new(leader_time, Err(conflict)));
 
                 Ok(None)
