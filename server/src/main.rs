@@ -65,6 +65,7 @@ pub(crate) use nano_server_storage::metrics;
 pub(crate) use nano_server_storage::readstore;
 pub(crate) use nano_server_storage::remote_sink;
 pub(crate) use nano_server_storage::seglog;
+pub(crate) use nano_server_storage::snapshot_health;
 pub(crate) use nano_server_storage::varspill;
 pub(crate) use nano_server_storage::varstore;
 use nanobpm_gateway_rest::{apis, models, types};
@@ -5164,10 +5165,17 @@ const DEFAULT_HISTORY_MB: u64 = 8192;
 /// the node to preserve durability — see the journal write-failure path).
 const HISTORY_DISK_FRACTION_PCT: u64 = 60;
 
-/// Total filesystem capacity (bytes) of the volume holding `path`, via
-/// `statvfs`, or `None` when it can't be read.
-#[cfg(unix)]
+/// Total filesystem capacity (bytes) of the volume holding `path`, or `None`
+/// when it can't be read. Derived from [`disk_space_bytes`].
 fn detect_disk_capacity_bytes(path: &std::path::Path) -> Option<u64> {
+    disk_space_bytes(path).map(|(_, total)| total)
+}
+
+/// `(available, total)` bytes of the volume holding `path`, via `statvfs`, or
+/// `None` when it can't be read. `available` is what an unprivileged writer can
+/// still use (`f_bavail`), the figure the #1385 disk guard compares.
+#[cfg(unix)]
+fn disk_space_bytes(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `st` is zeroed then filled by statvfs; `c` is a valid NUL-terminated
@@ -5177,11 +5185,12 @@ fn detect_disk_capacity_bytes(path: &std::path::Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some(st.f_blocks as u64 * st.f_frsize as u64)
+    let frsize = st.f_frsize as u64;
+    Some((st.f_bavail as u64 * frsize, st.f_blocks as u64 * frsize))
 }
 
 #[cfg(not(unix))]
-fn detect_disk_capacity_bytes(_path: &std::path::Path) -> Option<u64> {
+fn disk_space_bytes(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -23831,7 +23840,136 @@ fn metrics_body(server: &ServerImpl) -> String {
         legacy_lease_name_uses(),
     );
 
+    // Snapshot-health gauges (#1385): last-success age, consecutive failures,
+    // uncompacted journal footprint, quarantined orphans, data-dir free space
+    // and the degraded flag. Empty until the snapshot task has started.
+    body.push_str(&snapshot_health::global().render_prometheus(
+        std::time::Instant::now(),
+        &snapshot_health::HealthThresholds::from_env(),
+    ));
+
     body
+}
+
+/// Snapshot-health failure reason for a capture that aborted fail-closed
+/// (an unreadable off-heap payload, a strict orphan, or a gone writer); the
+/// blocking keys, when any, are reported alongside (#1385).
+const SNAPSHOT_CAPTURE_ABORTED: &str = "snapshot capture aborted (fail-closed)";
+
+/// `GET /health` (#1385): the snapshot/compaction pipeline's health as JSON —
+/// `status` (`healthy`/`degraded`), the `reasons` and `causes`, and the
+/// `blockingKeys` whose off-heap payload aborts snapshots. Answers **503** when
+/// degraded so an alerting probe (or a readiness check) notices without
+/// parsing the body; wire it to alerting/readiness, not liveness — a restart
+/// does not repair an unreadable store or a full disk.
+async fn health_handler() -> Response {
+    let report = snapshot_health::global().report(
+        std::time::Instant::now(),
+        &snapshot_health::HealthThresholds::from_env(),
+    );
+    health_response(&report)
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
+fn health_response(report: &snapshot_health::HealthReport) -> Response {
+    let status = if report.is_degraded() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    let body = serde_json::to_string(report).unwrap_or_else(|_| "{}".to_string());
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("health response builds")
+}
+
+/// Feeds one snapshot-maintenance tick's outcome into the snapshot-health
+/// tracker (#1385) and does the tick's logging: a failure is logged only when
+/// [`SnapshotHealth::record_failure`](snapshot_health::SnapshotHealth::record_failure)
+/// says it is news (first of a streak, changed reason/blockers, or a periodic
+/// reminder), a recovery once, and each degraded cause once on entry/exit.
+/// Shared by the single- and multi-partition snapshot loops so both report
+/// identically.
+async fn record_snapshot_health_tick(
+    health: &snapshot_health::SnapshotHealth,
+    handles: &[DeepthiHandle],
+    shared: &seglog::SegShared,
+    outcome: Result<(), String>,
+) {
+    let now = std::time::Instant::now();
+    let mut quarantined = 0u64;
+    let mut blockers = Vec::new();
+    for handle in handles {
+        let (q, b) = handle
+            .with(|journal| {
+                (
+                    journal.quarantined_orphans().len() as u64,
+                    journal.snapshot_blockers(),
+                )
+            })
+            .await;
+        quarantined += q;
+        blockers.extend(b);
+    }
+    blockers.sort_unstable();
+    blockers.dedup();
+    let (segments, bytes) = shared.uncompacted_usage();
+    let disk = disk_space_bytes(&shared.dir);
+    apply_snapshot_health_tick(
+        health,
+        now,
+        quarantined,
+        (segments, bytes),
+        disk,
+        outcome.map_err(|reason| (reason, blockers)),
+        &snapshot_health::HealthThresholds::from_env(),
+    );
+}
+
+/// The synchronous core of [`record_snapshot_health_tick`]: updates the
+/// tracker from already-sampled inputs and logs. Split out so the tick's
+/// state machine is tested deterministically (injected `now`, usage, disk).
+fn apply_snapshot_health_tick(
+    health: &snapshot_health::SnapshotHealth,
+    now: std::time::Instant,
+    quarantined: u64,
+    (segments, bytes): (u64, u64),
+    disk: Option<(u64, u64)>,
+    outcome: Result<(), (String, Vec<nanobpmn_engine_core::Key>)>,
+    thresholds: &snapshot_health::HealthThresholds,
+) {
+    health.set_quarantined_orphans(quarantined);
+    health.set_journal_usage(segments, bytes);
+    health.set_disk(disk);
+    match outcome {
+        Ok(()) => {
+            if health.record_success(now) {
+                tracing::info!("journal snapshots recovered; compaction resumed");
+            }
+        }
+        Err((reason, blockers)) => {
+            let failures_before = health.report(now, thresholds).consecutive_failures;
+            if health.record_failure(now, &reason, blockers.clone()) {
+                tracing::warn!(
+                    consecutive_failures = failures_before + 1,
+                    blocking_keys = ?blockers,
+                    "journal snapshot failed: {reason} (repeats are suppressed; see GET /health)"
+                );
+            }
+        }
+    }
+    let (entered, cleared) = health.alert_transitions(thresholds);
+    for (cause, reason) in entered {
+        tracing::warn!(cause = cause.code(), "snapshot health DEGRADED: {reason}");
+    }
+    for cause in cleared {
+        tracing::info!(cause = cause.code(), "snapshot health recovered");
+    }
 }
 
 #[allow(
@@ -24453,6 +24591,145 @@ fn adhoc_event_kind(ev: &Event) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+mod snapshot_health_tick_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn thresholds() -> snapshot_health::HealthThresholds {
+        snapshot_health::HealthThresholds {
+            degraded_after_failures: 2,
+            uncompacted_bytes_max: 10_000,
+            disk_free_min_percent: 10.0,
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nano-1385-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    // #1385: a streak of fail-closed ticks (the #1383 mode) degrades /health
+    // with 503 naming the blocker; the next successful tick returns it to 200.
+    #[test]
+    fn failing_ticks_degrade_health_to_503_and_success_recovers() {
+        let h = snapshot_health::SnapshotHealth::new();
+        let t = thresholds();
+        let base = Instant::now();
+        h.start(base);
+        for i in 1..=3u64 {
+            apply_snapshot_health_tick(
+                &h,
+                base + Duration::from_secs(i * 60),
+                1,
+                (4, 500),
+                Some((50, 100)),
+                Err((SNAPSHOT_CAPTURE_ABORTED.to_string(), vec![7])),
+                &t,
+            );
+        }
+        let r = h.report(base + Duration::from_secs(180), &t);
+        assert!(r.is_degraded(), "{r:?}");
+        assert_eq!(r.blocking_keys, vec![7]);
+        assert_eq!(r.quarantined_orphans, 1);
+        assert_eq!(r.last_success_age_seconds, Some(180));
+        assert_eq!(
+            health_response(&r).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(h.failure_logs_suppressed(), 2, "one log line per streak");
+
+        apply_snapshot_health_tick(
+            &h,
+            base + Duration::from_secs(240),
+            1,
+            (1, 100),
+            Some((50, 100)),
+            Ok(()),
+            &t,
+        );
+        let r = h.report(base + Duration::from_secs(240), &t);
+        assert_eq!(r.status, "healthy");
+        assert_eq!(health_response(&r).status(), StatusCode::OK);
+    }
+
+    // #1385 disk guard across a crash/restart: the uncompacted footprint is
+    // read from DISK, so a node restarted over a journal that stopped
+    // compacting reports (and degrades on) the backlog immediately rather than
+    // starting from a falsely clean in-memory zero. Drives the real async tick
+    // against a real segmented journal behind an engine actor.
+    #[tokio::test]
+    async fn restarted_node_reports_pre_crash_uncompacted_backlog() {
+        let dir = scratch("restart");
+        {
+            let (mut journal, _recovery) =
+                journal::Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(
+                    nanobpmn_engine_core::ProcessBuilder::new("p")
+                        .start_event("s")
+                        .end_event("e")
+                        .connect("s", "e")
+                        .build()
+                        .unwrap(),
+                ))
+                .unwrap();
+            for _ in 0..50 {
+                let _ = journal
+                    .apply_command(Command::create_instance("p"))
+                    .unwrap();
+            }
+        } // crash: no snapshot was ever taken, nothing was compacted.
+
+        let (journal, recovery) = journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let handle = DeepthiHandle::spawn(journal, 0, None);
+        let h = snapshot_health::SnapshotHealth::new();
+        h.start(Instant::now());
+        record_snapshot_health_tick(
+            &h,
+            std::slice::from_ref(&handle),
+            &shared,
+            Err(SNAPSHOT_CAPTURE_ABORTED.to_string()),
+        )
+        .await;
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(
+            r.uncompacted_bytes > 1,
+            "pre-crash journal bytes seen: {r:?}"
+        );
+        assert!(r.uncompacted_segments >= 1);
+        assert_eq!(r.consecutive_failures, 1);
+        assert!(
+            r.blocking_keys.is_empty(),
+            "no payload blocker in this journal"
+        );
+        assert_eq!(r.causes, vec!["journal_uncompacted_bytes"]);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn disk_space_reads_the_data_volume() {
+        let (free, total) = disk_space_bytes(&std::env::temp_dir()).expect("statvfs");
+        assert!(total > 0 && free <= total);
+        assert_eq!(
+            detect_disk_capacity_bytes(&std::env::temp_dir()),
+            Some(total)
+        );
+    }
+}
+
+#[cfg(test)]
 mod adhoc_metrics_tests {
     use super::Event;
     use super::adhoc_event_kind;
@@ -25033,6 +25310,8 @@ async fn main() {
                 && let Some(handle) = server.engine.all().first().cloned()
             {
                 let store = server.store.clone();
+                let health = snapshot_health::global();
+                health.start(std::time::Instant::now());
                 tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
                     // Skip the immediate first tick.
@@ -25048,10 +25327,23 @@ async fn main() {
                         ticker.tick().await;
                         let snapped = handle.with(|journal| journal.snapshot_and_rotate()).await;
                         let Some((snap, covered)) = snapped else {
+                            record_snapshot_health_tick(
+                                health,
+                                std::slice::from_ref(&handle),
+                                &shared,
+                                Err(SNAPSHOT_CAPTURE_ABORTED.to_string()),
+                            )
+                            .await;
                             continue;
                         };
                         if let Err(e) = seglog::write_snapshot(&shared.dir, snap, covered) {
-                            tracing::warn!("journal snapshot write failed: {e}");
+                            record_snapshot_health_tick(
+                                health,
+                                std::slice::from_ref(&handle),
+                                &shared,
+                                Err(format!("journal snapshot write failed: {e}")),
+                            )
+                            .await;
                             continue;
                         }
                         // Never delete a segment the read model has not yet
@@ -25074,6 +25366,13 @@ async fn main() {
                             );
                         }
                         prev_covered = covered;
+                        record_snapshot_health_tick(
+                            health,
+                            std::slice::from_ref(&handle),
+                            &shared,
+                            Ok(()),
+                        )
+                        .await;
                     }
                 });
                 tracing::info!(
@@ -25094,6 +25393,8 @@ async fn main() {
                 let store = server.store.clone();
                 let lean = varstore.is_some();
                 let varstore = varstore.clone();
+                let health = snapshot_health::global();
+                health.start(std::time::Instant::now());
                 tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
                     // Skip the immediate first tick.
@@ -25125,7 +25426,9 @@ async fn main() {
                         // covered boundary once this partition's variables are
                         // durable, gating compaction on the var store too.
                         let mut var_position = vec![u64::MAX; num_partitions as usize];
-                        let mut ok = true;
+                        // The first failure of this tick, for snapshot health
+                        // (#1385); `None` = every partition snapshotted.
+                        let mut failure: Option<String> = None;
                         for handle in &handles {
                             let pid = handle.with(|journal| journal.partition_id()).await;
                             if let Some(vs) = &varstore {
@@ -25145,10 +25448,9 @@ async fn main() {
                                         if let Err(e) =
                                             vs.checkpoint(pid, covered_p, &ups, &forgets)
                                         {
-                                            tracing::warn!(
+                                            failure = Some(format!(
                                                 "var store checkpoint failed (partition {pid}): {e}"
-                                            );
-                                            ok = false;
+                                            ));
                                             break;
                                         }
                                         if (pid as usize) < covered.len() {
@@ -25158,7 +25460,9 @@ async fn main() {
                                         entries.push((pid, covered_p, snap));
                                     }
                                     None => {
-                                        ok = false;
+                                        failure = Some(format!(
+                                            "{SNAPSHOT_CAPTURE_ABORTED} (partition {pid})"
+                                        ));
                                         break;
                                     }
                                 }
@@ -25171,13 +25475,17 @@ async fn main() {
                                         entries.push((pid, covered_p, snap));
                                     }
                                     None => {
-                                        ok = false;
+                                        failure = Some(format!(
+                                            "{SNAPSHOT_CAPTURE_ABORTED} (partition {pid})"
+                                        ));
                                         break;
                                     }
                                 }
                             }
                         }
-                        if !ok {
+                        if let Some(reason) = failure {
+                            record_snapshot_health_tick(health, &handles, &shared, Err(reason))
+                                .await;
                             continue;
                         }
                         // The covered watermarks for the partitions THIS node owns
@@ -25189,7 +25497,13 @@ async fn main() {
                         // floor at 0 forever (unbounded cold archive, #1076).
                         let owned_covered: Vec<u64> = entries.iter().map(|e| e.1).collect();
                         if let Err(e) = seglog::write_multi_snapshot(&shared.dir, entries) {
-                            tracing::warn!("multi-partition snapshot write failed: {e}");
+                            record_snapshot_health_tick(
+                                health,
+                                &handles,
+                                &shared,
+                                Err(format!("multi-partition snapshot write failed: {e}")),
+                            )
+                            .await;
                             continue;
                         }
                         let exported = store.exported_watermarks(num_partitions as usize);
@@ -25222,6 +25536,7 @@ async fn main() {
                             );
                         }
                         prev_floor = seglog::cold_prune_floor(&owned_covered);
+                        record_snapshot_health_tick(health, &handles, &shared, Ok(())).await;
 
                         // Bound the durable var-store WAL: truncate it back to zero
                         // on its own cadence so a sustained write load can't grow it
@@ -25535,6 +25850,10 @@ async fn main() {
 
     // disabled it 404s, removing the endpoint from the attack surface. Computed
     // on scrape, so it costs nothing at steady state.
+    // Snapshot-health status (#1385): always mounted (an operator must be able
+    // to see a degraded node even with Prometheus scraping disabled).
+    app = app.route("/health", axum::routing::get(health_handler));
+
     if obs_config.metrics {
         app = app.route(
             "/metrics",

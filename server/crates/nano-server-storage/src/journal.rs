@@ -164,6 +164,20 @@ enum OrphanPolicy {
     Quarantine,
 }
 
+/// Blocking-key tracking for the snapshot fold (#1385). A fail-closed fold
+/// aborts at the first unreadable payload; that key is recorded as the current
+/// blocker and its ERROR is logged once per outage (until a fold succeeds)
+/// instead of on every snapshot tick, which is what buried #1383 for 23 days.
+#[derive(Default)]
+struct SnapshotBlockers {
+    /// Blockers of the most recent fold attempt (empty after a success).
+    current: Mutex<Vec<Key>>,
+    /// Keys already logged during the ongoing outage.
+    logged: Mutex<HashSet<Key>>,
+    /// Repeat blocker log lines suppressed so far.
+    suppressed: AtomicU64,
+}
+
 /// The engine plus its durable event log.
 pub struct Journal {
     engine: Engine,
@@ -248,6 +262,10 @@ pub struct Journal {
     /// (SQLite/IO error or an undecodable row, #1388). The row and routing entry
     /// are kept for a retry; this makes each such failure observable.
     offheap_read_failures: AtomicU64,
+    /// Instances whose off-heap payload aborted the latest snapshot fold, and
+    /// log-dedupe state for them (#1385). Surfaced on `/health` so an operator
+    /// can name what blocks compaction instead of grepping a per-tick ERROR.
+    snapshot_blockers: SnapshotBlockers,
     /// `true` when this journal's commands are applied as replicated (Raft)
     /// state-machine application (#1384). There, a quarantine discovered while
     /// applying a command must stay deterministic across replicas, so it is
@@ -1013,6 +1031,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
@@ -1046,6 +1065,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
@@ -1177,6 +1197,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
@@ -1214,6 +1235,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
@@ -1256,6 +1278,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
@@ -1293,6 +1316,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
@@ -2897,6 +2921,7 @@ impl Journal {
         policy: OrphanPolicy,
     ) -> Option<Vec<Key>> {
         let mut orphans = Vec::new();
+        self.begin_fold();
         // Cold rows carry their variables inline (a variable-spilled instance is
         // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
         // fold keeps them as-is; the loop below only resolves *resident*
@@ -2931,26 +2956,28 @@ impl Journal {
                     orphans.push(instance.key);
                 }
                 Ok(None) => {
-                    tracing::error!(
-                        instance_key = instance.key,
+                    self.note_blocker(
+                        instance.key,
+                        None,
                         "snapshot (strict): spilled instance has no variable row; aborting \
-                         this snapshot"
+                         this snapshot",
                     );
                     return None;
                 }
                 // Unreadable (SQLite/IO/decode): possibly transient — fail closed
                 // so the rotation aborts before the seal and the next tick retries.
                 Err(err) => {
-                    tracing::error!(
-                        instance_key = instance.key,
-                        error = %err,
+                    self.note_blocker(
+                        instance.key,
+                        Some(&err),
                         "snapshot: spilled instance's variable row could not be read; \
-                         aborting this snapshot (will retry)"
+                         aborting this snapshot (will retry)",
                     );
                     return None;
                 }
             }
         }
+        self.fold_succeeded();
         Some(orphans)
     }
 
@@ -2966,6 +2993,70 @@ impl Journal {
         if first {
             tracing::error!(instance_key = key, "{msg}");
         }
+    }
+
+    /// Starts a snapshot fold attempt: forgets the previous attempt's blockers
+    /// (the log-dedupe set survives until a fold succeeds).
+    fn begin_fold(&self) {
+        self.snapshot_blockers
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// A fold completed: the outage (if any) is over, so a later recurrence of
+    /// the same blocker is logged afresh.
+    fn fold_succeeded(&self) {
+        self.begin_fold();
+        self.snapshot_blockers
+            .logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Records `key` as blocking the current fold, logging `msg` at ERROR only
+    /// the first time the key blocks during this outage (#1385); repeats are
+    /// counted in [`snapshot_blocker_logs_suppressed`](Journal::snapshot_blocker_logs_suppressed).
+    fn note_blocker(&self, key: Key, err: Option<&str>, msg: &str) {
+        self.snapshot_blockers
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key);
+        let first = self
+            .snapshot_blockers
+            .logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+        if first {
+            match err {
+                Some(error) => tracing::error!(instance_key = key, error, "{msg}"),
+                None => tracing::error!(instance_key = key, "{msg}"),
+            }
+        } else {
+            self.snapshot_blockers
+                .suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(instance_key = key, "{msg} (repeat)");
+        }
+    }
+
+    /// Instance keys whose off-heap payload aborted the most recent snapshot
+    /// fold (#1385); empty after a successful fold.
+    pub fn snapshot_blockers(&self) -> Vec<Key> {
+        self.snapshot_blockers
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Repeat snapshot-blocker ERROR lines suppressed so far (#1385).
+    pub fn snapshot_blocker_logs_suppressed(&self) -> u64 {
+        self.snapshot_blockers.suppressed.load(Ordering::Relaxed)
     }
 
     /// Number of off-heap rehydration reads that failed as unreadable so far
@@ -3124,19 +3215,20 @@ impl Journal {
                      — quarantined (omitted) so snapshots and compaction are not blocked",
                 ),
                 Ok(None) => {
-                    tracing::error!(
-                        instance_key = key,
-                        "snapshot (strict): cold instance has no row; aborting this snapshot"
+                    self.note_blocker(
+                        key,
+                        None,
+                        "snapshot (strict): cold instance has no row; aborting this snapshot",
                     );
                     return None;
                 }
                 // Unreadable: possibly transient — fail closed and retry.
                 Err(err) => {
-                    tracing::error!(
-                        instance_key = key,
-                        error = %err,
+                    self.note_blocker(
+                        key,
+                        Some(&err.to_string()),
                         "snapshot: cold instance's row could not be read; aborting this \
-                         snapshot (will retry)"
+                         snapshot (will retry)",
                     );
                     return None;
                 }
@@ -3307,7 +3399,9 @@ impl Journal {
         &self,
     ) -> Option<(nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta)> {
         let mut snap = self.engine.snapshot_control_only();
+        self.begin_fold();
         let cold_upserts = self.fold_cold_into(&mut snap.state, OrphanPolicy::Quarantine)?;
+        self.fold_succeeded();
         for (key, _) in &cold_upserts {
             if let Some(inst) = snap.state.instances.get_mut(key)
                 && !inst.variables.is_empty()
@@ -4987,6 +5081,53 @@ mod tests {
         assert!(journal.quarantined_orphans().is_empty());
         let _ = journal.engine_snapshot();
 
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1385: the #1383 failure mode (an unreadable payload fail-closing every
+    // snapshot) must NAME the blocking instance key for /health, log the
+    // blocker once rather than every tick, and clear once the store reads again
+    // — proven across a store outage and its repair, deterministically.
+    #[test]
+    fn unreadable_spill_store_names_blocker_dedupes_logs_and_clears_on_recovery() {
+        let path = restart_store_path("blocker-spill");
+        let (journal, keys) = spilled_journal(&path, 2);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE spill RENAME TO spill_offline;")
+            .unwrap();
+
+        for _ in 0..3 {
+            assert!(journal.try_engine_snapshot_quarantining().is_none());
+        }
+        let blockers = journal.snapshot_blockers();
+        assert_eq!(blockers.len(), 1, "the fold aborts at the first blocker");
+        assert!(
+            keys.contains(&blockers[0]),
+            "{blockers:?} names a real instance"
+        );
+        assert_eq!(
+            journal.snapshot_blocker_logs_suppressed(),
+            2,
+            "the same blocker is logged once, then only counted"
+        );
+        assert!(
+            journal.quarantined_orphans().is_empty(),
+            "unreadable != orphan"
+        );
+
+        conn.execute_batch("ALTER TABLE spill_offline RENAME TO spill;")
+            .unwrap();
+        assert!(journal.try_engine_snapshot_quarantining().is_some());
+        assert!(journal.snapshot_blockers().is_empty(), "cleared on success");
+
+        // A recurrence after recovery is a NEW incident and logs again.
+        conn.execute_batch("ALTER TABLE spill RENAME TO spill_offline;")
+            .unwrap();
+        assert!(journal.try_engine_snapshot_quarantining().is_none());
+        assert_eq!(journal.snapshot_blocker_logs_suppressed(), 2);
+
+        drop(conn);
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

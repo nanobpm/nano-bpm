@@ -355,6 +355,17 @@ impl SegShared {
         self.dir.join(HEAD_NAME)
     }
 
+    /// The uncompacted journal footprint still on disk (#1385): `(segments,
+    /// bytes)` over every sealed segment plus the active one. A file that has
+    /// vanished (raced with compaction) or cannot be stat'ed counts as 0 bytes.
+    /// This is what grows without bound when snapshots stop succeeding (#1383).
+    pub fn uncompacted_usage(&self) -> (u64, u64) {
+        let size = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let sealed = self.sealed.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = sealed.iter().map(|s| size(&s.path)).sum::<u64>() + size(&self.active_path);
+        (sealed.len() as u64 + 1, bytes)
+    }
+
     /// Number of partitions this log tracks (0 for the single-partition legacy
     /// path, which does no per-partition bookkeeping).
     pub fn partitions(&self) -> usize {
@@ -2605,6 +2616,38 @@ mod tests {
         );
         assert_eq!(reopened.state().processes.len(), 1);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1385 disk guard input: the uncompacted footprint counts every segment
+    /// still on disk (sealed + active) and their bytes, and shrinks exactly by
+    /// what compaction deletes — the gauge a stalled snapshot pipeline grows.
+    #[test]
+    fn uncompacted_usage_tracks_sealed_and_active_segments_through_compaction() {
+        let dir = temp_dir("usage");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+        let sealed_bytes = fs::metadata(&shared.sealed.lock().unwrap()[0].path)
+            .unwrap()
+            .len();
+        assert!(sealed_bytes > 0);
+        let (segments, bytes) = shared.uncompacted_usage();
+        assert_eq!(segments, 2, "one sealed + the active segment");
+        assert!(bytes >= sealed_bytes);
+
+        write_snapshot(&dir, snap, covered).expect("write snapshot");
+        assert_eq!(compact(&shared, covered), 1);
+        let (segments_after, bytes_after) = shared.uncompacted_usage();
+        assert_eq!(segments_after, 1, "only the active segment remains");
+        assert_eq!(bytes_after, bytes - sealed_bytes);
+
+        drop(journal);
+        drop(shared);
         let _ = fs::remove_dir_all(&dir);
     }
 
