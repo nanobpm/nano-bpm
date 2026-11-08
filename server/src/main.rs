@@ -4440,6 +4440,8 @@ impl Drop for RebuildDepthGuard {
 pub(crate) struct RebuildDepthProbe {
     depth: Arc<std::sync::atomic::AtomicUsize>,
     peak: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rebuilds that found their predecessor core still live after teardown.
+    live_predecessors: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Recovery-tick passes a returning owner waits for an in-flight hand-off before
@@ -15562,6 +15564,14 @@ impl ServerImpl {
                 } else {
                     raft_log_dir_for(p)
                 };
+                // One core per partition (issue #1455): construct + register under
+                // the partition's rebuild lock, and skip if a concurrent
+                // promotion/hand-off rebuild already hosted a member — inserting
+                // over it would orphan a LIVE core without shutting it down.
+                let _rebuild_guard = server.partition_rebuild_lock(p).lock_owned().await;
+                if server.raft_registry().get(p).is_some() {
+                    continue;
+                }
                 match crate::raft::RaftPartition::bootstrap_member(
                     topology.node_id as u64,
                     p,
@@ -15630,7 +15640,11 @@ impl ServerImpl {
                     }
                     // `handle_promotion` (adopting the incumbent's epoch during the
                     // probe) may already have hosted a deferred partition as a fresh
-                    // receiver — don't clobber it.
+                    // receiver — don't clobber it. The check + construct + insert run
+                    // under the partition's rebuild lock (issue #1455) so a receiver
+                    // rebuild racing this path cannot slip in between the check and
+                    // the insert and be overwritten while still live.
+                    let _rebuild_guard = server.partition_rebuild_lock(p).lock_owned().await;
                     if server.raft_registry().get(p).is_some() {
                         continue;
                     }
@@ -16421,6 +16435,8 @@ impl ServerImpl {
         // then the new core is built and registered — never two live cores for one
         // partition.
         let _rebuild_guard = self.partition_rebuild_lock(p).lock_owned().await;
+        #[cfg(test)]
+        let _depth_guard = RebuildDepthGuard::enter(&self.rebuild_depth_probe);
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
 
@@ -16432,9 +16448,7 @@ impl ServerImpl {
 
         // Tear down the stale group (a learner of the dead leader) before replacing
         // it, so its openraft task and sockets are released.
-        if let Some(old) = self.raft.get(p) {
-            old.raft.shutdown().await.ok();
-        }
+        self.retire_predecessor_core(p).await;
 
         // Form a fresh single-voter group on a clean in-memory log (the engine's
         // own journal remains the local durability source). Initialize with this
@@ -17269,6 +17283,23 @@ impl ServerImpl {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
+
+    /// Shut down and await the current core for `p` (if any) before a rebuild
+    /// constructs its replacement — the single canonical teardown step shared by
+    /// every rebuild path. Must be called with `p`'s rebuild lock held.
+    async fn retire_predecessor_core(&self, p: u64) {
+        if let Some(old) = self.raft.get(p) {
+            old.raft.shutdown().await.ok();
+            // Test-only: record any predecessor still live after teardown, so a
+            // test fails if a rebuild constructs a successor next to a live core.
+            #[cfg(test)]
+            if !old.is_shutdown() {
+                self.rebuild_depth_probe
+                    .live_predecessors
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     /// Rebuild this node's member for `p` as a fresh receiver (uninitialized —
     /// receive-only) of `leader_node`'s group, replacing any existing member. A
     /// learner of an OLD lineage would reject a new leader's lower-term fresh log,
@@ -17291,9 +17322,7 @@ impl ServerImpl {
             Some(h) => h,
             None => self.replica_engine_for(p).await,
         };
-        if let Some(old) = self.raft.get(p) {
-            old.raft.shutdown().await.ok();
-        }
+        self.retire_predecessor_core(p).await;
         let transport = self.raft_transport();
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
@@ -37585,70 +37614,78 @@ mod clustered_startup_tests {
         }
     }
 
-    /// One core per partition, asserted: two concurrent rebuilds of the SAME
-    /// partition (two rebuild-as-receiver calls — the recovery-tick and hand-off
-    /// paths) are serialized by the per-partition rebuild lock, so the old core is
-    /// fully shut down and awaited before the new core starts and the two never
-    /// overlap (issue #1455).
+    /// One core per partition, asserted: a concurrent promote and
+    /// rebuild-as-receiver of the SAME partition (the recovery-tick and hand-off
+    /// paths) are serialized by the per-partition rebuild lock; each fully shuts
+    /// down its predecessor before constructing a successor (issue #1455).
     ///
-    /// Deterministic: the test holds the rebuild lock to force the two rebuilds to
-    /// queue behind it (no sleeps/retries — `lock_owned().await` is the
-    /// synchronization point), then releases it and asserts the rebuild critical
-    /// section NEVER overlapped: the depth probe must peak at 1, never 2.
+    /// Deterministic, independent of worker scheduling: with the lock held, BOTH
+    /// rebuild futures are polled in-line and must be `Pending` with no critical
+    /// section entered (removing the lock from either path makes its first poll
+    /// enter the section → depth > 0 → fail). Then the lock is released and both
+    /// complete; the depth must peak at 1, and every predecessor must be shut down.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_rebuilds_of_one_partition_are_serialized_one_core() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::task::Poll;
+
         let (node0, _node1, _node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
-
-        // Create the rebuild lock for partition 0 up front so the test can hold it
-        // to deterministically queue the two rebuilds behind it.
-        let lock = node0.partition_rebuild_lock(0);
         let probe = node0.rebuild_depth_probe.clone();
+        let original = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition 0 is hosted at boot");
 
-        // Hold the lock so BOTH rebuilds block on it (queue) before either enters
-        // its critical section.
-        let guard = lock.clone().lock_owned().await;
+        let guard = node0.partition_rebuild_lock(0).lock_owned().await;
 
-        // Spawn the two concurrent rebuild paths for the same partition. Both block
-        // on the held lock before touching the registry.
-        let n_a = node0.clone();
-        let a = tokio::spawn(async move { n_a.rebuild_as_receiver(0, 1).await });
-        let n_b = node0.clone();
-        let b = tokio::spawn(async move { n_b.rebuild_as_receiver(0, 1).await });
-
-        // While the guard is held, neither rebuild has entered its critical section.
+        let mut receiver = Box::pin(node0.rebuild_as_receiver(0, 1));
+        let mut promote = Box::pin(node0.promote_partition(0, 1_000));
+        let polled = std::future::poll_fn(|cx| {
+            Poll::Ready((
+                receiver.as_mut().poll(cx).is_pending(),
+                promote.as_mut().poll(cx).is_pending(),
+            ))
+        })
+        .await;
+        assert_eq!(polled, (true, true), "both rebuilds block on the held lock");
         assert_eq!(
-            probe.depth.load(std::sync::atomic::Ordering::SeqCst),
+            probe.peak.load(SeqCst),
             0,
             "no rebuild entered its critical section while the lock is held"
         );
+        assert!(
+            !original.is_shutdown(),
+            "the predecessor is untouched while the rebuilds are queued"
+        );
 
-        // Release the guard: the two queued rebuilds now run ONE AT A TIME (the
-        // lock serializes them), each fully shutting down the prior core before
-        // registering its replacement.
         drop(guard);
-        let (ra, rb) = tokio::join!(a, b);
-        ra.expect("rebuild A did not panic");
-        rb.expect("rebuild B did not panic");
+        let (ok, ()) = tokio::join!(receiver, promote);
+        assert!(ok, "the receiver rebuild succeeded");
 
-        // The two rebuilds never overlapped: the critical-section depth PEAKED at 1,
-        // never 2. The peak is a high-water mark, so a transient overlap would be
-        // caught even though the running depth returns to 0 once both finish.
         assert_eq!(
-            probe.peak.load(std::sync::atomic::Ordering::SeqCst),
+            probe.peak.load(SeqCst),
             1,
             "the rebuild critical section was never entered by two rebuilds at once"
         );
-
-        // Exactly ONE core serves the partition afterwards: the registry holds a
-        // single live member for partition 0 (no interleaved teardown left it down).
+        assert_eq!(
+            probe.live_predecessors.load(SeqCst),
+            0,
+            "every rebuild shut down its predecessor before constructing a successor"
+        );
+        assert!(
+            original.is_shutdown(),
+            "the original core was retired, not orphaned live"
+        );
         let part = node0
             .raft_registry()
             .get(0)
             .expect("partition 0 is hosted after the rebuilds");
         assert!(
-            !part.is_shutdown(),
-            "the single surviving core is live — no interleaved teardown left it shutdown"
+            !Arc::ptr_eq(&part, &original),
+            "a successor core replaced the original"
         );
+        assert!(!part.is_shutdown(), "the single surviving core is live");
 
         for p in 0..3u64 {
             if let Some(part) = node0.raft_registry().get(p) {
