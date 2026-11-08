@@ -23895,10 +23895,32 @@ const STORAGE_USAGE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::
 /// Samples the uncompacted journal footprint and data-dir free space into the
 /// snapshot-health tracker. Records NO snapshot outcome, so it is safe to run
 /// on any cadence (and when snapshots are disabled entirely).
-fn sample_storage_usage(health: &snapshot_health::SnapshotHealth, shared: &seglog::SegShared) {
+fn sample_storage_usage(
+    health: &snapshot_health::SnapshotHealth,
+    shared: &seglog::SegShared,
+    thresholds: &snapshot_health::HealthThresholds,
+) {
     let (segments, bytes) = shared.uncompacted_usage();
     health.set_journal_usage(segments, bytes);
     health.set_disk(disk_space_bytes(&shared.dir));
+    log_health_alert_transitions(health, thresholds);
+}
+
+/// Logs each degraded cause once on entry (WARN) and once on exit (INFO).
+/// Edge-triggered via [`SnapshotHealth::alert_transitions`](snapshot_health::SnapshotHealth::alert_transitions),
+/// so calling it from both the storage sampler and the snapshot tick never
+/// double-logs, and a breach surfaces even with snapshots disabled (#1385).
+fn log_health_alert_transitions(
+    health: &snapshot_health::SnapshotHealth,
+    thresholds: &snapshot_health::HealthThresholds,
+) {
+    let (entered, cleared) = health.alert_transitions(thresholds);
+    for (cause, reason) in entered {
+        tracing::warn!(cause = cause.code(), "snapshot health DEGRADED: {reason}");
+    }
+    for cause in cleared {
+        tracing::info!(cause = cause.code(), "snapshot health recovered");
+    }
 }
 
 /// Seeds the storage gauges synchronously (so `/health` reflects an existing
@@ -23908,13 +23930,21 @@ fn sample_storage_usage(health: &snapshot_health::SnapshotHealth, shared: &seglo
 /// tick, a breached threshold must still surface (#1385).
 fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>) {
     let health = snapshot_health::global();
-    sample_storage_usage(health, &shared);
+    sample_storage_usage(
+        health,
+        &shared,
+        &snapshot_health::HealthThresholds::from_env(),
+    );
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(STORAGE_USAGE_SAMPLE_INTERVAL);
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            sample_storage_usage(health, &shared);
+            sample_storage_usage(
+                health,
+                &shared,
+                &snapshot_health::HealthThresholds::from_env(),
+            );
         }
     });
 }
@@ -23994,13 +24024,7 @@ fn apply_snapshot_health_tick(
             }
         }
     }
-    let (entered, cleared) = health.alert_transitions(thresholds);
-    for (cause, reason) in entered {
-        tracing::warn!(cause = cause.code(), "snapshot health DEGRADED: {reason}");
-    }
-    for cause in cleared {
-        tracing::info!(cause = cause.code(), "snapshot health recovered");
-    }
+    log_health_alert_transitions(health, thresholds);
 }
 
 #[allow(
@@ -24775,11 +24799,16 @@ mod snapshot_health_tick_tests {
             ))
             .unwrap();
         let h = snapshot_health::SnapshotHealth::new();
-        sample_storage_usage(&h, &recovery.shared);
         let tiny_budget = snapshot_health::HealthThresholds {
             uncompacted_bytes_max: 1,
             ..thresholds()
         };
+        sample_storage_usage(&h, &recovery.shared, &tiny_budget);
+        // The sampler itself logs the entry transition (edge-triggered), so a
+        // breach is logged even with snapshots disabled: nothing is left
+        // pending for a later snapshot tick to log.
+        let (entered, _) = h.alert_transitions(&tiny_budget);
+        assert!(entered.is_empty(), "sampler consumed the entry transition");
         let r = h.report(Instant::now(), &tiny_budget);
         assert!(r.uncompacted_bytes > 1, "backlog seen: {r:?}");
         assert_eq!(r.consecutive_failures, 0, "no snapshot outcome recorded");

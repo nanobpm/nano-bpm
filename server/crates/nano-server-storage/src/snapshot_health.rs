@@ -154,6 +154,10 @@ struct State {
     quarantined_orphans: u64,
     /// `(free, total)` bytes of the data-dir volume, when known.
     disk: Option<(u64, u64)>,
+    /// Whether storage usage (journal backlog / disk) has been sampled at
+    /// least once — gates the storage gauges independently of the snapshot
+    /// task, which may be disabled (`NANOBPMN_SNAPSHOT_INTERVAL_MS=0`).
+    storage_sampled: bool,
     /// Causes already alerted, so a WARN fires once on entry, not every tick.
     alerted: Vec<DegradedCause>,
 }
@@ -236,6 +240,7 @@ impl SnapshotHealth {
         let mut s = self.lock();
         s.uncompacted_segments = segments;
         s.uncompacted_bytes = bytes;
+        s.storage_sampled = true;
     }
 
     /// Updates the count of instances quarantined as off-heap orphans.
@@ -245,7 +250,9 @@ impl SnapshotHealth {
 
     /// Updates the data-dir volume's `(free, total)` bytes (`None` = unknown).
     pub fn set_disk(&self, disk: Option<(u64, u64)>) {
-        self.lock().disk = disk;
+        let mut s = self.lock();
+        s.disk = disk;
+        s.storage_sampled = true;
     }
 
     /// Failure log lines suppressed as repeats so far.
@@ -346,15 +353,21 @@ impl SnapshotHealth {
         (entered, cleared)
     }
 
-    /// Prometheus text-exposition of the snapshot-health gauges. Emits nothing
-    /// before the snapshot task has started (a node without segmented
-    /// snapshots has no such pipeline to report on).
+    /// Prometheus text-exposition of the snapshot-health gauges. The
+    /// snapshot-pipeline gauges (age, failures, suppressed logs) are emitted
+    /// only once the snapshot task has started; the storage gauges (backlog,
+    /// disk, orphans) and the degraded flag are emitted once either the
+    /// snapshot task has started or storage has been sampled — so a node with
+    /// snapshots disabled still exports what `/health` reports. Emits nothing
+    /// when neither has happened (no segmented storage to report on).
     pub fn render_prometheus(&self, now: Instant, t: &HealthThresholds) -> String {
         use std::fmt::Write as _;
         let r = self.report(now, t);
-        let Some(age) = r.last_success_age_seconds else {
+        let sampled = self.lock().storage_sampled;
+        let age = r.last_success_age_seconds;
+        if age.is_none() && !sampled {
             return String::new();
-        };
+        }
         let suppressed = self.failure_logs_suppressed();
         let mut out = String::new();
         let mut gauge = |name: &str, kind: &str, help: &str, value: String| {
@@ -363,24 +376,26 @@ impl SnapshotHealth {
                 "# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"
             );
         };
-        gauge(
-            "nanobpm_journal_snapshot_last_success_age_seconds",
-            "gauge",
-            "Seconds since the last successful journal snapshot (since start if none yet) (#1385).",
-            age.to_string(),
-        );
-        gauge(
-            "nanobpm_journal_snapshot_consecutive_failures",
-            "gauge",
-            "Consecutive failed journal snapshot ticks (#1385).",
-            r.consecutive_failures.to_string(),
-        );
-        gauge(
-            "nanobpm_journal_snapshot_failure_logs_suppressed_total",
-            "counter",
-            "Repeated snapshot-failure log lines suppressed as duplicates (#1385).",
-            suppressed.to_string(),
-        );
+        if let Some(age) = age {
+            gauge(
+                "nanobpm_journal_snapshot_last_success_age_seconds",
+                "gauge",
+                "Seconds since the last successful journal snapshot (since start if none yet) (#1385).",
+                age.to_string(),
+            );
+            gauge(
+                "nanobpm_journal_snapshot_consecutive_failures",
+                "gauge",
+                "Consecutive failed journal snapshot ticks (#1385).",
+                r.consecutive_failures.to_string(),
+            );
+            gauge(
+                "nanobpm_journal_snapshot_failure_logs_suppressed_total",
+                "counter",
+                "Repeated snapshot-failure log lines suppressed as duplicates (#1385).",
+                suppressed.to_string(),
+            );
+        }
         gauge(
             "nanobpm_journal_uncompacted_segments",
             "gauge",
@@ -449,6 +464,36 @@ mod tests {
         assert_eq!(r.status, "healthy");
         assert_eq!(r.last_success_age_seconds, None);
         assert!(h.render_prometheus(now, &t()).is_empty());
+    }
+
+    // Snapshots disabled: the sampler alone populates storage usage, so the
+    // storage gauges + degraded flag must still be exported (matching
+    // `/health`), while the snapshot-pipeline gauges stay absent.
+    #[test]
+    fn storage_gauges_render_without_snapshot_task() {
+        let h = SnapshotHealth::new();
+        let now = Instant::now();
+        h.set_journal_usage(3, 5_000);
+        h.set_disk(Some((50, 100)));
+        assert_eq!(h.report(now, &t()).status, "degraded");
+        let prom = h.render_prometheus(now, &t());
+        assert!(
+            prom.contains("nanobpm_journal_uncompacted_bytes 5000"),
+            "{prom}"
+        );
+        assert!(prom.contains("nanobpm_data_dir_free_bytes 50"), "{prom}");
+        assert!(
+            prom.contains("nanobpm_snapshot_health_degraded 1"),
+            "{prom}"
+        );
+        assert!(
+            !prom.contains("nanobpm_journal_snapshot_last_success_age_seconds"),
+            "{prom}"
+        );
+        assert!(
+            !prom.contains("nanobpm_journal_snapshot_consecutive_failures"),
+            "{prom}"
+        );
     }
 
     // The #1383 failure mode: snapshots fail every tick on an unreadable
