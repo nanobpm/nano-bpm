@@ -293,6 +293,34 @@ fn the_settlement_ledger_is_bounded_and_evicts_oldest_deterministically() {
     assert_eq!(a.settled_jobs, b.settled_jobs, "replicas agree");
 }
 
+#[test]
+fn the_settlement_ledger_bounds_tokens_per_job() {
+    let mut st = State::new();
+    let total = state::SETTLED_TOKENS_PER_JOB_CAP + 5;
+    for i in 0..total {
+        state::record_job_settlement(
+            &mut st,
+            7,
+            state::JobSettlement {
+                lease_token: format!("t{i}"),
+                outcome: state::JobSettlementOutcome::Failed,
+            },
+            state::SETTLED_JOB_LEDGER_CAP,
+        );
+    }
+    let kept: Vec<String> = st.settled_jobs[&7]
+        .iter()
+        .map(|s| s.lease_token.clone())
+        .collect();
+    let expected: Vec<String> = (total - state::SETTLED_TOKENS_PER_JOB_CAP..total)
+        .map(|i| format!("t{i}"))
+        .collect();
+    assert_eq!(
+        kept, expected,
+        "one job's history is capped, oldest dropped"
+    );
+}
+
 /// A token settles one activation exactly once: after a retryable failure
 /// (which returns the job to `Created` with its lease token and activation
 /// latch intact), the same token asserting a DIFFERENT outcome must be

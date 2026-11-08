@@ -145,5 +145,5 @@ pub use state::{
     MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance, ProcessInstanceState,
     SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState, UserTask, UserTaskState,
     DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID,
-    PARTITION_BITS, SETTLED_JOB_LEDGER_CAP,
+    PARTITION_BITS, SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
 };

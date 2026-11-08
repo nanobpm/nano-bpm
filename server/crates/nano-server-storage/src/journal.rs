@@ -2075,7 +2075,12 @@ impl Journal {
             events_arc: None,
             ack,
         })) {
-            Ok(()) => Commit(CommitInner::Pending(rx)),
+            Ok(()) => {
+                // The writer decrements `inflight` by one per processed
+                // request, barriers included — account for it on enqueue.
+                crate::metrics::inflight_inc();
+                Commit(CommitInner::Pending(rx))
+            }
             // The writer thread is gone (shutting down); treat as already
             // settled so callers never hang.
             Err(_) => Commit::ready(),
@@ -2180,6 +2185,10 @@ impl Journal {
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         self.ensure_resident_for_command(&command)?;
+        let settles_job = matches!(
+            command,
+            Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
+        );
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
             .iter()
@@ -2196,7 +2205,10 @@ impl Journal {
         // short-circuits empty batches to a ready commit, so take a writer
         // barrier instead: it resolves once every write enqueued before it
         // (the original included) is fsynced.
-        let commit = if events.is_empty() {
+        // Only settlement commands can be idempotent replays; any other eventless
+        // no-op (e.g. an idle expiry sweep) keeps its ready commit so it costs
+        // no fsync and no commit statistics.
+        let commit = if events.is_empty() && settles_job {
             self.barrier()
         } else {
             self.persist(&events)
@@ -3583,6 +3595,16 @@ mod tests {
         assert!(
             matches!(replay.1, Commit(CommitInner::Pending(_))),
             "the replay's ack rides the writer queue behind the original, never a bare ready commit"
+        );
+        // An unrelated eventless no-op (not a settlement) keeps a ready commit:
+        // no barrier, no fsync, no commit statistics.
+        let noop = journal
+            .apply_command_at(Command::ExpireJobs { now: 3 }, 3)
+            .unwrap();
+        assert!(noop.0.is_empty());
+        assert!(
+            matches!(noop.1, Commit(CommitInner::Ready)),
+            "a non-settlement no-op must not take a writer barrier"
         );
         // Both resolve once the writer drains (no deadlock).
         block_on(original.wait());

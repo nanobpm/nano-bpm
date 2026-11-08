@@ -1737,6 +1737,14 @@ pub struct JobSettlement {
 /// to the pre-#1181 answer (409/404), never to a double settlement.
 pub const SETTLED_JOB_LEDGER_CAP: usize = 65_536;
 
+/// Upper bound on the lease tokens retained **per job** in
+/// [`State::settled_jobs`] (#1181). Repeated fail/reactivate cycles append one
+/// token per activation; beyond this the oldest token of that job is dropped,
+/// so the ledger's total size is bounded by
+/// `SETTLED_JOB_LEDGER_CAP * SETTLED_TOKENS_PER_JOB_CAP` entries. A replay of a
+/// dropped token on a still-live job remains fenced by [`Job::settled_tokens`].
+pub const SETTLED_TOKENS_PER_JOB_CAP: usize = 8;
+
 /// Record a settlement in the ledger, evicting the oldest entries beyond `cap`.
 ///
 /// Entries are keyed by job but **retained per lease token** (#1181): a later
@@ -1754,6 +1762,10 @@ pub fn record_job_settlement(state: &mut State, job_key: Key, entry: JobSettleme
         Some(known) => {
             if !known.iter().any(|s| s.lease_token == entry.lease_token) {
                 known.push(entry);
+                if known.len() > SETTLED_TOKENS_PER_JOB_CAP {
+                    let excess = known.len() - SETTLED_TOKENS_PER_JOB_CAP;
+                    known.drain(..excess);
+                }
             }
         }
         None => {
