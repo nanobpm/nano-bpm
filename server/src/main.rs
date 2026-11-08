@@ -2883,6 +2883,19 @@ impl ServerImpl {
                     for journal in journals.iter_mut() {
                         config.apply(journal);
                     }
+                    // #1338: post-recovery GC of orphaned cold/spill rows. The
+                    // journals are fully recovered (snapshot + replayed journal)
+                    // and not yet serving, so the engine state is authoritative
+                    // for liveness. A crash between a row's write and its
+                    // terminal eviction forget — or a row from a
+                    // pre-self-contained-snapshot engine whose routing index was
+                    // never persisted — leaves a row no live state references;
+                    // reap it now (rows still referenced by a legacy spilled flag
+                    // are preserved). Runs once here, before serving, so no
+                    // concurrent command can be mid-`put` for a key it deletes.
+                    for journal in journals.iter() {
+                        journal.gc_offheap_orphans();
+                    }
                     if let Some(cfg) = &config.var {
                         match cfg {
                             VarSpillCfg::Budget(budget) => tracing::info!(
