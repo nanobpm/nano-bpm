@@ -25201,7 +25201,11 @@ mod snapshot_health_tick_tests {
         ));
         let (mut journal, recovery) =
             journal::Journal::open_segmented(&dir).expect("open segmented");
-        let _ = journal
+        // Await the commit so the deploy is fsynced to the segment BEFORE the
+        // sampler reads its on-disk length below — otherwise the sampler races
+        // the background writer and can observe a zero-length active segment
+        // (#1466).
+        let (_, commit) = journal
             .apply_command(Command::DeployProcess(
                 nanobpmn_engine_core::ProcessBuilder::new("p")
                     .start_event("s")
@@ -25211,6 +25215,7 @@ mod snapshot_health_tick_tests {
                     .unwrap(),
             ))
             .unwrap();
+        commit.blocking_wait();
         let h = snapshot_health::SnapshotHealth::new();
         let tiny_budget = snapshot_health::HealthThresholds {
             uncompacted_bytes_max: 1,
@@ -25245,7 +25250,11 @@ mod snapshot_health_tick_tests {
         let dir = scratch("sampler-pending-actor");
         let (mut journal, recovery) =
             journal::Journal::open_segmented(&dir).expect("open segmented");
-        let _ = journal
+        // Await the commit so the deploy is fsynced to the segment BEFORE the
+        // sampler reads its on-disk length below — otherwise the sampler races
+        // the background writer and can observe a zero-length active segment
+        // (#1466). Async test, so use the async `wait` (not `blocking_wait`).
+        let (_, commit) = journal
             .apply_command(Command::DeployProcess(
                 nanobpmn_engine_core::ProcessBuilder::new("p")
                     .start_event("s")
@@ -25255,6 +25264,7 @@ mod snapshot_health_tick_tests {
                     .unwrap(),
             ))
             .unwrap();
+        commit.wait().await;
         let handle = DeepthiHandle::spawn(journal, 0, None);
 
         // Occupy the single writer with a job that parks until released, then
