@@ -215,8 +215,18 @@ impl<NID: NodeId> Inflight<NID> {
                 id: _,
                 log_id_range: logs,
             } => {
-                // if prev_log_id==None, it will never conflict
-                debug_assert_eq!(Some(conflict), logs.prev.index());
+                // The conflict index is the follower's REAL last-log frontier when
+                // the follower supplies a conflict hint, which may differ from the
+                // request's `prev_log_id` (the leader's guess). Without a hint the
+                // two are equal. Either way the in-flight request is answered, so
+                // the inflight is cleared; the conflict VALUE is applied by
+                // `ProgressEntry::update_conflicting`, not here.
+                debug_assert!(
+                    Some(conflict) <= logs.prev.index(),
+                    "conflict {} must not exceed the request's prev_log_id {:?}",
+                    conflict,
+                    logs.prev
+                );
                 *self = Inflight::None
             }
             Inflight::Snapshot { id: _, last_log_id: _ } => {

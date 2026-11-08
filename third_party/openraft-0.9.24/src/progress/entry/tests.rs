@@ -78,6 +78,97 @@ fn test_update_conflicting() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A replication response must be applied only if it answers the CURRENT
+/// in-flight request. A success/conflict whose inflight_id does not match the
+/// leader's current inflight for that target is STALE (a superseded request,
+/// e.g. after a walk-down reset the inflight and a fresh send bumped
+/// `curr_inflight_id`) and must be dropped — never applied to the new request.
+///
+/// Red: a stale success regresses `matching` / a stale conflict shrinks the
+/// search window for a request it does not answer.
+#[test]
+fn test_stale_inflight_success_is_dropped() -> anyhow::Result<()> {
+    // The leader walked the follower down to matching=3, then sent a fresh
+    // AppendEntries (inflight id 2) for (3..8]. A STALE success for the
+    // superseded inflight id 1 (which covered (5..10]) arrives. It must be
+    // dropped: applying it would ack the wrong request and jump `matching`
+    // past the current search window.
+    let mut pe = ProgressEntry::empty(20);
+    pe.matching = Some(log_id(3));
+    pe.curr_inflight_id = 2;
+    pe.inflight = inflight_logs(3, 8).with_id(2);
+
+    // Stale success for the OLD inflight id 1, matching=10 (past the window).
+    pe.update_matching(1, Some(log_id(10)))?;
+
+    // The stale response is dropped: matching and inflight are unchanged.
+    assert_eq!(Some(log_id(3)), pe.matching);
+    assert_eq!(inflight_logs(3, 8).with_id(2), pe.inflight);
+    assert_eq!(20, pe.searching_end);
+
+    Ok(())
+}
+
+#[test]
+fn test_stale_inflight_conflict_is_dropped() -> anyhow::Result<()> {
+    // The leader is mid-search with a fresh inflight (id 2) for (3..8]. A STALE
+    // conflict for the superseded inflight id 1 arrives, claiming conflict at
+    // index 4. It must be dropped: applying it would shrink `searching_end` for
+    // a request that is no longer in flight.
+    let mut pe = ProgressEntry::empty(20);
+    pe.matching = Some(log_id(3));
+    pe.curr_inflight_id = 2;
+    pe.inflight = inflight_logs(3, 8).with_id(2);
+
+    pe.update_conflicting(Some(1), 4)?;
+
+    // The stale conflict is dropped: searching_end and inflight are unchanged.
+    assert_eq!(20, pe.searching_end);
+    assert_eq!(inflight_logs(3, 8).with_id(2), pe.inflight);
+    assert_eq!(Some(log_id(3)), pe.matching);
+
+    Ok(())
+}
+
+/// The matching response (current inflight id) is still applied.
+#[test]
+fn test_current_inflight_response_is_applied() -> anyhow::Result<()> {
+    let mut pe = ProgressEntry::empty(20);
+    pe.matching = Some(log_id(3));
+    pe.curr_inflight_id = 2;
+    pe.inflight = inflight_logs(3, 8).with_id(2);
+
+    pe.update_matching(2, Some(log_id(8)))?;
+    assert_eq!(Some(log_id(8)), pe.matching);
+    assert_eq!(Inflight::None, pe.inflight);
+
+    Ok(())
+}
+
+/// A conflict reported at the follower's REAL last-log frontier (the conflict
+/// hint) shrinks the search window straight to that frontier, so the next probe
+/// starts there instead of walking down one RPC per step.
+#[test]
+fn test_conflict_hint_shrinks_search_to_follower_frontier() -> anyhow::Result<()> {
+    // The leader believes the follower may match up to index 20 and is probing
+    // with inflight (10..15]. The follower actually only has up to index 4 (a
+    // divergent/rebuilt receiver): it reports a conflict at its real frontier,
+    // index 5 (= follower's last index 4, + 1).
+    let mut pe = ProgressEntry::empty(20);
+    pe.matching = None;
+    pe.curr_inflight_id = 1;
+    pe.inflight = inflight_logs(10, 15).with_id(1);
+
+    pe.update_conflicting(Some(1), 5)?;
+
+    // The search window shrinks to the follower's frontier: searching_end = 5,
+    // not merely "one step down" from the probe.
+    assert_eq!(5, pe.searching_end);
+    assert_eq!(Inflight::None, pe.inflight);
+
+    Ok(())
+}
+
 /// LogStateReader impl for testing
 struct LogState {
     last: Option<LogId<u64>>,

@@ -1539,8 +1539,13 @@ pub fn snapshot_recovery_engaged() -> bool {
 fn snapshot_build_sem() -> &'static tokio::sync::Semaphore {
     static SNAPSHOT_BUILD_SEM: std::sync::OnceLock<tokio::sync::Semaphore> =
         std::sync::OnceLock::new();
-    SNAPSHOT_BUILD_SEM
-        .get_or_init(|| tokio::sync::Semaphore::new(snapshot_build_concurrency() as usize))
+    SNAPSHOT_BUILD_SEM.get_or_init(new_snapshot_build_sem)
+}
+
+/// Constructs the snapshot-build semaphore, sized from
+/// [`snapshot_build_concurrency`] — the one place its capacity is derived.
+fn new_snapshot_build_sem() -> tokio::sync::Semaphore {
+    tokio::sync::Semaphore::new(snapshot_build_concurrency() as usize)
 }
 
 /// The per-partition snapshot cadence, in applied log entries, with a bounded
@@ -2107,6 +2112,67 @@ impl RaftPartition {
         if !self.raft.is_initialized().await? {
             self.raft.initialize(members).await?;
         }
+        Ok(())
+    }
+
+    /// Boots this node's member for `partition_id` as a **fresh receiver**: an
+    /// uninitialized, receive-only member with an EMPTY log, a default (never
+    /// granted) vote and no committed / applied / snapshot state, so whichever
+    /// leader it is handed to replicates its lineage onto a blank slate. A
+    /// receiver that came up carrying a prior lineage would present the new
+    /// leader with a divergent COMMITTED prefix — a Raft safety violation that
+    /// openraft (rightly) asserts on (`committed log should never be truncated`,
+    /// issue #1454).
+    ///
+    /// The single canonical constructor for every receiver path (the hand-off /
+    /// promotion rebuild-as-receiver and the boot-deferred receiver). It fails
+    /// closed: a member that is not provably empty is shut down and an error is
+    /// returned rather than letting it join a group.
+    pub async fn bootstrap_fresh_receiver(
+        node_id: NodeId,
+        partition_id: u64,
+        engine: DeepthiHandle,
+        transport: Arc<dyn RaftTransport>,
+        evict_eligible: bool,
+    ) -> anyhow::Result<Self> {
+        // No durable log dir: a receiver never resumes an on-disk lineage, and a
+        // volatile member anchors its snapshots in a fresh per-boot temp dir, so
+        // no prior snapshot can seed its applied state either.
+        let part = Self::bootstrap_member(
+            node_id,
+            partition_id,
+            engine,
+            transport,
+            None,
+            evict_eligible,
+        )
+        .await?;
+        if let Err(e) = part.ensure_fresh_receiver_state().await {
+            part.raft.shutdown().await.ok();
+            return Err(e);
+        }
+        Ok(part)
+    }
+
+    /// Fails unless this member's Raft state is that of a fresh receiver: no log,
+    /// a default vote, and nothing committed, applied or snapshotted.
+    pub async fn ensure_fresh_receiver_state(&self) -> anyhow::Result<()> {
+        let committed = self.raft.with_raft_state(|s| s.committed).await?;
+        let m = self.raft.metrics().borrow().clone();
+        anyhow::ensure!(
+            m.last_log_index.is_none()
+                && m.vote == openraft::Vote::default()
+                && committed.is_none()
+                && m.last_applied.is_none()
+                && m.snapshot.is_none(),
+            "partition {}: a fresh receiver must start empty, found last_log_index={:?} \
+             vote={:?} committed={committed:?} last_applied={:?} snapshot={:?}",
+            self.partition_id,
+            m.last_log_index,
+            m.vote,
+            m.last_applied,
+            m.snapshot,
+        );
         Ok(())
     }
 
@@ -2853,7 +2919,10 @@ mod tests {
         assert!(c >= 1, "concurrency must be floored at 1, got {c}");
         // The semaphore is sized from the same helper, so it always has >=1 permit
         // (acquire_many(concurrency) for the exclusive recovery path can succeed).
-        assert!(snapshot_build_sem().available_permits() >= 1);
+        // Probe a freshly constructed one: the process-global instance is shared
+        // with concurrently running tests whose snapshot builds hold its permits,
+        // so its *available* count is not a capacity measure.
+        assert_eq!(new_snapshot_build_sem().available_permits(), c as usize);
     }
 
     #[test]
@@ -2968,6 +3037,48 @@ mod tests {
             instance_key: 1
         }));
         assert!(!is_creation_intake(&deploy_command()));
+    }
+
+    /// A fresh receiver is provably empty, and the emptiness guard fails closed
+    /// on a member that carries a lineage (issue #1454): a receiver with a
+    /// committed prefix would present a new leader with a divergent committed
+    /// lineage.
+    #[tokio::test]
+    async fn fresh_receiver_starts_empty_and_the_guard_rejects_a_lineage() {
+        let fresh = RaftPartition::bootstrap_fresh_receiver(
+            1,
+            0,
+            DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+            Arc::new(NullTransport),
+            false,
+        )
+        .await
+        .expect("a fresh receiver boots empty");
+        fresh
+            .ensure_fresh_receiver_state()
+            .await
+            .expect("fresh receiver state is empty");
+        fresh.raft.shutdown().await.ok();
+
+        // An initialized single voter carries a log, a vote and a committed entry.
+        let led = RaftPartition::bootstrap_single(
+            0,
+            0,
+            "http://self".into(),
+            DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+        )
+        .await
+        .expect("bootstrap single-voter raft");
+        let mut rejected = false;
+        for _ in 0..300 {
+            if led.ensure_fresh_receiver_state().await.is_err() {
+                rejected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(rejected, "a member with a lineage is not a fresh receiver");
+        led.raft.shutdown().await.ok();
     }
 
     #[tokio::test]

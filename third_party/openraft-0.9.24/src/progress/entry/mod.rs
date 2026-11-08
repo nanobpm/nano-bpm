@@ -98,6 +98,21 @@ impl<NID: NodeId> ProgressEntry<NID> {
             "update_matching"
         );
 
+        // A replication response is applied only if it answers the CURRENT
+        // in-flight request. A response whose id does not match the current
+        // inflight is STALE (a superseded request, e.g. after a walk-down reset
+        // the inflight and a fresh send bumped `curr_inflight_id`): drop it
+        // rather than ack the wrong request and regress/jump `matching` past
+        // the search window.
+        if self.inflight.get_id() != Some(request_id) {
+            tracing::debug!(
+                "dropping stale matching response: inflight id {:?} != response id {}",
+                self.inflight.get_id(),
+                request_id
+            );
+            return Ok(());
+        }
+
         self.inflight.ack(request_id, matching.clone())?;
 
         debug_assert!(matching >= self.matching);
@@ -133,6 +148,17 @@ impl<NID: NodeId> ProgressEntry<NID> {
         );
 
         if let Some(request_id) = request_id {
+            // Drop a stale conflict the same way as a stale matching response:
+            // it must answer the CURRENT in-flight request, or it would shrink
+            // `searching_end` for a request that is no longer in flight.
+            if self.inflight.get_id() != Some(request_id) {
+                tracing::debug!(
+                    "dropping stale conflict response: inflight id {:?} != response id {}",
+                    self.inflight.get_id(),
+                    request_id
+                );
+                return Ok(());
+            }
             self.inflight.conflict(request_id, conflict)?;
         }
 

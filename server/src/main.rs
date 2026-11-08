@@ -15661,17 +15661,31 @@ impl ServerImpl {
                         continue;
                     };
                     let deferred = handoff_incumbents.contains(&p);
-                    let log_dir = if deferred { None } else { raft_log_dir_for(p) };
-                    match crate::raft::RaftPartition::bootstrap_member(
-                        topology.node_id as u64,
-                        p,
-                        engine,
-                        transport.clone(),
-                        log_dir,
-                        false, // owned: has an exporter, never evicts in `apply`
-                    )
-                    .await
-                    {
+                    let me = topology.node_id as u64;
+                    // owned: has an exporter, never evicts in `apply`.
+                    let hosted = if deferred {
+                        // A fresh receiver (empty log/vote/committed) so the
+                        // incumbent never meets a divergent committed prefix (#1454).
+                        crate::raft::RaftPartition::bootstrap_fresh_receiver(
+                            me,
+                            p,
+                            engine,
+                            transport.clone(),
+                            false,
+                        )
+                        .await
+                    } else {
+                        crate::raft::RaftPartition::bootstrap_member(
+                            me,
+                            p,
+                            engine,
+                            transport.clone(),
+                            raft_log_dir_for(p),
+                            false,
+                        )
+                        .await
+                    };
+                    match hosted {
                         Ok(part) => {
                             server.raft_registry().insert(Arc::new(part));
                             tracing::info!(
@@ -17336,7 +17350,10 @@ impl ServerImpl {
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
-        match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await
+        // A fresh receiver: empty log, vote and committed state, so the new leader
+        // never meets a divergent committed prefix (issue #1454).
+        match RaftPartition::bootstrap_fresh_receiver(me, p, engine, transport, evict_terminal)
+            .await
         {
             Ok(part) => {
                 self.raft.insert(Arc::new(part));
@@ -38560,6 +38577,109 @@ mod clustered_startup_tests {
                 .map(|&(e, _)| e >= 2)
                 .unwrap_or(false),
             "the owner reclaimed at incumbent_epoch + 1 (>= 2), not a fresh epoch-1 self-promote"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    /// A partition rebuilt as a receiver starts from a blank Raft slate — empty
+    /// log, default vote, nothing committed/applied — even when the core it
+    /// replaces led its own lineage with committed entries; and the hand-off onto
+    /// that receiver converges to one leader (issue #1454). A receiver carrying
+    /// the old committed prefix would present the new leader with a divergent
+    /// committed lineage, the Raft safety violation openraft asserts on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuilt_receiver_starts_empty_and_the_handoff_converges() {
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Node 0 boots as the owner of partition 0: its core carries a committed
+        // lineage (at least the initializing membership entry).
+        let old = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition 0 hosted at boot");
+        let mut committed = None;
+        for _ in 0..300 {
+            committed = old
+                .raft
+                .with_raft_state(|s| s.committed)
+                .await
+                .ok()
+                .flatten();
+            if committed.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            committed.is_some(),
+            "the owner's boot lineage has a committed entry"
+        );
+
+        // Rebuild it as a receiver of node 1: the successor must be provably empty.
+        assert!(node0.rebuild_as_receiver(0, 1).await, "rebuild succeeds");
+        let fresh = node0.raft_registry().get(0).expect("receiver registered");
+        assert!(
+            !Arc::ptr_eq(&old, &fresh),
+            "a new core replaced the old one"
+        );
+        fresh
+            .ensure_fresh_receiver_state()
+            .await
+            .expect("a rebuilt receiver starts with empty log/vote/committed state");
+        assert_eq!(
+            fresh
+                .raft
+                .with_raft_state(|s| s.committed)
+                .await
+                .expect("state"),
+            None,
+            "nothing committed on the rebuilt receiver"
+        );
+
+        // Node 1 takes the partition over, then hands it back to node 0: the
+        // hand-off onto the (rebuilt) receiver converges with node 0 leading.
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "node 1 leads partition 0 after promoting");
+        let owner_addr = node0
+            .engine
+            .topology()
+            .peer_addr(0)
+            .expect("node 0 has an address")
+            .to_string();
+        node1.handle_handoff_request(0, 0, owner_addr).await;
+        let mut owner_leads = false;
+        for _ in 0..400 {
+            if node0.i_lead_raft(0) {
+                owner_leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            owner_leads,
+            "the hand-off converges: node 0 leads partition 0"
+        );
+        assert!(
+            !node1.i_lead_raft(0),
+            "node 1 stepped down after handing off"
         );
 
         for node in [&node0, &node1, &node2] {
