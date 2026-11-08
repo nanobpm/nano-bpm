@@ -50,7 +50,7 @@
 //! a reader can learn the `format_version` before attempting the body.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -363,21 +363,36 @@ pub fn write_streaming_snapshot_from_stores(
         resolve_spilled: move |snap| {
             let key = snap.instance.key;
             // Lean mode reads the authoritative var store; classic reads the
-            // spill cache. Mirror `Journal::peek_spilled_variables`'s preference.
-            // Fail-closed throughout: a store read ERROR is propagated (never
-            // swallowed into a silent `None`), so a transient/corrupt row aborts
-            // the snapshot instead of being mistaken for a definitively-absent
-            // payload.
+            // spill cache. Mirror `Journal::peek_spilled_variables`'s preference
+            // AND its fail-closed semantics (#1464 review): a store read ERROR is
+            // propagated (never swallowed into a silent `None`), so a
+            // transient/corrupt row aborts the snapshot instead of being mistaken
+            // for a definitively-absent payload.
             let resolved = if let Some(vs) = varstore.as_ref() {
                 match vs.try_get(key).map_err(|e| invalid_data(&e.to_string()))? {
                     Some(vars) => Some(vars),
-                    // Var store has no row: fall back to a legacy spill row, but
-                    // propagate a spill-store read error rather than flattening
-                    // it into "absent".
-                    None => match spill_store.as_ref() {
-                        Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
-                        None => None,
-                    },
+                    // The authoritative var store has NO row. A legacy spill row
+                    // may still exist from an unmigrated lean-over-legacy
+                    // transition; that row is potentially STALE (the var store is
+                    // authoritative), so accepting it would seal outdated
+                    // variables into a self-contained snapshot whose covered log
+                    // is then purged. `Journal::peek_spilled_variables` refuses
+                    // exactly this state (journal.rs) — fail closed here too
+                    // rather than seal a payload the restore side would reject.
+                    None => {
+                        let legacy_row = match spill_store.as_ref() {
+                            Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
+                            None => None,
+                        };
+                        if legacy_row.is_some() {
+                            return Err(invalid_data(&format!(
+                                "spilled instance {key}: var store has no row but a legacy \
+                                 spill row exists (unmigrated lean-over-legacy state); refusing \
+                                 to seal a potentially stale payload"
+                            )));
+                        }
+                        None
+                    }
                 }
             } else if let Some(sp) = spill_store.as_ref() {
                 sp.try_get(key).map_err(|e| invalid_data(&e.to_string()))?
@@ -436,9 +451,24 @@ where
     // Line 1: the envelope header (its format version is validated by the caller
     // before this is invoked). The line is consumed to advance past it; the body
     // is not inspected here.
-    let mut _header_line = String::new();
-    if reader.read_line(&mut _header_line)? == 0 {
+    let mut header_line = String::new();
+    if reader.read_line(&mut header_line)? == 0 {
         return Err(invalid_data("streaming snapshot is empty (no header)"));
+    }
+
+    // Legacy fallback (#1464 review): a snapshot written by a build predating the
+    // chunked sidecar framing is ONE headerless `EngineSnapshot` JSON value (the
+    // pre-#1337 layout), with no envelope header line. Mistaking its first line
+    // for a header would consume it and then fail with "no control frame",
+    // breaking boot recovery / install of a durable pre-upgrade snapshot (the
+    // #1065 replay-compat class). Detect the legacy shape — line 1 is NOT an
+    // envelope header — and decode the WHOLE stream as a single `EngineSnapshot`,
+    // then replay it through the same control/per-instance restore contract so
+    // the caller cannot tell the difference. The envelope marker `format_version`
+    // is fixed-for-all-time (see `seglog::SnapshotHeader`), so its presence on
+    // line 1 unambiguously marks the chunked framing; its absence marks legacy.
+    if !is_envelope_header_line(&header_line) {
+        return restore_legacy_headerless_snapshot(header_line, reader, restore_control, restore);
     }
 
     // Line 2: the control frame.
@@ -487,6 +517,85 @@ fn into_invalid_data(e: serde_json::Error) -> std::io::Error {
 
 fn invalid_data(msg: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// Whether a snapshot's first line is the always-parseable envelope header that
+/// prefixes the chunked sidecar framing. The header shape is fixed for all time
+/// (`seglog::SnapshotHeader`: `{"format_version":N,"incarnation":…,…}`), so the
+/// `format_version` key is the unambiguous marker. A legacy headerless snapshot
+/// is a bare `EngineSnapshot` (`{"state":…,"partition_id":…,…}`) whose first line
+/// never carries `format_version`, so this cleanly separates the two layouts.
+///
+/// The check parses the line as a generic JSON object and looks for the key,
+/// rather than a brittle substring match, so a legacy payload that happened to
+/// contain the substring inside a string value is not misclassified.
+fn is_envelope_header_line(line: &str) -> bool {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(line.trim())
+    else {
+        return false;
+    };
+    map.contains_key("format_version")
+}
+
+/// Restores a **legacy headerless** snapshot: a single bare `EngineSnapshot`
+/// JSON value (the pre-#1337 layout), with no envelope header and no chunk
+/// framing. `first_line` is the already-consumed first line of the stream;
+/// `reader` yields the remainder. The whole body is decoded as one
+/// `EngineSnapshot` (exactly as the pre-#1337 reader did with
+/// `serde_json::from_reader`), then decomposed and replayed through the
+/// streaming contract: `restore_control` once with the control skeleton, then
+/// `restore` once per instance.
+///
+/// A legacy snapshot pre-dates self-contained spill metadata, so it carries no
+/// `covered_events`; `0` is reported (the Raft install/boot callers take the log
+/// position from the snapshot `meta.last_log_id`, not the in-file count, and the
+/// reassembly reader ignores it). Memory note: a legacy file was always read
+/// whole, so buffering it here matches the legacy read's footprint — the bounded
+/// streaming path applies only to the new chunked framing.
+fn restore_legacy_headerless_snapshot<R, RD>(
+    first_line: String,
+    mut reader: BufReader<RD>,
+    mut restore_control: impl FnMut(EngineSnapshot, u64),
+    mut restore: R,
+) -> std::io::Result<()>
+where
+    R: FnMut(InstanceSnapshot),
+    RD: std::io::Read,
+{
+    // Reassemble the full body: the consumed first line plus the rest of the
+    // stream. A legacy snapshot is a single compact JSON value, so it is one
+    // logical document even if it spans multiple lines.
+    let mut body = first_line;
+    reader.read_to_string(&mut body)?;
+    let snapshot: EngineSnapshot = serde_json::from_str(&body).map_err(into_invalid_data)?;
+
+    // Split the whole snapshot into the control skeleton + one self-contained
+    // payload per instance, then replay them through the streaming contract so a
+    // caller (e.g. `read_streaming_engine_snapshot_from`) restores a legacy file
+    // exactly as it does a chunked one.
+    let EngineSnapshot {
+        state,
+        partition_id,
+        next_local,
+        num_partitions,
+        now,
+        start_dispatch_rr,
+    } = snapshot;
+    let (control_state, instances) =
+        nanobpmn_engine_core::Engine::decompose_state_for_streaming(state);
+    let control = EngineSnapshot {
+        state: control_state,
+        partition_id,
+        next_local,
+        num_partitions,
+        now,
+        start_dispatch_rr,
+    };
+    restore_control(control, 0);
+    for snap in instances {
+        restore(snap);
+    }
+    Ok(())
 }
 
 /// Reads a streaming snapshot from a positioned reader and reassembles the full,
@@ -861,5 +970,99 @@ mod tests {
             now: full.now,
             start_dispatch_rr: full.start_dispatch_rr,
         }
+    }
+
+    // #1464 review (legacy/upgrade compat, the #1065 replay class): a snapshot
+    // written by a build PREDATING the chunked sidecar framing is ONE headerless
+    // `EngineSnapshot` JSON value (no envelope header line, no control/chunk
+    // frames). The reader must detect that legacy shape and restore it — not
+    // mistake its first line for a header and fail with "no control frame",
+    // which would break boot recovery / install of a durable pre-upgrade
+    // snapshot. Red-first: this fails before the legacy fallback was added.
+    #[test]
+    fn streaming_snapshot_reads_a_legacy_headerless_snapshot() {
+        let engine = engine_with_instances(4);
+        let expected = instance_view(&engine);
+
+        // Serialize the WHOLE snapshot as one bare JSON value — the pre-#1337
+        // on-disk layout (headerless, unframed). This is exactly what
+        // `serde_json::from_reader` used to decode.
+        let legacy = engine.snapshot();
+        let body = serde_json::to_string(&legacy).expect("serialize legacy snapshot");
+        assert!(
+            !body.trim_start().starts_with("{\"format_version\""),
+            "legacy body must NOT carry an envelope header"
+        );
+        let path = tmp_path("legacy-headerless");
+        std::fs::write(&path, body).unwrap();
+
+        // The streaming reader must restore the legacy file transparently.
+        let rebuilt_snapshot =
+            read_streaming_engine_snapshot(&path).expect("legacy headerless snapshot must restore");
+        let rebuilt = Engine::from_snapshot(rebuilt_snapshot);
+        assert_eq!(
+            instance_view(&rebuilt),
+            expected,
+            "a legacy headerless snapshot restores every instance"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1464 review (fail-closed spill resolution): when the authoritative var
+    // store has NO row for a spilled instance but a LEGACY spill row still exists
+    // (an unmigrated lean-over-legacy transition), the streaming writer must FAIL
+    // CLOSED rather than seal the potentially-stale legacy payload into a
+    // self-contained snapshot — mirroring `Journal::peek_spilled_variables`,
+    // which refuses exactly this state. Red-first: the writer previously fell
+    // back to the legacy row and cleared the spilled flag.
+    #[test]
+    fn streaming_writer_rejects_a_stale_legacy_spill_row() {
+        let engine = engine_with_instances(1);
+        let (control, instances) = Engine::decompose_state_for_streaming(engine.state().clone());
+        let mut snap = instances.into_iter().next().expect("one instance");
+        let key = snap.instance.key;
+
+        // Mark the resident instance variable-spilled (empty placeholder + flag).
+        let stale_vars = (*snap.instance.variables).clone();
+        snap.instance.variables = Arc::new(HashMap::new());
+        snap.instance.variables_spilled = true;
+
+        // Stores: a lean var store with NO row for `key`, and a legacy spill
+        // store that STILL has a (stale) row. The production
+        // `write_streaming_snapshot_from_stores` resolve_spilled must refuse
+        // this, not seal the stale row.
+        let varstore = Arc::new(VarStore::open(None).expect("var store"));
+        let spill = Arc::new(VarSpillStore::open(None).expect("spill store"));
+        spill.put(key, &stale_vars).expect("seed legacy spill row");
+
+        let path = tmp_path("stale-legacy-spill");
+        let result = write_streaming_snapshot_from_stores(
+            &path,
+            &header_line(),
+            7,
+            StreamingCapture {
+                control: control_snapshot(&control, &engine),
+                resident: vec![snap],
+            },
+            &[],
+            SpillStores {
+                cold: None,
+                spill: Some(spill),
+                varstore: Some(varstore),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "a var-store miss with a surviving legacy spill row must fail closed, \
+             not seal a stale payload"
+        );
+        // Fail-closed also means the partial snapshot is removed, never sealed.
+        assert!(
+            !path.exists(),
+            "the rejected snapshot's partial file must be removed"
+        );
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -3261,7 +3261,13 @@ impl Journal {
         crate::snapstream::SpillStores,
     ) {
         let full = self.engine.snapshot();
-        let (control_state, resident) = Engine::decompose_state_for_streaming(full.state.clone());
+        // Move the captured state into decomposition (rather than cloning it):
+        // `Engine::snapshot` already cloned the resident `State` off the live
+        // engine, and `decompose_state_for_streaming` consumes it by value, so a
+        // second clone here would keep an unnecessary extra copy of its maps
+        // alive during decomposition — raising peak memory on exactly the
+        // memory-constrained nodes this change targets (#1464 review).
+        let (control_state, resident) = Engine::decompose_state_for_streaming(full.state);
         let control = nanobpmn_engine_core::EngineSnapshot {
             state: control_state,
             partition_id: full.partition_id,
