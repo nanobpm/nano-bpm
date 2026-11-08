@@ -174,3 +174,32 @@ fn test_membership_state_truncate() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// A same-term divergent lineage must not panic the membership truncate.
+///
+/// During a two-lineage hand-off a follower can receive a truncation directed at
+/// or below its COMMITTED membership index (its committed entry is on a different
+/// lineage than the truncating leader's). `MembershipState::truncate` asserted
+/// `since >= committed.next_index()` and panicked — taking the Raft core down on a
+/// recoverable divergence (the
+/// `recovery_tick_hands_off_a_boot_deferred_partition_from_the_epoch_map` CI
+/// failure). It must instead clamp the truncation to just past the committed index
+/// (committed membership is never removed) and revert any conflicting effective
+/// membership to it.
+#[test]
+fn test_membership_state_truncate_divergent_committed_lineage_does_not_panic() -> anyhow::Result<()> {
+    // Committed membership at index 2; effective (uncommitted) at index 4. A
+    // divergent leader directs a truncation at index 1 — BELOW the committed
+    // index.
+    let mut ms = MembershipState::new(effmem(2, 2, m1()), effmem(3, 4, m123_345()));
+
+    // Must not panic. The truncation is clamped to the committed frontier (index
+    // 3), which still reverts the conflicting effective membership (index 4) to
+    // the committed one.
+    let res = ms.truncate(1);
+    assert_eq!(&Some(log_id(2, 1, 2)), res.unwrap().log_id());
+    assert_eq!(&Some(log_id(2, 1, 2)), ms.committed().log_id());
+    assert_eq!(&Some(log_id(2, 1, 2)), ms.effective().log_id());
+
+    Ok(())
+}

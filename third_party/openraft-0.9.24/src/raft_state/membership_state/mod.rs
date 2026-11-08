@@ -182,10 +182,17 @@ where
     /// last membership                                           // after  deleting since..
     /// ```
     pub(crate) fn truncate(&mut self, since: u64) -> Option<Arc<EffectiveMembership<NID, N>>> {
-        debug_assert!(
-            since >= self.committed().log_id().next_index(),
-            "committed log should never be truncated: committed membership can not conflict with the leader"
-        );
+        // A same-term DIVERGENT lineage (a two-lineage hand-off, or a follower
+        // rebuilt as a fresh receiver) can direct a truncation at or below this
+        // follower's committed membership index: the follower's committed entry is
+        // on a different lineage than the truncating leader's. That is a conflict
+        // to resolve, not a panic — clamp the truncation to just past the committed
+        // index so committed membership is never removed, and revert any
+        // conflicting effective membership to it. Never assert: panicking here
+        // takes the Raft core down on a recoverable replication divergence (the
+        // `recovery_tick_hands_off_a_boot_deferred_partition_from_the_epoch_map`
+        // CI failure).
+        let since = std::cmp::max(since, self.committed().log_id().next_index());
 
         if Some(since) <= self.effective().log_id().index() {
             tracing::debug!(
