@@ -1123,6 +1123,17 @@ pub enum IncidentKind {
     /// expression reads) retries the activation. Additive brand-new variant —
     /// old journals never carry it (#1390).
     ExtractValueError,
+    /// An instance's off-heap variable payload was **definitively lost**: it was
+    /// quarantined as an off-heap orphan (#1383/#1384) because its spill/cold
+    /// row was absent from a readable store (e.g. state carried over from a
+    /// pre-#1331 snapshot whose spill store was wiped). The instance keeps only
+    /// its surviving resident variables; the spilled payload is unrecoverable.
+    /// Raised by the host's storage layer (not by any BPMN element behaviour) via
+    /// [`crate::Command::QuarantineOffheapOrphan`], so it is durable and
+    /// replicated like any other incident. Not operator-resolvable into a retry —
+    /// the data is gone — so it carries no `redrive` and no `job_key`. Additive
+    /// brand-new variant — old journals never carry it (#1384).
+    VariablesLost,
 }
 
 /// The lifecycle re-drive an incident replays when it is resolved. Carried by

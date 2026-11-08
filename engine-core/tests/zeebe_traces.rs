@@ -358,6 +358,10 @@ fn zeebe_error_type(kind: IncidentKind) -> &'static str {
         IncidentKind::DecisionEvaluation => "DECISION_EVALUATION_ERROR",
         IncidentKind::CalledElementError => "CALLED_ELEMENT_ERROR",
         IncidentKind::IoMapping => "IO_MAPPING_ERROR",
+        // A nano-internal durability incident (#1384): an off-heap orphan's
+        // spilled variables were lost. No Zeebe analogue — maps to `UNKNOWN`,
+        // matching the server's REST `incident_error_type_enum`.
+        IncidentKind::VariablesLost => "UNKNOWN",
     }
 }
 

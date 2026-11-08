@@ -88,6 +88,12 @@ struct Metrics {
     /// means the remote exporter rejected a batch as unacceptable; the node
     /// dropped it (delivery is best-effort in remote mode) rather than wedging.
     read_model_export_drops_total: IntCounter,
+    /// Off-heap orphans quarantined inside replicated (Raft) state-machine
+    /// application, where the durable `VariablesLost` incident is deliberately
+    /// NOT raised (it would mint a replica-local key and wall-clock timestamp,
+    /// diverging replicas — #1384). Non-zero means a loss was observed but only
+    /// logged; see the leader-propose follow-up.
+    offheap_orphans_unreported_total: IntCounter,
     /// Active falcon WebSocket connections.
     stream_connections_active: IntGauge,
     /// Time spent processing each falcon frame (read + apply + reply).
@@ -524,6 +530,14 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter");
 
+    let offheap_orphans_unreported_total = IntCounter::new(
+        "nanobpm_offheap_orphans_unreported_total",
+        "Off-heap-orphan quarantines observed inside replicated (Raft) state-machine \
+         application, where no durable VariablesLost incident is raised (to keep \
+         replicas deterministic); the loss is logged and counted only.",
+    )
+    .expect("valid counter");
+
     let read_model_export_drops_total = IntCounter::new(
         "nanobpm_read_model_export_drops_total",
         "Read-model export batches dropped by the remote transport after a \
@@ -948,6 +962,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(stream_credit_stalls_total.clone())))
         .and(registry.register(Box::new(read_model_export_retries_total.clone())))
         .and(registry.register(Box::new(read_model_export_drops_total.clone())))
+        .and(registry.register(Box::new(offheap_orphans_unreported_total.clone())))
         .and(registry.register(Box::new(stream_connections_active.clone())))
         .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
         .and(registry.register(Box::new(peer_connect_attempts_total.clone())))
@@ -1023,6 +1038,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         stream_credit_stalls_total,
         read_model_export_retries_total,
         read_model_export_drops_total,
+        offheap_orphans_unreported_total,
         stream_connections_active,
         stream_frame_processing_seconds,
         peer_connect_attempts_total,
@@ -1713,6 +1729,13 @@ pub fn record_read_model_export_retry() {
 /// allowed to wedge the pipeline.
 pub fn record_read_model_export_drop() {
     METRICS.read_model_export_drops_total.inc();
+}
+
+/// Records one off-heap-orphan quarantine observed inside replicated (Raft)
+/// state-machine application, where the durable incident is deliberately not
+/// raised (#1384) — the loss is logged and counted only.
+pub fn record_offheap_orphan_unreported() {
+    METRICS.offheap_orphans_unreported_total.inc();
 }
 
 /// Falcon connection opened (+1).

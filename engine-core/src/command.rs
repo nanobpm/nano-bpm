@@ -626,6 +626,21 @@ pub enum Command {
     /// contract. Does not commit history or advance BPMN. Canonical completion
     /// cleans up all agents when their process instance finishes.
     CompleteAgentInstance { agent_instance_key: Key },
+    /// Raise a durable [`crate::Event::IncidentRaised`]
+    /// ([`crate::IncidentKind::VariablesLost`]) on an instance the host's storage
+    /// layer has quarantined as an **off-heap orphan** (#1384): its spill/cold
+    /// variable row was definitively absent from a readable store, so the spilled
+    /// payload is unrecoverable and the instance keeps only its surviving resident
+    /// variables. The host (snapshot fold / boot reconciliation / rehydration)
+    /// routes this through the normal command path so the incident is journaled
+    /// and Raft-replicated like any other, instead of being only a local log line.
+    ///
+    /// **Idempotent** — re-applying it for an instance that already carries an
+    /// active `VariablesLost` incident is a no-op (at-least-once safe across a
+    /// leader retry / replay), and an unknown or terminal instance is a no-op too
+    /// (the orphan may have been cancelled between the quarantine note and this
+    /// command landing). Additive brand-new variant — old journals never carry it.
+    QuarantineOffheapOrphan { instance_key: Key },
 }
 
 /// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
@@ -765,6 +780,7 @@ impl Command {
             Command::CreateAgentInstance { .. } => "create_agent_instance",
             Command::UpdateAgentInstance { .. } => "update_agent_instance",
             Command::CompleteAgentInstance { .. } => "complete_agent_instance",
+            Command::QuarantineOffheapOrphan { .. } => "quarantine_offheap_orphan",
         }
     }
 
