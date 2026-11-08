@@ -938,14 +938,19 @@ impl VarSpillStore {
         spill_referenced: &std::collections::HashSet<Key>,
     ) -> rusqlite::Result<u64> {
         // Collect orphan keys first (read), then delete in chunks (write), so
-        // the read cursor never overlaps its own delete transaction.
+        // the read cursor never overlaps its own delete transaction. An
+        // enumeration failure is latched into `forget_faults` exactly like a
+        // delete failure (never silent — the documented contract above), with
+        // no keys retained because no delete was attempted.
         let spill_orphans: Vec<Key> = self
-            .spill_keys()?
+            .spill_keys()
+            .inspect_err(|err| self.faults.record(err, Vec::new()))?
             .into_iter()
             .filter(|k| !live.contains(k) && !spill_referenced.contains(k))
             .collect();
         let cold_orphans: Vec<Key> = self
-            .cold_keys()?
+            .cold_keys()
+            .inspect_err(|err| self.faults.record(err, Vec::new()))?
             .into_iter()
             .filter(|k| !live.contains(k))
             .collect();
@@ -1902,5 +1907,36 @@ mod tests {
         );
         // flush is a no-op when there is no worker.
         assert!(store.flush_forgets(), "forget worker flushed");
+    }
+
+    /// #1338 / #1468 failure-injection guard (enumeration path): a SQLite read
+    /// failure inside `gc_orphans`' key enumeration (`spill_keys`/`cold_keys`)
+    /// must be latched into `forget_faults` exactly like a delete failure —
+    /// never silently returned through `?` leaving `forget_faults().error()`
+    /// unset, which the documented contract forbids. Deterministic: dropping the
+    /// `spill` table makes `SELECT key FROM spill` fail with a real SQLite error.
+    #[test]
+    fn gc_orphans_enumeration_error_is_latched_as_a_fault() {
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(1, &vars("a")).unwrap();
+
+        // Break enumeration: dropping the `spill` table makes `spill_keys()` fail
+        // with a real SQLite read error before any delete is attempted.
+        {
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute("DROP TABLE spill", []).unwrap();
+        }
+
+        let live = std::collections::HashSet::new();
+        let spill_referenced = std::collections::HashSet::new();
+        let result = store.gc_orphans(&live, &spill_referenced);
+        assert!(
+            result.is_err(),
+            "enumeration failure propagates as an error"
+        );
+        assert!(
+            store.forget_faults().error().is_some(),
+            "the enumeration failure is latched observably, not silently returned"
+        );
     }
 }
