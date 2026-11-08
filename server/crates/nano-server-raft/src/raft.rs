@@ -1226,8 +1226,45 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     responses.push(ReplicatedResponse::default());
                 }
                 EntryPayload::Normal(batch) => {
-                    // Phase 1: apply every command in the batch in ONE actor hop,
-                    // returning per-command (events, commit) or the engine rejection.
+                    // Single-phase, per-command apply (#1405 rework): apply every
+                    // command of the batch directly against the LIVE journal in ONE
+                    // actor hop, journaling each command's events as it succeeds.
+                    // There is no scratch clone, no full-working-set snapshot, and
+                    // no per-batch cold hydration — each command hydrates only the
+                    // state it targets, exactly as the pre-#1443 hot path did.
+                    //
+                    // Per-command error classification
+                    // (`EngineError::is_environmental`, #1388) decides the failure
+                    // mode:
+                    //
+                    // * DETERMINISTIC rejection — a pure function of `(command,
+                    //   replicated state)`, so every replica computes it
+                    //   identically. It is recorded against its command and the
+                    //   batch CONTINUES: independent later submissions are not
+                    //   dropped. The entry is consumed normally (replicas stay in
+                    //   lockstep).
+                    //
+                    // * ENVIRONMENTAL failure — an off-heap row THIS replica cannot
+                    //   read. Applying past it would silently diverge this replica
+                    //   from healthy peers, so the apply FAILS CLOSED: the closure
+                    //   stops at the failed command (later commands are never
+                    //   evaluated or journaled) and the error is propagated out to
+                    //   abort the entry with a `StorageError` BEFORE `last_applied`
+                    //   moves. openraft treats it as fatal and shuts this replica's
+                    //   Raft core down; recovery re-applies the still-unapplied
+                    //   entry after the store heals.
+                    //
+                    // A failed command journals NOTHING (`apply_command_at` returns
+                    // before `persist`), so the environmental abort never writes a
+                    // half-applied copy of the failed command. Any earlier commands
+                    // of the same batch that already succeeded ARE journaled — but
+                    // replay is idempotent for them (a re-issued `CompleteJob`
+                    // against an already-completed job rejects deterministically
+                    // with `JobNotFound`; a byte-identical redeploy is skipped), so
+                    // on recovery the prefix converges and only the failed command
+                    // is actually retried. No scratch-vs-live divergence is possible
+                    // because there is only ONE evaluation, against the live state.
+                    //
                     // The command `kind` is captured alongside each outcome so the
                     // error-mapping phase below can apply the command-specific HTTP
                     // status contract (`engine_error_status_for`) — a rejection like
@@ -1237,27 +1274,60 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         (Arc<Vec<Event>>, crate::journal::Commit),
                         nanobpmn_engine_core::EngineError,
                     >;
-                    let outcomes: Vec<(&'static str, ApplyOutcome)> = self
+                    let (outcomes, environmental): (
+                        Vec<(&'static str, ApplyOutcome)>,
+                        Option<nanobpmn_engine_core::EngineError>,
+                    ) = self
                         .engine
                         .with(move |journal| {
-                            batch
-                                .items
-                                .into_iter()
-                                .map(|ReplicatedCommand { command, now }| {
-                                    // Per-command actor profiling (off unless
-                                    // NANOBPM_CMD_PROFILE): time + allocated-byte
-                                    // delta by command kind, on the engine thread.
-                                    let timer = crate::cmd_profile::start();
-                                    let kind = command.kind();
-                                    let outcome = journal.apply_command_at(command, now);
-                                    crate::cmd_profile::finish(timer, kind);
-                                    (kind, outcome)
-                                })
-                                .collect()
+                            let mut outcomes = Vec::with_capacity(batch.items.len());
+                            let mut environmental = None;
+                            for ReplicatedCommand { command, now } in batch.items.into_iter() {
+                                // Per-command actor profiling (off unless
+                                // NANOBPM_CMD_PROFILE): time + allocated-byte
+                                // delta by command kind, on the engine thread.
+                                let timer = crate::cmd_profile::start();
+                                let kind = command.kind();
+                                let outcome = journal.apply_command_at(command, now);
+                                crate::cmd_profile::finish(timer, kind);
+                                // Stop the batch at the first ENVIRONMENTAL failure
+                                // (fail closed): later commands must not be
+                                // evaluated or journaled once this replica has
+                                // proved it cannot read its own state. Deterministic
+                                // rejections do NOT stop the batch.
+                                if let Err(e) = &outcome
+                                    && e.is_environmental()
+                                {
+                                    environmental = Some(e.clone());
+                                    break;
+                                }
+                                outcomes.push((kind, outcome));
+                            }
+                            (outcomes, environmental)
                         })
                         .await;
 
-                    // Phase 2: await the durable barriers (now coalesced by the
+                    // An environmental failure aborts the WHOLE entry closed: the
+                    // failed command journaled nothing, later commands were never
+                    // evaluated, and `last_applied` does not move.
+                    if let Some(e) = environmental {
+                        tracing::error!(
+                            error = %e,
+                            "raft apply: environmental failure applying a committed \
+                             batch; failing closed (last_applied NOT advanced, the \
+                             failed command journaled nothing) — recover this \
+                             replica via snapshot/replay (#1405)"
+                        );
+                        return Err(StorageError::from_io_error(
+                            ErrorSubject::StateMachine,
+                            ErrorVerb::Write,
+                            std::io::Error::other(format!(
+                                "environmental failure applying committed batch: {e}"
+                            )),
+                        ));
+                    }
+
+                    // Await the durable barriers (now coalesced by the
                     // group-commit writer) and build the per-command responses.
                     let mut items = Vec::with_capacity(outcomes.len());
                     // A follower replica has no read-model exporter to drive
@@ -3482,6 +3552,359 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    // ---- #1405: an environmental (off-heap read) failure during apply must fail
+    // the replica CLOSED (StorageError → Raft core shutdown), never advance
+    // `last_applied` past a command a healthy replica applied; and a DETERMINISTIC
+    // rejection must NOT drop the independent later commands of the same batch. ----
+
+    /// A service-task process whose instance parks on the `demo-work` job (the
+    /// cold-spillable shape the #1388 journal tests use).
+    fn wait_process_command() -> Command {
+        let proc = ProcessBuilder::new("w")
+            .start_event("s")
+            .service_task("t", "demo-work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid wait process");
+        Command::DeployProcess(proc)
+    }
+
+    /// Drives `sm.apply` with one Normal entry carrying `commands` at `index`,
+    /// returning the outcome. This is the exact function openraft calls when a
+    /// committed entry reaches a replica.
+    #[allow(
+        clippy::result_large_err,
+        reason = "test helper returning openraft's StorageError verbatim; the production apply signature is fixed by the RaftStateMachine trait"
+    )]
+    async fn apply_entry(
+        sm: &Arc<PartitionStateMachine>,
+        index: u64,
+        commands: Vec<ReplicatedCommand>,
+    ) -> Result<Vec<ReplicatedResponse>, StorageError<NodeId>> {
+        use openraft::CommittedLeaderId;
+        let entry = Entry::<RaftConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+            payload: EntryPayload::Normal(ReplicatedBatch::new(commands)),
+        };
+        let mut sm = sm.clone();
+        RaftStateMachine::apply(&mut sm, vec![entry]).await
+    }
+
+    /// Boots a single-partition state machine over a fresh engine backed by a
+    /// cold-spill store at `store_path`, returning the engine handle + SM.
+    async fn cold_backed_sm(
+        store_path: &std::path::Path,
+    ) -> (DeepthiHandle, Arc<PartitionStateMachine>) {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with({
+                let store_path = store_path.to_path_buf();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open cold-spill store"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+        (engine, sm)
+    }
+
+    /// Deploys `wait_process_command`, creates an instance, activates its
+    /// `demo-work` job, then expires the activation lock (entry 4) so the instance
+    /// goes idle and becomes cold-spillable. Returns `(job_key, instance_key)`.
+    async fn setup_parked_job(
+        sm: &Arc<PartitionStateMachine>,
+        engine: &DeepthiHandle,
+    ) -> (u64, u64) {
+        let setup = [
+            ReplicatedCommand {
+                command: wait_process_command(),
+                now: 1,
+            },
+            ReplicatedCommand {
+                command: Command::create_instance("w"),
+                now: 2,
+            },
+            ReplicatedCommand {
+                command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                now: 3,
+            },
+            // Release the activation lock so the parked instance goes idle and is
+            // cold-spillable (a locked job keeps its instance hot).
+            ReplicatedCommand {
+                command: Command::ExpireJobs { now: 64_000 },
+                now: 64_000,
+            },
+        ];
+        let mut job_key = None;
+        for (i, cmd) in setup.into_iter().enumerate() {
+            let outcome = apply_entry(sm, (i + 1) as u64, vec![cmd])
+                .await
+                .expect("setup entry applies");
+            if i == 2 {
+                job_key = outcome[0].items[0].events.iter().find_map(|e| match e {
+                    Event::JobActivated { job_key, .. } => Some(*job_key),
+                    _ => None,
+                });
+            }
+        }
+        let job_key = job_key.expect("activation produced a job");
+        let instance_key = engine
+            .with(|j| j.state().instances.keys().next().copied())
+            .await
+            .expect("one live instance");
+        (job_key, instance_key)
+    }
+
+    /// Corrupts `instance_key`'s cold row in the store at `store_path` so any
+    /// read of it fails environmentally (`EngineError::InstanceUnavailable`).
+    fn corrupt_cold_row(store_path: &std::path::Path, instance_key: u64) {
+        let conn = rusqlite::Connection::open(store_path).expect("open store");
+        assert_eq!(
+            conn.execute(
+                "UPDATE cold SET snapshot = 'not-json{{' WHERE key = ?1",
+                [instance_key as i64],
+            )
+            .expect("corrupt"),
+            1
+        );
+    }
+
+    /// The core defect (#1405): a batch whose LATER command hits an unreadable
+    /// cold row on this replica must fail the WHOLE entry closed — `last_applied`
+    /// must NOT advance and the failed command must journal nothing — so a healthy
+    /// peer that applies the batch does not diverge from this replica.
+    #[tokio::test]
+    async fn apply_fails_closed_on_unreadable_state_instead_of_advancing_last_applied() {
+        let store_dir = unique_log_dir("1405-failclosed");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+        let (engine, sm) = cold_backed_sm(&store_path).await;
+        let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
+
+        // Spill the instance cold, then corrupt its row so the CompleteJob read
+        // fails environmentally on THIS replica.
+        engine
+            .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
+            .await;
+        corrupt_cold_row(&store_path, instance_key);
+
+        // A batch [deploy, complete_job]: the deploy succeeds, the completion hits
+        // the unreadable row. The whole entry must abort closed at index 5.
+        let batch = vec![
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 5,
+            },
+            ReplicatedCommand {
+                command: Command::complete_job(job_key),
+                now: 6,
+            },
+        ];
+        let refused = apply_entry(&sm, 5, batch).await;
+        assert!(refused.is_err(), "the impaired replica fails closed");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(4),
+            "last_applied stays at the pre-batch index (4), never advanced past the \
+             command a healthy replica applied"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Finding #2 (data loss): a batch mixing a DETERMINISTIC rejection with an
+    /// independent later valid command must apply the valid command — the
+    /// rejection is per-command, not a batch abort. `[CompleteJob(unknown),
+    /// DeployProcess(valid)]` must still deploy.
+    #[tokio::test]
+    async fn deterministic_rejection_does_not_drop_later_independent_commands() {
+        let store_dir = unique_log_dir("1405-detrej");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+        let (engine, sm) = cold_backed_sm(&store_path).await;
+
+        // Entry 1: [CompleteJob(unknown key) -> deterministic JobNotFound,
+        //           DeployProcess(valid) -> must still apply].
+        let batch = vec![
+            ReplicatedCommand {
+                command: Command::complete_job(999_999),
+                now: 1,
+            },
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 2,
+            },
+        ];
+        let outcome = apply_entry(&sm, 1, batch)
+            .await
+            .expect("the entry applies (no environmental failure)");
+        let items = &outcome[0].items;
+        assert_eq!(items.len(), 2, "both commands get a per-command outcome");
+        assert!(
+            items[0].error.is_some(),
+            "the unknown-job completion is a per-command rejection (got {:?})",
+            items[0]
+        );
+        assert!(
+            items[1].error.is_none() && !items[1].events.is_empty(),
+            "the independent valid deploy is NOT dropped by the earlier rejection \
+             (got {:?})",
+            items[1]
+        );
+        // The deploy actually landed in replicated state.
+        let procs = engine.with(|j| j.state().processes.len()).await;
+        assert_eq!(
+            procs, 1,
+            "the valid deploy was applied, not silently dropped"
+        );
+        // And the entry was consumed (last_applied advanced) — deterministic
+        // rejections keep replicas in lockstep.
+        let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(applied.map(|l| l.index), Some(1));
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Crash/restart proof (#1405, finding #7 — disk-backed): an impaired replica
+    /// that failed closed on a committed entry must, after a RESTART that reopens
+    /// its actual on-disk journal + Raft storage with the off-heap store healed,
+    //  re-apply the still-unapplied entry and converge — never skip it, never
+    /// double-apply the batch's already-journaled prefix.
+    #[tokio::test]
+    async fn failed_closed_replica_recovers_via_replay_after_restart() {
+        let store_dir = unique_log_dir("1405-restart");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+
+        let (job_key, instance_key, setup) = {
+            let (engine, sm) = cold_backed_sm(&store_path).await;
+            let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
+            engine
+                .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
+                .await;
+            corrupt_cold_row(&store_path, instance_key);
+
+            // The committed batch fails closed at index 5 (last_applied stays 4).
+            let batch = vec![
+                ReplicatedCommand {
+                    command: deploy_command(),
+                    now: 5,
+                },
+                ReplicatedCommand {
+                    command: Command::complete_job(job_key),
+                    now: 6,
+                },
+            ];
+            assert!(apply_entry(&sm, 5, batch.clone()).await.is_err());
+            let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
+            assert_eq!(applied.map(|l| l.index), Some(4));
+            // Keep the setup commands to replay into the post-restart replica.
+            let setup = vec![
+                ReplicatedCommand {
+                    command: wait_process_command(),
+                    now: 1,
+                },
+                ReplicatedCommand {
+                    command: Command::create_instance("w"),
+                    now: 2,
+                },
+                ReplicatedCommand {
+                    command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                    now: 3,
+                },
+                ReplicatedCommand {
+                    command: Command::ExpireJobs { now: 64_000 },
+                    now: 64_000,
+                },
+            ];
+            (job_key, instance_key, setup)
+        };
+
+        // RESTART + heal: write back a VALID cold row for the instance (the bytes
+        // a healthy replica holds), rebuilt by replaying the applied prefix into a
+        // scratch engine and spilling the instance out of it.
+        {
+            let snap = {
+                let mut e = nanobpmn_engine_core::Engine::with_partition(0);
+                let _ = e.apply_command_at(wait_process_command(), 1).expect("d");
+                let _ = e
+                    .apply_command_at(Command::create_instance("w"), 2)
+                    .expect("c");
+                let _ = e
+                    .apply_command_at(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3)
+                    .expect("a");
+                let _ = e
+                    .apply_command_at(Command::ExpireJobs { now: 64_000 }, 64_000)
+                    .expect("x");
+                e.snapshot_instance(instance_key)
+                    .expect("instance snapshot")
+            };
+            let store = nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                .expect("reopen store");
+            store.put_cold(instance_key, &snap).expect("heal the row");
+        }
+
+        // The post-restart replica re-applies the still-unapplied entry (index 4):
+        // it now succeeds and converges with what a healthy replica computed.
+        let (engine2, sm2) = cold_backed_sm(&store_path).await;
+        for (i, cmd) in setup.iter().enumerate() {
+            apply_entry(&sm2, (i + 1) as u64, vec![cmd.clone()])
+                .await
+                .expect("prefix replays");
+        }
+        let recovered = apply_entry(
+            &sm2,
+            5,
+            vec![
+                ReplicatedCommand {
+                    command: deploy_command(),
+                    now: 5,
+                },
+                ReplicatedCommand {
+                    command: Command::complete_job(job_key),
+                    now: 6,
+                },
+            ],
+        )
+        .await
+        .expect("the healed replica re-applies the entry");
+        assert!(
+            recovered[0].items.iter().all(|i| i.error.is_none()),
+            "both commands apply after recovery (got {:?})",
+            recovered[0].items
+        );
+        let (recovered_applied, _) = sm2.clone().applied_state().await.expect("applied_state");
+        assert_eq!(recovered_applied.map(|l| l.index), Some(5));
+
+        // Convergence: the deploy landed exactly once and the job drove the
+        // instance to completion.
+        let recovered_processes = engine2.with(|j| j.state().processes.len()).await;
+        assert_eq!(
+            recovered_processes, 2,
+            "the retried deploy landed exactly once"
+        );
+        let instance_state = engine2
+            .with(move |j| j.state().instances.get(&instance_key).map(|i| i.state))
+            .await;
+        assert!(
+            matches!(
+                instance_state,
+                Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
+            ),
+            "the retried CompleteJob drove the instance to completion (got {instance_state:?})"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     /// Polls `cond` until it holds or `timeout_ms` elapses.

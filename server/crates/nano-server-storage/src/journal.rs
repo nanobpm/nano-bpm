@@ -1869,7 +1869,10 @@ impl Journal {
     /// Test hook: cold-spills every currently dormant instance regardless of the
     /// memory watermark, returning the number shed. Lets tests exercise the
     /// spill/rehydrate seams deterministically without driving real RAM pressure.
-    #[cfg(test)]
+    // Also compiled under `test-hooks` (like `cold_spill_configured` above) so the
+    // raft crate's fail-closed apply tests (#1405) — which link this crate as a
+    // non-test library — can drive the cold-spill seam.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn force_cold_spill_all(&mut self) -> usize {
         let store = match self.cold.as_ref() {
             Some(cold) => Arc::clone(&cold.store),
