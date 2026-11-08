@@ -38,6 +38,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    settled_tokens: Vec::new(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -87,6 +88,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    settled_tokens: Vec::new(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -136,6 +138,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_message: None,
                     error_code: None,
                     has_failed_with_retries_left: false,
+                    settled_tokens: Vec::new(),
                 },
             );
             resync_job_index(state, *job_key);
@@ -273,6 +276,35 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 }
             }
             resync_job_index(state, *job_key);
+        }
+
+        Event::JobSettlementRecorded {
+            job_key,
+            outcome,
+            lease_token,
+            ..
+        } => {
+            let settlement = JobSettlement {
+                lease_token: lease_token.clone(),
+                outcome: *outcome,
+            };
+            record_job_settlement(state, *job_key, settlement.clone(), SETTLED_JOB_LEDGER_CAP);
+            // Fence the live job itself (#1181): a retryable failure leaves the
+            // job alive (Created, token retained), and this per-job record —
+            // never evicted while the job lives — is what rejects both a
+            // double-apply of the same settlement (after the bounded ledger
+            // aged the entry out) and a conflicting outcome under the same
+            // token. Terminal jobs are dropped from `jobs` shortly after, so
+            // the ledger remains the cross-eviction record.
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                if !job
+                    .settled_tokens
+                    .iter()
+                    .any(|s| s.lease_token == *lease_token)
+                {
+                    job.settled_tokens.push(settlement);
+                }
+            }
         }
 
         Event::JobCompleted { job_key, .. } => {

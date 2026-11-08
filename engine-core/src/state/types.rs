@@ -5,7 +5,7 @@
 //! module: it **never references [`crate::event`]**, so both `event` and the
 //! applier ([`super::apply`]) can depend on it without forming a cycle.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
@@ -358,6 +358,21 @@ pub struct Job {
         serde(default, skip_serializing_if = "std::ops::Not::not")
     )]
     pub has_failed_with_retries_left: bool,
+    /// The settlements this job has already consumed (#1181): each lease token
+    /// (per-activation fence) that settled it, with the outcome. This is the
+    /// replay fence for a **live** job — unlike the bounded
+    /// [`State::settled_jobs`] ledger it is never evicted while the job lives,
+    /// so a retryable failure's replay is still answered idempotently after the
+    /// ledger entry aged out, and a recorded token asserting a different
+    /// outcome is rejected instead of settling the same activation twice.
+    /// Populated by the same replicated `JobSettlementRecorded` event that
+    /// feeds the ledger. `serde(default)`: jobs serialized before #1181 load
+    /// with no consumed settlements.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Vec::is_empty")
+    )]
+    pub settled_tokens: Vec<JobSettlement>,
 }
 
 impl Job {
@@ -1695,6 +1710,75 @@ pub struct DeployedProcess {
     pub definition: ProcessDefinition,
 }
 
+/// How a leased job was settled — the outcome half of the idempotency key, so a
+/// replay is recognized only when it re-asserts the *same* outcome (#1181).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum JobSettlementOutcome {
+    Completed,
+    Failed,
+    ErrorThrown,
+}
+
+/// One settlement-ledger entry ([`State::settled_jobs`]): the outcome half of
+/// the idempotency key, so a replay is recognized only when it re-asserts the
+/// *same* outcome under the *same* lease token (#1181).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct JobSettlement {
+    /// The lease token of the activation that settled the job.
+    pub lease_token: String,
+    pub outcome: JobSettlementOutcome,
+}
+
+/// Upper bound on [`State::settled_jobs`]. Beyond it the entries with the
+/// smallest job keys (the oldest jobs) are dropped; a replay that old degrades
+/// to the pre-#1181 answer (409/404), never to a double settlement.
+pub const SETTLED_JOB_LEDGER_CAP: usize = 65_536;
+
+/// Upper bound on the lease tokens retained **per job** in
+/// [`State::settled_jobs`] (#1181). Repeated fail/reactivate cycles append one
+/// token per activation; beyond this the oldest token of that job is dropped,
+/// so the ledger's total size is bounded by
+/// `SETTLED_JOB_LEDGER_CAP * SETTLED_TOKENS_PER_JOB_CAP` entries. A replay of a
+/// dropped token on a still-live job remains fenced by [`Job::settled_tokens`].
+pub const SETTLED_TOKENS_PER_JOB_CAP: usize = 8;
+
+/// Record a settlement in the ledger, evicting the oldest entries beyond `cap`.
+///
+/// Entries are keyed by job but **retained per lease token** (#1181): a later
+/// settlement under a newer activation's token must not erase the replay key of
+/// an earlier settlement (a worker that lost the response under token T1 still
+/// gets its idempotent no-op after token T2 settled the next activation). The
+/// replay fence for a settlement whose job is still *live* does not depend on
+/// this bounded map at all — it is kept on the job itself
+/// ([`Job::settled_tokens`]) — so ledger eviction can never re-admit a
+/// settlement the live job already consumed. Deterministic (keyed `BTreeMap`,
+/// evicts lowest keys) so every replica applying the same events holds the same
+/// ledger.
+pub fn record_job_settlement(state: &mut State, job_key: Key, entry: JobSettlement, cap: usize) {
+    match state.settled_jobs.get_mut(&job_key) {
+        Some(known) => {
+            if !known.iter().any(|s| s.lease_token == entry.lease_token) {
+                known.push(entry);
+                if known.len() > SETTLED_TOKENS_PER_JOB_CAP {
+                    let excess = known.len() - SETTLED_TOKENS_PER_JOB_CAP;
+                    known.drain(..excess);
+                }
+            }
+        }
+        None => {
+            state.settled_jobs.insert(job_key, vec![entry]);
+        }
+    }
+    while state.settled_jobs.len() > cap {
+        if state.settled_jobs.pop_first().is_none() {
+            break;
+        }
+    }
+}
+
 /// The complete working state of the engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1715,6 +1799,25 @@ pub struct State {
     pub process_versions: HashMap<Key, DeployedProcess>,
     pub instances: HashMap<Key, ProcessInstance>,
     pub jobs: HashMap<Key, Job>,
+    /// The **settlement ledger** (#1181): for each *leased* job, every recorded
+    /// settlement — the lease token (per-activation fence) and the outcome it
+    /// produced. A replayed `CompleteJob`/`FailJob`/`ThrowJobError` bearing a
+    /// recorded token and the same outcome is answered as an idempotent no-op
+    /// instead of a 409, on any replica; a recorded token asserting a
+    /// *different* outcome is rejected outright (a token settles one activation
+    /// exactly once). Derived only from the replicated
+    /// [`crate::Event::JobSettlementRecorded`], so every replica (including one
+    /// that never saw a leader-local activation) holds the same ledger. Kept
+    /// apart from [`State::jobs`] so it outlives host-driven instance eviction;
+    /// bounded by [`SETTLED_JOB_LEDGER_CAP`] (live jobs additionally fence
+    /// themselves via [`Job::settled_tokens`], so eviction of a live job's
+    /// entry never re-admits its settlement). `serde(default)`: snapshots
+    /// written before #1181 load with an empty ledger.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub settled_jobs: BTreeMap<Key, Vec<JobSettlement>>,
     /// User tasks created for `userTask` elements, keyed by user-task key. A
     /// completed task is retained (transitioned to [`UserTaskState::Completed`])
     /// as an audit trail.
@@ -2295,6 +2398,7 @@ mod job_attribution_worker_tests {
             error_message: None,
             error_code: None,
             has_failed_with_retries_left: false,
+            settled_tokens: Vec::new(),
         }
     }
 

@@ -2164,6 +2164,41 @@ impl Journal {
         self.fresh
     }
 
+    /// A **durability barrier** for a command that produced no events (#1181):
+    /// the returned [`Commit`] resolves only after every write already enqueued
+    /// on this journal's writer is durable (written and fsynced). An idempotent
+    /// settlement replay applies with an empty event batch — nothing new to
+    /// persist — but it must not be acknowledged before the ORIGINAL
+    /// settlement it restates is durable: a crash in between would lose a
+    /// settlement the worker was told succeeded, and the job would re-execute.
+    /// The barrier rides the writer's strictly ordered queue (an empty write
+    /// request), so it joins the same group-commit batch as the still-pending
+    /// original and resolves with it. An in-memory journal (no writer) is
+    /// already durable, so the barrier is ready immediately.
+    pub fn barrier(&self) -> Commit {
+        let Some(writer) = self.writer.as_ref() else {
+            return Commit::ready();
+        };
+        let (ack, rx) = oneshot::channel();
+        match writer.send(WriterMsg::Write(WriteRequest {
+            bytes: Vec::new(),
+            events: 0,
+            partition: self.partition_id,
+            events_arc: None,
+            ack,
+        })) {
+            Ok(()) => {
+                // The writer decrements `inflight` by one per processed
+                // request, barriers included — account for it on enqueue.
+                crate::metrics::inflight_inc();
+                Commit(CommitInner::Pending(rx))
+            }
+            // The writer thread is gone (shutting down); treat as already
+            // settled so callers never hang.
+            Err(_) => Commit::ready(),
+        }
+    }
+
     /// Serializes `events` for the durable writer and forwards them to the
     /// read-model exporter, returning a [`Commit`] that resolves once they are
     /// fsynced. The events are shared via `Arc`, so the exporter handoff is a
@@ -2262,6 +2297,10 @@ impl Journal {
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         self.ensure_resident_for_command(&command)?;
+        let settles_job = matches!(
+            command,
+            Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
+        );
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
             .iter()
@@ -2271,7 +2310,21 @@ impl Journal {
             })
             .collect();
         self.rehydrate_activated_variables(&mut activated);
-        let commit = self.persist(&events);
+        // An eventless success (an idempotent settlement replay, #1181) has
+        // nothing new to persist, but acknowledging it must still wait until
+        // the ORIGINAL settlement it restates is durable — otherwise a crash
+        // loses an acknowledged settlement and the job re-executes. `persist`
+        // short-circuits empty batches to a ready commit, so take a writer
+        // barrier instead: it resolves once every write enqueued before it
+        // (the original included) is fsynced.
+        // Only settlement commands can be idempotent replays; any other eventless
+        // no-op (e.g. an idle expiry sweep) keeps its ready commit so it costs
+        // no fsync and no commit statistics.
+        let commit = if events.is_empty() && settles_job {
+            self.barrier()
+        } else {
+            self.persist(&events)
+        };
         self.maybe_spill();
         Ok((events, commit))
     }
@@ -3608,6 +3661,31 @@ mod tests {
 
     use super::*;
 
+    /// Minimal no-runtime `block_on` for the commit handles (a `Commit` resolves
+    /// on a plain `oneshot`, so a thread-parking waker suffices — no tokio
+    /// reactor needed).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::sync::mpsc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Parker(mpsc::Sender<()>);
+        impl Wake for Parker {
+            fn wake(self: Arc<Self>) {
+                let _ = self.0.send(());
+            }
+        }
+        let (tx, rx) = mpsc::channel::<()>();
+        let waker = Waker::from(Arc::new(Parker(tx)));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => rx.recv().unwrap(),
+            }
+        }
+    }
+
     fn demo() -> nanobpmn_engine_core::ProcessDefinition {
         ProcessBuilder::new("demo")
             .start_event("start")
@@ -3710,6 +3788,134 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert!(journal.state().jobs[&leased].deadline.is_some());
         assert!(journal.state().jobs[&soft].deadline.is_none());
+    }
+
+    /// #1181 regression: an eventless success (an idempotent settlement replay)
+    /// must NOT be acknowledged on a bare `Commit::ready()` from a file-backed
+    /// journal while the ORIGINAL settlement could still be in the writer's
+    /// queue — a crash in between would lose a settlement the worker was told
+    /// succeeded. The replay's commit must be a real writer-queue barrier
+    /// (`Pending`), which resolves once everything enqueued before it is
+    /// durable; an in-memory journal (nothing to fsync) stays `Ready`.
+    #[test]
+    fn an_eventless_replay_commit_is_a_real_durability_barrier() {
+        let dir = std::env::temp_dir().join(format!("nanobpmn-barrier-{}", std::process::id()));
+        let path = dir.join("test.journal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut journal = Journal::open(&path).unwrap();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let activation = journal
+            .apply_command_at(
+                Command::activate_jobs_with_options(
+                    "demo-work",
+                    "w1",
+                    1,
+                    60_000,
+                    0,
+                    nanobpmn_engine_core::JobActivationOptions {
+                        with_lease: true,
+                        ..Default::default()
+                    },
+                ),
+                0,
+            )
+            .unwrap()
+            .0;
+        let (job_key, token) = activation
+            .iter()
+            .find_map(|e| match e {
+                Event::JobActivated {
+                    job_key,
+                    lease_token: Some(t),
+                    ..
+                } => Some((*job_key, t.clone())),
+                _ => None,
+            })
+            .unwrap();
+
+        let settle = Command::complete_job(job_key).with_lease_token(Some(token));
+        let (events, original) = journal.apply_command_at(settle.clone(), 1).unwrap();
+        assert!(!events.is_empty(), "the first settlement really settles");
+        assert!(
+            matches!(original, Commit(CommitInner::Pending(_))),
+            "a real settlement on a file-backed journal is a pending write"
+        );
+        let replay = journal.apply_command_at(settle, 2).unwrap();
+        assert!(
+            replay.0.is_empty(),
+            "the replay is an eventless idempotent success"
+        );
+        assert!(
+            matches!(replay.1, Commit(CommitInner::Pending(_))),
+            "the replay's ack rides the writer queue behind the original, never a bare ready commit"
+        );
+        // An unrelated eventless no-op (not a settlement) keeps a ready commit:
+        // no barrier, no fsync, no commit statistics.
+        let noop = journal
+            .apply_command_at(Command::ExpireJobs { now: 3 }, 3)
+            .unwrap();
+        assert!(noop.0.is_empty());
+        assert!(
+            matches!(noop.1, Commit(CommitInner::Ready)),
+            "a non-settlement no-op must not take a writer barrier"
+        );
+        // Both resolve once the writer drains (no deadlock).
+        block_on(original.wait());
+        block_on(replay.1.wait());
+
+        // The in-memory journal has no writer: its barrier is already durable.
+        let mut memory = Journal::in_memory();
+        let _ = memory
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let _ = memory
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let activation = memory
+            .apply_command_at(
+                Command::activate_jobs_with_options(
+                    "demo-work",
+                    "w1",
+                    1,
+                    60_000,
+                    0,
+                    nanobpmn_engine_core::JobActivationOptions {
+                        with_lease: true,
+                        ..Default::default()
+                    },
+                ),
+                0,
+            )
+            .unwrap()
+            .0;
+        let (job_key, token) = activation
+            .iter()
+            .find_map(|e| match e {
+                Event::JobActivated {
+                    job_key,
+                    lease_token: Some(t),
+                    ..
+                } => Some((*job_key, t.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let settle = Command::complete_job(job_key).with_lease_token(Some(token));
+        let _ = memory.apply_command_at(settle.clone(), 1).unwrap();
+        let replay = memory.apply_command_at(settle, 2).unwrap();
+        assert!(replay.0.is_empty());
+        assert!(
+            matches!(replay.1, Commit(CommitInner::Ready)),
+            "an in-memory journal is already durable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

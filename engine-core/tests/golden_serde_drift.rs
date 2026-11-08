@@ -890,6 +890,13 @@ fn build_event_witnesses() -> Vec<Event> {
                 target_element_id: "call2".to_string(),
             }],
         },
+        // The #1181 settlement-ledger frame (additive variant, no version bump).
+        Event::JobSettlementRecorded {
+            job_key: 23,
+            instance_key: 24,
+            outcome: nanobpmn_engine_core::JobSettlementOutcome::Failed,
+            lease_token: "nano-lease:0000000000000019".to_string(),
+        },
     ]
 }
 

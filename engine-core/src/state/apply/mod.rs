@@ -93,6 +93,7 @@ pub fn apply(state: &mut State, event: &Event) {
         | Event::JobFailed { .. }
         | Event::JobErrorThrown { .. }
         | Event::JobCompleted { .. }
+        | Event::JobSettlementRecorded { .. }
         | Event::IncidentRaised { .. }
         | Event::JobRetriesUpdated { .. }
         | Event::JobTimeoutUpdated { .. }

@@ -192,5 +192,13 @@
       "target_process_definition_key": 7,
       "target_process_id": "p2"
     }
+  },
+  {
+    "JobSettlementRecorded": {
+      "instance_key": 24,
+      "job_key": 23,
+      "lease_token": "nano-lease:0000000000000019",
+      "outcome": "failed"
+    }
   }
 ]
