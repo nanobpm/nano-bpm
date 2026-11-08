@@ -229,7 +229,18 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
             };
             let payload = &raw[start..end];
             let bytes = match codec {
-                CODEC_RAW => payload.to_vec(),
+                CODEC_RAW => {
+                    // A RAW frame's two lengths are written identically; any
+                    // disagreement is a damaged header that could shorten the
+                    // frame and split off its marker (#1405) — fail closed.
+                    if raw_len != comp_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "journal RAW frame header lengths disagree",
+                        ));
+                    }
+                    payload.to_vec()
+                }
                 CODEC_DEFLATE => {
                     use std::io::Read;
 
@@ -5567,6 +5578,26 @@ mod tests {
         let mut mid = bad.clone();
         mid.extend_from_slice(&durable_frame);
         fs::write(&path, &mid).unwrap();
+        assert!(read_segment_events(&path).is_err());
+        assert!(read_segment_events_tagged(&path, 1).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a RAW frame whose header `comp_len` was shortened (so the frame
+    /// would end after its events, splitting the marker off as a "legacy tail")
+    /// is rejected: RAW header lengths must agree.
+    #[test]
+    fn shortened_raw_frame_header_is_rejected() {
+        let dir = temp_dir("short-raw");
+        fs::create_dir_all(&dir).unwrap();
+        let (ev, marker) = entry_lines(1);
+        let mut payload = ev.clone();
+        payload.extend_from_slice(&marker);
+        let mut frame = frame_atomic(&payload, 2, false).unwrap();
+        let short = u32::try_from(ev.len()).unwrap().to_le_bytes();
+        frame[6..10].copy_from_slice(&short);
+        let path = dir.join("j.jsonl");
+        fs::write(&path, &frame).unwrap();
         assert!(read_segment_events(&path).is_err());
         assert!(read_segment_events_tagged(&path, 1).is_err());
         let _ = fs::remove_dir_all(&dir);

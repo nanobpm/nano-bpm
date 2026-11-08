@@ -2575,6 +2575,11 @@ impl Journal {
         now: u64,
         fetch_variables: Vec<String>,
     ) -> Vec<ActivatedJob> {
+        if self.fenced {
+            // Fenced after an aborted entry (#1405): the resident state holds a
+            // non-durable prefix; never hand its jobs to a worker.
+            return Vec::new();
+        }
         let job_type = job_type.into();
         self.rehydrate_activation_candidates(&job_type, max_jobs);
         let mut activated = self.engine.activate_jobs_with_fetch(
@@ -2596,6 +2601,9 @@ impl Journal {
         now: u64,
         with_lease: bool,
     ) -> Vec<Key> {
+        if self.fenced {
+            return Vec::new(); // see `activate_jobs_with_fetch` (#1405)
+        }
         self.rehydrate_activation_candidates(job_type, max_jobs);
         self.engine
             .select_activatable_job_keys(job_type, max_jobs, now, with_lease)
@@ -3138,6 +3146,9 @@ impl Journal {
     /// may have re-spilled it right after activation (`maybe_spill`), and a
     /// healthy activation must not be withheld for that.
     pub fn resident_activated_job(&mut self, job_key: Key) -> Option<ActivatedJob> {
+        if self.fenced {
+            return None; // see `activate_jobs_with_fetch` (#1405)
+        }
         let mut job = self.engine.activated_job(job_key)?;
         if self.engine.is_variables_spilled(job.instance_key)
             && (self.varstore.is_some() || self.spill.is_some())

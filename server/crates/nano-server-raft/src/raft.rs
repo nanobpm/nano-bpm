@@ -4105,6 +4105,26 @@ mod tests {
                     .is_none()
             );
             assert!(engine.with(|j| j.try_engine_snapshot()).await.is_none());
+            // Leader-local soft activation bypasses `apply_command_at`; it too
+            // must hand out no work from the aborted prefix.
+            assert!(
+                engine
+                    .with(|j| j.select_activatable_job_keys("w", 10, u64::MAX / 2, false))
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .with(|j| j.activate_jobs_with_fetch("w", "x", 10, 1, 1, Vec::new()))
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .with(move |j| j.resident_activated_job(job_key))
+                    .await
+                    .is_none()
+            );
             assert!(
                 engine
                     .with(|j| j.apply_command_at(Command::create_instance("w"), 9))
