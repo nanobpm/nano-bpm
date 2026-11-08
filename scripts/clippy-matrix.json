@@ -259,6 +259,13 @@
       "count": 1,
       "reason": "Windows (MSVC)-only code: every required Clippy run is Linux x86_64 (gnu) or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
       "trackedIn": "#1372"
+    },
+    {
+      "file": "server/crates/nano-server-storage/src/seglog.rs",
+      "pred": "not(unix)",
+      "count": 1,
+      "reason": "Non-Unix fallback for same_file (no portable file identity): every required Clippy run is Linux x86_64 or wasm32, and the Windows binaries ship (publish-*-binaries.yml). Frozen by count; new sites fail the guard.",
+      "trackedIn": "#1372"
     }
   ]
 }
