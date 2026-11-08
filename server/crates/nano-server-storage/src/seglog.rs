@@ -761,6 +761,21 @@ fn engine_fingerprint() -> String {
     format!("nanobpmn-engine-core@{}", nanobpmn_engine_core::VERSION)
 }
 
+/// Serializes the always-parseable snapshot envelope header for `dir` as a
+/// single-line JSON string (no trailing newline), at the current
+/// [`SNAPSHOT_FORMAT_VERSION`]. Used by the streaming/sidecar snapshot writer
+/// (#1337), which frames the header on its own line before the control + chunk
+/// frames; the shape is fixed for all time so any reader can learn the
+/// `format_version` before attempting the body.
+pub fn snapshot_envelope_header_line(dir: &Path) -> io::Result<String> {
+    let header = SnapshotHeader {
+        format_version: SNAPSHOT_FORMAT_VERSION,
+        incarnation: read_or_init_incarnation(dir)?,
+        engine_fingerprint: engine_fingerprint(),
+    };
+    serde_json::to_string(&header).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
 /// Reads (or, on first use, generates and durably persists) this data
 /// directory's incarnation id. Stable for the lifetime of the data dir; a
 /// reset/restore that removes [`INCARNATION_NAME`] yields a fresh id, which is

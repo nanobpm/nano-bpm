@@ -1893,7 +1893,9 @@ impl Journal {
     /// Test hook: cold-spills every currently dormant instance regardless of the
     /// memory watermark, returning the number shed. Lets tests exercise the
     /// spill/rehydrate seams deterministically without driving real RAM pressure.
-    #[cfg(test)]
+    /// Also compiled under `test-hooks` so downstream crates' tests (the Raft
+    /// snapshot-streaming test, #1337) can force the cold tier deterministically.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn force_cold_spill_all(&mut self) -> usize {
         let store = match self.cold.as_ref() {
             Some(cold) => Arc::clone(&cold.store),
@@ -2761,17 +2763,18 @@ impl Journal {
     /// instances stay off-heap while the snapshot restores every variable and
     /// every instance with no dependency on the spill store.
     ///
-    /// **Memory tradeoff (accepted, #1337):** making the snapshot self-contained
-    /// requires materializing the full working set — every spilled variable map
-    /// and every cold instance — into one in-memory `EngineSnapshot` at capture
-    /// time. Because spill is what lets the live working set exceed available
-    /// RAM, a periodic or Raft snapshot can transiently recreate that entire
-    /// working set on the engine heap at once, risking a long actor stall or OOM
-    /// on the memory-constrained deployments spill targets. This
-    /// bounded-by-working-set materialisation is the accepted self-containment
-    /// tradeoff for now; a streaming/sidecar snapshot representation that never
-    /// holds the whole cold set in RAM is a larger Raft-snapshot redesign tracked
-    /// separately in #1337.
+    /// **Memory (#1337):** the Raft snapshot path no longer materializes the
+    /// whole cold set — `get_snapshot_builder` captures the streaming halves
+    /// ([`streaming_snapshot_parts`](Journal::streaming_snapshot_parts)) and
+    /// `build_snapshot` streams the cold/spilled rows straight from the spill
+    /// store to disk in bounded chunks, so the capture peak is one chunk, not the
+    /// working set. This local-rotation capture (`snapshot_and_rotate`) still
+    /// folds the full set into one in-memory `EngineSnapshot` for the
+    /// single-file `snapshot.*.bin` format; converting that on-disk format to
+    /// the chunked sidecar is the remaining local-path follow-up (a breaking
+    /// snapshot-format change requiring an explicit `SNAPSHOT_FORMAT_VERSION`
+    /// bump and replay-migrator validation, deliberately out of #1337's Raft
+    /// scope).
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         let mut snap = self.engine.snapshot();
         // Best-effort (see the doc above): a failed fold is logged and left
@@ -3235,6 +3238,77 @@ impl Journal {
             }
         }
         Some(folded)
+    }
+
+    /// Decomposes the live engine into the streaming halves and the store handles
+    /// needed to stream them to disk — everything the caller needs to run the
+    /// serialize **off** the engine thread (#1337). Runs on the engine thread (a
+    /// consistent read of the live state + the cold routing index); the returned
+    /// parts own only `Arc` store handles and the resident payloads, so the
+    /// follow-up [`write_streaming_snapshot_from_stores`](crate::snapstream::write_streaming_snapshot_from_stores)
+    /// is purely synchronous and never folds the whole cold set into one
+    /// in-memory [`EngineSnapshot`].
+    ///
+    /// A variable-spilled resident instance keeps its placeholder here; its real
+    /// payload is resolved from the spill tier as it streams out. A cold instance
+    /// is not read at all here — only its key is captured, and the row is read
+    /// lazily during the stream.
+    pub fn streaming_snapshot_parts(
+        &self,
+    ) -> (
+        crate::snapstream::StreamingCapture,
+        Vec<Key>,
+        crate::snapstream::SpillStores,
+    ) {
+        let full = self.engine.snapshot();
+        let (control_state, resident) = Engine::decompose_state_for_streaming(full.state.clone());
+        let control = nanobpmn_engine_core::EngineSnapshot {
+            state: control_state,
+            partition_id: full.partition_id,
+            next_local: full.next_local,
+            num_partitions: full.num_partitions,
+            now: full.now,
+            start_dispatch_rr: full.start_dispatch_rr,
+        };
+        let cold_keys: Vec<Key> = self
+            .cold
+            .as_ref()
+            .map(|c| c.index.keys().collect())
+            .unwrap_or_default();
+        let stores = crate::snapstream::SpillStores {
+            cold: self.cold.as_ref().map(|c| Arc::clone(&c.store)),
+            spill: self.spill.as_ref().map(|s| Arc::clone(&s.store)),
+            varstore: self.varstore.as_ref().map(Arc::clone),
+        };
+        (
+            crate::snapstream::StreamingCapture { control, resident },
+            cold_keys,
+            stores,
+        )
+    }
+
+    /// Streaming/sidecar counterpart of [`try_engine_snapshot`](Journal::try_engine_snapshot)
+    /// (#1337): captures a self-contained snapshot **without** materializing the
+    /// whole cold/spilled set in one in-memory [`EngineSnapshot`], streaming it
+    /// to `path` as bounded chunk frames. Fail-closed, exactly like
+    /// [`try_engine_snapshot`](Journal::try_engine_snapshot): returns `Err` the
+    /// moment any cold row or spilled payload cannot be read, and the partial
+    /// file is removed, so an incomplete snapshot is never sealed.
+    pub fn write_streaming_snapshot_to(
+        &self,
+        path: &std::path::Path,
+        header_line: &str,
+        covered_events: u64,
+    ) -> std::io::Result<()> {
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        crate::snapstream::write_streaming_snapshot_from_stores(
+            path,
+            header_line,
+            covered_events,
+            capture,
+            &cold_keys,
+            stores,
+        )
     }
 
     /// Reads a spilled instance's variables without consuming them: from the
@@ -4641,6 +4715,132 @@ mod tests {
         }
 
         assert_eq!(view(&spilled.engine_snapshot()), expected);
+    }
+
+    // #1337 defect-class guard: the streaming/sidecar capture must produce the
+    // SAME logical snapshot as the folding capture (every instance, every
+    // variable) — spill is invisible either way — while never folding the whole
+    // cold set into one in-memory `EngineSnapshot`. This drives a journal with a
+    // mix of cold-spilled and variable-spilled instances through
+    // `write_streaming_snapshot_to`, restores it by streaming, and asserts the
+    // rebuilt engine matches a never-spilled twin.
+    #[test]
+    fn streaming_snapshot_is_invariant_under_variable_and_cold_spill() {
+        use nanobpmn_engine_core::Value;
+
+        fn drive(journal: &mut Journal, between: fn(&mut Journal)) -> Vec<Key> {
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let mut keys = Vec::new();
+            for i in 0..4 {
+                if i == 2 {
+                    between(journal);
+                }
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("data".to_string(), Value::Str(format!("p{i}")));
+                vars.insert("n".to_string(), Value::Int(i));
+                let (events, _) = journal
+                    .apply_command(Command::create_instance_with("demo", vars))
+                    .unwrap();
+                keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+            }
+            keys
+        }
+        type InstanceView = (Key, Vec<(String, String)>, Vec<Key>);
+        fn view(snap: &nanobpmn_engine_core::EngineSnapshot) -> Vec<InstanceView> {
+            let mut out: Vec<_> = snap
+                .state
+                .instances
+                .values()
+                .map(|inst| {
+                    assert!(!inst.variables_spilled, "no placeholder in a snapshot");
+                    let mut vars: Vec<(String, String)> = inst
+                        .variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                        .collect();
+                    vars.sort();
+                    let mut jobs: Vec<Key> = snap
+                        .state
+                        .jobs
+                        .values()
+                        .filter(|j| j.instance_key == inst.key)
+                        .map(|j| j.key)
+                        .collect();
+                    jobs.sort();
+                    (inst.key, vars, jobs)
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        let mut resident = Journal::in_memory();
+        let keys = drive(&mut resident, |_| {});
+        let expected = view(&resident.engine_snapshot());
+
+        // The spilled twin: first batch wholly cold, second batch variable-spilled.
+        let mut spilled = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+        spilled.set_spill(Arc::clone(&store), usize::MAX);
+        spilled.set_cold_spill(Arc::clone(&store), u64::MAX, u64::MAX);
+        let spilled_keys = drive(&mut spilled, |j| {
+            assert_eq!(
+                j.force_cold_spill_all(),
+                2,
+                "precondition: first batch cold"
+            );
+        });
+        assert_eq!(spilled_keys, keys);
+        spilled.set_spill(store, 0);
+        spilled.force_spill_scan();
+        assert_eq!(spilled.cold_count(), 2);
+        for key in &keys[2..] {
+            assert!(
+                spilled.engine.is_variables_spilled(*key),
+                "second batch spilled"
+            );
+        }
+
+        // Capture via the streaming sidecar. The cold instances must NOT become
+        // resident as a side effect (the whole point of #1337).
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-stream-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot.stream.bin");
+        spilled
+            .write_streaming_snapshot_to(&path, "{\"format_version\":3}", 0)
+            .expect("streaming capture succeeds");
+        assert_eq!(
+            spilled.cold_count(),
+            2,
+            "cold instances stayed off-heap through the streaming capture"
+        );
+
+        // Restore by streaming, rebuilding a full EngineSnapshot one instance at
+        // a time, and confirm it is logically identical to the never-spilled twin.
+        let mut control: Option<nanobpmn_engine_core::EngineSnapshot> = None;
+        let mut restored = Vec::new();
+        crate::snapstream::read_streaming_snapshot(
+            &path,
+            |c, _| control = Some(c),
+            |snap| restored.push(snap),
+        )
+        .expect("streaming restore");
+        let mut snap = control.expect("control frame present");
+        for is in restored {
+            nanobpmn_engine_core::restore_instance_snapshot(&mut snap.state, is);
+        }
+        assert_eq!(view(&snap), expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // #1331 (lean path): a cold-spilled (wholly off-heap) instance must survive a

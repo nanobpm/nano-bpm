@@ -31,6 +31,12 @@ anyhow = "1.0.102"
 flate2 = "1.1.9"
 base64 = "0.22.1"
 
+[dev-dependencies]
+# Enable the storage crate's `test-hooks` (e.g. `Journal::force_cold_spill_all`)
+# so the snapshot-streaming test (#1337) can force the cold tier
+# deterministically instead of driving real RAM pressure.
+nano-server-storage = { path = "../nano-server-storage", features = ["test-hooks"] }
+
 [lints.rust]
 # Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
 # warning (unused code, deprecations, future-incompat lints, etc.).
