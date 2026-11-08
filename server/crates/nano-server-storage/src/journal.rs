@@ -2812,46 +2812,50 @@ impl Journal {
     pub fn try_engine_snapshot_quarantining_with_incidents(
         &mut self,
     ) -> Option<nanobpmn_engine_core::EngineSnapshot> {
-        let snap = self.try_engine_snapshot_quarantining()?;
-        // Raise the durable incident for every orphan this capture quarantined.
-        // The fold cleared the flag only in the SNAPSHOT copy; the live engine
-        // still has it set, so a `false` (snapshot) / `true` (live) pair names
-        // exactly the instances folded to quarantine on this pass. Doing it after
-        // the capture keeps the borrow simple and is safe: the command is
-        // idempotent, so an orphan already carrying an active incident (e.g. from
-        // boot reconciliation) re-raises nothing.
-        let mut raised_any = false;
-        for instance in snap.state.instances.values() {
-            let quarantined_this_pass =
-                !instance.variables_spilled && self.engine.is_variables_spilled(instance.key);
-            if quarantined_this_pass {
-                raised_any = true;
-                if let Err(error) = self.apply_command_at(
-                    Command::QuarantineOffheapOrphan {
-                        instance_key: instance.key,
-                    },
-                    now_millis(),
-                ) {
-                    tracing::error!(
-                        instance_key = instance.key,
-                        error = %error,
-                        "snapshot: failed to raise the VariablesLost incident for a \
-                         quarantined orphan before sealing (will retry on the next \
-                         quarantine path)"
-                    );
-                }
+        // Under replicated (Raft) application the classic rotation still runs on
+        // the Raft-owned actor, but raising an incident here would mint a
+        // replica-local key + wall-clock stamp outside any Raft proposal and
+        // diverge replicas (#1384 review). Capture STRICT there instead: an
+        // orphan aborts the rotation, exactly like the Raft snapshot builder,
+        // until the leader-propose redesign (#1447) lands.
+        if self.replicated_apply {
+            return self.try_engine_snapshot();
+        }
+        let mut snap = self.engine.snapshot();
+        let orphans = self.fold_offheap_into(&mut snap, OrphanPolicy::Quarantine)?;
+        if orphans.is_empty() {
+            return Some(snap);
+        }
+        // Only keys whose row was DEFINITIVELY ABSENT (the fold's `Ok(None)`
+        // arm) are orphans — a healthy fold also clears the snapshot copy's
+        // spilled flag, so the flag pair cannot identify orphans (#1384 review).
+        for key in orphans {
+            // Clear the LIVE spilled flag too, keeping the surviving resident
+            // map (as boot reconciliation does), so resolving the incident does
+            // not leave the instance spilled and re-raise on the next snapshot.
+            let resident = self
+                .engine
+                .instance(key)
+                .map(|i| Arc::clone(&i.variables))
+                .unwrap_or_default();
+            self.engine.rehydrate_variables(key, resident);
+            // Idempotent: an orphan already carrying an active incident is a no-op.
+            if let Err(error) = self.apply_command_at(
+                Command::QuarantineOffheapOrphan { instance_key: key },
+                now_millis(),
+            ) {
+                tracing::error!(
+                    instance_key = key,
+                    error = %error,
+                    "snapshot: failed to raise the VariablesLost incident for a \
+                     quarantined orphan before sealing (will retry on the next \
+                     quarantine path)"
+                );
             }
         }
-        // Re-capture so the snapshot returned for sealing CARRIES the incident(s)
-        // just raised — otherwise a restart from it would restore the cleared
-        // spill flag with no incident and the loss would go unreported. The
-        // re-capture re-folds (now a no-op: the orphans are already quarantined
-        // and their incidents active), so it cannot fail or double-raise.
-        if raised_any {
-            self.try_engine_snapshot_quarantining()
-        } else {
-            Some(snap)
-        }
+        // Re-capture so the sealed snapshot CARRIES the incident(s) just raised.
+        // The orphans are no longer spilled, so this cannot re-quarantine them.
+        self.try_engine_snapshot_quarantining()
     }
 
     /// Folds cold instances and spilled variable payloads into `snap` (see
@@ -2867,7 +2871,8 @@ impl Journal {
         &self,
         snap: &mut nanobpmn_engine_core::EngineSnapshot,
         policy: OrphanPolicy,
-    ) -> Option<()> {
+    ) -> Option<Vec<Key>> {
+        let mut orphans = Vec::new();
         // Cold rows carry their variables inline (a variable-spilled instance is
         // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
         // fold keeps them as-is; the loop below only resolves *resident*
@@ -2899,6 +2904,7 @@ impl Journal {
                          blocked",
                     );
                     instance.variables_spilled = false;
+                    orphans.push(instance.key);
                 }
                 Ok(None) => {
                     tracing::error!(
@@ -2921,7 +2927,7 @@ impl Journal {
                 }
             }
         }
-        Some(())
+        Some(orphans)
     }
 
     /// Records `key` as a quarantined off-heap orphan, logging `msg` at ERROR
@@ -5273,6 +5279,101 @@ mod tests {
         );
 
         drop(rebooted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+    }
+
+    // #1384 review: a HEALTHY spilled instance (row present) also has its
+    // snapshot-copy flag cleared by the fold; it must not be mistaken for an
+    // orphan and must not raise a VariablesLost incident.
+    #[test]
+    fn healthy_spill_snapshot_raises_no_incident() {
+        let path = restart_store_path("healthy-snap-1384");
+        let (mut journal, keys) = spilled_journal(&path, 1);
+        assert!(journal.engine.is_variables_spilled(keys[0]));
+        let snap = journal
+            .try_engine_snapshot_quarantining_with_incidents()
+            .expect("capture succeeds");
+        assert!(!snap.state.instances[&keys[0]].variables.is_empty());
+        assert!(
+            journal.engine.active_incidents().is_empty(),
+            "no false loss"
+        );
+        assert!(journal.quarantined_orphans().is_empty());
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1384 review: snapshot-first quarantine must clear the LIVE spilled flag,
+    // so resolving the incident does not re-raise it on the next snapshot.
+    #[test]
+    fn snapshot_quarantine_then_resolve_does_not_reraise() {
+        let old_path = restart_store_path("snap-resolve-1384-old");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let new_path = restart_store_path("snap-resolve-1384-new");
+        let mut rebooted = reboot_from(&new_path, legacy);
+        rebooted
+            .try_engine_snapshot_quarantining_with_incidents()
+            .expect("capture");
+        assert!(
+            !rebooted.engine.is_variables_spilled(keys[0]),
+            "live flag cleared"
+        );
+        let incident = rebooted.engine.active_incidents()[0].key;
+        let _ = rebooted
+            .apply_command_at(Command::resolve_incident(incident), 9)
+            .unwrap();
+        assert!(rebooted.engine.active_incidents().is_empty());
+        rebooted
+            .try_engine_snapshot_quarantining_with_incidents()
+            .expect("capture");
+        assert!(
+            rebooted.engine.active_incidents().is_empty(),
+            "resolved loss is not re-raised"
+        );
+        drop(rebooted);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
+    }
+
+    // #1384 review: under replicated apply the rotation capture is strict — it
+    // must neither mint a replica-local incident nor mutate live state.
+    #[test]
+    fn replicated_snapshot_rotation_is_strict_on_orphan() {
+        let old_path = restart_store_path("raft-snap-1384-old");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let new_path = restart_store_path("raft-snap-1384-new");
+        let mut orphaned = reboot_from(&new_path, legacy.clone());
+        let mut with_row = reboot_from(&old_path, legacy);
+        orphaned.set_replicated_apply(true);
+        with_row.set_replicated_apply(true);
+        assert!(
+            orphaned
+                .try_engine_snapshot_quarantining_with_incidents()
+                .is_none()
+        );
+        assert!(
+            with_row
+                .try_engine_snapshot_quarantining_with_incidents()
+                .is_some()
+        );
+        assert!(orphaned.engine.active_incidents().is_empty());
+        assert!(
+            orphaned.engine.is_variables_spilled(keys[0]),
+            "live state untouched"
+        );
+        let (a, _) = with_row
+            .apply_command_at(Command::create_instance("demo"), 8)
+            .unwrap();
+        let (b, _) = orphaned
+            .apply_command_at(Command::create_instance("demo"), 8)
+            .unwrap();
+        assert_eq!(a, b, "no replica-local key minted");
+        drop((orphaned, with_row));
         let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
         let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
     }
