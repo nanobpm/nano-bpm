@@ -2625,17 +2625,12 @@ impl Journal {
                 }
                 // Raise the durable incident (#1384) — idempotent, so
                 // a repeated activation/reconcile does not double-raise.
-                if let Err(error) = self.apply_command_at(
-                    Command::QuarantineOffheapOrphan { instance_key },
-                    now_millis(),
-                ) {
-                    tracing::error!(
-                        instance_key,
-                        error = %error,
-                        "{context}: failed to raise the VariablesLost incident for a \
-                         quarantined orphan (will retry on the next quarantine path)"
-                    );
-                }
+                // Raised WITHOUT the per-command spill housekeeping: the
+                // caller (an outer command or activation) is about to consume
+                // the surviving resident variables, and a due spill check with
+                // an exhausted budget would re-spill the orphan first
+                // (Copilot review on #1442).
+                self.raise_quarantine_incident(instance_key, context);
             }
         }
         Ok(())
@@ -2826,6 +2821,13 @@ impl Journal {
         if orphans.is_empty() {
             return Some(snap);
         }
+        // Release the first capture BEFORE raising the incidents and
+        // recapturing: it owns every off-heap payload the fold just
+        // materialized, and the recapture below reads and allocates them all
+        // again — holding both at once would double the off-heap working set
+        // on the memory-constrained nodes spilling targets (Copilot review on
+        // #1442).
+        drop(snap);
         // Only keys whose row was DEFINITIVELY ABSENT (the fold's `Ok(None)`
         // arm) are orphans — a healthy fold also clears the snapshot copy's
         // spilled flag, so the flag pair cannot identify orphans (#1384 review).
@@ -2840,22 +2842,44 @@ impl Journal {
                 .unwrap_or_default();
             self.engine.rehydrate_variables(key, resident);
             // Idempotent: an orphan already carrying an active incident is a no-op.
-            if let Err(error) = self.apply_command_at(
-                Command::QuarantineOffheapOrphan { instance_key: key },
-                now_millis(),
-            ) {
-                tracing::error!(
-                    instance_key = key,
-                    error = %error,
-                    "snapshot: failed to raise the VariablesLost incident for a \
-                     quarantined orphan before sealing (will retry on the next \
-                     quarantine path)"
-                );
-            }
+            self.raise_quarantine_incident(key, "snapshot");
         }
         // Re-capture so the sealed snapshot CARRIES the incident(s) just raised.
         // The orphans are no longer spilled, so this cannot re-quarantine them.
         self.try_engine_snapshot_quarantining()
+    }
+
+    /// Raises the durable [`Command::QuarantineOffheapOrphan`] incident for `key`
+    /// and journals it, WITHOUT the per-command spill housekeeping
+    /// (`maybe_spill`) the full [`apply_command_at`](Journal::apply_command_at)
+    /// path runs (#1384 review). Every quarantine site has just restored the
+    /// orphan's surviving resident variables for a consumer that needs them
+    /// next — the outer Modify/Migrate command, the activated job, or the
+    /// snapshot recapture — and a spill check that is due with an exhausted
+    /// budget would immediately re-spill the orphan, failing that outer command
+    /// with `InstanceUnavailable` or filtering its job out of activation. The
+    /// incident command emits only `IncidentRaised`, so the activated-job
+    /// rehydration step is a no-op here; spill housekeeping is left to the
+    /// outer command that follows.
+    fn raise_quarantine_incident(&mut self, key: Key, context: &str) {
+        match self.engine.apply_command_at(
+            Command::QuarantineOffheapOrphan { instance_key: key },
+            now_millis(),
+        ) {
+            Ok(events) => {
+                // The `Commit` is the journal write's durability receipt; the
+                // incident must survive a crash, so keep the must-use explicit.
+                let _commit = self.persist(&Arc::new(events));
+            }
+            Err(error) => {
+                tracing::error!(
+                    instance_key = key,
+                    error = %error,
+                    "{context}: failed to raise the VariablesLost incident for a \
+                     quarantined orphan (will retry on the next quarantine path)"
+                );
+            }
+        }
     }
 
     /// Folds cold instances and spilled variable payloads into `snap` (see
@@ -3032,19 +3056,12 @@ impl Journal {
                 // replicated) like any other — not just a local log line. The
                 // command is idempotent, so a repeated reconcile after a crash
                 // between the note and the journal write does not double-raise.
-                if let Err(error) = self.apply_command_at(
-                    Command::QuarantineOffheapOrphan { instance_key: key },
-                    now_millis(),
-                ) {
-                    // A no-op outcome (unknown/terminal instance) is not an error;
-                    // a real engine rejection is logged and retried next boot.
-                    tracing::error!(
-                        instance_key = key,
-                        error = %error,
-                        "boot reconciliation: failed to raise the VariablesLost incident \
-                         for a quarantined orphan (will retry on next boot)"
-                    );
-                }
+                // Raised WITHOUT the per-command spill housekeeping
+                // (`maybe_spill`): reconcile has just restored the orphan's
+                // surviving resident variables, and a due spill check with an
+                // exhausted budget would immediately re-spill it (Copilot
+                // review on #1442).
+                self.raise_quarantine_incident(key, "boot reconciliation");
                 orphans.push(key);
             }
         }
@@ -5302,6 +5319,64 @@ mod tests {
         assert!(journal.quarantined_orphans().is_empty());
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1384 review (Copilot on #1442): raising the quarantine incident must NOT
+    // run the per-command spill housekeeping (`maybe_spill`). The orphan's
+    // surviving resident variables were just restored for the outer consumer
+    // (here: a job activation); a due spill check with an exhausted budget must
+    // not re-spill the orphan before that consumer reads them (which would
+    // withhold the job / fail the outer command with `InstanceUnavailable`).
+    #[test]
+    fn orphan_quarantine_does_not_respill_restored_variables() {
+        let old_path = restart_store_path("orphan-respill-1384-old");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let legacy = journal.engine.snapshot();
+        drop(journal);
+        let key = keys[0];
+
+        // Reboot over a store whose row was wiped (orphan), with the spill
+        // budget EXHAUSTED (cap 0): any `maybe_spill` re-sheds every resident
+        // spill candidate — including a freshly restored orphan.
+        let new_path = restart_store_path("orphan-respill-1384-new");
+        let mut orphan_journal = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&new_path)).unwrap());
+        orphan_journal.set_spill(store, 0);
+        orphan_journal.restore_engine_from_snapshot(legacy);
+        assert!(orphan_journal.engine.is_variables_spilled(key));
+
+        // Activation discovers the orphan, quarantines it and raises the
+        // incident. The incident raise must not re-spill the restored orphan:
+        // the job is handed out with the surviving resident variables.
+        let activated = orphan_journal.activate_jobs("demo-work", "w", 1, 60_000, 0);
+        assert_eq!(activated.len(), 1, "the orphan's job is not withheld");
+        assert!(
+            !orphan_journal.engine.is_variables_spilled(key),
+            "the restored orphan is not re-spilled by the incident raise"
+        );
+        assert_eq!(orphan_journal.engine.active_incidents().len(), 1);
+
+        // Housekeeping is deferred, not lost: a later ordinary command runs
+        // its `maybe_spill` and re-sheds the orphan once it is spillable again
+        // (it holds only its empty surviving map until a SetVariables repopulates
+        // it, so here we give it a payload first).
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "data".to_string(),
+            nanobpmn_engine_core::Value::Str("surviving".to_string()),
+        );
+        let _ = orphan_journal
+            .apply_command(Command::set_variables(key, vars))
+            .unwrap();
+        orphan_journal.force_spill_scan();
+        assert!(
+            orphan_journal.engine.is_variables_spilled(key),
+            "the next command's housekeeping re-sheds the orphan"
+        );
+
+        drop(orphan_journal);
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(new_path.parent().unwrap());
     }
 
     // #1384 review: snapshot-first quarantine must clear the LIVE spilled flag,
