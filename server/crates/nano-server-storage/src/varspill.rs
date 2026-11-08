@@ -454,16 +454,17 @@ impl VarSpillStore {
         // dropped by `forget` at eviction, so the store stays bounded by the
         // live set.
         //
-        // That bound is restored after a crash by the post-recovery GC (#1338):
-        // a crash between writing a cold/spill row and the instance's terminal
-        // eviction `forget` (or a row written by an engine predating
-        // self-contained snapshots, whose routing index was never persisted)
-        // leaves an orphan that `forget` never reaches, because the in-RAM cold
-        // index is not rebuilt at boot. [`gc_orphans`](Self::gc_orphans) deletes
-        // every row no longer referenced by the recovered live state — while
-        // preserving rows still referenced by a legacy spilled flag — and runs
-        // once at boot, after recovery and before serving (see
-        // [`crate::journal::Journal::gc_offheap_orphans`]).
+        // That bound is **best-effort across crashes** (accepted, #1338): a crash
+        // between writing a cold/spill row and the instance reaching a terminal
+        // state (or a row written by an engine predating self-contained
+        // snapshots, whose routing index was never persisted) leaves an orphaned
+        // row that `forget` never reaches, because the in-RAM cold index is not
+        // rebuilt at boot. A post-recovery reconciliation/GC that deletes rows no
+        // longer referenced by live state — while preserving rows still
+        // referenced by legacy spilled flags — is deliberately **not** added in
+        // this PR: it carries durability/ordering implications (what is
+        // authoritative, when to run it, how to avoid deleting a row a concurrent
+        // recovery still needs) and is tracked separately in #1338.
         //
         // Convert to INCREMENTAL auto-vacuum so freed pages can later be handed
         // back to the OS instead of plateauing at the high-water mark (a one-time
@@ -884,84 +885,6 @@ impl VarSpillStore {
             // pending-delete record and leave orphan rows (#1366).
             self.faults.record(err, keys.to_vec());
         })
-    }
-
-    /// Every key currently holding a `spill` (variable payload) row. Used by the
-    /// post-recovery orphan GC ([#1338]) to diff the store against the recovered
-    /// engine's live/referenced set.
-    pub fn spill_keys(&self) -> rusqlite::Result<Vec<Key>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare_cached("SELECT key FROM spill")?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-        rows.map(|k| k.map(|v| v as Key)).collect()
-    }
-
-    /// Every key currently holding a `cold` (whole-instance snapshot) row, the
-    /// cold-tier counterpart of [`spill_keys`](Self::spill_keys) ([#1338]).
-    pub fn cold_keys(&self) -> rusqlite::Result<Vec<Key>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let mut stmt = conn.prepare_cached("SELECT key FROM cold")?;
-        let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
-        rows.map(|k| k.map(|v| v as Key)).collect()
-    }
-
-    /// Post-recovery garbage collection of orphaned off-heap rows ([#1338]).
-    ///
-    /// Deletes every `spill` row whose key is absent from BOTH `live` (the
-    /// recovered engine's live instance keys) and `spill_referenced` (live
-    /// instances whose `variables_spilled` flag is still set — a legacy snapshot
-    /// can leave such a flag pointing at its spill row, so the row is the only
-    /// surviving copy of that instance's variables and must be preserved), and
-    /// every `cold` row whose key is absent from `live` (a cold row is only
-    /// reachable through the routing index of a live instance). Returns the
-    /// number of orphaned rows deleted.
-    ///
-    /// **Durability/ordering contract.** The recovered engine state (snapshot +
-    /// replayed journal) is authoritative for liveness. This runs **once, after
-    /// recovery completes and before the node serves traffic** (see
-    /// [`crate::journal::Journal::gc_offheap_orphans`]), so no concurrent command
-    /// can be mid-`put`/`put_cold` for a key the sweep would delete: a live
-    /// instance's row is either already present (kept) or written later by its
-    /// own spill (`INSERT OR REPLACE` re-creates it). A row for an instance the
-    /// recovered engine has driven to a terminal state is dead — its eviction
-    /// `forget` was lost to the crash — and is reaped here. Each table's sweep
-    /// commits in [`FORGET_CHUNK`]-sized transactions so a large orphan backlog
-    /// never holds the connection lock across live traffic.
-    ///
-    /// A SQLite failure propagates as the typed [`rusqlite::Error`] and is
-    /// latched into [`Self::forget_faults`] (never silent, matching
-    /// [`forget`](Self::forget)); already-committed chunks stay deleted and the
-    /// caller retries on the next boot.
-    pub fn gc_orphans(
-        &self,
-        live: &std::collections::HashSet<Key>,
-        spill_referenced: &std::collections::HashSet<Key>,
-    ) -> rusqlite::Result<u64> {
-        // Collect orphan keys first (read), then delete in chunks (write), so
-        // the read cursor never overlaps its own delete transaction.
-        let spill_orphans: Vec<Key> = self
-            .spill_keys()?
-            .into_iter()
-            .filter(|k| !live.contains(k) && !spill_referenced.contains(k))
-            .collect();
-        let cold_orphans: Vec<Key> = self
-            .cold_keys()?
-            .into_iter()
-            .filter(|k| !live.contains(k))
-            .collect();
-        let collected = (spill_orphans.len() + cold_orphans.len()) as u64;
-        if spill_orphans.is_empty() && cold_orphans.is_empty() {
-            return Ok(0);
-        }
-        // Reuse the chunked, activity-bumping delete path. `delete_keys` deletes
-        // from BOTH tables per key, which is exactly the orphan semantics (an
-        // orphaned key is dead in whichever table holds it).
-        let mut orphans = spill_orphans;
-        orphans.extend(cold_orphans);
-        Self::delete_keys(&self.conn, &self.activity, &orphans).inspect_err(|err| {
-            self.faults.record(err, orphans.clone());
-        })?;
-        Ok(collected)
     }
 
     /// Like [`forget`](Self::forget), but hands the deletes to the background
