@@ -23937,6 +23937,13 @@ fn log_health_alert_transitions(
 /// handles), not only on snapshot ticks, so it is correct with snapshots
 /// disabled. The synchronous seed leaves it untouched (reading it needs the
 /// engine writer); the first, immediate async tick fills it in.
+///
+/// Each tick samples disk/backlog BEFORE awaiting the engine actors: a
+/// long-running snapshot fold or rotation wait holds an actor query pending,
+/// and the storage gauges must keep refreshing while it does — otherwise
+/// `/health` and the disk guards sit stale while other partitions keep growing
+/// the journal. The quarantine count trails by the actor's queue latency and
+/// is applied whenever the query returns.
 fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>, handles: Vec<DeepthiHandle>) {
     let health = snapshot_health::global();
     sample_storage_usage(
@@ -23949,13 +23956,17 @@ fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>, handles: Vec<Deep
         let mut ticker = tokio::time::interval(STORAGE_USAGE_SAMPLE_INTERVAL);
         loop {
             ticker.tick().await;
-            let (quarantined, _) = journal_quarantine_state(&handles).await;
+            // Disk/backlog first: no actor involvement, so a busy engine
+            // cannot stall the storage-health refresh.
             sample_storage_usage(
                 health,
                 &shared,
-                Some(quarantined),
+                None,
                 &snapshot_health::HealthThresholds::from_env(),
             );
+            // Then the actor query; the count updates whenever it returns.
+            let (quarantined, _) = journal_quarantine_state(&handles).await;
+            health.set_quarantined_orphans(quarantined);
         }
     });
 }
@@ -24841,6 +24852,75 @@ mod snapshot_health_tick_tests {
         );
         assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
         drop(journal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1385: a busy engine actor (a long snapshot fold / rotation wait holds
+    /// its quarantine query pending) must NOT stall the disk/backlog refresh —
+    /// the sampler applies those measurements before awaiting the actor, so
+    /// `/health` and the disk guards never sit stale behind it.
+    #[tokio::test]
+    async fn storage_sampler_refreshes_usage_while_an_actor_query_is_pending() {
+        let dir = scratch("sampler-pending-actor");
+        let (mut journal, recovery) =
+            journal::Journal::open_segmented(&dir).expect("open segmented");
+        let _ = journal
+            .apply_command(Command::DeployProcess(
+                nanobpmn_engine_core::ProcessBuilder::new("p")
+                    .start_event("s")
+                    .end_event("e")
+                    .connect("s", "e")
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        let handle = DeepthiHandle::spawn(journal, 0, None);
+
+        // Occupy the single writer with a job that parks until released, then
+        // enqueue the sampler's quarantine query behind it: the query cannot
+        // return until the barrier opens.
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        handle
+            .with({
+                let hold = Arc::clone(&hold);
+                move |_journal| hold.wait()
+            })
+            .await;
+        let query = tokio::spawn({
+            let handle = handle.clone();
+            async move { journal_quarantine_state(std::slice::from_ref(&handle)).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The sampler's disk/backlog half does not touch the actor, so it
+        // lands even with the query above still queued behind the barrier.
+        let h = snapshot_health::SnapshotHealth::new();
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        sample_storage_usage(&h, &recovery.shared, None, &tiny_budget);
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(
+            r.uncompacted_bytes > 1,
+            "backlog refreshed despite the pending actor query: {r:?}"
+        );
+        assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
+        assert!(
+            !query.is_finished(),
+            "quarantine query is still parked behind the held actor"
+        );
+
+        // Release the actor: the pending query now completes and the sampler
+        // applies the quarantine count independently of the usage sample.
+        hold.wait();
+        let (quarantined, _) = query.await.expect("quarantine query answered");
+        h.set_quarantined_orphans(quarantined);
+        assert_eq!(
+            h.report(Instant::now(), &tiny_budget).quarantined_orphans,
+            0
+        );
+        drop(handle);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
