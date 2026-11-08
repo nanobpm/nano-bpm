@@ -760,6 +760,21 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         worker: Option<String>,
     },
+    /// A **leased** job's settlement was recorded in the settlement ledger
+    /// (#1181): the lease token (per-activation fence) that settled it and the
+    /// outcome. Emitted immediately before the terminal `JobCompleted` /
+    /// `JobFailed` / `JobErrorThrown` of a leased job (never for a lease-less
+    /// one, whose journal stays byte-identical). Carrying the token on a
+    /// replicated event — rather than reading it from replica job state — keeps
+    /// the ledger identical on every replica even when the activation itself was
+    /// leader-local and never replicated, so a re-issued settlement is answered
+    /// idempotently by whichever host the worker reaches.
+    JobSettlementRecorded {
+        job_key: Key,
+        instance_key: Key,
+        outcome: crate::state::JobSettlementOutcome,
+        lease_token: String,
+    },
     /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {
@@ -1691,6 +1706,7 @@ impl Event {
             | Event::JobFailed { instance_key, .. }
             | Event::JobErrorThrown { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
+            | Event::JobSettlementRecorded { instance_key, .. }
             | Event::JobRetriesUpdated { instance_key, .. }
             | Event::JobTimeoutUpdated { instance_key, .. }
             | Event::UserTaskCreated { instance_key, .. }
@@ -1933,6 +1949,21 @@ impl Event {
                         .map(crate::lease::issued_key)
                         .unwrap_or(0),
                 );
+            }
+            // The settlement frame carries the lease token that settled the job
+            // (#1181) — a key minted by the lease allocator at activation time.
+            // Under leader-local activation the `JobActivated` event may never
+            // have been replicated, so this frame can be the ONLY record of that
+            // minted key in the log: advance the allocator past it, exactly as
+            // `JobActivated` does, or a reactivation after replay re-mints the
+            // same token and the job's next legitimate settlement is swallowed
+            // as a replay of the old one.
+            Event::JobSettlementRecorded {
+                job_key,
+                lease_token,
+                ..
+            } => {
+                m = m.max(*job_key).max(crate::lease::issued_key(lease_token));
             }
             Event::JobLockExpired { job_key, .. }
             | Event::JobFailed { job_key, .. }

@@ -51,7 +51,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use crate::ServerImpl;
-use crate::journal::Commit;
+use crate::settles_a_job;
 
 /// Per-connection submission-credit window (creates the client may have in flight
 /// before it must wait for the server to replenish). Overridable via
@@ -2001,11 +2001,17 @@ fn pipeline_job_command(
     server: &ServerImpl,
     conn: &Arc<Connection>,
     corr: u64,
-    outcome: Result<Commit, (u16, String)>,
+    outcome: crate::JobStreamOutcome,
 ) {
     match outcome {
-        Ok(commit) => {
-            server.note_job_completion("stream");
+        Ok((events, commit)) => {
+            // An idempotent settlement replay (#1181) is answered 200 but
+            // settles nothing — no terminal job event — so it must not be
+            // counted again in the completion metrics (and the drain guard's
+            // completion-rate estimate).
+            if settles_a_job(&events) {
+                server.note_job_completion("stream");
+            }
             let server = server.clone();
             let conn = conn.clone();
             tokio::spawn(async move {
