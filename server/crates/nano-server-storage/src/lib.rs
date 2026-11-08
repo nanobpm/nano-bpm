@@ -22,6 +22,7 @@ pub mod readstore;
 pub mod remote_sink;
 pub mod seglog;
 pub mod snapshot_health;
+pub mod snapstream;
 pub mod sqlite_space;
 pub mod varspill;
 pub mod varstore;
