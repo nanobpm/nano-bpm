@@ -356,14 +356,28 @@ impl SegShared {
     }
 
     /// The uncompacted journal footprint still on disk (#1385): `(segments,
-    /// bytes)` over every sealed segment plus the active one. A file that has
-    /// vanished (raced with compaction) or cannot be stat'ed counts as 0 bytes.
+    /// bytes)` over every sealed segment file plus the active one. Measured from
+    /// the DIRECTORY, not the in-memory sealed registry: compaction drops a
+    /// registry entry even when deleting its file fails, and such a retained file
+    /// still occupies disk, so the registry would under-report and could clear
+    /// the byte-budget alert incorrectly. Per-partition sidecars are excluded. A
+    /// file that vanishes mid-scan (raced with compaction) counts as 0 bytes.
     /// This is what grows without bound when snapshots stop succeeding (#1383).
     pub fn uncompacted_usage(&self) -> (u64, u64) {
         let size = |p: &Path| fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-        let sealed = self.sealed.lock().unwrap_or_else(|e| e.into_inner());
-        let bytes = sealed.iter().map(|s| size(&s.path)).sum::<u64>() + size(&self.active_path);
-        (sealed.len() as u64 + 1, bytes)
+        let mut segments = 1u64;
+        let mut bytes = size(&self.active_path);
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(SEG_PREFIX) && !name.ends_with(PP_META_SUFFIX) {
+                    segments += 1;
+                    bytes += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                }
+            }
+        }
+        (segments, bytes)
     }
 
     /// Number of partitions this log tracks (0 for the single-partition legacy
@@ -2645,6 +2659,29 @@ mod tests {
         let (segments_after, bytes_after) = shared.uncompacted_usage();
         assert_eq!(segments_after, 1, "only the active segment remains");
         assert_eq!(bytes_after, bytes - sealed_bytes);
+
+        drop(journal);
+        drop(shared);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1385: a sealed segment whose registry entry is gone but whose file is
+    /// still on disk (compaction's delete failed) must still be counted — the
+    /// gauge reports disk truth, not the in-memory registry.
+    #[test]
+    fn uncompacted_usage_counts_segment_files_dropped_from_registry() {
+        let dir = temp_dir("usage-orphan");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let _ = journal.snapshot_and_rotate().expect("snapshot+rotate");
+        let before = shared.uncompacted_usage();
+        // Simulate a failed delete: registry entry removed, file retained.
+        shared.sealed.lock().unwrap().clear();
+        assert_eq!(shared.uncompacted_usage(), before);
 
         drop(journal);
         drop(shared);

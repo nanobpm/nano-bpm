@@ -23888,6 +23888,37 @@ fn health_response(report: &snapshot_health::HealthReport) -> Response {
         .expect("health response builds")
 }
 
+/// How often the storage-usage sampler refreshes the journal-backlog and
+/// disk-space gauges (#1385), independently of snapshot scheduling.
+const STORAGE_USAGE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Samples the uncompacted journal footprint and data-dir free space into the
+/// snapshot-health tracker. Records NO snapshot outcome, so it is safe to run
+/// on any cadence (and when snapshots are disabled entirely).
+fn sample_storage_usage(health: &snapshot_health::SnapshotHealth, shared: &seglog::SegShared) {
+    let (segments, bytes) = shared.uncompacted_usage();
+    health.set_journal_usage(segments, bytes);
+    health.set_disk(disk_space_bytes(&shared.dir));
+}
+
+/// Seeds the storage gauges synchronously (so `/health` reflects an existing
+/// backlog / low disk before the first request) and keeps them fresh on a
+/// fixed cadence decoupled from the snapshot interval — with
+/// `NANOBPMN_SNAPSHOT_INTERVAL_MS=0`, or before the first delayed snapshot
+/// tick, a breached threshold must still surface (#1385).
+fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>) {
+    let health = snapshot_health::global();
+    sample_storage_usage(health, &shared);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STORAGE_USAGE_SAMPLE_INTERVAL);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            sample_storage_usage(health, &shared);
+        }
+    });
+}
+
 /// Feeds one snapshot-maintenance tick's outcome into the snapshot-health
 /// tracker (#1385) and does the tick's logging: a failure is logged only when
 /// [`SnapshotHealth::record_failure`](snapshot_health::SnapshotHealth::record_failure)
@@ -24718,6 +24749,46 @@ mod snapshot_health_tick_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #1385: the storage sampler surfaces a journal backlog WITHOUT any
+    /// snapshot tick (snapshots disabled / before the first tick) and records
+    /// no snapshot outcome.
+    #[test]
+    fn storage_sampler_surfaces_backlog_without_a_snapshot_tick() {
+        let dir = std::env::temp_dir().join(format!(
+            "nano-sampler-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (mut journal, recovery) =
+            journal::Journal::open_segmented(&dir).expect("open segmented");
+        let _ = journal
+            .apply_command(Command::DeployProcess(
+                nanobpmn_engine_core::ProcessBuilder::new("p")
+                    .start_event("s")
+                    .end_event("e")
+                    .connect("s", "e")
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        let h = snapshot_health::SnapshotHealth::new();
+        sample_storage_usage(&h, &recovery.shared);
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(r.uncompacted_bytes > 1, "backlog seen: {r:?}");
+        assert_eq!(r.consecutive_failures, 0, "no snapshot outcome recorded");
+        assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn disk_space_reads_the_data_volume() {
         let (free, total) = disk_space_bytes(&std::env::temp_dir()).expect("statvfs");
@@ -25301,6 +25372,10 @@ async fn main() {
                 tracing::info!("started a fresh journal at {}", journal_path.display());
             }
 
+            if let Some(shared) = seg_shared.clone() {
+                spawn_storage_usage_sampler(shared);
+            }
+
             // Bounded-disk maintenance: periodically snapshot the engine, seal the
             // active segment at the snapshot boundary, and compact (delete) sealed
             // segments the snapshot AND the read model no longer need. Only the
@@ -25379,6 +25454,10 @@ async fn main() {
                     "segmented journal enabled (snapshot/compaction every {:?})",
                     interval
                 );
+            }
+
+            if let Some((shared, _)) = multi_seg.clone() {
+                spawn_storage_usage_sampler(shared);
             }
 
             // Bounded-disk maintenance for the single-node multi-partition
