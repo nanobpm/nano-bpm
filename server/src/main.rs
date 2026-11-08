@@ -23888,6 +23888,160 @@ fn health_response(report: &snapshot_health::HealthReport) -> Response {
         .expect("health response builds")
 }
 
+// ---------------------------------------------------------------------------
+// #1386 — admin tooling for snapshot blockers (follow-up to #1383).
+//
+// #1383 showed a single orphaned spilled instance could fail-close every
+// snapshot for weeks; #1385 made that *visible* (`GET /health` degrades and
+// names the blocking keys). This is the *act* half: an operator (or `c8ctl
+// nano doctor`) can list exactly which instances are blocking compaction and
+// which have already been quarantined as off-heap orphans, and cancel a
+// quarantined orphan so the partition's snapshots can fold again.
+// ---------------------------------------------------------------------------
+
+/// One partition's contribution to the snapshot-blockers report (#1386): the
+/// instance keys whose off-heap payload aborted this partition's latest
+/// snapshot fold, and the instances this partition has quarantined as
+/// off-heap orphans. Per-partition attribution tells the operator WHICH
+/// partition's journal is failing to fold.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PartitionSnapshotBlockers {
+    /// The partition these keys belong to.
+    partition: u64,
+    /// Instance keys whose off-heap payload aborted the latest snapshot fold.
+    snapshot_blockers: Vec<Key>,
+    /// Instance keys quarantined as off-heap orphans (spilled payload lost).
+    quarantined_orphans: Vec<Key>,
+}
+
+/// The admin snapshot-blockers report (#1386), served at
+/// `GET /debug/snapshot-blockers` and consumed by `c8ctl nano doctor`.
+/// Aggregates every owned partition's blockers/orphans into a sorted,
+/// deduplicated top-level view plus the per-partition breakdown.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotBlockersReport {
+    /// Every instance key blocking a snapshot fold, deduplicated and sorted.
+    snapshot_blockers: Vec<Key>,
+    /// Every quarantined off-heap orphan, deduplicated and sorted.
+    quarantined_orphans: Vec<Key>,
+    /// The per-partition breakdown behind the two top-level lists.
+    partitions: Vec<PartitionSnapshotBlockers>,
+}
+
+/// The pure core of the report (#1386): aggregates per-partition
+/// `(partition, blockers, orphans)` triples into a [`SnapshotBlockersReport`],
+/// sorting and deduplicating the two top-level lists. Split out so the
+/// aggregation is tested deterministically without standing up the spill
+/// machinery that produces a real blocker/orphan.
+fn build_snapshot_blockers_report(parts: &[(u64, Vec<Key>, Vec<Key>)]) -> SnapshotBlockersReport {
+    let mut snapshot_blockers: Vec<Key> = parts
+        .iter()
+        .flat_map(|(_, b, _)| b.iter().copied())
+        .collect();
+    snapshot_blockers.sort_unstable();
+    snapshot_blockers.dedup();
+    let mut quarantined_orphans: Vec<Key> = parts
+        .iter()
+        .flat_map(|(_, _, o)| o.iter().copied())
+        .collect();
+    quarantined_orphans.sort_unstable();
+    quarantined_orphans.dedup();
+    let partitions = parts
+        .iter()
+        .map(|(partition, b, o)| PartitionSnapshotBlockers {
+            partition: *partition,
+            snapshot_blockers: b.clone(),
+            quarantined_orphans: o.clone(),
+        })
+        .collect();
+    SnapshotBlockersReport {
+        snapshot_blockers,
+        quarantined_orphans,
+        partitions,
+    }
+}
+
+/// Reads every owned partition's journal and aggregates its snapshot blockers
+/// and quarantined orphans (#1386). Runs each partition's cheap read on its own
+/// engine actor via [`DeepthiHandle::with`]; the aggregation itself is the pure
+/// [`build_snapshot_blockers_report`].
+async fn snapshot_blockers_report(server: &ServerImpl) -> SnapshotBlockersReport {
+    let topology = server.engine.topology();
+    let mut parts = Vec::new();
+    for p in 0..topology.num_partitions {
+        let Some(handle) = server.engine_handle_for(p) else {
+            continue;
+        };
+        let (blockers, orphans) = handle
+            .with(|journal| (journal.snapshot_blockers(), journal.quarantined_orphans()))
+            .await;
+        parts.push((p, blockers, orphans));
+    }
+    build_snapshot_blockers_report(&parts)
+}
+
+/// Maps a quarantined-orphan cancel outcome to the operator-meaningful HTTP
+/// status (#1386): 200 cancelled, 404 no such active instance, 503 a
+/// transient leader transition (retryable), 500 otherwise. Split out so the
+/// mapping is pinned by a deterministic unit test.
+fn snapshot_blocker_cancel_status(outcome: &CancelInstanceOutcome) -> StatusCode {
+    match outcome {
+        CancelInstanceOutcome::Canceled => StatusCode::OK,
+        CancelInstanceOutcome::NotFound(_) => StatusCode::NOT_FOUND,
+        CancelInstanceOutcome::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        CancelInstanceOutcome::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// `GET /debug/snapshot-blockers` (#1386): the snapshot blockers and
+/// quarantined off-heap orphans across every owned partition, as JSON. This is
+/// the read half of the operator runbook for a degraded `GET /health`.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
+async fn snapshot_blockers_handler(server: ServerImpl) -> Response {
+    let report = snapshot_blockers_report(&server).await;
+    let body = serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("snapshot-blockers response builds")
+}
+
+/// `POST /debug/snapshot-blockers/{key}/cancel` (#1386): cancels a quarantined
+/// off-heap orphan (or any instance blocking snapshots) so the partition's
+/// snapshots can fold again. Routes through the normal
+/// [`ServerImpl::cancel_instance_core`] path — leader-forwarding, durable
+/// commit, Raft-replicated like any other cancel — so the cancellation is
+/// itself durable and consistent under failure.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
+async fn snapshot_blocker_cancel_handler(
+    server: ServerImpl,
+    axum::extract::Path(key): axum::extract::Path<Key>,
+) -> Response {
+    let outcome = server.cancel_instance_core(key).await;
+    let status = snapshot_blocker_cancel_status(&outcome);
+    let detail = match &outcome {
+        CancelInstanceOutcome::Canceled => format!("cancelled instance {key}"),
+        CancelInstanceOutcome::NotFound(d)
+        | CancelInstanceOutcome::Unavailable(d)
+        | CancelInstanceOutcome::Internal(d) => d.clone(),
+    };
+    let body = serde_json::json!({ "instanceKey": key, "detail": detail }).to_string();
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("snapshot-blocker cancel response builds")
+}
+
 /// How often the storage-usage sampler refreshes the journal-backlog and
 /// disk-space gauges (#1385), independently of snapshot scheduling.
 const STORAGE_USAGE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -24939,6 +25093,131 @@ mod snapshot_health_tick_tests {
 }
 
 #[cfg(test)]
+mod snapshot_blockers_admin_tests {
+    use super::*;
+
+    /// #1386: the admin report aggregates the per-partition snapshot blockers
+    /// and quarantined off-heap orphans into one sorted, deduplicated,
+    /// per-partition-attributed body an operator (or `c8ctl nano doctor`) can
+    /// read to learn exactly WHICH instances are blocking compaction and which
+    /// have already lost their spilled payload.
+    #[test]
+    fn report_aggregates_blockers_and_orphans_across_partitions() {
+        let parts = vec![
+            // (partition, snapshot blockers, quarantined orphans)
+            (0u64, vec![11, 12], vec![101]),
+            (1u64, vec![12, 13], vec![101, 102]),
+            (2u64, vec![], vec![]),
+        ];
+        let report = build_snapshot_blockers_report(&parts);
+        // Blockers deduplicated across partitions and sorted.
+        assert_eq!(report.snapshot_blockers, vec![11, 12, 13]);
+        // Orphans deduplicated across partitions and sorted.
+        assert_eq!(report.quarantined_orphans, vec![101, 102]);
+        // Per-partition attribution preserved so the operator knows where the
+        // blocker lives (which partition's journal is failing to fold).
+        assert_eq!(
+            report
+                .partitions
+                .iter()
+                .map(|p| (
+                    p.partition,
+                    p.snapshot_blockers.clone(),
+                    p.quarantined_orphans.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, vec![11, 12], vec![101]),
+                (1, vec![12, 13], vec![101, 102]),
+                (2, vec![], vec![]),
+            ]
+        );
+    }
+
+    /// #1386: the report is empty (not an error) when nothing blocks snapshots
+    /// and no orphan has been quarantined — the steady healthy state.
+    #[test]
+    fn report_is_empty_when_healthy() {
+        let report = build_snapshot_blockers_report(&[(0u64, vec![], vec![])]);
+        assert!(report.snapshot_blockers.is_empty());
+        assert!(report.quarantined_orphans.is_empty());
+        assert_eq!(report.partitions.len(), 1);
+    }
+
+    /// #1386: the cancel outcome maps to an operator-meaningful HTTP status —
+    /// 200 when the orphan was cancelled, 404 when no such active instance,
+    /// 503 on a transient leader transition (retryable), 500 otherwise.
+    #[test]
+    fn cancel_outcome_maps_to_http_status() {
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::Canceled),
+            StatusCode::OK
+        );
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::NotFound("x".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::Unavailable("x".into())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::Internal("x".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// #1386: the report serializes to the JSON shape the CLI/runbook document —
+    /// top-level `snapshotBlockers` / `quarantinedOrphans` plus a per-partition
+    /// breakdown — so the contract is pinned against drift.
+    #[test]
+    fn report_serializes_to_the_documented_json_shape() {
+        let report = build_snapshot_blockers_report(&[(0u64, vec![7], vec![42])]);
+        let json = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(json["snapshotBlockers"], serde_json::json!([7]));
+        assert_eq!(json["quarantinedOrphans"], serde_json::json!([42]));
+        assert_eq!(
+            json["partitions"],
+            serde_json::json!([{
+                "partition": 0,
+                "snapshotBlockers": [7],
+                "quarantinedOrphans": [42],
+            }])
+        );
+    }
+
+    /// #1386: the async report reader runs against a real `ServerImpl` (every
+    /// owned partition's journal behind its engine actor) and returns a
+    /// well-formed report — empty in the healthy steady state, with one entry
+    /// per owned partition. Drives the same `handle.with(|journal| …)` path the
+    /// HTTP handler uses, so the read half is proven end-to-end, not just at
+    /// the pure-function level.
+    #[tokio::test]
+    async fn report_reader_fans_out_across_owned_partitions() {
+        let server = build_server_in_memory(
+            vec![
+                Journal::in_memory_partition(0),
+                Journal::in_memory_partition(1),
+            ],
+            cluster::Topology::single(2),
+        );
+        let report = snapshot_blockers_report(&server).await;
+        // Healthy: nothing blocks snapshots, no orphan quarantined.
+        assert!(report.snapshot_blockers.is_empty(), "{report:?}");
+        assert!(report.quarantined_orphans.is_empty(), "{report:?}");
+        // One entry per owned partition, attributed by partition id.
+        assert_eq!(
+            report
+                .partitions
+                .iter()
+                .map(|p| p.partition)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+}
+
+#[cfg(test)]
 mod adhoc_metrics_tests {
     use super::Event;
     use super::adhoc_event_kind;
@@ -25940,6 +26219,10 @@ async fn main() {
     // peer-pressure view + own create-load index — used to confirm whether a
     // rejoining peer is pinned out of create placement by a stale SHED reading).
     let peers_dbg = server.clone();
+    // Captured for the #1386 snapshot-blockers admin routes (list blockers /
+    // quarantined orphans; cancel a quarantined orphan).
+    let snapshot_blockers_srv = server.clone();
+    let snapshot_blocker_cancel_srv = server.clone();
 
     // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
     // (e.g. on an unrecoverable storage error) and then silently stop applying,
@@ -26053,6 +26336,24 @@ async fn main() {
         .route(
             "/v2/system/memory",
             axum::routing::get(system_memory_handler),
+        )
+        // #1386 snapshot-blockers admin tooling: list which instances block
+        // compaction / were quarantined as off-heap orphans, and cancel a
+        // quarantined orphan so snapshots can fold again. The operator runbook
+        // for a degraded `GET /health` (docs/runbook-snapshot-blockers.md).
+        .route(
+            "/debug/snapshot-blockers",
+            axum::routing::get(move || {
+                let srv = snapshot_blockers_srv.clone();
+                async move { snapshot_blockers_handler(srv).await }
+            }),
+        )
+        .route(
+            "/debug/snapshot-blockers/{key}/cancel",
+            axum::routing::post(move |path: axum::extract::Path<Key>| {
+                let srv = snapshot_blocker_cancel_srv.clone();
+                async move { snapshot_blocker_cancel_handler(srv, path).await }
+            }),
         );
 
     // Spec-generated response-contract guard (issue #1011): validate every
