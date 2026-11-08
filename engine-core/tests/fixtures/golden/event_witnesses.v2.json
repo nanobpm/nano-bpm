@@ -1,8 +1,8 @@
 [
   {
-    "ReplayCursor": {
-      "command_ordinal": 2,
-      "raft_index": 41
+    "RaftEntryApplied": {
+      "index": 41,
+      "raft_state": "{\"opaque\":true}"
     }
   },
   {

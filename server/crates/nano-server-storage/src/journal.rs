@@ -17,8 +17,7 @@
 //! semantic — after a restart, workers simply re-activate.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -258,14 +257,15 @@ pub struct Journal {
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
     activation_cursor: HashMap<String, Key>,
-    /// The Raft entry currently being applied, as `(log index, next command
-    /// ordinal)`, set by the state machine around each entry's batch (#1405).
-    /// While `Some`, every successfully applied command has a
-    /// [`Event::ReplayCursor`] marker appended to its journaled events — in the
-    /// SAME write, so the cursor is durable exactly when the command's events
-    /// are — and the engine's apply cursor is advanced. `None` outside Raft
-    /// apply (the direct REST/single-node path journals no markers).
-    raft_apply: Option<(u64, u32)>,
+    /// The Raft entry currently being applied (#1405): `Some(buffer)` between
+    /// [`begin_raft_entry`](Self::begin_raft_entry) and
+    /// [`commit_raft_entry`](Self::commit_raft_entry) /
+    /// [`abort_raft_entry`](Self::abort_raft_entry). While armed, each applied
+    /// command's events are BUFFERED here instead of written, so the whole
+    /// entry — plus its [`Event::RaftEntryApplied`] record — is journaled as
+    /// ONE atomic frame. `None` outside Raft apply (the direct REST /
+    /// single-node path journals per command as before).
+    raft_entry: Option<Vec<Event>>,
     /// Test-only instrumentation: how many times the cold-descendant traversal
     /// scanned the resident instance set per visited descendant (the O(N × D)
     /// shape Copilot flagged on #1418). The indexed traversal never scans, so a
@@ -1023,7 +1023,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
-            raft_apply: None,
+            raft_entry: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1057,7 +1057,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
-            raft_apply: None,
+            raft_entry: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1130,20 +1130,9 @@ impl Journal {
     /// empty vec if the file does not exist). Shared by [`Journal::open`] (to
     /// replay into the engine) and the boot-time read-model catch-up.
     pub fn read_events(path: impl AsRef<Path>) -> io::Result<Vec<Event>> {
-        let path = path.as_ref();
-        let mut events = Vec::new();
-        if path.exists() {
-            for line in BufReader::new(File::open(path)?).lines() {
-                let line = line?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let event: Event = serde_json::from_str(&line)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                events.push(event);
-            }
-        }
-        Ok(events)
+        // Frame-aware (#1405): the single-file journal can carry atomic Raft
+        // entry frames, and shares the segment reader's torn-tail contract.
+        crate::seglog::read_segment_events(path.as_ref())
     }
 
     /// Opens (creating if absent) the journal at `path`, replaying any existing
@@ -1189,7 +1178,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
-            raft_apply: None,
+            raft_entry: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1227,7 +1216,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
-            raft_apply: None,
+            raft_entry: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1270,7 +1259,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
-            raft_apply: None,
+            raft_entry: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1308,7 +1297,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
-            raft_apply: None,
+            raft_entry: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -2099,9 +2088,9 @@ impl Journal {
             });
         }
 
-        let Some(writer) = self.writer.as_ref() else {
+        if self.writer.is_none() {
             return Commit::ready();
-        };
+        }
 
         // The shared multi-partition segmented writer records each event line
         // with its GLOBAL write-partition tag (`<partition>\t<json>`), so
@@ -2112,7 +2101,15 @@ impl Journal {
         // which a node not owning partition 0 could not otherwise route back. The
         // single-partition / legacy / in-memory paths keep the bare `<json>` line
         // format (their reader does not expect a tag).
-        let tagged = shared_backed;
+        let bytes = self.serialize_events(events);
+        self.send_write(bytes, events, shared_backed)
+    }
+
+    /// Serializes `events` to the journal's newline-terminated record format
+    /// (`<partition>\t<json>` on the shared multi-partition writer, bare
+    /// `<json>` otherwise — see [`persist`](Self::persist)).
+    fn serialize_events(&self, events: &[Event]) -> Vec<u8> {
+        let tagged = self.shared_exporter.is_some();
         let mut bytes = Vec::new();
         for event in events.iter() {
             if tagged {
@@ -2131,7 +2128,15 @@ impl Journal {
             bytes.extend_from_slice(line.as_bytes());
             bytes.push(b'\n');
         }
+        bytes
+    }
 
+    /// Hands already-serialized `bytes` (carrying `events`) to the writer and
+    /// returns their durability barrier.
+    fn send_write(&self, bytes: Vec<u8>, events: &Arc<Vec<Event>>, shared_backed: bool) -> Commit {
+        let Some(writer) = self.writer.as_ref() else {
+            return Commit::ready();
+        };
         let (ack, rx) = oneshot::channel();
         let events_count = events.len();
         let bytes_len = bytes.len();
@@ -2162,29 +2167,17 @@ impl Journal {
     /// exporter) and a [`Commit`] the caller should await before acknowledging the
     /// request. Mirrors [`Engine::apply_command_at`].
     ///
-    /// Under a Raft apply ([`begin_raft_apply`](Self::begin_raft_apply)) the
-    /// journaled record ALSO carries a [`Event::ReplayCursor`] marker as its last
-    /// line — the same [`persist`] write, so the apply cursor is durable in
-    /// exactly the same fsync as the command's events (#1405).
+    /// Under a Raft entry ([`begin_raft_entry`](Self::begin_raft_entry)) the
+    /// events are BUFFERED, not written, and the returned [`Commit`] is
+    /// already-ready: the entry's single durable barrier is the one
+    /// [`commit_raft_entry`](Self::commit_raft_entry) returns (#1405).
     pub fn apply_command_at(
         &mut self,
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         self.ensure_resident_for_command(&command)?;
-        let mut events = self.engine.apply_command_at(command, now)?;
-        // Raft apply cursor (#1405): stamp the marker AFTER the command
-        // succeeded (a failed command journals nothing and must not move the
-        // cursor) and BEFORE persist, so it lands in the same journal write.
-        if let Some((raft_index, ordinal)) = self.raft_apply {
-            events.push(Event::ReplayCursor {
-                raft_index,
-                command_ordinal: ordinal,
-            });
-            self.raft_apply = Some((raft_index, ordinal + 1));
-            self.engine.set_applied_through(raft_index, ordinal);
-        }
-        let events = Arc::new(events);
+        let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -2193,56 +2186,83 @@ impl Journal {
             })
             .collect();
         self.rehydrate_activated_variables(&mut activated);
+        if let Some(buffer) = self.raft_entry.as_mut() {
+            // Raft entry (#1405): buffer for the entry's atomic frame. No
+            // spill either — spilling state whose events are not yet durable
+            // would let the off-heap store run ahead of the journal; the
+            // deferred `maybe_spill` runs in `commit_raft_entry`.
+            buffer.extend(events.iter().cloned());
+            return Ok((events, Commit::ready()));
+        }
         let commit = self.persist(&events);
         self.maybe_spill();
         Ok((events, commit))
     }
 
-    /// Arms the Raft apply cursor for the entry at `raft_index` (#1405): from
-    /// here each successfully applied command journals a
-    /// [`Event::ReplayCursor`] marker with its ordinal, starting at 0. Called by
-    /// the Raft state machine before applying an entry's batch.
-    pub fn begin_raft_apply(&mut self, raft_index: u64) {
-        self.raft_apply = Some((raft_index, 0));
+    /// Arms entry-level atomicity for one committed Raft entry (#1405): until
+    /// [`commit_raft_entry`](Self::commit_raft_entry) or
+    /// [`abort_raft_entry`](Self::abort_raft_entry), applied commands buffer
+    /// their events instead of journaling them.
+    pub fn begin_raft_entry(&mut self) {
+        self.raft_entry = Some(Vec::new());
     }
 
-    /// Disarms the Raft apply cursor at the end of an entry's batch. The
-    /// engine-side cursor ([`Engine::applied_through`]) persists — it is the
-    /// recovery-visible record; `raft_apply` is only the per-entry stamping
-    /// state.
-    pub fn end_raft_apply(&mut self) {
-        self.raft_apply = None;
+    /// Journals the armed Raft entry as ONE atomic frame (#1405): every
+    /// buffered event followed by an [`Event::RaftEntryApplied`] record for
+    /// `index` (`raft_state` is the replication layer's opaque log-id +
+    /// membership), with a single durability barrier. A torn frame is dropped
+    /// whole on recovery, so a crash can never keep part of an entry. Returns
+    /// the entry's events (the record included, for log-order export) and the
+    /// barrier. Errors — journaling nothing — when the frame would exceed the
+    /// frame cap; the caller must fail closed.
+    pub fn commit_raft_entry(
+        &mut self,
+        index: u64,
+        raft_state: String,
+    ) -> io::Result<(Arc<Vec<Event>>, Commit)> {
+        let mut events = self.raft_entry.take().unwrap_or_default();
+        events.push(Event::RaftEntryApplied {
+            index,
+            raft_state: raft_state.clone(),
+        });
+        let events = Arc::new(events);
+        let shared_backed = self.shared_exporter.is_some();
+        let commit = if self.writer.is_some() {
+            let compress = self.seg.as_ref().is_some_and(|s| s.compress);
+            let frame = crate::seglog::frame_atomic(
+                &self.serialize_events(&events),
+                events.len() as u64,
+                compress,
+            )?;
+            if !shared_backed && let Some(exporter) = self.exporter.as_ref() {
+                let _ = exporter.send(ExportBatch {
+                    events: Arc::clone(&events),
+                    bytes: 0,
+                });
+            }
+            self.send_write(frame, &events, shared_backed)
+        } else {
+            // In-memory journal: nothing to frame, but the exporter still sees
+            // the entry exactly as `persist` would forward it.
+            self.persist(&events)
+        };
+        self.engine.set_raft_applied(index, raft_state);
+        self.maybe_spill();
+        Ok((events, commit))
     }
 
-    /// Advances the per-entry ordinal counter WITHOUT applying a command: the
-    /// command was already applied + journaled before a fail-closed crash and
-    /// the recovered apply cursor told the state machine to skip it (#1405), so
-    /// no marker is stamped for it again — but the counter must stay in step so
-    /// the next *applied* command of the same entry stamps its true ordinal.
-    pub fn note_raft_command_skipped(&mut self) {
-        if let Some((raft_index, ordinal)) = self.raft_apply {
-            self.raft_apply = Some((raft_index, ordinal + 1));
-        }
+    /// Disarms the Raft entry WITHOUT journaling anything (#1405): the entry
+    /// failed closed on an environmental error. The live engine state may hold
+    /// the entry's partial, non-durable effects; the replica must shut down and
+    /// rebuild from the durable journal, which never saw them.
+    pub fn abort_raft_entry(&mut self) {
+        self.raft_entry = None;
     }
 
-    /// How far into the entry at `raft_index` this journal's engine has already
-    /// applied + journaled commands, per the recovered apply cursor (#1405).
-    /// `Some(ordinal)` means commands `0..=ordinal` of that entry are durable
-    /// and must be skipped on a re-apply; `None` means no prefix of the entry
-    /// is recorded (either it was never started, or it fully applied and the
-    /// cursor moved on).
-    pub fn applied_through(&self, raft_index: u64) -> Option<u32> {
-        match self.engine.applied_through() {
-            Some((index, ordinal)) if index == raft_index => Some(ordinal),
-            _ => None,
-        }
-    }
-
-    /// Clears the engine's apply cursor once the Raft `last_applied` has moved
-    /// past the entry it names (#1405). Called by the state machine after it
-    /// records `last_applied` for an entry beyond the cursor's.
-    pub fn clear_applied_through(&mut self) {
-        self.engine.clear_applied_through();
+    /// The last Raft applied-entry record this journal wrote or recovered
+    /// (#1405): `(raft log index, opaque replication state)`.
+    pub fn raft_applied(&self) -> Option<(u64, String)> {
+        self.engine.raft_applied().cloned()
     }
 
     /// The authoritative ownership tuple `(element_id, process_instance_key)` of

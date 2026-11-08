@@ -760,13 +760,12 @@ fn build_event_witnesses() -> Vec<Event> {
         scope_id: Some("sub".to_string()),
     };
     vec![
-        // The #1405 Raft apply-progress marker: journaled atomically with a
-        // replicated command's events so recovery skips an already-applied
-        // prefix. The executed corpus never applies through Raft, so the frame
-        // is pinned here.
-        Event::ReplayCursor {
-            raft_index: 41,
-            command_ordinal: 2,
+        // The #1405 Raft applied-entry record: the last record of a committed
+        // entry's atomic journal frame. The executed corpus never applies
+        // through Raft, so the frame is pinned here.
+        Event::RaftEntryApplied {
+            index: 41,
+            raft_state: "{\"opaque\":true}".to_string(),
         },
         // The #901 bottom-to-top scope-subscription completion frame.
         Event::CompensationScopeSubscriptionCompleted {

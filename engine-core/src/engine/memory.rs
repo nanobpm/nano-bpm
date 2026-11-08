@@ -23,7 +23,7 @@ impl Engine {
             num_partitions: self.num_partitions,
             now: self.now,
             start_dispatch_rr: self.start_dispatch_rr,
-            apply_cursor: self.apply_cursor,
+            raft_applied: self.raft_applied.clone(),
         }
     }
 
@@ -80,7 +80,7 @@ impl Engine {
             retired_tombstones: std::collections::HashSet::new(),
             torn_down_scopes: std::collections::HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
-            apply_cursor: snapshot.apply_cursor,
+            raft_applied: snapshot.raft_applied,
         }
     }
 
@@ -161,7 +161,7 @@ impl Engine {
             num_partitions: self.num_partitions,
             now: self.now,
             start_dispatch_rr: self.start_dispatch_rr,
-            apply_cursor: self.apply_cursor,
+            raft_applied: self.raft_applied.clone(),
         }
     }
 
@@ -187,14 +187,10 @@ impl Engine {
         I: IntoIterator<Item = Event>,
     {
         for event in events {
-            // A replay-progress marker (#1405) only reseeds the apply cursor;
+            // A Raft applied-entry record (#1405) only reseeds `raft_applied`;
             // it carries no keys and mutates no state.
-            if let Event::ReplayCursor {
-                raft_index,
-                command_ordinal,
-            } = event
-            {
-                self.apply_cursor = Some((raft_index, command_ordinal));
+            if let Event::RaftEntryApplied { index, raft_state } = event {
+                self.raft_applied = Some((index, raft_state));
                 continue;
             }
             let max_key = event.max_key();

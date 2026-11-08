@@ -149,6 +149,48 @@ fn frame_compress(buf: &[u8], events: u64) -> Option<Vec<u8>> {
     Some(frame)
 }
 
+/// The largest payload one atomic frame can carry: the frame header stores the
+/// payload lengths as `u32`.
+pub(crate) const MAX_ATOMIC_FRAME_BYTES: usize = u32::MAX as usize;
+
+/// Frames `buf` (newline-terminated records) as ONE all-or-nothing journal
+/// record (#1405): the reader ([`decode_segment_bytes`]) drops a torn frame
+/// WHOLE, so either every record in `buf` survives a crash or none does. The
+/// Raft apply path uses it to make each committed entry's events plus its
+/// applied-entry record atomic. Deflates when `compress` is set and it pays
+/// (see [`frame_compress`]); otherwise emits a [`CODEC_RAW`] frame. Errors when
+/// `buf` exceeds [`MAX_ATOMIC_FRAME_BYTES`] — the caller must fail closed
+/// rather than split the entry across non-atomic writes.
+pub(crate) fn frame_atomic(buf: &[u8], events: u64, compress: bool) -> io::Result<Vec<u8>> {
+    frame_atomic_capped(buf, events, compress, MAX_ATOMIC_FRAME_BYTES)
+}
+
+/// [`frame_atomic`] with an explicit size cap (testable without a 4 GiB buffer).
+fn frame_atomic_capped(buf: &[u8], events: u64, compress: bool, cap: usize) -> io::Result<Vec<u8>> {
+    if buf.len() > cap {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "atomic journal frame of {} bytes exceeds the {cap}-byte frame cap",
+                buf.len()
+            ),
+        ));
+    }
+    if compress && let Some(frame) = frame_compress(buf, events) {
+        return Ok(frame);
+    }
+    let len = u32::try_from(buf.len())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+        .to_le_bytes();
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + buf.len());
+    frame.push(FRAME_MAGIC);
+    frame.push(CODEC_RAW);
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(buf);
+    Ok(frame)
+}
+
 /// Decodes a segment file into its logical plaintext bytes — the concatenated
 /// newline-terminated records the writer appended — transparently inflating any
 /// compressed frames. Walks the file record-by-record: a [`FRAME_MAGIC`] byte
@@ -436,7 +478,13 @@ impl ActiveSegment {
     /// large payloads — shrinks; `self.bytes` therefore tracks on-disk bytes, so
     /// size-based sealing rotates on physical size.
     pub fn write_all(&mut self, buf: &[u8], events: u64) -> io::Result<()> {
+        // A batch that already contains an atomic frame (#1405) is written
+        // verbatim: re-framing it would nest a frame inside a frame, which the
+        // reader does not decode. Serialized JSON never contains a raw
+        // `FRAME_MAGIC` byte (serde escapes control characters), so its
+        // presence means a pre-framed record.
         let written = if self.shared.compress
+            && !buf.contains(&FRAME_MAGIC)
             && let Some(frame) = frame_compress(buf, events)
         {
             self.file.write_all(&frame)?;
@@ -5382,6 +5430,78 @@ mod tests {
         // Both compaction entry points must still work (empty list → no-op).
         assert_eq!(compact(&shared, u64::MAX), 0);
         assert_eq!(compact_multi(&shared, &[u64::MAX], &[u64::MAX]), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: an atomic Raft-entry frame round-trips, is dropped WHOLE when
+    /// torn at any byte, and an oversized entry is refused (never split).
+    #[test]
+    fn atomic_frame_round_trips_drops_whole_when_torn_and_is_capped() {
+        let dir = temp_dir("atomic-frame");
+        fs::create_dir_all(&dir).unwrap();
+        let durable = b"{\"a\":1}\n".to_vec();
+        let entry = b"{\"b\":2}\n{\"c\":3}\n".to_vec();
+        let frame = frame_atomic(&entry, 2, false).unwrap();
+        assert_eq!(frame[0], FRAME_MAGIC);
+        assert_eq!(frame[1], CODEC_RAW);
+        let path = dir.join("j.jsonl");
+        let mut file = durable.clone();
+        file.extend_from_slice(&frame);
+        fs::write(&path, &file).unwrap();
+        let mut whole = durable.clone();
+        whole.extend_from_slice(&entry);
+        assert_eq!(decode_segment_bytes(&path).unwrap(), whole);
+        for cut in 1..frame.len() {
+            fs::write(&path, &file[..file.len() - cut]).unwrap();
+            assert_eq!(
+                decode_segment_bytes(&path).unwrap(),
+                durable,
+                "a frame torn {cut} byte(s) short is dropped whole"
+            );
+        }
+        let err = frame_atomic_capped(&entry, 2, false, entry.len() - 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(frame_atomic_capped(&entry, 2, false, entry.len()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a compressing writer must NOT re-frame a batch that already holds
+    /// an atomic frame (a nested frame would not decode); a compressible
+    /// atomic frame is itself deflated when compression is on.
+    #[test]
+    fn compressing_writer_never_nests_an_atomic_frame() {
+        let dir = temp_dir("atomic-nest");
+        fs::create_dir_all(&dir).unwrap();
+        let mut entry = Vec::new();
+        for i in 0..64 {
+            entry.extend_from_slice(
+                format!("{{\"seq\":{i},\"p\":\"{}\"}}\n", "abcdefgh".repeat(256)).as_bytes(),
+            );
+        }
+        let frame = frame_atomic(&entry, 64, true).unwrap();
+        assert_eq!(frame[1], CODEC_DEFLATE, "big entry frame is deflated");
+        let mut batch = entry.clone();
+        batch.extend_from_slice(&frame);
+        let active_path = dir.join(ACTIVE_NAME);
+        let shared = Arc::new(SegShared {
+            dir: dir.clone(),
+            active_path: active_path.clone(),
+            total_events: AtomicU64::new(0),
+            active_start: AtomicU64::new(0),
+            sealed: Mutex::new(Vec::new()),
+            segment_bytes: u64::MAX,
+            per_partition_total: Vec::new(),
+            per_partition_active_start: Vec::new(),
+            compress: true,
+        });
+        {
+            let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
+            seg.write_all(&batch, 128).unwrap();
+            seg.fsync().unwrap();
+        }
+        let mut expected = entry.clone();
+        expected.extend_from_slice(&entry);
+        assert_eq!(decode_segment_bytes(&active_path).unwrap(), expected);
         let _ = fs::remove_dir_all(&dir);
     }
 

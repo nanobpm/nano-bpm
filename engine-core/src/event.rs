@@ -1153,22 +1153,17 @@ pub enum Event {
         message_name: String,
         correlation_key: String,
     },
-    /// A Raft apply-progress marker (#1405): journaled **atomically in the same
-    /// write as the events of the command it follows**, recording that command
-    /// `command_ordinal` of Raft log entry `raft_index` was applied and its
-    /// events persisted. On recovery a replica re-applying a still-unapplied
-    /// entry (one it had failed closed on mid-batch) skips every command whose
-    /// ordinal the cursor already covers, so a non-idempotent prefix command
-    /// (e.g. `CreateInstance`) is never executed twice. The marker is
-    /// state-neutral: the applier ignores it and it carries no keys, so replay
-    /// and the read model are unaffected; it only reseeds the engine's
-    /// in-memory apply cursor. A marker whose `raft_index` is at or below the
-    /// recovered `last_applied` is dead (the entry fully applied before the
-    /// crash) and is ignored.
-    ReplayCursor {
-        raft_index: u64,
-        command_ordinal: u32,
-    },
+    /// A Raft applied-entry record (#1405): the LAST record of the single
+    /// atomic journal frame that carries every event of one committed Raft log
+    /// entry, so the journal knows — in the same all-or-nothing write as the
+    /// entry's effects — which Raft entry it last applied. `index` is the Raft
+    /// log index; `raft_state` is the replication layer's opaque serialization
+    /// of the applied log id and membership (engine-core never interprets it).
+    /// On a Raft bootstrap without a snapshot the state machine seeds its
+    /// `last_applied` from the journal-recovered record, so entries already in
+    /// the journal are never re-applied. State-neutral: the applier ignores it
+    /// and it carries no keys, so the read model is unaffected.
+    RaftEntryApplied { index: u64, raft_state: String },
     /// An open message subscription was cancelled before correlating because the
     /// element it guarded left the flow first (e.g. a boundary subscription whose
     /// activity completed normally, or a sibling boundary subscription when
@@ -1785,7 +1780,7 @@ impl Event {
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
-            | Event::ReplayCursor { .. }
+            | Event::RaftEntryApplied { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
     }

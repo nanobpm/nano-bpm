@@ -131,11 +131,11 @@ pub fn apply(state: &mut State, event: &Event) {
         // A history-only record (#1300): the instance it names was already
         // created by the preceding `ProcessInstanceCreated`.
         Event::MessageStartEventCorrelated { .. } => {}
-        // A Raft apply-progress marker (#1405): state-neutral bookkeeping the
-        // replay loop folds into the engine's apply cursor (see
+        // A Raft applied-entry record (#1405): state-neutral bookkeeping the
+        // replay loop folds into the engine's `raft_applied` (see
         // `Engine::replay_partition` / `apply_replayed_events`); it mutates no
         // state.
-        Event::ReplayCursor { .. } => {}
+        Event::RaftEntryApplied { .. } => {}
     }
 }
 

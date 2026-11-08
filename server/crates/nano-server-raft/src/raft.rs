@@ -806,6 +806,27 @@ pub fn durable_log_has_purge_hole(log_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The replication state journaled in each [`Event::RaftEntryApplied`] record
+/// (#1405): the applied log id and the membership in effect after it. Opaque to
+/// engine-core (carried as a JSON string), decoded only here.
+#[derive(Serialize, Deserialize)]
+struct JournaledRaftState {
+    log_id: LogId<NodeId>,
+    membership: StoredMembership<NodeId, BasicNode>,
+}
+
+/// Serializes the [`JournaledRaftState`] for `log_id` + `membership`.
+fn journaled_raft_state(
+    log_id: LogId<NodeId>,
+    membership: &StoredMembership<NodeId, BasicNode>,
+) -> std::io::Result<String> {
+    serde_json::to_string(&JournaledRaftState {
+        log_id,
+        membership: membership.clone(),
+    })
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Metadata held by the Raft state machine: the last applied log id and
 /// membership. The materialized engine state itself lives on the partition's
 /// [`DeepthiHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
@@ -979,6 +1000,35 @@ impl PartitionStateMachine {
                 journal.restore_engine_from_snapshot(captured);
             })
             .await;
+        Ok(())
+    }
+
+    /// Seeds `last_applied` (and the membership it established) from the
+    /// journal's last [`Event::RaftEntryApplied`] record (#1405), when it is
+    /// AHEAD of what the state machine already knows (no Raft snapshot, or an
+    /// older one). The engine was rebuilt from that journal, so every entry at
+    /// or below the record is already applied; without the seed openraft would
+    /// re-apply them from `last_applied = None` and execute non-idempotent
+    /// commands twice. An undecodable record fails closed (bootstrap errors)
+    /// rather than guessing.
+    async fn seed_last_applied_from_journal(&self) -> anyhow::Result<()> {
+        let Some((index, raft_state)) = self.engine.with(|journal| journal.raft_applied()).await
+        else {
+            return Ok(());
+        };
+        let recorded: JournaledRaftState = serde_json::from_str(&raft_state).map_err(|e| {
+            anyhow::anyhow!("undecodable Raft applied-entry record at index {index}: {e}")
+        })?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if Some(recorded.log_id) > inner.last_applied {
+            tracing::info!(
+                partition = inner.partition_id,
+                last_applied = %recorded.log_id,
+                "raft: seeding last_applied from the journal's applied-entry record (#1405)"
+            );
+            inner.last_applied = Some(recorded.log_id);
+            inner.last_membership = recorded.membership;
+        }
         Ok(())
     }
 }
@@ -1226,85 +1276,50 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     responses.push(ReplicatedResponse::default());
                 }
                 EntryPayload::Normal(batch) => {
-                    // Single-phase, per-command apply (#1405 rework): apply every
-                    // command of the batch directly against the LIVE journal in ONE
-                    // actor hop, journaling each command's events as it succeeds.
-                    // There is no scratch clone, no full-working-set snapshot, and
-                    // no per-batch cold hydration — each command hydrates only the
-                    // state it targets, exactly as the pre-#1443 hot path did.
+                    // Entry-level atomic apply (#1405): apply every command of the
+                    // batch against the LIVE journal in ONE actor hop, BUFFERING
+                    // the events, then journal the WHOLE entry — every command's
+                    // events plus a `RaftEntryApplied` record naming this log id —
+                    // as ONE atomic journal frame with a single durability barrier.
+                    // The reader drops a torn frame whole, so a crash can never
+                    // keep part of an entry, and the journal knows atomically which
+                    // entry it last applied (bootstrap seeds `last_applied` from it,
+                    // see `seed_last_applied_from_journal`).
                     //
                     // Per-command error classification
-                    // (`EngineError::is_environmental`, #1388) decides the failure
-                    // mode:
+                    // (`EngineError::is_environmental`, #1388):
                     //
                     // * DETERMINISTIC rejection — a pure function of `(command,
-                    //   replicated state)`, so every replica computes it
-                    //   identically. It is recorded against its command and the
-                    //   batch CONTINUES: independent later submissions are not
-                    //   dropped. The entry is consumed normally (replicas stay in
-                    //   lockstep).
+                    //   replicated state)`, identical on every replica. It is
+                    //   recorded against its command and the batch CONTINUES.
                     //
                     // * ENVIRONMENTAL failure — an off-heap row THIS replica cannot
-                    //   read. Applying past it would silently diverge this replica
-                    //   from healthy peers, so the apply FAILS CLOSED: the closure
-                    //   stops at the failed command (later commands are never
-                    //   evaluated or journaled) and the error is propagated out to
-                    //   abort the entry with a `StorageError` BEFORE `last_applied`
-                    //   moves. openraft treats it as fatal and shuts this replica's
-                    //   Raft core down; recovery re-applies the still-unapplied
-                    //   entry after the store heals.
-                    //
-                    // A failed command journals NOTHING (`apply_command_at` returns
-                    // before `persist`), so the environmental abort never writes a
-                    // half-applied copy of the failed command. Any earlier commands
-                    // of the same batch that already succeeded ARE journaled — and
-                    // each journaled a `ReplayCursor` marker ATOMICALLY in the same
-                    // write as its events, recording `(log index, command ordinal)`.
-                    // When recovery re-applies this still-unapplied entry, the
-                    // recovered cursor makes the replica SKIP the already-journaled
-                    // prefix (below), so a non-idempotent prefix command (e.g. a
-                    // `CreateInstance` ahead of the failed command) is never
-                    // executed twice — no duplicate instance, no key drift against
-                    // healthy peers. No scratch-vs-live divergence is possible
-                    // because there is only ONE evaluation, against the live state.
+                    //   read. The entry FAILS CLOSED: the buffer is discarded (the
+                    //   journal never sees any of the entry), `last_applied` does not
+                    //   move, and a `StorageError` makes openraft shut this replica's
+                    //   Raft core down. The live engine may hold the entry's partial
+                    //   effects, but they were never durable: recovery rebuilds from
+                    //   the journal, so nothing needs undoing and no non-idempotent
+                    //   prefix command can execute twice.
                     //
                     // The command `kind` is captured alongside each outcome so the
                     // error-mapping phase below can apply the command-specific HTTP
-                    // status contract (`engine_error_status_for`) — a rejection like
-                    // `AdHocUnknownElement` maps to a different status for
-                    // `CompleteJob` than for `ActivateAdHocActivities`. #1308.
-                    type ApplyOutcome = Result<
-                        (Arc<Vec<Event>>, crate::journal::Commit),
-                        nanobpmn_engine_core::EngineError,
-                    >;
-                    let (outcomes, environmental): (
-                        Vec<(&'static str, ApplyOutcome)>,
-                        Option<nanobpmn_engine_core::EngineError>,
-                    ) = self
+                    // status contract (`engine_error_status_for`).
+                    type ApplyOutcome = Result<Arc<Vec<Event>>, nanobpmn_engine_core::EngineError>;
+                    let raft_state = {
+                        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        journaled_raft_state(log_id, &inner.last_membership)
+                    }
+                    .map_err(|e| {
+                        StorageError::from_io_error(ErrorSubject::StateMachine, ErrorVerb::Write, e)
+                    })?;
+                    type EntryOutcomes = Vec<(&'static str, ApplyOutcome)>;
+                    let applied: std::io::Result<(EntryOutcomes, crate::journal::Commit)> = self
                         .engine
                         .with(move |journal| {
-                            // The recovered apply cursor: if this entry was
-                            // partially applied before a fail-closed crash, every
-                            // command up to and including `skip_through` is
-                            // already durable in the journal and must not run
-                            // again (#1405).
-                            let skip_through = journal.applied_through(log_id.index);
-                            journal.begin_raft_apply(log_id.index);
+                            journal.begin_raft_entry();
                             let mut outcomes = Vec::with_capacity(batch.items.len());
-                            let mut environmental = None;
-                            for (ordinal, ReplicatedCommand { command, now }) in
-                                batch.items.into_iter().enumerate()
-                            {
-                                let ordinal = ordinal as u32;
-                                if skip_through.is_some_and(|s| ordinal <= s) {
-                                    // Already applied + journaled before the
-                                    // crash; the cursor advanced past it. Keep
-                                    // the journal's per-entry ordinal counter in
-                                    // step so the NEXT applied command stamps the
-                                    // right ordinal.
-                                    journal.note_raft_command_skipped();
-                                    continue;
-                                }
+                            for ReplicatedCommand { command, now } in batch.items {
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
@@ -1312,46 +1327,43 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 let kind = command.kind();
                                 let outcome = journal.apply_command_at(command, now);
                                 crate::cmd_profile::finish(timer, kind);
-                                // Stop the batch at the first ENVIRONMENTAL failure
-                                // (fail closed): later commands must not be
-                                // evaluated or journaled once this replica has
-                                // proved it cannot read its own state. Deterministic
-                                // rejections do NOT stop the batch.
-                                if let Err(e) = &outcome
-                                    && e.is_environmental()
-                                {
-                                    environmental = Some(e.clone());
-                                    break;
+                                match outcome {
+                                    Err(e) if e.is_environmental() => {
+                                        journal.abort_raft_entry();
+                                        return Err(std::io::Error::other(format!(
+                                            "environmental failure applying committed \
+                                             batch: {e}"
+                                        )));
+                                    }
+                                    outcome => outcomes.push((kind, outcome.map(|(ev, _)| ev))),
                                 }
-                                outcomes.push((kind, outcome));
                             }
-                            journal.end_raft_apply();
-                            (outcomes, environmental)
+                            let (_, commit) = journal
+                                .commit_raft_entry(log_id.index, raft_state)
+                                .inspect_err(|_| journal.abort_raft_entry())?;
+                            Ok((outcomes, commit))
                         })
                         .await;
+                    let (outcomes, commit) = match applied {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "raft apply: failing closed on a committed entry \
+                                 (nothing journaled, last_applied NOT advanced) — \
+                                 recover this replica from its journal (#1405)"
+                            );
+                            return Err(StorageError::from_io_error(
+                                ErrorSubject::StateMachine,
+                                ErrorVerb::Write,
+                                e,
+                            ));
+                        }
+                    };
+                    // The entry's single durability barrier.
+                    commit.wait().await;
 
-                    // An environmental failure aborts the WHOLE entry closed: the
-                    // failed command journaled nothing, later commands were never
-                    // evaluated, and `last_applied` does not move.
-                    if let Some(e) = environmental {
-                        tracing::error!(
-                            error = %e,
-                            "raft apply: environmental failure applying a committed \
-                             batch; failing closed (last_applied NOT advanced, the \
-                             failed command journaled nothing) — recover this \
-                             replica via snapshot/replay (#1405)"
-                        );
-                        return Err(StorageError::from_io_error(
-                            ErrorSubject::StateMachine,
-                            ErrorVerb::Write,
-                            std::io::Error::other(format!(
-                                "environmental failure applying committed batch: {e}"
-                            )),
-                        ));
-                    }
-
-                    // Await the durable barriers (now coalesced by the
-                    // group-commit writer) and build the per-command responses.
+                    // Build the per-command responses.
                     let mut items = Vec::with_capacity(outcomes.len());
                     // A follower replica has no read-model exporter to drive
                     // hot-state eviction, so reclaim each instance's shell (+ its
@@ -1366,8 +1378,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     let mut terminal: Vec<nanobpmn_engine_core::Key> = Vec::new();
                     for outcome in outcomes {
                         match outcome {
-                            (_, Ok((events, commit))) => {
-                                commit.wait().await;
+                            (_, Ok(events)) => {
                                 if evict_terminal {
                                     terminal.extend(
                                         events.iter().filter_map(|e| e.terminal_instance_key()),
@@ -1400,18 +1411,38 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .last_applied = Some(log_id);
-                    // The entry fully applied: the apply cursor it may have
-                    // carried is now dead (#1405 — a replay that re-reads its
-                    // markers reseeds it, but no live apply consults it again).
-                    self.engine.spawn_job(move |journal| {
-                        journal.clear_applied_through();
-                    });
                     responses.push(ReplicatedResponse { items });
                 }
                 EntryPayload::Membership(mem) => {
+                    // Journal the applied-entry record carrying the NEW
+                    // membership (#1405) so a snapshot-less bootstrap that seeds
+                    // `last_applied` from the journal also recovers the
+                    // membership the skipped log prefix established.
+                    let membership = StoredMembership::new(Some(log_id), mem);
+                    let raft_state = journaled_raft_state(log_id, &membership).map_err(|e| {
+                        StorageError::from_io_error(ErrorSubject::StateMachine, ErrorVerb::Write, e)
+                    })?;
+                    let commit = self
+                        .engine
+                        .with(move |journal| {
+                            journal.begin_raft_entry();
+                            journal
+                                .commit_raft_entry(log_id.index, raft_state)
+                                .map(|(_, commit)| commit)
+                                .inspect_err(|_| journal.abort_raft_entry())
+                        })
+                        .await
+                        .map_err(|e| {
+                            StorageError::from_io_error(
+                                ErrorSubject::StateMachine,
+                                ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                    commit.wait().await;
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.last_applied = Some(log_id);
-                    inner.last_membership = StoredMembership::new(Some(log_id), mem);
+                    inner.last_membership = membership;
                     responses.push(ReplicatedResponse::default());
                 }
             }
@@ -2075,6 +2106,9 @@ impl RaftPartition {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )?);
+        // A durable journal-backed engine already holds every entry its journal
+        // recorded: seed `last_applied` so openraft does not re-apply them (#1405).
+        state_machine.seed_last_applied_from_journal().await?;
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(
             Arc::new(NullTransport),
@@ -2151,6 +2185,13 @@ impl RaftPartition {
         // replays the post-snapshot log tail. Without this a rejoining node whose
         // log was purged fails to host the partition entirely.
         state_machine.restore_from_current_snapshot().await?;
+        // A durable log resumes on-disk: the engine was rebuilt from its durable
+        // journal, so seed `last_applied` from the journal's applied-entry record
+        // and openraft only re-applies entries the journal never saw (#1405). A
+        // volatile (fresh-receiver) member installs the leader's snapshot instead.
+        if log_dir.is_some() {
+            state_machine.seed_last_applied_from_journal().await?;
+        }
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(transport, partition_id, snapshot_progress.clone());
         // One `Raft` handle, two possible log stores. The handle erases the log
@@ -3804,41 +3845,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    /// Crash/restart proof (#1405, finding #7 — disk-backed, NON-IDEMPOTENT
-    /// prefix): an impaired replica fails closed on a committed entry whose
-    /// FIRST command (`CreateInstance`, non-idempotent) already applied and
-    /// journaled. After a real shutdown + reopen of the SAME durable journal,
-    /// recovery must re-apply the entry from the cursor — exactly one instance,
-    /// byte-identical to a replica that applied the entry cleanly.
+    /// Spawns an engine over the durable SEGMENTED journal rooted at `dir`
+    /// (replaying whatever it already holds).
+    fn durable_engine(dir: &std::path::Path) -> DeepthiHandle {
+        let (journal, _) = Journal::open_segmented(dir).expect("open segmented journal");
+        DeepthiHandle::spawn(journal, 0, None)
+    }
+
+    /// Attaches the cold-spill store at `store_path` to `engine`.
+    async fn attach_cold(engine: &DeepthiHandle, store_path: &std::path::Path) {
+        let store_path = store_path.to_path_buf();
+        engine
+            .with(move |j| {
+                let store = Arc::new(
+                    nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                        .expect("open cold-spill store"),
+                );
+                j.set_cold_spill(store, 1, 0);
+            })
+            .await;
+    }
+
+    /// Deterministically shuts a durable engine down: swaps its journal out of
+    /// the actor and drops it HERE, which joins the journal's writer thread
+    /// (`Journal::drop`). On return every acked write is on disk and no writer
+    /// still holds the journal open — so a reopen can never race the old
+    /// writer (the detached actor thread drops only the in-memory stand-in).
+    async fn shutdown_engine(engine: DeepthiHandle) {
+        let journal = engine
+            .with(|j| std::mem::replace(j, Journal::in_memory_partition(0)))
+            .await;
+        drop(engine);
+        drop(journal);
+    }
+
+    /// The commands of the entry the impaired replica fails closed on: a
+    /// DETERMINISTIC rejection, a NON-IDEMPOTENT create, then the completion
+    /// that hits the unreadable cold row.
+    fn failing_entry(job_key: u64) -> Vec<ReplicatedCommand> {
+        vec![
+            ReplicatedCommand {
+                command: Command::complete_job(999_999),
+                now: 5,
+            },
+            ReplicatedCommand {
+                command: Command::create_instance("w"),
+                now: 6,
+            },
+            ReplicatedCommand {
+                command: Command::complete_job(job_key),
+                now: 7,
+            },
+        ]
+    }
+
+    /// Crash/restart proof (#1405): an impaired replica fails closed on a
+    /// committed entry `[CompleteJob(unknown), CreateInstance, CompleteJob(
+    /// unreadable)]` whose NON-IDEMPOTENT create already ran against live
+    /// state. Entry-level atomicity means the journal saw NONE of it: reopening
+    /// the real disk-backed journal shows zero instances from the entry and an
+    /// applied index still at the previous entry. Re-applying after the store
+    /// heals yields exactly one new instance, byte-identical to a clean replica
+    /// — with the deterministic rejection ahead of the create in the same
+    /// entry (the old per-command-ordinal drift shape).
     #[tokio::test]
-    async fn failed_closed_replica_recovers_via_replay_after_restart() {
+    async fn failed_closed_entry_journals_nothing_and_reapplies_exactly_once() {
         let store_dir = unique_log_dir("1405-restart");
         std::fs::create_dir_all(&store_dir).expect("store dir");
         let store_path = store_dir.join("replica.sqlite");
-        let journal_path = store_dir.join("replica.journal");
+        let journal_dir = store_dir.join("journal");
 
-        // Phase 1: the impaired replica. Setup parks an instance on a cold row;
-        // the row is corrupted; the entry [CreateInstance, CompleteJob] fails
-        // closed at the completion — but the create (a NON-IDEMPOTENT prefix)
-        // already applied and journaled, with its ReplayCursor marker.
+        // Phase 1: the impaired replica fails closed on entry 5.
         let (job_key, instance_key) = {
-            let engine = DeepthiHandle::spawn(
-                Journal::open_partition(&journal_path, 0).expect("open journal"),
-                0,
-                None,
-            );
-            engine
-                .with({
-                    let store_path = store_path.clone();
-                    move |j| {
-                        let store = Arc::new(
-                            nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
-                                .expect("open cold-spill store"),
-                        );
-                        j.set_cold_spill(store, 1, 0);
-                    }
-                })
-                .await;
+            let engine = durable_engine(&journal_dir);
+            attach_cold(&engine, &store_path).await;
             let sm: Arc<PartitionStateMachine> =
                 Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
             let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
@@ -3846,35 +3926,32 @@ mod tests {
                 .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
                 .await;
             corrupt_cold_row(&store_path, instance_key);
-
-            // Entry 5: [CreateInstance (applies + journals, cursor (5,0)),
-            //           CompleteJob (environmental failure -> fail closed)].
-            let batch = vec![
-                ReplicatedCommand {
-                    command: Command::create_instance("w"),
-                    now: 5,
-                },
-                ReplicatedCommand {
-                    command: Command::complete_job(job_key),
-                    now: 6,
-                },
-            ];
-            assert!(apply_entry(&sm, 5, batch).await.is_err());
+            assert!(apply_entry(&sm, 5, failing_entry(job_key)).await.is_err());
             let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
             assert_eq!(applied.map(|l| l.index), Some(4));
-            // The prefix's cursor marker is durable in the journal BEFORE the
-            // replica goes down.
-            engine
-                .with(|j| assert_eq!(j.applied_through(5), Some(0), "cursor (5,0) journaled"))
-                .await;
+            drop(sm);
+            shutdown_engine(engine).await;
             (job_key, instance_key)
-            // `engine`/`sm` drop here: the engine thread drains, the journal
-            // writer flushes + fsyncs, and the journal file closes — a real
-            // shutdown of the durable writers.
         };
 
-        // Heal the cold row (the bytes a healthy replica holds), rebuilt by
-        // replaying the applied prefix into a scratch engine.
+        // Phase 2: RESTART over the same durable journal. NOTHING of entry 5
+        // is journaled: no instance from its create, applied index still 4.
+        let engine2 = durable_engine(&journal_dir);
+        let keys: Vec<u64> = engine2
+            .with(|j| j.state().instances.keys().copied().collect())
+            .await;
+        assert_eq!(
+            keys,
+            vec![instance_key],
+            "only the setup instance: the failed-closed entry's create was never journaled"
+        );
+        assert_eq!(
+            engine2.with(|j| j.raft_applied().map(|(i, _)| i)).await,
+            Some(4),
+            "the journal's applied-entry record still names entry 4"
+        );
+
+        // Heal the cold row with the bytes a healthy replica holds.
         {
             let snap = {
                 let mut e = nanobpmn_engine_core::Engine::with_partition(0);
@@ -3895,82 +3972,44 @@ mod tests {
                 .expect("reopen store");
             store.put_cold(instance_key, &snap).expect("heal the row");
         }
-
-        // Phase 2: RESTART. Reopen the SAME durable journal — replay restores
-        // the prefix state AND the apply cursor — and re-apply entry 5.
-        let engine2 = DeepthiHandle::spawn(
-            Journal::open_partition(&journal_path, 0).expect("reopen journal"),
-            0,
-            None,
-        );
-        engine2
-            .with({
-                let store_path = store_path.clone();
-                move |j| {
-                    let store = Arc::new(
-                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
-                            .expect("open cold-spill store"),
-                    );
-                    j.set_cold_spill(store, 1, 0);
-                }
-            })
-            .await;
+        attach_cold(&engine2, &store_path).await;
         let sm2: Arc<PartitionStateMachine> =
             Arc::new(PartitionStateMachine::new_temp(engine2.clone(), 0).expect("sm"));
-        // Replay recovered the cursor: the prefix of entry 5 is known durable.
-        engine2
-            .with(|j| assert_eq!(j.applied_through(5), Some(0), "cursor survived restart"))
-            .await;
-        let recovered = apply_entry(
-            &sm2,
-            5,
-            vec![
-                ReplicatedCommand {
-                    command: Command::create_instance("w"),
-                    now: 5,
-                },
-                ReplicatedCommand {
-                    command: Command::complete_job(job_key),
-                    now: 6,
-                },
-            ],
-        )
-        .await
-        .expect("the healed replica re-applies the entry");
-        assert!(
-            recovered[0].items.iter().all(|i| i.error.is_none()),
-            "both commands apply after recovery (got {:?})",
-            recovered[0].items
-        );
-        let (recovered_applied, _) = sm2.clone().applied_state().await.expect("applied_state");
-        assert_eq!(recovered_applied.map(|l| l.index), Some(5));
+        sm2.seed_last_applied_from_journal()
+            .await
+            .expect("seed from journal");
+        let (seeded, _) = sm2.clone().applied_state().await.expect("applied_state");
+        assert_eq!(seeded.map(|l| l.index), Some(4), "seeded from the journal");
 
-        // Phase 3: parity with a CLEAN replica that applied the same entry
-        // without ever failing. Exactly one extra instance (the skipped prefix
-        // did NOT double-apply), and byte-identical state.
+        let recovered = apply_entry(&sm2, 5, failing_entry(job_key))
+            .await
+            .expect("the healed replica re-applies the entry");
+        let items = &recovered[0].items;
+        assert!(
+            items[0].error.is_some(),
+            "the unknown-job rejection replicates"
+        );
+        assert!(
+            items[1].error.is_none() && items[2].error.is_none(),
+            "create + completion apply after recovery (got {items:?})"
+        );
+        let created = items
+            .iter()
+            .flat_map(|i| i.events.iter())
+            .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+            .count();
+        assert_eq!(created, 1, "the create executed exactly once");
+
+        // Parity with a CLEAN replica that applied the same entry first time.
         let clean_dir = unique_log_dir("1405-restart-clean");
         std::fs::create_dir_all(&clean_dir).expect("clean store dir");
-        let clean_store = clean_dir.join("replica.sqlite");
-        let (clean_engine, clean_sm) = cold_backed_sm(&clean_store).await;
+        let (clean_engine, clean_sm) = cold_backed_sm(&clean_dir.join("replica.sqlite")).await;
         let (clean_job, _) = setup_parked_job(&clean_sm, &clean_engine).await;
         assert_eq!(clean_job, job_key, "same key sequence on the clean replica");
-        let clean = apply_entry(
-            &clean_sm,
-            5,
-            vec![
-                ReplicatedCommand {
-                    command: Command::create_instance("w"),
-                    now: 5,
-                },
-                ReplicatedCommand {
-                    command: Command::complete_job(job_key),
-                    now: 6,
-                },
-            ],
-        )
-        .await
-        .expect("clean replica applies the entry");
-        assert!(clean[0].items.iter().all(|i| i.error.is_none()));
+        let clean = apply_entry(&clean_sm, 5, failing_entry(job_key))
+            .await
+            .expect("clean replica applies the entry");
+        assert!(clean[0].items[1].error.is_none() && clean[0].items[2].error.is_none());
 
         let recovered_snapshot = engine2.with(|j| j.engine().snapshot()).await;
         let clean_snapshot = clean_engine.with(|j| j.engine().snapshot()).await;
@@ -3978,126 +4017,154 @@ mod tests {
             recovered_snapshot.state, clean_snapshot.state,
             "recovered replica is byte-identical to the clean replica"
         );
-        let instance_count = engine2.with(|j| j.state().instances.len()).await;
-        assert_eq!(
-            instance_count, 2,
-            "exactly one instance from the create (the prefix did NOT double-apply)"
-        );
 
+        drop(sm2);
+        shutdown_engine(engine2).await;
         let _ = std::fs::remove_dir_all(&store_dir);
         let _ = std::fs::remove_dir_all(&clean_dir);
     }
 
-    /// Mid-entry crash (#1405): a replica that dies BETWEEN two commands of one
-    /// entry — the first journaled with its cursor, the second never applied —
-    /// recovers without duplicating the first command. This is the crash window
-    /// the per-command cursor exists to close: events and cursor land in the
-    /// same fsync, so recovery never re-executes a durable prefix command.
+    /// A torn final frame drops the WHOLE entry (#1405): a crash mid-append of
+    /// a two-command entry can never keep the first command without the
+    /// second, nor the events without the applied-entry record.
     #[tokio::test]
-    async fn crash_between_commands_of_one_entry_recovers_without_duplicating() {
-        let store_dir = unique_log_dir("1405-midentry");
-        std::fs::create_dir_all(&store_dir).expect("store dir");
-        let journal_path = store_dir.join("replica.journal");
-
-        // Phase 1: deploy the process (entry 0 equivalent — applied cleanly
-        // BEFORE the crashed entry), then apply entry 1 = [CreateInstance,
-        // CreateInstance] against a durable journal, simulating the crash
-        // between the two commands by driving the journal DIRECTLY (no state
-        // machine): command 0 applies + journals its cursor (1,0); the process
-        // "dies" before command 1.
-        let first_instance = {
-            let engine = DeepthiHandle::spawn(
-                Journal::open_partition(&journal_path, 0).expect("open journal"),
-                0,
-                None,
-            );
-            // Entry 0: the deploy (applied cleanly, cursor cleared). Await its
-            // durable barrier so the "crash" below never loses it.
-            let deploy_commit = engine
-                .with(|j| {
-                    j.begin_raft_apply(0);
-                    let (_events, commit) = j
-                        .apply_command_at(wait_process_command(), 0)
-                        .expect("deploy applies");
-                    j.end_raft_apply();
-                    j.clear_applied_through();
-                    commit
-                })
-                .await;
-            deploy_commit.wait().await;
-            // Entry 1, command 0: the create — journaled with cursor (1,0) —
-            // then the "crash" before command 1.
-            engine
-                .with(|j| {
-                    j.begin_raft_apply(1);
-                    let (events, commit) = j
-                        .apply_command_at(Command::create_instance("w"), 1)
-                        .expect("first command applies");
-                    // The cursor marker rode the same write as the events.
-                    assert_eq!(j.applied_through(1), Some(0));
-                    j.end_raft_apply();
-                    drop(commit);
-                    events
-                        .iter()
-                        .find_map(|e| match e {
-                            Event::ProcessInstanceCreated { instance_key, .. } => {
-                                Some(*instance_key)
-                            }
-                            _ => None,
-                        })
-                        .expect("instance created")
-                })
-                .await
-            // engine drops: writer flushes + fsyncs — the crash boundary.
-        };
-
-        // Phase 2: recovery reopens the journal and re-applies the FULL entry
-        // through the state machine, exactly as openraft replays the
-        // still-unapplied entry after a crash.
-        let engine2 = DeepthiHandle::spawn(
-            Journal::open_partition(&journal_path, 0).expect("reopen journal"),
-            0,
-            None,
-        );
-        engine2
-            .with(|j| assert_eq!(j.applied_through(1), Some(0), "cursor recovered"))
-            .await;
-        let sm2: Arc<PartitionStateMachine> =
-            Arc::new(PartitionStateMachine::new_temp(engine2.clone(), 0).expect("sm"));
-        // Entry 0 (the deploy) is already durable in the reopened journal; the
-        // crash window under test is INSIDE entry 1.
-        let outcome = apply_entry(
-            &sm2,
-            1,
-            vec![
-                ReplicatedCommand {
-                    command: Command::create_instance("w"),
+    async fn torn_final_frame_drops_the_whole_entry() {
+        let dir = unique_log_dir("1405-torn");
+        let journal_dir = dir.join("journal");
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm: Arc<PartitionStateMachine> =
+                Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+            apply_entry(
+                &sm,
+                1,
+                vec![ReplicatedCommand {
+                    command: wait_process_command(),
                     now: 1,
-                },
-                ReplicatedCommand {
+                }],
+            )
+            .await
+            .expect("entry 1");
+            let two_creates = (0..2)
+                .map(|i| ReplicatedCommand {
                     command: Command::create_instance("w"),
-                    now: 2,
-                },
-            ],
+                    now: 2 + i,
+                })
+                .collect();
+            apply_entry(&sm, 2, two_creates).await.expect("entry 2");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        // Sanity: intact, the journal holds both creates of entry 2.
+        {
+            let engine = durable_engine(&journal_dir);
+            assert_eq!(engine.with(|j| j.state().instances.len()).await, 2);
+            shutdown_engine(engine).await;
+        }
+        // Tear the tail of entry 2's frame (a crash mid-append).
+        let active = journal_dir.join(nano_server_storage::seglog::ACTIVE_NAME);
+        let len = std::fs::metadata(&active).expect("active segment").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active)
+            .expect("open active")
+            .set_len(len - 3)
+            .expect("truncate");
+
+        let engine = durable_engine(&journal_dir);
+        assert_eq!(
+            engine.with(|j| j.state().processes.len()).await,
+            1,
+            "entry 1 survives"
+        );
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            0,
+            "NEITHER create of the torn entry survives — all or nothing"
+        );
+        assert_eq!(
+            engine.with(|j| j.raft_applied().map(|(i, _)| i)).await,
+            Some(1),
+            "the applied-entry record of the torn entry is gone with it"
+        );
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bootstrap without a Raft snapshot must NOT re-apply entries the durable
+    /// journal already holds (#1405): before the fix `last_applied` started at
+    /// `None`, so openraft re-applied the whole committed log on top of the
+    /// journal-rebuilt engine and every non-idempotent create ran twice.
+    #[tokio::test]
+    async fn bootstrap_without_snapshot_does_not_reapply_journaled_entries() {
+        let dir = unique_log_dir("1405-bootstrap");
+        let journal_dir = dir.join("journal");
+        let log_dir = dir.join("raftlog");
+        {
+            let engine = durable_engine(&journal_dir);
+            let part = RaftPartition::bootstrap_single_durable(
+                0,
+                0,
+                "http://self".into(),
+                engine.clone(),
+                &log_dir,
+            )
+            .await
+            .expect("bootstrap durable raft");
+            part.propose(wait_process_command(), 1)
+                .await
+                .expect("deploy");
+            part.propose(Command::create_instance("w"), 2)
+                .await
+                .expect("create");
+            part.raft.shutdown().await.expect("clean shutdown");
+            drop(part);
+            shutdown_engine(engine).await;
+        }
+        assert!(
+            read_snapshot_ptr(&log_dir.join("snapshots")).is_none(),
+            "no Raft snapshot: the bootstrap path under test"
+        );
+
+        let engine = durable_engine(&journal_dir);
+        assert_eq!(engine.with(|j| j.state().instances.len()).await, 1);
+        let journaled = engine
+            .with(|j| j.raft_applied().map(|(i, _)| i))
+            .await
+            .expect("the journal recorded its last applied entry");
+        let part = RaftPartition::bootstrap_single_durable(
+            0,
+            0,
+            "http://self".into(),
+            engine.clone(),
+            &log_dir,
         )
         .await
-        .expect("entry re-applies after recovery");
-        // Command 0 was skipped (cursor), command 1 applied fresh.
-        assert_eq!(outcome[0].items.len(), 1, "only the un-applied command ran");
-        assert!(outcome[0].items[0].error.is_none());
-        let instances = engine2.with(|j| j.state().instances.len()).await;
-        assert_eq!(
-            instances, 2,
-            "the first command was NOT duplicated: one pre-crash + one post-recovery instance"
-        );
+        .expect("recover durable raft");
         assert!(
-            engine2
-                .with(move |j| j.state().instances.contains_key(&first_instance))
-                .await,
-            "the pre-crash instance survived recovery exactly once"
+            part.raft.metrics().borrow().last_applied.map(|l| l.index) >= Some(journaled),
+            "last_applied seeded from the journal"
         );
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            1,
+            "the journaled create was NOT re-applied on bootstrap"
+        );
+        part.raft.shutdown().await.expect("clean shutdown");
+        drop(part);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
-        let _ = std::fs::remove_dir_all(&store_dir);
+    /// The opaque replication state journaled in `RaftEntryApplied` decodes back
+    /// to the exact log id the seed relies on (#1405).
+    #[test]
+    fn journaled_raft_state_round_trips() {
+        use openraft::CommittedLeaderId;
+        let log_id = LogId::new(CommittedLeaderId::new(3, 1), 17);
+        let json = journaled_raft_state(log_id, &StoredMembership::default()).expect("encode");
+        let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.log_id, log_id);
     }
 
     /// Polls `cond` until it holds or `timeout_ms` elapses.
