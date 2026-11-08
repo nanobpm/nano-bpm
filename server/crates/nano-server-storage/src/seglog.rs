@@ -355,6 +355,51 @@ impl SegShared {
         self.dir.join(HEAD_NAME)
     }
 
+    /// The uncompacted journal footprint still on disk (#1385): `(segments,
+    /// bytes)` over every sealed segment file plus the active one. Measured from
+    /// the DIRECTORY, not the in-memory sealed registry: compaction drops a
+    /// registry entry even when deleting its file fails, and such a retained file
+    /// still occupies disk, so the registry would under-report and could clear
+    /// the byte-budget alert incorrectly. Per-partition sidecars are excluded. A
+    /// file that vanishes mid-scan (raced with compaction) counts as 0 bytes.
+    /// This is what grows without bound when snapshots stop succeeding (#1383).
+    ///
+    /// Rotation race: if the writer seals between the active-file read and the
+    /// directory scan, the just-sealed file is the SAME file (same inode) as
+    /// the active one already counted. On Unix it is identified by `(dev,
+    /// ino)` and counted once, so a seal never double-counts bytes.
+    pub fn uncompacted_usage(&self) -> (u64, u64) {
+        self.usage_with_active(fs::metadata(&self.active_path).ok())
+    }
+
+    /// [`uncompacted_usage`](Self::uncompacted_usage) with the active file's
+    /// metadata already read — split out so the seal-between-reads
+    /// interleaving is tested deterministically.
+    fn usage_with_active(&self, active: Option<fs::Metadata>) -> (u64, u64) {
+        let mut segments = 1u64;
+        let mut bytes = active.as_ref().map_or(0, fs::Metadata::len);
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with(SEG_PREFIX) && !name.ends_with(PP_META_SUFFIX) {
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if let Some(a) = active.as_ref()
+                        && same_file(a, &meta)
+                    {
+                        // Sealed after we read it as active: already counted
+                        // (take the larger size in case of a final append).
+                        bytes = bytes - a.len() + a.len().max(meta.len());
+                        continue;
+                    }
+                    segments += 1;
+                    bytes += meta.len();
+                }
+            }
+        }
+        (segments, bytes)
+    }
+
     /// Number of partitions this log tracks (0 for the single-partition legacy
     /// path, which does no per-partition bookkeeping).
     pub fn partitions(&self) -> usize {
@@ -2477,6 +2522,20 @@ fn rebuild_from_surviving_tail(
     Ok(())
 }
 
+/// Whether two metadata records describe the same on-disk file (#1385).
+#[cfg(unix)]
+fn same_file(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    a.dev() == b.dev() && a.ino() == b.ino()
+}
+
+/// Non-Unix: no portable file identity; the rotation race may transiently
+/// double-count until the next sample.
+#[cfg(not(unix))]
+fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -2605,6 +2664,86 @@ mod tests {
         );
         assert_eq!(reopened.state().processes.len(), 1);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1385 disk guard input: the uncompacted footprint counts every segment
+    /// still on disk (sealed + active) and their bytes, and shrinks exactly by
+    /// what compaction deletes — the gauge a stalled snapshot pipeline grows.
+    #[test]
+    fn uncompacted_usage_tracks_sealed_and_active_segments_through_compaction() {
+        let dir = temp_dir("usage");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+        let sealed_bytes = fs::metadata(&shared.sealed.lock().unwrap()[0].path)
+            .unwrap()
+            .len();
+        assert!(sealed_bytes > 0);
+        let (segments, bytes) = shared.uncompacted_usage();
+        assert_eq!(segments, 2, "one sealed + the active segment");
+        assert!(bytes >= sealed_bytes);
+
+        write_snapshot(&dir, snap, covered).expect("write snapshot");
+        assert_eq!(compact(&shared, covered), 1);
+        let (segments_after, bytes_after) = shared.uncompacted_usage();
+        assert_eq!(segments_after, 1, "only the active segment remains");
+        assert_eq!(bytes_after, bytes - sealed_bytes);
+
+        drop(journal);
+        drop(shared);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1385: a sealed segment whose registry entry is gone but whose file is
+    /// still on disk (compaction's delete failed) must still be counted — the
+    /// gauge reports disk truth, not the in-memory registry.
+    #[test]
+    fn uncompacted_usage_counts_segment_files_dropped_from_registry() {
+        let dir = temp_dir("usage-orphan");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let _ = journal.snapshot_and_rotate().expect("snapshot+rotate");
+        let before = shared.uncompacted_usage();
+        // Simulate a failed delete: registry entry removed, file retained.
+        shared.sealed.lock().unwrap().clear();
+        assert_eq!(shared.uncompacted_usage(), before);
+
+        drop(journal);
+        drop(shared);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1385: a seal landing BETWEEN the active-file read and the directory
+    /// scan must not count the same bytes twice (once as active, once as the
+    /// renamed `journal.seg.*`), which could raise a false byte-budget 503.
+    #[cfg(unix)]
+    #[test]
+    fn uncompacted_usage_does_not_double_count_a_seal_mid_sample() {
+        let dir = temp_dir("usage-seal-race");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let expected = shared.uncompacted_usage();
+        assert!(expected.1 > 0);
+        // Interleaving: read active metadata, THEN the writer seals (rename).
+        let active = fs::metadata(&shared.active_path).ok();
+        fs::rename(&shared.active_path, shared.sealed_name(0)).unwrap();
+        assert_eq!(shared.usage_with_active(active), expected);
+
+        drop(journal);
+        drop(shared);
         let _ = fs::remove_dir_all(&dir);
     }
 
