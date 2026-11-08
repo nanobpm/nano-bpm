@@ -191,16 +191,25 @@ fn frame_atomic_capped(buf: &[u8], events: u64, compress: bool, cap: usize) -> i
     Ok(frame)
 }
 
-/// Decodes a segment file into its logical plaintext bytes — the concatenated
-/// newline-terminated records the writer appended — transparently inflating any
-/// compressed frames. Walks the file record-by-record: a [`FRAME_MAGIC`] byte
-/// begins a frame, anything else begins a legacy plaintext line, so a segment
-/// may freely interleave the two. A torn trailing frame header/body (a crash
-/// mid-append that was never fsynced, hence never acked) is dropped, matching
-/// the writer's ack-after-write-before-fsync durability contract.
-fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    let raw = fs::read(path)?;
-    let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+/// One physical journal record recovered from a segment file: either a single
+/// legacy plaintext line or a whole frame (#1405). `bytes` is its logical
+/// plaintext (newline-terminated records, inflated when compressed) and `end`
+/// the file offset just past it. A frame is the reader's unit of atomicity: its
+/// records are accepted or dropped TOGETHER, never flattened into a partial
+/// entry.
+struct SegRecord {
+    bytes: Vec<u8>,
+    end: usize,
+}
+
+/// Walks `raw` record-by-record: a [`FRAME_MAGIC`] byte begins a frame,
+/// anything else begins a legacy plaintext line, so a segment may freely
+/// interleave the two. A torn trailing frame header/body or an unterminated
+/// trailing line (a crash mid-append that was never fsynced, hence never acked)
+/// ends the walk, matching the writer's ack-after-write-before-fsync durability
+/// contract.
+fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
+    let mut out = Vec::new();
     let mut i = 0;
     while i < raw.len() {
         if raw[i] == FRAME_MAGIC {
@@ -209,8 +218,7 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
             }
             let codec = raw[i + 1];
             // Total: the `i + FRAME_HEADER_LEN <= raw.len()` guard above
-            // guarantees both 4-byte windows are in bounds, and a `[u8; 4]`
-            // conversion from a 4-byte slice cannot fail.
+            // guarantees both 4-byte windows are in bounds.
             let raw_len =
                 u32::from_le_bytes([raw[i + 2], raw[i + 3], raw[i + 4], raw[i + 5]]) as usize;
             let comp_len =
@@ -220,20 +228,21 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
                 break; // torn frame body
             };
             let payload = &raw[start..end];
-            match codec {
-                CODEC_RAW => out.extend_from_slice(payload),
+            let bytes = match codec {
+                CODEC_RAW => payload.to_vec(),
                 CODEC_DEFLATE => {
                     use std::io::Read;
 
                     use flate2::read::DeflateDecoder;
-                    let before = out.len();
-                    DeflateDecoder::new(payload).read_to_end(&mut out)?;
-                    if out.len() - before != raw_len {
+                    let mut buf = Vec::with_capacity(raw_len);
+                    DeflateDecoder::new(payload).read_to_end(&mut buf)?;
+                    if buf.len() != raw_len {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "journal frame inflated to unexpected length",
                         ));
                     }
+                    buf
                 }
                 other => {
                     return Err(io::Error::new(
@@ -241,19 +250,20 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
                         format!("unknown journal frame codec {other}"),
                     ));
                 }
-            }
+            };
+            out.push(SegRecord { bytes, end });
             i = end;
         } else {
-            // Legacy plaintext record: copy through the next newline (inclusive).
-            // An unterminated trailing line is a crash mid-append that was never
-            // newline-terminated — hence never fsynced/acked — so it is dropped,
-            // matching the torn-frame contract above and the writer's
-            // ack-after-write-before-fsync durability contract. Copying it through
-            // would hand a truncated JSON record to the segment reader and panic
-            // boot recovery ("EOF while parsing a string").
+            // Legacy plaintext record: through the next newline (inclusive). An
+            // unterminated trailing line was never newline-terminated — hence
+            // never fsynced/acked — so it is dropped; copying it through would
+            // hand a truncated JSON record to the segment reader.
             match raw[i..].iter().position(|&b| b == b'\n') {
                 Some(nl) => {
-                    out.extend_from_slice(&raw[i..=i + nl]);
+                    out.push(SegRecord {
+                        bytes: raw[i..=i + nl].to_vec(),
+                        end: i + nl + 1,
+                    });
                     i += nl + 1;
                 }
                 None => break,
@@ -261,6 +271,101 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
         }
     }
     Ok(out)
+}
+
+/// Decodes a segment file into its logical plaintext bytes — the concatenated
+/// newline-terminated records the writer appended — transparently inflating any
+/// compressed frames (see [`decode_segment_records`]).
+fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    let records = decode_segment_records(&fs::read(path)?)?;
+    Ok(records.into_iter().flat_map(|r| r.bytes).collect())
+}
+
+/// Whether `bytes` carries any content (a non-whitespace, non-NUL byte).
+fn has_content(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b != 0 && !b.is_ascii_whitespace())
+}
+
+/// Parses every record of a segment file with `parse` (one call per non-blank
+/// line), returning the parsed values and the byte length of the VALID prefix —
+/// the offset just past the last accepted record.
+///
+/// Frame-atomic (#1405): a record's lines are accepted or rejected as a UNIT.
+/// Only the LAST content-carrying record may be a torn tail — a crash mid-append
+/// can leave an unterminated/garbled line, NUL padding, or a full-length frame
+/// whose reused-block payload is garbled — so a non-UTF-8 or
+/// [`EventDecodeError::Malformed`] line THERE drops that whole record (never
+/// exposing a frame's events without its trailing applied-entry marker), while
+/// the same failure mid-file is genuine corruption and fatal. An
+/// [`EventDecodeError::UnknownVariant`] is a complete record this build cannot
+/// replay — never a torn write — so it is fatal anywhere (#1065, #1071).
+fn read_segment_with<T>(
+    path: &Path,
+    mut parse: impl FnMut(&str) -> Result<T, EventDecodeError>,
+) -> io::Result<(Vec<T>, u64)> {
+    let mut out = Vec::new();
+    let mut valid_end = 0u64;
+    if !path.exists() {
+        return Ok((out, valid_end));
+    }
+    let records = decode_segment_records(&fs::read(path)?)?;
+    let last = records.iter().rposition(|r| has_content(&r.bytes));
+    for (idx, record) in records.iter().enumerate() {
+        if !has_content(&record.bytes) {
+            continue;
+        }
+        let torn_tail = Some(idx) == last;
+        let mut parsed = Vec::new();
+        let mut failure: Option<(bool, io::Error)> = None;
+        for line in record.bytes.split(|&b| b == b'\n') {
+            let line = match std::str::from_utf8(line) {
+                Ok(s) => s,
+                Err(e) => {
+                    failure = Some((true, io::Error::new(io::ErrorKind::InvalidData, e)));
+                    break;
+                }
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            match parse(line) {
+                Ok(v) => parsed.push(v),
+                Err(e) => {
+                    let tolerable = matches!(e, EventDecodeError::Malformed { .. });
+                    failure = Some((tolerable, io::Error::new(io::ErrorKind::InvalidData, e)));
+                    break;
+                }
+            }
+        }
+        match failure {
+            None => {
+                out.extend(parsed);
+                valid_end = record.end as u64;
+            }
+            Some((true, e)) if torn_tail => {
+                tracing::warn!(
+                    "dropping torn journal tail record in {}: {e}",
+                    path.display()
+                );
+                break;
+            }
+            Some((_, e)) => return Err(e),
+        }
+    }
+    Ok((out, valid_end))
+}
+
+/// The byte length of `path`'s valid record prefix (see
+/// [`read_segment_with`]): everything past it is a torn tail that recovery
+/// drops. [`ActiveSegment::open`] truncates the active segment to it before
+/// appending, so a retried write can never splice into a torn record's
+/// advertised length (#1405).
+fn valid_segment_len(path: &Path) -> io::Result<u64> {
+    read_segment_with(path, |line| {
+        let json = line.split_once('\t').map_or(line, |(_, rest)| rest);
+        decode_event_json(json).map(|_| ())
+    })
+    .map(|(_, end)| end)
 }
 
 /// Whether the segmented journal is enabled for the persistent single-partition
@@ -453,6 +558,23 @@ pub struct ActiveSegment {
 impl ActiveSegment {
     /// Opens (creating, positioned to append) the active segment for `shared`.
     pub fn open(shared: Arc<SegShared>) -> io::Result<Self> {
+        // Truncate any torn tail first (#1405): recovery drops it, but its
+        // bytes would otherwise stay in front of the next append — a retried
+        // write could then fill a torn frame's advertised length with new
+        // bytes, and a later recovery would parse a mixed record.
+        if let Ok(meta) = fs::metadata(&shared.active_path) {
+            let valid = valid_segment_len(&shared.active_path)?;
+            if valid < meta.len() {
+                tracing::warn!(
+                    "truncating torn tail of {} from {} to {valid} bytes",
+                    shared.active_path.display(),
+                    meta.len()
+                );
+                let f = OpenOptions::new().write(true).open(&shared.active_path)?;
+                f.set_len(valid)?;
+                f.sync_all()?;
+            }
+        }
         let file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -938,56 +1060,10 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segs)
 }
 
-/// Index of the last line that carries content (any non-whitespace, non-NUL
-/// byte), or `None` when every line is blank. Only this final line may be a torn
-/// tail — a crash mid-append can leave an unterminated record or NUL padding at
-/// end-of-file — so segment readers tolerate a parse failure *there* (dropping
-/// it) while still hard-erroring on genuine mid-file corruption.
-fn last_content_line(lines: &[&[u8]]) -> Option<usize> {
-    lines
-        .iter()
-        .rposition(|l| l.iter().any(|&b| b != 0 && !b.is_ascii_whitespace()))
-}
-
 /// Reads and deserializes every event from a single segment/log file (empty if
-/// absent).
+/// absent). Torn-tail and frame-atomicity contract: [`read_segment_with`].
 pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    let mut events = Vec::new();
-    if path.exists() {
-        let decoded = decode_segment_bytes(path)?;
-        let lines: Vec<&[u8]> = decoded.split(|&b| b == b'\n').collect();
-        let last = last_content_line(&lines);
-        for (idx, line) in lines.iter().enumerate() {
-            let torn_tail = Some(idx) == last;
-            let line = match std::str::from_utf8(line) {
-                Ok(s) => s,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let event: Event = match decode_event_json(line) {
-                Ok(ev) => ev,
-                // A torn trailing write can leave a truncated/garbled last line;
-                // that is `Malformed` and safe to drop as an unfsynced tail. An
-                // `UnknownVariant` is a COMPLETE, well-formed record naming an
-                // event this build cannot replay (a renamed/removed variant or a
-                // newer/foreign journal) — never a torn write, so it is fatal
-                // even as the last line (routed to fail-closed / #1071, #1065).
-                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            events.push(event);
-        }
-    }
-    Ok(events)
+    read_segment_with(path, decode_event_json).map(|(events, _)| events)
 }
 
 /// Reads a segment/log file written by the shared multi-partition writer, where
@@ -999,47 +1075,18 @@ pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
 /// key partition, so a directory written by the pre-tag multi-partition format
 /// still recovers with the same demux behaviour it had then.
 fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
-    let mut events = Vec::new();
-    if path.exists() {
-        let decoded = decode_segment_bytes(path)?;
-        let lines: Vec<&[u8]> = decoded.split(|&b| b == b'\n').collect();
-        let last = last_content_line(&lines);
-        for (idx, line) in lines.iter().enumerate() {
-            let torn_tail = Some(idx) == last;
-            let line = match std::str::from_utf8(line) {
-                Ok(s) => s,
-                Err(e) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let (tag, json) = match line.split_once('\t') {
-                Some((t, rest)) => (t.parse::<u64>().ok(), rest),
-                None => (None, line),
-            };
-            let event: Event = match decode_event_json(json) {
-                Ok(ev) => ev,
-                // Same torn-tail vs. unknown-frame distinction as
-                // `read_segment_events`: tolerate only a `Malformed` tail; an
-                // `UnknownVariant` is a real cross-version frame, never dropped.
-                Err(EventDecodeError::Malformed { detail }) if torn_tail => {
-                    tracing::warn!("dropping torn journal tail in {}: {detail}", path.display());
-                    break;
-                }
-                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-            };
-            let tag = tag.unwrap_or_else(|| {
-                (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1))
-                    as u64
-            });
-            events.push((tag, event));
-        }
-    }
-    Ok(events)
+    read_segment_with(path, |line| {
+        let (tag, json) = match line.split_once('\t') {
+            Some((t, rest)) => (t.parse::<u64>().ok(), rest),
+            None => (None, line),
+        };
+        let event = decode_event_json(json)?;
+        let tag = tag.unwrap_or_else(|| {
+            (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1)) as u64
+        });
+        Ok((tag, event))
+    })
+    .map(|(events, _)| events)
 }
 
 /// Loads the latest persisted snapshot in `dir`.
@@ -5462,6 +5509,121 @@ mod tests {
         let err = frame_atomic_capped(&entry, 2, false, entry.len() - 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(frame_atomic_capped(&entry, 2, false, entry.len()).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Serialized event lines for the #1405 frame-integrity tests: a real
+    /// command event followed by its entry's applied-entry marker.
+    fn entry_lines(index: u64) -> (Vec<u8>, Vec<u8>) {
+        let ev = serde_json::to_string(&Event::RaftEntryApplied {
+            index: index * 1000,
+            raft_state: "cmd".into(),
+        })
+        .unwrap();
+        let marker = serde_json::to_string(&Event::RaftEntryApplied {
+            index,
+            raft_state: "{}".into(),
+        })
+        .unwrap();
+        (
+            format!("{ev}\n").into_bytes(),
+            format!("{marker}\n").into_bytes(),
+        )
+    }
+
+    /// #1405: a FULL-LENGTH frame whose trailing applied-entry marker line is
+    /// garbled (reused-block torn tail) is dropped WHOLE — its command events
+    /// are never exposed without the marker — by BOTH the bare and the tagged
+    /// readers; the same frame mid-file is fatal corruption.
+    #[test]
+    fn garbled_marker_line_drops_the_entire_frame() {
+        let dir = temp_dir("garbled-marker");
+        fs::create_dir_all(&dir).unwrap();
+        let (durable_ev, durable_marker) = entry_lines(1);
+        let mut durable = durable_ev.clone();
+        durable.extend_from_slice(&durable_marker);
+        let durable_frame = frame_atomic(&durable, 2, false).unwrap();
+        let (ev, marker) = entry_lines(2);
+        let mut payload = ev.clone();
+        // Same length as the real marker, but garbled.
+        payload.extend(std::iter::repeat_n(b'#', marker.len() - 1));
+        payload.push(b'\n');
+        let bad = frame_atomic(&payload, 2, false).unwrap();
+        let path = dir.join("j.jsonl");
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&bad);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            read_segment_events(&path).unwrap().len(),
+            2,
+            "only the durable entry"
+        );
+        assert_eq!(read_segment_events_tagged(&path, 1).unwrap().len(), 2);
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        // Mid-file, the garbled frame is genuine corruption: fatal, never skipped.
+        let mut mid = bad.clone();
+        mid.extend_from_slice(&durable_frame);
+        fs::write(&path, &mid).unwrap();
+        assert!(read_segment_events(&path).is_err());
+        assert!(read_segment_events_tagged(&path, 1).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a torn frame is TRUNCATED when the active segment reopens, so a
+    /// retried append never splices into the torn frame's advertised length:
+    /// the retried entry survives two consecutive recoveries.
+    #[test]
+    fn retried_append_after_a_torn_frame_survives_two_recoveries() {
+        let dir = temp_dir("torn-retry");
+        fs::create_dir_all(&dir).unwrap();
+        let active_path = dir.join(ACTIVE_NAME);
+        let shared = Arc::new(SegShared {
+            dir: dir.clone(),
+            active_path: active_path.clone(),
+            total_events: AtomicU64::new(0),
+            active_start: AtomicU64::new(0),
+            sealed: Mutex::new(Vec::new()),
+            segment_bytes: u64::MAX,
+            per_partition_total: Vec::new(),
+            per_partition_active_start: Vec::new(),
+            compress: false,
+        });
+        let entry = |i: u64| {
+            let (ev, marker) = entry_lines(i);
+            let mut buf = ev;
+            buf.extend_from_slice(&marker);
+            frame_atomic(&buf, 2, false).unwrap()
+        };
+        let durable = entry(1);
+        let retried = entry(2);
+        let mut file = durable.clone();
+        file.extend_from_slice(&retried[..retried.len() - 3]); // torn
+        fs::write(&active_path, &file).unwrap();
+        assert_eq!(read_segment_events(&active_path).unwrap().len(), 2);
+        // Recovery 1 → reopen → the retried entry is appended again.
+        {
+            let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
+            seg.write_all(&retried, 2).unwrap();
+            seg.fsync().unwrap();
+        }
+        for round in 1..=2 {
+            let events = read_segment_events(&active_path).unwrap();
+            assert_eq!(events.len(), 4, "recovery {round}: both entries intact");
+            assert_eq!(
+                events.last(),
+                Some(&Event::RaftEntryApplied {
+                    index: 2,
+                    raft_state: "{}".into()
+                })
+            );
+            drop(ActiveSegment::open(Arc::clone(&shared)).unwrap());
+        }
+        let mut expected = durable;
+        expected.extend_from_slice(&retried);
+        assert_eq!(fs::read(&active_path).unwrap(), expected);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -1003,6 +1003,48 @@ impl PartitionStateMachine {
         Ok(())
     }
 
+    /// Selects the NEWEST consistent boot state for a durable member (#1405):
+    /// the journal-rebuilt engine (applied index = its last
+    /// [`Event::RaftEntryApplied`] record) or the durable Raft snapshot
+    /// (applied index = its meta), together with the matching applied/membership
+    /// metadata. The engine was rebuilt from the journal, so when the journal is
+    /// at or ahead of the snapshot restoring the OLDER snapshot over it would
+    /// discard the journaled suffix — and openraft would then re-execute (and
+    /// re-journal) that suffix, running every non-idempotent create twice.
+    /// Only a snapshot strictly ahead of the journal (or a journal with no
+    /// applied-entry record at all) is restored. The single canonical boot-state
+    /// rule for every durable bootstrap path.
+    async fn restore_newest_boot_state(&self) -> anyhow::Result<()> {
+        let journaled = self.journaled_applied().await?;
+        let snapshot = self
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|s| s.meta.last_log_id);
+        match (journaled, snapshot) {
+            (Some(journal), Some(snap)) if snap > journal.log_id => {
+                // The snapshot is strictly newer: install it (its metadata was
+                // adopted in `new`); openraft replays only the tail after it.
+                self.restore_from_current_snapshot().await
+            }
+            (Some(_), _) => self.seed_last_applied_from_journal().await,
+            (None, _) => self.restore_from_current_snapshot().await,
+        }
+    }
+
+    /// Decodes the journal's last [`Event::RaftEntryApplied`] record, if any.
+    /// An undecodable record fails closed rather than guessing.
+    async fn journaled_applied(&self) -> anyhow::Result<Option<JournaledRaftState>> {
+        let Some((index, raft_state)) = self.engine.with(|journal| journal.raft_applied()).await
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raft_state).map(Some).map_err(|e| {
+            anyhow::anyhow!("undecodable Raft applied-entry record at index {index}: {e}")
+        })
+    }
+
     /// Seeds `last_applied` (and the membership it established) from the
     /// journal's last [`Event::RaftEntryApplied`] record (#1405), when it is
     /// AHEAD of what the state machine already knows (no Raft snapshot, or an
@@ -1012,13 +1054,9 @@ impl PartitionStateMachine {
     /// commands twice. An undecodable record fails closed (bootstrap errors)
     /// rather than guessing.
     async fn seed_last_applied_from_journal(&self) -> anyhow::Result<()> {
-        let Some((index, raft_state)) = self.engine.with(|journal| journal.raft_applied()).await
-        else {
+        let Some(recorded) = self.journaled_applied().await? else {
             return Ok(());
         };
-        let recorded: JournaledRaftState = serde_json::from_str(&raft_state).map_err(|e| {
-            anyhow::anyhow!("undecodable Raft applied-entry record at index {index}: {e}")
-        })?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if Some(recorded.log_id) > inner.last_applied {
             tracing::info!(
@@ -2107,8 +2145,9 @@ impl RaftPartition {
             Arc::new(AtomicU64::new(u64::MAX)),
         )?);
         // A durable journal-backed engine already holds every entry its journal
-        // recorded: seed `last_applied` so openraft does not re-apply them (#1405).
-        state_machine.seed_last_applied_from_journal().await?;
+        // recorded: boot from the newer of journal and snapshot so openraft
+        // re-applies neither's entries (#1405).
+        state_machine.restore_newest_boot_state().await?;
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(
             Arc::new(NullTransport),
@@ -2184,13 +2223,16 @@ impl RaftPartition {
         // metadata, so openraft's `get_initial_state` reconciles cleanly and only
         // replays the post-snapshot log tail. Without this a rejoining node whose
         // log was purged fails to host the partition entirely.
-        state_machine.restore_from_current_snapshot().await?;
+        //
         // A durable log resumes on-disk: the engine was rebuilt from its durable
-        // journal, so seed `last_applied` from the journal's applied-entry record
-        // and openraft only re-applies entries the journal never saw (#1405). A
-        // volatile (fresh-receiver) member installs the leader's snapshot instead.
+        // journal, so the NEWER of journal and snapshot wins, with matching
+        // applied metadata, and openraft only re-applies entries neither holds
+        // (#1405). A volatile (fresh-receiver) member restores its snapshot (if
+        // any) and otherwise installs the leader's.
         if log_dir.is_some() {
-            state_machine.seed_last_applied_from_journal().await?;
+            state_machine.restore_newest_boot_state().await?;
+        } else {
+            state_machine.restore_from_current_snapshot().await?;
         }
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(transport, partition_id, snapshot_progress.clone());
@@ -3951,27 +3993,7 @@ mod tests {
             "the journal's applied-entry record still names entry 4"
         );
 
-        // Heal the cold row with the bytes a healthy replica holds.
-        {
-            let snap = {
-                let mut e = nanobpmn_engine_core::Engine::with_partition(0);
-                let _ = e.apply_command_at(wait_process_command(), 1).expect("d");
-                let _ = e
-                    .apply_command_at(Command::create_instance("w"), 2)
-                    .expect("c");
-                let _ = e
-                    .apply_command_at(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3)
-                    .expect("a");
-                let _ = e
-                    .apply_command_at(Command::ExpireJobs { now: 64_000 }, 64_000)
-                    .expect("x");
-                e.snapshot_instance(instance_key)
-                    .expect("instance snapshot")
-            };
-            let store = nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
-                .expect("reopen store");
-            store.put_cold(instance_key, &snap).expect("heal the row");
-        }
+        heal_cold_row(&store_path, instance_key);
         attach_cold(&engine2, &store_path).await;
         let sm2: Arc<PartitionStateMachine> =
             Arc::new(PartitionStateMachine::new_temp(engine2.clone(), 0).expect("sm"));
@@ -4022,6 +4044,181 @@ mod tests {
         shutdown_engine(engine2).await;
         let _ = std::fs::remove_dir_all(&store_dir);
         let _ = std::fs::remove_dir_all(&clean_dir);
+    }
+
+    /// Heals `instance_key`'s cold row at `store_path` with the bytes a
+    /// healthy replica holds after [`setup_parked_job`].
+    fn heal_cold_row(store_path: &std::path::Path, instance_key: u64) {
+        let snap = {
+            let mut e = nanobpmn_engine_core::Engine::with_partition(0);
+            let _ = e.apply_command_at(wait_process_command(), 1).expect("d");
+            let _ = e
+                .apply_command_at(Command::create_instance("w"), 2)
+                .expect("c");
+            let _ = e
+                .apply_command_at(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3)
+                .expect("a");
+            let _ = e
+                .apply_command_at(Command::ExpireJobs { now: 64_000 }, 64_000)
+                .expect("x");
+            e.snapshot_instance(instance_key)
+                .expect("instance snapshot")
+        };
+        let store = nano_server_storage::varspill::VarSpillStore::open(Some(store_path))
+            .expect("reopen store");
+        store.put_cold(instance_key, &snap).expect("heal the row");
+    }
+
+    /// Fencing after an abort (#1405): once an entry fails closed, the live
+    /// engine holds its partial, non-durable effects, so even after the cold
+    /// read CLEARS a periodic checkpoint must not persist them. Abort → heal →
+    /// checkpoint tick → restart: the journal-rebuilt replica holds no trace of
+    /// the refused entry, so re-applying it creates exactly once.
+    #[tokio::test]
+    async fn aborted_entry_fences_checkpoints_until_rebuilt() {
+        let store_dir = unique_log_dir("1405-fence");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+        let journal_dir = store_dir.join("journal");
+        let job_key = {
+            let engine = durable_engine(&journal_dir);
+            attach_cold(&engine, &store_path).await;
+            let sm: Arc<PartitionStateMachine> =
+                Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+            let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
+            engine
+                .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
+                .await;
+            corrupt_cold_row(&store_path, instance_key);
+            assert!(apply_entry(&sm, 5, failing_entry(job_key)).await.is_err());
+            // The cold read clears, then the periodic checkpoint ticks.
+            heal_cold_row(&store_path, instance_key);
+            assert!(engine.with(|j| j.is_fenced()).await, "fenced after abort");
+            assert!(
+                engine.with(|j| j.snapshot_and_rotate()).await.is_none(),
+                "a checkpoint of the aborted prefix is refused"
+            );
+            assert!(
+                engine
+                    .with(|j| j.snapshot_and_rotate_lean())
+                    .await
+                    .is_none()
+            );
+            assert!(engine.with(|j| j.try_engine_snapshot()).await.is_none());
+            assert!(
+                engine
+                    .with(|j| j.apply_command_at(Command::create_instance("w"), 9))
+                    .await
+                    .is_err_and(|e| e.is_environmental()),
+                "no further mutation while fenced"
+            );
+            drop(sm);
+            shutdown_engine(engine).await;
+            job_key
+        };
+        let engine = durable_engine(&journal_dir);
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            1,
+            "only the setup instance: nothing of the refused entry was checkpointed"
+        );
+        attach_cold(&engine, &store_path).await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+        sm.seed_last_applied_from_journal().await.expect("seed");
+        let out = apply_entry(&sm, 5, failing_entry(job_key))
+            .await
+            .expect("re-apply after rebuild");
+        let created = out[0]
+            .items
+            .iter()
+            .flat_map(|i| i.events.iter())
+            .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+            .count();
+        assert_eq!(created, 1);
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            2,
+            "no duplicate"
+        );
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Boot-state selection (#1405): a durable journal AHEAD of the Raft
+    /// snapshot must win. Restoring the older snapshot over the journal-rebuilt
+    /// engine would discard the journaled suffix and make openraft re-execute
+    /// it — a duplicate `ProcessInstanceCreated` and shifted key counters.
+    #[tokio::test]
+    async fn boot_prefers_a_journal_ahead_of_an_older_snapshot() {
+        let dir = unique_log_dir("1405-boot-newest");
+        let journal_dir = dir.join("journal");
+        let snap_dir = dir.join("snapshots");
+        let new_sm = |engine: &DeepthiHandle| -> Arc<PartitionStateMachine> {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snap_dir.clone(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let before = {
+            let engine = durable_engine(&journal_dir);
+            let mut sm = new_sm(&engine);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            apply_entry(&sm, 2, one(Command::create_instance("w"), 2))
+                .await
+                .expect("2");
+            let mut builder = sm.get_snapshot_builder().await;
+            let _ = builder.build_snapshot().await.expect("snapshot at 2");
+            apply_entry(&sm, 3, one(Command::create_instance("w"), 3))
+                .await
+                .expect("3");
+            let state = engine.with(|j| j.engine().snapshot().state).await;
+            drop(sm);
+            shutdown_engine(engine).await;
+            state
+        };
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine);
+        let (adopted, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(adopted.map(|l| l.index), Some(2), "the snapshot is older");
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(3),
+            "the journal's index wins"
+        );
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(
+            after, before,
+            "journal state kept: no suffix lost, no counter shift"
+        );
+        drop(sm);
+        shutdown_engine(engine).await;
+
+        // The converse: a snapshot strictly AHEAD of the journal is restored.
+        let fresh = unique_log_dir("1405-boot-snapshot-ahead").join("journal");
+        let engine = durable_engine(&fresh);
+        let sm = new_sm(&engine);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        assert_eq!(engine.with(|j| j.state().instances.len()).await, 1);
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(2), "the snapshot's index");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(fresh.parent().expect("parent"));
     }
 
     /// A torn final frame drops the WHOLE entry (#1405): a crash mid-append of

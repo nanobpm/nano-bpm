@@ -266,6 +266,14 @@ pub struct Journal {
     /// ONE atomic frame. `None` outside Raft apply (the direct REST /
     /// single-node path journals per command as before).
     raft_entry: Option<Vec<Event>>,
+    /// Set by [`abort_raft_entry`](Self::abort_raft_entry) (#1405): the live
+    /// engine may hold a refused entry's partial, NON-durable effects, so this
+    /// journal is FENCED until the process rebuilds it from disk — no further
+    /// mutation, journal write, spill, or snapshot/checkpoint capture. Without
+    /// the fence a later checkpoint (once the cold-read failure clears) could
+    /// persist that partial prefix under the previous applied index, and a
+    /// restart would re-execute the entry on top of it.
+    fenced: bool,
     /// Test-only instrumentation: how many times the cold-descendant traversal
     /// scanned the resident instance set per visited descendant (the O(N × D)
     /// shape Copilot flagged on #1418). The indexed traversal never scans, so a
@@ -1024,6 +1032,7 @@ impl Journal {
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1058,6 +1067,7 @@ impl Journal {
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1179,6 +1189,7 @@ impl Journal {
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1217,6 +1228,7 @@ impl Journal {
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1260,6 +1272,7 @@ impl Journal {
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1298,6 +1311,7 @@ impl Journal {
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
+            fenced: false,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1775,6 +1789,9 @@ impl Journal {
     /// snapshots are derived from the durable journal, so a lost one is
     /// reconstructable: this is a memory cache, not a system of record.
     pub fn maybe_cold_spill(&mut self) {
+        if self.fenced {
+            return;
+        }
         let (high, low, shedding) = match self.cold.as_ref() {
             Some(cold) if cold.high_water > 0 => (cold.high_water, cold.low_water, cold.shedding),
             _ => return,
@@ -2176,6 +2193,11 @@ impl Journal {
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        if self.fenced {
+            // Environmental + retryable: a peer (or this replica once rebuilt
+            // from its journal) applies the command; this one must not (#1405).
+            return Err(EngineError::InstanceUnavailable { instance_key: 0 });
+        }
         self.ensure_resident_for_command(&command)?;
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
@@ -2220,6 +2242,12 @@ impl Journal {
         index: u64,
         raft_state: String,
     ) -> io::Result<(Arc<Vec<Event>>, Commit)> {
+        if self.fenced {
+            self.raft_entry = None;
+            return Err(io::Error::other(
+                "journal fenced after an aborted Raft entry; rebuild from disk (#1405)",
+            ));
+        }
         let mut events = self.raft_entry.take().unwrap_or_default();
         events.push(Event::RaftEntryApplied {
             index,
@@ -2257,6 +2285,13 @@ impl Journal {
     /// rebuild from the durable journal, which never saw them.
     pub fn abort_raft_entry(&mut self) {
         self.raft_entry = None;
+        self.fenced = true;
+    }
+
+    /// Whether this journal is fenced after an aborted Raft entry (#1405, see
+    /// the `fenced` field).
+    pub fn is_fenced(&self) -> bool {
+        self.fenced
     }
 
     /// The last Raft applied-entry record this journal wrote or recovered
@@ -2283,6 +2318,9 @@ impl Journal {
         &mut self,
         command: Command,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
+        if self.fenced {
+            return Err(EngineError::InstanceUnavailable { instance_key: 0 });
+        }
         self.ensure_resident_for_command(&command)?;
         let events = Arc::new(self.engine.apply_command(command)?);
         let commit = self.persist(&events);
@@ -2314,6 +2352,9 @@ impl Journal {
     }
 
     fn maybe_spill(&mut self) {
+        if self.fenced {
+            return;
+        }
         let Some(cap) = self
             .spill
             .as_ref()
@@ -2405,6 +2446,9 @@ impl Journal {
     /// small a fraction of the overshoot to matter, so a tiny-payload backlog is
     /// not thrashed for negligible relief.
     pub fn maybe_var_spill_pressure(&mut self) {
+        if self.fenced {
+            return;
+        }
         let (floor, high, low, reserve) = match self.spill.as_ref().map(|vs| &vs.trigger) {
             Some(VarSpillTrigger::Adaptive {
                 floor,
@@ -2742,6 +2786,9 @@ impl Journal {
     /// [`Engine::trigger_timers`]; returns the events produced (empty if none
     /// were due) and their [`Commit`].
     pub fn trigger_timers(&mut self, now: u64) -> (Arc<Vec<Event>>, Commit) {
+        if self.fenced {
+            return (Arc::new(Vec::new()), Commit::ready());
+        }
         // Rehydrate any cold instance whose armed timer is now due, so the tick
         // can fire it. No-op when nothing cold is due.
         if let Some(cold) = self.cold.as_ref() {
@@ -2878,6 +2925,9 @@ impl Journal {
     /// recording it. Only the local journal rotation tolerates orphans — see
     /// [`try_engine_snapshot_quarantining`](Journal::try_engine_snapshot_quarantining).
     pub fn try_engine_snapshot(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        if self.fenced {
+            return None;
+        }
         let mut snap = self.engine.snapshot();
         self.fold_offheap_into(&mut snap, OrphanPolicy::Strict)?;
         Some(snap)
@@ -2889,6 +2939,9 @@ impl Journal {
     /// readable, wired store is quarantined (logged once, see `note_orphan`) so a
     /// permanently lost payload cannot block local snapshots + compaction forever.
     pub fn try_engine_snapshot_quarantining(&self) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        if self.fenced {
+            return None;
+        }
         let mut snap = self.engine.snapshot();
         self.fold_offheap_into(&mut snap, OrphanPolicy::Quarantine)?;
         Some(snap)
@@ -2908,6 +2961,9 @@ impl Journal {
     pub fn try_engine_snapshot_quarantining_with_incidents(
         &mut self,
     ) -> Option<nanobpmn_engine_core::EngineSnapshot> {
+        if self.fenced {
+            return None;
+        }
         // Under replicated (Raft) application the classic rotation still runs on
         // the Raft-owned actor, but raising an incident here would mint a
         // replica-local key + wall-clock stamp outside any Raft proposal and
@@ -3318,6 +3374,9 @@ impl Journal {
     /// snapshot. No command runs between the snapshot and the seal because the
     /// actor is single-threaded.
     pub fn snapshot_and_rotate(&mut self) -> Option<(nanobpmn_engine_core::EngineSnapshot, u64)> {
+        if self.fenced {
+            return None;
+        }
         self.seg.as_ref()?;
         // Fail-closed: abort the rotation (returning `None` before the seal) if any
         // off-heap payload could not be folded in, so an incomplete snapshot is
@@ -3369,6 +3428,9 @@ impl Journal {
     /// cannot be folded in, so an incomplete lean checkpoint never gates
     /// compaction.
     pub fn snapshot_and_rotate_lean(&mut self) -> Option<LeanCheckpoint> {
+        if self.fenced {
+            return None;
+        }
         self.seg.as_ref()?;
         // Fold cold instances FIRST: it is a pure read of engine + cold store (no
         // mutation), so doing it before the drain is equivalent on the success
