@@ -23898,8 +23898,12 @@ const STORAGE_USAGE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::
 fn sample_storage_usage(
     health: &snapshot_health::SnapshotHealth,
     shared: &seglog::SegShared,
+    quarantined: Option<u64>,
     thresholds: &snapshot_health::HealthThresholds,
 ) {
+    if let Some(q) = quarantined {
+        health.set_quarantined_orphans(q);
+    }
     let (segments, bytes) = shared.uncompacted_usage();
     health.set_journal_usage(segments, bytes);
     health.set_disk(disk_space_bytes(&shared.dir));
@@ -23928,41 +23932,40 @@ fn log_health_alert_transitions(
 /// fixed cadence decoupled from the snapshot interval — with
 /// `NANOBPMN_SNAPSHOT_INTERVAL_MS=0`, or before the first delayed snapshot
 /// tick, a breached threshold must still surface (#1385).
-fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>) {
+///
+/// The quarantined-orphan count is refreshed here too (from the owned engine
+/// handles), not only on snapshot ticks, so it is correct with snapshots
+/// disabled. The synchronous seed leaves it untouched (reading it needs the
+/// engine writer); the first, immediate async tick fills it in.
+fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>, handles: Vec<DeepthiHandle>) {
     let health = snapshot_health::global();
     sample_storage_usage(
         health,
         &shared,
+        None,
         &snapshot_health::HealthThresholds::from_env(),
     );
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(STORAGE_USAGE_SAMPLE_INTERVAL);
-        ticker.tick().await;
         loop {
             ticker.tick().await;
+            let (quarantined, _) = journal_quarantine_state(&handles).await;
             sample_storage_usage(
                 health,
                 &shared,
+                Some(quarantined),
                 &snapshot_health::HealthThresholds::from_env(),
             );
         }
     });
 }
 
-/// Feeds one snapshot-maintenance tick's outcome into the snapshot-health
-/// tracker (#1385) and does the tick's logging: a failure is logged only when
-/// [`SnapshotHealth::record_failure`](snapshot_health::SnapshotHealth::record_failure)
-/// says it is news (first of a streak, changed reason/blockers, or a periodic
-/// reminder), a recovery once, and each degraded cause once on entry/exit.
-/// Shared by the single- and multi-partition snapshot loops so both report
-/// identically.
-async fn record_snapshot_health_tick(
-    health: &snapshot_health::SnapshotHealth,
+/// Sums quarantined off-heap orphans and collects (sorted, deduped) snapshot
+/// blockers across `handles`. The single source for both the storage sampler
+/// and the snapshot tick (#1385).
+async fn journal_quarantine_state(
     handles: &[DeepthiHandle],
-    shared: &seglog::SegShared,
-    outcome: Result<(), String>,
-) {
-    let now = std::time::Instant::now();
+) -> (u64, Vec<nanobpmn_engine_core::Key>) {
     let mut quarantined = 0u64;
     let mut blockers = Vec::new();
     for handle in handles {
@@ -23979,6 +23982,24 @@ async fn record_snapshot_health_tick(
     }
     blockers.sort_unstable();
     blockers.dedup();
+    (quarantined, blockers)
+}
+
+/// Feeds one snapshot-maintenance tick's outcome into the snapshot-health
+/// tracker (#1385) and does the tick's logging: a failure is logged only when
+/// [`SnapshotHealth::record_failure`](snapshot_health::SnapshotHealth::record_failure)
+/// says it is news (first of a streak, changed reason/blockers, or a periodic
+/// reminder), a recovery once, and each degraded cause once on entry/exit.
+/// Shared by the single- and multi-partition snapshot loops so both report
+/// identically.
+async fn record_snapshot_health_tick(
+    health: &snapshot_health::SnapshotHealth,
+    handles: &[DeepthiHandle],
+    shared: &seglog::SegShared,
+    outcome: Result<(), String>,
+) {
+    let now = std::time::Instant::now();
+    let (quarantined, blockers) = journal_quarantine_state(handles).await;
     let (segments, bytes) = shared.uncompacted_usage();
     let disk = disk_space_bytes(&shared.dir);
     apply_snapshot_health_tick(
@@ -24803,7 +24824,7 @@ mod snapshot_health_tick_tests {
             uncompacted_bytes_max: 1,
             ..thresholds()
         };
-        sample_storage_usage(&h, &recovery.shared, &tiny_budget);
+        sample_storage_usage(&h, &recovery.shared, Some(2), &tiny_budget);
         // The sampler itself logs the entry transition (edge-triggered), so a
         // breach is logged even with snapshots disabled: nothing is left
         // pending for a later snapshot tick to log.
@@ -24812,6 +24833,12 @@ mod snapshot_health_tick_tests {
         let r = h.report(Instant::now(), &tiny_budget);
         assert!(r.uncompacted_bytes > 1, "backlog seen: {r:?}");
         assert_eq!(r.consecutive_failures, 0, "no snapshot outcome recorded");
+        // Quarantine count is refreshed by the sampler, not only by snapshot
+        // ticks, so it is correct with snapshots disabled.
+        assert_eq!(
+            r.quarantined_orphans, 2,
+            "sampler refreshed quarantine count"
+        );
         assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
         drop(journal);
         let _ = std::fs::remove_dir_all(&dir);
@@ -25402,7 +25429,7 @@ async fn main() {
             }
 
             if let Some(shared) = seg_shared.clone() {
-                spawn_storage_usage_sampler(shared);
+                spawn_storage_usage_sampler(shared, server.engine.all().to_vec());
             }
 
             // Bounded-disk maintenance: periodically snapshot the engine, seal the
@@ -25486,7 +25513,7 @@ async fn main() {
             }
 
             if let Some((shared, _)) = multi_seg.clone() {
-                spawn_storage_usage_sampler(shared);
+                spawn_storage_usage_sampler(shared, server.engine.all().to_vec());
             }
 
             // Bounded-disk maintenance for the single-node multi-partition
