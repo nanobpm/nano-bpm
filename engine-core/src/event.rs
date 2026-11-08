@@ -1153,6 +1153,22 @@ pub enum Event {
         message_name: String,
         correlation_key: String,
     },
+    /// A Raft apply-progress marker (#1405): journaled **atomically in the same
+    /// write as the events of the command it follows**, recording that command
+    /// `command_ordinal` of Raft log entry `raft_index` was applied and its
+    /// events persisted. On recovery a replica re-applying a still-unapplied
+    /// entry (one it had failed closed on mid-batch) skips every command whose
+    /// ordinal the cursor already covers, so a non-idempotent prefix command
+    /// (e.g. `CreateInstance`) is never executed twice. The marker is
+    /// state-neutral: the applier ignores it and it carries no keys, so replay
+    /// and the read model are unaffected; it only reseeds the engine's
+    /// in-memory apply cursor. A marker whose `raft_index` is at or below the
+    /// recovered `last_applied` is dead (the entry fully applied before the
+    /// crash) and is ignored.
+    ReplayCursor {
+        raft_index: u64,
+        command_ordinal: u32,
+    },
     /// An open message subscription was cancelled before correlating because the
     /// element it guarded left the flow first (e.g. a boundary subscription whose
     /// activity completed normally, or a sibling boundary subscription when
@@ -1769,6 +1785,7 @@ impl Event {
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
+            | Event::ReplayCursor { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
     }

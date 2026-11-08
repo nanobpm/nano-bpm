@@ -1257,12 +1257,15 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     // A failed command journals NOTHING (`apply_command_at` returns
                     // before `persist`), so the environmental abort never writes a
                     // half-applied copy of the failed command. Any earlier commands
-                    // of the same batch that already succeeded ARE journaled — but
-                    // replay is idempotent for them (a re-issued `CompleteJob`
-                    // against an already-completed job rejects deterministically
-                    // with `JobNotFound`; a byte-identical redeploy is skipped), so
-                    // on recovery the prefix converges and only the failed command
-                    // is actually retried. No scratch-vs-live divergence is possible
+                    // of the same batch that already succeeded ARE journaled — and
+                    // each journaled a `ReplayCursor` marker ATOMICALLY in the same
+                    // write as its events, recording `(log index, command ordinal)`.
+                    // When recovery re-applies this still-unapplied entry, the
+                    // recovered cursor makes the replica SKIP the already-journaled
+                    // prefix (below), so a non-idempotent prefix command (e.g. a
+                    // `CreateInstance` ahead of the failed command) is never
+                    // executed twice — no duplicate instance, no key drift against
+                    // healthy peers. No scratch-vs-live divergence is possible
                     // because there is only ONE evaluation, against the live state.
                     //
                     // The command `kind` is captured alongside each outcome so the
@@ -1280,9 +1283,28 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     ) = self
                         .engine
                         .with(move |journal| {
+                            // The recovered apply cursor: if this entry was
+                            // partially applied before a fail-closed crash, every
+                            // command up to and including `skip_through` is
+                            // already durable in the journal and must not run
+                            // again (#1405).
+                            let skip_through = journal.applied_through(log_id.index);
+                            journal.begin_raft_apply(log_id.index);
                             let mut outcomes = Vec::with_capacity(batch.items.len());
                             let mut environmental = None;
-                            for ReplicatedCommand { command, now } in batch.items.into_iter() {
+                            for (ordinal, ReplicatedCommand { command, now }) in
+                                batch.items.into_iter().enumerate()
+                            {
+                                let ordinal = ordinal as u32;
+                                if skip_through.is_some_and(|s| ordinal <= s) {
+                                    // Already applied + journaled before the
+                                    // crash; the cursor advanced past it. Keep
+                                    // the journal's per-entry ordinal counter in
+                                    // step so the NEXT applied command stamps the
+                                    // right ordinal.
+                                    journal.note_raft_command_skipped();
+                                    continue;
+                                }
                                 // Per-command actor profiling (off unless
                                 // NANOBPM_CMD_PROFILE): time + allocated-byte
                                 // delta by command kind, on the engine thread.
@@ -1303,6 +1325,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                                 }
                                 outcomes.push((kind, outcome));
                             }
+                            journal.end_raft_apply();
                             (outcomes, environmental)
                         })
                         .await;
@@ -1377,6 +1400,12 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .last_applied = Some(log_id);
+                    // The entry fully applied: the apply cursor it may have
+                    // carried is now dead (#1405 — a replay that re-reads its
+                    // markers reseeds it, but no live apply consults it again).
+                    self.engine.spawn_job(move |journal| {
+                        journal.clear_applied_through();
+                    });
                     responses.push(ReplicatedResponse { items });
                 }
                 EntryPayload::Membership(mem) => {
@@ -3775,29 +3804,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store_dir);
     }
 
-    /// Crash/restart proof (#1405, finding #7 — disk-backed): an impaired replica
-    /// that failed closed on a committed entry must, after a RESTART that reopens
-    /// its actual on-disk journal + Raft storage with the off-heap store healed,
-    //  re-apply the still-unapplied entry and converge — never skip it, never
-    /// double-apply the batch's already-journaled prefix.
+    /// Crash/restart proof (#1405, finding #7 — disk-backed, NON-IDEMPOTENT
+    /// prefix): an impaired replica fails closed on a committed entry whose
+    /// FIRST command (`CreateInstance`, non-idempotent) already applied and
+    /// journaled. After a real shutdown + reopen of the SAME durable journal,
+    /// recovery must re-apply the entry from the cursor — exactly one instance,
+    /// byte-identical to a replica that applied the entry cleanly.
     #[tokio::test]
     async fn failed_closed_replica_recovers_via_replay_after_restart() {
         let store_dir = unique_log_dir("1405-restart");
         std::fs::create_dir_all(&store_dir).expect("store dir");
         let store_path = store_dir.join("replica.sqlite");
+        let journal_path = store_dir.join("replica.journal");
 
-        let (job_key, instance_key, setup) = {
-            let (engine, sm) = cold_backed_sm(&store_path).await;
+        // Phase 1: the impaired replica. Setup parks an instance on a cold row;
+        // the row is corrupted; the entry [CreateInstance, CompleteJob] fails
+        // closed at the completion — but the create (a NON-IDEMPOTENT prefix)
+        // already applied and journaled, with its ReplayCursor marker.
+        let (job_key, instance_key) = {
+            let engine = DeepthiHandle::spawn(
+                Journal::open_partition(&journal_path, 0).expect("open journal"),
+                0,
+                None,
+            );
+            engine
+                .with({
+                    let store_path = store_path.clone();
+                    move |j| {
+                        let store = Arc::new(
+                            nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                                .expect("open cold-spill store"),
+                        );
+                        j.set_cold_spill(store, 1, 0);
+                    }
+                })
+                .await;
+            let sm: Arc<PartitionStateMachine> =
+                Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
             let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
             engine
                 .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
                 .await;
             corrupt_cold_row(&store_path, instance_key);
 
-            // The committed batch fails closed at index 5 (last_applied stays 4).
+            // Entry 5: [CreateInstance (applies + journals, cursor (5,0)),
+            //           CompleteJob (environmental failure -> fail closed)].
             let batch = vec![
                 ReplicatedCommand {
-                    command: deploy_command(),
+                    command: Command::create_instance("w"),
                     now: 5,
                 },
                 ReplicatedCommand {
@@ -3805,34 +3859,22 @@ mod tests {
                     now: 6,
                 },
             ];
-            assert!(apply_entry(&sm, 5, batch.clone()).await.is_err());
+            assert!(apply_entry(&sm, 5, batch).await.is_err());
             let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
             assert_eq!(applied.map(|l| l.index), Some(4));
-            // Keep the setup commands to replay into the post-restart replica.
-            let setup = vec![
-                ReplicatedCommand {
-                    command: wait_process_command(),
-                    now: 1,
-                },
-                ReplicatedCommand {
-                    command: Command::create_instance("w"),
-                    now: 2,
-                },
-                ReplicatedCommand {
-                    command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
-                    now: 3,
-                },
-                ReplicatedCommand {
-                    command: Command::ExpireJobs { now: 64_000 },
-                    now: 64_000,
-                },
-            ];
-            (job_key, instance_key, setup)
+            // The prefix's cursor marker is durable in the journal BEFORE the
+            // replica goes down.
+            engine
+                .with(|j| assert_eq!(j.applied_through(5), Some(0), "cursor (5,0) journaled"))
+                .await;
+            (job_key, instance_key)
+            // `engine`/`sm` drop here: the engine thread drains, the journal
+            // writer flushes + fsyncs, and the journal file closes — a real
+            // shutdown of the durable writers.
         };
 
-        // RESTART + heal: write back a VALID cold row for the instance (the bytes
-        // a healthy replica holds), rebuilt by replaying the applied prefix into a
-        // scratch engine and spilling the instance out of it.
+        // Heal the cold row (the bytes a healthy replica holds), rebuilt by
+        // replaying the applied prefix into a scratch engine.
         {
             let snap = {
                 let mut e = nanobpmn_engine_core::Engine::with_partition(0);
@@ -3854,20 +3896,37 @@ mod tests {
             store.put_cold(instance_key, &snap).expect("heal the row");
         }
 
-        // The post-restart replica re-applies the still-unapplied entry (index 4):
-        // it now succeeds and converges with what a healthy replica computed.
-        let (engine2, sm2) = cold_backed_sm(&store_path).await;
-        for (i, cmd) in setup.iter().enumerate() {
-            apply_entry(&sm2, (i + 1) as u64, vec![cmd.clone()])
-                .await
-                .expect("prefix replays");
-        }
+        // Phase 2: RESTART. Reopen the SAME durable journal — replay restores
+        // the prefix state AND the apply cursor — and re-apply entry 5.
+        let engine2 = DeepthiHandle::spawn(
+            Journal::open_partition(&journal_path, 0).expect("reopen journal"),
+            0,
+            None,
+        );
+        engine2
+            .with({
+                let store_path = store_path.clone();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open cold-spill store"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+        let sm2: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine2.clone(), 0).expect("sm"));
+        // Replay recovered the cursor: the prefix of entry 5 is known durable.
+        engine2
+            .with(|j| assert_eq!(j.applied_through(5), Some(0), "cursor survived restart"))
+            .await;
         let recovered = apply_entry(
             &sm2,
             5,
             vec![
                 ReplicatedCommand {
-                    command: deploy_command(),
+                    command: Command::create_instance("w"),
                     now: 5,
                 },
                 ReplicatedCommand {
@@ -3886,22 +3945,156 @@ mod tests {
         let (recovered_applied, _) = sm2.clone().applied_state().await.expect("applied_state");
         assert_eq!(recovered_applied.map(|l| l.index), Some(5));
 
-        // Convergence: the deploy landed exactly once and the job drove the
-        // instance to completion.
-        let recovered_processes = engine2.with(|j| j.state().processes.len()).await;
+        // Phase 3: parity with a CLEAN replica that applied the same entry
+        // without ever failing. Exactly one extra instance (the skipped prefix
+        // did NOT double-apply), and byte-identical state.
+        let clean_dir = unique_log_dir("1405-restart-clean");
+        std::fs::create_dir_all(&clean_dir).expect("clean store dir");
+        let clean_store = clean_dir.join("replica.sqlite");
+        let (clean_engine, clean_sm) = cold_backed_sm(&clean_store).await;
+        let (clean_job, _) = setup_parked_job(&clean_sm, &clean_engine).await;
+        assert_eq!(clean_job, job_key, "same key sequence on the clean replica");
+        let clean = apply_entry(
+            &clean_sm,
+            5,
+            vec![
+                ReplicatedCommand {
+                    command: Command::create_instance("w"),
+                    now: 5,
+                },
+                ReplicatedCommand {
+                    command: Command::complete_job(job_key),
+                    now: 6,
+                },
+            ],
+        )
+        .await
+        .expect("clean replica applies the entry");
+        assert!(clean[0].items.iter().all(|i| i.error.is_none()));
+
+        let recovered_snapshot = engine2.with(|j| j.engine().snapshot()).await;
+        let clean_snapshot = clean_engine.with(|j| j.engine().snapshot()).await;
         assert_eq!(
-            recovered_processes, 2,
-            "the retried deploy landed exactly once"
+            recovered_snapshot.state, clean_snapshot.state,
+            "recovered replica is byte-identical to the clean replica"
         );
-        let instance_state = engine2
-            .with(move |j| j.state().instances.get(&instance_key).map(|i| i.state))
+        let instance_count = engine2.with(|j| j.state().instances.len()).await;
+        assert_eq!(
+            instance_count, 2,
+            "exactly one instance from the create (the prefix did NOT double-apply)"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&clean_dir);
+    }
+
+    /// Mid-entry crash (#1405): a replica that dies BETWEEN two commands of one
+    /// entry — the first journaled with its cursor, the second never applied —
+    /// recovers without duplicating the first command. This is the crash window
+    /// the per-command cursor exists to close: events and cursor land in the
+    /// same fsync, so recovery never re-executes a durable prefix command.
+    #[tokio::test]
+    async fn crash_between_commands_of_one_entry_recovers_without_duplicating() {
+        let store_dir = unique_log_dir("1405-midentry");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let journal_path = store_dir.join("replica.journal");
+
+        // Phase 1: deploy the process (entry 0 equivalent — applied cleanly
+        // BEFORE the crashed entry), then apply entry 1 = [CreateInstance,
+        // CreateInstance] against a durable journal, simulating the crash
+        // between the two commands by driving the journal DIRECTLY (no state
+        // machine): command 0 applies + journals its cursor (1,0); the process
+        // "dies" before command 1.
+        let first_instance = {
+            let engine = DeepthiHandle::spawn(
+                Journal::open_partition(&journal_path, 0).expect("open journal"),
+                0,
+                None,
+            );
+            // Entry 0: the deploy (applied cleanly, cursor cleared). Await its
+            // durable barrier so the "crash" below never loses it.
+            let deploy_commit = engine
+                .with(|j| {
+                    j.begin_raft_apply(0);
+                    let (_events, commit) = j
+                        .apply_command_at(wait_process_command(), 0)
+                        .expect("deploy applies");
+                    j.end_raft_apply();
+                    j.clear_applied_through();
+                    commit
+                })
+                .await;
+            deploy_commit.wait().await;
+            // Entry 1, command 0: the create — journaled with cursor (1,0) —
+            // then the "crash" before command 1.
+            engine
+                .with(|j| {
+                    j.begin_raft_apply(1);
+                    let (events, commit) = j
+                        .apply_command_at(Command::create_instance("w"), 1)
+                        .expect("first command applies");
+                    // The cursor marker rode the same write as the events.
+                    assert_eq!(j.applied_through(1), Some(0));
+                    j.end_raft_apply();
+                    drop(commit);
+                    events
+                        .iter()
+                        .find_map(|e| match e {
+                            Event::ProcessInstanceCreated { instance_key, .. } => {
+                                Some(*instance_key)
+                            }
+                            _ => None,
+                        })
+                        .expect("instance created")
+                })
+                .await
+            // engine drops: writer flushes + fsyncs — the crash boundary.
+        };
+
+        // Phase 2: recovery reopens the journal and re-applies the FULL entry
+        // through the state machine, exactly as openraft replays the
+        // still-unapplied entry after a crash.
+        let engine2 = DeepthiHandle::spawn(
+            Journal::open_partition(&journal_path, 0).expect("reopen journal"),
+            0,
+            None,
+        );
+        engine2
+            .with(|j| assert_eq!(j.applied_through(1), Some(0), "cursor recovered"))
             .await;
+        let sm2: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine2.clone(), 0).expect("sm"));
+        // Entry 0 (the deploy) is already durable in the reopened journal; the
+        // crash window under test is INSIDE entry 1.
+        let outcome = apply_entry(
+            &sm2,
+            1,
+            vec![
+                ReplicatedCommand {
+                    command: Command::create_instance("w"),
+                    now: 1,
+                },
+                ReplicatedCommand {
+                    command: Command::create_instance("w"),
+                    now: 2,
+                },
+            ],
+        )
+        .await
+        .expect("entry re-applies after recovery");
+        // Command 0 was skipped (cursor), command 1 applied fresh.
+        assert_eq!(outcome[0].items.len(), 1, "only the un-applied command ran");
+        assert!(outcome[0].items[0].error.is_none());
+        let instances = engine2.with(|j| j.state().instances.len()).await;
+        assert_eq!(
+            instances, 2,
+            "the first command was NOT duplicated: one pre-crash + one post-recovery instance"
+        );
         assert!(
-            matches!(
-                instance_state,
-                Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
-            ),
-            "the retried CompleteJob drove the instance to completion (got {instance_state:?})"
+            engine2
+                .with(move |j| j.state().instances.contains_key(&first_instance))
+                .await,
+            "the pre-crash instance survived recovery exactly once"
         );
 
         let _ = std::fs::remove_dir_all(&store_dir);

@@ -258,6 +258,14 @@ pub struct Journal {
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
     activation_cursor: HashMap<String, Key>,
+    /// The Raft entry currently being applied, as `(log index, next command
+    /// ordinal)`, set by the state machine around each entry's batch (#1405).
+    /// While `Some`, every successfully applied command has a
+    /// [`Event::ReplayCursor`] marker appended to its journaled events — in the
+    /// SAME write, so the cursor is durable exactly when the command's events
+    /// are — and the engine's apply cursor is advanced. `None` outside Raft
+    /// apply (the direct REST/single-node path journals no markers).
+    raft_apply: Option<(u64, u32)>,
     /// Test-only instrumentation: how many times the cold-descendant traversal
     /// scanned the resident instance set per visited descendant (the O(N × D)
     /// shape Copilot flagged on #1418). The indexed traversal never scans, so a
@@ -1015,6 +1023,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_apply: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1048,6 +1057,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_apply: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1179,6 +1189,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_apply: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1216,6 +1227,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_apply: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1258,6 +1270,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_apply: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -1295,6 +1308,7 @@ impl Journal {
             offheap_read_failures: AtomicU64::new(0),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
+            raft_apply: None,
             #[cfg(test)]
             resident_child_scans: 0,
             spill_check_skip: 0,
@@ -2147,13 +2161,30 @@ impl Journal {
     /// on success. Returns the events (shared via `Arc` with the read-model
     /// exporter) and a [`Commit`] the caller should await before acknowledging the
     /// request. Mirrors [`Engine::apply_command_at`].
+    ///
+    /// Under a Raft apply ([`begin_raft_apply`](Self::begin_raft_apply)) the
+    /// journaled record ALSO carries a [`Event::ReplayCursor`] marker as its last
+    /// line — the same [`persist`] write, so the apply cursor is durable in
+    /// exactly the same fsync as the command's events (#1405).
     pub fn apply_command_at(
         &mut self,
         command: Command,
         now: u64,
     ) -> Result<(Arc<Vec<Event>>, Commit), EngineError> {
         self.ensure_resident_for_command(&command)?;
-        let events = Arc::new(self.engine.apply_command_at(command, now)?);
+        let mut events = self.engine.apply_command_at(command, now)?;
+        // Raft apply cursor (#1405): stamp the marker AFTER the command
+        // succeeded (a failed command journals nothing and must not move the
+        // cursor) and BEFORE persist, so it lands in the same journal write.
+        if let Some((raft_index, ordinal)) = self.raft_apply {
+            events.push(Event::ReplayCursor {
+                raft_index,
+                command_ordinal: ordinal,
+            });
+            self.raft_apply = Some((raft_index, ordinal + 1));
+            self.engine.set_applied_through(raft_index, ordinal);
+        }
+        let events = Arc::new(events);
         let mut activated: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -2165,6 +2196,53 @@ impl Journal {
         let commit = self.persist(&events);
         self.maybe_spill();
         Ok((events, commit))
+    }
+
+    /// Arms the Raft apply cursor for the entry at `raft_index` (#1405): from
+    /// here each successfully applied command journals a
+    /// [`Event::ReplayCursor`] marker with its ordinal, starting at 0. Called by
+    /// the Raft state machine before applying an entry's batch.
+    pub fn begin_raft_apply(&mut self, raft_index: u64) {
+        self.raft_apply = Some((raft_index, 0));
+    }
+
+    /// Disarms the Raft apply cursor at the end of an entry's batch. The
+    /// engine-side cursor ([`Engine::applied_through`]) persists — it is the
+    /// recovery-visible record; `raft_apply` is only the per-entry stamping
+    /// state.
+    pub fn end_raft_apply(&mut self) {
+        self.raft_apply = None;
+    }
+
+    /// Advances the per-entry ordinal counter WITHOUT applying a command: the
+    /// command was already applied + journaled before a fail-closed crash and
+    /// the recovered apply cursor told the state machine to skip it (#1405), so
+    /// no marker is stamped for it again — but the counter must stay in step so
+    /// the next *applied* command of the same entry stamps its true ordinal.
+    pub fn note_raft_command_skipped(&mut self) {
+        if let Some((raft_index, ordinal)) = self.raft_apply {
+            self.raft_apply = Some((raft_index, ordinal + 1));
+        }
+    }
+
+    /// How far into the entry at `raft_index` this journal's engine has already
+    /// applied + journaled commands, per the recovered apply cursor (#1405).
+    /// `Some(ordinal)` means commands `0..=ordinal` of that entry are durable
+    /// and must be skipped on a re-apply; `None` means no prefix of the entry
+    /// is recorded (either it was never started, or it fully applied and the
+    /// cursor moved on).
+    pub fn applied_through(&self, raft_index: u64) -> Option<u32> {
+        match self.engine.applied_through() {
+            Some((index, ordinal)) if index == raft_index => Some(ordinal),
+            _ => None,
+        }
+    }
+
+    /// Clears the engine's apply cursor once the Raft `last_applied` has moved
+    /// past the entry it names (#1405). Called by the state machine after it
+    /// records `last_applied` for an entry beyond the cursor's.
+    pub fn clear_applied_through(&mut self) {
+        self.engine.clear_applied_through();
     }
 
     /// The authoritative ownership tuple `(element_id, process_instance_key)` of

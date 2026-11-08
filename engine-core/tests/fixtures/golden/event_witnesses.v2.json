@@ -1,5 +1,11 @@
 [
   {
+    "ReplayCursor": {
+      "command_ordinal": 2,
+      "raft_index": 41
+    }
+  },
+  {
     "CompensationScopeSubscriptionCompleted": {
       "instance_key": 1,
       "scope_subscription_key": 3,

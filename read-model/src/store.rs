@@ -6530,6 +6530,8 @@ fn project_event(
         | Event::ProcessInstanceTerminating { .. }
         | Event::ProcessStartTimerArmed { .. }
         | Event::ProcessStartTimerFired { .. }
+        // A Raft apply-progress marker (#1405): no read-model state.
+        | Event::ReplayCursor { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }

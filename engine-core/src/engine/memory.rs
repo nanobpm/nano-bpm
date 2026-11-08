@@ -23,6 +23,7 @@ impl Engine {
             num_partitions: self.num_partitions,
             now: self.now,
             start_dispatch_rr: self.start_dispatch_rr,
+            apply_cursor: self.apply_cursor,
         }
     }
 
@@ -79,6 +80,7 @@ impl Engine {
             retired_tombstones: std::collections::HashSet::new(),
             torn_down_scopes: std::collections::HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            apply_cursor: snapshot.apply_cursor,
         }
     }
 
@@ -159,6 +161,7 @@ impl Engine {
             num_partitions: self.num_partitions,
             now: self.now,
             start_dispatch_rr: self.start_dispatch_rr,
+            apply_cursor: self.apply_cursor,
         }
     }
 
@@ -184,6 +187,16 @@ impl Engine {
         I: IntoIterator<Item = Event>,
     {
         for event in events {
+            // A replay-progress marker (#1405) only reseeds the apply cursor;
+            // it carries no keys and mutates no state.
+            if let Event::ReplayCursor {
+                raft_index,
+                command_ordinal,
+            } = event
+            {
+                self.apply_cursor = Some((raft_index, command_ordinal));
+                continue;
+            }
             let max_key = event.max_key();
             if state::partition_of(max_key) == self.partition_id {
                 self.next_local = self.next_local.max(state::local_of(max_key));

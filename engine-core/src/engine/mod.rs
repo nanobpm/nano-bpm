@@ -109,6 +109,14 @@ pub struct EngineSnapshot {
     pub num_partitions: u64,
     pub now: u64,
     pub start_dispatch_rr: u64,
+    /// The Raft apply cursor (#1405) at snapshot time, so a snapshot+tail
+    /// recovery restores it exactly as a full journal replay would. Snapshots
+    /// are only ever taken at an applied-entry boundary, so the cursor they
+    /// carry is always consistent with the snapshot's `last_applied`. Additive:
+    /// a pre-#1405 snapshot decodes with `None` (no cursor — the fail-closed
+    /// rework did not exist to leave one).
+    #[serde(default)]
+    pub apply_cursor: Option<(u64, u32)>,
 }
 
 /// Synthetic worker name stamped on a job whose activation lease was recovered
@@ -222,6 +230,18 @@ pub struct Engine {
     /// [`set_cluster_variables`](Engine::set_cluster_variables)). Empty by default,
     /// in which case variable resolution keeps its zero-copy fast path.
     cluster_variables: crate::cluster_vars::ClusterVariables,
+    /// The Raft apply cursor (#1405): `(raft log index, command ordinal)` of the
+    /// most recent command whose events were journaled **with** a
+    /// [`Event::ReplayCursor`] marker, folded in by replay when the marker is
+    /// read back off the durable journal. A Raft state machine re-applying a
+    /// still-unapplied entry after a fail-closed crash consults it via
+    /// [`applied_through`](Engine::applied_through) to skip the entry's
+    /// already-journaled prefix (a non-idempotent command must never execute
+    /// twice), and clears it via [`clear_applied_through`](Engine::clear_applied_through)
+    /// once `last_applied` moves past the entry. `None` on a non-replicated
+    /// engine (no markers are ever journaled there) and on a cleanly-applied
+    /// history. Carried by the snapshot so a snapshot+tail recovery keeps it.
+    apply_cursor: Option<(u64, u32)>,
 }
 
 /// A `zeebe:ioMapping` source expression that failed to evaluate. Carries a
@@ -595,6 +615,7 @@ impl Engine {
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            apply_cursor: None,
         }
     }
 
@@ -694,7 +715,19 @@ impl Engine {
         );
         let mut state = State::new();
         let mut next_local: u64 = 0;
+        let mut apply_cursor: Option<(u64, u32)> = None;
         for event in events {
+            // A replay-progress marker (#1405) carries no keys and mutates no
+            // state; it only reseeds the apply cursor so a Raft replica
+            // re-applying a failed-closed entry skips its journaled prefix.
+            if let Event::ReplayCursor {
+                raft_index,
+                command_ordinal,
+            } = event
+            {
+                apply_cursor = Some((raft_index, command_ordinal));
+                continue;
+            }
             let max_key = event.max_key();
             if state::partition_of(max_key) == partition_id {
                 next_local = next_local.max(state::local_of(max_key));
@@ -715,7 +748,33 @@ impl Engine {
             retired_tombstones: HashSet::new(),
             torn_down_scopes: HashSet::new(),
             cluster_variables: crate::cluster_vars::ClusterVariables::default(),
+            apply_cursor,
         }
+    }
+
+    /// The engine's Raft apply cursor (#1405): `(raft log index, command
+    /// ordinal)` of the last command whose journaled events carried a
+    /// [`Event::ReplayCursor`] marker, recovered by replaying those markers.
+    /// `Some((index, ordinal))` means every command of the entry at `index` up
+    /// to and including `ordinal` is durable in this engine's journal and must
+    /// NOT be re-applied when the entry is retried.
+    pub fn applied_through(&self) -> Option<(u64, u32)> {
+        self.apply_cursor
+    }
+
+    /// Advances the apply cursor as command `ordinal` of the entry at
+    /// `raft_index` is journaled with its marker (#1405). Called by the journal
+    /// (which owns the marker stamping) so the in-memory cursor tracks the
+    /// durable one without waiting for a replay.
+    pub fn set_applied_through(&mut self, raft_index: u64, ordinal: u32) {
+        self.apply_cursor = Some((raft_index, ordinal));
+    }
+
+    /// Clears the apply cursor once the Raft `last_applied` it names has moved
+    /// past the entry: from then on the cursor is dead weight (a replay that
+    /// re-reads its marker reseeds it, but no live apply consults it again).
+    pub fn clear_applied_through(&mut self) {
+        self.apply_cursor = None;
     }
 
     fn mint_key(&mut self) -> Key {
