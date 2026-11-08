@@ -79,8 +79,9 @@ enum type.
   change; roll the whole cluster, not one node at a time.
   The same rule governs every later change to an intra-cluster wire shape on this channel — e.g.
   openraft's `AppendEntriesResponse::Conflict` gaining a follower last-log-id hint (#1454), which
-  changes its serialized form from `"Conflict"` to `{"Conflict": …}`. Such changes ship as plain
-  format changes with no mixed-version decoding; upgrade the whole cluster together.
+  changes it structurally from a unit variant to a tuple variant carrying `Option<LogId>` (the exact
+  serialized shape is serializer-dependent). Such changes ship as plain format changes with no
+  mixed-version decoding; upgrade the whole cluster together.
 - **Secret is optional but recommended.** With `NANOBPMN_CLUSTER_SECRET` unset the `/cluster` channel
   is open (a single node has no peers, so nothing is exposed); a startup warning fires for a
   multi-node deployment with no secret configured.

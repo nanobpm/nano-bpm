@@ -482,6 +482,18 @@ where
                 }))
             }
             AppendEntriesResponse::Conflict(follower_last) => {
+                // A conflict answers a non-empty probe: `prev_log_id=None` (an
+                // empty request / heartbeat) can never conflict. Guard it in every
+                // build — a release build must not fabricate a conflict from a
+                // default leader id at index 0.
+                let Some(prev) = sending_range.prev.clone() else {
+                    tracing::warn!(
+                        req = display(&sending_range),
+                        "conflict response to a prev_log_id=None request; ignoring"
+                    );
+                    return Ok(None);
+                };
+
                 // The follower's real last log id is the conflict hint: the leader
                 // shrinks its search window to the follower's actual frontier (plus
                 // one, the next index to probe) instead of walking down one RPC per
@@ -489,23 +501,15 @@ where
                 // request's own prev log id — the previous behaviour.
                 let conflict = match follower_last {
                     Some(last) => {
-                        let hint_next = last.index + 1;
+                        let hint_next = last.index.saturating_add(1);
                         // Never shrink past the follower's frontier, but also never
                         // report a conflict ABOVE the range we actually sent.
-                        let prev_next = sending_range.prev.index().unwrap_or(0);
+                        let prev_next = prev.index.saturating_add(1);
                         let index = std::cmp::min(hint_next, prev_next);
-                        let leader_id = sending_range
-                            .prev
-                            .clone()
-                            .map(|p| p.committed_leader_id().clone())
-                            .unwrap_or_default();
+                        let leader_id = prev.committed_leader_id().clone();
                         LogId::new(leader_id, index)
                     }
-                    None => {
-                        let conflict = sending_range.prev.clone();
-                        debug_assert!(conflict.is_some(), "prev_log_id=None never conflict");
-                        conflict.unwrap()
-                    }
+                    None => prev,
                 };
                 self.send_progress(request_id, ReplicationResult::new(leader_time, Err(conflict)));
 

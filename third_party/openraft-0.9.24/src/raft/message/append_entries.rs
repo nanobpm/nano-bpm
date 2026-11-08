@@ -99,11 +99,11 @@ pub enum AppendEntriesResponse<NID: NodeId> {
 
 impl<NID: NodeId> AppendEntriesResponse<NID> {
     pub fn is_success(&self) -> bool {
-        matches!(*self, AppendEntriesResponse::Success)
+        matches!(self, AppendEntriesResponse::Success)
     }
 
     pub fn is_conflict(&self) -> bool {
-        matches!(*self, AppendEntriesResponse::Conflict(_))
+        matches!(self, AppendEntriesResponse::Conflict(_))
     }
 }
 
