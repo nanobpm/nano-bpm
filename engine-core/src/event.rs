@@ -1950,11 +1950,25 @@ impl Event {
                         .unwrap_or(0),
                 );
             }
+            // The settlement frame carries the lease token that settled the job
+            // (#1181) — a key minted by the lease allocator at activation time.
+            // Under leader-local activation the `JobActivated` event may never
+            // have been replicated, so this frame can be the ONLY record of that
+            // minted key in the log: advance the allocator past it, exactly as
+            // `JobActivated` does, or a reactivation after replay re-mints the
+            // same token and the job's next legitimate settlement is swallowed
+            // as a replay of the old one.
+            Event::JobSettlementRecorded {
+                job_key,
+                lease_token,
+                ..
+            } => {
+                m = m.max(*job_key).max(crate::lease::issued_key(lease_token));
+            }
             Event::JobLockExpired { job_key, .. }
             | Event::JobFailed { job_key, .. }
             | Event::JobErrorThrown { job_key, .. }
             | Event::JobCompleted { job_key, .. }
-            | Event::JobSettlementRecorded { job_key, .. }
             | Event::JobCanceled { job_key, .. }
             | Event::JobRetriesUpdated { job_key, .. }
             | Event::JobTimeoutUpdated { job_key, .. } => m = m.max(*job_key),

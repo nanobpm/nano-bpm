@@ -603,6 +603,14 @@ impl Engine {
         &self.state
     }
 
+    /// Mutable access to the full engine state, for tests that need to simulate
+    /// host-side effects the engine cannot perform on itself (e.g. aging a
+    /// bounded-ledger entry out from under a live job).
+    #[cfg(test)]
+    pub(crate) fn state_mut(&mut self) -> &mut State {
+        &mut self.state
+    }
+
     /// Sets the cluster-wide partition count used to place message
     /// subscriptions (see [`crate::subscription_partition`]). Defaults to `1`
     /// (single-partition, every subscription local). A clustered host calls
@@ -2166,6 +2174,18 @@ impl Engine {
                 ) {
                     return Ok((log, queue));
                 }
+                // The same fence asserting a DIFFERENT outcome is a conflict,
+                // not a replay: the token settles one activation exactly once.
+                // Rejected explicitly here because a retryable failure leaves
+                // the job `Created` with its token, so the ordinary checks
+                // below would let the same activation settle a second time.
+                if self.settlement_conflict(
+                    job_key,
+                    lease_token.as_deref(),
+                    state::JobSettlementOutcome::Completed,
+                ) {
+                    return Err(EngineError::JobLeaseMismatch { job_key });
+                }
                 let job = self
                     .state
                     .jobs
@@ -2982,6 +3002,15 @@ impl Engine {
                 ) {
                     return Ok((log, queue));
                 }
+                // The same fence asserting a DIFFERENT outcome is a conflict,
+                // not a replay: the token settles one activation exactly once.
+                if self.settlement_conflict(
+                    job_key,
+                    lease_token.as_deref(),
+                    state::JobSettlementOutcome::Failed,
+                ) {
+                    return Err(EngineError::JobLeaseMismatch { job_key });
+                }
                 let job = self
                     .state
                     .jobs
@@ -3060,6 +3089,15 @@ impl Engine {
                     state::JobSettlementOutcome::ErrorThrown,
                 ) {
                     return Ok((log, queue));
+                }
+                // The same fence asserting a DIFFERENT outcome is a conflict,
+                // not a replay: the token settles one activation exactly once.
+                if self.settlement_conflict(
+                    job_key,
+                    lease_token.as_deref(),
+                    state::JobSettlementOutcome::ErrorThrown,
+                ) {
+                    return Err(EngineError::JobLeaseMismatch { job_key });
                 }
                 let job = self
                     .state
@@ -15329,12 +15367,26 @@ impl Engine {
         }
     }
 
-    /// Whether a settlement command is a replay of the one the settlement ledger
-    /// already recorded for `job_key` (#1181): the supplied lease token — the
-    /// per-activation fence, which doubles as the idempotency key — and the
-    /// outcome both match. A lease-less command never matches (no key), and a
-    /// different outcome under the same token is not a replay, so it falls
-    /// through to the ordinary state/fence checks and is refused there.
+    /// Whether a settlement command is a replay of one already recorded for
+    /// `job_key` (#1181): the supplied lease token — the per-activation fence,
+    /// which doubles as the idempotency key — and the outcome both match a
+    /// recorded settlement. A lease-less command never matches (no key).
+    ///
+    /// The lookup consults two records, both derived from the same replicated
+    /// `JobSettlementRecorded` event:
+    ///
+    /// - the live job's own [`state::Job::settled_tokens`] — never evicted
+    ///   while the job lives, so a retryable failure (which leaves the job
+    ///   `Created` with its token) stays fenced even after the bounded ledger
+    ///   aged the job's entry out;
+    /// - the bounded [`state::State::settled_jobs`] ledger — the
+    ///   cross-eviction record that outlives the job itself.
+    ///
+    /// A *different* outcome under a recorded token is NOT a replay: it is
+    /// rejected via [`settlement_conflict`](Self::settlement_conflict) before
+    /// the ordinary state/fence checks, because the job's post-failure state
+    /// (`Created`, token retained) would otherwise let the same activation
+    /// settle a second time.
     fn is_settlement_replay(
         &self,
         job_key: Key,
@@ -15344,10 +15396,41 @@ impl Engine {
         let Some(supplied) = supplied.filter(|token| !token.is_empty()) else {
             return false;
         };
+        self.known_settlement(job_key, supplied)
+            .is_some_and(|s| s.outcome == outcome)
+    }
+
+    /// The settlement already recorded for `job_key` under `token`, if any —
+    /// from the live job's own fence first, then the bounded ledger.
+    fn known_settlement(&self, job_key: Key, token: &str) -> Option<&state::JobSettlement> {
         self.state
-            .settled_jobs
+            .jobs
             .get(&job_key)
-            .is_some_and(|s| s.outcome == outcome && s.lease_token == supplied)
+            .and_then(|job| job.settled_tokens.iter().find(|s| s.lease_token == token))
+            .or_else(|| {
+                self.state
+                    .settled_jobs
+                    .get(&job_key)
+                    .and_then(|known| known.iter().find(|s| s.lease_token == token))
+            })
+    }
+
+    /// Whether `supplied` matches a settlement already recorded for `job_key`
+    /// under a **different** outcome (#1181): the token settles one activation
+    /// exactly once, so re-asserting it with another outcome (complete after
+    /// fail, error after complete, …) is a conflict, never a replay and never a
+    /// second settlement.
+    fn settlement_conflict(
+        &self,
+        job_key: Key,
+        supplied: Option<&str>,
+        outcome: state::JobSettlementOutcome,
+    ) -> bool {
+        let Some(supplied) = supplied.filter(|token| !token.is_empty()) else {
+            return false;
+        };
+        self.known_settlement(job_key, supplied)
+            .is_some_and(|s| s.outcome != outcome)
     }
 
     /// Journal a leased job's settlement into the replicated settlement ledger

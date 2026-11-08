@@ -2,10 +2,13 @@
 //!
 //! A worker that loses its activation (crash, network partition, host
 //! migration) may re-issue a settlement it already performed. The engine keeps
-//! a replicated **settlement ledger** keyed by job, recording the lease token
-//! (the per-activation fence) that settled it. A replay bearing the recorded
-//! token and the same outcome is a no-op success, from *any* replica, while a
-//! settlement bearing a superseded token is still rejected.
+//! a replicated **settlement ledger** keyed by job, retaining every recorded
+//! settlement — the lease token (the per-activation fence) and the outcome it
+//! produced — plus a per-job fence on the live job itself. A replay bearing a
+//! recorded token and the same outcome is a no-op success, from *any* replica;
+//! a recorded token asserting a *different* outcome is rejected outright (one
+//! token settles one activation exactly once), and a settlement bearing a
+//! superseded token is still fenced by the newer activation.
 use super::*;
 
 /// Deploy `linear_with_task`, start one instance, and lease its job.
@@ -90,10 +93,11 @@ fn a_settlement_with_a_different_outcome_under_the_recorded_lease_is_not_masked(
     let (mut engine, _) = parked();
     let (job_key, token) = leased(&mut engine, "w1", 0);
     engine.apply_command(complete(job_key, &token)).unwrap();
-    // Same key, different outcome: not a replay, so it must still be refused.
+    // Same key, different outcome: not a replay — an explicit conflict
+    // rejection (a token settles one activation exactly once).
     assert_eq!(
         engine.apply_command(fail(job_key, &token, 0)),
-        Err(EngineError::JobNotActive { job_key })
+        Err(EngineError::JobLeaseMismatch { job_key })
     );
 }
 
@@ -196,24 +200,31 @@ fn replay_is_idempotent_on_every_replica_that_rebuilt_from_the_journal() {
             Vec::<Event>::new(),
             "{name}: promoted follower accepts the replay idempotently"
         );
-        // Snapshot + restore (another host booting from the snapshot).
-        let mut restored = Engine::from_snapshot(follower.snapshot());
-        assert_eq!(
-            restored.apply_command(complete(job_key, &token)).unwrap(),
-            Vec::<Event>::new(),
-            "{name}: restored replica accepts the replay idempotently"
-        );
+        // Snapshot + restore (another host booting from the snapshot). The
+        // snapshot/`from_snapshot` pair exists only under the `serde` feature;
+        // the feature-off build exercises the journal-replay and eviction
+        // checks below instead.
+        #[cfg(feature = "serde")]
+        {
+            let mut restored = Engine::from_snapshot(follower.snapshot());
+            assert_eq!(
+                restored.apply_command(complete(job_key, &token)).unwrap(),
+                Vec::<Event>::new(),
+                "{name}: restored replica accepts the replay idempotently"
+            );
+            follower = restored;
+        }
         // The host evicted the finished instance from hot state: the ledger
         // must outlive it, or the replay degrades to 404.
-        let instance_key = restored.job(job_key).unwrap().instance_key;
-        assert!(restored.evict_instance(instance_key));
+        let instance_key = follower.job(job_key).unwrap().instance_key;
+        assert!(follower.evict_instance(instance_key));
         assert_eq!(
-            restored.apply_command(complete(job_key, &token)).unwrap(),
+            follower.apply_command(complete(job_key, &token)).unwrap(),
             Vec::<Event>::new(),
             "{name}: replay survives instance eviction"
         );
         // A forged/unknown token is still refused.
-        assert!(restored
+        assert!(follower
             .apply_command(complete(job_key, "nano-lease:00000000deadbeef"))
             .is_err());
     }
@@ -231,6 +242,7 @@ fn the_settlement_ledger_survives_a_serialized_snapshot() {
         state
             .settled_jobs
             .get(&job_key)
+            .and_then(|known| known.first())
             .map(|s| s.lease_token.as_str()),
         Some(token.as_str())
     );
@@ -279,4 +291,168 @@ fn the_settlement_ledger_is_bounded_and_evicts_oldest_deterministically() {
     let keys: Vec<Key> = a.settled_jobs.keys().copied().collect();
     assert_eq!(keys, vec![3, 4, 5], "oldest job keys are evicted first");
     assert_eq!(a.settled_jobs, b.settled_jobs, "replicas agree");
+}
+
+/// A token settles one activation exactly once: after a retryable failure
+/// (which returns the job to `Created` with its lease token and activation
+/// latch intact), the same token asserting a DIFFERENT outcome must be
+/// rejected — never allowed to settle the same activation a second time.
+#[test]
+fn a_conflicting_outcome_under_the_recorded_lease_is_rejected() {
+    let (mut engine, _) = parked();
+    let (job_key, token) = leased(&mut engine, "w1", 0);
+    engine.apply_command(fail(job_key, &token, 2)).unwrap();
+    assert_eq!(engine.job(job_key).unwrap().state, state::JobState::Created);
+
+    // Complete under the failed token: not a replay, not a second settlement.
+    assert_eq!(
+        engine.apply_command(complete(job_key, &token)),
+        Err(EngineError::JobLeaseMismatch { job_key })
+    );
+    // Throw-error under the failed token: likewise.
+    let throw =
+        Command::throw_job_error_with(job_key, "E".to_string(), "m".to_string(), HashMap::new())
+            .with_lease_token(Some(token.clone()));
+    assert_eq!(
+        engine.apply_command(throw),
+        Err(EngineError::JobLeaseMismatch { job_key })
+    );
+    // The job is untouched: still retryable, still fenced to the same token.
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.state, state::JobState::Created);
+    assert_eq!(job.retries, 2);
+    assert_eq!(job.lease_token.as_deref(), Some(token.as_str()));
+
+    // And the mirror image: a completion recorded under the token rejects a
+    // later failure under it (already covered pre-#1181-fix by the terminal
+    // state check, kept explicit here so the conflict rule is symmetric).
+    let (mut engine, _) = parked();
+    let (job_key, token) = leased(&mut engine, "w1", 0);
+    engine.apply_command(complete(job_key, &token)).unwrap();
+    assert_eq!(
+        engine.apply_command(fail(job_key, &token, 0)),
+        Err(EngineError::JobLeaseMismatch { job_key })
+    );
+}
+
+/// A retryable failure's replay fence must survive eviction of the job's
+/// bounded-ledger entry: the live job itself retains the consumed token, so a
+/// replayed failure after the ledger aged the entry out is still an idempotent
+/// no-op — never a second `JobFailed` decrementing retries again.
+#[test]
+fn a_replayed_failure_after_ledger_eviction_is_still_fenced_by_the_live_job() {
+    let (mut engine, _) = parked();
+    let (job_key, token) = leased(&mut engine, "w1", 0);
+    engine.apply_command(fail(job_key, &token, 2)).unwrap();
+
+    // Age the job's ledger entry out (the live job's own fence is what must
+    // keep answering; the bounded ledger is only the cross-eviction record).
+    engine.state_mut().settled_jobs.clear();
+    assert!(engine.state().settled_jobs.is_empty());
+
+    assert_eq!(
+        engine.apply_command(fail(job_key, &token, 2)).unwrap(),
+        Vec::<Event>::new(),
+        "replay after ledger eviction emits no second settlement"
+    );
+    let job = engine.job(job_key).unwrap();
+    assert_eq!(job.retries, 2, "retries are not decremented twice");
+    assert_eq!(job.state, state::JobState::Created);
+
+    // The conflicting-outcome fence survives eviction too.
+    assert_eq!(
+        engine.apply_command(complete(job_key, &token)),
+        Err(EngineError::JobLeaseMismatch { job_key })
+    );
+}
+
+/// A later settlement under a NEWER activation's token must not erase the
+/// replay key of an earlier one: worker A's exact replay under T1 is still an
+/// idempotent no-op after worker B settled the next activation under T2, even
+/// when the ledger is far below its cap.
+#[test]
+fn a_superseded_tokens_replay_survives_a_later_settlement() {
+    let (mut engine, _) = parked();
+    let (job_key, first) = leased(&mut engine, "w1", 0);
+    engine.apply_command(fail(job_key, &first, 2)).unwrap();
+    let (_, second) = leased(&mut engine, "w2", 1);
+    engine.apply_command(complete(job_key, &second)).unwrap();
+
+    // Both settlements are retained in the ledger, keyed by token.
+    let known = engine.state().settled_jobs.get(&job_key).unwrap();
+    assert_eq!(known.len(), 2, "T1's entry is not replaced by T2's");
+
+    // A's lost-response replay under T1 is still answered idempotently.
+    assert_eq!(
+        engine.apply_command(fail(job_key, &first, 2)).unwrap(),
+        Vec::<Event>::new(),
+        "the superseded token's exact replay is still a no-op success"
+    );
+    // And a conflicting outcome under T1 is still a conflict, not a replay.
+    assert_eq!(
+        engine.apply_command(complete(job_key, &first)),
+        Err(EngineError::JobLeaseMismatch { job_key })
+    );
+}
+
+/// Under leader-local activation the `JobActivated` event is never journaled,
+/// so a replayed log's only record of the minted lease key is the settlement
+/// frame itself. Replay must advance the key allocator past it, or the next
+/// activation re-mints the SAME token — and the job's next legitimate
+/// settlement is then swallowed as a replay of the old one.
+#[test]
+fn replaying_a_settlement_frame_advances_the_lease_allocator() {
+    let (mut leader, mut journal) = parked();
+    // Leader-local activation: its events (including the JobActivated carrying
+    // the minted lease key) are NOT journaled — only the settlement is.
+    let activation = leader
+        .apply_command_at(
+            Command::activate_jobs_with_options(
+                "payment",
+                "w1",
+                1,
+                60_000,
+                0,
+                crate::JobActivationOptions {
+                    fetch_variables: Vec::new(),
+                    with_lease: true,
+                },
+            ),
+            0,
+        )
+        .unwrap();
+    let (job_key, token) = activation
+        .iter()
+        .find_map(|e| match e {
+            Event::JobActivated {
+                job_key,
+                lease_token: Some(t),
+                ..
+            } => Some((*job_key, t.clone())),
+            _ => None,
+        })
+        .unwrap();
+    journal.extend(leader.apply_command(fail(job_key, &token, 2)).unwrap());
+
+    // The follower rebuilds from a log whose only record of the lease key is
+    // the settlement frame.
+    let mut follower = Engine::replay(journal);
+    let (_, fresh) = leased(&mut follower, "w2", 1);
+    assert_ne!(
+        fresh, token,
+        "reactivation must not re-mint the settled activation's token"
+    );
+    assert!(
+        crate::lease::issued_key(&fresh) > crate::lease::issued_key(&token),
+        "the allocator advanced past the replayed settlement's token"
+    );
+
+    // The new activation's own legitimate settlement is NOT mistaken for a
+    // replay of the old one: it really applies.
+    let events = follower.apply_command(fail(job_key, &fresh, 1)).unwrap();
+    assert!(
+        events.iter().any(|e| matches!(e, Event::JobFailed { .. })),
+        "the fresh token's first settlement applies"
+    );
+    assert_eq!(follower.job(job_key).unwrap().retries, 1);
 }

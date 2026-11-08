@@ -1974,6 +1974,12 @@ fn settles_a_job(events: &[Event]) -> bool {
     })
 }
 
+/// The outcome of a job-lifecycle command (complete/fail/throw) on the stream
+/// path: the applied events (so the caller can tell a real settlement from an
+/// eventless idempotent replay via [`settles_a_job`], #1181) plus the
+/// durability handle.
+pub(crate) type JobStreamOutcome = Result<(Arc<Vec<Event>>, Commit), (u16, String)>;
+
 /// Best-effort recovery of a completed job's type from the emitted events, used
 /// when the read-model snapshot taken before applying the command didn't carry
 /// it (e.g. the projection had not yet caught up).
@@ -7952,7 +7958,7 @@ impl ServerImpl {
         };
         let commit = if self.raft.is_empty() {
             let result = self.apply_job_command_direct(job_key, command).await;
-            Self::map_job_outcome(result)?
+            Self::map_job_events(result)?.1
         } else {
             // REST job path, not stream CompleteJob: no stream diagnostic. #1306.
             self.propose_job_for_stream(job_key, command, false).await?
@@ -18294,14 +18300,13 @@ impl ServerImpl {
 /// next to the REST handlers that share the same command path and `jobs_available`
 /// wake discipline.
 impl ServerImpl {
-    /// Maps the result of a job lifecycle command (complete/fail/throw) into a
-    /// `(status, message)` outcome, awaiting durability and waking job pollers on
-    /// success. Mirrors the REST handlers' success/error arms.
-    fn map_job_outcome(
-        result: Result<(Arc<Vec<Event>>, Commit), EngineError>,
-    ) -> Result<Commit, (u16, String)> {
+    /// Maps a job-mutation outcome to `(events, commit)` so the caller can tell
+    /// a real settlement from an idempotent replay (#1181): a replay succeeds
+    /// with NO terminal job event and must not be counted again in the stream
+    /// completion metrics (`falcon::pipeline_job_command`).
+    fn map_job_events(result: Result<(Arc<Vec<Event>>, Commit), EngineError>) -> JobStreamOutcome {
         match result {
-            Ok((_, commit)) => Ok(commit),
+            Ok((events, commit)) => Ok((events, commit)),
             Err(EngineError::JobNotFound { job_key }) => {
                 Err((404, format!("No job with key {job_key}.")))
             }
@@ -19188,6 +19193,7 @@ impl ServerImpl {
             None,
         )
         .await
+        .map(|(_, commit)| commit)
     }
 
     pub(crate) async fn complete_job_for_stream_with_lease(
@@ -19198,7 +19204,7 @@ impl ServerImpl {
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
         business_id: Option<String>,
-    ) -> Result<Commit, (u16, String)> {
+    ) -> JobStreamOutcome {
         // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
         // task-listener result cannot carry variables. Reject here rather than
         // letting the command constructor silently drop them.
@@ -19216,7 +19222,7 @@ impl ServerImpl {
         if !self.raft.is_empty() {
             // The stream CompleteJob path owns the stream-completion diagnostic
             // (`record_stream_outcome = true`). #1306.
-            return self.propose_job_for_stream(job_key, command, true).await;
+            return self.propose_partition_command(job_key, command, true).await;
         }
         let result = self.apply_job_command_direct(job_key, command).await;
         if let Ok((events, _)) = &result {
@@ -19224,7 +19230,7 @@ impl ServerImpl {
             self.observe_job_sojourn(events, now_millis());
             self.record_adhoc_events(events);
         }
-        Self::map_job_outcome(result)
+        Self::map_job_events(result)
     }
 
     /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
@@ -19238,6 +19244,7 @@ impl ServerImpl {
     ) -> Result<Commit, (u16, String)> {
         self.fail_job_for_stream_with_lease(job_key, None, retries, error_message)
             .await
+            .map(|(_, commit)| commit)
     }
 
     pub(crate) async fn fail_job_for_stream_with_lease(
@@ -19246,10 +19253,10 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
-    ) -> Result<Commit, (u16, String)> {
+    ) -> JobStreamOutcome {
         if !self.raft.is_empty() {
             return self
-                .propose_job_for_stream(
+                .propose_partition_command(
                     job_key,
                     job_command_with_lease(
                         Command::fail_job(job_key, retries, error_message),
@@ -19274,7 +19281,7 @@ impl ServerImpl {
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
         }
-        Self::map_job_outcome(result)
+        Self::map_job_events(result)
     }
 
     /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
@@ -19286,10 +19293,10 @@ impl ServerImpl {
         error_code: String,
         error_message: String,
         variables: std::collections::HashMap<String, Value>,
-    ) -> Result<Commit, (u16, String)> {
+    ) -> JobStreamOutcome {
         if !self.raft.is_empty() {
             return self
-                .propose_job_for_stream(
+                .propose_partition_command(
                     job_key,
                     job_command_with_lease(
                         Command::throw_job_error_with(
@@ -19319,7 +19326,7 @@ impl ServerImpl {
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
         }
-        Self::map_job_outcome(result)
+        Self::map_job_events(result)
     }
 
     /// Activates up to `max_jobs` of `job_type` for `worker` and returns the
@@ -43322,6 +43329,7 @@ mod call_activity_hierarchy_read_model_tests {
         )
         .await
         .unwrap()
+        .1
         .wait()
         .await;
         let mut committed = false;
