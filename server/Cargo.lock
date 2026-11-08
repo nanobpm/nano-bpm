@@ -1464,7 +1464,6 @@ dependencies = [
  "nano-server-storage",
  "nanobpmn-engine-core",
  "openraft",
- "rusqlite",
  "serde",
  "serde_json",
  "tokio",
