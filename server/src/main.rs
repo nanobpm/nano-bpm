@@ -23899,20 +23899,71 @@ fn health_response(report: &snapshot_health::HealthReport) -> Response {
 // quarantined orphan so the partition's snapshots can fold again.
 // ---------------------------------------------------------------------------
 
-/// One partition's contribution to the snapshot-blockers report (#1386): the
-/// instance keys whose off-heap payload aborted this partition's latest
-/// snapshot fold, and the instances this partition has quarantined as
-/// off-heap orphans. Per-partition attribution tells the operator WHICH
-/// partition's journal is failing to fold.
+/// Serializes instance keys as decimal strings (#1386): partitioned keys
+/// exceed JavaScript's safe-integer range (`compose_key(4, 1)` > 2^53), so a
+/// JSON-number key would be silently rounded by a JS consumer and a cancel URL
+/// built from it would target the wrong instance. Matches the v2 API.
+fn serialize_keys_as_strings<S: serde::Serializer>(
+    keys: &[Key],
+    ser: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = ser.serialize_seq(Some(keys.len()))?;
+    for k in keys {
+        seq.serialize_element(&k.to_string())?;
+    }
+    seq.end()
+}
+
+/// One partition's raw orphan inputs (#1386), read under its engine actor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PartitionOrphanInputs {
+    /// Instance keys whose off-heap payload aborted the latest snapshot fold.
+    snapshot_blockers: Vec<Key>,
+    /// The process-local quarantine observation set (historical, since start).
+    observed: Vec<Key>,
+    /// Instances carrying a durable, unresolved `VariablesLost` incident.
+    variables_lost: Vec<Key>,
+    /// Which of `observed ∪ variables_lost` are still live (non-terminal).
+    live: Vec<Key>,
+}
+
+/// Derives the actionable orphan list (#1386): the union of the process-local
+/// observations and the durable `VariablesLost` incidents (which survive a
+/// restart), restricted to instances still live — so a cancelled orphan drops
+/// out and a restart does not hide one. Sorted, deduplicated.
+fn pending_orphans(inputs: &PartitionOrphanInputs) -> Vec<Key> {
+    let mut keys: Vec<Key> = inputs
+        .observed
+        .iter()
+        .chain(inputs.variables_lost.iter())
+        .copied()
+        .filter(|k| inputs.live.contains(k))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// One partition's contribution to the snapshot-blockers report (#1386).
+/// Per-partition attribution tells the operator WHICH partition's journal is
+/// failing to fold. Keys are decimal strings on the wire.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PartitionSnapshotBlockers {
     /// The partition these keys belong to.
     partition: u64,
     /// Instance keys whose off-heap payload aborted the latest snapshot fold.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
     snapshot_blockers: Vec<Key>,
-    /// Instance keys quarantined as off-heap orphans (spilled payload lost).
+    /// Live instances that lost off-heap data (observed quarantine or durable
+    /// `VariablesLost` incident) — the actionable cancel candidates.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
     quarantined_orphans: Vec<Key>,
+    /// Every quarantine observed by this process since start, including ones
+    /// already cancelled. Historical/diagnostic only; not durable.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
+    observed_orphans: Vec<Key>,
 }
 
 /// The admin snapshot-blockers report (#1386), served at
@@ -23923,39 +23974,47 @@ struct PartitionSnapshotBlockers {
 #[serde(rename_all = "camelCase")]
 struct SnapshotBlockersReport {
     /// Every instance key blocking a snapshot fold, deduplicated and sorted.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
     snapshot_blockers: Vec<Key>,
-    /// Every quarantined off-heap orphan, deduplicated and sorted.
+    /// Every pending (live) off-heap orphan, deduplicated and sorted.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
     quarantined_orphans: Vec<Key>,
     /// The per-partition breakdown behind the two top-level lists.
     partitions: Vec<PartitionSnapshotBlockers>,
 }
 
-/// The pure core of the report (#1386): aggregates per-partition
-/// `(partition, blockers, orphans)` triples into a [`SnapshotBlockersReport`],
-/// sorting and deduplicating the two top-level lists. Split out so the
-/// aggregation is tested deterministically without standing up the spill
-/// machinery that produces a real blocker/orphan.
-fn build_snapshot_blockers_report(parts: &[(u64, Vec<Key>, Vec<Key>)]) -> SnapshotBlockersReport {
-    let mut snapshot_blockers: Vec<Key> = parts
+/// The pure core of the report (#1386): derives each partition's pending
+/// orphans and aggregates sorted, deduplicated top-level lists. Split out so
+/// it is tested deterministically without the spill machinery.
+fn build_snapshot_blockers_report(
+    parts: &[(u64, PartitionOrphanInputs)],
+) -> SnapshotBlockersReport {
+    let partitions: Vec<PartitionSnapshotBlockers> = parts
         .iter()
-        .flat_map(|(_, b, _)| b.iter().copied())
+        .map(|(partition, inputs)| {
+            let mut observed = inputs.observed.clone();
+            observed.sort_unstable();
+            observed.dedup();
+            PartitionSnapshotBlockers {
+                partition: *partition,
+                snapshot_blockers: inputs.snapshot_blockers.clone(),
+                quarantined_orphans: pending_orphans(inputs),
+                observed_orphans: observed,
+            }
+        })
+        .collect();
+    let mut snapshot_blockers: Vec<Key> = partitions
+        .iter()
+        .flat_map(|p| p.snapshot_blockers.iter().copied())
         .collect();
     snapshot_blockers.sort_unstable();
     snapshot_blockers.dedup();
-    let mut quarantined_orphans: Vec<Key> = parts
+    let mut quarantined_orphans: Vec<Key> = partitions
         .iter()
-        .flat_map(|(_, _, o)| o.iter().copied())
+        .flat_map(|p| p.quarantined_orphans.iter().copied())
         .collect();
     quarantined_orphans.sort_unstable();
     quarantined_orphans.dedup();
-    let partitions = parts
-        .iter()
-        .map(|(partition, b, o)| PartitionSnapshotBlockers {
-            partition: *partition,
-            snapshot_blockers: b.clone(),
-            quarantined_orphans: o.clone(),
-        })
-        .collect();
     SnapshotBlockersReport {
         snapshot_blockers,
         quarantined_orphans,
@@ -23974,10 +24033,40 @@ async fn snapshot_blockers_report(server: &ServerImpl) -> SnapshotBlockersReport
         let Some(handle) = server.engine_handle_for(p) else {
             continue;
         };
-        let (blockers, orphans) = handle
-            .with(|journal| (journal.snapshot_blockers(), journal.quarantined_orphans()))
+        let inputs = handle
+            .with(|journal| {
+                let observed = journal.quarantined_orphans();
+                let variables_lost: Vec<Key> = journal
+                    .incidents()
+                    .into_iter()
+                    .filter(|i| {
+                        matches!(i.kind, IncidentKind::VariablesLost)
+                            && matches!(i.state, IncidentState::Active)
+                    })
+                    .map(|i| i.instance_key)
+                    .collect();
+                let live = observed
+                    .iter()
+                    .chain(variables_lost.iter())
+                    .copied()
+                    .filter(|k| {
+                        journal.instance(*k).is_some_and(|i| {
+                            !matches!(
+                                i.state,
+                                ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+                            )
+                        })
+                    })
+                    .collect();
+                PartitionOrphanInputs {
+                    snapshot_blockers: journal.snapshot_blockers(),
+                    observed,
+                    variables_lost,
+                    live,
+                }
+            })
             .await;
-        parts.push((p, blockers, orphans));
+        parts.push((p, inputs));
     }
     build_snapshot_blockers_report(&parts)
 }
@@ -24034,7 +24123,7 @@ async fn snapshot_blocker_cancel_handler(
         | CancelInstanceOutcome::Unavailable(d)
         | CancelInstanceOutcome::Internal(d) => d.clone(),
     };
-    let body = serde_json::json!({ "instanceKey": key, "detail": detail }).to_string();
+    let body = serde_json::json!({ "instanceKey": key.to_string(), "detail": detail }).to_string();
     Response::builder()
         .status(status)
         .header(http::header::CONTENT_TYPE, "application/json")
@@ -25101,21 +25190,30 @@ mod snapshot_blockers_admin_tests {
     /// per-partition-attributed body an operator (or `c8ctl nano doctor`) can
     /// read to learn exactly WHICH instances are blocking compaction and which
     /// have already lost their spilled payload.
+    fn inputs(
+        blockers: &[Key],
+        observed: &[Key],
+        lost: &[Key],
+        live: &[Key],
+    ) -> PartitionOrphanInputs {
+        PartitionOrphanInputs {
+            snapshot_blockers: blockers.to_vec(),
+            observed: observed.to_vec(),
+            variables_lost: lost.to_vec(),
+            live: live.to_vec(),
+        }
+    }
+
     #[test]
     fn report_aggregates_blockers_and_orphans_across_partitions() {
         let parts = vec![
-            // (partition, snapshot blockers, quarantined orphans)
-            (0u64, vec![11, 12], vec![101]),
-            (1u64, vec![12, 13], vec![101, 102]),
-            (2u64, vec![], vec![]),
+            (0u64, inputs(&[11, 12], &[101], &[], &[101])),
+            (1u64, inputs(&[12, 13], &[101, 102], &[], &[101, 102])),
+            (2u64, inputs(&[], &[], &[], &[])),
         ];
         let report = build_snapshot_blockers_report(&parts);
-        // Blockers deduplicated across partitions and sorted.
         assert_eq!(report.snapshot_blockers, vec![11, 12, 13]);
-        // Orphans deduplicated across partitions and sorted.
         assert_eq!(report.quarantined_orphans, vec![101, 102]);
-        // Per-partition attribution preserved so the operator knows where the
-        // blocker lives (which partition's journal is failing to fold).
         assert_eq!(
             report
                 .partitions
@@ -25134,11 +25232,30 @@ mod snapshot_blockers_admin_tests {
         );
     }
 
+    /// #1386: a cancelled (no longer live) orphan drops out of the actionable
+    /// list but stays in the historical `observedOrphans`.
+    #[test]
+    fn cancelled_orphan_drops_out_of_pending_list() {
+        let report =
+            build_snapshot_blockers_report(&[(0u64, inputs(&[], &[101, 102], &[], &[102]))]);
+        assert_eq!(report.quarantined_orphans, vec![102]);
+        assert_eq!(report.partitions[0].observed_orphans, vec![101, 102]);
+    }
+
+    /// #1386: after a restart the process-local observation set is empty, but a
+    /// durable `VariablesLost` incident still surfaces the live orphan.
+    #[test]
+    fn durable_variables_lost_incident_surfaces_orphan_after_restart() {
+        let report = build_snapshot_blockers_report(&[(0u64, inputs(&[], &[], &[55, 55], &[55]))]);
+        assert_eq!(report.quarantined_orphans, vec![55]);
+        assert!(report.partitions[0].observed_orphans.is_empty());
+    }
+
     /// #1386: the report is empty (not an error) when nothing blocks snapshots
     /// and no orphan has been quarantined — the steady healthy state.
     #[test]
     fn report_is_empty_when_healthy() {
-        let report = build_snapshot_blockers_report(&[(0u64, vec![], vec![])]);
+        let report = build_snapshot_blockers_report(&[(0u64, PartitionOrphanInputs::default())]);
         assert!(report.snapshot_blockers.is_empty());
         assert!(report.quarantined_orphans.is_empty());
         assert_eq!(report.partitions.len(), 1);
@@ -25172,16 +25289,22 @@ mod snapshot_blockers_admin_tests {
     /// breakdown — so the contract is pinned against drift.
     #[test]
     fn report_serializes_to_the_documented_json_shape() {
-        let report = build_snapshot_blockers_report(&[(0u64, vec![7], vec![42])]);
+        // A key above 2^53 (JS safe-integer range) must survive exactly.
+        let big: Key = 9_007_199_254_740_993;
+        let report = build_snapshot_blockers_report(&[(0u64, inputs(&[7], &[big], &[], &[big]))]);
         let json = serde_json::to_value(&report).expect("serialize report");
-        assert_eq!(json["snapshotBlockers"], serde_json::json!([7]));
-        assert_eq!(json["quarantinedOrphans"], serde_json::json!([42]));
+        assert_eq!(json["snapshotBlockers"], serde_json::json!(["7"]));
+        assert_eq!(
+            json["quarantinedOrphans"],
+            serde_json::json!(["9007199254740993"])
+        );
         assert_eq!(
             json["partitions"],
             serde_json::json!([{
                 "partition": 0,
-                "snapshotBlockers": [7],
-                "quarantinedOrphans": [42],
+                "snapshotBlockers": ["7"],
+                "quarantinedOrphans": ["9007199254740993"],
+                "observedOrphans": ["9007199254740993"],
             }])
         );
     }
