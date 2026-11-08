@@ -279,9 +279,15 @@ where
     }
 
     // Cold instances: read one row straight from the spill store, push it, flush
-    // when the chunk fills — the cold set never becomes resident.
+    // when the chunk fills — the cold set never becomes resident. A cold row can
+    // itself be variable-spilled (spilled before it was cold-evicted), so it is
+    // resolved through the same `resolve_spilled` path as a resident instance to
+    // keep the snapshot self-contained.
     for &key in cold {
-        let snap = read_cold(key)?;
+        let mut snap = read_cold(key)?;
+        if snap.instance.variables_spilled {
+            resolve_spilled(&mut snap)?;
+        }
         chunk.push(snap);
         if chunk.len() >= STREAM_CHUNK_INSTANCES {
             flush_chunk(&mut w, &mut chunk, false)?;
@@ -428,9 +434,10 @@ where
     let mut reader = BufReader::new(reader);
 
     // Line 1: the envelope header (its format version is validated by the caller
-    // before this is invoked).
-    let mut header_line = String::new();
-    if reader.read_line(&mut header_line)? == 0 {
+    // before this is invoked). The line is consumed to advance past it; the body
+    // is not inspected here.
+    let mut _header_line = String::new();
+    if reader.read_line(&mut _header_line)? == 0 {
         return Err(invalid_data("streaming snapshot is empty (no header)"));
     }
 
@@ -729,6 +736,74 @@ mod tests {
         .expect("streaming read");
         assert_eq!(count, 3, "every cold instance streamed back");
         assert!(restored.is_some());
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1337 + Copilot review on #1464: a COLD row can itself be variable-spilled
+    // (spilled before it was cold-evicted). The cold streaming path must resolve
+    // that spilled payload too, so the snapshot it writes is self-contained —
+    // restoring it must yield the variables and a cleared `variables_spilled`
+    // flag, not an empty placeholder still marked spilled.
+    #[test]
+    fn streaming_snapshot_resolves_spilled_cold_instances() {
+        let engine = engine_with_instances(1);
+        let (control, instances) = Engine::decompose_state_for_streaming(engine.state().clone());
+        let mut cold_snap = instances.into_iter().next().expect("one instance");
+        let key = cold_snap.instance.key;
+
+        // Capture the real payload, then mark the cold row spilled (empty
+        // placeholder variables + the spilled flag), as a cold-evicted row that
+        // was variable-spilled first would look.
+        let real_vars = (*cold_snap.instance.variables).clone();
+        let payload = match real_vars.get("data") {
+            Some(Value::Str(s)) => s.clone(),
+            other => panic!("missing payload: {other:?}"),
+        };
+        cold_snap.instance.variables = Arc::new(HashMap::new());
+        cold_snap.instance.variables_spilled = true;
+
+        let cold_keys: Vec<Key> = vec![key];
+        let resolved_vars = real_vars.clone();
+
+        let path = tmp_path("cold-spilled");
+        write_streaming_snapshot(StreamWrite {
+            path: &path,
+            header_line: &header_line(),
+            covered_events: 9,
+            control: control_snapshot(&control, &engine),
+            instances: Vec::new(), // the instance is cold, not resident
+            cold: &cold_keys,
+            read_cold: move |k| {
+                assert_eq!(k, key);
+                Ok(cold_snap.clone())
+            },
+            // The writer must call this for the spilled cold row and rehydrate it.
+            resolve_spilled: move |snap| {
+                snap.instance.variables = Arc::new(resolved_vars.clone());
+                snap.instance.variables_spilled = false;
+                Ok(())
+            },
+        })
+        .expect("streaming write of a spilled cold instance");
+
+        // Restore: the single instance must come back with its variables present
+        // and the spilled flag cleared (a self-contained snapshot).
+        let mut restored_instances: Vec<InstanceSnapshot> = Vec::new();
+        read_streaming_snapshot(
+            &path,
+            |_control, _covered| {},
+            |snap| restored_instances.push(snap),
+        )
+        .expect("streaming read");
+
+        assert_eq!(restored_instances.len(), 1);
+        let snap = &restored_instances[0];
+        assert!(!snap.instance.variables_spilled, "spilled flag cleared");
+        match snap.instance.variables.get("data") {
+            Some(Value::Str(s)) => assert_eq!(*s, payload),
+            other => panic!("restored cold instance missing payload: {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
