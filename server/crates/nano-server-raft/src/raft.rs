@@ -1045,21 +1045,24 @@ pub fn sweep_orphaned_snapshot_dirs() {
 /// serialize an already-consistent state — no engine round-trip, no race with a
 /// concurrent apply.
 ///
-/// `captured` is the **fail-closed** capture ([`Journal::try_engine_snapshot`]):
-/// `None` when any indexed off-heap payload (a cold instance, a spilled variable
-/// map) could not be folded in. `build_snapshot` turns that `None` into a
-/// [`StorageError`] **before** publishing anything, so openraft treats the build
-/// as failed and — critically — does **not** purge the covered log. An incomplete
-/// snapshot is therefore never minted as the durable recovery point: the log that
-/// can still regenerate the omitted state is preserved intact on disk, so no data
-/// is lost. This is a hard fail-stop, not a graceful retry: openraft propagates
-/// the `StorageError` as a `Fatal`, which drives this partition's Raft core to
-/// [`ServerState::Shutdown`](openraft::ServerState::Shutdown) (see
-/// [`is_shutdown`](RaftPartition::is_shutdown)). There is no auto-restart in this
-/// crate, so the partition stops applying entries and every instance/job routed
-/// here is stranded until the process is restarted — at which point recovery
-/// replays the preserved log. The unreadable payload is thus traded for
-/// availability loss, never data loss.
+/// `captured` holds the streaming capture parts ([`Journal::streaming_snapshot_parts`]):
+/// the control skeleton, the resident per-instance payloads, the cold routing
+/// keys, and the store handles to resolve off-heap rows. `build_snapshot`
+/// streams them to disk in bounded chunks, so the whole cold/spilled set is
+/// never folded into one in-memory `EngineSnapshot` (#1337). The serialize is
+/// **fail-closed**: if any cold/spilled row will not read, `build_snapshot`
+/// returns a [`StorageError`] **before** publishing anything, so openraft treats
+/// the build as failed and — critically — does **not** purge the covered log. An
+/// incomplete snapshot is therefore never minted as the durable recovery point:
+/// the log that can still regenerate the omitted state is preserved intact on
+/// disk, so no data is lost. This is a hard fail-stop, not a graceful retry:
+/// openraft propagates the `StorageError` as a `Fatal`, which drives this
+/// partition's Raft core to [`ServerState::Shutdown`](openraft::ServerState::Shutdown)
+/// (see [`is_shutdown`](RaftPartition::is_shutdown)). There is no auto-restart
+/// in this crate, so the partition stops applying entries and every
+/// instance/job routed here is stranded until the process is restarted — at
+/// which point recovery replays the preserved log. The unreadable payload is
+/// thus traded for availability loss, never data loss.
 pub struct PartitionSnapshotBuilder {
     sm: Arc<PartitionStateMachine>,
     /// The streaming capture parts (#1337): a small control skeleton plus the
@@ -1070,7 +1073,7 @@ pub struct PartitionSnapshotBuilder {
     /// straight from the spill store to disk without materializing it in RAM.
     captured: Option<(
         nano_server_storage::snapstream::StreamingCapture,
-        Vec<u64>,
+        Vec<nanobpmn_engine_core::Key>,
         nano_server_storage::snapstream::SpillStores,
     )>,
     last_applied: Option<LogId<NodeId>>,
@@ -1097,10 +1100,9 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
                 ErrorVerb::Write,
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "refusing to build a Raft snapshot: the streaming capture was \
-                         already taken (build_snapshot called twice) — an off-heap \
-                         payload could not be folded in; aborting before the covered \
-                         log is purged",
+                    "refusing to build a Raft snapshot: the streaming capture parts \
+                     were already consumed (build_snapshot called twice); aborting \
+                     before the covered log is purged",
                 ),
             )
         })?;
@@ -3324,8 +3326,8 @@ mod tests {
             Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
         let snap_dir = src_sm.snapshot_dir.clone();
 
-        // A builder whose capture is `None` — exactly what `get_snapshot_builder`
-        // produces when `try_engine_snapshot` cannot fold every off-heap payload.
+        // A builder whose capture is `None` — what `get_snapshot_builder` would
+        // have produced had the streaming capture already been consumed.
         let mut builder = PartitionSnapshotBuilder {
             sm: src_sm.clone(),
             captured: None,
@@ -3337,8 +3339,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("off-heap payload"),
-            "the error names the incomplete fold, got: {err}"
+            err.to_string().contains("already consumed"),
+            "the error names the consumed capture, got: {err}"
         );
 
         // Nothing was published: no durable pointer, no snapshot body on disk.

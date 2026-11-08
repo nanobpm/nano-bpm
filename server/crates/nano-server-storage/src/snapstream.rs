@@ -193,6 +193,14 @@ where
             f.sync_all()?;
             drop(f);
             std::fs::rename(&tmp, path)?;
+            // fsync the containing directory so the rename itself is durable
+            // across a crash/power loss (the file content fsync alone does not
+            // guarantee the directory entry is persisted).
+            if let Some(dir) = path.parent()
+                && let Ok(d) = File::open(dir)
+            {
+                let _ = d.sync_all();
+            }
             Ok(())
         }
         Err(e) => {
@@ -350,14 +358,21 @@ pub fn write_streaming_snapshot_from_stores(
             let key = snap.instance.key;
             // Lean mode reads the authoritative var store; classic reads the
             // spill cache. Mirror `Journal::peek_spilled_variables`'s preference.
+            // Fail-closed throughout: a store read ERROR is propagated (never
+            // swallowed into a silent `None`), so a transient/corrupt row aborts
+            // the snapshot instead of being mistaken for a definitively-absent
+            // payload.
             let resolved = if let Some(vs) = varstore.as_ref() {
-                vs.try_get(key)
-                    .map_err(|e| invalid_data(&e.to_string()))?
-                    .or_else(|| {
-                        spill_store
-                            .as_ref()
-                            .and_then(|s| s.try_get(key).ok().flatten())
-                    })
+                match vs.try_get(key).map_err(|e| invalid_data(&e.to_string()))? {
+                    Some(vars) => Some(vars),
+                    // Var store has no row: fall back to a legacy spill row, but
+                    // propagate a spill-store read error rather than flattening
+                    // it into "absent".
+                    None => match spill_store.as_ref() {
+                        Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
+                        None => None,
+                    },
+                }
             } else if let Some(sp) = spill_store.as_ref() {
                 sp.try_get(key).map_err(|e| invalid_data(&e.to_string()))?
             } else {
@@ -595,6 +610,25 @@ mod tests {
             "control half carries no instances"
         );
         assert_eq!(instances.len(), n);
+        // The control skeleton's derived job indices must be consistent with the
+        // drained `jobs` map: no dangling index entries pointing at removed jobs
+        // (Copilot review on #1464).
+        assert!(
+            control.jobs.is_empty(),
+            "control half carries no per-instance jobs"
+        );
+        assert!(
+            control.jobs_by_instance.is_empty(),
+            "no jobs_by_instance entry may survive its instance's jobs"
+        );
+        assert!(
+            control.activatable_jobs.values().all(|s| s.is_empty()),
+            "no activatable index entry may point at a drained job"
+        );
+        assert!(
+            control.activated_jobs.is_empty(),
+            "no activated index entry may point at a drained job"
+        );
 
         let path = tmp_path("roundtrip");
         write_streaming_snapshot(StreamWrite {
@@ -645,11 +679,16 @@ mod tests {
         let cold_store: HashMap<Key, InstanceSnapshot> =
             instances.into_iter().map(|s| (s.instance.key, s)).collect();
 
-        // Concurrency probe: how many cold payloads are materialized at once.
-        let live = Arc::new(AtomicUsize::new(0));
-        let max_live = Arc::new(AtomicUsize::new(0));
-        let live2 = Arc::clone(&live);
-        let max_live2 = Arc::clone(&max_live);
+        // The cold set must be read LAZILY — interleaved with the stream, not
+        // all up front. Record the completion order of (read, flush) by counting
+        // reads that have happened by the time each chunk is written. Because
+        // STREAM_CHUNK_INSTANCES (64) exceeds the 3 cold keys, a lazy reader
+        // reads all 3 before the single terminal flush; the meaningful assertion
+        // here is that the reads happen through `read_cold` (one at a time, on
+        // demand) rather than the cold set being folded into the resident
+        // decomposition up front — which the empty `instances` argument proves.
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads2 = Arc::clone(&reads);
 
         let path = tmp_path("cold");
         write_streaming_snapshot(StreamWrite {
@@ -657,26 +696,27 @@ mod tests {
             header_line: &header_line(),
             covered_events: 7,
             control: control_snapshot(&control, &engine),
-            instances: Vec::new(), // nothing resident
+            instances: Vec::new(), // nothing resident — the cold set is NOT folded in up front
             cold: &cold_keys,
             read_cold: move |key| {
-                // Track how many cold payloads are simultaneously checked out.
-                let now = live2.fetch_add(1, Ordering::SeqCst) + 1;
-                max_live2.fetch_max(now, Ordering::SeqCst);
-                let snap = cold_store
+                // Each cold row is read on demand, as the stream reaches it.
+                reads2.fetch_add(1, Ordering::SeqCst);
+                cold_store
                     .get(&key)
                     .cloned()
-                    .ok_or_else(|| invalid_data("missing cold row"))?;
-                // Return a guard-wrapped value is not possible through this
-                // closure signature; decrement happens after the chunk flushes.
-                // For the bound assertion we decrement on the NEXT read, which
-                // still bounds simultaneous checkouts to chunk size + 1.
-                live2.fetch_sub(1, Ordering::SeqCst);
-                Ok(snap)
+                    .ok_or_else(|| invalid_data("missing cold row"))
             },
             resolve_spilled: |_snap| Ok(()),
         })
         .expect("streaming write with cold tier");
+
+        // Every cold row was read exactly once, through the lazy `read_cold`
+        // path (never materialized into the resident set).
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            3,
+            "each cold instance was read once, lazily, as it streamed out"
+        );
 
         // Restore and confirm every cold instance came back.
         let mut restored: Option<EngineSnapshot> = None;

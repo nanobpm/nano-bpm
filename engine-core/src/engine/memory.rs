@@ -839,11 +839,19 @@ impl Engine {
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             // Every job this instance owns, gathered without disturbing the
-            // control half's `jobs` map membership for other instances.
+            // control half's `jobs` map membership for other instances. Each job
+            // is also removed from the derived activatable/activated indices, and
+            // the instance's `jobs_by_instance` entry is dropped, so the control
+            // skeleton's derived indices stay consistent with the maps drained
+            // out of it (no dangling index entries pointing at removed jobs).
             let mut jobs = Vec::new();
-            if let Some(job_keys) = state.jobs_by_instance.get(&key) {
+            if let Some(job_keys) = state.jobs_by_instance.remove(&key) {
                 for job_key in job_keys {
-                    if let Some(job) = state.jobs.remove(job_key) {
+                    if let Some(job) = state.jobs.remove(&job_key) {
+                        // Keep the control skeleton's derived job indices
+                        // consistent with the drained `jobs` map (no dangling
+                        // index entries pointing at removed jobs).
+                        state.deindex_job(&job.job_type, job_key, job.priority);
                         jobs.push(job);
                     }
                 }
