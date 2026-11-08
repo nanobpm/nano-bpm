@@ -2439,6 +2439,21 @@ pub struct ServerImpl {
     /// in flight so the two paths can't race into competing groups. See
     /// [`HandoffPending`].
     handoff_pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, HandoffPending>>>,
+    /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
+    /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
+    /// new core is constructed and registered, all under the partition's lock. Without
+    /// it two concurrent rebuild paths (the recovery tick's promote and a hand-off's
+    /// rebuild-as-receiver, or the liveness supervisor's auto-recovery) interleave
+    /// `shutdown`/`insert` and leave TWO cores serving the SAME partition — the
+    /// two-lineage overlap. Acquiring this lock for the whole rebuild asserts the
+    /// one-core-per-partition invariant.
+    partition_rebuild_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Test-only probe: the live depth (and high-water mark) of rebuild critical
+    /// sections. The rebuild lock keeps the peak at most 1; a test asserts it never
+    /// reaches 2, proving two cores never overlap.
+    #[cfg(test)]
+    rebuild_depth_probe: RebuildDepthProbe,
     /// Cluster create-placement mode (`NANOBPMN_CREATE_PLACEMENT`, ADR 0014).
     /// [`PlacementMode::Off`] (default) keeps blind round-robin placement with
     /// forwarded creates ungated — byte-identical to the historical path.
@@ -3007,6 +3022,11 @@ impl ServerImpl {
                 handoff_catchup_ceiling_from_env().as_millis() as u64,
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(test)]
+            rebuild_depth_probe: RebuildDepthProbe::default(),
             placement_mode,
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4373,6 +4393,53 @@ struct HandoffPending {
     /// The incumbent reported it may have committed the joint config but not the
     /// final uniform one; never self-promote over this — wait it out.
     joint_suspected: bool,
+}
+
+/// Test-only RAII guard tracking the depth of a partition-rebuild critical
+/// section. `enter` increments the shared counter; `Drop` decrements it. The
+/// per-partition rebuild lock keeps the depth at most 1; a concurrent rebuild that
+/// slipped past the lock would push it to 2, which the test asserts against.
+///
+/// The probe records the PEAK (high-water) depth, so a transient overlap is caught
+/// even though the running depth returns to 0 once both rebuilds finish.
+#[cfg(test)]
+struct RebuildDepthGuard {
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl RebuildDepthGuard {
+    fn enter(probe: &RebuildDepthProbe) -> Self {
+        let depth = probe
+            .depth
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        // Record the high-water mark so a transient overlap is not lost when the
+        // sections later drain back to 0.
+        probe
+            .peak
+            .fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            depth: probe.depth.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RebuildDepthGuard {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Test-only probe shared by every rebuild critical section: the live depth and
+/// its high-water mark. One per `ServerImpl` (the rebuild lock is per-partition,
+/// but the tests drive a single partition, so a node-wide probe suffices).
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RebuildDepthProbe {
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Recovery-tick passes a returning owner waits for an in-flight hand-off before
@@ -16349,6 +16416,11 @@ impl ServerImpl {
     /// epoch — bounded loss, never permanent divergence (higher epoch always wins).
     async fn promote_partition(&self, p: u64, epoch: u64) {
         use crate::raft::RaftPartition;
+        // Serialize the rebuild against any concurrent rebuild/recover of the SAME
+        // partition (issue #1455): the old core is fully shut down and awaited,
+        // then the new core is built and registered — never two live cores for one
+        // partition.
+        let _rebuild_guard = self.partition_rebuild_lock(p).lock_owned().await;
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
 
@@ -17186,6 +17258,17 @@ impl ServerImpl {
         }
     }
 
+    /// The per-partition rebuild lock for `p`, creating it on first use. Held for the
+    /// whole shutdown→rebuild→insert sequence so two concurrent rebuild paths can
+    /// never leave two cores serving the same partition (issue #1455).
+    fn partition_rebuild_lock(&self, p: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.partition_rebuild_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(p)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
     /// Rebuild this node's member for `p` as a fresh receiver (uninitialized —
     /// receive-only) of `leader_node`'s group, replacing any existing member. A
     /// learner of an OLD lineage would reject a new leader's lower-term fresh log,
@@ -17194,6 +17277,15 @@ impl ServerImpl {
     /// the rebuild succeeded.
     async fn rebuild_as_receiver(&self, p: u64, leader_node: u64) -> bool {
         use crate::raft::RaftPartition;
+        // Serialize the rebuild against any concurrent promote/recover of the SAME
+        // partition: the old core is fully shut down and awaited, then the new core
+        // is built and registered — never two live cores for one partition.
+        let _rebuild_guard = self.partition_rebuild_lock(p).lock_owned().await;
+        // Test-only overlap probe: entering the critical section increments the
+        // depth, leaving it decrements. The rebuild lock keeps this at most 1; a
+        // concurrent rebuild that slipped past the lock would push it to 2.
+        #[cfg(test)]
+        let _depth_guard = RebuildDepthGuard::enter(&self.rebuild_depth_probe);
         let me = self.engine.topology().node_id as u64;
         let engine = match self.engine_handle_for(p) {
             Some(h) => h,
@@ -37486,6 +37578,81 @@ mod clustered_startup_tests {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();
                 }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    /// One core per partition, asserted: two concurrent rebuilds of the SAME
+    /// partition (two rebuild-as-receiver calls — the recovery-tick and hand-off
+    /// paths) are serialized by the per-partition rebuild lock, so the old core is
+    /// fully shut down and awaited before the new core starts and the two never
+    /// overlap (issue #1455).
+    ///
+    /// Deterministic: the test holds the rebuild lock to force the two rebuilds to
+    /// queue behind it (no sleeps/retries — `lock_owned().await` is the
+    /// synchronization point), then releases it and asserts the rebuild critical
+    /// section NEVER overlapped: the depth probe must peak at 1, never 2.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rebuilds_of_one_partition_are_serialized_one_core() {
+        let (node0, _node1, _node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Create the rebuild lock for partition 0 up front so the test can hold it
+        // to deterministically queue the two rebuilds behind it.
+        let lock = node0.partition_rebuild_lock(0);
+        let probe = node0.rebuild_depth_probe.clone();
+
+        // Hold the lock so BOTH rebuilds block on it (queue) before either enters
+        // its critical section.
+        let guard = lock.clone().lock_owned().await;
+
+        // Spawn the two concurrent rebuild paths for the same partition. Both block
+        // on the held lock before touching the registry.
+        let n_a = node0.clone();
+        let a = tokio::spawn(async move { n_a.rebuild_as_receiver(0, 1).await });
+        let n_b = node0.clone();
+        let b = tokio::spawn(async move { n_b.rebuild_as_receiver(0, 1).await });
+
+        // While the guard is held, neither rebuild has entered its critical section.
+        assert_eq!(
+            probe.depth.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no rebuild entered its critical section while the lock is held"
+        );
+
+        // Release the guard: the two queued rebuilds now run ONE AT A TIME (the
+        // lock serializes them), each fully shutting down the prior core before
+        // registering its replacement.
+        drop(guard);
+        let (ra, rb) = tokio::join!(a, b);
+        ra.expect("rebuild A did not panic");
+        rb.expect("rebuild B did not panic");
+
+        // The two rebuilds never overlapped: the critical-section depth PEAKED at 1,
+        // never 2. The peak is a high-water mark, so a transient overlap would be
+        // caught even though the running depth returns to 0 once both finish.
+        assert_eq!(
+            probe.peak.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the rebuild critical section was never entered by two rebuilds at once"
+        );
+
+        // Exactly ONE core serves the partition afterwards: the registry holds a
+        // single live member for partition 0 (no interleaved teardown left it down).
+        let part = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition 0 is hosted after the rebuilds");
+        assert!(
+            !part.is_shutdown(),
+            "the single surviving core is live — no interleaved teardown left it shutdown"
+        );
+
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
             }
         }
         for h in handles.drain(..) {
