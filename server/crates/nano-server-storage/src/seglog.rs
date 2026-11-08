@@ -2443,6 +2443,10 @@ fn reseed_from_engine_state(
     if total > 0 {
         shard.advance_exported(total as usize)?;
     }
+    // The reseeded job rows reflect every event below `total`, so their durable
+    // replay floor (#1347) is the planted cursor: a later re-delivery of any
+    // event at or below it is held, exactly as for rows built by projection.
+    shard.stamp_job_positions_to_cursor()?;
     Ok(())
 }
 
@@ -3849,6 +3853,16 @@ mod tests {
             live_jobs,
             "every live job must be recovered from the snapshot"
         );
+        // #1347: the reseeded job rows reflect every event below the planted
+        // cursor, so their durable replay floor is that cursor — a re-delivered
+        // event at or below it is held; the next tail event (cursor + 1) applies.
+        for job in store.jobs() {
+            assert_eq!(
+                job.last_event_position, recovery.total_events,
+                "reseeded job {} must carry the planted cursor as its replay floor",
+                job.key
+            );
+        }
 
         // Regression guard: the planted cursor resumes cleanly on the next boot.
         assert_eq!(
