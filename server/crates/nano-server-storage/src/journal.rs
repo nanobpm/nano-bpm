@@ -248,6 +248,12 @@ pub struct Journal {
     /// (SQLite/IO error or an undecodable row, #1388). The row and routing entry
     /// are kept for a retry; this makes each such failure observable.
     offheap_read_failures: AtomicU64,
+    /// `true` when this journal's commands are applied as replicated (Raft)
+    /// state-machine application (#1384). There, a quarantine discovered while
+    /// applying a command must stay deterministic across replicas, so it is
+    /// observed (log + metric) only and never raises the `VariablesLost`
+    /// incident (which would mint a replica-local key + wall-clock timestamp).
+    replicated_apply: bool,
     /// Per-job-type rotation cursor for cold activation candidates (#1388): the
     /// last key whose cold row was unreadable, so the next poll starts after it
     /// and an unreadable oldest row cannot starve healthy later instances.
@@ -1007,6 +1013,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
             resident_child_scans: 0,
@@ -1039,6 +1046,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
             resident_child_scans: 0,
@@ -1169,6 +1177,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
             resident_child_scans: 0,
@@ -1205,6 +1214,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
             resident_child_scans: 0,
@@ -1246,6 +1256,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
             resident_child_scans: 0,
@@ -1282,6 +1293,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            replicated_apply: false,
             activation_cursor: HashMap::new(),
             #[cfg(test)]
             resident_child_scans: 0,
@@ -1351,6 +1363,14 @@ impl Journal {
     /// variable spill write-through, job-activation rehydration and terminal
     /// forget all target this store instead of the destructive spill cache. Set
     /// before serving.
+    /// Marks this journal as applied under replicated (Raft) state-machine
+    /// application (#1384): command-path off-heap-orphan quarantines are then
+    /// observed only (log + metric) instead of raising a non-deterministic
+    /// durable incident.
+    pub fn set_replicated_apply(&mut self, replicated: bool) {
+        self.replicated_apply = replicated;
+    }
+
     pub fn set_varstore(&mut self, store: Arc<VarStore>) {
         self.engine.set_track_dirty_vars(true);
         // Seed the dirty set with every currently-resident instance so the FIRST
@@ -2588,7 +2608,22 @@ impl Journal {
                     .map(|i| Arc::clone(&i.variables))
                     .unwrap_or_default();
                 self.engine.rehydrate_variables(instance_key, resident);
-                // Raise the durable, replicated incident (#1384) — idempotent, so
+                // Under replicated (Raft) application this path runs inside the
+                // state machine: raising the incident here would mint a
+                // replica-local key and stamp wall-clock time, diverging replicas
+                // whose spill state differs. Observe only (#1384; the
+                // leader-propose redesign is tracked separately).
+                if self.replicated_apply {
+                    crate::metrics::record_offheap_orphan_unreported();
+                    tracing::error!(
+                        instance_key,
+                        "{context}: off-heap orphan quarantined during replicated \
+                         apply; VariablesLost incident NOT raised (replica \
+                         determinism) — observed only"
+                    );
+                    return Ok(());
+                }
+                // Raise the durable incident (#1384) — idempotent, so
                 // a repeated activation/reconcile does not double-raise.
                 if let Err(error) = self.apply_command_at(
                     Command::QuarantineOffheapOrphan { instance_key },
@@ -4705,6 +4740,50 @@ mod tests {
         assert!(journal.resident_activated_job(job_key).is_none());
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1384 (review): under replicated (Raft) application the same command
+    // applied on two replicas whose spill state differs (one still has the row,
+    // the other lost it) must produce identical journals — the orphan replica
+    // must NOT mint a VariablesLost incident key / wall-clock timestamp there.
+    #[test]
+    fn replicated_apply_with_differing_spill_state_is_deterministic() {
+        let old_path = restart_store_path("replica-determinism-1384-a");
+        let (journal, keys) = spilled_journal(&old_path, 1);
+        let snapshot = journal.engine.snapshot();
+        drop(journal);
+        let empty_path = restart_store_path("replica-determinism-1384-b");
+
+        let mut with_row = reboot_from(&old_path, snapshot.clone());
+        let mut orphaned = reboot_from(&empty_path, snapshot);
+        with_row.set_replicated_apply(true);
+        orphaned.set_replicated_apply(true);
+
+        let (ev_a, _) = with_row
+            .apply_command_at(Command::activate_jobs("demo-work", "w", 1, 60_000, 7), 7)
+            .unwrap();
+        let (ev_b, _) = orphaned
+            .apply_command_at(Command::activate_jobs("demo-work", "w", 1, 60_000, 7), 7)
+            .unwrap();
+        assert_eq!(
+            orphaned.quarantined_orphans(),
+            vec![keys[0]],
+            "loss observed"
+        );
+        assert_eq!(ev_a, ev_b, "identical replicated events");
+        assert!(orphaned.incidents().is_empty(), "no replica-local incident");
+        assert_eq!(with_row.incidents().len(), orphaned.incidents().len());
+        // The next replicated command mints the same keys on both replicas.
+        let (next_a, _) = with_row
+            .apply_command_at(Command::create_instance("demo"), 8)
+            .unwrap();
+        let (next_b, _) = orphaned
+            .apply_command_at(Command::create_instance("demo"), 8)
+            .unwrap();
+        assert_eq!(next_a, next_b, "no replica-local key minted");
+        drop((with_row, orphaned));
+        let _ = std::fs::remove_dir_all(old_path.parent().unwrap());
+        let _ = std::fs::remove_dir_all(empty_path.parent().unwrap());
     }
 
     #[test]
