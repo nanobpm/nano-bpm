@@ -2157,6 +2157,15 @@ impl Engine {
                 task_listener_result,
                 business_id,
             } => {
+                // Idempotent replay (#1181): the same fence re-asserting the
+                // outcome it already recorded is a no-op success on any replica.
+                if self.is_settlement_replay(
+                    job_key,
+                    lease_token.as_deref(),
+                    state::JobSettlementOutcome::Completed,
+                ) {
+                    return Ok((log, queue));
+                }
                 let job = self
                     .state
                     .jobs
@@ -2291,6 +2300,12 @@ impl Engine {
                     );
                 }
 
+                self.record_settlement(
+                    &mut log,
+                    job_key,
+                    instance_key,
+                    state::JobSettlementOutcome::Completed,
+                );
                 self.emit(
                     &mut log,
                     Event::JobCompleted {
@@ -2958,6 +2973,15 @@ impl Engine {
                 retries,
                 error_message,
             } => {
+                // Idempotent replay (#1181): the same fence re-asserting the
+                // outcome it already recorded is a no-op success on any replica.
+                if self.is_settlement_replay(
+                    job_key,
+                    lease_token.as_deref(),
+                    state::JobSettlementOutcome::Failed,
+                ) {
+                    return Ok((log, queue));
+                }
                 let job = self
                     .state
                     .jobs
@@ -2984,6 +3008,12 @@ impl Engine {
                 let worker = job.attribution_worker();
                 let retries = retries.max(0);
 
+                self.record_settlement(
+                    &mut log,
+                    job_key,
+                    instance_key,
+                    state::JobSettlementOutcome::Failed,
+                );
                 self.emit(
                     &mut log,
                     Event::JobFailed {
@@ -3022,6 +3052,15 @@ impl Engine {
                 error_message,
                 variables,
             } => {
+                // Idempotent replay (#1181): the same fence re-asserting the
+                // outcome it already recorded is a no-op success on any replica.
+                if self.is_settlement_replay(
+                    job_key,
+                    lease_token.as_deref(),
+                    state::JobSettlementOutcome::ErrorThrown,
+                ) {
+                    return Ok((log, queue));
+                }
                 let job = self
                     .state
                     .jobs
@@ -3046,6 +3085,12 @@ impl Engine {
 
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // The job is consumed by the thrown error either way.
+                self.record_settlement(
+                    &mut log,
+                    job_key,
+                    instance_key,
+                    state::JobSettlementOutcome::ErrorThrown,
+                );
                 self.emit(
                     &mut log,
                     Event::JobErrorThrown {
@@ -15282,6 +15327,57 @@ impl Engine {
             Some(_) => Err(EngineError::BusinessIdAlreadyAssigned { instance_key }),
             None => Ok(Some(business_id)),
         }
+    }
+
+    /// Whether a settlement command is a replay of the one the settlement ledger
+    /// already recorded for `job_key` (#1181): the supplied lease token — the
+    /// per-activation fence, which doubles as the idempotency key — and the
+    /// outcome both match. A lease-less command never matches (no key), and a
+    /// different outcome under the same token is not a replay, so it falls
+    /// through to the ordinary state/fence checks and is refused there.
+    fn is_settlement_replay(
+        &self,
+        job_key: Key,
+        supplied: Option<&str>,
+        outcome: state::JobSettlementOutcome,
+    ) -> bool {
+        let Some(supplied) = supplied.filter(|token| !token.is_empty()) else {
+            return false;
+        };
+        self.state
+            .settled_jobs
+            .get(&job_key)
+            .is_some_and(|s| s.outcome == outcome && s.lease_token == supplied)
+    }
+
+    /// Journal a leased job's settlement into the replicated settlement ledger
+    /// (#1181) just before its terminal event. Lease-less jobs record nothing,
+    /// keeping their journal byte-identical.
+    fn record_settlement(
+        &mut self,
+        log: &mut Vec<Event>,
+        job_key: Key,
+        instance_key: Key,
+        outcome: state::JobSettlementOutcome,
+    ) {
+        let Some(lease_token) = self
+            .state
+            .jobs
+            .get(&job_key)
+            .and_then(|job| job.lease_token.clone())
+            .filter(|token| !token.is_empty())
+        else {
+            return;
+        };
+        self.emit(
+            log,
+            Event::JobSettlementRecorded {
+                job_key,
+                instance_key,
+                outcome,
+                lease_token,
+            },
+        );
     }
 
     fn validate_job_lease(

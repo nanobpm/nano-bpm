@@ -5,7 +5,7 @@
 //! module: it **never references [`crate::event`]**, so both `event` and the
 //! applier ([`super::apply`]) can depend on it without forming a cycle.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::model::{ElementId, IncomingFlow, ProcessDefinition, Value};
@@ -1695,6 +1695,43 @@ pub struct DeployedProcess {
     pub definition: ProcessDefinition,
 }
 
+/// How a leased job was settled — the outcome half of the idempotency key, so a
+/// replay is recognized only when it re-asserts the *same* outcome (#1181).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum JobSettlementOutcome {
+    Completed,
+    Failed,
+    ErrorThrown,
+}
+
+/// One settlement-ledger entry ([`State::settled_jobs`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct JobSettlement {
+    /// The lease token of the activation that settled the job.
+    pub lease_token: String,
+    pub outcome: JobSettlementOutcome,
+}
+
+/// Upper bound on [`State::settled_jobs`]. Beyond it the entries with the
+/// smallest job keys (the oldest jobs) are dropped; a replay that old degrades
+/// to the pre-#1181 answer (409/404), never to a double settlement.
+pub const SETTLED_JOB_LEDGER_CAP: usize = 65_536;
+
+/// Record a settlement in the ledger, evicting the oldest entries beyond `cap`.
+/// Deterministic (keyed `BTreeMap`, evicts lowest keys) so every replica applying
+/// the same events holds the same ledger.
+pub fn record_job_settlement(state: &mut State, job_key: Key, entry: JobSettlement, cap: usize) {
+    state.settled_jobs.insert(job_key, entry);
+    while state.settled_jobs.len() > cap {
+        if state.settled_jobs.pop_first().is_none() {
+            break;
+        }
+    }
+}
+
 /// The complete working state of the engine.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1715,6 +1752,21 @@ pub struct State {
     pub process_versions: HashMap<Key, DeployedProcess>,
     pub instances: HashMap<Key, ProcessInstance>,
     pub jobs: HashMap<Key, Job>,
+    /// The **settlement ledger** (#1181): for each *leased* job, the lease token
+    /// (per-activation fence) and outcome of its most recent settlement. A
+    /// replayed `CompleteJob`/`FailJob`/`ThrowJobError` bearing the recorded
+    /// token and the same outcome is answered as an idempotent no-op instead of
+    /// a 409, on any replica. Derived only from the replicated
+    /// [`crate::Event::JobSettlementRecorded`], so every replica (including one
+    /// that never saw a leader-local activation) holds the same ledger. Kept
+    /// apart from [`State::jobs`] so it outlives host-driven instance eviction;
+    /// bounded by [`SETTLED_JOB_LEDGER_CAP`]. `serde(default)`: snapshots written
+    /// before #1181 load with an empty ledger.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "BTreeMap::is_empty")
+    )]
+    pub settled_jobs: BTreeMap<Key, JobSettlement>,
     /// User tasks created for `userTask` elements, keyed by user-task key. A
     /// completed task is retained (transitioned to [`UserTaskState::Completed`])
     /// as an audit trail.

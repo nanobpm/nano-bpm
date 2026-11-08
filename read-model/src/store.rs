@@ -6534,6 +6534,9 @@ fn project_event(
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
         | Event::StartInstanceDispatched { .. }
+        // Engine-internal settlement ledger (#1181); the terminal job event
+        // that follows carries everything the read model projects.
+        | Event::JobSettlementRecorded { .. }
         | Event::UserTaskCorrectionsApplied { .. }
         | Event::UserTaskTransitionDeferred { .. }
         | Event::UserTaskTransitionResolved { .. }

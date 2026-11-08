@@ -275,6 +275,23 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             resync_job_index(state, *job_key);
         }
 
+        Event::JobSettlementRecorded {
+            job_key,
+            outcome,
+            lease_token,
+            ..
+        } => {
+            record_job_settlement(
+                state,
+                *job_key,
+                JobSettlement {
+                    lease_token: lease_token.clone(),
+                    outcome: *outcome,
+                },
+                SETTLED_JOB_LEDGER_CAP,
+            );
+        }
+
         Event::JobCompleted { job_key, .. } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Completed;

@@ -1961,6 +1961,19 @@ fn bump(slot: &mut (u64, Option<u64>), at_ms: u64) {
     slot.1 = Some(slot.1.map_or(at_ms, |prev| prev.max(at_ms)));
 }
 
+/// Whether `events` actually settled a job (a terminal `JobCompleted` /
+/// `JobFailed` / `JobErrorThrown`). An idempotent settlement replay (#1181)
+/// succeeds with no events, and must not be counted again in job statistics or
+/// completion metrics.
+fn settles_a_job(events: &[Event]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            Event::JobCompleted { .. } | Event::JobFailed { .. } | Event::JobErrorThrown { .. }
+        )
+    })
+}
+
 /// Best-effort recovery of a completed job's type from the emitted events, used
 /// when the read-model snapshot taken before applying the command didn't carry
 /// it (e.g. the projection had not yet caught up).
@@ -6852,10 +6865,16 @@ impl ServerImpl {
             // REST complete is not the stream CompleteJob path: do not record the
             // stream-completion diagnostic (`record_stream_outcome = false`). #1306.
             return Ok(
-                match self.propose_job_for_stream(job_key, command, false).await {
-                    Ok(commit) => {
+                match self
+                    .propose_partition_command(job_key, command, false)
+                    .await
+                {
+                    Ok((events, commit)) => {
                         commit.wait().await;
-                        self.note_job_completion("rest");
+                        let metadata = metadata.filter(|_| settles_a_job(&events));
+                        if settles_a_job(&events) {
+                            self.note_job_completion("rest");
+                        }
                         if let Some((job_type, worker)) = metadata {
                             self.job_statistics
                                 .record_completed(job_type, worker, now_millis());
@@ -6909,18 +6928,22 @@ impl ServerImpl {
         let completed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((events, commit)) => {
-                // Record REST job completion (drain-side; also feeds the drain guard).
-                self.note_job_completion("rest");
-                // Job-statistics (epic #903 / #907): a completed job, attributed to
-                // the worker that held it (captured before the command dropped it).
-                self.job_statistics.record_completed(
-                    completed_meta
-                        .0
-                        .clone()
-                        .unwrap_or_else(|| job_completed_type_from_events(&events)),
-                    completed_meta.1.clone(),
-                    now_millis(),
-                );
+                // An idempotent settlement replay (#1181) settles nothing: it is
+                // answered 204 but not counted twice.
+                if settles_a_job(&events) {
+                    // Record REST job completion (drain-side; also feeds the drain guard).
+                    self.note_job_completion("rest");
+                    // Job-statistics (epic #903 / #907): a completed job, attributed to
+                    // the worker that held it (captured before the command dropped it).
+                    self.job_statistics.record_completed(
+                        completed_meta
+                            .0
+                            .clone()
+                            .unwrap_or_else(|| job_completed_type_from_events(&events)),
+                        completed_meta.1.clone(),
+                        now_millis(),
+                    );
+                }
                 // REST API: await fsync before replying (synchronous durability).
                 // Contrast with falcon::pipeline_job_command, which replies
                 // immediately and awaits fsync in a detached task for throughput.
@@ -7049,10 +7072,16 @@ impl ServerImpl {
             );
             // REST fail is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
             return Ok(
-                match self.propose_job_for_stream(job_key, command, false).await {
-                    Ok(commit) => {
+                match self
+                    .propose_partition_command(job_key, command, false)
+                    .await
+                {
+                    Ok((events, commit)) => {
                         commit.wait().await;
-                        self.note_job_completion("rest");
+                        let metadata = metadata.filter(|_| settles_a_job(&events));
+                        if settles_a_job(&events) {
+                            self.note_job_completion("rest");
+                        }
                         if let Some((job_type, worker)) = metadata {
                             self.job_statistics
                                 .record_failed(job_type, worker, now_millis());
@@ -7100,13 +7129,17 @@ impl ServerImpl {
             .await;
         let failed_meta = engine_meta.unwrap_or((None, None));
         match result {
-            Ok((_, commit)) => {
+            Ok((events, commit)) => {
+                // An idempotent settlement replay (#1181) settles nothing.
+                let settled = settles_a_job(&events);
                 // Record REST job completion (fail also completes the job lifecycle;
                 // drain-side, so it feeds the drain guard too).
-                self.note_job_completion("rest");
+                if settled {
+                    self.note_job_completion("rest");
+                }
                 // Job-statistics (epic #903 / #907): a failed job, attributed to
                 // the worker that held it (captured before the command dropped it).
-                if let Some(job_type) = failed_meta.0.clone() {
+                if let Some(job_type) = failed_meta.0.clone().filter(|_| settled) {
                     self.job_statistics.record_failed(
                         job_type,
                         failed_meta.1.clone(),
@@ -7227,10 +7260,16 @@ impl ServerImpl {
             );
             // REST throw-error is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
             return Ok(
-                match self.propose_job_for_stream(job_key, command, false).await {
-                    Ok(commit) => {
+                match self
+                    .propose_partition_command(job_key, command, false)
+                    .await
+                {
+                    Ok((events, commit)) => {
                         commit.wait().await;
-                        self.note_job_completion("rest");
+                        let metadata = metadata.filter(|_| settles_a_job(&events));
+                        if settles_a_job(&events) {
+                            self.note_job_completion("rest");
+                        }
                         if let Some((job_type, worker)) = metadata {
                             self.job_statistics.record_error(
                                 job_type,
@@ -7295,12 +7334,13 @@ impl ServerImpl {
             .await;
         let error_meta = engine_meta.unwrap_or((None, None));
         match result {
-            Ok((_, commit)) => {
+            Ok((events, commit)) => {
                 commit.wait().await;
                 // Job-statistics (epic #903 / #907): a thrown BPMN business error,
                 // feeding `/v2/jobs/statistics/errors`, attributed to the worker
-                // that held the job (captured before the command dropped it).
-                if let Some(job_type) = error_meta.0.clone() {
+                // that held the job (captured before the command dropped it). An
+                // idempotent settlement replay (#1181) settles nothing.
+                if let Some(job_type) = error_meta.0.clone().filter(|_| settles_a_job(&events)) {
                     self.job_statistics.record_error(
                         job_type,
                         error_meta.1.clone(),
@@ -38321,6 +38361,102 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the {job_type} job never projected into the read model");
+    }
+
+    /// #1181: a worker that lost the response to its settlement (network blip,
+    /// gateway restart, a hop to another gateway host) and replays the same
+    /// complete / fail with the SAME lease token gets an idempotent 204, not a
+    /// 409 "Job not activated" that would make it re-run the job elsewhere —
+    /// and the replay is not counted twice in job statistics.
+    #[tokio::test]
+    async fn rest_settlement_replay_under_the_same_lease_is_an_idempotent_204() {
+        let server = ServerImpl::default();
+        let from = chrono::Utc::now() - chrono::Duration::hours(1);
+        for _ in 0..2 {
+            server
+                .create_for_stream(Some("demo".into()), None, Default::default())
+                .await
+                .expect("create the demo instance");
+        }
+        await_job_key(&server, "demo-work").await;
+        let jobs = server
+            .activate_for_stream_with_lease("demo-work", "worker-a", 10, 60_000, None, true)
+            .await;
+        assert_eq!(jobs.len(), 2, "both demo-work jobs are activatable");
+        let token = |j: &models::ActivatedJobResult| -> String {
+            serde_json::to_value(j).unwrap()["jobLeaseToken"]
+                .as_str()
+                .expect("a leased activation carries a token")
+                .to_owned()
+        };
+
+        use apis::job::CompleteJobResponse as CResp;
+        let path = models::CompleteJobPathParams {
+            job_key: jobs[0].job_key.0.clone(),
+        };
+        let body = Some(
+            serde_json::from_value(serde_json::json!({ "jobLeaseToken": token(&jobs[0]) }))
+                .unwrap(),
+        );
+        for attempt in ["first", "replayed"] {
+            assert!(
+                matches!(
+                    server.complete_job_impl(&path, &body).await.unwrap(),
+                    CResp::Status204_TheJobWasCompletedSuccessfully
+                ),
+                "the {attempt} completion under the recorded lease is a 204"
+            );
+        }
+        let stale = Some(
+            serde_json::from_value(serde_json::json!({ "jobLeaseToken": "nano-lease:stale" }))
+                .unwrap(),
+        );
+        assert!(
+            !matches!(
+                server.complete_job_impl(&path, &stale).await.unwrap(),
+                CResp::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "a token that never settled the job is never answered as a success"
+        );
+
+        use apis::job::FailJobResponse as FResp;
+        let path = models::FailJobPathParams {
+            job_key: jobs[1].job_key.0.clone(),
+        };
+        let body: Option<models::JobFailRequest> = Some(
+            serde_json::from_value(
+                serde_json::json!({ "retries": 0, "jobLeaseToken": token(&jobs[1]) }),
+            )
+            .unwrap(),
+        );
+        for attempt in ["first", "replayed"] {
+            assert!(
+                matches!(
+                    server.fail_job_impl(&path, &body).await.unwrap(),
+                    FResp::Status204_TheJobIsFailed
+                ),
+                "the {attempt} failure under the recorded lease is a 204"
+            );
+        }
+
+        let to = chrono::Utc::now() + chrono::Duration::hours(1);
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        let GResp::Status200_GlobalJobMetrics(g) = server
+            .get_global_job_statistics_impl(&models::GetGlobalJobStatisticsQueryParams {
+                from,
+                to,
+                job_type: Some("demo-work".into()),
+            })
+            .await
+            .expect("global stats run")
+        else {
+            panic!("expected 200 from global stats");
+        };
+        assert_eq!(
+            g.completed.count, 1,
+            "a replayed completion is not recounted"
+        );
+        assert_eq!(g.failed.count, 1, "a replayed failure is not recounted");
     }
 
     #[tokio::test]

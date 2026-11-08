@@ -760,6 +760,21 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         worker: Option<String>,
     },
+    /// A **leased** job's settlement was recorded in the settlement ledger
+    /// (#1181): the lease token (per-activation fence) that settled it and the
+    /// outcome. Emitted immediately before the terminal `JobCompleted` /
+    /// `JobFailed` / `JobErrorThrown` of a leased job (never for a lease-less
+    /// one, whose journal stays byte-identical). Carrying the token on a
+    /// replicated event — rather than reading it from replica job state — keeps
+    /// the ledger identical on every replica even when the activation itself was
+    /// leader-local and never replicated, so a re-issued settlement is answered
+    /// idempotently by whichever host the worker reaches.
+    JobSettlementRecorded {
+        job_key: Key,
+        instance_key: Key,
+        outcome: crate::state::JobSettlementOutcome,
+        lease_token: String,
+    },
     /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {
@@ -1691,6 +1706,7 @@ impl Event {
             | Event::JobFailed { instance_key, .. }
             | Event::JobErrorThrown { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
+            | Event::JobSettlementRecorded { instance_key, .. }
             | Event::JobRetriesUpdated { instance_key, .. }
             | Event::JobTimeoutUpdated { instance_key, .. }
             | Event::UserTaskCreated { instance_key, .. }
@@ -1938,6 +1954,7 @@ impl Event {
             | Event::JobFailed { job_key, .. }
             | Event::JobErrorThrown { job_key, .. }
             | Event::JobCompleted { job_key, .. }
+            | Event::JobSettlementRecorded { job_key, .. }
             | Event::JobCanceled { job_key, .. }
             | Event::JobRetriesUpdated { job_key, .. }
             | Event::JobTimeoutUpdated { job_key, .. } => m = m.max(*job_key),
