@@ -20,17 +20,8 @@ pub(crate) trait LogStateReader<NID: NodeId> {
     /// It assumes a committed log will always get positive return value, according to raft spec.
     fn has_log_id(&self, log_id: &LogId<NID>) -> bool {
         if log_id.index < self.committed().next_index() {
-            // Committed fast-path: a log id at or below the committed index is
-            // present IF it is on the committed lineage (`Some(log_id) <=
-            // committed`). A same-term DIVERGENT lineage (a two-lineage
-            // hand-off) can present a log id below the committed index that is
-            // NOT `<= committed`; that is a conflict to resolve, not a panic.
-            // Fall through to the log-id comparison, which reports it as
-            // not-present. Never assert: panicking here takes the Raft core
-            // down on a recoverable replication divergence.
-            if Some(log_id) <= self.committed() {
-                return true;
-            }
+            debug_assert!(Some(log_id) <= self.committed());
+            return true;
         }
 
         // The local log id exists at the index and is same as the input.

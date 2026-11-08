@@ -77,6 +77,10 @@ enum type.
 - **Coordinated cluster upgrade required.** All nodes must move to `/cluster` (+ secret) together — a
   node still dialing `/falcon` for peer traffic would be 403'd. This is a breaking intra-cluster
   change; roll the whole cluster, not one node at a time.
+  The same rule governs every later change to an intra-cluster wire shape on this channel — e.g.
+  openraft's `AppendEntriesResponse::Conflict` gaining a follower last-log-id hint (#1454), which
+  changes its serialized form from `"Conflict"` to `{"Conflict": …}`. Such changes ship as plain
+  format changes with no mixed-version decoding; upgrade the whole cluster together.
 - **Secret is optional but recommended.** With `NANOBPMN_CLUSTER_SECRET` unset the `/cluster` channel
   is open (a single node has no peers, so nothing is exposed); a startup warning fires for a
   multi-node deployment with no secret configured.
