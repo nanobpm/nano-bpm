@@ -719,6 +719,31 @@ fn build_golden_corpus() -> (EngineSnapshot, Vec<Event>) {
             .expect("migrate instance D"),
     );
 
+    // Off-heap-orphan incident witness (#1384): instance E is quarantined via the
+    // host-injected `QuarantineOffheapOrphan` command, pinning the
+    // `IncidentKind::VariablesLost` frame (and the command's own frame, had it been
+    // journaled) so a silent drift in either is caught. The engine does not model
+    // the spill tier, so the command is applied directly to a live instance — the
+    // same frame the storage layer emits for a real orphan.
+    let created_e = engine
+        .apply_command_at(Command::create_instance("order"), T0 + 22)
+        .expect("create instance E");
+    let inst_e = created_e
+        .iter()
+        .find_map(|e| e.instance_key())
+        .expect("instance E key");
+    journal.extend(created_e);
+    journal.extend(
+        engine
+            .apply_command_at(
+                Command::QuarantineOffheapOrphan {
+                    instance_key: inst_e,
+                },
+                T0 + 23,
+            )
+            .expect("quarantine instance E"),
+    );
+
     let snapshot = engine.snapshot();
     (snapshot, journal)
 }

@@ -5514,6 +5514,10 @@ impl SpillConfig {
     /// Installs the configured spill tiers onto `journal`. Idempotent per
     /// journal; call once per engine actor at construction.
     fn apply(&self, journal: &mut Journal) {
+        // #1384: under Raft, command-path orphan quarantines run inside
+        // state-machine application and must not raise a non-deterministic
+        // incident — observe only.
+        journal.set_replicated_apply(raft_enabled());
         if let Some(cfg) = &self.var {
             match cfg {
                 VarSpillCfg::Budget(budget) => {
@@ -20704,6 +20708,10 @@ fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum
         IncidentKind::CalledElementError => models::IncidentErrorTypeEnum::CalledElementError,
         IncidentKind::IoMapping => models::IncidentErrorTypeEnum::IoMappingError,
         IncidentKind::ExtractValueError => models::IncidentErrorTypeEnum::ExtractValueError,
+        // A nano-internal durability incident (#1384): an off-heap orphan's spilled
+        // variables were definitively lost. The Camunda taxonomy has no analogue,
+        // so it surfaces as `UNKNOWN` (the honest catch-all), not a BPMN error.
+        IncidentKind::VariablesLost => models::IncidentErrorTypeEnum::Unknown,
     }
 }
 
@@ -24973,6 +24981,7 @@ async fn main() {
             {
                 for journal in &mut journals {
                     journal.set_varstore(Arc::clone(vs));
+                    journal.set_replicated_apply(raft_enabled());
                 }
             }
 
