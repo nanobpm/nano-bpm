@@ -24880,12 +24880,14 @@ mod snapshot_health_tick_tests {
         // enqueue the sampler's quarantine query behind it: the query cannot
         // return until the barrier opens.
         let hold = Arc::new(std::sync::Barrier::new(2));
-        handle
-            .with({
-                let hold = Arc::clone(&hold);
-                move |_journal| hold.wait()
-            })
-            .await;
+        // `spawn_job` enqueues without awaiting: awaiting `with` here would
+        // deadlock, since the barrier's other party is the release below.
+        handle.spawn_job({
+            let hold = Arc::clone(&hold);
+            move |_journal| {
+                hold.wait();
+            }
+        });
         let query = tokio::spawn({
             let handle = handle.clone();
             async move { journal_quarantine_state(std::slice::from_ref(&handle)).await }
