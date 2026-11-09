@@ -16410,6 +16410,29 @@ impl ServerImpl {
             }
             // Leaderless past the grace window. Promote iff this node is the
             // deterministic surviving successor for `p`.
+            // A live local core whose committed membership names THIS node the
+            // sole voter (e.g. just handed leadership by the incumbent) inherits
+            // the group's lineage: it only needs to campaign. A fresh self-promote
+            // would discard that log and form a competing lineage at a term that
+            // ties the incumbent's (the two-lineage split). Elect instead.
+            if let Some(part) = self.raft.get(p)
+                && !part.is_shutdown()
+                && {
+                    let metrics = part.raft.metrics();
+                    let m = metrics.borrow();
+                    let voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
+                    voters == [me]
+                }
+            {
+                if let Err(e) = part.raft.trigger().elect().await {
+                    tracing::warn!(
+                        partition = p,
+                        "leader-durable: could not trigger election: {e}"
+                    );
+                }
+                state.misses.remove(&p);
+                continue;
+            }
             if self.designated_successor(p).await == Some(me as u32) {
                 let next_epoch = self.next_promotion_epoch(p);
                 tracing::warn!(
@@ -16943,6 +16966,17 @@ impl ServerImpl {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&partition);
+        // The incumbent committed a membership naming THIS node the sole voter and
+        // stepped down, so the group is momentarily leaderless. Campaign now, on
+        // the inherited lineage, rather than waiting out an election timeout: a
+        // leaderless window here would let the recovery tick's legacy path
+        // self-promote a FRESH single-voter group at a term that ties the
+        // incumbent's (the two-lineage split this hand-off exists to avoid; #53).
+        if let Some(part) = self.raft.get(partition)
+            && let Err(e) = part.raft.trigger().elect().await
+        {
+            tracing::warn!(partition, "hand-off: could not trigger election: {e}");
+        }
         tracing::info!(
             partition,
             epoch,
@@ -17411,6 +17445,185 @@ impl ServerImpl {
                 false
             }
         }
+    }
+
+    /// Auto-recover a partition whose Raft core entered `Shutdown` (issue #53).
+    ///
+    /// An openraft core terminates (state `Shutdown`) on a `Fatal` — an
+    /// unrecoverable storage error from apply/snapshot (the fail-closed #1405
+    /// path) or a defensive log-append rejection (a divergent local log). Left
+    /// alone the partition never applies again and every instance/job routed to
+    /// it is stranded (the RF>1 completion-freeze). PR #52 made this loud; this
+    /// makes it *recoverable*: tear the dead core down and rebuild a fresh member
+    /// in the registry, so the partition rejoins its group instead of waiting for
+    /// a manual process restart.
+    ///
+    /// The rebuild policy follows the partition's role, mirroring the boot path:
+    ///
+    /// - **A partition another node leads** (a follower/learner, or an owned
+    ///   partition a failover incumbent currently leads): rebuild as a FRESH
+    ///   receiver — an empty volatile log (`log_dir = None`), no `initialize`.
+    ///   The dead core's local log is exactly the divergent one that trips the
+    ///   defensive `LogIndexNotFound` collision, so discarding it lets the
+    ///   leader's authoritative lineage replicate in cleanly (via log
+    ///   backfill or a snapshot install). Safe because this node is not the
+    ///   durability source for a partition it does not lead.
+    /// - **A partition this node leads** (the sole/leader voter): rebuild
+    ///   resuming the durable on-disk log (`raft_log_dir_for`). The leader's log
+    ///   is the durability point and must not be discarded; the Shutdown cause
+    ///   was transient in-memory core state, so replaying the preserved durable
+    ///   log + snapshot reconstructs the engine with no data loss.
+    ///
+    /// Returns `true` when the partition was rebuilt (the registry now holds a
+    /// live member). A rebuild failure is logged and retried by the next
+    /// supervisor tick (the partition stays down but the node keeps trying).
+    async fn recover_shutdown_partition(&self, p: u64) -> bool {
+        use crate::raft::RaftPartition;
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id as u64;
+
+        // Serialize against a concurrent promote / rebuild-as-receiver of the
+        // SAME partition (#1455): never two live cores for one partition.
+        let _rebuild_guard = self.partition_rebuild_lock(p).lock_owned().await;
+        #[cfg(test)]
+        let _depth_guard = RebuildDepthGuard::enter(&self.rebuild_depth_probe);
+        // Re-check under the lock: a recovery that queued behind a concurrent
+        // rebuild must not tear down the live core that rebuild just installed.
+        match self.raft.get(p) {
+            Some(cur) if cur.is_shutdown() => {}
+            _ => return false,
+        }
+
+        // An RF=1 in-memory deployment cannot be safely recovered in place: with
+        // no durable log (`raft_log_dir_for` is `None`) and no replica peer to
+        // backfill from (RF=1 means this node is the partition's ONLY replica,
+        // regardless of how many nodes the cluster has), rebuilding would install an empty uninitialized learner
+        // that never elects itself — silently discarding the partition's state
+        // and leaving it unavailable while reporting "recovered" (issue #53
+        // review). Refuse the silent data loss: log loudly and leave the
+        // partition down for an operator restart (the only sound recovery for a
+        // volatile sole voter). Replicated (RF>1) and durable deployments
+        // proceed below.
+        if topology.effective_rf() == 1 && raft_log_dir_for(p).is_none() {
+            tracing::error!(
+                partition = p,
+                "raft partition core is SHUTDOWN on an RF=1 in-memory deployment (no replica to backfill from); \
+                 in-place recovery would discard its volatile state — NOT auto-recovering \
+                 (restart the node to recover; run with NANOBPMN_DATA_DIR for a durable log)"
+            );
+            return false;
+        }
+
+        let engine = match self.engine_handle_for(p) {
+            Some(h) => h,
+            None => self.replica_engine_for(p).await,
+        };
+        let transport = self.raft_transport();
+        // A partition this node does not statically own has no exporter, so its
+        // state machine must evict terminal shells itself (the RF>1 hot-state
+        // leak guard); an owned partition keeps shells for its read path.
+        let evict_terminal = self.engine.local_for_partition(p).is_none();
+        let i_own = topology.leader_of(p) == topology.node_id;
+        // Read the dead core's last-known leader BEFORE the swap: a live peer
+        // leader means we rejoin as its receiver (fresh log); anything else
+        // (we lead, or no leader is known) means we resume our own lineage.
+        let peer_leads = self
+            .raft
+            .get(p)
+            .and_then(|old| old.raft.metrics().borrow().current_leader)
+            .map(|l| l != me)
+            .unwrap_or(false);
+        let fresh_receiver = !i_own || peer_leads;
+        // In `quorum` mode (the default) a followed partition is a VOTER: its
+        // durable log + persisted vote back the write quorum, so recovering it
+        // onto an empty volatile log would discard committed state and could let
+        // a later election discard acknowledged writes (or let the voter vote
+        // twice in one term) — issue #53 review. A voter must resume its durable
+        // on-disk log regardless of the fresh-receiver heuristic; only in
+        // `leader-durable` mode is a follower a disposable non-voting learner
+        // whose sole durability point is the leader, safe to rebuild fresh.
+        let voter_must_resume = self.replication_mode == ReplicationMode::Quorum;
+        let log_dir = if fresh_receiver && !voter_must_resume {
+            None
+        } else {
+            raft_log_dir_for(p)
+        };
+        // A quorum VOTER with no durable log (an in-memory deployment) has nothing
+        // to resume: rebuilding it would hand the group an EMPTY voter — no log,
+        // no persisted vote — that can vote twice in a term or help elect a stale
+        // replica, discarding acknowledged writes (Raft's amnesia hazard; #53
+        // review). Refuse, loudly, and leave the partition down for an operator
+        // restart. Only leader-durable learners (non-voting, the leader is their
+        // sole durability point) and durable voters are rebuilt in place.
+        if voter_must_resume && log_dir.is_none() {
+            tracing::error!(
+                partition = p,
+                "raft partition core is SHUTDOWN on an in-memory quorum voter; \
+                 rebuilding it empty would let an amnesiac voter lose acknowledged writes — \
+                 NOT auto-recovering (restart the node to recover; run with NANOBPMN_DATA_DIR \
+                 for a durable log, or leader-durable replication for disposable learners)"
+            );
+            return false;
+        }
+        // Tear down the dead core first so its tasks fully stop before we
+        // construct the replacement (and so a durable log store's file handles
+        // are released before the new store reopens the same dir).
+        self.retire_predecessor_core(p).await;
+        // A rebuild with no durable log is an EMPTY receiver, so it goes through
+        // the one canonical fail-closed constructor every receiver path uses
+        // (#1454): it refuses to hand back a member carrying any log, vote,
+        // committed, applied or snapshot state, so a recovered follower can never
+        // present the leader with a divergent committed prefix.
+        let rebuilt_fresh = log_dir.is_none();
+        let rebuilt = match log_dir {
+            None => {
+                RaftPartition::bootstrap_fresh_receiver(me, p, engine, transport, evict_terminal)
+                    .await
+            }
+            dir @ Some(_) => {
+                RaftPartition::bootstrap_member(me, p, engine, transport, dir, evict_terminal).await
+            }
+        };
+        match rebuilt {
+            Ok(part) => {
+                self.raft.insert(Arc::new(part));
+                tracing::info!(
+                    "raft: node {me} auto-recovered shutdown partition {p} ({})",
+                    if rebuilt_fresh {
+                        "fresh receiver; the leader will backfill/snapshot it"
+                    } else {
+                        "resumed its durable on-disk lineage"
+                    }
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    "raft: node {me} failed to auto-recover shutdown partition {p}: {e}; \
+                     the supervisor will retry"
+                );
+                false
+            }
+        }
+    }
+
+    /// One pass of the partition-Shutdown auto-recovery supervisor (issue #53).
+    /// For every hosted partition whose core is `Shutdown`, rebuild it in the
+    /// registry (see [`recover_shutdown_partition`](Self::recover_shutdown_partition)).
+    /// Returns the partition ids that were recovered this pass. Factored out of
+    /// the spawned loop so a test can drive it deterministically.
+    #[cfg(test)]
+    pub(crate) async fn recover_shutdown_partitions_once(&self) -> Vec<u64> {
+        let mut recovered = Vec::new();
+        for part in self.raft.all() {
+            if part.is_shutdown() {
+                let p = part.partition_id;
+                if self.recover_shutdown_partition(p).await {
+                    recovered.push(p);
+                }
+            }
+        }
+        recovered
     }
 
     /// Replicates a deployment's process definitions to every partition other
@@ -26545,12 +26758,15 @@ async fn main() {
     // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
     // (e.g. on an unrecoverable storage error) and then silently stop applying,
     // stranding that partition's share of instances/jobs — the mechanism behind
-    // the RF>1 completion-freeze. This makes the failure LOUD: it polls every
-    // partition on a slow cadence, publishes the `nanobpm_raft_partition_shutdown`
-    // gauge, and logs a rate-limited ERROR (once per partition per shutdown edge)
-    // so a dead partition can never again fail silently.
+    // the RF>1 completion-freeze. This makes the failure LOUD (the
+    // `nanobpm_raft_partition_shutdown` gauge + a rate-limited ERROR) AND
+    // self-healing (issue #53): on the shutdown edge it rebuilds the partition's
+    // member in the registry so the partition rejoins its group instead of
+    // waiting for a manual process restart. The gauge returns to 0 once the
+    // rebuilt member is live.
     {
         let reg = server.raft_registry().clone();
+        let recover_server = server.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             let mut alarmed: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -26564,6 +26780,12 @@ async fn main() {
                     let down = part.is_shutdown();
                     metrics::set_raft_partition_shutdown(pid, down);
                     if down {
+                        // The ERROR log is edge-triggered (once per shutdown edge,
+                        // via `alarmed`); the RECOVERY attempt is not — a failed
+                        // rebuild leaves the partition Shutdown, so it must be
+                        // retried on EVERY down tick, not gated by `alarmed`
+                        // (otherwise one transient failure strands the partition
+                        // until the next process restart — issue #53 review).
                         if alarmed.insert(pid) {
                             let m = part.raft.metrics().borrow().clone();
                             let applied = m.last_applied.map(|l| l.index as i128).unwrap_or(-1);
@@ -26575,8 +26797,15 @@ async fn main() {
                                 applied = applied as i64,
                                 "raft partition core is SHUTDOWN and no longer applying; \
                                  its instances/jobs are stranded (RF>1 completion-freeze) — \
-                                 the node must be restarted (clean) to recover this partition"
+                                 auto-recovering the partition in place (issue #53)"
                             );
+                        }
+                        // Rebuild the dead partition in the registry so it
+                        // rejoins its group. A rebuild failure is retried on
+                        // the next tick (the partition stays down meanwhile).
+                        if recover_server.recover_shutdown_partition(pid).await {
+                            alarmed.remove(&pid);
+                            metrics::set_raft_partition_shutdown(pid, false);
                         }
                     } else {
                         alarmed.remove(&pid);
@@ -35404,6 +35633,417 @@ mod clustered_startup_tests {
         part1.raft.shutdown().await.expect("clean shutdown node 1");
     }
 
+    /// A multi-node RF=1 in-memory cluster has no replica to backfill a
+    /// partition from, so a Shutdown core there must NOT be "recovered" onto an
+    /// empty uninitialized member (silent data loss + permanent unavailability
+    /// reported as recovered). Guard keys on `effective_rf() == 1`, not cluster
+    /// size (issue #53 review).
+    #[tokio::test]
+    async fn a_shutdown_rf1_in_memory_partition_on_a_multi_node_cluster_is_not_recovered() {
+        use std::collections::BTreeMap;
+
+        use openraft::BasicNode;
+
+        use crate::raft::RaftPartition;
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused-0".into(), "http://unused-1".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        assert!(!topology.is_single_node());
+        assert_eq!(topology.effective_rf(), 1);
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node0 = build_server_in_memory(journals, topology);
+        assert!(
+            raft_log_dir_for(0).is_none(),
+            "test requires in-memory mode"
+        );
+
+        let part0 = Arc::new(
+            RaftPartition::bootstrap_member(
+                0,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                node0.raft_transport(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot raft member on node 0"),
+        );
+        node0.raft_registry().insert(part0.clone());
+        let mut members = BTreeMap::new();
+        members.insert(0u64, BasicNode::new("http://unused-0".to_string()));
+        part0
+            .initialize(members)
+            .await
+            .expect("form sole-voter group");
+        part0.raft.shutdown().await.expect("drive core to shutdown");
+        assert!(part0.is_shutdown());
+
+        assert!(
+            !node0.recover_shutdown_partition(0).await,
+            "an RF=1 in-memory partition must not be recovered onto an empty member"
+        );
+        let still = node0.raft_registry().get(0).expect("p0 still registered");
+        assert!(
+            Arc::ptr_eq(&still, &part0),
+            "the dead core must not be swapped for an empty uninitialized member"
+        );
+    }
+    /// Two served in-memory nodes hosting partition 0, node 0 leading, in the
+    /// given replication `mode` (quorum: 2 voters; leader-durable: voter +
+    /// learner). Shared by the #53 Shutdown-recovery tests.
+    async fn two_node_p0_group(
+        mode: ReplicationMode,
+    ) -> (
+        ServerImpl,
+        ServerImpl,
+        Arc<crate::raft::RaftPartition>,
+        Arc<crate::raft::RaftPartition>,
+    ) {
+        use std::collections::BTreeMap;
+
+        use openraft::BasicNode;
+
+        use crate::raft::RaftPartition;
+
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+                replication_factor: 2,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            build_server_in_memory(journals, topology)
+        };
+        let mut node0 = build_node(0);
+        let mut node1 = build_node(1);
+        node0.replication_mode = mode;
+        node1.replication_mode = mode;
+
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = peer_facing_app(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
+        // Host a 2-voter group for partition 0 on both nodes; node 0 leads.
+        let part0 = Arc::new(
+            RaftPartition::bootstrap_member(
+                0,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                node0.raft_transport(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot raft member on node 0"),
+        );
+        node0.raft_registry().insert(part0.clone());
+        let part1 = Arc::new(
+            RaftPartition::bootstrap_member(
+                1,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                node1.raft_transport(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot raft member on node 1"),
+        );
+        node1.raft_registry().insert(part1.clone());
+
+        // Quorum: a 2-VOTER group. Leader-durable: node 0 is the sole voter and
+        // node 1 a non-voting learner (ADR 0003), the shape that mode forms.
+        let mut members = BTreeMap::new();
+        members.insert(0u64, BasicNode::new(peers[0].clone()));
+        if mode == ReplicationMode::Quorum {
+            members.insert(1u64, BasicNode::new(peers[1].clone()));
+        }
+        part0.initialize(members).await.expect("form group");
+
+        // Wait for node 0 to be the established leader.
+        let mut leader_ok = false;
+        for _ in 0..300 {
+            if part0.raft.metrics().borrow().current_leader == Some(0) {
+                leader_ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leader_ok, "node 0 should win the initial election");
+        if mode == ReplicationMode::LeaderDurable {
+            part0
+                .add_learner_blocking(1, BasicNode::new(peers[1].clone()))
+                .await
+                .expect("add node 1 as a learner");
+        }
+        (node0, node1, part0, part1)
+    }
+
+    /// #53 review: an in-memory QUORUM voter must never be rebuilt empty. With no
+    /// durable log to resume, the rebuilt member would rejoin as an amnesiac
+    /// voter — no log, no persisted vote — able to vote twice in a term or help
+    /// elect a stale replica and discard acknowledged writes. Recovery must
+    /// refuse and keep the dead core registered (loud, for an operator restart).
+    #[tokio::test]
+    async fn an_in_memory_quorum_voter_is_not_rebuilt_empty() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::Quorum).await;
+        part1
+            .raft
+            .shutdown()
+            .await
+            .expect("drive the voter to shutdown");
+        assert!(part1.is_shutdown(), "the voter's core reports Shutdown");
+
+        assert!(
+            !node1.recover_shutdown_partition(0).await,
+            "an in-memory quorum voter must not be recovered onto an empty member"
+        );
+        let still = node1.raft_registry().get(0).expect("p0 still registered");
+        assert!(
+            Arc::ptr_eq(&still, &part1),
+            "the dead voter must not be swapped for an empty member"
+        );
+        assert!(
+            node1.recover_shutdown_partitions_once().await.is_empty(),
+            "the supervisor pass must not recover it either"
+        );
+
+        part0.raft.shutdown().await.ok();
+    }
+
+    /// Issue #53: a partition whose Raft core enters `Shutdown` must be
+    /// auto-recovered in place (rebuilt in the registry so it rejoins its group),
+    /// not left dead until a manual process restart.
+    ///
+    /// Two served nodes host partition 0 in leader-durable mode (node 0 the sole
+    /// voter and leader, node 1 a disposable learner; an in-memory quorum voter
+    /// is refused instead, see `an_in_memory_quorum_voter_is_not_rebuilt_empty`).
+    /// The follower (node 1) core is driven to `Shutdown` (a graceful `shutdown()`
+    /// terminates the core, which reports `ServerState::Shutdown` — the same
+    /// terminal state a `Fatal` storage error produces). Before the fix the
+    /// partition stays dead forever: `applied` freezes and the registry keeps the
+    /// corpse. The recovery supervisor must rebuild it so it catches back up and
+    /// applies new entries.
+    #[tokio::test]
+    async fn a_shutdown_partition_is_auto_recovered_in_place() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+
+        // Commit one entry so the group has real state the follower must re-attain.
+        let proc = ProcessBuilder::new("survives-recovery")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc), 1_000)
+            .await
+            .expect("propose deploy via the leader");
+
+        // Drive the FOLLOWER (node 1) core into Shutdown. A graceful shutdown
+        // terminates the RaftCore, which reports `ServerState::Shutdown` — the
+        // same terminal state an unrecoverable `Fatal` storage error produces.
+        assert!(!part1.is_shutdown(), "follower starts healthy");
+        part1
+            .raft
+            .shutdown()
+            .await
+            .expect("drive follower to shutdown");
+        // The registry still holds the (now-dead) member; it reads Shutdown.
+        let reg_part = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(
+            reg_part.is_shutdown(),
+            "the hosted member reports Shutdown after its core terminated"
+        );
+
+        // The defect: without recovery the partition stays dead. The supervisor
+        // pass must rebuild it. Run one deterministic recovery pass on node 1.
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(
+            recovered.contains(&0),
+            "the shutdown partition must be recovered in place, got {recovered:?}"
+        );
+
+        // The rebuilt member is live (not Shutdown) and registered.
+        let rebuilt = node1.raft_registry().get(0).expect("node 1 still hosts p0");
+        assert!(
+            !rebuilt.is_shutdown(),
+            "the rebuilt member is a live core, not Shutdown"
+        );
+
+        // Proof of recovery: the leader commits a NEW entry after the rebuild and
+        // the rebuilt follower catches up and applies it (it rejoins the group and
+        // backfills from the leader). This is the real acceptance signal — the
+        // partition is no longer stranded.
+        let proc2 = ProcessBuilder::new("post-recovery")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc2), 2_000)
+            .await
+            .expect("propose a post-recovery deploy via the leader");
+        let target = part0
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+
+        let mut caught_up = false;
+        for _ in 0..500 {
+            let idx = node1
+                .raft_registry()
+                .get(0)
+                .and_then(|p| p.raft.metrics().borrow().last_applied.map(|l| l.index))
+                .unwrap_or(0);
+            if idx >= target {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            caught_up,
+            "the rebuilt follower must catch up to the leader's applied index {target}"
+        );
+
+        // And the recovered member applied BOTH processes (no state lost across
+        // the rebuild — the leader backfilled the pre-shutdown entry too).
+        let dump = node1
+            .engine_handle_for(0)
+            .expect("node 1 has a p0 engine")
+            .with(|j| format!("{:?}", j.state()))
+            .await;
+        assert!(
+            dump.contains("survives-recovery") && dump.contains("post-recovery"),
+            "the recovered follower holds both the pre- and post-recovery deployments"
+        );
+
+        part0.raft.shutdown().await.ok();
+        if let Some(p) = node1.raft_registry().get(0) {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
+    /// Defect-class guard (issue #53 follow-through): rebuilding a follower as a
+    /// fresh receiver reverts its local log, and the leader's replication
+    /// progress must NOT panic on that reversion (openraft's
+    /// `follower log reversion is not allowed` guard, loosened via the
+    /// `loosen-follower-log-revert` feature). Before the loosening, recovering one
+    /// partition cascaded into the LEADER's death (a `Panicked` Fatal) — turning
+    /// a single-partition failure into a two-partition outage. This drives the
+    /// exact reversion and asserts the leader survives and keeps serving.
+    #[tokio::test]
+    async fn the_leader_survives_a_rebuilt_followers_log_reversion() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+
+        // Commit several entries so the follower has a non-trivial log to revert.
+        for i in 0..3u64 {
+            let proc = ProcessBuilder::new(format!("p{i}"))
+                .start_event("s")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .expect("valid process");
+            part0
+                .propose(Command::DeployProcess(proc), 1_000 + i)
+                .await
+                .expect("propose");
+        }
+        // The follower must genuinely hold these entries (the leader's progress
+        // records a non-zero `matching` for it), or the rebuild below is no
+        // reversion at all. A bounded metrics-watch barrier, not a sleep loop.
+        let leader_idx = part0.raft.metrics().borrow().last_applied.map(|l| l.index);
+        part1
+            .raft
+            .wait(Some(std::time::Duration::from_secs(10)))
+            .applied_index_at_least(leader_idx, "follower catches up before the rebuild")
+            .await
+            .expect("the follower applies the leader's entries before it is rebuilt");
+
+        // Rebuild the follower as a fresh receiver (empty log) — the reversion.
+        node1.recover_shutdown_partitions_once().await; // no-op: not shutdown
+        part1.raft.shutdown().await.ok();
+        assert!(
+            node1.recover_shutdown_partition(0).await,
+            "rebuild follower"
+        );
+
+        // The leader commits MORE entries against the reverted follower. Without
+        // the loosened guard this panics the leader core; with it the leader
+        // re-syncs the follower and keeps serving.
+        let proc = ProcessBuilder::new("after-revert")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc), 9_000)
+            .await
+            .expect("the leader survives the follower's log reversion and keeps serving");
+        // In leader-durable mode the sole voter commits alone, so the proposal
+        // returning proves nothing about the reversion. Wait until the REBUILT
+        // follower has applied the new entry: that requires the leader to have
+        // replicated to it, meeting its reverted (empty) log and re-syncing it,
+        // which is exactly the path the loosened guard handles.
+        let after_idx = part0.raft.metrics().borrow().last_applied.map(|l| l.index);
+        node1
+            .raft_registry()
+            .get(0)
+            .expect("node 1 hosts the rebuilt member")
+            .raft
+            .wait(Some(std::time::Duration::from_secs(10)))
+            .applied_index_at_least(after_idx, "rebuilt follower re-syncs")
+            .await
+            .expect("the rebuilt follower re-syncs from the leader after its log reversion");
+        assert!(
+            !part0.is_shutdown(),
+            "the leader core must not panic/Shutdown on a rebuilt follower's log reversion"
+        );
+
+        part0.raft.shutdown().await.ok();
+        if let Some(p) = node1.raft_registry().get(0) {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
     #[test]
     fn boot_offheap_reconcile_is_disabled_under_raft() {
         // #1387: Raft startup must leave unresolved spilled orphans flagged.
@@ -38635,6 +39275,23 @@ mod clustered_startup_tests {
                 .unwrap_or(false),
             "the owner reclaimed at incumbent_epoch + 1 (>= 2), not a fresh epoch-1 self-promote"
         );
+        // ONE raft lineage: the owner campaigned on the log it inherited from the
+        // incumbent (term > the incumbent's term 1), rather than discarding it and
+        // self-promoting a fresh single-voter group whose term-1 vote ties the
+        // incumbent's — the split that, once a follower-log reversion no longer
+        // panics the stale leader (#53's `loosen-follower-log-revert`), never heals.
+        let owner_core = node0.raft_registry().get(0).expect("partition 0 hosted");
+        let m = owner_core.raft.metrics().borrow().clone();
+        assert!(
+            m.current_term >= 2,
+            "the owner inherited the incumbent's lineage (term {}), not a fresh group",
+            m.current_term
+        );
+        assert!(
+            m.last_log_index.unwrap_or(0) >= 6,
+            "the owner kept the incumbent's log (last index {:?}), not a fresh log",
+            m.last_log_index
+        );
 
         for node in [&node0, &node1, &node2] {
             for p in 0..3u64 {
@@ -38744,6 +39401,93 @@ mod clustered_startup_tests {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();
                 }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    /// #53 x #1455: the Shutdown auto-recovery path takes the same per-partition
+    /// rebuild lock as promote / rebuild-as-receiver, so it can never run
+    /// concurrently with them (two live cores for one partition), and it
+    /// re-checks under the lock that the core is STILL shutdown — a recovery
+    /// that queued behind a concurrent rebuild must not tear down the live core
+    /// that rebuild just installed.
+    ///
+    /// Deterministic, independent of worker scheduling: with the lock held, BOTH
+    /// futures are polled in-line and must be `Pending` with no critical section
+    /// entered (removing the lock from either path lets its first poll enter the
+    /// section → depth > 0 → fail). Then the lock is released and both complete;
+    /// the depth must peak at 1 (no overlap), and the queued recovery must not
+    /// tear down the live core the rebuild installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_recovery_is_serialized_with_rebuilds_and_skips_a_live_core() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::task::Poll;
+
+        let (node0, _node1, _node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+        let probe = node0.rebuild_depth_probe.clone();
+
+        // Kill partition 0's core so it is Shutdown (the #53 trigger).
+        let dead = node0.raft_registry().get(0).expect("partition 0 hosted");
+        dead.raft.shutdown().await.ok();
+        assert!(dead.is_shutdown());
+
+        // Hold the rebuild lock, then poll a hand-off rebuild AND the shutdown
+        // recovery in-line. Both must block on the held lock WITHOUT entering
+        // the critical section — this is what actually proves the lock (not the
+        // scheduler) serializes them: if either path dropped the lock, its first
+        // poll would enter the section and drive the depth probe above 0 here.
+        let guard = node0.partition_rebuild_lock(0).lock_owned().await;
+        let mut rebuild = Box::pin(node0.rebuild_as_receiver(0, 1));
+        let mut recover = Box::pin(node0.recover_shutdown_partition(0));
+        let polled = std::future::poll_fn(|cx| {
+            Poll::Ready((
+                rebuild.as_mut().poll(cx).is_pending(),
+                recover.as_mut().poll(cx).is_pending(),
+            ))
+        })
+        .await;
+        assert_eq!(
+            polled,
+            (true, true),
+            "both rebuild + recovery block on the held lock"
+        );
+        assert_eq!(
+            probe.depth.load(SeqCst),
+            0,
+            "neither future entered the critical section while the lock is held"
+        );
+
+        drop(guard);
+        let (rebuilt, _recovered) = tokio::join!(rebuild, recover);
+        assert!(rebuilt, "the receiver rebuild succeeded");
+        assert_eq!(
+            probe.peak.load(SeqCst),
+            1,
+            "shutdown recovery overlapped a concurrent rebuild of the same partition"
+        );
+        let live = node0.raft_registry().get(0).expect("partition 0 hosted");
+        assert!(
+            !live.is_shutdown(),
+            "exactly one live core serves partition 0"
+        );
+
+        // A recovery whose target was already replaced by a live core is a no-op:
+        // it must neither shut the live core down nor swap it out.
+        assert!(
+            !node0.recover_shutdown_partition(0).await,
+            "recovery of a partition whose core is live must be a no-op"
+        );
+        let after = node0.raft_registry().get(0).expect("partition 0 hosted");
+        assert!(Arc::ptr_eq(&live, &after), "the live core was swapped out");
+        assert!(!after.is_shutdown(), "the live core was torn down");
+
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
             }
         }
         for h in handles.drain(..) {
