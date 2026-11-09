@@ -2343,6 +2343,9 @@ impl Engine {
                         created_at,
                         job_type,
                         worker,
+                        completed_at: self.now,
+                        // Stamped centrally in `emit` (#1440).
+                        deadline: None,
                     },
                 );
                 if !variables.is_empty() {
@@ -4336,6 +4339,8 @@ impl Engine {
                     .map(|j| Event::JobCanceled {
                         job_key: j.key,
                         instance_key,
+                        canceled_at: self.now,
+                        deadline: None, // stamped centrally in `emit` (#1440)
                     })
                     .collect();
 
@@ -9376,6 +9381,8 @@ impl Engine {
             events.push(Event::JobCanceled {
                 job_key,
                 instance_key,
+                canceled_at: self.now,
+                deadline: None, // stamped centrally in `emit` (#1440)
             });
         }
         events.extend(self.cancel_all_timers_on(child_eik));
@@ -9479,6 +9486,8 @@ impl Engine {
                 events.push(Event::JobCanceled {
                     job_key,
                     instance_key,
+                    canceled_at: self.now,
+                    deadline: None, // stamped centrally in `emit` (#1440)
                 });
             }
             events.extend(self.cancel_all_timers_on(child));
@@ -11197,6 +11206,8 @@ impl Engine {
             .map(|job_key| Event::JobCanceled {
                 job_key,
                 instance_key,
+                canceled_at: self.now,
+                deadline: None, // stamped centrally in `emit` (#1440)
             })
             .collect()
     }
@@ -15007,6 +15018,8 @@ impl Engine {
         cancels.extend(jobs.iter().map(|j| Event::JobCanceled {
             job_key: j.key,
             instance_key,
+            canceled_at: self.now,
+            deadline: None, // stamped centrally in `emit` (#1440)
         }));
 
         let mut timers: Vec<&state::Timer> = self
@@ -15129,6 +15142,51 @@ impl Engine {
             .collect()
     }
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
+        // Terminal-deadline stamping (#1440) is centralized HERE — the engine's
+        // single event choke point — so every emission site (completion, scope
+        // teardown, instance discard, boundary cascade, …) stamps the job's
+        // last lock deadline identically, and no site can drift to reading
+        // replica-local state directly.
+        //
+        // A terminal event carries a deadline ONLY for a DURABLE (leased)
+        // activation — one whose lock is journaled and therefore identical on
+        // every replica. A leader-local (soft) activation is unreplicated by
+        // design (ADR 0002): a follower never sees it, so a soft job's deadline
+        // is replica-local and a terminal event stamped from it would diverge
+        // across replicas. Soft jobs therefore record NO deadline. Making
+        // terminal metadata authoritative for soft jobs is the architectural
+        // follow-up tracked in #963 — do NOT stamp a soft deadline here.
+        let event = match event {
+            Event::JobCompleted {
+                job_key,
+                instance_key,
+                created_at,
+                job_type,
+                worker,
+                completed_at,
+                deadline: _,
+            } => Event::JobCompleted {
+                job_key,
+                instance_key,
+                created_at,
+                job_type,
+                worker,
+                completed_at,
+                deadline: self.job_terminal_deadline(job_key),
+            },
+            Event::JobCanceled {
+                job_key,
+                instance_key,
+                canceled_at,
+                deadline: _,
+            } => Event::JobCanceled {
+                job_key,
+                instance_key,
+                canceled_at,
+                deadline: self.job_terminal_deadline(job_key),
+            },
+            other => other,
+        };
         let resolution = match &event {
             Event::JobCompleted {
                 job_key,
