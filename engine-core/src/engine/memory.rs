@@ -851,6 +851,16 @@ impl Engine {
         mut state: State,
     ) -> (State, Vec<state::InstanceSnapshot>) {
         let keys: Vec<Key> = state.instances.keys().copied().collect();
+        // Group every owned-entity map by owning instance in ONE pass each, so
+        // decomposition is linear in (instances + entities) — a per-instance
+        // `drain_owned` rescan would be quadratic with a backlog (#1476).
+        let owners: HashSet<Key> = keys.iter().copied().collect();
+        let mut timers_by = group_owned(&mut state.timers, &owners);
+        let mut msg_by = group_owned(&mut state.message_subscriptions, &owners);
+        let mut sig_by = group_owned(&mut state.signal_subscriptions, &owners);
+        let mut cond_by = group_owned(&mut state.conditional_subscriptions, &owners);
+        let mut ut_by = group_owned(&mut state.user_tasks, &owners);
+        let mut inc_by = group_owned(&mut state.incidents, &owners);
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
             // Every job this instance owns, gathered without disturbing the
@@ -871,12 +881,12 @@ impl Engine {
                     }
                 }
             }
-            let timers = drain_owned(&mut state.timers, key);
-            let message_subscriptions = drain_owned(&mut state.message_subscriptions, key);
-            let signal_subscriptions = drain_owned(&mut state.signal_subscriptions, key);
-            let conditional_subscriptions = drain_owned(&mut state.conditional_subscriptions, key);
-            let user_tasks = drain_owned(&mut state.user_tasks, key);
-            let incidents = drain_owned(&mut state.incidents, key);
+            let timers = timers_by.remove(&key).unwrap_or_default();
+            let message_subscriptions = msg_by.remove(&key).unwrap_or_default();
+            let signal_subscriptions = sig_by.remove(&key).unwrap_or_default();
+            let conditional_subscriptions = cond_by.remove(&key).unwrap_or_default();
+            let user_tasks = ut_by.remove(&key).unwrap_or_default();
+            let incidents = inc_by.remove(&key).unwrap_or_default();
             if let Some(instance) = state.instances.remove(&key) {
                 out.push(state::InstanceSnapshot {
                     instance,

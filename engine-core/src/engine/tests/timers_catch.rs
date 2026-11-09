@@ -1634,3 +1634,38 @@ fn link_events_hand_the_token_from_throw_to_catch() {
         .unwrap();
     assert!(engine.is_completed(inst));
 }
+
+/// #1476: `decompose_state_for_streaming` groups each owned-entity map by
+/// instance in one pass. With a timer per instance across a large backlog it
+/// must attribute every timer to exactly its owner (and stay linear — a
+/// per-instance rescan of the timer map would be quadratic at this size).
+#[cfg(feature = "serde")]
+#[test]
+fn decompose_for_streaming_groups_owned_entities_per_instance_over_a_backlog() {
+    let def = ProcessBuilder::new("waiting")
+        .start_event("start")
+        .timer_intermediate_catch_event("wait", 5_000)
+        .end_event("end")
+        .connect("start", "wait")
+        .connect("wait", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    const N: usize = 3_000;
+    for _ in 0..N {
+        engine
+            .apply_command_at(Command::create_instance("waiting"), 1_000)
+            .unwrap();
+    }
+    let state = engine.state().clone();
+    assert_eq!(state.timers.len(), N);
+    let (control, instances) = Engine::decompose_state_for_streaming(state);
+    assert_eq!(instances.len(), N);
+    assert!(control.instances.is_empty());
+    assert!(control.timers.is_empty(), "every owned timer is lifted out");
+    for snap in &instances {
+        assert_eq!(snap.timers.len(), 1);
+        assert_eq!(snap.timers[0].instance_key, snap.instance.key);
+    }
+}

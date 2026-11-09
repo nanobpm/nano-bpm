@@ -35,7 +35,7 @@ mod peer_forward_tests;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1707,7 +1707,7 @@ mod converted_lock_poison_tests {
         // --- lease digests ---
         poison(server.lease_digests.clone());
         assert!(server.lease_digests.is_poisoned());
-        server.record_lease_digest(0, vec![(1, 2)], 0);
+        server.record_lease_digest(0, vec![(1, 2)], Vec::new(), 0);
         assert!(
             server
                 .lease_digests
@@ -2356,6 +2356,16 @@ pub struct ServerImpl {
     /// pinning the entire replicated working set resident (the RF>1 follower
     /// memory imbalance). See [`SpillConfig`].
     spill_config: Option<SpillConfig>,
+    /// Set when any hosted partition's recovery was INCOMPLETE at boot (a Raft
+    /// `bootstrap_member` failure — e.g. its durable snapshot failed to restore —
+    /// leaves a freshly-registered replica engine holding an empty/partial state
+    /// while its rows are still in the shared store). The post-recovery GC sweep
+    /// ([#1338]) skips itself while this is set: sweeping with an unrecovered
+    /// partition's live set missing would reap that partition's rows, including
+    /// legacy spill payloads a successful later restart still needs (the #1479
+    /// review finding). Orphans of the failed partition are retained until the
+    /// next boot retries recovery and the sweep.
+    gc_recovery_incomplete: Arc<AtomicBool>,
     /// How the per-job activation lock is replicated ([`ActivationPolicy`], from
     /// `NANOBPMN_REPLICATE_ACTIVATION`). Resolved once at startup; the per-partition
     /// answer is [`Self::replicate_activation_for`].
@@ -3022,6 +3032,7 @@ impl ServerImpl {
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             spill_config,
+            gc_recovery_incomplete: Arc::new(AtomicBool::new(false)),
             activation_policy,
             activation_guards,
             lease_digest,
@@ -4745,6 +4756,9 @@ struct RecoveryState {
 #[derive(Clone, Debug)]
 struct ReceivedDigest {
     leases: Vec<(u64, u64)>,
+    /// `(job_key, worker)` attribution for the leases (#963); empty from an
+    /// older sender.
+    workers: std::collections::HashMap<u64, String>,
 }
 
 /// The resolved active-backlog admission policy (see
@@ -15646,6 +15660,15 @@ impl ServerImpl {
                     }
                     Err(e) => {
                         tracing::error!("raft: failed to host partition {p}: {e}");
+                        // The replica engine for {p} was registered (fresh,
+                        // empty) BEFORE its durable state was restored, so this
+                        // partition's recovery is INCOMPLETE while its rows are
+                        // still in the shared store. Bar the post-recovery GC
+                        // sweep: running it now would treat the unrecovered
+                        // partition's live set as empty and reap its rows,
+                        // including legacy spill payloads a successful later
+                        // restart still needs (#1479 review finding).
+                        server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
                     }
                 }
             }
@@ -15746,6 +15769,17 @@ impl ServerImpl {
                         }
                         Err(e) => {
                             tracing::error!("raft: failed to host owned partition {p}: {e}");
+                            // Same latch as the non-deferred hosting loop above:
+                            // this partition's engine was recovered (or seeded
+                            // fresh) BEFORE its durable Raft log was opened, so a
+                            // failure here leaves its recovery INCOMPLETE while
+                            // its cold/spill rows are still in the shared store.
+                            // Bar the post-recovery GC sweep: running it now
+                            // would treat the unrecovered partition's live set as
+                            // empty and reap its still-needed rows (#1479 review
+                            // finding — the deferred path is reachable only with
+                            // NANOBPMN_RECLAIM_HANDOFF=1, but fails identically).
+                            server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
                         }
                     }
                 }
@@ -15889,6 +15923,19 @@ impl ServerImpl {
             // (once per node) to bound the payload-bearing Raft log by bytes and
             // reclaim it at idle — beyond what the entry-count snapshot policy does.
             crate::raft::spawn_compaction_governor(server.raft_registry().clone());
+
+            // #1338: post-recovery GC of orphaned cold/spill rows, AFTER every
+            // member this node hosts is registered. `bootstrap_member` restores
+            // each replica's durable snapshot synchronously before returning, so
+            // at this point every hosted partition's recovered engine (owned and
+            // replica alike) is authoritative for liveness; a sweep that ran
+            // earlier could miss a not-yet-restored replica's live instances and
+            // reap their rows (the #1467 ordering defect). Each partition's
+            // sweep runs THROUGH its engine actor (the single-writer fence), so
+            // a create/replicated apply that lands after bootstrap cannot be
+            // reaped mid-`put` — and the whole sweep skips itself when any
+            // member failed to host (its live set would not be authoritative).
+            server.gc_offheap_orphans_once().await;
         }
     }
 
@@ -17747,6 +17794,69 @@ impl ServerImpl {
             .cloned()
     }
 
+    /// Post-recovery GC of orphaned cold/spill rows ([#1338], reworked after the
+    /// reverted #1467), scoped to the whole NODE.
+    ///
+    /// Every partition's journal shares one spill store, so every HOSTED
+    /// partition sweeps it — "hosted" covers both the partitions this node OWNS
+    /// (their engine actors) and the ones it REPLICATES under Raft (the
+    /// follower replica engines `raft_bootstrap` hosts). A partition this node
+    /// neither owns nor replicates contributes nothing: keys embed their
+    /// partition id and a row is written only by a local engine, so no row in
+    /// THIS node's store belongs to a partition hosted elsewhere.
+    ///
+    /// **Fencing (#1479 review findings).** Each partition's sweep runs THROUGH
+    /// its engine actor ([`Journal::gc_offheap_orphans_locked`]): the closure
+    /// holds the partition's single-writer thread from the live-set capture to
+    /// the last delete, so no create/complete/replicated apply can mint or
+    /// spill a key mid-sweep — a detached sweep over fixed sets could reap an
+    /// instance created after the capture. Partitions are swept sequentially;
+    /// the store's paged commits release the connection lock between pages, so
+    /// other partitions' live traffic is not starved. The sweep runs only
+    /// AFTER Raft bootstrap has hosted every member (`bootstrap_member`
+    /// restores each replica's durable snapshot synchronously — the #1467
+    /// ordering defect was sweeping before that), and is SKIPPED entirely when
+    /// any hosted partition's recovery failed (`gc_recovery_incomplete`): an
+    /// unrecovered partition's live set would be empty and the sweep would reap
+    /// its still-needed rows. Orphans are then retained until the next boot
+    /// retries recovery and the sweep.
+    ///
+    /// Returns the number of orphaned rows reaped.
+    async fn gc_offheap_orphans_once(&self) -> u64 {
+        if self.spill_config.is_none() {
+            return 0;
+        }
+        if self.gc_recovery_incomplete.load(Ordering::Relaxed) {
+            tracing::error!(
+                "post-recovery GC skipped: a hosted partition's recovery failed at boot, so \
+                 its live set is not authoritative; orphaned cold/spill rows are retained \
+                 and the next boot retries both recovery and the sweep (#1338)"
+            );
+            return 0;
+        }
+        let num = self.engine.topology().num_partitions;
+        let mut collected = 0u64;
+        for p in 0..num {
+            let Some(handle) = self.engine_handle_for(p) else {
+                continue;
+            };
+            // The sweep is blocking SQLite work over a potentially large
+            // backlog, run on the engine thread: holding the single writer IS
+            // the fence that keeps the live-set capture and the deletes atomic
+            // against creates/spills on this partition.
+            collected += handle
+                .with(|journal| journal.gc_offheap_orphans_locked())
+                .await;
+        }
+        if collected > 0 {
+            tracing::info!(
+                collected,
+                "post-recovery GC: reaped orphaned cold/spill rows (node-wide sweep)"
+            );
+        }
+        collected
+    }
+
     /// One read-model reconciliation sweep. Rebuilds the engine's authoritative
     /// live-instance set (hot ∪ cold) across every partition this node hosts and
     /// retires any read-model `Active` row absent from it — an orphan whose CREATE
@@ -17797,14 +17907,26 @@ impl ServerImpl {
     /// leader (soft state; never journaled). Consulted on leadership takeover by
     /// [`Self::run_lease_digest`]. A no-op-cost overwrite: only the most recent
     /// digest per partition is retained.
-    pub fn record_lease_digest(&self, partition: u64, leases: Vec<(u64, u64)>, _sent_at: u64) {
+    pub fn record_lease_digest(
+        &self,
+        partition: u64,
+        leases: Vec<(u64, u64)>,
+        workers: Vec<(u64, String)>,
+        _sent_at: u64,
+    ) {
         if !self.lease_digest {
             return;
         }
         self.lease_digests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(partition, ReceivedDigest { leases });
+            .insert(
+                partition,
+                ReceivedDigest {
+                    leases,
+                    workers: workers.into_iter().collect(),
+                },
+            );
     }
 
     /// One pass of the soft lease-digest protocol, driven by the 500ms tick when
@@ -17840,11 +17962,13 @@ impl ServerImpl {
                 .cloned();
             if let Some(digest) = stored {
                 let leases = digest.leases.clone();
+                let workers = digest.workers.clone();
                 let recover_handle = handle.clone();
                 recover_handle
                     .with(move |journal| {
                         for (job_key, deadline) in &leases {
-                            journal.recover_lease(*job_key, *deadline, now);
+                            let worker = workers.get(job_key).map(String::as_str);
+                            journal.recover_lease(*job_key, *deadline, worker, now);
                         }
                     })
                     .await;
@@ -17859,7 +17983,14 @@ impl ServerImpl {
                 }
             }
             // 2. Broadcast our current leases to this partition's followers.
-            let leases = handle.with(|journal| journal.activated_leases()).await;
+            let (leases, workers) = handle
+                .with(|journal| {
+                    (
+                        journal.activated_leases(),
+                        journal.activated_lease_workers(),
+                    )
+                })
+                .await;
             let followers: Vec<u32> = self
                 .engine
                 .topology()
@@ -17870,7 +18001,9 @@ impl ServerImpl {
             for follower in followers {
                 if let Ok(link) = self.peers.link(follower).await {
                     // Fire-and-forget: a failed send just skips this round.
-                    let _ = link.send_lease_digest(p, leases.clone(), now).await;
+                    let _ = link
+                        .send_lease_digest(p, leases.clone(), workers.clone(), now)
+                        .await;
                 }
             }
         }
@@ -25825,6 +25958,8 @@ mod adhoc_metrics_tests {
                 created_at: 0,
                 job_type: String::new(),
                 worker: None,
+                completed_at: 0,
+                deadline: None,
             }),
             None
         );
@@ -26374,8 +26509,14 @@ async fn main() {
                         // snapshot adoption's base checkpoint (#1405): taken off
                         // the engine actor, held until the tick ends.
                         let _permit = shared.checkpoint_permit().await;
-                        let snapped = handle.with(|journal| journal.snapshot_and_rotate()).await;
-                        let Some((snap, covered)) = snapped else {
+                        // Capture the streaming halves + seal on the engine
+                        // thread (a consistent read), then stream to disk OFF it
+                        // so the whole cold/spilled set is never resident at once
+                        // (#1463).
+                        let snapped = handle
+                            .with(|journal| journal.streaming_snapshot_and_rotate())
+                            .await;
+                        let Some((capture, cold_keys, stores, covered)) = snapped else {
                             record_snapshot_health_tick(
                                 health,
                                 std::slice::from_ref(&handle),
@@ -26385,7 +26526,19 @@ async fn main() {
                             .await;
                             continue;
                         };
-                        if let Err(e) = seglog::write_snapshot(&shared.dir, snap, covered) {
+                        let write_dir = shared.dir.clone();
+                        let write_result = tokio::task::spawn_blocking(move || {
+                            seglog::write_snapshot_streaming(
+                                &write_dir, capture, &cold_keys, stores, covered,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(std::io::Error::other(format!(
+                                "snapshot writer task panicked: {e}"
+                            )))
+                        });
+                        if let Err(e) = write_result {
                             record_snapshot_health_tick(
                                 health,
                                 std::slice::from_ref(&handle),
@@ -26473,9 +26626,20 @@ async fn main() {
                         let _permit = shared.checkpoint_permit().await;
                         // Snapshot each owned partition; a `None` (writer gone)
                         // aborts this tick so compaction never runs on a partial
-                        // watermark set.
+                        // watermark set. The non-lean path captures the STREAMING
+                        // halves (#1463) so no partition's cold set is folded into
+                        // one in-memory snapshot; the lean path keeps its
+                        // control-only capture.
                         let mut entries: Vec<(u64, u64, nanobpmn_engine_core::EngineSnapshot)> =
                             Vec::with_capacity(handles.len());
+                        let mut stream_entries: Vec<(
+                            u64,
+                            u64,
+                            nano_server_storage::snapstream::StreamingCapture,
+                            Vec<nanobpmn_engine_core::Key>,
+                            nano_server_storage::snapstream::SpillStores,
+                            bool,
+                        )> = Vec::with_capacity(handles.len());
                         let mut covered = vec![0u64; num_partitions as usize];
                         // Per-partition durable-variable position. `u64::MAX` means
                         // "no variable constraint" (non-lean, or a partition this
@@ -26524,12 +26688,20 @@ async fn main() {
                                     }
                                 }
                             } else {
-                                match handle.with(|journal| journal.snapshot_and_rotate()).await {
-                                    Some((snap, covered_p)) => {
+                                match handle
+                                    .with(|journal| journal.streaming_snapshot_and_rotate())
+                                    .await
+                                {
+                                    Some((capture, cold_keys, stores, covered_p)) => {
                                         if (pid as usize) < covered.len() {
                                             covered[pid as usize] = covered_p;
                                         }
-                                        entries.push((pid, covered_p, snap));
+                                        // Non-lean: a self-contained snapshot
+                                        // (control_only = false — resolve every
+                                        // spilled placeholder against the stores).
+                                        stream_entries.push((
+                                            pid, covered_p, capture, cold_keys, stores, false,
+                                        ));
                                     }
                                     None => {
                                         failure = Some(format!(
@@ -26546,14 +26718,38 @@ async fn main() {
                             continue;
                         }
                         // The covered watermarks for the partitions THIS node owns
-                        // (one per snapshotted entry). Captured before `entries` is
-                        // moved into the snapshot writer so the cold-archive prune
-                        // floor derives from owned partitions only — `covered` is a
-                        // GLOBAL-width vector with 0-holes for partitions a
-                        // clustered node does not own, and its min would pin the
-                        // floor at 0 forever (unbounded cold archive, #1076).
-                        let owned_covered: Vec<u64> = entries.iter().map(|e| e.1).collect();
-                        if let Err(e) = seglog::write_multi_snapshot(&shared.dir, entries) {
+                        // (one per snapshotted entry). Captured before the entries
+                        // are moved into the snapshot writer so the cold-archive
+                        // prune floor derives from owned partitions only —
+                        // `covered` is a GLOBAL-width vector with 0-holes for
+                        // partitions a clustered node does not own, and its min
+                        // would pin the floor at 0 forever (unbounded cold
+                        // archive, #1076).
+                        let owned_covered: Vec<u64> = if varstore.is_some() {
+                            entries.iter().map(|e| e.1).collect()
+                        } else {
+                            stream_entries.iter().map(|e| e.1).collect()
+                        };
+                        // Lean path: control-only snapshots written inline (the
+                        // authoritative var store holds the payloads, so a spilled
+                        // placeholder is serialized as-is). Non-lean path (#1463):
+                        // stream the combined snapshot off the engine thread so no
+                        // partition's cold set is held in RAM.
+                        let write_result = if varstore.is_some() {
+                            seglog::write_multi_snapshot_lean(&shared.dir, entries)
+                        } else {
+                            let write_dir = shared.dir.clone();
+                            tokio::task::spawn_blocking(move || {
+                                seglog::write_multi_snapshot_streaming(&write_dir, stream_entries)
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(std::io::Error::other(format!(
+                                    "multi snapshot writer task panicked: {e}"
+                                )))
+                            })
+                        };
+                        if let Err(e) = write_result {
                             record_snapshot_health_tick(
                                 health,
                                 &handles,
@@ -26739,6 +26935,23 @@ async fn main() {
     // Env-gated (NANOBPMN_RAFT): bring up this node's per-partition Raft groups
     // over the Falcon protocol and form the ones it leads. No-op by default.
     server.spawn_raft_bootstrap();
+
+    // #1338: post-recovery GC of orphaned cold/spill rows. Under Raft the sweep
+    // runs at the END of `raft_bootstrap` (after every hosted member's durable
+    // snapshot is restored — see there). On the non-Raft path there is no
+    // bootstrap to wait for: the owned journals were fully recovered (snapshot +
+    // replayed journal) before their actors spawned, so the engine state is
+    // already authoritative for liveness. The sweep runs THROUGH each
+    // partition's engine actor (the single-writer fence), so a create that
+    // lands after boot cannot be reaped mid-`put`. Spawned (not awaited) so
+    // boot is never blocked by a large backlog sweep; the store's paged
+    // commits interleave with live traffic by construction.
+    if !raft_enabled() {
+        let server = server.clone();
+        tokio::spawn(async move {
+            server.gc_offheap_orphans_once().await;
+        });
+    }
 
     // Leader-durable auto-recovery (ADR 0003): when the replication tier is
     // leader-durable, each group has a single voter, so openraft cannot elect on
@@ -28213,6 +28426,347 @@ mod clustered_startup_tests {
     // too tight and starved these waits (creates never observed as shipped
     // before the test proceeded). 30s = 1500 * 20ms.
     const LEADER_SHIP_POLL_ITERS: usize = 1500;
+
+    /// Deploys the demo process and creates one parked instance on `journal`,
+    /// returning the new instance's key. Mirrors the storage crate's helper.
+    fn deploy_and_create(journal: &mut Journal) -> Key {
+        let demo = ProcessBuilder::new("demo")
+            .start_event("start")
+            .service_task("work", "demo-work")
+            .end_event("end")
+            .connect("start", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid demo process");
+        let _ = journal.apply_command(Command::DeployProcess(demo)).unwrap();
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        events.iter().find_map(|e| e.instance_key()).unwrap()
+    }
+
+    /// #1467 finding F1 (reworked in #1338): every journal SHARES one spill
+    /// store, so a sweep built from only ONE partition's live set scans the
+    /// whole store and deletes the OTHER partition's live rows. The GC must run
+    /// once over the UNION of every hosted partition's live set. This drives
+    /// the defect directly: two partitions' journals share a store; partition
+    /// 1's live instance is cold-spilled; a sweep scoped to partition 0 alone
+    /// must not delete partition 1's row — and the node-scoped sweep must reap
+    /// partition 0's orphan while preserving it.
+    #[tokio::test]
+    async fn node_scoped_gc_never_deletes_another_partitions_live_rows() {
+        let store = Arc::new(varspill::VarSpillStore::open(None).expect("in-memory store"));
+
+        // Two partitions, one shared store (the production layout).
+        let mut j0 = Journal::in_memory_partition(0);
+        j0.set_cold_spill(Arc::clone(&store), 1, 0);
+        let mut j1 = Journal::in_memory_partition(1);
+        j1.set_cold_spill(Arc::clone(&store), 1, 0);
+
+        // Partition 0: an orphan (a row whose instance is gone — its terminal
+        // eviction forget was lost to a crash) and a live parked instance.
+        let orphan0 = deploy_and_create(&mut j0);
+        let live0 = deploy_and_create(&mut j0);
+        // Partition 1: a live parked instance.
+        let live1 = deploy_and_create(&mut j1);
+        assert_eq!(j0.force_cold_spill_all(), 2);
+        assert_eq!(j1.force_cold_spill_all(), 1);
+        // Simulate the crash window for orphan0: it rehydrates ALONE (the
+        // activation takes only its job) and completes (its terminal event is
+        // journaled), but the node dies BEFORE the eviction forget reaches the
+        // store. Capture its cold row BEFORE the rehydration forget drops it,
+        // so we can restore exactly the row a real crash leaves behind. live0
+        // stays cold (never activated), so its row must survive.
+        let orphan0_row = store
+            .try_get_cold(orphan0)
+            .unwrap()
+            .expect("orphan row present");
+        let jobs = j0.activate_jobs("demo-work", "w", 1, 1_000, 0);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].instance_key, orphan0,
+            "the oldest instance activates first"
+        );
+        let _ = j0
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap();
+        // Crash here: the terminal eviction forget is lost; re-write the row.
+        store.put_cold(orphan0, &orphan0_row).unwrap();
+        assert!(store.try_get_cold(orphan0).unwrap().is_some());
+        assert!(
+            store.try_get_cold(live0).unwrap().is_some(),
+            "live0 is still cold (never activated)"
+        );
+
+        let mut server = build_server_in_memory(vec![j0, j1], cluster::Topology::single(2));
+        server.spill_config = Some(SpillConfig {
+            store: Arc::clone(&store),
+            var: None,
+            cold: Some((1, 0)),
+        });
+
+        // The node-scoped sweep: each hosted partition sweeps the shared store
+        // through its OWN engine actor (the single-writer fence), and each
+        // sweep's delete is bounded to keys that partition minted — so
+        // partition 0's fenced sweep reaps partition 0's orphan, partition 1's
+        // fenced sweep finds nothing of its own, and NEITHER can touch the
+        // other partition's live row. What matters is the end state: the
+        // orphan is gone and BOTH partitions' live rows survive.
+        let collected = server.gc_offheap_orphans_once().await;
+        assert!(collected >= 1, "the orphan row is reaped");
+        assert!(
+            store.try_get_cold(orphan0).unwrap().is_none(),
+            "the orphaned cold row is reaped"
+        );
+        assert!(
+            store.try_get_cold(live0).unwrap().is_some(),
+            "partition 0's live row survives"
+        );
+        assert!(
+            store.try_get_cold(live1).unwrap().is_some(),
+            "partition 1's live row survives the shared-store sweep (the #1467 defect)"
+        );
+    }
+
+    /// #1467 finding F2 (reworked in #1338): in Raft mode the sweep must run
+    /// only AFTER bootstrap — a follower replica's engine is hosted by
+    /// `raft_bootstrap` (its durable snapshot restored synchronously inside
+    /// `bootstrap_member`), so a sweep that ran before it would miss the
+    /// replica's live instances and reap their rows. This drives the ordering
+    /// directly: a replica engine is registered in `raft_replicas` (as
+    /// bootstrap would), and the node-scoped sweep must union ITS live set too.
+    #[tokio::test]
+    async fn node_scoped_gc_includes_raft_replica_engines_live_sets() {
+        let store = Arc::new(varspill::VarSpillStore::open(None).expect("in-memory store"));
+
+        // This node owns partition 0 and REPLICATES partition 1 (a follower).
+        let mut owned = Journal::in_memory_partition(0);
+        owned.set_cold_spill(Arc::clone(&store), 1, 0);
+        let mut replica = Journal::in_memory_partition(1);
+        replica.set_cold_spill(Arc::clone(&store), 1, 0);
+
+        // The replica (restored from its durable snapshot during bootstrap)
+        // holds a live instance whose cold row is in the shared store.
+        let replica_live = deploy_and_create(&mut replica);
+        assert_eq!(replica.force_cold_spill_all(), 1);
+        assert!(store.try_get_cold(replica_live).unwrap().is_some());
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".to_string(),
+                "http://127.0.0.1:2".to_string(),
+            ],
+            num_partitions: 2,
+            replication_factor: 2,
+        };
+        let mut server = build_server_in_memory(vec![owned], topology);
+        server.spill_config = Some(SpillConfig {
+            store: Arc::clone(&store),
+            var: None,
+            cold: Some((1, 0)),
+        });
+        // As raft_bootstrap would: host the follower replica engine.
+        let replica_handle = DeepthiHandle::spawn(replica, 1, None);
+        server
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(1, replica_handle);
+
+        let collected = server.gc_offheap_orphans_once().await;
+        assert_eq!(collected, 0, "nothing is orphaned");
+        assert!(
+            store.try_get_cold(replica_live).unwrap().is_some(),
+            "the replica partition's live row survives (the sweep ran after its engine was hosted)"
+        );
+    }
+
+    /// #1479 review finding: when a hosted partition's recovery FAILS at boot
+    /// (a Raft `bootstrap_member` error — e.g. its durable snapshot failed to
+    /// restore — after `replica_engine_for` already registered the fresh,
+    /// empty engine), that partition's live set is not authoritative: sweeping
+    /// with it would reap the partition's rows, including legacy spill payloads
+    /// a successful later restart still needs. The node-wide sweep must SKIP
+    /// itself (retaining every row) until the next boot retries recovery.
+    #[tokio::test]
+    async fn node_scoped_gc_skips_the_sweep_when_a_partitions_recovery_failed() {
+        let store = Arc::new(varspill::VarSpillStore::open(None).expect("in-memory store"));
+
+        let mut j0 = Journal::in_memory_partition(0);
+        j0.set_cold_spill(Arc::clone(&store), 1, 0);
+        let live0 = deploy_and_create(&mut j0);
+        assert_eq!(j0.force_cold_spill_all(), 1);
+        // A crash-orphaned row whose owning partition failed to recover: no
+        // hosted engine references it, so an unguarded sweep would reap it.
+        // Seed it in a HOSTED-but-EMPTY partition (1) — a partition whose
+        // recovered live set is legitimately empty, exactly the state a failed
+        // recovery leaves behind — so the orphan key is DISTINCT from every
+        // live key: seeding it in partition 0 would collide with `live0` (both
+        // journals mint the same first key) and the test would pass even
+        // without the guard, because the normal sweep preserves that live key
+        // (#1479 review finding).
+        //
+        // The scratch instance must be TERMINAL in its engine, not merely
+        // dropped: `deploy_and_create` leaves it Active in the scratch engine's
+        // hot state, and the spilled cold index then keeps its key in the
+        // scratch journal's live set — so even an UNGUARDED sweep preserves
+        // the row and the test cannot detect a missing latch. Drive the crash
+        // window exactly as the storage crate's crash-orphan test does:
+        // capture the cold row, cancel the instance (its eviction forget drops
+        // the row), then re-write the row the crash left behind — the terminal
+        // instance's key is now in NO live set, so only the latch keeps the
+        // row alive.
+        let failed_partition_orphan = {
+            let mut scratch = Journal::in_memory_partition(1);
+            scratch.set_cold_spill(Arc::clone(&store), 1, 0);
+            let key = deploy_and_create(&mut scratch);
+            assert_eq!(scratch.force_cold_spill_all(), 1);
+            let orphan_row = store
+                .try_get_cold(key)
+                .unwrap()
+                .expect("cold row present before the cancel");
+            let _ = scratch
+                .apply_command(Command::cancel_instance(key))
+                .unwrap();
+            assert!(
+                store.try_get_cold(key).unwrap().is_none(),
+                "the cancel's eviction forget dropped the row"
+            );
+            store.put_cold(key, &orphan_row).unwrap();
+            key
+        };
+        assert_ne!(
+            failed_partition_orphan, live0,
+            "the orphan must be a distinct key, or the test cannot detect an unguarded sweep"
+        );
+
+        // Partition 1 is hosted but EMPTY (its recovered live set is
+        // legitimately empty — as a failed recovery would leave it), so only
+        // the recovery-failure latch keeps its orphaned row alive. Its journal
+        // still attaches the shared cold store (a hosted partition always
+        // does), so an unguarded sweep WOULD enumerate and reap the orphan.
+        let mut j1 = Journal::in_memory_partition(1);
+        j1.set_cold_spill(Arc::clone(&store), 1, 0);
+        let mut server = build_server_in_memory(
+            vec![j0, j1],
+            cluster::Topology {
+                node_id: 0,
+                peers: vec!["http://127.0.0.1:1".to_string()],
+                num_partitions: 2,
+                replication_factor: 1,
+            },
+        );
+        server.spill_config = Some(SpillConfig {
+            store: Arc::clone(&store),
+            var: None,
+            cold: Some((1, 0)),
+        });
+        // As raft_bootstrap does when hosting a member fails.
+        server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
+
+        let collected = server.gc_offheap_orphans_once().await;
+        assert_eq!(collected, 0, "the sweep skipped itself");
+        assert!(
+            store
+                .try_get_cold(failed_partition_orphan)
+                .unwrap()
+                .is_some(),
+            "the unrecovered partition's row is retained for the next boot"
+        );
+        assert!(
+            store.try_get_cold(live0).unwrap().is_some(),
+            "the recovered partition's live row is untouched"
+        );
+    }
+
+    /// #1479 review finding: with `NANOBPMN_RECLAIM_HANDOFF=1` an owned
+    /// partition is hosted by the DEFERRED hosting loop (after the incumbent
+    /// probe), whose error branch must set the SAME `gc_recovery_incomplete`
+    /// latch the non-deferred loop sets — a failure opening the Raft log there
+    /// leaves the partition's recovery incomplete while its rows sit in the
+    /// shared store, and an unlatched sweep would reap them. This drives the
+    /// latch's effect directly: a deferred-owned partition's orphan row is in
+    /// the store, the latch is set as the deferred error branch does, and the
+    /// node-wide sweep must skip itself even though every hosted engine's live
+    /// set is authoritative for its own partition.
+    #[tokio::test]
+    async fn node_scoped_gc_skips_the_sweep_when_a_deferred_owned_partitions_hosting_failed() {
+        let store = Arc::new(varspill::VarSpillStore::open(None).expect("in-memory store"));
+
+        // This node owns partitions 0 and 1. Partition 1's deferred hosting
+        // (NANOBPMN_RECLAIM_HANDOFF=1) FAILED, so its engine was never
+        // recovered: only its crash-orphaned cold row remains in the store.
+        let mut j0 = Journal::in_memory_partition(0);
+        j0.set_cold_spill(Arc::clone(&store), 1, 0);
+        let live0 = deploy_and_create(&mut j0);
+        assert_eq!(j0.force_cold_spill_all(), 1);
+        let deferred_partition_orphan = {
+            let mut scratch = Journal::in_memory_partition(1);
+            scratch.set_cold_spill(Arc::clone(&store), 1, 0);
+            let key = deploy_and_create(&mut scratch);
+            assert_eq!(scratch.force_cold_spill_all(), 1);
+            // Terminal in the scratch engine (see the recovery-failure test
+            // above): otherwise its key stays in the scratch live set and even
+            // an unguarded sweep preserves the row. Capture the cold row,
+            // cancel (the eviction forget drops it), then re-write the row the
+            // crash left behind.
+            let orphan_row = store
+                .try_get_cold(key)
+                .unwrap()
+                .expect("cold row present before the cancel");
+            let _ = scratch
+                .apply_command(Command::cancel_instance(key))
+                .unwrap();
+            store.put_cold(key, &orphan_row).unwrap();
+            key
+        };
+        assert_ne!(
+            deferred_partition_orphan, live0,
+            "the orphan must be a distinct key, or the test cannot detect an unguarded sweep"
+        );
+
+        // Partition 1 is hosted but EMPTY (its deferred hosting failed before
+        // any recovery ran, so its live set is empty), and its journal attaches
+        // the shared cold store as a hosted partition always does — so an
+        // UNGUARDED sweep would enumerate partition 1's band and reap the
+        // orphan. Hosting it requires a two-partition topology: with
+        // `num_partitions == 1` the sweep never visits partition 1 and the
+        // band-bounded partition-0 sweep cannot reach the row, so the test
+        // would pass even without the latch (#1479 review finding).
+        let mut j1 = Journal::in_memory_partition(1);
+        j1.set_cold_spill(Arc::clone(&store), 1, 0);
+        let mut server = build_server_in_memory(
+            vec![j0, j1],
+            cluster::Topology {
+                node_id: 0,
+                peers: vec!["http://127.0.0.1:1".to_string()],
+                num_partitions: 2,
+                replication_factor: 1,
+            },
+        );
+        server.spill_config = Some(SpillConfig {
+            store: Arc::clone(&store),
+            var: None,
+            cold: Some((1, 0)),
+        });
+        // As the deferred hosting loop's error branch does (NANOBPMN_RECLAIM_HANDOFF=1).
+        server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
+
+        let collected = server.gc_offheap_orphans_once().await;
+        assert_eq!(collected, 0, "the sweep skipped itself");
+        assert!(
+            store
+                .try_get_cold(deferred_partition_orphan)
+                .unwrap()
+                .is_some(),
+            "the deferred-owned partition's row is retained for the next boot"
+        );
+        assert!(
+            store.try_get_cold(live0).unwrap().is_some(),
+            "the recovered partition's live row is untouched"
+        );
+    }
 
     #[test]
     fn retry_until_ok_retries_transient_failures_then_returns_without_dropping() {
@@ -37049,6 +37603,27 @@ mod clustered_startup_tests {
         ServerImpl,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
+        boot_rf3_intake_cluster_with(digest, leader_durable, None, None, Vec::new()).await
+    }
+
+    /// As [`boot_rf3_intake_cluster_cfg2`], plus: `spill` builds a per-node spill
+    /// config (each node gets its own store, applied to its owned engines and —
+    /// via `ServerImpl::spill_config` — to every replica engine it later builds),
+    /// `activation` pins the activation-replication policy on every node (the
+    /// env reader can't be used under parallel tests), and `extra` deploys
+    /// additional processes alongside `intake`/`auto`.
+    async fn boot_rf3_intake_cluster_with(
+        digest: bool,
+        leader_durable: bool,
+        activation: Option<ActivationPolicy>,
+        spill: Option<fn() -> SpillConfig>,
+        extra: Vec<ProcessDefinition>,
+    ) -> (
+        ServerImpl,
+        ServerImpl,
+        ServerImpl,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
         let mut listeners = Vec::new();
         let mut ports = Vec::new();
         for i in 0..3u32 {
@@ -37110,6 +37685,33 @@ mod clustered_startup_tests {
             }
         }
 
+        if let Some(policy) = activation {
+            for node in [&mut node0, &mut node1, &mut node2] {
+                node.activation_policy = policy;
+                node.lease_digest = policy.broadcasts_lease_digest();
+                let lenient = policy.may_be_leader_local();
+                for handle in node.engine.all() {
+                    handle
+                        .with(move |journal| journal.set_lenient_completion(lenient))
+                        .await;
+                }
+            }
+        }
+
+        // Spill tiers: one store per node (a node's spill rows are local state),
+        // applied to the owned engines now and to every replica engine built
+        // later in `raft_bootstrap` / recovery via `spill_config`.
+        if let Some(make_spill) = spill {
+            for node in [&mut node0, &mut node1, &mut node2] {
+                let config = make_spill();
+                for handle in node.engine.all() {
+                    let config = config.clone();
+                    handle.with(move |journal| config.apply(journal)).await;
+                }
+                node.spill_config = Some(config);
+            }
+        }
+
         let proc = ProcessBuilder::new("intake")
             .start_event("start")
             .service_task("work", "do-work")
@@ -37129,9 +37731,14 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         names.insert("auto".to_string(), "auto.bpmn".to_string());
+        for extra_proc in &extra {
+            names.insert(extra_proc.id.clone(), format!("{}.bpmn", extra_proc.id));
+        }
+        let mut procs = vec![proc, auto];
+        procs.extend(extra);
         let (_r, events) = node0
             .deploy_resources_locally(
-                vec![proc, auto],
+                procs,
                 &names,
                 Vec::new(),
                 &std::collections::HashMap::new(),
@@ -37190,6 +37797,575 @@ mod clustered_startup_tests {
             "every partition must have its owning node as leader before creates"
         );
         (node0, node1, node2, serve_handles)
+    }
+
+    // --- issue #100: leader/follower replica parity --------------------------
+    //
+    // Defect class: once the log is fully applied, the leader and every follower
+    // must agree on per-instance and per-job state. #100 observed followers
+    // stranding a load-scaling fraction of instances as `Active` (a completion
+    // the leader applied but a follower did not). The guards below drive every
+    // local, non-replicated mechanism that can make a follower's apply differ
+    // from the leader's — cold spill, variable spill, leader-local lock expiry,
+    // replicated timer firing, and snapshot-install catch-up after a log purge —
+    // then wait on an applied-index barrier (never a sleep) and compare the
+    // exact KEY sets, not counts.
+
+    /// Spill tiers for the parity guards: variable spill sheds on every command
+    /// (budget 0) and cold spill is forced deterministically via
+    /// `force_cold_spill_all`; the RAM-gated sweep watermark is unreachable so it
+    /// never fires on its own. One in-memory store per call (= per node).
+    fn parity_spill_config() -> SpillConfig {
+        SpillConfig {
+            store: Arc::new(
+                varspill::VarSpillStore::open(None).expect("in-memory var-spill store"),
+            ),
+            var: Some(VarSpillCfg::Budget(0)),
+            cold: Some((u64::MAX, u64::MAX)),
+        }
+    }
+
+    /// `start -> timer(1ms) -> service(do-timed) -> end`: its job only exists
+    /// once a replicated `TriggerTimers` fires the catch event.
+    fn parity_timed_process() -> ProcessDefinition {
+        ProcessBuilder::new("timed")
+            .start_event("start")
+            .timer_intermediate_catch_event("wait", 1)
+            .service_task("work", "do-timed")
+            .end_event("end")
+            .connect("start", "wait")
+            .connect("wait", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid timed process")
+    }
+
+    async fn boot_parity_cluster() -> (
+        ServerImpl,
+        ServerImpl,
+        ServerImpl,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        boot_rf3_intake_cluster_with(
+            false,
+            true,
+            Some(ActivationPolicy::LeaderLocal),
+            Some(parity_spill_config),
+            vec![parity_timed_process()],
+        )
+        .await
+    }
+
+    /// Spill tally for one [`parity_force_spill`] sweep: the per-command
+    /// variable-budget shed and the whole-instance cold shed are counted
+    /// separately so the test can assert each tier engaged on its own — the
+    /// cold tally says nothing about variable spill.
+    #[derive(Default)]
+    struct ParitySpill {
+        var: usize,
+        cold: usize,
+    }
+
+    /// Spills on EVERY engine (owned + replica) of every node — spill is local
+    /// and unreplicated, so each replica sheds a different working set from the
+    /// leader. Forces BOTH tiers deterministically: `force_spill_scan` runs the
+    /// per-command variable-budget shed (`Budget(0)` spills every spill
+    /// candidate) without waiting out the 256-command amortisation — the
+    /// RAM-pressure sweep (`maybe_var_spill_pressure`) is a no-op under
+    /// `Budget`, so without this the variable tier never engages — and
+    /// `force_cold_spill_all` evicts every dormant instance.
+    async fn parity_force_spill(nodes: [&ServerImpl; 3]) -> ParitySpill {
+        let mut total = ParitySpill::default();
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    let sweep = h
+                        .with(|journal| {
+                            let before = journal.engine().resident_spillable_count();
+                            journal.force_spill_scan();
+                            let var = before - journal.engine().resident_spillable_count();
+                            ParitySpill {
+                                var,
+                                cold: journal.force_cold_spill_all(),
+                            }
+                        })
+                        .await;
+                    total.var += sweep.var;
+                    total.cold += sweep.cold;
+                }
+            }
+        }
+        total
+    }
+
+    /// One replicated clock tick at `now` on every partition (only the leader
+    /// proposes): fires due timers and expires due leases.
+    async fn parity_tick(nodes: [&ServerImpl; 3], now: u64) {
+        for node in nodes {
+            for p in 0..3u64 {
+                node.tick_partition_via_raft(p, now, true).await;
+            }
+        }
+    }
+
+    /// Activates up to `max` jobs of `job_type` on `node` and completes them all
+    /// with a payload. Returns how many completed.
+    async fn parity_activate_complete(node: &ServerImpl, job_type: &str, max: usize) -> usize {
+        let jobs = node
+            .activate_for_stream(job_type, "parity-worker", max, 60_000, None)
+            .await;
+        let n = jobs.len();
+        for job in jobs {
+            let key = job.job_key.0.parse::<u64>().expect("numeric job key");
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("result".to_string(), Value::Str("r".repeat(512)));
+            node.complete_job_for_stream(key, vars, None, None)
+                .await
+                .expect("completion commits through the leader")
+                .wait()
+                .await;
+        }
+        n
+    }
+
+    #[derive(Default)]
+    struct ParityTally {
+        created: usize,
+        abandoned: usize,
+        completed: usize,
+        timed_completed: usize,
+        /// Whole-instance (cold) sheds, aggregated over every replica.
+        shed: usize,
+        /// Variable-tier sheds, aggregated over every replica. Counted
+        /// separately from `shed`: a cold-only tally could be satisfied
+        /// without the variable spill path ever engaging.
+        var_shed: usize,
+    }
+
+    /// One round of the mixed workload: creates (with payload), cold/var spill,
+    /// abandoned short leases expired by a replicated tick that also fires the
+    /// timers, then activate+complete of both job types, with spill between.
+    async fn parity_workload_round(nodes: [&ServerImpl; 3], tally: &mut ParityTally) {
+        for node in nodes {
+            for i in 0..6 {
+                let mut vars = std::collections::HashMap::new();
+                vars.insert(
+                    "payload".to_string(),
+                    Value::Str(format!("{i}").repeat(256)),
+                );
+                node.create_for_stream(Some("intake".into()), None, vars)
+                    .await
+                    .expect("intake create acks");
+                tally.created += 1;
+            }
+            for _ in 0..3 {
+                node.create_for_stream(Some("timed".into()), None, Default::default())
+                    .await
+                    .expect("timed create acks");
+                tally.created += 1;
+            }
+        }
+        // Fire the timers while their instances are still hot. (The Raft tick's
+        // pre-check only sees HOT timers, so a timer whose instance is cold on
+        // the leader is never proposed — a liveness defect tracked in #1483;
+        // it cannot cause replica divergence because nothing is
+        // proposed.)
+        let far_future = now_millis() + 600_000;
+        parity_tick(nodes, far_future).await;
+        // Create/tick acks are leader-durable: they do NOT wait for the
+        // learners. Barrier here so a delayed follower has applied the creates
+        // and timer firings before the spill sweep — otherwise it spills
+        // nothing, later applies the whole workload against hot state, and its
+        // cold/var rehydration paths go untested (while the aggregate tally is
+        // still satisfied by the other replicas).
+        parity_barrier(nodes).await;
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
+        // Lease with a 1 ms timeout and abandon (rehydrating cold instances):
+        // leader-local locks the followers never see, reclaimed by the expiry.
+        for node in nodes {
+            tally.abandoned += node
+                .activate_for_stream("do-work", "abandoner", 3, 1, None)
+                .await
+                .len();
+        }
+        parity_tick(nodes, now_millis() + 1_200_000).await;
+        // Same barrier: the expiry tick is leader-durable too, so every replica
+        // must have applied it before this sweep for the sweep to shed (and
+        // later rehydrate) on all three.
+        parity_barrier(nodes).await;
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
+        for node in nodes {
+            tally.completed += parity_activate_complete(node, "do-work", 4).await;
+            tally.timed_completed += parity_activate_complete(node, "do-timed", 2).await;
+        }
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
+    }
+
+    /// Applied-index barrier: for every partition, every replica (leader and
+    /// learners) has applied up to the leader's last log index.
+    async fn parity_barrier(nodes: [&ServerImpl; 3]) {
+        for p in 0..3u64 {
+            let leader = nodes[p as usize]
+                .raft_registry()
+                .get(p)
+                .expect("owner hosts its partition");
+            let metrics = leader.raft.metrics().borrow().clone();
+            assert_eq!(
+                metrics.current_leader,
+                Some(p),
+                "node {p} leads partition {p}"
+            );
+            let idx = metrics.last_log_index;
+            for (n, node) in nodes.iter().enumerate() {
+                node.raft_registry()
+                    .get(p)
+                    .unwrap_or_else(|| panic!("node {n} replicates partition {p}"))
+                    .raft
+                    .wait(Some(std::time::Duration::from_secs(30)))
+                    .applied_index_at_least(idx, "replica applies the full log")
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("node {n} must apply partition {p} up to {idx:?}: {e}")
+                    });
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReplicaView {
+        /// Live instance keys, hot ∪ cold, BEFORE rehydration.
+        live: std::collections::BTreeSet<Key>,
+        /// `Active` instance keys after rehydrating every cold instance.
+        active: std::collections::BTreeSet<Key>,
+        /// Non-terminal job keys (`Created`/`Activated`/`Failed`).
+        jobs: std::collections::BTreeSet<Key>,
+        /// Cold rows that could not be rehydrated (absent or unreadable).
+        unreadable: usize,
+    }
+
+    async fn replica_view(node: &ServerImpl, p: u64) -> ReplicaView {
+        node.engine_handle_for(p)
+            .expect("replica engine exists")
+            .with(|journal| {
+                let mut live = std::collections::HashSet::new();
+                journal.collect_live_instance_keys(&mut live);
+                let (_restored, unreadable) = journal.rehydrate_all_cold();
+                let state = journal.engine().state();
+                ReplicaView {
+                    live: live.into_iter().collect(),
+                    active: state
+                        .instances
+                        .values()
+                        .filter(|i| matches!(i.state, ProcessInstanceState::Active))
+                        .map(|i| i.key)
+                        .collect(),
+                    jobs: state
+                        .jobs
+                        .values()
+                        .filter(|j| {
+                            matches!(
+                                j.state,
+                                nanobpmn_engine_core::JobState::Created
+                                    | nanobpmn_engine_core::JobState::Activated
+                                    | nanobpmn_engine_core::JobState::Failed
+                            )
+                        })
+                        .map(|j| j.key)
+                        .collect(),
+                    unreadable,
+                }
+            })
+            .await
+    }
+
+    /// Asserts every replica of every partition holds exactly the leader's
+    /// Active-instance and non-terminal-job key sets; on mismatch, reports the
+    /// diverging keys. Returns the total number of Active instances (so callers
+    /// can prove the comparison is non-vacuous).
+    async fn assert_replica_parity(nodes: [&ServerImpl; 3]) -> usize {
+        let mut total_active = 0;
+        for p in 0..3u64 {
+            let leader = replica_view(nodes[p as usize], p).await;
+            assert_eq!(leader.unreadable, 0, "leader p{p} off-heap rows readable");
+            assert_eq!(
+                leader.live, leader.active,
+                "leader p{p}: the hot∪cold live set equals the rehydrated Active set"
+            );
+            total_active += leader.active.len();
+            for (n, node) in nodes.iter().enumerate() {
+                if n == p as usize {
+                    continue;
+                }
+                let view = replica_view(node, p).await;
+                let diff = |a: &std::collections::BTreeSet<Key>,
+                            b: &std::collections::BTreeSet<Key>| {
+                    (
+                        a.difference(b).copied().collect::<Vec<_>>(),
+                        b.difference(a).copied().collect::<Vec<_>>(),
+                    )
+                };
+                assert_eq!(view.unreadable, 0, "node {n} p{p} off-heap rows readable");
+                let (only_f, only_l) = diff(&view.live, &leader.live);
+                assert!(
+                    only_f.is_empty() && only_l.is_empty(),
+                    "node {n} p{p} live instances diverge: follower-only {only_f:?}, leader-only {only_l:?}"
+                );
+                let (only_f, only_l) = diff(&view.active, &leader.active);
+                assert!(
+                    only_f.is_empty() && only_l.is_empty(),
+                    "node {n} p{p} Active instances diverge: follower-only {only_f:?}, leader-only {only_l:?}"
+                );
+                let (only_f, only_l) = diff(&view.jobs, &leader.jobs);
+                assert!(
+                    only_f.is_empty() && only_l.is_empty(),
+                    "node {n} p{p} non-terminal jobs diverge: follower-only {only_f:?}, leader-only {only_l:?}"
+                );
+            }
+        }
+        total_active
+    }
+
+    async fn parity_shutdown(nodes: [&ServerImpl; 3], handles: Vec<tokio::task::JoinHandle<()>>) {
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    /// #100 guard: under leader-durable RF=3 with leader-local activation and
+    /// lenient followers, a create/activate/complete workload with cold spill,
+    /// variable spill, lock expiry and timer firing leaves every replica with
+    /// the leader's exact Active-instance and non-terminal-job key sets once the
+    /// log is fully applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replicas_agree_on_instance_and_job_state_after_full_apply() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        let mut tally = ParityTally::default();
+        for _ in 0..3 {
+            parity_workload_round(nodes, &mut tally).await;
+        }
+        assert!(tally.shed > 0, "cold spill engaged");
+        assert!(
+            tally.var_shed > 0,
+            "variable spill engaged (Budget(0) sheds every spill candidate)"
+        );
+        assert!(tally.abandoned > 0, "leases were abandoned for expiry");
+        assert!(tally.completed > 0, "intake jobs completed");
+        assert!(
+            tally.timed_completed > 0,
+            "timers fired and their jobs completed"
+        );
+
+        parity_barrier(nodes).await;
+        let active = assert_replica_parity(nodes).await;
+        assert!(active > 0, "the parity comparison covers live instances");
+        assert!(
+            active < tally.created,
+            "the parity comparison covers completed instances too"
+        );
+        parity_shutdown(nodes, handles).await;
+    }
+
+    /// #100 guard, snapshot-install path: after the leader snapshots and PURGES
+    /// its log mid-workload, a learner rebuilt empty can only catch up by
+    /// installing the leader's snapshot (cold set included). It must then apply
+    /// the rest of the workload and agree with the leader key-for-key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_learner_caught_up_by_snapshot_install_agrees_with_the_leader() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        let mut tally = ParityTally::default();
+        parity_workload_round(nodes, &mut tally).await;
+        parity_barrier(nodes).await;
+
+        // Snapshot partition 0 on its leader, then purge the log it covers.
+        let leader = node0.raft_registry().get(0).expect("node 0 hosts p0");
+        let applied = leader
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .expect("p0 applied the workload");
+        leader
+            .raft
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger snapshot");
+        let snap = leader
+            .raft
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .metrics(
+                |m| m.snapshot.is_some_and(|s| s.index >= applied),
+                "leader snapshot covers the applied workload",
+            )
+            .await
+            .expect("leader builds its snapshot")
+            .snapshot
+            .expect("snapshot present")
+            .index;
+        leader
+            .raft
+            .trigger()
+            .purge_log(snap)
+            .await
+            .expect("trigger purge");
+        leader
+            .raft
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .metrics(
+                |m| m.purged.is_some_and(|l| l.index >= snap),
+                "leader purges its log up to the snapshot",
+            )
+            .await
+            .expect("leader purges the snapshotted prefix");
+
+        // Rebuild node 1's p0 member as an EMPTY receiver with a FRESH engine:
+        // the purged prefix is unavailable, so the leader must install its snapshot.
+        node1
+            .raft_registry()
+            .get(0)
+            .expect("node 1 replicates p0")
+            .raft
+            .shutdown()
+            .await
+            .ok();
+        node1
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&0);
+        assert!(
+            node1.recover_shutdown_partition(0).await,
+            "node 1 rebuilds its p0 member as a fresh receiver"
+        );
+
+        // More workload on top of the snapshot: completions of jobs the learner
+        // only knows from the installed snapshot, plus new creates/timers/expiry.
+        parity_workload_round(nodes, &mut tally).await;
+        parity_barrier(nodes).await;
+
+        let installed = node1
+            .raft_registry()
+            .get(0)
+            .expect("rebuilt p0 member")
+            .raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .map(|s| s.index);
+        assert!(
+            installed.is_some_and(|i| i >= snap),
+            "the rebuilt learner caught up by snapshot install (installed {installed:?}, purged to {snap})"
+        );
+        assert!(
+            tally.shed > 0
+                && tally.var_shed > 0
+                && tally.completed > 0
+                && tally.timed_completed > 0,
+            "cold and variable spill both engaged, and both job types completed"
+        );
+        let active = assert_replica_parity(nodes).await;
+        assert!(active > 0, "the parity comparison covers live instances");
+        parity_shutdown(nodes, handles).await;
+    }
+
+    /// #100 candidate (a) = #1405: a follower whose own cold row is UNREADABLE
+    /// when a replicated completion arrives must not silently advance past the
+    /// entry with the instance stranded `Active`. Either it fails closed (does not
+    /// reach the leader's applied index) or, once applied, it agrees with the
+    /// leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "candidate (a) of #100 is #1405; enable when PR #1452 (fail closed on unreadable state during apply) lands"]
+    async fn a_follower_with_an_unreadable_cold_row_never_diverges_silently() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        let (instance_key, _) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("create acks");
+        assert_eq!(partition_of(instance_key), 0);
+        parity_barrier(nodes).await;
+        let follower = node1.engine_handle_for(0).expect("node 1 replica of p0");
+        assert!(follower.with(|j| j.force_cold_spill_all()).await > 0);
+        assert!(
+            node1
+                .spill_config
+                .as_ref()
+                .expect("spill configured")
+                .store
+                .corrupt_cold_row(instance_key),
+            "inject an unreadable cold row on the follower"
+        );
+
+        assert_eq!(
+            parity_activate_complete(&node0, "do-work", 1).await,
+            1,
+            "the leader activates and completes the job"
+        );
+        let idx = node0
+            .raft_registry()
+            .get(0)
+            .expect("leader p0")
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .expect("leader has a log after the completion");
+        let follower_p0 = node1.raft_registry().get(0).expect("follower p0");
+        let reached = follower_p0
+            .raft
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .metrics(
+                |m| {
+                    m.state == openraft::ServerState::Shutdown
+                        || m.last_applied.is_some_and(|l| l.index >= idx)
+                },
+                "follower applies the completion or fails closed",
+            )
+            .await
+            .expect("follower neither applied the completion nor failed closed (a bare timeout is a failure)");
+        let applied_idx = reached.last_applied.map(|l| l.index);
+        let reached = applied_idx.is_some_and(|i| i >= idx);
+        if !reached {
+            // Fail-closed branch: the follower must have entered Shutdown AND
+            // must not have applied the completion entry.
+            assert!(
+                follower_p0.is_shutdown(),
+                "follower stopped short of the completion without failing closed"
+            );
+            assert!(
+                applied_idx.is_none_or(|i| i < idx),
+                "a fail-closed follower must not apply the completion (applied {applied_idx:?}, completion at {idx})"
+            );
+        } else {
+            let still_live = follower
+                .with(move |j| {
+                    let mut live = std::collections::HashSet::new();
+                    j.collect_live_instance_keys(&mut live);
+                    live.contains(&instance_key)
+                })
+                .await;
+            assert!(
+                !still_live,
+                "follower advanced past the completion but still holds {instance_key} live"
+            );
+        }
+        parity_shutdown(nodes, handles).await;
     }
 
     fn self_observed_failover_leader(views: &[(u64, Option<u64>); 2]) -> Option<usize> {
@@ -38291,6 +39467,245 @@ mod clustered_startup_tests {
                 }
             }
         }
+    }
+
+    /// Taps `node`'s replica engine for `partition`: every event it applies is
+    /// forwarded to the returned receiver (the in-memory journal's exporter
+    /// hook). Used to observe the events a FOLLOWER materializes from the
+    /// replicated log (#963).
+    async fn tap_replica_events(
+        node: &ServerImpl,
+        partition: u64,
+    ) -> std::sync::mpsc::Receiver<nano_server_storage::journal::ExportBatch> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        node.engine_handle_for(partition)
+            .expect("node materializes the partition")
+            .with(move |journal| {
+                journal.set_exporter(tx, Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            })
+            .await;
+        rx
+    }
+
+    /// The worker of the first terminal job event (`JobCompleted` / `JobFailed`
+    /// / `JobErrorThrown`) for `job_key` in `events`.
+    fn terminal_job_worker(events: &[Event], job_key: u64) -> Option<Option<String>> {
+        events.iter().find_map(|e| match e {
+            Event::JobCompleted {
+                job_key: k, worker, ..
+            }
+            | Event::JobFailed {
+                job_key: k, worker, ..
+            }
+            | Event::JobErrorThrown {
+                job_key: k, worker, ..
+            } if *k == job_key => Some(worker.clone()),
+            _ => None,
+        })
+    }
+
+    /// Waits until the tapped replica has applied a terminal event for
+    /// `job_key` (replication is asynchronous) and returns its attribution.
+    async fn replica_terminal_worker(
+        rx: &std::sync::mpsc::Receiver<nano_server_storage::journal::ExportBatch>,
+        job_key: u64,
+    ) -> Option<String> {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            while let Ok(batch) = rx.try_recv() {
+                if let Some(worker) = terminal_job_worker(&batch.events, job_key) {
+                    return worker;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the replica never applied a terminal event for job {job_key}");
+    }
+
+    async fn lease_on(node: &ServerImpl, worker: &str) -> u64 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            let jobs = node
+                .activate_for_stream("do-work", worker, 1, 600_000, None)
+                .await;
+            if let Some(job) = jobs.first() {
+                return job.job_key.0.parse().expect("numeric job key");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no job leased on the leader");
+    }
+
+    async fn shutdown_all(nodes: &[&ServerImpl]) {
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_local_terminal_jobs_attribute_the_same_worker_on_every_replica() {
+        // #963: under leader-local activation the lease (and its worker) lives
+        // only in the leader's RAM. Each replica re-derives events from the
+        // replicated COMMAND, so a follower used to persist `worker: None`
+        // where the leader persisted the real worker — divergent durable
+        // records for the same log entry. Every terminal kind must agree.
+        for kind in ["complete", "fail", "throw"] {
+            let (node0, node1, node2, _h) = boot_rf3_intake_cluster_with(
+                false,
+                false,
+                Some(ActivationPolicy::LeaderLocal),
+                None,
+                Vec::new(),
+            )
+            .await;
+            let followers = [
+                tap_replica_events(&node1, 0).await,
+                tap_replica_events(&node2, 0).await,
+            ];
+            let (instance_key, _c) = node0
+                .create_for_stream(Some("intake".into()), None, Default::default())
+                .await
+                .expect("raft-routed create commits");
+            assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+            let job_key = lease_on(&node0, "alice").await;
+
+            let outcome = match kind {
+                "complete" => {
+                    node0
+                        .complete_job_for_stream_with_lease(
+                            job_key,
+                            None,
+                            Default::default(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                }
+                "fail" => {
+                    node0
+                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+                        .await
+                }
+                _ => {
+                    node0
+                        .throw_error_for_stream_with_lease(
+                            job_key,
+                            None,
+                            "E".into(),
+                            "boom".into(),
+                            Default::default(),
+                        )
+                        .await
+                }
+            };
+            let (leader_events, _) = outcome.expect("the terminal command commits");
+            let on_leader = terminal_job_worker(&leader_events, job_key)
+                .expect("the leader emits a terminal job event");
+            assert_eq!(on_leader.as_deref(), Some("alice"), "{kind}: leader");
+            for rx in &followers {
+                assert_eq!(
+                    replica_terminal_worker(rx, job_key).await,
+                    on_leader,
+                    "{kind}: a follower must persist the leader's attribution"
+                );
+            }
+            shutdown_all(&[&node0, &node1, &node2]).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lease_recovered_after_failover_attributes_the_real_worker_on_every_replica() {
+        // #963 (digest facet): the promoted leader rebuilds the in-flight lease
+        // from the previous leader's digest. The digest now carries the worker,
+        // so a terminal settlement after failover is attributed to the real
+        // worker — never the `__lease_digest__` sentinel, never NULL — and the
+        // surviving follower agrees with the new leader.
+        let (node0, node1, node2) = boot_rf3_intake_cluster_cfg(true).await;
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        let job_key = lease_on(&node0, "alice").await;
+
+        // Broadcast the held lease, and wait until BOTH followers recorded it
+        // (the digest is fire-and-forget).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        node0.run_lease_digest(now).await;
+        for node in [&node1, &node2] {
+            let mut recorded = false;
+            for _ in 0..LEADER_SHIP_POLL_ITERS {
+                let workers = node
+                    .lease_digests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&0)
+                    .map(|d| d.workers.clone());
+                if let Some(workers) = workers {
+                    assert_eq!(workers.get(&job_key).map(String::as_str), Some("alice"));
+                    recorded = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                recorded,
+                "the digest (with its worker) reaches every follower"
+            );
+        }
+
+        shutdown_all(&[&node0]).await;
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+        let survivor = if std::ptr::eq(new_leader, &node1) {
+            &node2
+        } else {
+            &node1
+        };
+        let survivor_rx = tap_replica_events(survivor, 0).await;
+        let handle = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0");
+        let mut present = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if handle
+                .with(move |j| j.engine().state().jobs.contains_key(&job_key))
+                .await
+            {
+                present = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(present, "the job replicated to the new leader");
+        let recover_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        new_leader.run_lease_digest(recover_now).await;
+
+        let (leader_events, _) = new_leader
+            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+            .await
+            .expect("the fail commits on the new leader");
+        let on_leader =
+            terminal_job_worker(&leader_events, job_key).expect("terminal event on the new leader");
+        assert_eq!(
+            on_leader.as_deref(),
+            Some("alice"),
+            "real worker, not the sentinel"
+        );
+        assert_eq!(
+            replica_terminal_worker(&survivor_rx, job_key).await,
+            on_leader,
+            "the surviving follower agrees with the new leader"
+        );
+        shutdown_all(&[&node1, &node2]).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

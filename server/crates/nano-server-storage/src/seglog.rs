@@ -32,7 +32,7 @@
 //! it is recoverable when *all* sealed segments have been compacted away).
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1003,6 +1003,11 @@ fn read_pphead(path: &Path) -> Option<Vec<u64>> {
 
 /// A persisted snapshot: the engine's compact state plus the absolute event
 /// count it covers (== the sealed-segment boundary at snapshot time).
+///
+/// **Legacy (v0/v1/v2) monolithic framing only.** At v3 the local snapshot is
+/// the chunked sidecar stream (`snapstream`), not this struct; this type is
+/// retained solely to decode pre-v3 `snapshot.*.bin` files on the
+/// backward-compat read path.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedSnapshot {
     covered_events: u64,
@@ -1014,6 +1019,12 @@ struct PersistedSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     base_id: Option<u64>,
 }
+
+/// The `format_version` at which the local snapshot payload is the chunked
+/// sidecar stream (control frame + bounded instance-chunk frames + terminal end
+/// frame) rather than a monolithic JSON value (#1463). At and above this version
+/// the reader streams; below it the payload is a legacy monolith.
+const STREAMING_SNAPSHOT_FORMAT_VERSION: u32 = 3;
 
 // ----------------------------------------------------------------------------
 // Versioned, self-describing snapshot envelope (L2 / #1068).
@@ -1367,36 +1378,6 @@ fn read_or_init_incarnation(dir: &Path) -> io::Result<u64> {
     Ok(incarnation)
 }
 
-/// Writes `payload` to `path` atomically (tmp + rename + fsync), prefixed with
-/// the versioned envelope header. `dir` is the containing data dir (source of
-/// the incarnation id). Shared by [`write_snapshot`] and [`write_multi_snapshot`].
-fn write_enveloped<T: serde::Serialize>(dir: &Path, path: &Path, payload: &T) -> io::Result<()> {
-    let header = SnapshotHeader {
-        format_version: SNAPSHOT_FORMAT_VERSION,
-        incarnation: read_or_init_incarnation(dir)?,
-        engine_fingerprint: engine_fingerprint(),
-    };
-    let tmp = unique_tmp_path(path);
-    {
-        // Stream to the file (BufWriter) rather than building a full `Vec<u8>`
-        // first; under a large backlog the intermediate buffer is multi-GB (all
-        // resident variable payloads serialized at once).
-        let f = File::create(&tmp)?;
-        let mut w = BufWriter::new(f);
-        // Header first, on its own line — always parseable, fixed shape.
-        serde_json::to_writer(&mut w, &header)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        w.write_all(b"\n")?;
-        serde_json::to_writer(&mut w, payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let f = w.into_inner()?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    fsync_dir(dir);
-    Ok(())
-}
-
 /// Splits raw snapshot bytes into `(header, payload)`. A missing header line
 /// (no `\n`, i.e. legacy headerless compact JSON) yields the synthetic
 /// `format_version = 0` header and the whole file as payload. A present-but-
@@ -1571,6 +1552,62 @@ fn load_latest_snapshot_based(
         return Ok(None);
     };
     // A file we selected by name is PRESENT: from here on, every failure is fatal.
+    //
+    // Version dispatch (#1463): the envelope header's `format_version` selects
+    // the payload framing. v3 is the chunked sidecar stream, read back
+    // chunk-by-chunk (never slurping the whole serialized body into one buffer
+    // or one in-memory value graph at the read layer). v0/v1/v2 are the
+    // monolithic `PersistedSnapshot` JSON, decoded as before — their payload
+    // shape is unchanged, so they still load under this build (no migration
+    // needed); only a NEWER-than-supported version is a `FormatMismatch`.
+    let version =
+        peek_snapshot_format_version(&path)?.ok_or_else(|| SnapshotLoadError::Corrupt {
+            reason: "snapshot file vanished between listing and read".to_string(),
+        })?;
+    if version > SNAPSHOT_FORMAT_VERSION {
+        return Err(SnapshotLoadError::FormatMismatch {
+            found: version,
+            supported: SNAPSHOT_FORMAT_VERSION,
+        }
+        .into());
+    }
+    if version == STREAMING_SNAPSHOT_FORMAT_VERSION {
+        // Read the v3 chunked stream back in ONE pass: the control frame hands
+        // us the covered-event count and the control skeleton, then each
+        // instance chunk is restored into it as it streams by — the whole
+        // serialized body is never held as one buffer.
+        let acc: std::cell::RefCell<Option<(EngineSnapshot, u64)>> = std::cell::RefCell::new(None);
+        let base_id = crate::snapstream::read_streaming_snapshot_based(
+            &path,
+            |control, covered| *acc.borrow_mut() = Some((control, covered)),
+            |snap| {
+                let mut guard = acc.borrow_mut();
+                if let Some((acc, _)) = guard.as_mut() {
+                    nanobpmn_engine_core::restore_instance_snapshot(&mut acc.state, snap);
+                }
+            },
+        )
+        .map_err(|e| {
+            // Preserve an already-typed snapshot error; wrap anything else as
+            // Corrupt so a present-but-unreadable v3 stream is fatal, never a
+            // silent `None`.
+            match e
+                .get_ref()
+                .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
+            {
+                Some(_) => e,
+                None => SnapshotLoadError::Corrupt {
+                    reason: format!("streaming snapshot read failed: {e}"),
+                }
+                .into(),
+            }
+        })?;
+        let (engine, covered) = acc.into_inner().ok_or_else(|| SnapshotLoadError::Corrupt {
+            reason: "streaming snapshot had no control frame".to_string(),
+        })?;
+        return Ok(Some((engine, covered, base_id)));
+    }
+    // Legacy monolithic framing (v0 headerless, v1, v2).
     let bytes = fs::read(&path)?;
     let (header, payload) = parse_envelope(&bytes)?;
     check_format_version(&header)?;
@@ -1579,6 +1616,51 @@ fn load_latest_snapshot_based(
             reason: format!("snapshot payload deserialize failed: {e}"),
         })?;
     Ok(Some((snap.engine, snap.covered_events, snap.base_id)))
+}
+
+/// Rewrites the `covered_events` in a v3 streaming single-partition snapshot's
+/// control frame (line 2), preserving the envelope header and every chunk frame
+/// byte-for-byte. Test-only helper for the stale-floor guards, which need a
+/// loadable-but-stale snapshot (a covered count below the compaction floor)
+/// rather than a decode failure.
+#[cfg(test)]
+fn rewrite_streaming_covered_events(path: &Path, new_covered: u64) {
+    let text = fs::read_to_string(path).expect("read snapshot");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    assert!(
+        lines.len() >= 2,
+        "a v3 snapshot has a header + control frame"
+    );
+    let mut control: serde_json::Value =
+        serde_json::from_str(&lines[1]).expect("control frame parses");
+    control["covered_events"] = serde_json::json!(new_covered);
+    lines[1] = serde_json::to_string(&control).expect("re-serialize control frame");
+    fs::write(path, lines.join("\n") + "\n").expect("rewrite snapshot");
+}
+
+/// Rewrites one partition's `covered_events` in a v3 streaming MULTI-partition
+/// snapshot's control frame, preserving the envelope header and every other
+/// frame byte-for-byte. Test-only helper for the per-partition stale-floor
+/// guards (a loadable-but-stale entry, not a decode failure).
+#[cfg(test)]
+fn rewrite_multi_streaming_covered(path: &Path, partition: u64, new_covered: u64) {
+    let text = fs::read_to_string(path).expect("read multi snapshot");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut rewrote = false;
+    for line in lines.iter_mut().skip(1) {
+        let Ok(mut frame) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if frame.get("control").is_some()
+            && frame.get("partition").and_then(|p| p.as_u64()) == Some(partition)
+        {
+            frame["covered_events"] = serde_json::json!(new_covered);
+            *line = serde_json::to_string(&frame).expect("re-serialize control frame");
+            rewrote = true;
+        }
+    }
+    assert!(rewrote, "partition {partition} control frame present");
+    fs::write(path, lines.join("\n") + "\n").expect("rewrite multi snapshot");
 }
 
 /// The outcome of recovering a segmented journal directory.
@@ -1786,14 +1868,78 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
 
 /// Persists `snap` (covering `covered_events`) atomically to `dir`, then removes
 /// any older snapshot files. Called by the maintenance task after rotating.
+///
+/// **Format (#1463):** writes the v3 chunked sidecar framing (envelope header +
+/// control frame + bounded instance-chunk frames + terminal end frame), never
+/// the monolithic v2 `PersistedSnapshot` — so even this value-taking
+/// convenience path (used by tests and the replay-migrator, whose engine is
+/// already fully resident) seals a snapshot the *reader* can stream back
+/// chunk-by-chunk. The production maintenance loop uses
+/// [`write_snapshot_streaming`], which additionally never materializes the
+/// whole cold set in the first place.
 pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> io::Result<()> {
-    let payload = PersistedSnapshot {
-        covered_events,
-        engine: snap,
-        base_id: floor_stamp(dir, None, covered_events)?,
+    let (control_state, resident) = Engine::decompose_state_for_streaming(snap.state);
+    let capture = crate::snapstream::StreamingCapture {
+        control: EngineSnapshot {
+            state: control_state,
+            partition_id: snap.partition_id,
+            next_local: snap.next_local,
+            num_partitions: snap.num_partitions,
+            now: snap.now,
+            start_dispatch_rr: snap.start_dispatch_rr,
+            raft_applied: snap.raft_applied,
+        },
+        resident,
     };
+    write_snapshot_parts(
+        dir,
+        capture,
+        &[],
+        crate::snapstream::SpillStores::default(),
+        covered_events,
+    )
+}
+
+/// The production local-path snapshot write (#1463): streams `capture` (the
+/// control skeleton + resident payloads captured on the engine thread by
+/// [`Journal::streaming_snapshot_and_rotate`](crate::journal::Journal::streaming_snapshot_and_rotate))
+/// plus the cold set to `dir`'s `snapshot.<covered>.bin`, reading each cold row
+/// lazily from `stores` so the whole cold/spilled set is never held in RAM.
+/// Atomically promoted (tmp + fsync + rename) and fail-closed — an unreadable
+/// cold/spilled row aborts the write and removes the partial file, exactly like
+/// the folding capture returning `None`. Then removes any older snapshot files.
+pub fn write_snapshot_streaming(
+    dir: &Path,
+    capture: crate::snapstream::StreamingCapture,
+    cold_keys: &[nanobpmn_engine_core::Key],
+    stores: crate::snapstream::SpillStores,
+    covered_events: u64,
+) -> io::Result<()> {
+    write_snapshot_parts(dir, capture, cold_keys, stores, covered_events)
+}
+
+/// Shared streaming write + supersede for [`write_snapshot`] and
+/// [`write_snapshot_streaming`].
+fn write_snapshot_parts(
+    dir: &Path,
+    capture: crate::snapstream::StreamingCapture,
+    cold_keys: &[nanobpmn_engine_core::Key],
+    stores: crate::snapstream::SpillStores,
+    covered_events: u64,
+) -> io::Result<()> {
     let final_path = dir.join(format!("{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}"));
-    write_enveloped(dir, &final_path, &payload)?;
+    let header_line = snapshot_envelope_header_line(dir)?;
+    let base_id = floor_stamp(dir, None, covered_events)?;
+    crate::snapstream::write_streaming_snapshot_from_stores(
+        &final_path,
+        &header_line,
+        covered_events,
+        base_id,
+        capture,
+        cold_keys,
+        stores,
+        false,
+    )?;
 
     // Drop superseded snapshots (keep only the newest covered count).
     if let Ok(rd) = fs::read_dir(dir) {
@@ -2272,32 +2418,136 @@ struct MultiPersistedSnapshot {
 /// Persists the combined per-partition snapshot atomically (tmp + rename +
 /// fsync). `entries` is `(global_partition_id, covered_count, snapshot)` for
 /// every owned partition. Overwrites the previous combined snapshot.
+///
+/// **Format (#1463):** writes the v3 chunked framing — one control frame per
+/// partition plus shared bounded instance-chunk frames — never the monolithic
+/// v2 `MultiPersistedSnapshot`. This value-taking path (tests + the
+/// replay-migrator, whose engines are already fully resident) decomposes each
+/// snapshot first; the production maintenance loop uses
+/// [`write_multi_snapshot_streaming`], which never materializes any partition's
+/// cold set.
 pub fn write_multi_snapshot(
     dir: &Path,
     entries: Vec<(u64, u64, EngineSnapshot)>,
 ) -> io::Result<()> {
-    let payload = MultiPersistedSnapshot {
-        entries: entries
-            .into_iter()
-            .map(|(partition, covered, engine)| {
-                Ok(MultiSnapshotEntry {
-                    partition,
-                    covered,
-                    base_id: floor_stamp(dir, Some(partition), covered)?,
-                    engine,
-                })
-            })
-            .collect::<io::Result<_>>()?,
-    };
+    write_multi_snapshot_with_mode(dir, entries, false)
+}
+
+/// The lean-checkpoint counterpart of [`write_multi_snapshot`] (#1463 review):
+/// the snapshots are **control-only** (a variable-spilled instance retains its
+/// empty placeholder + the spilled flag; the authoritative durable var store
+/// holds the payload in lockstep). They are serialized as-is — never resolved
+/// against a spill store — so a lean checkpoint with a spilled instance writes
+/// successfully instead of failing closed on the placeholder.
+pub fn write_multi_snapshot_lean(
+    dir: &Path,
+    entries: Vec<(u64, u64, EngineSnapshot)>,
+) -> io::Result<()> {
+    write_multi_snapshot_with_mode(dir, entries, true)
+}
+
+/// Shared value-taking combined write behind [`write_multi_snapshot`] and
+/// [`write_multi_snapshot_lean`].
+fn write_multi_snapshot_with_mode(
+    dir: &Path,
+    entries: Vec<(u64, u64, EngineSnapshot)>,
+    control_only: bool,
+) -> io::Result<()> {
+    write_multi_snapshot_streaming(dir, decompose_multi_entries(entries, control_only))
+}
+
+/// Decomposes value-taking `(partition, covered, snapshot)` entries into the
+/// streaming writer's per-partition captures (no cold set, no stores).
+#[allow(clippy::type_complexity)]
+fn decompose_multi_entries(
+    entries: Vec<(u64, u64, EngineSnapshot)>,
+    control_only: bool,
+) -> Vec<(
+    u64,
+    u64,
+    crate::snapstream::StreamingCapture,
+    Vec<nanobpmn_engine_core::Key>,
+    crate::snapstream::SpillStores,
+    bool,
+)> {
+    entries
+        .into_iter()
+        .map(|(partition, covered, snap)| {
+            let (control_state, resident) = Engine::decompose_state_for_streaming(snap.state);
+            (
+                partition,
+                covered,
+                crate::snapstream::StreamingCapture {
+                    control: EngineSnapshot {
+                        state: control_state,
+                        partition_id: snap.partition_id,
+                        next_local: snap.next_local,
+                        num_partitions: snap.num_partitions,
+                        now: snap.now,
+                        start_dispatch_rr: snap.start_dispatch_rr,
+                        raft_applied: snap.raft_applied,
+                    },
+                    resident,
+                },
+                Vec::new(),
+                crate::snapstream::SpillStores::default(),
+                control_only,
+            )
+        })
+        .collect()
+}
+
+/// The production multi-partition combined snapshot write (#1463): streams every
+/// owned partition's capture (control skeleton + resident payloads) plus its
+/// cold set to `dir`'s `msnapshot.bin`, reading each cold row lazily from that
+/// partition's stores so no partition's whole cold/spilled set is ever held in
+/// RAM. Atomically promoted and fail-closed — an unreadable cold/spilled row in
+/// ANY partition aborts the write and removes the partial file, so a partial
+/// combined snapshot is never sealed.
+///
+/// `entries` is `(global_partition_id, covered_count, capture, cold_keys,
+/// stores, control_only)` per owned partition. `control_only` marks a lean
+/// checkpoint (a variable-spilled placeholder is serialized as-is, never
+/// resolved — the authoritative var store holds the payload).
+pub fn write_multi_snapshot_streaming(
+    dir: &Path,
+    entries: Vec<(
+        u64,
+        u64,
+        crate::snapstream::StreamingCapture,
+        Vec<nanobpmn_engine_core::Key>,
+        crate::snapstream::SpillStores,
+        bool,
+    )>,
+) -> io::Result<()> {
+    // Every written entry is stamped from the current floor (#1405).
+    let mut base_ids = crate::snapstream::MultiBaseIds::new();
+    for (partition, covered, ..) in &entries {
+        if let Some(id) = floor_stamp(dir, Some(*partition), *covered)? {
+            base_ids.insert(*partition, id);
+        }
+    }
+    write_multi_snapshot_streaming_based(dir, entries, &base_ids)
+}
+
+/// [`write_multi_snapshot_streaming`] with explicit per-partition rebase-floor
+/// identities (a partition absent from `base_ids` is written without one).
+#[allow(clippy::type_complexity)]
+fn write_multi_snapshot_streaming_based(
+    dir: &Path,
+    entries: Vec<(
+        u64,
+        u64,
+        crate::snapstream::StreamingCapture,
+        Vec<nanobpmn_engine_core::Key>,
+        crate::snapstream::SpillStores,
+        bool,
+    )>,
+    base_ids: &crate::snapstream::MultiBaseIds,
+) -> io::Result<()> {
     let final_path = dir.join(MULTI_SNAP_NAME);
-    // Stream the JSON straight to the file through a BufWriter instead of
-    // materialising the whole snapshot into a `Vec<u8>` first: under a large
-    // active backlog that intermediate buffer is multi-GB (all resident variable
-    // payloads serialized at once) and was a major driver of the transient RSS
-    // balloon during the 60s snapshot tick. The snapshots share the live
-    // variables by Arc, so only this serialization ever duplicated them.
-    write_enveloped(dir, &final_path, &payload)?;
-    Ok(())
+    let header_line = snapshot_envelope_header_line(dir)?;
+    crate::snapstream::write_multi_streaming_snapshot(&final_path, &header_line, entries, base_ids)
 }
 
 /// Replaces (or adds) ONE partition's entry in the combined snapshot, keeping
@@ -2316,31 +2566,29 @@ pub fn upsert_multi_snapshot_entry(
     // replaced entry is stamped from the current floor. Re-stamping every entry
     // would let a partition whose adoption published a new floor but failed to
     // write its base certify its unchanged, same-boundary snapshot as that base.
-    let mut entries: Vec<MultiSnapshotEntry> = match load_multi_snapshot_based(dir)? {
+    let mut base_ids = crate::snapstream::MultiBaseIds::new();
+    let mut entries: Vec<(u64, u64, EngineSnapshot)> = match load_multi_snapshot_based(dir)? {
         Some((engines, bases)) => engines
             .into_iter()
             .filter(|(p, _)| *p != partition)
-            .map(|(p, (c, engine))| MultiSnapshotEntry {
-                partition: p,
-                covered: c,
-                base_id: bases.get(&p).and_then(|(_, id)| *id),
-                engine,
+            .map(|(p, (c, engine))| {
+                if let Some(id) = bases.get(&p).and_then(|(_, id)| *id) {
+                    base_ids.insert(p, id);
+                }
+                (p, c, engine)
             })
             .collect(),
         None => Vec::new(),
     };
-    entries.push(MultiSnapshotEntry {
-        partition,
-        covered,
-        base_id: floor_stamp(dir, Some(partition), covered)?,
-        engine: snap,
-    });
-    entries.sort_by_key(|e| e.partition);
-    write_enveloped(
-        dir,
-        &dir.join(MULTI_SNAP_NAME),
-        &MultiPersistedSnapshot { entries },
-    )
+    if let Some(id) = floor_stamp(dir, Some(partition), covered)? {
+        base_ids.insert(partition, id);
+    }
+    entries.push((partition, covered, snap));
+    entries.sort_by_key(|e| e.0);
+    // Serialized as-is (`control_only`): a stored lean entry keeps its spilled
+    // placeholders verbatim (the var store holds the payload), and the adopted
+    // snapshot is self-contained, so nothing needs resolving.
+    write_multi_snapshot_streaming_based(dir, decompose_multi_entries(entries, true), &base_ids)
 }
 
 /// Loads the combined per-partition snapshot, as a map from global partition id
@@ -2363,11 +2611,45 @@ type MultiEngines = std::collections::HashMap<u64, (u64, EngineSnapshot)>;
 
 /// [`load_multi_snapshot`] plus each entry's `(covered, base_id)`.
 fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, MultiBases)>> {
-    let bytes = match fs::read(dir.join(MULTI_SNAP_NAME)) {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+    let path = dir.join(MULTI_SNAP_NAME);
+    // Version dispatch (#1463), mirroring `load_latest_snapshot`: v3 is the
+    // chunked per-partition stream; v0/v1/v2 are the monolithic
+    // `MultiPersistedSnapshot` JSON (payload shape unchanged, still loads).
+    // Only an explicit NotFound is "no snapshot"; any other metadata/open error
+    // (EACCES, ELOOP, ...) propagates — never `Path::exists`, which would mask
+    // it as absence and route recovery down the no-snapshot replay path.
+    let Some(version) = peek_snapshot_format_version(&path)? else {
+        return Ok(None);
     };
+    if version > SNAPSHOT_FORMAT_VERSION {
+        return Err(SnapshotLoadError::FormatMismatch {
+            found: version,
+            supported: SNAPSHOT_FORMAT_VERSION,
+        }
+        .into());
+    }
+    if version == STREAMING_SNAPSHOT_FORMAT_VERSION {
+        let (map, ids) =
+            crate::snapstream::read_multi_streaming_snapshot_based(&path).map_err(|e| {
+                match e
+                    .get_ref()
+                    .and_then(|r| r.downcast_ref::<SnapshotLoadError>())
+                {
+                    Some(_) => e,
+                    None => SnapshotLoadError::Corrupt {
+                        reason: format!("streaming multi snapshot read failed: {e}"),
+                    }
+                    .into(),
+                }
+            })?;
+        let bases = map
+            .iter()
+            .map(|(p, (covered, _))| (*p, (*covered, ids.get(p).copied())))
+            .collect();
+        return Ok(Some((map, bases)));
+    }
+    // Legacy monolithic framing (v0 headerless, v1, v2).
+    let bytes = fs::read(&path)?;
     let (header, payload) = parse_envelope(&bytes)?;
     check_format_version(&header)?;
     let snap: MultiPersistedSnapshot =
@@ -3326,15 +3608,13 @@ mod tests {
         let (mut journal, recovery) =
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
         let shared = Arc::clone(&recovery.shared);
+        // Await durability: the group-commit writer thread appends
+        // asynchronously, so sampling the active file before the commit lands
+        // races it (an empty active segment under parallel-test load).
         let (_, commit) = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
-        // The append lands on the background writer thread: wait for it to be
-        // durable before sampling, or the active file can still be empty.
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-            .block_on(commit.wait());
+        commit.blocking_wait();
         let expected = shared.uncompacted_usage();
         assert!(expected.1 > 0);
         // Interleaving: read active metadata, THEN the writer seals (rename).
@@ -3344,6 +3624,298 @@ mod tests {
 
         drop(journal);
         drop(shared);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1462 defect-class guard. The seal-mid-sample test above failed under
+    /// parallel load because it sampled the active segment right after
+    /// `apply_command`. The group-commit writer appends asynchronously, so under
+    /// load the sample could see an empty file (`expected.1 == 0`). This was a
+    /// hidden timing dependency in the test, not a product race: the product
+    /// dedups a mid-sample seal by inode. The sync point is
+    /// `Commit::blocking_wait`. This test pins the contract every on-disk
+    /// sampling test relies on: once a commit resolves, its bytes are visible to
+    /// `uncompacted_usage`, exactly and monotonically. It has no sleeps; it is
+    /// ordered only by the commit acknowledgement.
+    #[test]
+    fn resolved_commit_bytes_are_visible_to_uncompacted_usage() {
+        let dir = temp_dir("usage-commit-visible");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+
+        let (_, c1) = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        c1.blocking_wait();
+        let (segs1, bytes1) = shared.uncompacted_usage();
+        let on_disk1 = fs::metadata(&shared.active_path).unwrap().len();
+        assert_eq!(segs1, 1, "only the active segment");
+        assert!(bytes1 > 0, "a resolved commit's bytes must be on disk");
+        assert_eq!(bytes1, on_disk1);
+
+        let (_, c2) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        c2.blocking_wait();
+        let (_, bytes2) = shared.uncompacted_usage();
+        assert!(bytes2 > bytes1, "each resolved commit grows the gauge");
+        assert_eq!(bytes2, fs::metadata(&shared.active_path).unwrap().len());
+
+        drop(journal);
+        drop(shared);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ------------------------------------------------------------------------
+    // #1463: the local (non-Raft) snapshot path streams the cold/spilled set.
+    // ------------------------------------------------------------------------
+
+    /// RED for #1463: the local single-partition snapshot path
+    /// (`snapshot_and_rotate` → `write_snapshot`) must never fold the whole
+    /// cold/spilled set back into one in-memory [`EngineSnapshot`]. A journal
+    /// with cold-spilled (wholly off-heap) instances must stream them straight
+    /// from the spill store into the snapshot file — so the cold set stays
+    /// off-heap through the capture — and the sealed snapshot must be the
+    /// chunked sidecar framing (`format_version` 3), which a restart streams
+    /// back chunk-by-chunk.
+    ///
+    /// Before the fix this fails on every count: `snapshot_and_rotate` folds
+    /// every cold row into one in-memory snapshot (the #1337 defect class on
+    /// the local path), and `write_snapshot` seals a monolithic v2 payload.
+    #[test]
+    fn local_snapshot_streams_cold_instances_without_folding_them_resident() {
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("local-streaming-snapshot");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut keys = Vec::new();
+        for i in 0..4 {
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("data".to_string(), Value::Str(format!("payload-{i}")));
+            let (events, _) = journal
+                .apply_command(Command::create_instance_with("demo", vars))
+                .unwrap();
+            keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+        }
+
+        // Shed every instance to the cold tier (wholly off-heap).
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+        journal.set_cold_spill(store, 0, 0);
+        assert_eq!(
+            journal.force_cold_spill_all(),
+            4,
+            "precondition: all four instances cold"
+        );
+        assert_eq!(journal.cold_count(), 4);
+
+        // The local-path capture + write. The streaming capture runs on the
+        // engine thread (a consistent read); the write streams off it.
+        let (capture, cold_keys, stores, covered) = journal
+            .streaming_snapshot_and_rotate()
+            .expect("streaming snapshot+rotate");
+        assert!(covered > 0);
+        assert_eq!(
+            journal.cold_count(),
+            4,
+            "cold instances stayed off-heap through the streaming capture"
+        );
+        write_snapshot_streaming(&dir, capture, &cold_keys, stores, covered)
+            .expect("write streaming snapshot");
+
+        // The sealed snapshot is the chunked sidecar framing at the current
+        // format version: header line, control frame, chunk frames, terminal
+        // end frame — NOT one monolithic `PersistedSnapshot` JSON value.
+        let bytes = fs::read(snap_path(&dir, covered)).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let mut lines = text.lines();
+        let header = lines.next().expect("header line");
+        assert!(
+            header.contains("\"format_version\":3"),
+            "v3 chunked framing header, got: {header}"
+        );
+        let control = lines.next().expect("control frame");
+        assert!(
+            control.contains("\"covered_events\""),
+            "a control frame, not a monolithic snapshot: {control}"
+        );
+        assert!(
+            text.contains("\"end\":true"),
+            "a terminal end frame marks the clean end of stream"
+        );
+
+        // Crash/restart: the v3 snapshot + surviving tail rebuild every cold
+        // instance, with payloads, through the streaming reader.
+        drop(journal);
+        drop(shared);
+        let (reopened, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        assert!(!recovery.fresh);
+        for key in &keys {
+            let inst = reopened
+                .instance(*key)
+                .expect("cold instance restored from the streamed snapshot");
+            assert!(
+                !inst.variables_spilled,
+                "restored instance carries its variables (self-contained)"
+            );
+        }
+        assert_eq!(reopened.state().processes.len(), 1);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1476 review (stale cold routing key): a cold instance whose row is
+    /// **definitively absent** from the spill store (quarantined by the capture)
+    /// must not be re-captured into `cold_keys` and rejected by the streaming
+    /// writer on every tick — that would block snapshots and compaction forever.
+    /// The streaming rotation excludes the proven-absent key, so the write
+    /// succeeds (without the lost instance) and compaction proceeds.
+    #[test]
+    fn streaming_rotation_excludes_a_quarantined_absent_cold_row() {
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("streaming-absent-cold");
+        let (mut journal, _recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("lost".to_string()));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("demo", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Cold-spill the instance, then DELETE its row out from under the index
+        // (simulating a lost cold row).
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+        journal.set_cold_spill(Arc::clone(&store), 0, 0);
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert_eq!(journal.cold_count(), 1);
+        store.forget(&[key]).expect("delete the cold row");
+        assert!(
+            store.try_get_cold(key).expect("read").is_none(),
+            "precondition: the cold row is definitively absent"
+        );
+
+        // The streaming rotation must quarantine the absent row (journaled
+        // incident) and EXCLUDE its key, so the write succeeds and seals.
+        let (capture, cold_keys, stores, covered) = journal
+            .streaming_snapshot_and_rotate()
+            .expect("streaming snapshot+rotate must not abort on a quarantined absent row");
+        assert!(
+            cold_keys.is_empty(),
+            "the proven-absent cold key is excluded from the write"
+        );
+        write_snapshot_streaming(&dir, capture, &cold_keys, stores, covered)
+            .expect("the write succeeds without the lost row");
+
+        // The loss was journaled as a VariablesLost incident before the seal.
+        assert!(
+            journal.quarantined_orphans().contains(&key),
+            "the absent cold row is quarantined"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// RED for #1463 (multi-partition arm): the combined `msnapshot.bin` write
+    /// must stream every owned partition's cold set too — one partition's
+    /// cold-spilled instances must not be folded into memory, and a reopen
+    /// must restore them per partition.
+    #[test]
+    fn multi_snapshot_streams_cold_instances_without_folding_them_resident() {
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("multi-streaming-snapshot");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+
+        let (key0, key1) = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+
+            let mut vars0 = std::collections::HashMap::new();
+            vars0.insert("data".to_string(), Value::Str("p0-payload".to_string()));
+            let (e0, _) = j0
+                .apply_command(Command::create_instance_with("demo", vars0))
+                .unwrap();
+            let key0 = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            let mut vars1 = std::collections::HashMap::new();
+            vars1.insert("data".to_string(), Value::Str("p1-payload".to_string()));
+            let (e1, _) = j1
+                .apply_command(Command::create_instance_with("demo", vars1))
+                .unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+
+            // Cold-spill BOTH partitions' instances off-heap.
+            let store0 = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+            let store1 = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+            j0.set_cold_spill(store0, 0, 0);
+            j1.set_cold_spill(store1, 0, 0);
+            assert_eq!(j0.force_cold_spill_all(), 1);
+            assert_eq!(j1.force_cold_spill_all(), 1);
+
+            let (cap0, cold0, stores0, covered0) =
+                j0.streaming_snapshot_and_rotate().expect("snapshot p0");
+            let (cap1, cold1, stores1, covered1) =
+                j1.streaming_snapshot_and_rotate().expect("snapshot p1");
+            assert_eq!(j0.cold_count(), 1, "p0 cold set stayed off-heap");
+            assert_eq!(j1.cold_count(), 1, "p1 cold set stayed off-heap");
+
+            write_multi_snapshot_streaming(
+                &dir,
+                vec![
+                    (0, covered0, cap0, cold0, stores0, false),
+                    (1, covered1, cap1, cold1, stores1, false),
+                ],
+            )
+            .expect("write combined streaming snapshot");
+
+            (key0, key1)
+        };
+
+        // Reopen: both partitions restore from the streamed combined snapshot.
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        let inst0 = engines[&0]
+            .instance(key0)
+            .expect("partition 0 cold instance restored");
+        let inst1 = engines[&1]
+            .instance(key1)
+            .expect("partition 1 cold instance restored");
+        assert!(!inst0.variables_spilled && !inst1.variables_spilled);
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3486,25 +4058,12 @@ mod tests {
         let (dir, _key1, _key2) = compacted_dir_with_two_instances("stale-snap");
 
         // Rewrite the surviving snapshot so it still deserializes but reports a
-        // `covered_events` below the compaction floor (0 < first_index). Preserve
-        // the envelope header line so `parse_envelope` + `check_format_version`
-        // still admit the payload — the stale-floor guard, not a decode failure,
-        // is what must reject it.
+        // `covered_events` below the compaction floor (0 < first_index). At v3
+        // the covered count lives in the streaming control frame (line 2), so
+        // rewrite it there — the stale-floor guard, not a decode failure, is
+        // what must reject it.
         let path = snapshot_file(&dir);
-        let raw = fs::read(&path).unwrap();
-        let nl = raw
-            .iter()
-            .position(|&b| b == b'\n')
-            .expect("an enveloped snapshot carries a header line");
-        let mut snap: PersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
-        assert!(
-            snap.covered_events > 0,
-            "the compaction floor must be nonzero for this test to exercise the gap"
-        );
-        snap.covered_events = 0;
-        let mut out = raw[..=nl].to_vec(); // header line + '\n'
-        out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
-        fs::write(&path, out).unwrap();
+        rewrite_streaming_covered_events(&path, 0);
 
         let err = match crate::journal::Journal::open_segmented(&dir) {
             Ok(_) => panic!(
@@ -3780,30 +4339,12 @@ mod tests {
             assert!(seg.sealed.lock().unwrap().is_empty());
         }
 
-        // Simulate the loadable-but-stale case: rewrite partition 1's entry so its
-        // `covered` sits below the compaction floor (0 < pp_base[1]). Preserve the
-        // envelope header line so the payload still parses — the per-partition
+        // Simulate the loadable-but-stale case: rewrite partition 1's control
+        // frame so its `covered` sits below the compaction floor (0 <
+        // pp_base[1]). At v3 each partition's covered count lives in its
+        // streaming control frame, so rewrite it there — the per-partition
         // stale-floor guard is what must reject it.
-        let path = dir.join(MULTI_SNAP_NAME);
-        let raw = fs::read(&path).unwrap();
-        let nl = raw
-            .iter()
-            .position(|&b| b == b'\n')
-            .expect("an enveloped multi-snapshot carries a header line");
-        let mut snap: MultiPersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
-        let e = snap
-            .entries
-            .iter_mut()
-            .find(|e| e.partition == 1)
-            .expect("partition 1 snapshot entry");
-        assert!(
-            e.covered > 0,
-            "partition 1's compaction floor must be nonzero for this test to exercise the gap"
-        );
-        e.covered = 0;
-        let mut out = raw[..=nl].to_vec(); // header line + '\n'
-        out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
-        fs::write(&path, out).unwrap();
+        rewrite_multi_streaming_covered(&dir.join(MULTI_SNAP_NAME), 1, 0);
 
         let err = recover_multi(&dir, &[0, 1], 2, None)
             .err()
@@ -3984,6 +4525,104 @@ mod tests {
             inst.variables.get("c"),
             Some(&Value::Int(3i64)),
             "post-checkpoint merge from the journal tail"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// RED for the #1476 review finding (lean regression): a lean checkpoint
+    /// whose instance is **variable-spilled** at capture time must still write.
+    /// The lean control-only snapshot deliberately retains
+    /// `variables_spilled = true` (the var store is authoritative for the
+    /// payload), so the combined-snapshot writer must NOT try to resolve that
+    /// placeholder against the (empty) spill stores — it must serialize the
+    /// control-only placeholder as-is. Before the fix, `write_multi_snapshot`'s
+    /// streaming decomposition resolved every spilled flag and failed closed,
+    /// blocking every lean snapshot (and so all compaction) whenever an instance
+    /// was variable-spilled.
+    #[test]
+    fn lean_multi_snapshot_writes_a_variable_spilled_instance_as_control_only() {
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("lean-spilled");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+
+        let key = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                    .expect("open multi");
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j0.set_varstore(Arc::clone(&varstore));
+            j1.set_varstore(Arc::clone(&varstore));
+            // Classic spill wired too, budget 0: the instance is variable-spilled
+            // (placeholder + flag) at checkpoint time. Lean mode writes the spill
+            // through to the authoritative var store, so the payload is durable.
+            let spill = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+            j0.set_spill(spill, 0);
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+            let mut vars = std::collections::HashMap::new();
+            vars.insert(
+                "data".to_string(),
+                Value::Str("spilled-payload".to_string()),
+            );
+            let (e0, _) = j0
+                .apply_command(Command::create_instance_with("demo", vars))
+                .unwrap();
+            let key = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            j0.force_spill_scan();
+            assert!(
+                j0.engine().is_variables_spilled(key),
+                "precondition: variable-spilled at checkpoint"
+            );
+
+            let mut entries = Vec::new();
+            for (j, pid) in [(&mut j0, 0u64), (&mut j1, 1u64)] {
+                let (snap, covered, upserts, forgets) =
+                    j.snapshot_and_rotate_lean().expect("lean checkpoint");
+                let ups: Vec<(
+                    nanobpmn_engine_core::Key,
+                    &std::collections::HashMap<String, Value>,
+                )> = upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+                varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
+                entries.push((pid, covered, snap));
+            }
+            // The lean snapshot retains the spilled placeholder; the write must
+            // succeed (control-only serialization), not fail resolving it.
+            write_multi_snapshot_lean(&dir, entries)
+                .expect("write lean snapshot with a spilled instance");
+
+            key
+        };
+
+        // Reopen: control from the lean snapshot, variables installed from the
+        // authoritative store (the spilled payload is durable there).
+        let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        let inst = engines[&0].instance(key).expect("instance restored");
+        assert_eq!(
+            inst.variables.get("data"),
+            Some(&Value::Str("spilled-payload".to_string())),
+            "the spilled payload is recovered from the authoritative var store"
         );
 
         let _ = fs::remove_dir_all(&dir);
@@ -4732,8 +5371,26 @@ mod tests {
             "fingerprint = {}",
             header.engine_fingerprint
         );
-        // The payload after the header is the real PersistedSnapshot.
-        let _: PersistedSnapshot = serde_json::from_slice(payload).expect("payload decodes");
+        // The payload after the header is the v3 chunked stream: a control frame
+        // carrying the covered count, then the terminal end frame (a deploy-only
+        // snapshot has no instances, so no chunk frames between them).
+        let text = String::from_utf8(payload.to_vec()).expect("payload is utf8");
+        let mut lines = text.lines();
+        let control: serde_json::Value =
+            serde_json::from_str(lines.next().expect("control frame")).expect("control parses");
+        assert_eq!(
+            control["covered_events"].as_u64(),
+            Some(covered),
+            "the v3 control frame carries the covered count"
+        );
+        assert!(
+            control.get("control").is_some(),
+            "the v3 control frame carries the control skeleton"
+        );
+        assert!(
+            text.contains("\"end\":true"),
+            "the v3 stream ends with a terminal end frame"
+        );
 
         // The loader returns the engine plus `covered_events` as the 2ND tuple
         // element (caller contract).
@@ -4747,6 +5404,20 @@ mod tests {
             "round-tripped snapshot carries the deployed process"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1476: an inaccessible multi snapshot (a symlink loop -> ELOOP) is an
+    /// error, never masked as "no snapshot" (which would send recovery down the
+    /// no-snapshot replay path instead of failing closed).
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_multi_snapshot_is_an_error_not_absent() {
+        let dir = temp_dir("multi-snap-eloop");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MULTI_SNAP_NAME);
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        assert!(load_multi_snapshot(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -5023,6 +5694,156 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1463 upgrade path: a snapshot written at the PREVIOUS format version (v2,
+    /// the monolithic `PersistedSnapshot`) must still load under this build and
+    /// recover every instance — the payload *shape* did not change at v3, only
+    /// the framing did, so no replay migration is needed for a v2 file. This is
+    /// the forward-compat half of the version bump: a node upgrading onto this
+    /// build with a durable v2 snapshot boots straight off it.
+    #[test]
+    fn v2_monolithic_snapshot_still_loads_and_recovers() {
+        let dir = temp_dir("v2-snapshot-loads");
+
+        let (key1, key2, covered) = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (e1, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            // Write the snapshot, then REWRITE it as a v2 monolith: the exact
+            // bytes a pre-#1463 build would have sealed.
+            write_snapshot(&dir, snap.clone(), covered).expect("write snapshot");
+            rewrite_snapshot_as_v2_monolith(&dir, covered, &snap);
+            assert_eq!(compact(&shared, covered), 1);
+            let (e2, commit) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key2 = e2.iter().find_map(|e| e.instance_key()).unwrap();
+            commit.blocking_wait();
+            (key1, key2, covered)
+        };
+
+        // Boot: the v2 snapshot loads directly (no replay migration), then the
+        // hot tail applies on top.
+        let (reopened, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen over a v2 snapshot");
+        assert!(!recovery.fresh);
+        assert!(
+            reopened.instance(key1).is_some(),
+            "the v2-snapshotted (compacted) instance is restored"
+        );
+        assert!(
+            reopened.instance(key2).is_some(),
+            "the hot-tail instance applies on top of the v2 snapshot"
+        );
+        assert_eq!(reopened.state().processes.len(), 1);
+        // The v2 file is still on disk and still readable at v2 (the boot did
+        // not need to rewrite it).
+        assert_eq!(
+            peek_snapshot_format_version(&snap_path(&dir, covered)).unwrap(),
+            Some(2),
+            "the v2 snapshot loaded in place, unmigrated"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1463 replay-migrator validation: a snapshot stamped at a version this
+    /// build cannot read (a FUTURE v4, standing in for "v2 payload under a build
+    /// that only reads v3") is rebuilt by #1071's replay-migrator from the cold
+    /// archive + hot tail, and the migrator rewrites it as a loadable v3 chunked
+    /// snapshot — proving the version bump routes through the migrator exactly as
+    /// AGENTS.md's breaking-change rule requires.
+    #[test]
+    fn future_version_snapshot_migrates_by_replay_into_a_v3_stream() {
+        let dir = temp_dir("v3-migrate-replay");
+
+        let (key1, key2, _covered) = {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let (e1, _) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1);
+            assert_eq!(cold_archive_span(&dir).unwrap(), Some((0, covered)));
+            let (e2, commit) = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let key2 = e2.iter().find_map(|e| e.instance_key()).unwrap();
+            commit.blocking_wait();
+            // Stamp the snapshot at a version this build cannot read.
+            bump_snapshot_to_future(&dir, covered);
+            (key1, key2, covered)
+        };
+
+        // Boot: FormatMismatch routes to the replay-migrator, which rebuilds and
+        // rewrites a fresh v3 snapshot.
+        let (reopened, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("migrating reopen");
+        assert!(!recovery.fresh);
+        assert!(
+            reopened.instance(key1).is_some(),
+            "cold-archived instance rebuilt"
+        );
+        assert!(
+            reopened.instance(key2).is_some(),
+            "hot-tail instance preserved"
+        );
+
+        // The rewritten snapshot is a loadable v3 chunked stream.
+        let path = snap_path(&dir, recovery.total_events);
+        assert_eq!(
+            peek_snapshot_format_version(&path).unwrap(),
+            Some(SNAPSHOT_FORMAT_VERSION),
+            "the migrator rewrote a v3 snapshot"
+        );
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\"end\":true"),
+            "the rewritten snapshot is the chunked stream framing"
+        );
+        let (loaded, _) = load_latest_snapshot(&dir)
+            .expect("v3 loads")
+            .expect("present");
+        assert!(loaded.state.instances.contains_key(&key1));
+        assert!(loaded.state.instances.contains_key(&key2));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Rewrites the single-partition snapshot covering `covered` as a v2
+    /// monolithic `PersistedSnapshot` (header `format_version: 2` + one JSON
+    /// value) — the exact on-disk bytes a pre-#1463 build sealed.
+    fn rewrite_snapshot_as_v2_monolith(dir: &Path, covered: u64, snap: &EngineSnapshot) {
+        let header = SnapshotHeader {
+            format_version: 2,
+            incarnation: read_or_init_incarnation(dir).unwrap(),
+            engine_fingerprint: engine_fingerprint(),
+        };
+        let payload = PersistedSnapshot {
+            covered_events: covered,
+            engine: snap.clone(),
+            base_id: None,
+        };
+        let mut out = serde_json::to_vec(&header).unwrap();
+        out.push(b'\n');
+        out.extend_from_slice(&serde_json::to_vec(&payload).unwrap());
+        fs::write(snap_path(dir, covered), out).expect("rewrite as v2 monolith");
     }
 
     /// #1065 guard (no-snapshot variant): when the snapshot file is ABSENT but
@@ -5924,27 +6745,13 @@ mod tests {
         /// loud: `RecoverOutcome = Reject` (FailClosed, #1065).
         #[test]
         fn stale_snapshot_below_floor_rejects() {
-            use super::super::PersistedSnapshot;
             let (dir, _key1, _key2) = compacted_dir_with_two_instances("conf-stale");
             // Rewrite the surviving snapshot so it still deserializes but reports a
-            // `covered_events` below the compaction floor (0 < first_index),
-            // preserving the envelope header so the stale-floor guard — not a
-            // decode failure — is what rejects it.
+            // `covered_events` below the compaction floor (0 < first_index). At v3
+            // the covered count lives in the streaming control frame — the
+            // stale-floor guard, not a decode failure, is what rejects it.
             let path = snapshot_file(&dir);
-            let raw = fs::read(&path).unwrap();
-            let nl = raw
-                .iter()
-                .position(|&b| b == b'\n')
-                .expect("an enveloped snapshot carries a header line");
-            let mut snap: PersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
-            assert!(
-                snap.covered_events > 0,
-                "the floor must be nonzero to exercise the gap"
-            );
-            snap.covered_events = 0;
-            let mut out = raw[..=nl].to_vec();
-            out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
-            fs::write(&path, out).unwrap();
+            super::super::rewrite_streaming_covered_events(&path, 0);
             assert_recovery(&dir, &[], Expect::Rejects);
             let _ = fs::remove_dir_all(&dir);
         }
@@ -6063,32 +6870,13 @@ mod tests {
         /// multi-partition path.
         #[test]
         fn multi_partition_stale_partition_snapshot_rejects() {
-            use super::super::{MULTI_SNAP_NAME, MultiPersistedSnapshot, recover_multi};
+            use super::super::{MULTI_SNAP_NAME, recover_multi};
 
             let (dir, _key0, _key1) = compacted_multi_dir("conf-multi-stale");
-            // Rewrite partition 1's entry so its `covered` sits below the
-            // compaction floor while the enveloped payload still parses — the
-            // per-partition stale-floor guard (not a decode failure) must reject.
-            let path = dir.join(MULTI_SNAP_NAME);
-            let raw = fs::read(&path).unwrap();
-            let nl = raw
-                .iter()
-                .position(|&b| b == b'\n')
-                .expect("an enveloped multi-snapshot carries a header line");
-            let mut snap: MultiPersistedSnapshot = serde_json::from_slice(&raw[nl + 1..]).unwrap();
-            let e = snap
-                .entries
-                .iter_mut()
-                .find(|e| e.partition == 1)
-                .expect("partition 1 snapshot entry");
-            assert!(
-                e.covered > 0,
-                "partition 1's compaction floor must be nonzero"
-            );
-            e.covered = 0;
-            let mut out = raw[..=nl].to_vec();
-            out.extend_from_slice(&serde_json::to_vec(&snap).unwrap());
-            fs::write(&path, out).unwrap();
+            // Rewrite partition 1's control frame so its `covered` sits below the
+            // compaction floor while the snapshot still parses — the per-partition
+            // stale-floor guard (not a decode failure) must reject.
+            super::super::rewrite_multi_streaming_covered(&dir.join(MULTI_SNAP_NAME), 1, 0);
 
             let err = recover_multi(&dir, &[0, 1], 2, None)
                 .err()

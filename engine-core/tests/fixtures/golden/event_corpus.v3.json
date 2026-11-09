@@ -1,0 +1,3924 @@
+[
+  {
+    "DeploymentCreated": {
+      "deployment_key": 1
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 1,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "charge": {
+            "end_listeners": [],
+            "id": "charge",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "payment",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "end": {
+            "end_listeners": [],
+            "id": "end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "start": {
+            "end_listeners": [],
+            "id": "start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "charge"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "order",
+        "name": null,
+        "start_event": "start",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 2,
+      "version": 1
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 3
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 3,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "audit": {
+            "end_listeners": [],
+            "id": "audit",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "audit",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "join": {
+            "end_listeners": [],
+            "id": "join",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "InclusiveGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "notify": {
+            "end_listeners": [],
+            "id": "notify",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "notify",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "split"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "split": {
+            "end_listeners": [],
+            "id": "split",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "InclusiveGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": {
+                  "expression": "= risk > 10"
+                },
+                "is_default": false,
+                "to": "audit"
+              },
+              {
+                "condition": null,
+                "is_default": true,
+                "to": "notify"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "review",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 4,
+      "version": 1
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 5
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 5,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "b_int": {
+            "end_listeners": [],
+            "id": "b_int",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "EscalationBoundaryEvent": {
+                "attached_to": "sub",
+                "escalation_code": "OVERLOAD",
+                "interrupting": true
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "h_int"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "b_non": {
+            "end_listeners": [],
+            "id": "b_non",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "EscalationBoundaryEvent": {
+                "attached_to": "sub",
+                "escalation_code": "",
+                "interrupting": false
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "h_non"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "h_int": {
+            "end_listeners": [],
+            "id": "h_int",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "h_non": {
+            "end_listeners": [],
+            "id": "h_non",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub": {
+            "end_listeners": [],
+            "id": "sub",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "SubProcess": {
+                "start_event": "sub_start"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_end": {
+            "end_listeners": [],
+            "id": "sub_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_start": {
+            "end_listeners": [],
+            "id": "sub_start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "throw"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "throw": {
+            "end_listeners": [],
+            "id": "throw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "EscalationThrowEvent": {
+                "escalation_code": "OVERLOAD"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub_end"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "escalate",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 6,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000001,
+      "instance_key": 7,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {
+        "amount": {
+          "Int": 4200
+        },
+        "currency": {
+          "Str": "EUR"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 8,
+      "instance_key": 7,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 8,
+      "instance_key": 7,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 8,
+      "instance_key": 7
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 8,
+      "instance_key": 7
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 7,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 9,
+      "instance_key": 7,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 9,
+      "instance_key": 7,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000001,
+      "element_id": "charge",
+      "element_instance_key": 9,
+      "instance_key": 7,
+      "job_key": 10,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "JobActivated": {
+      "activated_at": 1700000000002,
+      "deadline": 1700000030002,
+      "durable": true,
+      "instance_key": 7,
+      "job_key": 10,
+      "worker": "worker-1"
+    }
+  },
+  {
+    "JobFailed": {
+      "error_message": "transient: upstream 503",
+      "instance_key": 7,
+      "job_key": 10,
+      "retries": 2,
+      "worker": "worker-1"
+    }
+  },
+  {
+    "JobActivated": {
+      "activated_at": 1700000000002,
+      "deadline": 1700000030002,
+      "durable": true,
+      "instance_key": 7,
+      "job_key": 10,
+      "worker": "worker-1"
+    }
+  },
+  {
+    "ProcessInstanceBusinessIdAssigned": {
+      "business_id": "order-A",
+      "instance_key": 7
+    }
+  },
+  {
+    "JobCompleted": {
+      "completed_at": 1700000000003,
+      "created_at": 1700000000001,
+      "instance_key": 7,
+      "job_key": 10,
+      "job_type": "payment",
+      "worker": "worker-1"
+    }
+  },
+  {
+    "VariablesUpdated": {
+      "instance_key": 7,
+      "variables": {
+        "approved": {
+          "Bool": true
+        }
+      }
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "charge",
+      "element_instance_key": 9,
+      "instance_key": 7
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "charge",
+      "element_instance_key": 9,
+      "instance_key": 7
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "charge",
+      "instance_key": 7,
+      "to": "end"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "end",
+      "element_instance_key": 11,
+      "instance_key": 7,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "end",
+      "element_instance_key": 11,
+      "instance_key": 7,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "end",
+      "element_instance_key": 11,
+      "instance_key": 7
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "end",
+      "element_instance_key": 11,
+      "instance_key": 7
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 7
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000004,
+      "instance_key": 12,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {
+        "amount": {
+          "Int": 999
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 13,
+      "instance_key": 12,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 13,
+      "instance_key": 12,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 13,
+      "instance_key": 12
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 13,
+      "instance_key": 12
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 12,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 14,
+      "instance_key": 12,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 14,
+      "instance_key": 12,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000004,
+      "element_id": "charge",
+      "element_instance_key": 14,
+      "instance_key": 12,
+      "job_key": 15,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "ProcessInstanceSuspended": {
+      "at": 1700000000005,
+      "instance_key": 12
+    }
+  },
+  {
+    "ProcessInstanceResumed": {
+      "instance_key": 12
+    }
+  },
+  {
+    "ProcessInstanceSuspended": {
+      "at": 1700000000007,
+      "instance_key": 12
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 16
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 16,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "fork": {
+            "end_listeners": [],
+            "id": "fork",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              },
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "join": {
+            "end_listeners": [],
+            "id": "join",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "fork"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "dup",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 17,
+      "version": 1
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 18
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 18,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "fork": {
+            "end_listeners": [],
+            "id": "fork",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "t"
+              },
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "join": {
+            "end_listeners": [],
+            "id": "join",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "ParallelGateway",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "fork"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "t": {
+            "end_listeners": [],
+            "id": "t",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "sync-task",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "join"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "sync",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 19,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000009,
+      "instance_key": 20,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 17,
+      "process_id": "dup",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 21,
+      "instance_key": 20
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 20,
+      "to": "fork"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "fork",
+      "element_instance_key": 22,
+      "instance_key": 20
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 20,
+      "to": "join"
+    }
+  },
+  {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 1
+      },
+      "instance_key": 20
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 20,
+      "to": "join"
+    }
+  },
+  {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 0
+      },
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ParallelJoinFired": {
+      "element_id": "join",
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "join",
+      "element_instance_key": 23,
+      "instance_key": 20
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "join",
+      "instance_key": 20,
+      "to": "e"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "e",
+      "element_instance_key": 24,
+      "instance_key": 20
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 20
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000010,
+      "instance_key": 25,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 19,
+      "process_id": "sync",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 26,
+      "instance_key": 25
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 25,
+      "to": "fork"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "fork",
+      "element_instance_key": 27,
+      "instance_key": 25
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 25,
+      "to": "join"
+    }
+  },
+  {
+    "ParallelJoinTokenArrived": {
+      "element_id": "join",
+      "flow": {
+        "from": "fork",
+        "ordinal": 0
+      },
+      "instance_key": 25
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "fork",
+      "instance_key": 25,
+      "to": "t"
+    }
+  },
+  {
+    "ParallelJoinOpened": {
+      "element_id": "join",
+      "element_instance_key": 28,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "t",
+      "element_instance_key": 29,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "t",
+      "element_instance_key": 29,
+      "instance_key": 25,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000010,
+      "element_id": "t",
+      "element_instance_key": 29,
+      "instance_key": 25,
+      "job_key": 30,
+      "job_type": "sync-task",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 31
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 31,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "book": {
+            "end_listeners": [],
+            "id": "book",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "Task",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "throw"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "book-comp": {
+            "end_listeners": [],
+            "id": "book-comp",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "CompensationBoundaryEvent": {
+                "attached_to": "book",
+                "handler": "cancel"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "cancel": {
+            "end_listeners": [],
+            "id": "cancel",
+            "io": {
+              "inputs": [
+                {
+                  "source": "= missing_var",
+                  "target": "mapped"
+                }
+              ],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "cancel-job",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "done": {
+            "end_listeners": [],
+            "id": "done",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "book"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "throw": {
+            "end_listeners": [],
+            "id": "throw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "CompensationThrowEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "done"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "trip",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 32,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000011,
+      "instance_key": 33,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 32,
+      "process_id": "trip",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 34,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 34,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 34,
+      "instance_key": 33
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 34,
+      "instance_key": 33
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 33,
+      "to": "book"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book",
+      "element_instance_key": 35,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book",
+      "element_instance_key": 35,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book",
+      "element_instance_key": 35,
+      "instance_key": 33
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book",
+      "element_instance_key": 35,
+      "instance_key": 33
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "book",
+      "element_instance_key": 35,
+      "handler": "cancel",
+      "instance_key": 33,
+      "scope": 0,
+      "scope_subscription": false
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "book",
+      "instance_key": 33,
+      "to": "throw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "throw",
+      "element_instance_key": 36,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "throw",
+      "element_instance_key": 36,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "CompensationTriggered": {
+      "consumed": [
+        35
+      ],
+      "handler_instance_keys": [
+        38
+      ],
+      "handler_scopes": [
+        0
+      ],
+      "handlers": [
+        "cancel"
+      ],
+      "instance_key": 33,
+      "scope": 0,
+      "scope_subscription_parents": [],
+      "scope_subscriptions": [],
+      "throw_element_id": "throw",
+      "throw_element_instance_key": 36
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book-comp",
+      "element_instance_key": 37,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book-comp",
+      "element_instance_key": 37,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book-comp",
+      "element_instance_key": 37,
+      "instance_key": 33
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book-comp",
+      "element_instance_key": 37,
+      "instance_key": 33
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "cancel",
+      "element_instance_key": 38,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "cancel",
+      "element_instance_key": 38,
+      "instance_key": 33,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 33,
+      "parent_scope_key": 0,
+      "scope_key": 38
+    }
+  },
+  {
+    "ScopedVariablesUpdated": {
+      "instance_key": 33,
+      "scope_key": 38,
+      "variables": {
+        "mapped": "Null"
+      }
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000011,
+      "element_id": "cancel",
+      "element_instance_key": 38,
+      "instance_key": 33,
+      "job_key": 39,
+      "job_type": "cancel-job",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 40
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 40,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "book": {
+            "end_listeners": [],
+            "id": "book",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "Task",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub_end"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "book-comp": {
+            "end_listeners": [],
+            "id": "book-comp",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "CompensationBoundaryEvent": {
+                "attached_to": "book",
+                "handler": "cancel"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "cancel": {
+            "end_listeners": [],
+            "id": "cancel",
+            "io": {
+              "inputs": [
+                {
+                  "source": "= missing_var",
+                  "target": "mapped"
+                }
+              ],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "whole-cancel-job",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "done": {
+            "end_listeners": [],
+            "id": "done",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub": {
+            "end_listeners": [],
+            "id": "sub",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "SubProcess": {
+                "start_event": "sub_start"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "throw"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_end": {
+            "end_listeners": [],
+            "id": "sub_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_start": {
+            "end_listeners": [],
+            "id": "sub_start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "book"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "throw": {
+            "end_listeners": [],
+            "id": "throw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "CompensationThrowEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "done"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "whole",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 41,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000013,
+      "instance_key": 42,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 41,
+      "process_id": "whole",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 43,
+      "instance_key": 42
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 42,
+      "to": "sub"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub",
+      "element_instance_key": 44,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub",
+      "element_instance_key": 44,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 42,
+      "parent_scope_key": 0,
+      "scope_key": 44
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_start",
+      "element_instance_key": 45,
+      "instance_key": 42,
+      "scope": 44
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_start",
+      "element_instance_key": 45,
+      "instance_key": 42,
+      "scope": 44
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_start",
+      "element_instance_key": 45,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_start",
+      "element_instance_key": 45,
+      "instance_key": 42
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub_start",
+      "instance_key": 42,
+      "to": "book"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book",
+      "element_instance_key": 46,
+      "instance_key": 42,
+      "scope": 44
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book",
+      "element_instance_key": 46,
+      "instance_key": 42,
+      "scope": 44
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book",
+      "element_instance_key": 46,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book",
+      "element_instance_key": 46,
+      "instance_key": 42
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "book",
+      "element_instance_key": 46,
+      "handler": "cancel",
+      "instance_key": 42,
+      "scope": 44,
+      "scope_subscription": false
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "book",
+      "instance_key": 42,
+      "to": "sub_end"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_end",
+      "element_instance_key": 47,
+      "instance_key": 42,
+      "scope": 44
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_end",
+      "element_instance_key": 47,
+      "instance_key": 42,
+      "scope": 44
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_end",
+      "element_instance_key": 47,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_end",
+      "element_instance_key": 47,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub",
+      "element_instance_key": 44,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub",
+      "element_instance_key": 44,
+      "instance_key": 42
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "sub",
+      "element_instance_key": 44,
+      "handler": "",
+      "instance_key": 42,
+      "scope": 0,
+      "scope_subscription": true
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub",
+      "instance_key": 42,
+      "to": "throw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "throw",
+      "element_instance_key": 48,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "throw",
+      "element_instance_key": 48,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "CompensationTriggered": {
+      "consumed": [
+        44,
+        46
+      ],
+      "handler_instance_keys": [
+        50
+      ],
+      "handler_scopes": [
+        44
+      ],
+      "handlers": [
+        "cancel"
+      ],
+      "instance_key": 42,
+      "scope": 0,
+      "scope_subscription_parents": [
+        0
+      ],
+      "scope_subscriptions": [
+        44
+      ],
+      "throw_element_id": "throw",
+      "throw_element_instance_key": 48
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book-comp",
+      "element_instance_key": 49,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book-comp",
+      "element_instance_key": 49,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book-comp",
+      "element_instance_key": 49,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book-comp",
+      "element_instance_key": 49,
+      "instance_key": 42
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "cancel",
+      "element_instance_key": 50,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "cancel",
+      "element_instance_key": 50,
+      "instance_key": 42,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 42,
+      "parent_scope_key": 0,
+      "scope_key": 50
+    }
+  },
+  {
+    "ScopedVariablesUpdated": {
+      "instance_key": 42,
+      "scope_key": 50,
+      "variables": {
+        "mapped": "Null"
+      }
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000013,
+      "element_id": "cancel",
+      "element_instance_key": 50,
+      "instance_key": 42,
+      "job_key": 51,
+      "job_type": "whole-cancel-job",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 52
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 52,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "book": {
+            "end_listeners": [],
+            "id": "book",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "Task",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub_end"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "book-comp": {
+            "end_listeners": [],
+            "id": "book-comp",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "CompensationBoundaryEvent": {
+                "attached_to": "book",
+                "handler": "cancel"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "cancel": {
+            "end_listeners": [],
+            "id": "cancel",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "Task",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "done": {
+            "end_listeners": [],
+            "id": "done",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "sub"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub": {
+            "end_listeners": [],
+            "id": "sub",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "SubProcess": {
+                "start_event": "sub_start"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "throw"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_end": {
+            "end_listeners": [],
+            "id": "sub_end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "sub_start": {
+            "end_listeners": [],
+            "id": "sub_start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "book"
+              }
+            ],
+            "parent": "sub",
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "throw": {
+            "end_listeners": [],
+            "id": "throw",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "CompensationThrowEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "done"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "whole-done",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 53,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000015,
+      "instance_key": 54,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 53,
+      "process_id": "whole-done",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 55,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 55,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 55,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 55,
+      "instance_key": 54
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 54,
+      "to": "sub"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub",
+      "element_instance_key": 56,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub",
+      "element_instance_key": 56,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "VariableScopeCreated": {
+      "instance_key": 54,
+      "parent_scope_key": 0,
+      "scope_key": 56
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_start",
+      "element_instance_key": 57,
+      "instance_key": 54,
+      "scope": 56
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_start",
+      "element_instance_key": 57,
+      "instance_key": 54,
+      "scope": 56
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_start",
+      "element_instance_key": 57,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_start",
+      "element_instance_key": 57,
+      "instance_key": 54
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub_start",
+      "instance_key": 54,
+      "to": "book"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book",
+      "element_instance_key": 58,
+      "instance_key": 54,
+      "scope": 56
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book",
+      "element_instance_key": 58,
+      "instance_key": 54,
+      "scope": 56
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book",
+      "element_instance_key": 58,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book",
+      "element_instance_key": 58,
+      "instance_key": 54
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "book",
+      "element_instance_key": 58,
+      "handler": "cancel",
+      "instance_key": 54,
+      "scope": 56,
+      "scope_subscription": false
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "book",
+      "instance_key": 54,
+      "to": "sub_end"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "sub_end",
+      "element_instance_key": 59,
+      "instance_key": 54,
+      "scope": 56
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "sub_end",
+      "element_instance_key": 59,
+      "instance_key": 54,
+      "scope": 56
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub_end",
+      "element_instance_key": 59,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub_end",
+      "element_instance_key": 59,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "sub",
+      "element_instance_key": 56,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "sub",
+      "element_instance_key": 56,
+      "instance_key": 54
+    }
+  },
+  {
+    "CompensationSubscriptionCreated": {
+      "element_id": "sub",
+      "element_instance_key": 56,
+      "handler": "",
+      "instance_key": 54,
+      "scope": 0,
+      "scope_subscription": true
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "sub",
+      "instance_key": 54,
+      "to": "throw"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "throw",
+      "element_instance_key": 60,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "throw",
+      "element_instance_key": 60,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "CompensationTriggered": {
+      "consumed": [
+        56,
+        58
+      ],
+      "handler_instance_keys": [
+        62
+      ],
+      "handler_scopes": [
+        56
+      ],
+      "handlers": [
+        "cancel"
+      ],
+      "instance_key": 54,
+      "scope": 0,
+      "scope_subscription_parents": [
+        0
+      ],
+      "scope_subscriptions": [
+        56
+      ],
+      "throw_element_id": "throw",
+      "throw_element_instance_key": 60
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "book-comp",
+      "element_instance_key": 61,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "book-comp",
+      "element_instance_key": 61,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "book-comp",
+      "element_instance_key": 61,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "book-comp",
+      "element_instance_key": 61,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "cancel",
+      "element_instance_key": 62,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "cancel",
+      "element_instance_key": 62,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "cancel",
+      "element_instance_key": 62,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "cancel",
+      "element_instance_key": 62,
+      "instance_key": 54
+    }
+  },
+  {
+    "CompensationHandlerCompleted": {
+      "handler_element_id": "cancel",
+      "handler_element_instance_key": 62,
+      "instance_key": 54,
+      "throw_element_instance_key": 60
+    }
+  },
+  {
+    "CompensationScopeSubscriptionCompleted": {
+      "instance_key": 54,
+      "scope_subscription_key": 56,
+      "throw_element_instance_key": 60
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "throw",
+      "element_instance_key": 60,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "throw",
+      "element_instance_key": 60,
+      "instance_key": 54
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "throw",
+      "instance_key": 54,
+      "to": "done"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "done",
+      "element_instance_key": 63,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "done",
+      "element_instance_key": 63,
+      "instance_key": 54,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "done",
+      "element_instance_key": 63,
+      "instance_key": 54
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "done",
+      "element_instance_key": 63,
+      "instance_key": 54
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 54
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 64
+    }
+  },
+  {
+    "DecisionRequirementsDeployed": {
+      "decision_requirements_key": 65,
+      "deployment_key": 64,
+      "drg": {
+        "decisions": [
+          {
+            "id": "base",
+            "logic": {
+              "LiteralExpression": "\"b\""
+            },
+            "name": "Base",
+            "required_decisions": [],
+            "variable_name": null
+          },
+          {
+            "id": "root",
+            "logic": {
+              "DecisionTable": {
+                "aggregation": null,
+                "hit_policy": "Unique",
+                "inputs": [
+                  {
+                    "expression": "lang",
+                    "id": "ri",
+                    "label": null,
+                    "type_ref": "string"
+                  }
+                ],
+                "outputs": [
+                  {
+                    "id": "ro",
+                    "label": null,
+                    "name": "result",
+                    "output_values": [],
+                    "type_ref": "string"
+                  }
+                ],
+                "rules": [
+                  {
+                    "id": "r1",
+                    "input_entries": [
+                      "\"xx\""
+                    ],
+                    "output_entries": [
+                      "\"a\""
+                    ]
+                  },
+                  {
+                    "id": "r2",
+                    "input_entries": [
+                      "\"xx\""
+                    ],
+                    "output_entries": [
+                      "\"b\""
+                    ]
+                  },
+                  {
+                    "id": "r3",
+                    "input_entries": [
+                      "not(\"xx\")"
+                    ],
+                    "output_entries": [
+                      "base"
+                    ]
+                  }
+                ]
+              }
+            },
+            "name": "Root",
+            "required_decisions": [
+              "base"
+            ],
+            "variable_name": null
+          }
+        ],
+        "id": "greet",
+        "name": "greet",
+        "namespace": "",
+        "xml": "<definitions xmlns=\"https://www.omg.org/spec/DMN/20191111/MODEL/\" id=\"greet\" name=\"greet\">\n      <decision id=\"base\" name=\"Base\">\n        <literalExpression id=\"bl\"><text>\"b\"</text></literalExpression>\n      </decision>\n      <decision id=\"root\" name=\"Root\">\n        <informationRequirement id=\"ir\"><requiredDecision href=\"#base\" /></informationRequirement>\n        <decisionTable hitPolicy=\"UNIQUE\">\n          <input id=\"ri\"><inputExpression id=\"re\" typeRef=\"string\"><text>lang</text></inputExpression></input>\n          <output id=\"ro\" name=\"result\" typeRef=\"string\" />\n          <rule id=\"r1\"><inputEntry id=\"rie1\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe1\"><text>\"a\"</text></outputEntry></rule>\n          <rule id=\"r2\"><inputEntry id=\"rie2\"><text>\"xx\"</text></inputEntry>\n            <outputEntry id=\"roe2\"><text>\"b\"</text></outputEntry></rule>\n          <rule id=\"r3\"><inputEntry id=\"rie3\"><text>not(\"xx\")</text></inputEntry>\n            <outputEntry id=\"roe3\"><text>base</text></outputEntry></rule>\n        </decisionTable>\n      </decision>\n    </definitions>"
+      },
+      "version": 1
+    }
+  },
+  {
+    "DecisionDeployed": {
+      "decision_id": "base",
+      "decision_key": 66,
+      "decision_name": "Base",
+      "decision_requirements_key": 65,
+      "deployment_key": 64,
+      "version": 1
+    }
+  },
+  {
+    "DecisionDeployed": {
+      "decision_id": "root",
+      "decision_key": 67,
+      "decision_name": "Root",
+      "decision_requirements_key": 65,
+      "deployment_key": 64,
+      "version": 1
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 68
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 68,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "brt": {
+            "end_listeners": [],
+            "id": "brt",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "BusinessRuleTask": {
+                "decision_id": "root",
+                "result_variable": "out"
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "e"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "e": {
+            "end_listeners": [],
+            "id": "e",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "s": {
+            "end_listeners": [],
+            "id": "s",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "brt"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "decide",
+        "name": null,
+        "start_event": "s",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 69,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000012,
+      "instance_key": 70,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 69,
+      "process_id": "decide",
+      "tags": [],
+      "variables": {
+        "lang": {
+          "Str": "de"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 71,
+      "instance_key": 70,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 71,
+      "instance_key": 70,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 71,
+      "instance_key": 70
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 71,
+      "instance_key": 70
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 70,
+      "to": "brt"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "brt",
+      "element_instance_key": 72,
+      "instance_key": 70,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "brt",
+      "element_instance_key": 72,
+      "instance_key": 70,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "brt",
+      "element_instance_key": 72,
+      "instance_key": 70
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "brt",
+      "element_instance_key": 72,
+      "instance_key": 70
+    }
+  },
+  {
+    "DecisionEvaluated": {
+      "decision_evaluation_key": 73,
+      "decision_id": "root",
+      "decision_key": 67,
+      "decision_output": {
+        "Str": "b"
+      },
+      "decision_requirements_id": "greet",
+      "decision_requirements_key": 65,
+      "element_id": "brt",
+      "element_instance_key": 72,
+      "evaluated_at": 1700000000012,
+      "evaluated_decisions": [
+        {
+          "decision_id": "base",
+          "decision_key": 66,
+          "decision_name": "Base",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "LiteralExpression",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        },
+        {
+          "decision_id": "root",
+          "decision_key": 67,
+          "decision_name": "Root",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "DecisionTable",
+          "decision_version": 1,
+          "evaluated_inputs": [
+            {
+              "input_id": "ri",
+              "input_name": null,
+              "input_value": {
+                "Str": "de"
+              }
+            }
+          ],
+          "matched_rules": [
+            {
+              "evaluated_outputs": [
+                {
+                  "output_id": "ro",
+                  "output_name": "result",
+                  "output_value": {
+                    "Str": "b"
+                  }
+                }
+              ],
+              "rule_id": "r3",
+              "rule_index": 3
+            }
+          ]
+        }
+      ],
+      "failure": null,
+      "instance_key": 70
+    }
+  },
+  {
+    "VariablesUpdated": {
+      "instance_key": 70,
+      "variables": {
+        "out": {
+          "Str": "b"
+        }
+      }
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "brt",
+      "instance_key": 70,
+      "to": "e"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "e",
+      "element_instance_key": 74,
+      "instance_key": 70,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "e",
+      "element_instance_key": 74,
+      "instance_key": 70,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "e",
+      "element_instance_key": 74,
+      "instance_key": 70
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "e",
+      "element_instance_key": 74,
+      "instance_key": 70
+    }
+  },
+  {
+    "ProcessInstanceCompleted": {
+      "instance_key": 70
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000013,
+      "instance_key": 75,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 69,
+      "process_id": "decide",
+      "tags": [],
+      "variables": {
+        "lang": {
+          "Str": "xx"
+        }
+      },
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "s",
+      "element_instance_key": 76,
+      "instance_key": 75,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "s",
+      "element_instance_key": 76,
+      "instance_key": 75,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "s",
+      "element_instance_key": 76,
+      "instance_key": 75
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "s",
+      "element_instance_key": 76,
+      "instance_key": 75
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "s",
+      "instance_key": 75,
+      "to": "brt"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "brt",
+      "element_instance_key": 77,
+      "instance_key": 75,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "brt",
+      "element_instance_key": 77,
+      "instance_key": 75,
+      "scope": 0
+    }
+  },
+  {
+    "DecisionEvaluated": {
+      "decision_evaluation_key": 78,
+      "decision_id": "root",
+      "decision_key": 67,
+      "decision_output": "Null",
+      "decision_requirements_id": "greet",
+      "decision_requirements_key": 65,
+      "element_id": "brt",
+      "element_instance_key": 77,
+      "evaluated_at": 1700000000013,
+      "evaluated_decisions": [
+        {
+          "decision_id": "base",
+          "decision_key": 66,
+          "decision_name": "Base",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "LiteralExpression",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        },
+        {
+          "decision_id": "root",
+          "decision_key": 67,
+          "decision_name": "Root",
+          "decision_output": "Null",
+          "decision_type": "DecisionTable",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        }
+      ],
+      "failure": {
+        "failed_decision_id": "root",
+        "message": "hit policy UNIQUE requires at most one matching rule, but 2 rules matched"
+      },
+      "instance_key": 75
+    }
+  },
+  {
+    "IncidentRaised": {
+      "created_at": 1700000000013,
+      "element_id": "brt",
+      "element_instance_key": 77,
+      "incident_key": 79,
+      "instance_key": 75,
+      "job_key": null,
+      "kind": "DecisionEvaluation",
+      "reason": "failed to evaluate decision 'root' at business rule task 'brt': hit policy UNIQUE requires at most one matching rule, but 2 rules matched",
+      "redrive": null
+    }
+  },
+  {
+    "DecisionEvaluated": {
+      "decision_evaluation_key": 80,
+      "decision_id": "root",
+      "decision_key": 67,
+      "decision_output": {
+        "Str": "b"
+      },
+      "decision_requirements_id": "greet",
+      "decision_requirements_key": 65,
+      "element_id": "",
+      "element_instance_key": 0,
+      "evaluated_at": 1700000000014,
+      "evaluated_decisions": [
+        {
+          "decision_id": "base",
+          "decision_key": 66,
+          "decision_name": "Base",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "LiteralExpression",
+          "decision_version": 1,
+          "evaluated_inputs": [],
+          "matched_rules": []
+        },
+        {
+          "decision_id": "root",
+          "decision_key": 67,
+          "decision_name": "Root",
+          "decision_output": {
+            "Str": "b"
+          },
+          "decision_type": "DecisionTable",
+          "decision_version": 1,
+          "evaluated_inputs": [
+            {
+              "input_id": "ri",
+              "input_name": null,
+              "input_value": {
+                "Str": "en"
+              }
+            }
+          ],
+          "matched_rules": [
+            {
+              "evaluated_outputs": [
+                {
+                  "output_id": "ro",
+                  "output_name": "result",
+                  "output_value": {
+                    "Str": "b"
+                  }
+                }
+              ],
+              "rule_id": "r3",
+              "rule_index": 3
+            }
+          ]
+        }
+      ],
+      "failure": null,
+      "instance_key": 0
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000015,
+      "instance_key": 81,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 82,
+      "instance_key": 81,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 82,
+      "instance_key": 81,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 82,
+      "instance_key": 81
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 82,
+      "instance_key": 81
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 81,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 83,
+      "instance_key": 81,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 83,
+      "instance_key": 81,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000015,
+      "element_id": "charge",
+      "element_instance_key": 83,
+      "instance_key": 81,
+      "job_key": 84,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "JobActivated": {
+      "activated_at": 1700000000016,
+      "deadline": 1700000030016,
+      "durable": true,
+      "instance_key": 81,
+      "job_key": 84,
+      "worker": "worker-3"
+    }
+  },
+  {
+    "JobErrorThrown": {
+      "error_code": "CARD_DECLINED",
+      "error_message": "card declined",
+      "instance_key": 81,
+      "job_key": 84,
+      "worker": "worker-3"
+    }
+  },
+  {
+    "IncidentRaised": {
+      "created_at": 1700000000017,
+      "element_id": "charge",
+      "element_instance_key": 83,
+      "incident_key": 85,
+      "instance_key": 81,
+      "job_key": null,
+      "kind": "UnhandledError",
+      "reason": "unhandled BPMN error 'CARD_DECLINED': card declined",
+      "redrive": null
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000018,
+      "instance_key": 86,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 87,
+      "instance_key": 86,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 87,
+      "instance_key": 86,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 87,
+      "instance_key": 86
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 87,
+      "instance_key": 86
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 86,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 88,
+      "instance_key": 86,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 88,
+      "instance_key": 86,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000018,
+      "element_id": "charge",
+      "element_instance_key": 88,
+      "instance_key": 86,
+      "job_key": 89,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "DeploymentCreated": {
+      "deployment_key": 90
+    }
+  },
+  {
+    "ProcessDeployed": {
+      "deployment_key": 90,
+      "process": {
+        "adhoc": [],
+        "elements": {
+          "charge2": {
+            "end_listeners": [],
+            "id": "charge2",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": {
+              "ServiceTask": {
+                "custom_headers": {},
+                "job_type": "payment",
+                "linked_resources": [],
+                "priority": null
+              }
+            },
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "end"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "end": {
+            "end_listeners": [],
+            "id": "end",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "EndEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          },
+          "start": {
+            "end_listeners": [],
+            "id": "start",
+            "io": {
+              "inputs": [],
+              "outputs": []
+            },
+            "kind": "StartEvent",
+            "multi_instance": null,
+            "name": null,
+            "outgoing": [
+              {
+                "condition": null,
+                "is_default": false,
+                "to": "charge2"
+              }
+            ],
+            "parent": null,
+            "retries": null,
+            "start_listeners": [],
+            "task_listeners": [],
+            "timer": null
+          }
+        },
+        "id": "order-v2",
+        "name": null,
+        "start_event": "start",
+        "start_form_id": null,
+        "xml": ""
+      },
+      "process_definition_key": 91,
+      "version": 1
+    }
+  },
+  {
+    "ProcessInstanceMigrated": {
+      "child_instances": [],
+      "element_mappings": [
+        [
+          "charge",
+          "charge2"
+        ]
+      ],
+      "instance_key": 86,
+      "migrated_flow_scopes": [],
+      "subscriptions": [],
+      "target_process_definition_key": 91,
+      "target_process_id": "order-v2"
+    }
+  },
+  {
+    "ProcessInstanceCreated": {
+      "business_id": null,
+      "created_at": 1700000000022,
+      "instance_key": 92,
+      "parent_element_instance_key": null,
+      "parent_process_instance_key": null,
+      "process_definition_key": 2,
+      "process_id": "order",
+      "tags": [],
+      "variables": {},
+      "version": 1
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "ElementCompleting": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92
+    }
+  },
+  {
+    "ElementCompleted": {
+      "element_id": "start",
+      "element_instance_key": 93,
+      "instance_key": 92
+    }
+  },
+  {
+    "SequenceFlowTaken": {
+      "from": "start",
+      "instance_key": 92,
+      "to": "charge"
+    }
+  },
+  {
+    "ElementActivating": {
+      "element_id": "charge",
+      "element_instance_key": 94,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "ElementActivated": {
+      "element_id": "charge",
+      "element_instance_key": 94,
+      "instance_key": 92,
+      "scope": 0
+    }
+  },
+  {
+    "JobCreated": {
+      "created_at": 1700000000022,
+      "element_id": "charge",
+      "element_instance_key": 94,
+      "instance_key": 92,
+      "job_key": 95,
+      "job_type": "payment",
+      "priority": 50,
+      "retries": 3
+    }
+  },
+  {
+    "IncidentRaised": {
+      "created_at": 1700000000023,
+      "element_id": "order",
+      "element_instance_key": 92,
+      "incident_key": 96,
+      "instance_key": 92,
+      "job_key": null,
+      "kind": "VariablesLost",
+      "reason": "variables lost: spill row missing",
+      "redrive": null
+    }
+  }
+]

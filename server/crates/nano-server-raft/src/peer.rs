@@ -341,12 +341,14 @@ impl PeerLink {
         &self,
         partition: u64,
         leases: Vec<(u64, u64)>,
+        workers: Vec<(u64, String)>,
         sent_at: u64,
     ) -> Result<(), PeerError> {
         self.send_oneway(ClientFrame::LeaseDigest {
             partition,
             leases,
             sent_at,
+            workers,
         })
         .await
     }

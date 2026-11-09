@@ -1819,11 +1819,12 @@ async fn handle_client_frame(
             partition,
             leases,
             sent_at,
+            workers,
         } => {
             // Best-effort soft lease digest from this partition's current leader.
             // Store it; on promotion this node recovers the leases (see the tick
             // driver). Fire-and-forget: no reply.
-            server.record_lease_digest(partition, leases, sent_at);
+            server.record_lease_digest(partition, leases, workers, sent_at);
         }
         ClientFrame::RetirementDigest { partition, keys } => {
             // Best-effort retirement digest from this partition's leader: drop the

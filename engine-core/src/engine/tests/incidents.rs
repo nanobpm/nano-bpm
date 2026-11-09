@@ -605,6 +605,8 @@ fn top_level_terminate_end_resolves_a_root_scope_incident_and_completes() {
     assert!(events.contains(&Event::JobCanceled {
         job_key: work_job,
         instance_key: key,
+        canceled_at: 0,
+        deadline: None,
     }));
     assert!(events
         .iter()

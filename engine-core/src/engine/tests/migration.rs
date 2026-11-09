@@ -40,6 +40,8 @@ fn modify_terminates_one_element_and_activates_another() {
     assert!(events.contains(&Event::JobCanceled {
         job_key: job_a,
         instance_key: inst,
+        canceled_at: 0,
+        deadline: None,
     }));
     assert_eq!(engine.job(job_a).unwrap().state, state::JobState::Canceled);
     // The instance stays active, now with a token (and fresh job) on `b`.
@@ -93,6 +95,8 @@ fn modify_terminating_the_last_token_terminates_the_instance() {
     assert!(events.contains(&Event::JobCanceled {
         job_key: job,
         instance_key: inst,
+        canceled_at: 0,
+        deadline: None,
     }));
     assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key: inst }));
     assert!(!events

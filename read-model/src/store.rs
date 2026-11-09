@@ -1059,6 +1059,14 @@ fn now_ms() -> u64 {
 /// `(0, 0)`; execution-listener jobs store `(1, start=0/end=1)`; task-listener
 /// jobs store `(2, creating=0/assigning=1/updating=2/completing=3/canceling=4)`.
 /// The listener index/scope are not projected.
+/// The record instant of a terminal job event (#1440): the engine's command
+/// instant when the event carries one, else (a pre-field record, `0`) the batch
+/// observation time. Shared by both terminal projectors so the live projection
+/// and a snapshot reseed (`Job::terminal_end`) derive `endTime` identically.
+fn terminal_instant(event_at: u64, now_ms: u64) -> u64 {
+    if event_at != 0 { event_at } else { now_ms }
+}
+
 fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
     match kind {
         JobKind::BpmnElement => (0, 0),
@@ -4149,27 +4157,34 @@ fn project_engine_state(
     for job in state.jobs.values() {
         let (def_id, def_key) = instance_def(tx, job.instance_key);
         let (kind_code, event_code) = job_kind_codes(&job.kind);
-        // Timing (#1344): a snapshotted job is USUALLY live — a terminal job is
-        // evicted from engine state together with its owning instance — so
-        // `end_ms` stays NULL and `last_update_ms` seeds from the creation
+        // Timing (#1344, #1440): a snapshotted job is USUALLY live — a terminal
+        // job is evicted from engine state together with its owning instance —
+        // so `end_ms` stays NULL and `last_update_ms` seeds from the creation
         // instant, the best lower bound available without the per-event
-        // history, matching `creationTime <= lastUpdateTime`. KNOWN LIMITATION
-        // (#1346 review): the engine drops a job only when its owning INSTANCE
-        // goes terminal (`evict_instance`), so a parallel/multi-instance
-        // process can be snapshotted with a COMPLETED/CANCELED job whose
-        // sibling branch is still active. Such a job is seeded here as
-        // terminal with `end_ms = NULL` and `last_update_ms = creation_ms`,
-        // and its retained deadline is already gone from engine state
-        // (`JobCompleted` clears `Job::deadline`) — the terminal timing and
-        // deadline are event-derived and not recoverable from a snapshot.
-        // Pinned by
-        // `seed_from_engine_state_cannot_recover_terminal_job_timing`; the
-        // fix needs engine-retained terminal timing (#1440) — a reseed has no
-        // events to order, so the #1347 durable position cannot recover it.
+        // history, matching `creationTime <= lastUpdateTime`. But the engine
+        // drops a job only when its owning INSTANCE goes terminal, so a
+        // parallel/multi-instance process can be snapshotted with a
+        // COMPLETED/CANCELED job whose sibling branch is still active. For such
+        // a job the engine retains the terminal transition's instant and the
+        // deadline it held (`Job::terminal_end`, #1440): seed `end_ms` and
+        // `last_update_ms` from that instant and `deadline_ms` from the retained
+        // deadline — exactly what the event-driven `JobCompleted`/`JobCanceled`
+        // projection writes (the first terminal transition stamps `end_ms` and
+        // keeps the last projected deadline). A reseed has no events to order,
+        // so this engine-retained state is the only source (the #1347 durable
+        // position cannot recover it).
         // On a CONFLICT we deliberately do NOT overwrite `created_at_ms` /
         // `last_update_ms` / `end_ms`: an existing read-model row already
         // carries the authoritative event-derived values, which a
-        // compaction-floor reseed must not clobber. Seed `created_at_ms` with
+        // compaction-floor reseed must not clobber — with ONE exception: when
+        // the existing row has NO terminal instant (`end_ms IS NULL`) and the
+        // snapshot carries one, the upsert accepts the snapshot's `end_ms` and
+        // must move `last_update_ms` to that same instant (the terminal
+        // transition IS the last update). Leaving `last_update_ms` at the
+        // pre-terminal value would surface a stale `lastUpdateTime` that no
+        // later terminal-event delivery can repair (the terminal projection is
+        // `end_ms`-guarded, so it is a no-op once `end_ms` is set). When an
+        // end time already exists, both values are preserved. Seed `created_at_ms` with
         // the SAME batch-observation fallback as `last_update_ms` when the
         // snapshot predates `created_at` (legacy `0`), so a recovered legacy
         // job surfaces a non-null `creationTime` (== `lastUpdateTime`) rather
@@ -4189,26 +4204,36 @@ fn project_engine_state(
         // with `last_update_ms > created_at_ms` — is covered by
         // `replayed_activation_is_held_on_a_non_fresh_row`.) On CONFLICT the
         // floor is never lowered.
+        let terminal_end = job.terminal_end;
+        let end_ms = terminal_end.map(|t| t.at);
+        // Unknown (legacy `0`) creation falls back to the retained terminal
+        // instant when there is one — never the later batch time, which would
+        // put `creationTime` after `endTime` — else to the batch time.
         let last_update = if job.created_at != 0 {
             job.created_at
         } else {
-            now_ms
+            end_ms.unwrap_or(now_ms)
         };
         let creation_ms = last_update;
+        let last_update = end_ms.unwrap_or(last_update);
+        let deadline = job.deadline.or(terminal_end.and_then(|t| t.deadline));
         let replay_floor = job.created_at.max(job.activated_at.unwrap_or(0));
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
              job_kind, listener_event_type, lease_token, error_message, error_code, \
              has_failed_with_retries_left, created_at_ms, last_update_ms, business_id, \
-             last_event_identity_ms) \
+             last_event_identity_ms, end_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2), ?20) \
+             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2), ?20, ?21) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
              worker = excluded.worker, deadline_ms = excluded.deadline_ms, \
              lease_token = excluded.lease_token, error_message = excluded.error_message, \
              error_code = excluded.error_code, \
              has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
+             end_ms = COALESCE(jobs.end_ms, excluded.end_ms), \
+             last_update_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
+                 THEN excluded.last_update_ms ELSE jobs.last_update_ms END, \
              last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
             params![
                 job.key as i64,
@@ -4226,7 +4251,7 @@ fn project_engine_state(
                 // capture is now `None`) would preserve the empty string and pin
                 // the row to a bogus empty worker (#1191).
                 worker_attribution(job.worker.as_deref()),
-                job.deadline.map(|d| d as i64),
+                deadline.map(|d| d as i64),
                 def_id,
                 def_key,
                 kind_code,
@@ -4241,6 +4266,7 @@ fn project_engine_state(
                 creation_ms as i64,
                 last_update as i64,
                 replay_floor as i64,
+                end_ms.map(|e| e as i64),
             ],
         )?;
     }
@@ -5593,7 +5619,11 @@ fn project_event(
         }
 
         Event::JobCompleted {
-            job_key, worker, ..
+            job_key,
+            worker,
+            completed_at,
+            deadline,
+            ..
         } => {
             // Set `worker` from the event so a *successful* completion is
             // attributable to the activating worker on the read-model
@@ -5607,18 +5637,44 @@ fn project_event(
             // AgentInstance) attributable via the
             // `AgentInstance.jobKey → completed Job.worker` join.
             //
-            // Timing (#1344): stamp `lastUpdateTime` and `endTime` from the batch
-            // observation time, but only on the first active→terminal transition
+            // Timing (#1344, #1440): stamp `lastUpdateTime` and `endTime` from the
+            // event's command instant (`completed_at`), falling back to the batch
+            // observation time only for a pre-field record (`0`) — the SAME
+            // instant a snapshot reseed seeds (`Job::terminal_end`), so live and
+            // reseeded rows agree. Only on the first active→terminal transition
             // (`end_ms IS NULL`), so a re-delivery is a no-op — mirroring
             // `ElementCompleted`. The deadline is NOT cleared: Camunda keeps the
-            // last projected deadline on a completed job.
+            // last deadline on a completed job; the event carries it (#1440) so a
+            // leader-local activation that was never exported still projects it,
+            // and a pre-field record (`None`) keeps the row's value.
             //
             // Replay safety (#1347): a replayed recovered-then-completed prefix
             // (`[JobFailed, JobRetriesUpdated, IncidentResolved, JobActivated,
             // JobCompleted]`) is held event-by-event by the durable position
             // gate in `project`, so it can no longer clear the retained deadline.
+            //
+            // Deadline authority (#1440): a MODERN record (`completed_at != 0`)
+            // carries the deadline the engine resolved at completion — `None`
+            // INCLUDED. A soft activation followed by an unexported lock change
+            // (`JobTimeoutUpdated`) and an unjournaled soft expiry completes
+            // with `deadline == None`; keeping the row's stale projected
+            // deadline here would diverge from a snapshot reseed, which seeds
+            // `None` from `Job::terminal_end`. So a modern record OVERWRITES
+            // (`?6`); only a pre-field record (`completed_at == 0`, `?5 == 0`)
+            // falls back to keeping the row's value.
+            //
+            // `created_at_ms` is NOT clamped here (#1440 review): the engine
+            // stamps `JobCreated.created_at` and `JobCompleted.completed_at`
+            // from the same wall clock without enforcing monotonicity, so a
+            // backward clock adjustment can leave a GENUINE creation after the
+            // completion instant. Clamping would rewrite that real creation
+            // timestamp and diverge from a snapshot reseed (which preserves
+            // `job.created_at`). The projection therefore keeps the recorded
+            // creation, matching the reseed; a single backward-clock policy for
+            // BOTH paths is part of the #963 follow-up.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
+                 deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?5 THEN COALESCE(?6, deadline_ms) ELSE ?6 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
                  WHERE key = ?1",
@@ -5626,25 +5682,38 @@ fn project_event(
                     *job_key as i64,
                     job_state_code(JobState::Completed),
                     worker_attribution(worker.as_deref()),
-                    now_ms as i64,
+                    terminal_instant(*completed_at, now_ms) as i64,
+                    *completed_at == 0,
+                    deadline.map(|d| d as i64),
                 ],
             )?;
         }
 
-        Event::JobCanceled { job_key, .. } => {
+        Event::JobCanceled {
+            job_key,
+            canceled_at,
+            deadline,
+            ..
+        } => {
             // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
-            // Guard on the first terminal transition so a re-delivery is a no-op;
-            // a job that was already FAILED/ERRORED (no `end_ms`) still gets its
-            // cancellation `endTime` here (#1344).
+            // Instant and deadline come from the event exactly as for
+            // `JobCompleted` (#1440) — including the modern-record deadline
+            // authority — and `created_at_ms` is likewise NOT clamped (see
+            // there). Guard on the first terminal transition so a re-delivery
+            // is a no-op; a job that was already FAILED/ERRORED (no `end_ms`)
+            // still gets its cancellation `endTime` here (#1344).
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, \
+                 deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?4 THEN COALESCE(?5, deadline_ms) ELSE ?5 END ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
                  WHERE key = ?1",
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Canceled),
-                    now_ms as i64,
+                    terminal_instant(*canceled_at, now_ms) as i64,
+                    *canceled_at == 0,
+                    deadline.map(|d| d as i64),
                 ],
             )?;
         }
@@ -8156,6 +8225,7 @@ mod definition_xml_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: None,
             },
         );
 
@@ -8344,18 +8414,19 @@ mod definition_xml_tests {
         assert!(store.jobs().into_iter().all(|j| j.key != 9_900));
     }
 
-    /// Defect-class guard (#1346 review): `seed_from_engine_state` cannot recover
-    /// terminal-job timing. The engine drops a job only when its owning INSTANCE
-    /// goes terminal (`evict_instance`), so a parallel process can be snapshotted
-    /// with a COMPLETED job whose sibling branch is still ACTIVE. Seeding that
-    /// snapshot recreates the job as terminal with `end_ms = NULL` and
-    /// `last_update_ms = creation_ms` (and the retained deadline already gone
-    /// from engine state — `JobCompleted` clears `Job::deadline`). This pins the
-    /// current (lossy) behaviour so the gap is explicit and covered; the fix
-    /// needs engine-retained terminal timing (#1440).
+    /// Defect-class guard (#1346 review → fixed by #1440): a snapshot CAN now
+    /// recover terminal-job timing. The engine drops a job only when its owning
+    /// INSTANCE goes terminal (`evict_instance`), so a parallel process can be
+    /// snapshotted with a COMPLETED job whose sibling branch is still ACTIVE.
+    /// The engine retains the terminal transition's instant and the
+    /// last-projected deadline on the job (`Job::terminal_end`, stamped by the
+    /// `JobCompleted`/`JobCanceled` reducer from the event's `completed_at` /
+    /// `canceled_at`), and seeding that snapshot must recreate the row with
+    /// `end_ms`/`last_update_ms` at that instant and the retained deadline —
+    /// exactly what the event-driven projection would have written.
     #[test]
-    fn seed_from_engine_state_cannot_recover_terminal_job_timing() {
-        use nanobpmn_engine_core::{Job, JobKind, ProcessInstance, State};
+    fn seed_from_engine_state_recovers_terminal_job_timing() {
+        use nanobpmn_engine_core::{Job, JobKind, JobTerminalEnd, ProcessInstance, State};
 
         let mut state = State::default();
         // A still-ACTIVE owning instance (a parallel branch is still running)…
@@ -8394,7 +8465,8 @@ mod definition_xml_tests {
         state.instances.insert(7_600, inst);
         // …holding a COMPLETED job (engine kept it: `JobCompleted` only flips
         // `state`; eviction happens with the instance, which is still active).
-        // The engine has already cleared `deadline`/`activated_at` on completion.
+        // The live `deadline`/`activated_at` were cleared on completion, but the
+        // engine retained the terminal instant and the last-projected deadline.
         state.jobs.insert(
             8_600,
             Job {
@@ -8419,11 +8491,32 @@ mod definition_xml_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: Some(JobTerminalEnd {
+                    at: 600,
+                    deadline: Some(70_000),
+                }),
             },
         );
 
+        // A legacy (`created_at == 0`, pre-field snapshot) job that went
+        // terminal after the upgrade: its unknown creation must fall back to
+        // the retained terminal instant, never to the (later) reseed time, or
+        // `creationTime > endTime`.
+        let mut legacy = state.jobs.get(&8_600).unwrap().clone();
+        legacy.key = 8_601;
+        legacy.created_at = 0;
+        state.jobs.insert(8_601, legacy);
+
         let store = ReadStore::open(None).unwrap();
         store.seed_from_engine_state(&state).unwrap();
+
+        let legacy = job_row(&store, 8_601);
+        assert_eq!(legacy.end_ms, Some(600));
+        assert_eq!(
+            legacy.created_at_ms, 600,
+            "unknown creation falls back to the terminal instant, not the reseed time"
+        );
+        assert_eq!(legacy.last_update_ms, Some(600));
 
         let seeded = job_row(&store, 8_600);
         assert_eq!(
@@ -8431,21 +8524,345 @@ mod definition_xml_tests {
             nanobpmn_engine_core::JobState::Completed,
             "the seed projects the snapshotted terminal state"
         );
-        // The lossy gap: no `endTime`, `lastUpdateTime` falls back to creation,
-        // and the retained deadline is gone — none are derivable from a snapshot.
         assert_eq!(
-            seeded.end_ms, None,
-            "a snapshot carries no completion instant, so endTime is unrecoverable"
+            seeded.end_ms,
+            Some(600),
+            "the retained terminal instant recovers endTime"
         );
         assert_eq!(
             seeded.last_update_ms,
-            Some(seeded.created_at_ms),
-            "lastUpdateTime degrades to the creation instant"
+            Some(600),
+            "lastUpdateTime recovers to the terminal instant, not creation"
         );
         assert_eq!(
-            seeded.deadline_ms, None,
-            "the retained deadline is already gone from engine state"
+            seeded.deadline_ms,
+            Some(70_000),
+            "the retained terminal deadline recovers (Camunda keeps it on a completed job)"
         );
+    }
+
+    /// Defect-class guard (#1440) over the whole durability path, not a
+    /// hand-built `State`: drive a REAL engine to one COMPLETED and one
+    /// CANCELED job of a still-active parallel instance, then rebuild the read
+    /// model two ways — (a) event-driven, projecting the journal with each
+    /// batch observed at its command instant, and (b) a compaction-floor
+    /// reseed from the engine snapshot after a serialize → deserialize →
+    /// `Engine::from_snapshot` recovery (and from a journal-replayed engine,
+    /// the crash/restart / follower path). Every terminal job's timing columns
+    /// must be identical across both — the reseed may not lose what the event
+    /// projection would have written.
+    #[test]
+    fn seed_from_engine_snapshot_matches_event_projection_for_terminal_jobs() {
+        use nanobpmn_engine_core::{Command, Engine, EngineSnapshot, ProcessBuilder};
+
+        let def = ProcessBuilder::new("terminal-seed")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("b", "jb")
+            .service_task("c", "jc")
+            .parallel_gateway("join")
+            .end_event("done")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "b")
+            .connect("fork", "c")
+            .connect("a", "join")
+            .connect("b", "join")
+            .connect("c", "join")
+            .connect("join", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        let mut batches: Vec<(Vec<Event>, u64)> = Vec::new();
+        let mut run = |engine: &mut Engine, cmd: Command, now: u64| {
+            let events = engine.apply_command_at(cmd, now).unwrap();
+            batches.push((events.clone(), now));
+            events
+        };
+        run(&mut engine, Command::DeployProcess(def), 1_000);
+        let inst = run(
+            &mut engine,
+            Command::create_instance("terminal-seed"),
+            2_000,
+        )
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+        let key_of = |engine: &Engine, ty: &str| {
+            engine
+                .state()
+                .jobs
+                .values()
+                .find(|j| j.job_type == ty)
+                .unwrap()
+                .key
+        };
+        let (ja, jb) = (key_of(&engine, "ja"), key_of(&engine, "jb"));
+        // DURABLE (leased) activations (#1440): the lock is journaled, so the
+        // terminal deadline is replicated and identical on every replica — the
+        // only case this PR carries a terminal deadline for. A leader-local
+        // (soft) activation records NO terminal deadline (see
+        // `a_soft_terminal_job_recovers_no_deadline`).
+        let lease = |with_lease| nanobpmn_engine_core::JobActivationOptions {
+            fetch_variables: Vec::new(),
+            with_lease,
+        };
+        run(
+            &mut engine,
+            Command::activate_jobs_by_key(vec![ja], "w", 60_000, 3_000, lease(true)),
+            3_000,
+        );
+        run(
+            &mut engine,
+            Command::activate_jobs_by_key(vec![jb], "w", 40_000, 3_500, lease(true)),
+            3_500,
+        );
+        // A leased completion must echo the activation's lease token (#1181).
+        let ja_lease = engine.state().jobs.get(&ja).unwrap().lease_token.clone();
+        run(
+            &mut engine,
+            Command::complete_job(ja).with_lease_token(ja_lease),
+            5_000,
+        );
+        let b_eik = engine.state().jobs.get(&jb).unwrap().element_instance_key;
+        run(
+            &mut engine,
+            Command::modify_instance(inst, vec![], vec![b_eik]),
+            7_000,
+        );
+
+        // (a) Event-driven projection, under every export shape: batches
+        // observed at their command instant AND exported later than it (the
+        // terminal projectors must use the event's instant, not the batch
+        // time), and with/without `JobActivated` exported (a durable lease is
+        // journaled, but the terminal deadline must reach the projection via
+        // the terminal event regardless of export shape).
+        let mut projections = Vec::new();
+        for (lag, soft) in [(0, false), (4_000, false), (0, true), (4_000, true)] {
+            let projected = ReadStore::open(None).unwrap();
+            for (events, now) in &batches {
+                for e in events {
+                    if soft && matches!(e, Event::JobActivated { .. }) {
+                        continue;
+                    }
+                    super::read_surface_tests::apply_at(&projected, e, *now + lag);
+                }
+            }
+            projections.push((format!("lag={lag} soft={soft}"), projected));
+        }
+
+        // (b) Snapshot recovery, from the live engine and from a replayed one
+        // (including a follower whose journal omits the activations).
+        let journal: Vec<Event> = batches.iter().flat_map(|(e, _)| e.clone()).collect();
+        let soft_journal: Vec<Event> = journal
+            .iter()
+            .filter(|e| !matches!(e, Event::JobActivated { .. }))
+            .cloned()
+            .collect();
+        for (path, source) in [
+            ("live", engine.snapshot()),
+            ("replayed", Engine::replay(journal).snapshot()),
+            ("soft-replayed", Engine::replay(soft_journal).snapshot()),
+        ] {
+            let bytes = serde_json::to_vec(&source).unwrap();
+            let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+            let recovered = Engine::from_snapshot(decoded);
+            let seeded = ReadStore::open(None).unwrap();
+            seeded.seed_from_engine_state(recovered.state()).unwrap();
+
+            for ((key, end, deadline), (shape, projected)) in
+                [(ja, 5_000, 63_000), (jb, 7_000, 43_500)]
+                    .into_iter()
+                    .flat_map(|j| projections.iter().map(move |p| (j, p)))
+            {
+                let path = format!("{path} vs {shape}");
+                let want = super::read_surface_tests::job_row(projected, key);
+                let got = super::read_surface_tests::job_row(&seeded, key);
+                assert_eq!(
+                    want.deadline_ms,
+                    Some(deadline),
+                    "{path}: projected deadline"
+                );
+                assert_eq!(got.state, want.state, "{path}: job {key} state");
+                assert_eq!(want.end_ms, Some(end), "{path}: projected endTime");
+                assert_eq!(got.end_ms, want.end_ms, "{path}: job {key} endTime");
+                assert_eq!(
+                    got.last_update_ms, want.last_update_ms,
+                    "{path}: job {key} lastUpdateTime"
+                );
+                assert_eq!(
+                    got.deadline_ms, want.deadline_ms,
+                    "{path}: job {key} retained deadline"
+                );
+            }
+        }
+    }
+
+    /// DOCUMENTED behaviour (#1440, follow-up #963): a leader-local (soft)
+    /// activation is unreplicated by design (ADR 0002), so its deadline is
+    /// replica-local. The engine therefore records NO terminal deadline for a
+    /// soft job (`Job::terminal_end.deadline == None`), and a snapshot reseed
+    /// seeds `deadline_ms = NULL` — matching the event-driven projection of a
+    /// follower that never saw the soft activation. Making terminal metadata
+    /// authoritative for soft jobs is the architectural follow-up in #963; this
+    /// pins the documented absence so a regression re-introducing replica-local
+    /// stamping is caught.
+    #[test]
+    fn a_soft_terminal_job_recovers_no_deadline() {
+        use nanobpmn_engine_core::{Command, Engine, EngineSnapshot, ProcessBuilder};
+
+        let def = ProcessBuilder::new("soft-terminal-seed")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("c", "jc")
+            .parallel_gateway("join")
+            .end_event("done")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "c")
+            .connect("a", "join")
+            .connect("c", "join")
+            .connect("join", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.set_lenient_completion(true);
+        engine
+            .apply_command_at(Command::DeployProcess(def), 1_000)
+            .unwrap();
+        engine
+            .apply_command_at(Command::create_instance("soft-terminal-seed"), 2_000)
+            .unwrap();
+        // Soft activation (`with_lease: false`): leader-local, never journaled.
+        engine
+            .apply_command_at(Command::activate_jobs("ja", "w", 1, 60_000, 3_000), 3_000)
+            .unwrap();
+        let ja = engine
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.job_type == "ja")
+            .unwrap()
+            .key;
+        assert_eq!(
+            engine.job(ja).unwrap().lease_token,
+            None,
+            "soft = unleashed"
+        );
+        engine
+            .apply_command_at(Command::complete_job(ja), 5_000)
+            .unwrap();
+
+        // The engine retains the terminal instant but NO deadline.
+        let terminal_end = engine.job(ja).unwrap().terminal_end.unwrap();
+        assert_eq!(terminal_end.at, 5_000);
+        assert_eq!(terminal_end.deadline, None, "soft job records no deadline");
+
+        // A snapshot reseed recovers the instant and a NULL deadline.
+        let bytes = serde_json::to_vec(&engine.snapshot()).unwrap();
+        let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let recovered = Engine::from_snapshot(decoded);
+        let seeded = ReadStore::open(None).unwrap();
+        seeded.seed_from_engine_state(recovered.state()).unwrap();
+        let row = super::read_surface_tests::job_row(&seeded, ja);
+        assert_eq!(row.end_ms, Some(5_000));
+        assert_eq!(
+            row.deadline_ms, None,
+            "a soft terminal job reseeds with no deadline (#963)"
+        );
+    }
+
+    /// Regression (#1440 review): a compaction-floor reseed can CONFLICT with a
+    /// live row that has no terminal instant yet (`end_ms IS NULL`) while the
+    /// snapshot's job went terminal. Accepting the snapshot's `end_ms` must
+    /// move `last_update_ms` to that same instant — the terminal transition IS
+    /// the last update — or the row surfaces a stale `lastUpdateTime` that no
+    /// later terminal-event delivery can repair (the terminal projection is
+    /// `end_ms`-guarded, so it is a no-op once `end_ms` is set). When the row
+    /// already carries an end time, BOTH values are preserved.
+    #[test]
+    fn a_reseed_accepting_a_missing_terminal_instant_moves_last_update() {
+        use nanobpmn_engine_core::{Command, Engine, EngineSnapshot, ProcessBuilder};
+
+        let def = ProcessBuilder::new("terminal-reseed-last-update")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("c", "jc")
+            .parallel_gateway("join")
+            .end_event("done")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "c")
+            .connect("a", "join")
+            .connect("c", "join")
+            .connect("join", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.set_lenient_completion(true);
+        let store = ReadStore::open(None).unwrap();
+        let run = |engine: &mut Engine, cmd: Command, now: u64| {
+            let events = engine.apply_command_at(cmd, now).unwrap();
+            for e in &events {
+                super::read_surface_tests::apply_at(&store, e, now);
+            }
+            events
+        };
+        run(&mut engine, Command::DeployProcess(def), 1_000);
+        run(
+            &mut engine,
+            Command::create_instance("terminal-reseed-last-update"),
+            2_000,
+        );
+        let ja = engine
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.job_type == "ja")
+            .unwrap()
+            .key;
+
+        // The store saw the job live (created at 2_000 — `end_ms` NULL,
+        // `last_update_ms` at the creation instant).
+        let live = super::read_surface_tests::job_row(&store, ja);
+        assert_eq!(live.end_ms, None, "the row is still live");
+        assert_eq!(live.last_update_ms, Some(2_000));
+
+        // The engine then drives the job terminal at 5_000 (soft activation:
+        // no deadline) while a sibling branch keeps the instance alive.
+        engine
+            .apply_command_at(Command::complete_job(ja), 5_000)
+            .unwrap();
+        assert_eq!(
+            engine.job(ja).unwrap().terminal_end,
+            Some(nanobpmn_engine_core::JobTerminalEnd {
+                at: 5_000,
+                deadline: None,
+            })
+        );
+
+        // A compaction-floor reseed over the still-live row accepts the
+        // snapshot's terminal instant — and must move `last_update_ms` with it.
+        let bytes = serde_json::to_vec(&engine.snapshot()).unwrap();
+        let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let recovered = Engine::from_snapshot(decoded);
+        store.seed_from_engine_state(recovered.state()).unwrap();
+        let row = super::read_surface_tests::job_row(&store, ja);
+        assert_eq!(row.end_ms, Some(5_000), "the terminal instant is accepted");
+        assert_eq!(
+            row.last_update_ms,
+            Some(5_000),
+            "accepting a missing terminal instant moves lastUpdateTime to it"
+        );
+
+        // A SECOND reseed (row already terminal) preserves both values.
+        store.seed_from_engine_state(recovered.state()).unwrap();
+        let row = super::read_surface_tests::job_row(&store, ja);
+        assert_eq!(row.end_ms, Some(5_000));
+        assert_eq!(row.last_update_ms, Some(5_000));
     }
 
     /// Defect-class guard (#1244 review): a parked join is registered in the
@@ -8618,6 +9035,8 @@ mod definition_xml_tests {
                 created_at: 600,
                 job_type: "worker".to_string(),
                 worker: Some("w2".to_string()),
+                completed_at: 0,
+                deadline: None,
             },
         ];
         let positions: Vec<u64> = history
@@ -11407,6 +11826,8 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: Some("host-a-senior".to_string()),
+                    completed_at: 0,
+                    deadline: None,
                 },
                 // A completion with no activating worker leaves it NULL, not "".
                 &Event::JobCreated {
@@ -11425,6 +11846,8 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: None,
+                    completed_at: 0,
+                    deadline: None,
                 },
             ])
             .unwrap();
@@ -11471,6 +11894,8 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: Some(String::new()),
+                    completed_at: 0,
+                    deadline: None,
                 },
                 &Event::JobCreated {
                     job_key: 9202,
@@ -11571,6 +11996,8 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: None,
+                    completed_at: 0,
+                    deadline: None,
                 },
             ])
             .unwrap();
@@ -11621,6 +12048,7 @@ mod element_instance_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: None,
             },
         );
 
@@ -11643,6 +12071,8 @@ mod element_instance_tests {
                 created_at: 2,
                 job_type: "review-round".to_string(),
                 worker: None,
+                completed_at: 0,
+                deadline: None,
             }])
             .unwrap();
 
@@ -11687,6 +12117,7 @@ mod element_instance_tests {
             error_code: None,
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
+            terminal_end: None,
         };
         let mut state = State::default();
         // Failed with retries left.
@@ -11756,6 +12187,8 @@ mod element_instance_tests {
                     created_at: 2,
                     job_type: "review-round".to_string(),
                     worker: None,
+                    completed_at: 0,
+                    deadline: None,
                 },
             ),
             (
@@ -11857,6 +12290,8 @@ mod element_instance_tests {
             created_at: 0,
             job_type: String::new(),
             worker: None,
+            completed_at: 0,
+            deadline: None,
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -11907,6 +12342,8 @@ mod element_instance_tests {
             .export(&[&Event::JobCanceled {
                 job_key: 7002,
                 instance_key: INST,
+                canceled_at: 0,
+                deadline: None,
             }])
             .unwrap();
         assert!(get(7002).end_ms.is_some(), "a cancelled job has an endTime");
@@ -11974,6 +12411,8 @@ mod element_instance_tests {
                     created_at: 0,
                     job_type: String::new(),
                     worker: None,
+                    completed_at: 0,
+                    deadline: None,
                 },
             ])
             .unwrap();
@@ -12033,6 +12472,8 @@ mod element_instance_tests {
             .export(&[&Event::JobCanceled {
                 job_key: 8002,
                 instance_key: INST,
+                canceled_at: 0,
+                deadline: None,
             }])
             .unwrap();
         let canceled_end = get(8002).end_ms.expect("cancelled job has an endTime");
@@ -12292,6 +12733,7 @@ mod element_instance_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: None,
             },
         );
         let store = ReadStore::open(None).unwrap();
@@ -13018,6 +13460,193 @@ mod read_surface_tests {
             Some(1_000),
             "legacy re-delivery must not move lastUpdateTime"
         );
+    }
+
+    /// Defect-class guard (#1440 review): a MIXED-VERSION replay projects a
+    /// legacy `JobCreated` (`created_at == 0`) at its batch observation time,
+    /// then a MODERN terminal event whose command instant is EARLIER (export
+    /// lag). The projection must NOT clamp the recorded creation down to the
+    /// terminal instant: the engine stamps both from the same wall clock without
+    /// enforcing monotonicity, so a backward clock adjustment can leave a
+    /// genuine creation after the terminal instant, and clamping would rewrite
+    /// it and diverge from a snapshot reseed (which preserves `job.created_at`).
+    /// The projection keeps the recorded creation, matching the reseed; a single
+    /// backward-clock policy for both paths is part of the #963 follow-up. A
+    /// re-delivery of the terminal event must stay a no-op. Both terminal
+    /// projectors share the class.
+    #[test]
+    fn mixed_version_replay_repairs_an_unknown_creation_at_the_terminal_transition() {
+        for (terminal, want_state) in [
+            (
+                Event::JobCompleted {
+                    job_key: 8350,
+                    instance_key: 7350,
+                    created_at: 0,
+                    job_type: "worker".to_string(),
+                    worker: None,
+                    completed_at: 5_000,
+                    deadline: None,
+                },
+                nanobpmn_engine_core::JobState::Completed,
+            ),
+            (
+                Event::JobCanceled {
+                    job_key: 8350,
+                    instance_key: 7350,
+                    canceled_at: 5_000,
+                    deadline: None,
+                },
+                nanobpmn_engine_core::JobState::Canceled,
+            ),
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            // Legacy CREATED projected at a LATER batch time (export lag).
+            apply_at(
+                &store,
+                &Event::JobCreated {
+                    job_key: 8350,
+                    instance_key: 7350,
+                    element_instance_key: 7351,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 0,
+                    priority: 0,
+                    retries: 3,
+                },
+                9_000,
+            );
+            let seeded = job_row(&store, 8350);
+            assert_eq!(seeded.created_at_ms, 9_000, "legacy batch-time fallback");
+
+            apply_at(&store, &terminal, 9_500);
+            let row = job_row(&store, 8350);
+            assert_eq!(row.state, want_state);
+            assert_eq!(row.end_ms, Some(5_000));
+            // The projection does NOT clamp creation down to the terminal
+            // instant (#1440 review): the engine stamps `JobCreated.created_at`
+            // and the terminal instant from the same wall clock without
+            // enforcing monotonicity, so a backward clock adjustment can leave
+            // a genuine creation after the terminal instant. Clamping would
+            // rewrite that real timestamp and diverge from a snapshot reseed
+            // (which preserves `job.created_at`). The projection keeps the
+            // recorded creation, matching the reseed; a single backward-clock
+            // policy for both paths is part of the #963 follow-up.
+            assert_eq!(
+                row.created_at_ms, 9_000,
+                "creation is preserved (not clamped), matching the snapshot reseed"
+            );
+            assert_eq!(row.last_update_ms, Some(5_000));
+
+            // A re-delivery of the terminal event is a no-op (the write is
+            // guarded by `end_ms IS NULL`).
+            apply_at(&store, &terminal, 9_900);
+            let again = job_row(&store, 8350);
+            assert_eq!(again.created_at_ms, 9_000);
+            assert_eq!(again.end_ms, Some(5_000));
+            assert_eq!(again.last_update_ms, Some(5_000));
+        }
+    }
+
+    /// Defect-class guard (#1440 review, "previously missed"): a MODERN
+    /// terminal record's `deadline` is authoritative — `None` INCLUDED. A soft
+    /// activation whose lock was changed by a durable `JobTimeoutUpdated` and
+    /// then expired WITHOUT an exported event completes with `deadline ==
+    /// None`; keeping the row's stale projected deadline would diverge from a
+    /// snapshot reseed (which seeds `None` from `Job::terminal_end`). Only a
+    /// PRE-FIELD record (`completed_at`/`canceled_at == 0`) keeps the row's
+    /// value. Both terminal projectors share the class.
+    #[test]
+    fn a_modern_terminal_absence_clears_the_stale_projected_deadline() {
+        for (terminal, legacy_terminal) in [
+            (
+                Event::JobCompleted {
+                    job_key: 8360,
+                    instance_key: 7360,
+                    created_at: 1_000,
+                    job_type: "worker".to_string(),
+                    worker: None,
+                    completed_at: 5_000,
+                    deadline: None,
+                },
+                Event::JobCompleted {
+                    job_key: 8361,
+                    instance_key: 7361,
+                    created_at: 1_000,
+                    job_type: "worker".to_string(),
+                    worker: None,
+                    completed_at: 0,
+                    deadline: None,
+                },
+            ),
+            (
+                Event::JobCanceled {
+                    job_key: 8360,
+                    instance_key: 7360,
+                    canceled_at: 5_000,
+                    deadline: None,
+                },
+                Event::JobCanceled {
+                    job_key: 8361,
+                    instance_key: 7361,
+                    canceled_at: 0,
+                    deadline: None,
+                },
+            ),
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            for key in [8360_i64, 8361] {
+                apply_at(
+                    &store,
+                    &Event::JobCreated {
+                        job_key: key as u64,
+                        instance_key: (key - 1000) as u64,
+                        element_instance_key: (key - 999) as u64,
+                        element_id: "t".to_string(),
+                        job_type: "worker".to_string(),
+                        created_at: 1_000,
+                        priority: 0,
+                        retries: 3,
+                    },
+                    1_000,
+                );
+                // The stale projected deadline: a durable timeout update
+                // projected while the soft lock was still held.
+                apply_at(
+                    &store,
+                    &Event::JobTimeoutUpdated {
+                        job_key: key as u64,
+                        instance_key: (key - 1000) as u64,
+                        deadline: 60_000,
+                        operation_reference: None,
+                    },
+                    2_000,
+                );
+                assert_eq!(
+                    job_row(&store, key as u64).deadline_ms,
+                    Some(60_000),
+                    "precondition: the projection holds the stale deadline"
+                );
+            }
+
+            // Modern record: `None` is authoritative — the stale deadline goes.
+            apply_at(&store, &terminal, 5_000);
+            let modern = job_row(&store, 8360);
+            assert_eq!(modern.end_ms, Some(5_000));
+            assert_eq!(
+                modern.deadline_ms, None,
+                "a modern terminal record with no deadline clears the stale projection \
+                 (the reseed seeds None from Job::terminal_end)"
+            );
+
+            // Pre-field record: no terminal metadata — the row's value is kept.
+            apply_at(&store, &legacy_terminal, 5_000);
+            let legacy = job_row(&store, 8361);
+            assert_eq!(
+                legacy.deadline_ms,
+                Some(60_000),
+                "a pre-field record keeps the projected deadline"
+            );
+        }
     }
 
     /// Defect-class guard (#1344, finding 2): replaying a whole committed prefix

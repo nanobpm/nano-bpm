@@ -16,6 +16,7 @@ mod execution_order;
 mod expression_failures;
 mod feel_fallbacks;
 mod incidents;
+mod job_attribution;
 mod job_settlement;
 mod jobs;
 mod lifecycle;
@@ -26,6 +27,7 @@ mod modify_scopes;
 mod multi_instance;
 mod retry_phases;
 mod scoped_conditions;
+mod terminal_timing;
 mod timers_catch;
 mod user_task;
 

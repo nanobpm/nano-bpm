@@ -86,6 +86,10 @@ pub(crate) struct InstanceChunk {
 pub(crate) struct ControlFrame {
     covered_events: u64,
     control: EngineSnapshot,
+    /// The rebase-floor identity this snapshot was stamped with (#1405), see
+    /// `seglog::PersistedSnapshot::base_id`. Additive: absent decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
 }
 
 /// The decomposed halves of a streaming capture, produced on the engine thread
@@ -127,11 +131,22 @@ where
     pub path: &'a Path,
     pub header_line: &'a str,
     pub covered_events: u64,
+    /// The rebase-floor identity to stamp into the control frame (#1405).
+    pub base_id: Option<u64>,
     pub control: EngineSnapshot,
     pub instances: I,
     pub cold: &'a [Key],
     pub read_cold: RC,
     pub resolve_spilled: RS,
+    /// When true, a variable-spilled instance is serialized **as-is** (empty
+    /// placeholder + the spilled flag), never resolved through `resolve_spilled`.
+    /// This is the lean-snapshot mode (#1463 review): the authoritative durable
+    /// var store holds the payload in lockstep, so the snapshot is control-only
+    /// by design and resolving the placeholder would both fail (no spill store
+    /// is wired for it) and be wrong (the snapshot must stay variable-free).
+    /// When false (the self-contained default), every spilled flag is resolved
+    /// so the snapshot restores every variable with no dependency on any store.
+    pub control_only: bool,
 }
 
 /// Streams a self-contained snapshot to `path` without ever holding the whole
@@ -168,22 +183,26 @@ where
         path,
         header_line,
         covered_events,
+        base_id,
         control,
         instances,
         cold,
         mut read_cold,
         mut resolve_spilled,
+        control_only,
     } = req;
     let tmp = path.with_extension("tmp");
     let outcome = write_streaming_snapshot_inner(
         &tmp,
         header_line,
         covered_events,
+        base_id,
         control,
         instances,
         cold,
         &mut read_cold,
         &mut resolve_spilled,
+        control_only,
     );
     match outcome {
         Ok(()) => {
@@ -217,11 +236,13 @@ fn write_streaming_snapshot_inner<I, RC, RS>(
     tmp: &Path,
     header_line: &str,
     covered_events: u64,
+    base_id: Option<u64>,
     control: EngineSnapshot,
     instances: I,
     cold: &[Key],
     read_cold: &mut RC,
     resolve_spilled: &mut RS,
+    control_only: bool,
 ) -> std::io::Result<()>
 where
     I: IntoIterator<Item = InstanceSnapshot>,
@@ -239,6 +260,7 @@ where
         &ControlFrame {
             covered_events,
             control,
+            base_id,
         },
     )
     .map_err(into_invalid_data)?;
@@ -266,10 +288,11 @@ where
     let mut chunk: Vec<InstanceSnapshot> = Vec::with_capacity(STREAM_CHUNK_INSTANCES);
 
     // Resident instances: resolve a spilled payload just before it serializes,
-    // then stream it out. Consuming `instances` by value drops each payload as
+    // then stream it out — UNLESS control_only (lean mode), which serializes the
+    // placeholder as-is. Consuming `instances` by value drops each payload as
     // its chunk flushes.
     for mut snap in instances {
-        if snap.instance.variables_spilled {
+        if snap.instance.variables_spilled && !control_only {
             resolve_spilled(&mut snap)?;
         }
         chunk.push(snap);
@@ -282,10 +305,10 @@ where
     // when the chunk fills — the cold set never becomes resident. A cold row can
     // itself be variable-spilled (spilled before it was cold-evicted), so it is
     // resolved through the same `resolve_spilled` path as a resident instance to
-    // keep the snapshot self-contained.
+    // keep the snapshot self-contained (skipped under control_only).
     for &key in cold {
         let mut snap = read_cold(key)?;
-        if snap.instance.variables_spilled {
+        if snap.instance.variables_spilled && !control_only {
             resolve_spilled(&mut snap)?;
         }
         chunk.push(snap);
@@ -324,16 +347,24 @@ pub struct SpillStores {
 ///   `stores.varstore` (lean mode) or `stores.spill` (classic), and its spilled
 ///   flag cleared in the serialized copy so the snapshot is self-contained.
 ///
+/// `control_only` (the lean checkpoint, #1463 review) instead serializes a
+/// variable-spilled placeholder **as-is**: the authoritative var store holds the
+/// payload in lockstep, so the snapshot stays variable-free by design and the
+/// placeholder is never resolved.
+///
 /// Purely synchronous and owning only `Arc` store handles — safe to call from a
 /// blocking task off the engine actor. Fail-closed: any unreadable/absent row
 /// aborts the write and removes the partial file.
+#[allow(clippy::too_many_arguments)]
 pub fn write_streaming_snapshot_from_stores(
     path: &Path,
     header_line: &str,
     covered_events: u64,
+    base_id: Option<u64>,
     capture: StreamingCapture,
     cold_keys: &[Key],
     stores: SpillStores,
+    control_only: bool,
 ) -> std::io::Result<()> {
     let SpillStores {
         cold: cold_store,
@@ -344,6 +375,7 @@ pub fn write_streaming_snapshot_from_stores(
         path,
         header_line,
         covered_events,
+        base_id,
         control: capture.control,
         instances: capture.resident,
         cold: cold_keys,
@@ -410,6 +442,7 @@ pub fn write_streaming_snapshot_from_stores(
                 ))),
             }
         },
+        control_only,
     })
 }
 
@@ -439,9 +472,35 @@ where
 /// it. The reader is wrapped in a `BufReader` internally.
 pub fn read_streaming_snapshot_from<RD, R>(
     reader: RD,
+    restore_control: impl FnMut(EngineSnapshot, u64),
+    restore: R,
+) -> std::io::Result<()>
+where
+    RD: std::io::Read,
+    R: FnMut(InstanceSnapshot),
+{
+    read_streaming_snapshot_based_from(reader, restore_control, restore).map(|_| ())
+}
+
+/// [`read_streaming_snapshot`] that also returns the control frame's rebase-floor
+/// identity (#1405; `None` when absent, incl. the legacy headerless layout).
+pub fn read_streaming_snapshot_based<R>(
+    path: &Path,
+    restore_control: impl FnMut(EngineSnapshot, u64),
+    restore: R,
+) -> std::io::Result<Option<u64>>
+where
+    R: FnMut(InstanceSnapshot),
+{
+    let file = File::open(path)?;
+    read_streaming_snapshot_based_from(file, restore_control, restore)
+}
+
+fn read_streaming_snapshot_based_from<RD, R>(
+    reader: RD,
     mut restore_control: impl FnMut(EngineSnapshot, u64),
     mut restore: R,
-) -> std::io::Result<()>
+) -> std::io::Result<Option<u64>>
 where
     RD: std::io::Read,
     R: FnMut(InstanceSnapshot),
@@ -468,7 +527,8 @@ where
     // is fixed-for-all-time (see `seglog::SnapshotHeader`), so its presence on
     // line 1 unambiguously marks the chunked framing; its absence marks legacy.
     if !is_envelope_header_line(&header_line) {
-        return restore_legacy_headerless_snapshot(header_line, reader, restore_control, restore);
+        return restore_legacy_headerless_snapshot(header_line, reader, restore_control, restore)
+            .map(|()| None);
     }
 
     // Line 2: the control frame.
@@ -478,6 +538,7 @@ where
     }
     let control_frame: ControlFrame =
         serde_json::from_str(&control_line).map_err(into_invalid_data)?;
+    let base_id = control_frame.base_id;
     restore_control(control_frame.control, control_frame.covered_events);
 
     // Remaining lines: instance chunk frames until the terminal `end` frame.
@@ -508,7 +569,7 @@ where
              restore an incomplete instance set",
         ));
     }
-    Ok(())
+    Ok(base_id)
 }
 
 fn into_invalid_data(e: serde_json::Error) -> std::io::Error {
@@ -630,6 +691,340 @@ pub fn read_streaming_engine_snapshot(path: &Path) -> std::io::Result<EngineSnap
     read_streaming_engine_snapshot_from(file)
 }
 
+// ----------------------------------------------------------------------------
+// Multi-partition combined streaming snapshot (#1463).
+//
+// The multi-partition `msnapshot.bin` carries one engine per OWNED partition.
+// Its v3 framing reuses the same bounded-chunk idea, generalized so each
+// instance chunk is tagged with the partition it belongs to:
+//
+// ```text
+// {"format_version":3,…}\n                                            (header)
+// {"partition":0,"covered_events":…,"control":{…}}\n        (control frame ×P)
+// {"partition":0,"instances":[<InstanceSnapshot>, …]}\n    (chunk frame ×N)
+// {"partition":-,"instances":[],"end":true}\n                     (terminal)
+// ```
+//
+// Control frames carry no instances (each partition's skeleton); every instance
+// payload — resident or cold — streams through the shared bounded chunk frames,
+// so no partition's whole cold set is ever resident at once.
+// ----------------------------------------------------------------------------
+
+/// One partition's control frame in a combined multi-partition snapshot.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MultiControlFrame {
+    partition: u64,
+    covered_events: u64,
+    control: EngineSnapshot,
+    /// The partition's rebase-floor identity (#1405), see [`ControlFrame`].
+    /// Additive: absent decodes as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
+}
+
+/// One instance chunk in a combined multi-partition snapshot, tagged with the
+/// partition its instances belong to so the reader restores each into the right
+/// partition's engine. `end` marks the terminal frame (fail-closed on a torn
+/// write, exactly like the single-partition stream).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MultiInstanceChunk {
+    partition: u64,
+    instances: Vec<InstanceSnapshot>,
+    #[serde(default)]
+    end: bool,
+}
+
+/// Streams a combined multi-partition snapshot to `path` without ever holding
+/// any partition's whole cold set in memory (#1463). `entries` is
+/// `(partition, covered_events, capture, cold_keys, stores, control_only)` per
+/// owned partition; each partition's control frame is written first, then every
+/// partition's instances stream through shared bounded chunk frames (cold rows
+/// read lazily from that partition's stores). `control_only` (the lean
+/// checkpoint) serializes a variable-spilled placeholder as-is rather than
+/// resolving it. Fail-closed and atomic (tmp + fsync + rename, partial file
+/// removed on error), exactly like [`write_streaming_snapshot_from_stores`].
+///
+/// `base_ids` maps a partition to the rebase-floor identity stamped into its
+/// control frame (#1405); a partition absent from the map is written without one.
+pub fn write_multi_streaming_snapshot(
+    path: &Path,
+    header_line: &str,
+    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
+    base_ids: &std::collections::HashMap<u64, u64>,
+) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let outcome = write_multi_streaming_snapshot_inner(&tmp, header_line, entries, base_ids);
+    match outcome {
+        Ok(()) => {
+            let f = File::open(&tmp)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
+            if let Some(dir) = path.parent()
+                && let Ok(d) = File::open(dir)
+            {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_multi_streaming_snapshot_inner(
+    tmp: &Path,
+    header_line: &str,
+    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
+    base_ids: &std::collections::HashMap<u64, u64>,
+) -> std::io::Result<()> {
+    let file = File::create(tmp)?;
+    let mut w = BufWriter::new(file);
+
+    w.write_all(header_line.as_bytes())?;
+    w.write_all(b"\n")?;
+
+    // Every partition's control frame first (instance-free skeletons).
+    for (partition, covered_events, capture, _, _, _) in &entries {
+        serde_json::to_writer(
+            &mut w,
+            &MultiControlFrame {
+                partition: *partition,
+                covered_events: *covered_events,
+                control: capture.control.clone(),
+                base_id: base_ids.get(partition).copied(),
+            },
+        )
+        .map_err(into_invalid_data)?;
+        w.write_all(b"\n")?;
+    }
+
+    // Then stream every partition's instances through shared bounded chunks.
+    let mut chunk: Vec<(u64, InstanceSnapshot)> = Vec::with_capacity(STREAM_CHUNK_INSTANCES);
+    for (partition, _covered, capture, cold_keys, stores, control_only) in entries {
+        let SpillStores {
+            cold: cold_store,
+            spill: spill_store,
+            varstore,
+        } = stores;
+        // Reuse the single-partition spill-resolution closure logic per row.
+        let resolve = |snap: &mut InstanceSnapshot| {
+            resolve_spilled_from_stores(snap, varstore.as_ref(), spill_store.as_ref())
+        };
+        let push = |chunk: &mut Vec<(u64, InstanceSnapshot)>,
+                    w: &mut BufWriter<File>,
+                    mut snap: InstanceSnapshot|
+         -> std::io::Result<()> {
+            // Lean (control_only): serialize the spilled placeholder as-is — the
+            // authoritative var store holds the payload. Self-contained: resolve.
+            if snap.instance.variables_spilled && !control_only {
+                resolve(&mut snap)?;
+            }
+            chunk.push((partition, snap));
+            if chunk.len() >= STREAM_CHUNK_INSTANCES {
+                flush_multi_chunk(w, chunk, false)?;
+            }
+            Ok(())
+        };
+        for snap in capture.resident {
+            push(&mut chunk, &mut w, snap)?;
+        }
+        for key in cold_keys {
+            let store = cold_store.as_ref().ok_or_else(|| {
+                invalid_data("cold index references a key but no cold store is wired")
+            })?;
+            let snap = store
+                .try_get_cold(key)
+                .map_err(|e| invalid_data(&e.to_string()))?
+                .ok_or_else(|| {
+                    invalid_data(&format!(
+                        "cold instance {key} has no row in the spill store"
+                    ))
+                })?;
+            push(&mut chunk, &mut w, snap)?;
+        }
+    }
+    flush_multi_chunk(&mut w, &mut chunk, true)?;
+    w.flush()?;
+    Ok(())
+}
+
+fn flush_multi_chunk(
+    w: &mut BufWriter<File>,
+    chunk: &mut Vec<(u64, InstanceSnapshot)>,
+    end: bool,
+) -> std::io::Result<()> {
+    if chunk.is_empty() && !end {
+        return Ok(());
+    }
+    // A chunk may span partitions; emit one frame per contiguous partition run
+    // so each frame is single-partition (simpler reader). For the common case
+    // (one partition's rows per chunk) this is exactly one frame. Drain takes
+    // ownership safely — no unsafe, no leak.
+    let taken = std::mem::take(chunk);
+    let mut runs: Vec<(u64, Vec<InstanceSnapshot>)> = Vec::new();
+    for (partition, snap) in taken {
+        match runs.last_mut() {
+            Some((p, batch)) if *p == partition => batch.push(snap),
+            _ => runs.push((partition, vec![snap])),
+        }
+    }
+    for (partition, batch) in runs {
+        let frame = MultiInstanceChunk {
+            partition,
+            instances: batch,
+            end: false,
+        };
+        serde_json::to_writer(&mut *w, &frame).map_err(into_invalid_data)?;
+        w.write_all(b"\n")?;
+    }
+    if end {
+        let frame = MultiInstanceChunk {
+            partition: 0,
+            instances: Vec::new(),
+            end: true,
+        };
+        serde_json::to_writer(&mut *w, &frame).map_err(into_invalid_data)?;
+        w.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Resolves a variable-spilled instance's payload from the wired stores,
+/// mirroring [`write_streaming_snapshot_from_stores`]'s fail-closed semantics
+/// (a lean var-store miss with a surviving legacy spill row is refused).
+fn resolve_spilled_from_stores(
+    snap: &mut InstanceSnapshot,
+    varstore: Option<&Arc<VarStore>>,
+    spill_store: Option<&Arc<VarSpillStore>>,
+) -> std::io::Result<()> {
+    let key = snap.instance.key;
+    let resolved = if let Some(vs) = varstore {
+        match vs.try_get(key).map_err(|e| invalid_data(&e.to_string()))? {
+            Some(vars) => Some(vars),
+            None => {
+                let legacy_row = match spill_store {
+                    Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
+                    None => None,
+                };
+                if legacy_row.is_some() {
+                    return Err(invalid_data(&format!(
+                        "spilled instance {key}: var store has no row but a legacy \
+                         spill row exists (unmigrated lean-over-legacy state); refusing \
+                         to seal a potentially stale payload"
+                    )));
+                }
+                None
+            }
+        }
+    } else if let Some(sp) = spill_store {
+        sp.try_get(key).map_err(|e| invalid_data(&e.to_string()))?
+    } else {
+        None
+    };
+    match resolved {
+        Some(vars) => {
+            snap.instance.variables = Arc::new(vars);
+            snap.instance.variables_spilled = false;
+            Ok(())
+        }
+        None => Err(invalid_data(&format!(
+            "spilled instance {key} has no variable row in any wired store"
+        ))),
+    }
+}
+
+/// Reads a combined multi-partition streaming snapshot back into a map from
+/// global partition id to `(covered_events, EngineSnapshot)`, streaming each
+/// instance chunk into its partition's skeleton as it arrives (#1463).
+/// Fail-closed on a torn write (no terminal `end` frame).
+pub fn read_multi_streaming_snapshot(
+    path: &Path,
+) -> std::io::Result<std::collections::HashMap<u64, (u64, EngineSnapshot)>> {
+    read_multi_streaming_snapshot_based(path).map(|(map, _)| map)
+}
+
+/// Per-partition rebase-floor identities read from a combined snapshot's
+/// control frames (#1405); a partition without one is absent.
+pub type MultiBaseIds = std::collections::HashMap<u64, u64>;
+
+/// [`read_multi_streaming_snapshot`] plus each partition's control-frame
+/// rebase-floor identity.
+#[allow(clippy::type_complexity)]
+pub fn read_multi_streaming_snapshot_based(
+    path: &Path,
+) -> std::io::Result<(
+    std::collections::HashMap<u64, (u64, EngineSnapshot)>,
+    MultiBaseIds,
+)> {
+    let mut bases = MultiBaseIds::new();
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    // Line 1: envelope header (validated by the caller).
+    let mut header_line = String::new();
+    if reader.read_line(&mut header_line)? == 0 {
+        return Err(invalid_data(
+            "multi streaming snapshot is empty (no header)",
+        ));
+    }
+
+    let mut map: std::collections::HashMap<u64, (u64, EngineSnapshot)> =
+        std::collections::HashMap::new();
+    let mut saw_end = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Distinguish a control frame from a chunk frame by the presence of the
+        // `control` key (control frames carry it; chunk frames carry
+        // `instances`). Parse generically first.
+        let value: serde_json::Value = serde_json::from_str(trimmed).map_err(into_invalid_data)?;
+        if value.get("control").is_some() {
+            let frame: MultiControlFrame =
+                serde_json::from_value(value).map_err(into_invalid_data)?;
+            if let Some(id) = frame.base_id {
+                bases.insert(frame.partition, id);
+            }
+            map.insert(frame.partition, (frame.covered_events, frame.control));
+        } else {
+            let chunk: MultiInstanceChunk =
+                serde_json::from_value(value).map_err(into_invalid_data)?;
+            let end = chunk.end;
+            if !chunk.instances.is_empty() {
+                let entry = map.get_mut(&chunk.partition).ok_or_else(|| {
+                    invalid_data(&format!(
+                        "multi snapshot chunk for unknown partition {}",
+                        chunk.partition
+                    ))
+                })?;
+                for snap in chunk.instances {
+                    nanobpmn_engine_core::restore_instance_snapshot(&mut entry.1.state, snap);
+                }
+            }
+            if end {
+                saw_end = true;
+                break;
+            }
+        }
+    }
+    if !saw_end {
+        return Err(invalid_data(
+            "multi streaming snapshot is truncated (no terminal frame); refusing to \
+             restore an incomplete instance set",
+        ));
+    }
+    Ok((map, bases))
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -713,6 +1108,62 @@ mod tests {
         "{\"format_version\":3,\"incarnation\":1,\"engine_fingerprint\":\"test\"}".to_string()
     }
 
+    // #1405: the rebase-floor identity rides in the v3 control frame (single and
+    // multi), additively — absent means `None`, present round-trips verbatim.
+    #[test]
+    fn control_frames_round_trip_base_id_additively() {
+        let engine = engine_with_instances(3);
+        for base_id in [None, Some(0xfeed_u64)] {
+            let (control, instances) =
+                Engine::decompose_state_for_streaming(engine.state().clone());
+            let path = tmp_path("base-id");
+            write_streaming_snapshot(StreamWrite {
+                path: &path,
+                header_line: &header_line(),
+                covered_events: 5,
+                base_id,
+                control: control_snapshot(&control, &engine),
+                instances,
+                cold: &[],
+                read_cold: |_key| Err(invalid_data("no cold tier in this test")),
+                resolve_spilled: |_snap| Ok(()),
+                control_only: false,
+            })
+            .expect("streaming write");
+            let control_line = std::fs::read_to_string(&path).unwrap();
+            let control_line = control_line.lines().nth(1).unwrap();
+            assert_eq!(control_line.contains("\"base_id\""), base_id.is_some());
+            let got = read_streaming_snapshot_based(&path, |_, _| {}, |_| {}).unwrap();
+            assert_eq!(got, base_id);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+            let (control, resident) = Engine::decompose_state_for_streaming(engine.state().clone());
+            let path = tmp_path("multi-base-id");
+            let ids: MultiBaseIds = base_id.map(|id| (0, id)).into_iter().collect();
+            write_multi_streaming_snapshot(
+                &path,
+                &header_line(),
+                vec![(
+                    0,
+                    5,
+                    StreamingCapture {
+                        control: control_snapshot(&control, &engine),
+                        resident,
+                    },
+                    Vec::new(),
+                    SpillStores::default(),
+                    false,
+                )],
+                &ids,
+            )
+            .expect("multi streaming write");
+            let (map, bases) = read_multi_streaming_snapshot_based(&path).unwrap();
+            assert_eq!(map.get(&0).map(|(c, _)| *c), Some(5));
+            assert_eq!(bases.get(&0).copied(), base_id);
+            let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
     // #1337 red/green: a streaming snapshot must round-trip every resident
     // instance's payload WITHOUT materializing the whole set at once, and a
     // restore must rebuild an equivalent engine.
@@ -753,11 +1204,13 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 42,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances,
             cold: &[],
             read_cold: |_key| Err(invalid_data("no cold tier in this test")),
             resolve_spilled: |_snap| Ok(()),
+            control_only: false,
         })
         .expect("streaming write");
 
@@ -813,6 +1266,7 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 7,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances: Vec::new(), // nothing resident — the cold set is NOT folded in up front
             cold: &cold_keys,
@@ -825,6 +1279,7 @@ mod tests {
                     .ok_or_else(|| invalid_data("missing cold row"))
             },
             resolve_spilled: |_snap| Ok(()),
+            control_only: false,
         })
         .expect("streaming write with cold tier");
 
@@ -882,6 +1337,7 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 9,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances: Vec::new(), // the instance is cold, not resident
             cold: &cold_keys,
@@ -895,6 +1351,7 @@ mod tests {
                 snap.instance.variables_spilled = false;
                 Ok(())
             },
+            control_only: false,
         })
         .expect("streaming write of a spilled cold instance");
 
@@ -930,11 +1387,13 @@ mod tests {
             path: &path,
             header_line: &header_line(),
             covered_events: 1,
+            base_id: None,
             control: control_snapshot(&control, &engine),
             instances,
             cold: &[],
             read_cold: |_key| Err(invalid_data("no cold tier")),
             resolve_spilled: |_snap| Ok(()),
+            control_only: false,
         })
         .expect("write");
 
@@ -1044,6 +1503,7 @@ mod tests {
             &path,
             &header_line(),
             7,
+            None,
             StreamingCapture {
                 control: control_snapshot(&control, &engine),
                 resident: vec![snap],
@@ -1054,6 +1514,7 @@ mod tests {
                 spill: Some(spill),
                 varstore: Some(varstore),
             },
+            false,
         );
         assert!(
             result.is_err(),

@@ -107,6 +107,7 @@ pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT
 #[cfg(feature = "serde")]
 pub use command::form_id_of;
 pub use command::JobActivationOptions;
+pub use command::JobAttribution;
 pub use command::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
     GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,
@@ -141,9 +142,9 @@ pub use state::{
     compose_key, local_of, partition_of, restore_instance_snapshot, stable_hash,
     subscription_partition, ConditionalSubscription, DeployedProcess, Incident, IncidentKind,
     IncidentState, InstanceSnapshot, IoMappingRedrive, Job, JobKind, JobSettlement,
-    JobSettlementOutcome, JobState, Key, MessageStartSubscription, MessageSubscription,
-    MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance, ProcessInstanceState,
-    SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState, UserTask, UserTaskState,
-    DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK, MAX_PARTITION_ID,
-    PARTITION_BITS, SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
+    JobSettlementOutcome, JobState, JobTerminalEnd, Key, MessageStartSubscription,
+    MessageSubscription, MessageSubscriptionKind, MessageSubscriptionState, ProcessInstance,
+    ProcessInstanceState, SignalSubscription, StartTimer, State, Timer, TimerKind, TimerState,
+    UserTask, UserTaskState, DEFAULT_JOB_PRIORITY, DEFAULT_JOB_RETRIES, LOCAL_BITS, LOCAL_MASK,
+    MAX_PARTITION_ID, PARTITION_BITS, SETTLED_JOB_LEDGER_CAP, SETTLED_TOKENS_PER_JOB_CAP,
 };

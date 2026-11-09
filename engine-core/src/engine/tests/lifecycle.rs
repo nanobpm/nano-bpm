@@ -1643,6 +1643,8 @@ fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
     assert!(events.contains(&Event::JobCanceled {
         job_key: work_job,
         instance_key,
+        canceled_at: 0,
+        deadline: None, // soft (leader-local) activation records no terminal deadline (#1440/#963)
     }));
     assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));
     assert!(!events
@@ -1713,6 +1715,8 @@ fn subprocess_terminate_end_confines_to_the_subprocess_scope() {
     assert!(events.contains(&Event::JobCanceled {
         job_key: inner_work_job,
         instance_key,
+        canceled_at: 0,
+        deadline: None, // soft (leader-local) activation records no terminal deadline (#1440/#963)
     }));
     // ...and the sub-process completes and continues on its outgoing flow —
     // the parent instance is NOT terminated.
@@ -2332,7 +2336,7 @@ fn recover_lease_restores_a_soft_lease_and_holds_redelivery_until_the_deadline()
     let job_key = engine.pending_jobs()[0].key;
 
     // when it recovers the lease from the digest at t=0
-    assert!(engine.recover_lease(job_key, 1_000, 0));
+    assert!(engine.recover_lease(job_key, 1_000, None, 0));
 
     // then the job is no longer activatable (held until the deadline), so a
     // worker activation before the deadline gets nothing
@@ -2361,19 +2365,19 @@ fn recover_lease_is_idempotent_and_respects_an_expired_deadline() {
     let job_key = engine.pending_jobs()[0].key;
 
     // a lease whose deadline has already passed is not recovered
-    assert!(!engine.recover_lease(job_key, 1_000, 1_000));
+    assert!(!engine.recover_lease(job_key, 1_000, None, 1_000));
     assert_eq!(engine.pending_jobs().len(), 1);
 
     // a live lease is recovered and surfaces in activated_leases
-    assert!(engine.recover_lease(job_key, 2_000, 1_000));
+    assert!(engine.recover_lease(job_key, 2_000, None, 1_000));
     assert_eq!(engine.activated_leases(), vec![(job_key, 2_000)]);
 
     // recovering again on an already-activated job is a no-op
-    assert!(!engine.recover_lease(job_key, 3_000, 1_000));
+    assert!(!engine.recover_lease(job_key, 3_000, None, 1_000));
     assert_eq!(engine.activated_leases(), vec![(job_key, 2_000)]);
 
     // an unknown key is a no-op
-    assert!(!engine.recover_lease(999_999, 5_000, 1_000));
+    assert!(!engine.recover_lease(999_999, 5_000, None, 1_000));
 }
 
 #[test]
@@ -2451,6 +2455,7 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
     // (b) The empty/absent form must not appear on the wire (byte-unchanged).
     let throw_empty = Command::ThrowJobError {
         lease_token: None,
+        attribution: None,
         job_key: 7,
         error_code: "E".into(),
         error_message: "m".into(),
@@ -6890,6 +6895,8 @@ fn top_level_terminate_end_runs_its_end_listener_before_terminating_siblings() {
             *e == Event::JobCanceled {
                 job_key: work_job,
                 instance_key,
+                canceled_at: 0,
+                deadline: None, // soft (leader-local) activation records no terminal deadline (#1440/#963)
             }
         })
         .expect("the sibling job is cancelled");
@@ -6921,7 +6928,9 @@ fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope(
     let events = complete_one(&mut engine, "stop-end");
     assert!(events.contains(&Event::JobCanceled {
         job_key: work_job,
-        instance_key
+        instance_key,
+        canceled_at: 0,
+        deadline: None, // soft (leader-local) activation records no terminal deadline (#1440/#963)
     }));
     // Zeebe's `TerminateEndEventBehavior` ordering: the terminate end's own
     // COMPLETED is recorded BEFORE any sibling teardown — a sibling with a
@@ -6936,6 +6945,8 @@ fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope(
             *e == Event::JobCanceled {
                 job_key: work_job,
                 instance_key,
+                canceled_at: 0,
+                deadline: None, // soft (leader-local) activation records no terminal deadline (#1440/#963)
             }
         })
         .expect("the sibling job is cancelled");

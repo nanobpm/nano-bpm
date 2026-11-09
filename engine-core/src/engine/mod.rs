@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::command::Command;
+use crate::command::{Command, JobAttribution};
 use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
@@ -95,7 +95,16 @@ struct Paused {
 /// and explicitly nullable history metrics.
 /// Persistence decoders retain numeric tokens and literal legacy prompt strings
 /// so version-1 journals and snapshots still load.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Version `3` reframes the LOCAL (non-Raft) `snapshot.*.bin` / `msnapshot.bin`
+/// payload as the #1337 chunked sidecar stream (control frame + bounded
+/// instance-chunk frames + a terminal end frame) so a snapshot never
+/// materializes the whole cold/spilled set in RAM (#1463). The versioned
+/// `EngineSnapshot` *payload shape* itself is unchanged — a v3 control frame
+/// carries the same `EngineSnapshot` value a v2 monolith did — so version-2
+/// (and headerless version-0) snapshots still load under this build, and a
+/// pre-v3 build fails a v3 file closed as `FormatMismatch` (then migrates it by
+/// replay, #1071).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
 /// identically. Produced by [`Engine::snapshot`] and consumed by
@@ -121,6 +130,7 @@ pub struct EngineSnapshot {
 /// from a soft lease digest by a newly-promoted leader (see
 /// [`Engine::recover_lease`]). It marks the lease as "restored from a digest, not
 /// held by a live worker connection".
+/// Never a durable attribution: [`state::Job::attribution_worker`] filters it.
 pub const LEASE_DIGEST_WORKER: &str = "__lease_digest__";
 
 struct ActivationPlan {
@@ -647,6 +657,21 @@ impl Engine {
     /// See the `lenient_completion` field. Must be set identically on every replica.
     pub fn set_lenient_completion(&mut self, lenient: bool) {
         self.lenient_completion = lenient;
+    }
+
+    /// The worker a terminal job event attributes (#963): the replicated
+    /// command's stamp when present (authoritative on every replica, including
+    /// a "resolved absent" `worker: None`), else the live job's attribution for
+    /// an unstamped (legacy / locally-applied) command. The single capture
+    /// point for `JobCompleted` / `JobFailed` / `JobErrorThrown`.
+    fn terminal_worker(job: &state::Job, attribution: Option<&JobAttribution>) -> Option<String> {
+        match attribution {
+            Some(stamp) => stamp
+                .worker
+                .clone()
+                .filter(|w| !w.is_empty() && w != LEASE_DIGEST_WORKER),
+            None => job.attribution_worker(),
+        }
     }
 
     /// Whether lenient completion is enabled (see [`Self::set_lenient_completion`]).
@@ -2211,6 +2236,7 @@ impl Engine {
 
             Command::CompleteJob {
                 job_key,
+                attribution,
                 lease_token,
                 variables,
                 adhoc_result,
@@ -2274,7 +2300,7 @@ impl Engine {
                 // removed from state. `attribution_worker()` normalizes a
                 // snapshot-restored empty worker (`Some("")`) to `None`, so a
                 // pre-normalization snapshot can never leak an empty attribution.
-                let worker = job.attribution_worker();
+                let worker = Self::terminal_worker(job, attribution.as_ref());
                 let job_kind = job.kind;
 
                 // A task-listener job (ADR 0037 §6) gates a user task's deferred
@@ -2386,6 +2412,9 @@ impl Engine {
                         created_at,
                         job_type,
                         worker,
+                        completed_at: self.now,
+                        // Stamped centrally in `emit` (#1440).
+                        deadline: None,
                     },
                 );
                 if !variables.is_empty() {
@@ -3041,6 +3070,7 @@ impl Engine {
 
             Command::FailJob {
                 job_key,
+                attribution,
                 lease_token,
                 retries,
                 error_message,
@@ -3086,7 +3116,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let element_id = job.element_id.clone();
-                let worker = job.attribution_worker();
+                let worker = Self::terminal_worker(job, attribution.as_ref());
                 let retries = retries.max(0);
 
                 self.record_settlement(
@@ -3128,6 +3158,7 @@ impl Engine {
 
             Command::ThrowJobError {
                 job_key,
+                attribution,
                 lease_token,
                 error_code,
                 error_message,
@@ -3171,7 +3202,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let task_element_id = job.element_id.clone();
-                let worker = job.attribution_worker();
+                let worker = Self::terminal_worker(job, attribution.as_ref());
 
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // The job is consumed by the thrown error either way.
@@ -4379,6 +4410,8 @@ impl Engine {
                     .map(|j| Event::JobCanceled {
                         job_key: j.key,
                         instance_key,
+                        canceled_at: self.now,
+                        deadline: None, // stamped centrally in `emit` (#1440)
                     })
                     .collect();
 
@@ -9419,6 +9452,8 @@ impl Engine {
             events.push(Event::JobCanceled {
                 job_key,
                 instance_key,
+                canceled_at: self.now,
+                deadline: None, // stamped centrally in `emit` (#1440)
             });
         }
         events.extend(self.cancel_all_timers_on(child_eik));
@@ -9522,6 +9557,8 @@ impl Engine {
                 events.push(Event::JobCanceled {
                     job_key,
                     instance_key,
+                    canceled_at: self.now,
+                    deadline: None, // stamped centrally in `emit` (#1440)
                 });
             }
             events.extend(self.cancel_all_timers_on(child));
@@ -11240,6 +11277,8 @@ impl Engine {
             .map(|job_key| Event::JobCanceled {
                 job_key,
                 instance_key,
+                canceled_at: self.now,
+                deadline: None, // stamped centrally in `emit` (#1440)
             })
             .collect()
     }
@@ -15050,6 +15089,8 @@ impl Engine {
         cancels.extend(jobs.iter().map(|j| Event::JobCanceled {
             job_key: j.key,
             instance_key,
+            canceled_at: self.now,
+            deadline: None, // stamped centrally in `emit` (#1440)
         }));
 
         let mut timers: Vec<&state::Timer> = self
@@ -15172,6 +15213,51 @@ impl Engine {
             .collect()
     }
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
+        // Terminal-deadline stamping (#1440) is centralized HERE — the engine's
+        // single event choke point — so every emission site (completion, scope
+        // teardown, instance discard, boundary cascade, …) stamps the job's
+        // last lock deadline identically, and no site can drift to reading
+        // replica-local state directly.
+        //
+        // A terminal event carries a deadline ONLY for a DURABLE (leased)
+        // activation — one whose lock is journaled and therefore identical on
+        // every replica. A leader-local (soft) activation is unreplicated by
+        // design (ADR 0002): a follower never sees it, so a soft job's deadline
+        // is replica-local and a terminal event stamped from it would diverge
+        // across replicas. Soft jobs therefore record NO deadline. Making
+        // terminal metadata authoritative for soft jobs is the architectural
+        // follow-up tracked in #963 — do NOT stamp a soft deadline here.
+        let event = match event {
+            Event::JobCompleted {
+                job_key,
+                instance_key,
+                created_at,
+                job_type,
+                worker,
+                completed_at,
+                deadline: _,
+            } => Event::JobCompleted {
+                job_key,
+                instance_key,
+                created_at,
+                job_type,
+                worker,
+                completed_at,
+                deadline: self.job_terminal_deadline(job_key),
+            },
+            Event::JobCanceled {
+                job_key,
+                instance_key,
+                canceled_at,
+                deadline: _,
+            } => Event::JobCanceled {
+                job_key,
+                instance_key,
+                canceled_at,
+                deadline: self.job_terminal_deadline(job_key),
+            },
+            other => other,
+        };
         let resolution = match &event {
             Event::JobCompleted {
                 job_key,
@@ -15668,6 +15754,29 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
         .map(|(k, _)| *k)
         .collect();
     owned.into_iter().filter_map(|k| map.remove(&k)).collect()
+}
+
+/// Removes from `map` every entity owned by an instance in `owners`, grouped by
+/// owning instance, in a single pass over `map`. Entities whose owner is not in
+/// `owners` stay in `map`. The linear-time counterpart of calling
+/// [`drain_owned`] once per instance (which is quadratic over a backlog).
+#[cfg(feature = "serde")]
+fn group_owned<V: OwnedByInstance>(
+    map: &mut HashMap<Key, V>,
+    owners: &HashSet<Key>,
+) -> HashMap<Key, Vec<V>> {
+    let mut grouped: HashMap<Key, Vec<V>> = HashMap::new();
+    let owned: Vec<Key> = map
+        .iter()
+        .filter(|(_, v)| owners.contains(&v.instance_key()))
+        .map(|(k, _)| *k)
+        .collect();
+    for k in owned {
+        if let Some(v) = map.remove(&k) {
+            grouped.entry(v.instance_key()).or_default().push(v);
+        }
+    }
+    grouped
 }
 
 /// A process start event's deploy-time-resolved trigger.
