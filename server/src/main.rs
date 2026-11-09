@@ -3081,16 +3081,26 @@ impl ServerImpl {
     }
 }
 
-/// Synthesises the `ProcessDeployed` events needed to replicate the deployment
-/// partition's process definitions to the other partitions. Reads the deployment
-/// partition's engine state (its definitions survive its own journal replay) and
-/// re-emits one `ProcessDeployed` per definition under the same shared
-/// `processDefinitionKey`. `install_deployment` applies only these events (never
+/// Synthesises the deployment events needed to replicate the deployment
+/// partition's resource definitions to the other partitions. Reads the
+/// deployment partition's engine state (its definitions survive its own journal
+/// replay) and re-emits one event per deployed **version** under its original
+/// per-version key. `install_deployment` applies only these events (never
 /// arming a second copy of a start subscription/timer).
+///
+/// Every deployable resource is seeded from its version-retention map
+/// (`State::*_versions`, keyed by the unique per-version key), NOT from the
+/// latest-by-id index (`State::{processes,decisions,…}`): the index retains
+/// only the newest version per resource id, so seeding from it would leave
+/// every historical key non-resolvable on a freshly-seeded peer even though
+/// the deployment partition resolves it (issue #720; Zeebe parity: deployment
+/// distribution replicates every deployed version to every partition). The
+/// appliers are idempotent per key and retain every version in their own
+/// `*_versions` map, so re-installing an already-known version is a no-op.
 fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
     let state = deploy_journal.engine().state();
     let mut events: Vec<Event> = state
-        .processes
+        .process_versions
         .values()
         .map(|deployed| Event::ProcessDeployed {
             // The deployment key is not used by the applier (definitions are
@@ -3101,22 +3111,27 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
             process: deployed.definition.clone(),
         })
         .collect();
-    // Re-emit each deployed DRG followed by its decisions so a freshly seeded
-    // replica can evaluate business rule tasks. DecisionRequirementsDeployed
-    // must precede its DecisionDeployed events (the applier resolves the DRG by
-    // key), so emit them grouped per DRG.
-    for drg in state.decision_requirements.values() {
+    // Re-emit each deployed DRG version followed by its decision versions so a
+    // freshly seeded replica can evaluate business rule tasks pinned to any
+    // historical key. DecisionRequirementsDeployed must precede its
+    // DecisionDeployed events (the applier resolves the DRG by its exact key in
+    // `decision_requirements_versions`), so emit them grouped per DRG version.
+    let mut drgs: Vec<_> = state.decision_requirements_versions.values().collect();
+    drgs.sort_by_key(|drg| drg.key);
+    for drg in drgs {
         events.push(Event::DecisionRequirementsDeployed {
             deployment_key: 0,
             decision_requirements_key: drg.key,
             version: drg.version,
             drg: drg.drg.clone(),
         });
-        for decision in state
-            .decisions
+        let mut decisions: Vec<_> = state
+            .decision_versions
             .values()
             .filter(|d| d.decision_requirements_key == drg.key)
-        {
+            .collect();
+        decisions.sort_by_key(|d| d.key);
+        for decision in decisions {
             events.push(Event::DecisionDeployed {
                 deployment_key: 0,
                 decision_requirements_key: decision.decision_requirements_key,
@@ -3127,9 +3142,10 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
             });
         }
     }
-    // Re-emit each deployed form so a freshly seeded replica can serve it via
-    // GetFormByKey. Forms are independent (no sub-resources), so order is free.
-    for form in state.forms.values() {
+    // Re-emit each deployed form version so a freshly seeded replica can serve
+    // it via GetFormByKey. Forms are independent (no sub-resources), so order
+    // is free.
+    for form in state.form_versions.values() {
         events.push(Event::FormDeployed {
             deployment_key: 0,
             form_key: form.key,
@@ -3137,6 +3153,19 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
             form_id: form.form_id.clone(),
             resource_name: form.resource_name.clone(),
             schema: form.schema.clone(),
+        });
+    }
+    // Re-emit each deployed generic-resource version so a freshly seeded
+    // replica can serve it via GetResourceByKey / searchResources. Resources
+    // are independent, so order is free.
+    for resource in state.resource_versions.values() {
+        events.push(Event::GenericResourceDeployed {
+            deployment_key: 0,
+            resource_key: resource.key,
+            version: resource.version,
+            resource_id: resource.resource_id.clone(),
+            resource_name: resource.resource_name.clone(),
+            content: resource.content.clone(),
         });
     }
     events
@@ -28613,6 +28642,228 @@ mod clustered_startup_tests {
             .apply_command(Command::create_instance("demo"))
             .unwrap();
         events.iter().find_map(|e| e.instance_key()).unwrap()
+    }
+
+    /// #720: the deployment seed broadcast must carry EVERY deployed version of
+    /// every deployable resource, not just the latest per id, so a
+    /// freshly-seeded peer resolves a historical key exactly as the deployment
+    /// partition does (Zeebe parity: deployment distribution replicates every
+    /// deployed version to every partition).
+    ///
+    /// Deploys two versions each of a process, a DRG (+decision), a form, and a
+    /// generic resource onto the deployment-partition owner, then seeds a fresh
+    /// peer via [`deployment_replication_events`] + `install_replicated_deployment`
+    /// — the exact path `spawn_seed_broadcast` / `current_deployment_events` use —
+    /// and asserts BOTH versions resolve by key on every partition the peer owns.
+    /// Deterministic: the install is awaited (the durable commit included), so no
+    /// polling or sleeps are involved.
+    #[tokio::test]
+    async fn deployment_seed_replicates_every_deployed_version() {
+        let node0 = clustered_node(0);
+        let node1 = clustered_node(1);
+
+        // Two versions of one process (an added task changes the definition).
+        let proc_v1 = ProcessBuilder::new("versioned-proc")
+            .start_event("s")
+            .service_task("work", "versioned-work")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .build()
+            .expect("valid v1 process");
+        let proc_v2 = ProcessBuilder::new("versioned-proc")
+            .start_event("s")
+            .service_task("work", "versioned-work")
+            .service_task("work2", "versioned-work-2")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "work2")
+            .connect("work2", "e")
+            .build()
+            .expect("valid v2 process");
+        // Two versions of one DRG (a renamed decision changes the graph).
+        let drg_v1 = nanobpmn_engine_core::dmn::parse_dmn(
+            r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="versioned-drg" name="Versioned DRG">
+              <decision id="versioned-decision" name="Versioned Decision">
+                <decisionTable hitPolicy="FIRST">
+                  <input id="i"><inputExpression id="ie" typeRef="string"><text>lang</text></inputExpression></input>
+                  <output id="o" name="result" typeRef="string" />
+                  <rule id="r1"><inputEntry id="ie1"><text>-</text></inputEntry>
+                    <outputEntry id="oe1"><text>"v1"</text></outputEntry></rule>
+                </decisionTable>
+              </decision>
+            </definitions>"##,
+        )
+        .expect("valid v1 DMN");
+        let drg_v2 = nanobpmn_engine_core::dmn::parse_dmn(
+            r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="versioned-drg" name="Versioned DRG">
+              <decision id="versioned-decision" name="Versioned Decision v2">
+                <decisionTable hitPolicy="FIRST">
+                  <input id="i"><inputExpression id="ie" typeRef="string"><text>lang</text></inputExpression></input>
+                  <output id="o" name="result" typeRef="string" />
+                  <rule id="r1"><inputEntry id="ie1"><text>-</text></inputEntry>
+                    <outputEntry id="oe1"><text>"v2"</text></outputEntry></rule>
+                </decisionTable>
+              </decision>
+            </definitions>"##,
+        )
+        .expect("valid v2 DMN");
+        let form = |schema: &str| nanobpmn_engine_core::FormResource {
+            id: "versioned-form".to_string(),
+            resource_name: "versioned.form".to_string(),
+            schema: schema.to_string(),
+        };
+        let form_v1 = form(r#"{"id":"versioned-form","type":"default","components":[]}"#);
+        let form_v2 = form(
+            r#"{"id":"versioned-form","type":"default","components":[{"type":"textfield","key":"who"}]}"#,
+        );
+        let resource = |content: &str| nanobpmn_engine_core::GenericResource {
+            resource_id: "versioned.md".to_string(),
+            resource_name: "versioned.md".to_string(),
+            content: content.to_string(),
+        };
+        let resource_v1 = resource("# v1");
+        let resource_v2 = resource("# v2");
+
+        // Deploy v1 of everything, then v2 of everything, on the deployment
+        // partition (node 0). Each `apply_command` awaits its journal commit, so
+        // the owner's state is durable before the seed is derived.
+        let deploy = node0.engine.deploy_partition().clone();
+        let (pdk1, drgk1, dk1, fk1, rk1) = deploy
+            .with(move |journal| {
+                let (e1, _) = journal
+                    .apply_command(Command::DeployResources(vec![proc_v1]))
+                    .expect("deploy process v1");
+                let (e2, _) = journal
+                    .apply_command(Command::DeployDecisionRequirements(vec![drg_v1]))
+                    .expect("deploy DRG v1");
+                let (e3, _) = journal
+                    .apply_command(Command::DeployForms(vec![form_v1]))
+                    .expect("deploy form v1");
+                let (e4, _) = journal
+                    .apply_command(Command::DeployGenericResources(vec![resource_v1]))
+                    .expect("deploy resource v1");
+                let find = |events: &[Event], f: &dyn Fn(&Event) -> Option<Key>| {
+                    events.iter().find_map(f).expect("deploy event emitted")
+                };
+                let pdk = find(&e1, &|e| match e {
+                    Event::ProcessDeployed {
+                        process_definition_key,
+                        ..
+                    } => Some(*process_definition_key),
+                    _ => None,
+                });
+                let drgk = find(&e2, &|e| match e {
+                    Event::DecisionRequirementsDeployed {
+                        decision_requirements_key,
+                        ..
+                    } => Some(*decision_requirements_key),
+                    _ => None,
+                });
+                let dk = find(&e2, &|e| match e {
+                    Event::DecisionDeployed { decision_key, .. } => Some(*decision_key),
+                    _ => None,
+                });
+                let fk = find(&e3, &|e| match e {
+                    Event::FormDeployed { form_key, .. } => Some(*form_key),
+                    _ => None,
+                });
+                let rk = find(&e4, &|e| match e {
+                    Event::GenericResourceDeployed { resource_key, .. } => Some(*resource_key),
+                    _ => None,
+                });
+                (pdk, drgk, dk, fk, rk)
+            })
+            .await;
+        let (pdk2, drgk2, dk2, fk2, rk2) = deploy
+            .with(move |journal| {
+                let (e1, _) = journal
+                    .apply_command(Command::DeployResources(vec![proc_v2]))
+                    .expect("deploy process v2");
+                let (e2, _) = journal
+                    .apply_command(Command::DeployDecisionRequirements(vec![drg_v2]))
+                    .expect("deploy DRG v2");
+                let (e3, _) = journal
+                    .apply_command(Command::DeployForms(vec![form_v2]))
+                    .expect("deploy form v2");
+                let (e4, _) = journal
+                    .apply_command(Command::DeployGenericResources(vec![resource_v2]))
+                    .expect("deploy resource v2");
+                let find = |events: &[Event], f: &dyn Fn(&Event) -> Option<Key>| {
+                    events.iter().find_map(f).expect("deploy event emitted")
+                };
+                let pdk = find(&e1, &|e| match e {
+                    Event::ProcessDeployed {
+                        process_definition_key,
+                        ..
+                    } => Some(*process_definition_key),
+                    _ => None,
+                });
+                let drgk = find(&e2, &|e| match e {
+                    Event::DecisionRequirementsDeployed {
+                        decision_requirements_key,
+                        ..
+                    } => Some(*decision_requirements_key),
+                    _ => None,
+                });
+                let dk = find(&e2, &|e| match e {
+                    Event::DecisionDeployed { decision_key, .. } => Some(*decision_key),
+                    _ => None,
+                });
+                let fk = find(&e3, &|e| match e {
+                    Event::FormDeployed { form_key, .. } => Some(*form_key),
+                    _ => None,
+                });
+                let rk = find(&e4, &|e| match e {
+                    Event::GenericResourceDeployed { resource_key, .. } => Some(*resource_key),
+                    _ => None,
+                });
+                (pdk, drgk, dk, fk, rk)
+            })
+            .await;
+        assert_ne!(pdk1, pdk2, "a changed process re-mints its key");
+        assert_ne!(fk1, fk2, "a changed form re-mints its key");
+        assert_ne!(rk1, rk2, "a changed resource re-mints its key");
+
+        // Seed the fresh peer exactly as startup does.
+        let events = node0
+            .engine
+            .deploy_partition()
+            .with(|journal| deployment_replication_events(journal))
+            .await;
+        node1.install_replicated_deployment(events).await;
+
+        // Every historical key resolves on EVERY partition the peer owns — the
+        // same resolution the deployment partition offers.
+        for handle in node1.engine.all() {
+            let (pv1, pv2, fv1, fv2, rv1, rv2, dv1, dv2, drgv1, drgv2) = handle
+                .with(move |journal| {
+                    let state = journal.state();
+                    (
+                        state.process_by_key(pdk1).map(|d| d.version),
+                        state.process_by_key(pdk2).map(|d| d.version),
+                        state.form_by_key(fk1).map(|f| f.version),
+                        state.form_by_key(fk2).map(|f| f.version),
+                        state.resource_by_key(rk1).map(|r| r.version),
+                        state.resource_by_key(rk2).map(|r| r.version),
+                        state.decision_by_key(dk1).map(|d| d.version),
+                        state.decision_by_key(dk2).map(|d| d.version),
+                        state.drg_by_key(drgk1).map(|d| d.version),
+                        state.drg_by_key(drgk2).map(|d| d.version),
+                    )
+                })
+                .await;
+            assert_eq!(pv1, Some(1), "process v1 key resolves on the peer");
+            assert_eq!(pv2, Some(2), "process v2 key resolves on the peer");
+            assert_eq!(fv1, Some(1), "form v1 key resolves on the peer");
+            assert_eq!(fv2, Some(2), "form v2 key resolves on the peer");
+            assert_eq!(rv1, Some(1), "resource v1 key resolves on the peer");
+            assert_eq!(rv2, Some(2), "resource v2 key resolves on the peer");
+            assert_eq!(dv1, Some(1), "decision v1 key resolves on the peer");
+            assert_eq!(dv2, Some(2), "decision v2 key resolves on the peer");
+            assert_eq!(drgv1, Some(1), "DRG v1 key resolves on the peer");
+            assert_eq!(drgv2, Some(2), "DRG v2 key resolves on the peer");
+        }
     }
 
     /// #1467 finding F1 (reworked in #1338): every journal SHARES one spill
