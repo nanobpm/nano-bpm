@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
-import BpmnViewer from "./BpmnViewer";
-import { Button } from "./ui";
+import { BpmnViewer } from "@nanobpm/process-explorer";
+import { Button } from "@nanobpm/process-explorer/ui";
 import { projectDerivedModels, type DerivedModel } from "../lib/api";
 
 // The Derived Model panel (ADR 0045). Code-first workflow projects have no

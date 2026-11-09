@@ -5,7 +5,7 @@ import {
   updateProjectFromTemplate,
   type ProjectSummary,
 } from "../gen";
-import { Button, Spinner } from "./ui";
+import { Button, Spinner } from "@nanobpm/process-explorer/ui";
 import {
   POST_UPDATE_PROJECTS_MESSAGE,
   runProjectUpdate,

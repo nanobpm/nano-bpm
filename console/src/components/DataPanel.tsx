@@ -9,7 +9,7 @@ import {
 
 import CodeEditor from "./CodeEditor";
 import { isReadStatement } from "../lib/sqlStatement";
-import { Button, Input, inputClass } from "./ui";
+import { Button, Input, inputClass } from "@nanobpm/process-explorer/ui";
 import {
   execData,
   execDataScript,

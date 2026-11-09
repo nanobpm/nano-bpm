@@ -4,7 +4,7 @@
 // trusted* message means, so the console's node:test unit suite can cover the
 // routing table directly without a renderer.
 
-import { INSTANCE_DEEP_LINK_PARAM } from "../views/explorerFilters.ts";
+import { INSTANCE_DEEP_LINK_PARAM } from "@nanobpm/process-explorer/filters";
 
 /// The sessionStorage key the host stashes a raw-XML definition preview under
 /// before navigating to `/explorer?preview=1`. The XML is carried out-of-band

@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Card } from "./ui";
+import { Card } from "@nanobpm/process-explorer/ui";
 import type { Journey } from "../lib/tour/types";
 
 /**

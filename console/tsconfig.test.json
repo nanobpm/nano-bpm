@@ -12,6 +12,11 @@
   "include": [
     "src/**/*.test.ts",
     "src/**/*.test.tsx",
+    // The shared Process Explorer package's unit tests (it has no install of
+    // its own; the console's toolchain typechecks it).
+    // Through the `file:` dep symlink so (with `preserveSymlinks`) its imports
+    // resolve against this node_modules.
+    "node_modules/@nanobpm/process-explorer/src/**/*.test.ts",
     "src/vite-env.d.ts",
     "e2e/**/*.ts"
   ],

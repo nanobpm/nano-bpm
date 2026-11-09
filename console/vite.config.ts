@@ -1,6 +1,28 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+/**
+ * The shared Process Explorer package (`../process-explorer`) is console source
+ * kept outside `console/` so other hosts can embed it. Serve it from its real
+ * path, like `src/`, not through its `node_modules` symlink: Vite treats files
+ * under `node_modules` as third-party and versions their URLs inconsistently
+ * (`?v=` on some imports, not others), which loads a module twice — and a second
+ * copy of its data-source React context leaves the Explorer without the
+ * console's provider. Each `exports` entry becomes an exact-match alias.
+ */
+const explorerDir = fileURLToPath(
+  new URL("../process-explorer/", import.meta.url),
+);
+const explorerExports: Record<string, string> = JSON.parse(
+  readFileSync(explorerDir + "package.json", "utf8"),
+).exports;
+const explorerAliases = Object.entries(explorerExports).map(([sub, file]) => ({
+  find: new RegExp(`^@nanobpm/process-explorer${sub.slice(1)}$`),
+  replacement: explorerDir + file.slice(2),
+}));
 
 // The gateway the dev server proxies API calls to. Defaults to the local
 // gateway `c8ctl` starts on :8080; override with NANO_BACKEND to point at a
@@ -42,7 +64,17 @@ export default defineConfig({
   // palette or properties panel. Collapsing preact to a single instance fixes it
   // in both dev (optimizeDeps) and the production build (Rollup).
   resolve: {
-    dedupe: ["preact"],
+    dedupe: [
+      "preact",
+      // The Process Explorer's bare imports, resolved from here: the package has
+      // no install of its own (the console provides its peer dependencies).
+      "react",
+      "react-dom",
+      "@tanstack/react-query",
+      "bpmn-js",
+      "@nanobpm/nano-app-schema",
+    ],
+    alias: explorerAliases,
     // Match the console tsconfig's `preserveSymlinks`: `@nanobpm/nano-app-schema`
     // is a `file:` dep (`../spec-app`) symlinked into `node_modules`. Resolving
     // via its realpath (Rollup's default) can miss the hoisted copy, so follow

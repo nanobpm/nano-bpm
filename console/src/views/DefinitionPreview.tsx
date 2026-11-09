@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import BpmnViewer from "../components/BpmnViewer";
-import { Badge } from "../components/ui";
+import { BpmnViewer } from "@nanobpm/process-explorer";
+import { Badge } from "@nanobpm/process-explorer/ui";
 import {
   DEFINITION_PREVIEW_MAX_XML,
   DEFINITION_PREVIEW_STASH_KEY,

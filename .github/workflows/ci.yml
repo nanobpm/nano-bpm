@@ -107,6 +107,9 @@ jobs:
               - '.github/workflows/ci.yml'
             console:
               - 'console/**'
+              # The shared Process Explorer package the console builds from source
+              # (`file:` dep; typechecked, tested and formatted by the console job).
+              - 'process-explorer/**'
               - 'spec-console/**'
               # The merge-gate tests compare these with CI job names.
               - 'AGENTS.md'
@@ -1083,10 +1086,12 @@ jobs:
         # src/gen-c8 (the Camunda REST subset of spec/rest-api.yaml) in place;
         # fail if either committed client drifted (the maker forgot `npm run
         # gen:api`), including newly generated files git diff alone would miss.
-        # Both are committed and imported directly by the SPA.
+        # Both are committed and imported directly by the SPA. The same specs
+        # also generate the types-only wire model of the shared Process Explorer
+        # package (../process-explorer/src/gen, gen-c8), guarded the same way.
         run: |
-          git diff --exit-code -- src/gen src/gen-c8
-          test -z "$(git status --porcelain -- src/gen src/gen-c8)"
+          git diff --exit-code -- src/gen src/gen-c8 ../process-explorer/src/gen ../process-explorer/src/gen-c8
+          test -z "$(git status --porcelain -- src/gen src/gen-c8 ../process-explorer/src/gen ../process-explorer/src/gen-c8)"
       - name: Test (node:test unit tests)
         run: npm test
       - name: Build bundled docs (guard)

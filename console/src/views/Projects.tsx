@@ -20,13 +20,16 @@ import {
   PageHeader,
   Spinner,
   useIsNarrow,
-} from "../components/ui";
+} from "@nanobpm/process-explorer/ui";
 import { useTemplateUpdate } from "../components/TemplateUpdate";
 import { toUpdateTarget } from "../lib/templateUpdate";
 import JourneyPicker from "../components/JourneyPicker";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
-import { copyText, selectElementText } from "../lib/clipboard";
+import {
+  copyText,
+  selectElementText,
+} from "@nanobpm/process-explorer/clipboard";
 import { CONSOLE_PROFILE } from "../lib/profile";
 import { TOUR_ANCHOR, templateAnchor } from "../lib/tour/tourAnchors";
 import { useTour } from "../lib/tour/tourContext";

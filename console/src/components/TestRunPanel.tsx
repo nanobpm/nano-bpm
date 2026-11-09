@@ -2,9 +2,14 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import { useBojtos, BpmnRuntimeView } from "@nanobpm/bojtos-react";
-import { TraceTimeline } from "./TraceTimeline";
+import { TraceTimeline } from "@nanobpm/process-explorer";
 import { foldSimTrace, stepFmt } from "../lib/simTrace";
-import { Badge, Button, ErrorText, SectionLabel } from "./ui";
+import {
+  Badge,
+  Button,
+  ErrorText,
+  SectionLabel,
+} from "@nanobpm/process-explorer/ui";
 import {
   parseModelEnvelopes,
   scaffoldJobOutput,
