@@ -8,7 +8,8 @@
     ".": "./src/index.ts",
     "./ui": "./src/ui.tsx",
     "./filters": "./src/explorerFilters.ts",
-    "./clipboard": "./src/clipboard.ts"
+    "./clipboard": "./src/clipboard.ts",
+    "./styles.css": "./src/styles.css"
   },
   "files": [
     "src",

@@ -15,6 +15,9 @@
 @import "tailwindcss";
 @import "@nanobpm/nano-app-schema/tokens.css";
 @import "./theme/tokens.css";
+/* The shared Process Explorer package's handwritten component rules (diagram
+ * markers, badges, touch targets, card grid, safe-area helpers). */
+@import "../../process-explorer/src/styles.css";
 /* The shared Process Explorer package (../process-explorer) is styled with these
  * same utilities; Tailwind doesn't scan outside this project on its own. */
 @source "../../process-explorer/src";
@@ -38,64 +41,6 @@ body {
     sans-serif;
   background: var(--nano-app);
   color: var(--nano-text);
-}
-
-/* BPMN diagram overlay markers (diagram-js adds these classes to shapes).
- * The diagram canvas is always a light surface (bpmn-js is a light-themed
- * widget), so these stay fixed rather than token-driven. */
-.nano-active .djs-visual > :nth-child(1) {
-  stroke: #0284c7 !important;
-  stroke-width: 3px !important;
-  fill: #e0f2fe !important;
-}
-
-.nano-incident .djs-visual > :nth-child(1) {
-  stroke: #dc2626 !important;
-  stroke-width: 3px !important;
-  fill: #fee2e2 !important;
-}
-
-/* Agent-session badge (BpmnViewer `badges`, #1314): a pill on the element's
- * top-right corner that opens the session scrubber. Fixed light colours for
- * the same reason as the markers above. */
-.nano-badge {
-  white-space: nowrap;
-  border-radius: 9999px;
-  border: 1px solid #7c3aed;
-  background: #f5f3ff;
-  color: #5b21b6;
-  font:
-    600 11px/1.4 ui-sans-serif,
-    system-ui,
-    sans-serif;
-  padding: 0 6px;
-  cursor: pointer;
-  box-shadow: 0 1px 2px rgb(0 0 0 / 0.15);
-}
-
-.nano-badge:hover,
-.nano-badge:focus-visible {
-  background: #ede9fe;
-  outline: 2px solid #7c3aed;
-  outline-offset: 1px;
-}
-
-.nano-badge-active {
-  background: #7c3aed;
-  color: #fff;
-  animation: nano-badge-pulse 1.6s ease-in-out infinite;
-}
-
-@keyframes nano-badge-pulse {
-  50% {
-    box-shadow: 0 0 0 4px rgb(124 58 237 / 0.25);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .nano-badge-active {
-    animation: none;
-  }
 }
 
 /*
@@ -267,65 +212,8 @@ body {
   max-width: 100%;
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
- * Mobile-first console styles (unit A0) append below this line.
+/* Mobile-first primitives (touch targets, card grid, bottom-sheet grip,
+ * safe-area helpers) live in `process-explorer/src/styles.css`, imported above,
+ * alongside the UI kit (process-explorer/src/ui.tsx) that consumes them.
  * Keep palette/token definitions out of here — they live in the shared
- * `@nanobpm/nano-app-schema/tokens.css` imported at the top of this file.
- *
- * These primitives (consumed via process-explorer/src/ui.tsx, the shared UI kit) are self-contained: a
- * consumer at 375×812 gets no horizontal scroll from them. The single JS
- * breakpoint lives in `MOBILE_MAX_WIDTH`; the layout rules below stay
- * breakpoint-free (intrinsic auto-fill / safe-area) so no second `640px`
- * literal is introduced here.
- * ───────────────────────────────────────────────────────────────────────── */
-
-/* Minimum comfortable touch target (WCAG 2.5.5 / iOS HIG ≈ 44px). Any control
- * a finger taps on mobile should carry `.nano-touch`. */
-.nano-touch {
-  min-height: 44px;
-  min-width: 44px;
-}
-
-/* Responsive card grid (CardGrid). Columns are chosen by available width via
- * `auto-fill`, so the grid collapses to a single column on a phone with no
- * horizontal overflow — no width media query, hence no breakpoint literal.
- * `min(100%, 16rem)` guarantees a lone card never exceeds the viewport. */
-.nano-card-grid {
-  display: grid;
-  gap: 0.75rem;
-  grid-template-columns: repeat(auto-fill, minmax(min(100%, 16rem), 1fr));
-}
-
-/* Bottom-sheet drag affordance (BottomSheet): a centered grip bar at the top. */
-.nano-sheet-grip {
-  display: block;
-  height: 0.25rem;
-  width: 2.25rem;
-  flex-shrink: 0;
-  border-radius: 9999px;
-  background: var(--nano-edge-strong);
-}
-
-/* Safe-area helpers so content clears the notch and home indicator on devices
- * with display cut-outs. Paired with `viewport-fit=cover` in index.html.
- * `env(safe-area-inset-*)` resolves to 0 where there is no inset, so these are
- * inert on desktop and non-notched screens. */
-.nano-safe-area {
-  padding-top: env(safe-area-inset-top);
-  padding-right: env(safe-area-inset-right);
-  padding-bottom: env(safe-area-inset-bottom);
-  padding-left: env(safe-area-inset-left);
-}
-
-.nano-safe-top {
-  padding-top: env(safe-area-inset-top);
-}
-
-.nano-safe-bottom {
-  padding-bottom: env(safe-area-inset-bottom);
-}
-
-.nano-safe-x {
-  padding-right: env(safe-area-inset-right);
-  padding-left: env(safe-area-inset-left);
-}
+ * `@nanobpm/nano-app-schema/tokens.css`. */

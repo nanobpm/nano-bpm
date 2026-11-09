@@ -39,12 +39,13 @@ the console's `npm run gen:api`, and they are types only. Don't edit them by han
 
 ## Entry points
 
-| Import                                | What                                                                 |
-| ------------------------------------- | -------------------------------------------------------------------- |
-| `@nanobpm/process-explorer`           | Explorer, InstanceDetail, BpmnViewer, TraceTimeline, the data source |
-| `@nanobpm/process-explorer/ui`        | The console UI kit (Button, Badge, Modal, …)                         |
-| `@nanobpm/process-explorer/filters`   | URL filter helpers, which have no React or bpmn-js deps              |
-| `@nanobpm/process-explorer/clipboard` | `copyText`, `selectElementText`                                      |
+| Import                                 | What                                                                 |
+| -------------------------------------- | -------------------------------------------------------------------- |
+| `@nanobpm/process-explorer`            | Explorer, InstanceDetail, BpmnViewer, TraceTimeline, the data source |
+| `@nanobpm/process-explorer/ui`         | The console UI kit (Button, Badge, Modal, …)                         |
+| `@nanobpm/process-explorer/filters`    | URL filter helpers, which have no React or bpmn-js deps              |
+| `@nanobpm/process-explorer/clipboard`  | `copyText`, `selectElementText`                                      |
+| `@nanobpm/process-explorer/styles.css` | Handwritten component CSS every host must import                     |
 
 ## How it is built
 
@@ -54,5 +55,6 @@ of its own:
 - **Dependency:** the console depends on it as `file:../process-explorer`.
 - **Peer dependencies:** the console supplies them (React, TanStack Query, bpmn-js).
 - **Vite:** the console's Vite config aliases each `exports` entry to the real path.
-- **Styling:** Tailwind scans `src/` through an `@source` in `console/src/index.css`, and the theme comes from the host's tokens.
+- **Styling:** Tailwind scans `src/` through an `@source` in `console/src/index.css`, and the theme comes from the host's tokens. The handwritten component rules (diagram markers, agent badges, touch targets, card grid, safe-area helpers) ship in `src/styles.css`: every host must import `@nanobpm/process-explorer/styles.css` (the console imports it from `index.css`).
+- **Query cache:** `ExplorerDataProvider` gives each data source its own TanStack Query cache (inheriting the host's default options), so two sources never share cached instances or diagrams.
 - **Console checks:** `npm run typecheck`, `npm test` (`test:explorer`) and `npm run format:check` cover this package too.

@@ -9,8 +9,18 @@
 // Operator actions are optional. A host that can't suspend, resume, cancel,
 // resolve or write variables leaves the method out and the Explorer hides the
 // matching control, so a read-only host never renders a dead button.
-import { createContext, useContext, useEffect, type ReactNode } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  type ReactNode,
+} from "react";
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQueryClient,
+} from "@tanstack/react-query";
 import type {
   InstanceDetail,
   InstancePage,
@@ -72,7 +82,26 @@ export interface ExplorerDataSource {
 
 const DataSourceContext = createContext<ExplorerDataSource | null>(null);
 
-/** Makes `source` the data source of every Explorer component below it. */
+/**
+ * A fresh query cache for one data source, inheriting the host's default query
+ * options. Explorer query keys (`["instance", key]`, `["process-xml", def]`, …)
+ * are not source-qualified, so sharing one cache across sources would show one
+ * engine's data (XML is cached forever) while actions target another. Giving
+ * each source its own cache removes that collision class for every key, present
+ * and future, rather than namespacing each key by hand.
+ */
+export function createSourceQueryClient(parent?: QueryClient): QueryClient {
+  return new QueryClient(
+    parent ? { defaultOptions: parent.getDefaultOptions() } : undefined,
+  );
+}
+
+/**
+ * Makes `source` the data source of every Explorer component below it, with a
+ * query cache private to that source (see `createSourceQueryClient`). Passing a
+ * different `source` starts from an empty cache. Needs a host
+ * `QueryClientProvider` above it, whose default options it inherits.
+ */
 export function ExplorerDataProvider({
   source,
   children,
@@ -80,10 +109,18 @@ export function ExplorerDataProvider({
   source: ExplorerDataSource;
   children: ReactNode;
 }) {
+  const parent = useQueryClient();
+  const client = useMemo(
+    () => createSourceQueryClient(parent),
+    [parent, source],
+  );
+  useEffect(() => () => client.clear(), [client]);
   return (
-    <DataSourceContext.Provider value={source}>
-      {children}
-    </DataSourceContext.Provider>
+    <QueryClientProvider client={client}>
+      <DataSourceContext.Provider value={source}>
+        {children}
+      </DataSourceContext.Provider>
+    </QueryClientProvider>
   );
 }
 
