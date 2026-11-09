@@ -2816,18 +2816,17 @@ impl Journal {
     /// instances stay off-heap while the snapshot restores every variable and
     /// every instance with no dependency on the spill store.
     ///
-    /// **Memory (#1337):** the Raft snapshot path no longer materializes the
-    /// whole cold set — `get_snapshot_builder` captures the streaming halves
+    /// **Memory (#1337, #1463):** neither snapshot path materializes the whole
+    /// cold set any more. The Raft path captures the streaming halves
     /// ([`streaming_snapshot_parts`](Journal::streaming_snapshot_parts)) and
     /// `build_snapshot` streams the cold/spilled rows straight from the spill
-    /// store to disk in bounded chunks, so the capture peak is one chunk, not the
-    /// working set. This local-rotation capture (`snapshot_and_rotate`) still
-    /// folds the full set into one in-memory `EngineSnapshot` for the
-    /// single-file `snapshot.*.bin` format; converting that on-disk format to
-    /// the chunked sidecar is the remaining local-path follow-up (a breaking
-    /// snapshot-format change requiring an explicit `SNAPSHOT_FORMAT_VERSION`
-    /// bump and replay-migrator validation, deliberately out of #1337's Raft
-    /// scope).
+    /// store to disk in bounded chunks; the local (non-Raft) rotation uses
+    /// [`streaming_snapshot_and_rotate`](Journal::streaming_snapshot_and_rotate)
+    /// and
+    /// [`seglog::write_snapshot_streaming`](crate::seglog::write_snapshot_streaming),
+    /// which seal the same chunked sidecar framing (snapshot format v3). This
+    /// best-effort value wrapper still folds, but it backs no durable recovery
+    /// point.
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         let mut snap = self.engine.snapshot();
         // Best-effort (see the doc above): a failed fold is logged and left
@@ -3451,6 +3450,53 @@ impl Journal {
         // journaled before the seal (#1384 review), so the loss survives restart.
         // The capture borrows `self` mutably, so it runs before the `writer` borrow.
         let snap = self.try_engine_snapshot_quarantining_with_incidents()?;
+        self.rotate_sealing().map(|covered| (snap, covered))
+    }
+
+    /// The streaming/sidecar counterpart of
+    /// [`snapshot_and_rotate`](Journal::snapshot_and_rotate) (#1463): captures the
+    /// same consistent engine state and seals the active segment at the same
+    /// boundary, but returns the **decomposed streaming parts**
+    /// ([`streaming_snapshot_parts`](Journal::streaming_snapshot_parts)) instead
+    /// of one folded in-memory [`EngineSnapshot`]. The caller streams them to
+    /// disk off the engine thread with
+    /// [`write_streaming_snapshot_from_stores`](crate::snapstream::write_streaming_snapshot_from_stores)
+    /// (via [`seglog::write_snapshot_streaming`](crate::seglog::write_snapshot_streaming)),
+    /// so the whole cold/spilled set is never resident at once on the local
+    /// (non-Raft) snapshot path either.
+    ///
+    /// Fail-closed exactly like [`snapshot_and_rotate`](Journal::snapshot_and_rotate):
+    /// the capture validates every off-heap row **before** the seal (quarantining
+    /// a definitively-absent one with its journaled `VariablesLost` incident), so
+    /// an incomplete snapshot is never sealed and the covered prefix never becomes
+    /// eligible for compaction. The validation capture is dropped before the
+    /// streaming decompose re-reads the state, so the two never coexist.
+    pub fn streaming_snapshot_and_rotate(
+        &mut self,
+    ) -> Option<(
+        crate::snapstream::StreamingCapture,
+        Vec<Key>,
+        crate::snapstream::SpillStores,
+        u64,
+    )> {
+        self.seg.as_ref()?;
+        // Validate + quarantine first (journaling any `VariablesLost` incident
+        // BEFORE the seal), then drop the folded capture: it exists only to
+        // prove completeness and is not what gets written.
+        let validated = self.try_engine_snapshot_quarantining_with_incidents()?;
+        drop(validated);
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        let covered = self.rotate_sealing()?;
+        Some((capture, cold_keys, stores, covered))
+    }
+
+    /// The seal half of a snapshot rotation, shared by
+    /// [`snapshot_and_rotate`](Journal::snapshot_and_rotate) and
+    /// [`streaming_snapshot_and_rotate`](Journal::streaming_snapshot_and_rotate):
+    /// routes the rotate through the ordered writer channel (after every write
+    /// the captured state already reflects) and returns this partition's covered
+    /// event count at the sealed boundary. `None` when the writer is gone.
+    fn rotate_sealing(&mut self) -> Option<u64> {
         let writer = self.writer.as_ref()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
@@ -3466,7 +3512,7 @@ impl Journal {
             .get(self.partition_id as usize)
             .copied()
             .unwrap_or(info.end);
-        Some((snap, covered))
+        Some(covered)
     }
 
     /// The lean-snapshot counterpart of

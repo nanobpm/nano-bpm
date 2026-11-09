@@ -95,7 +95,16 @@ struct Paused {
 /// and explicitly nullable history metrics.
 /// Persistence decoders retain numeric tokens and literal legacy prompt strings
 /// so version-1 journals and snapshots still load.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Version `3` reframes the LOCAL (non-Raft) `snapshot.*.bin` / `msnapshot.bin`
+/// payload as the #1337 chunked sidecar stream (control frame + bounded
+/// instance-chunk frames + a terminal end frame) so a snapshot never
+/// materializes the whole cold/spilled set in RAM (#1463). The versioned
+/// `EngineSnapshot` *payload shape* itself is unchanged — a v3 control frame
+/// carries the same `EngineSnapshot` value a v2 monolith did — so version-2
+/// (and headerless version-0) snapshots still load under this build, and a
+/// pre-v3 build fails a v3 file closed as `FormatMismatch` (then migrates it by
+/// replay, #1071).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
 /// identically. Produced by [`Engine::snapshot`] and consumed by

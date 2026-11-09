@@ -26348,8 +26348,14 @@ async fn main() {
                     let mut prev_covered: u64 = 0;
                     loop {
                         ticker.tick().await;
-                        let snapped = handle.with(|journal| journal.snapshot_and_rotate()).await;
-                        let Some((snap, covered)) = snapped else {
+                        // Capture the streaming halves + seal on the engine
+                        // thread (a consistent read), then stream to disk OFF it
+                        // so the whole cold/spilled set is never resident at once
+                        // (#1463).
+                        let snapped = handle
+                            .with(|journal| journal.streaming_snapshot_and_rotate())
+                            .await;
+                        let Some((capture, cold_keys, stores, covered)) = snapped else {
                             record_snapshot_health_tick(
                                 health,
                                 std::slice::from_ref(&handle),
@@ -26359,7 +26365,19 @@ async fn main() {
                             .await;
                             continue;
                         };
-                        if let Err(e) = seglog::write_snapshot(&shared.dir, snap, covered) {
+                        let write_dir = shared.dir.clone();
+                        let write_result = tokio::task::spawn_blocking(move || {
+                            seglog::write_snapshot_streaming(
+                                &write_dir, capture, &cold_keys, stores, covered,
+                            )
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(std::io::Error::other(format!(
+                                "snapshot writer task panicked: {e}"
+                            )))
+                        });
+                        if let Err(e) = write_result {
                             record_snapshot_health_tick(
                                 health,
                                 std::slice::from_ref(&handle),
@@ -26443,9 +26461,19 @@ async fn main() {
                         ticker.tick().await;
                         // Snapshot each owned partition; a `None` (writer gone)
                         // aborts this tick so compaction never runs on a partial
-                        // watermark set.
+                        // watermark set. The non-lean path captures the STREAMING
+                        // halves (#1463) so no partition's cold set is folded into
+                        // one in-memory snapshot; the lean path keeps its
+                        // control-only capture.
                         let mut entries: Vec<(u64, u64, nanobpmn_engine_core::EngineSnapshot)> =
                             Vec::with_capacity(handles.len());
+                        let mut stream_entries: Vec<(
+                            u64,
+                            u64,
+                            nano_server_storage::snapstream::StreamingCapture,
+                            Vec<nanobpmn_engine_core::Key>,
+                            nano_server_storage::snapstream::SpillStores,
+                        )> = Vec::with_capacity(handles.len());
                         let mut covered = vec![0u64; num_partitions as usize];
                         // Per-partition durable-variable position. `u64::MAX` means
                         // "no variable constraint" (non-lean, or a partition this
@@ -26494,12 +26522,16 @@ async fn main() {
                                     }
                                 }
                             } else {
-                                match handle.with(|journal| journal.snapshot_and_rotate()).await {
-                                    Some((snap, covered_p)) => {
+                                match handle
+                                    .with(|journal| journal.streaming_snapshot_and_rotate())
+                                    .await
+                                {
+                                    Some((capture, cold_keys, stores, covered_p)) => {
                                         if (pid as usize) < covered.len() {
                                             covered[pid as usize] = covered_p;
                                         }
-                                        entries.push((pid, covered_p, snap));
+                                        stream_entries
+                                            .push((pid, covered_p, capture, cold_keys, stores));
                                     }
                                     None => {
                                         failure = Some(format!(
@@ -26516,14 +26548,36 @@ async fn main() {
                             continue;
                         }
                         // The covered watermarks for the partitions THIS node owns
-                        // (one per snapshotted entry). Captured before `entries` is
-                        // moved into the snapshot writer so the cold-archive prune
-                        // floor derives from owned partitions only — `covered` is a
-                        // GLOBAL-width vector with 0-holes for partitions a
-                        // clustered node does not own, and its min would pin the
-                        // floor at 0 forever (unbounded cold archive, #1076).
-                        let owned_covered: Vec<u64> = entries.iter().map(|e| e.1).collect();
-                        if let Err(e) = seglog::write_multi_snapshot(&shared.dir, entries) {
+                        // (one per snapshotted entry). Captured before the entries
+                        // are moved into the snapshot writer so the cold-archive
+                        // prune floor derives from owned partitions only —
+                        // `covered` is a GLOBAL-width vector with 0-holes for
+                        // partitions a clustered node does not own, and its min
+                        // would pin the floor at 0 forever (unbounded cold
+                        // archive, #1076).
+                        let owned_covered: Vec<u64> = if varstore.is_some() {
+                            entries.iter().map(|e| e.1).collect()
+                        } else {
+                            stream_entries.iter().map(|e| e.1).collect()
+                        };
+                        // Lean path: control-only snapshots written inline. Non-lean
+                        // path (#1463): stream the combined snapshot off the engine
+                        // thread so no partition's cold set is held in RAM.
+                        let write_result = if varstore.is_some() {
+                            seglog::write_multi_snapshot(&shared.dir, entries)
+                        } else {
+                            let write_dir = shared.dir.clone();
+                            tokio::task::spawn_blocking(move || {
+                                seglog::write_multi_snapshot_streaming(&write_dir, stream_entries)
+                            })
+                            .await
+                            .unwrap_or_else(|e| {
+                                Err(std::io::Error::other(format!(
+                                    "multi snapshot writer task panicked: {e}"
+                                )))
+                            })
+                        };
+                        if let Err(e) = write_result {
                             record_snapshot_health_tick(
                                 health,
                                 &handles,

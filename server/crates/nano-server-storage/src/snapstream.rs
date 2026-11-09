@@ -628,6 +628,307 @@ pub fn read_streaming_engine_snapshot(path: &Path) -> std::io::Result<EngineSnap
     read_streaming_engine_snapshot_from(file)
 }
 
+// ----------------------------------------------------------------------------
+// Multi-partition combined streaming snapshot (#1463).
+//
+// The multi-partition `msnapshot.bin` carries one engine per OWNED partition.
+// Its v3 framing reuses the same bounded-chunk idea, generalized so each
+// instance chunk is tagged with the partition it belongs to:
+//
+// ```text
+// {"format_version":3,…}\n                                            (header)
+// {"partition":0,"covered_events":…,"control":{…}}\n        (control frame ×P)
+// {"partition":0,"instances":[<InstanceSnapshot>, …]}\n    (chunk frame ×N)
+// {"partition":-,"instances":[],"end":true}\n                     (terminal)
+// ```
+//
+// Control frames carry no instances (each partition's skeleton); every instance
+// payload — resident or cold — streams through the shared bounded chunk frames,
+// so no partition's whole cold set is ever resident at once.
+// ----------------------------------------------------------------------------
+
+/// One partition's control frame in a combined multi-partition snapshot.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MultiControlFrame {
+    partition: u64,
+    covered_events: u64,
+    control: EngineSnapshot,
+}
+
+/// One instance chunk in a combined multi-partition snapshot, tagged with the
+/// partition its instances belong to so the reader restores each into the right
+/// partition's engine. `end` marks the terminal frame (fail-closed on a torn
+/// write, exactly like the single-partition stream).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MultiInstanceChunk {
+    partition: u64,
+    instances: Vec<InstanceSnapshot>,
+    #[serde(default)]
+    end: bool,
+}
+
+/// Streams a combined multi-partition snapshot to `path` without ever holding
+/// any partition's whole cold set in memory (#1463). `entries` is
+/// `(partition, covered_events, capture, cold_keys, stores)` per owned
+/// partition; each partition's control frame is written first, then every
+/// partition's instances stream through shared bounded chunk frames (cold rows
+/// read lazily from that partition's stores). Fail-closed and atomic (tmp +
+/// fsync + rename, partial file removed on error), exactly like
+/// [`write_streaming_snapshot_from_stores`].
+pub fn write_multi_streaming_snapshot(
+    path: &Path,
+    header_line: &str,
+    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores)>,
+) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let outcome = write_multi_streaming_snapshot_inner(&tmp, header_line, entries);
+    match outcome {
+        Ok(()) => {
+            let f = File::open(&tmp)?;
+            f.sync_all()?;
+            drop(f);
+            std::fs::rename(&tmp, path)?;
+            if let Some(dir) = path.parent()
+                && let Ok(d) = File::open(dir)
+            {
+                let _ = d.sync_all();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_multi_streaming_snapshot_inner(
+    tmp: &Path,
+    header_line: &str,
+    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores)>,
+) -> std::io::Result<()> {
+    let file = File::create(tmp)?;
+    let mut w = BufWriter::new(file);
+
+    w.write_all(header_line.as_bytes())?;
+    w.write_all(b"\n")?;
+
+    // Every partition's control frame first (instance-free skeletons).
+    for (partition, covered_events, capture, _, _) in &entries {
+        serde_json::to_writer(
+            &mut w,
+            &MultiControlFrame {
+                partition: *partition,
+                covered_events: *covered_events,
+                control: capture.control.clone(),
+            },
+        )
+        .map_err(into_invalid_data)?;
+        w.write_all(b"\n")?;
+    }
+
+    // Then stream every partition's instances through shared bounded chunks.
+    let mut chunk: Vec<(u64, InstanceSnapshot)> = Vec::with_capacity(STREAM_CHUNK_INSTANCES);
+    for (partition, _covered, capture, cold_keys, stores) in entries {
+        let SpillStores {
+            cold: cold_store,
+            spill: spill_store,
+            varstore,
+        } = stores;
+        // Reuse the single-partition spill-resolution closure logic per row.
+        let resolve = |snap: &mut InstanceSnapshot| {
+            resolve_spilled_from_stores(snap, varstore.as_ref(), spill_store.as_ref())
+        };
+        let push = |chunk: &mut Vec<(u64, InstanceSnapshot)>,
+                    w: &mut BufWriter<File>,
+                    mut snap: InstanceSnapshot|
+         -> std::io::Result<()> {
+            if snap.instance.variables_spilled {
+                resolve(&mut snap)?;
+            }
+            chunk.push((partition, snap));
+            if chunk.len() >= STREAM_CHUNK_INSTANCES {
+                flush_multi_chunk(w, chunk, false)?;
+            }
+            Ok(())
+        };
+        for snap in capture.resident {
+            push(&mut chunk, &mut w, snap)?;
+        }
+        for key in cold_keys {
+            let store = cold_store.as_ref().ok_or_else(|| {
+                invalid_data("cold index references a key but no cold store is wired")
+            })?;
+            let snap = store
+                .try_get_cold(key)
+                .map_err(|e| invalid_data(&e.to_string()))?
+                .ok_or_else(|| {
+                    invalid_data(&format!(
+                        "cold instance {key} has no row in the spill store"
+                    ))
+                })?;
+            push(&mut chunk, &mut w, snap)?;
+        }
+    }
+    flush_multi_chunk(&mut w, &mut chunk, true)?;
+    w.flush()?;
+    Ok(())
+}
+
+fn flush_multi_chunk(
+    w: &mut BufWriter<File>,
+    chunk: &mut Vec<(u64, InstanceSnapshot)>,
+    end: bool,
+) -> std::io::Result<()> {
+    if chunk.is_empty() && !end {
+        return Ok(());
+    }
+    // A chunk may span partitions; emit one frame per contiguous partition run
+    // so each frame is single-partition (simpler reader). For the common case
+    // (one partition's rows per chunk) this is exactly one frame. Drain takes
+    // ownership safely — no unsafe, no leak.
+    let taken = std::mem::take(chunk);
+    let mut runs: Vec<(u64, Vec<InstanceSnapshot>)> = Vec::new();
+    for (partition, snap) in taken {
+        match runs.last_mut() {
+            Some((p, batch)) if *p == partition => batch.push(snap),
+            _ => runs.push((partition, vec![snap])),
+        }
+    }
+    for (partition, batch) in runs {
+        let frame = MultiInstanceChunk {
+            partition,
+            instances: batch,
+            end: false,
+        };
+        serde_json::to_writer(&mut *w, &frame).map_err(into_invalid_data)?;
+        w.write_all(b"\n")?;
+    }
+    if end {
+        let frame = MultiInstanceChunk {
+            partition: 0,
+            instances: Vec::new(),
+            end: true,
+        };
+        serde_json::to_writer(&mut *w, &frame).map_err(into_invalid_data)?;
+        w.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+/// Resolves a variable-spilled instance's payload from the wired stores,
+/// mirroring [`write_streaming_snapshot_from_stores`]'s fail-closed semantics
+/// (a lean var-store miss with a surviving legacy spill row is refused).
+fn resolve_spilled_from_stores(
+    snap: &mut InstanceSnapshot,
+    varstore: Option<&Arc<VarStore>>,
+    spill_store: Option<&Arc<VarSpillStore>>,
+) -> std::io::Result<()> {
+    let key = snap.instance.key;
+    let resolved = if let Some(vs) = varstore {
+        match vs.try_get(key).map_err(|e| invalid_data(&e.to_string()))? {
+            Some(vars) => Some(vars),
+            None => {
+                let legacy_row = match spill_store {
+                    Some(s) => s.try_get(key).map_err(|e| invalid_data(&e.to_string()))?,
+                    None => None,
+                };
+                if legacy_row.is_some() {
+                    return Err(invalid_data(&format!(
+                        "spilled instance {key}: var store has no row but a legacy \
+                         spill row exists (unmigrated lean-over-legacy state); refusing \
+                         to seal a potentially stale payload"
+                    )));
+                }
+                None
+            }
+        }
+    } else if let Some(sp) = spill_store {
+        sp.try_get(key).map_err(|e| invalid_data(&e.to_string()))?
+    } else {
+        None
+    };
+    match resolved {
+        Some(vars) => {
+            snap.instance.variables = Arc::new(vars);
+            snap.instance.variables_spilled = false;
+            Ok(())
+        }
+        None => Err(invalid_data(&format!(
+            "spilled instance {key} has no variable row in any wired store"
+        ))),
+    }
+}
+
+/// Reads a combined multi-partition streaming snapshot back into a map from
+/// global partition id to `(covered_events, EngineSnapshot)`, streaming each
+/// instance chunk into its partition's skeleton as it arrives (#1463).
+/// Fail-closed on a torn write (no terminal `end` frame).
+pub fn read_multi_streaming_snapshot(
+    path: &Path,
+) -> std::io::Result<std::collections::HashMap<u64, (u64, EngineSnapshot)>> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+
+    // Line 1: envelope header (validated by the caller).
+    let mut header_line = String::new();
+    if reader.read_line(&mut header_line)? == 0 {
+        return Err(invalid_data(
+            "multi streaming snapshot is empty (no header)",
+        ));
+    }
+
+    let mut map: std::collections::HashMap<u64, (u64, EngineSnapshot)> =
+        std::collections::HashMap::new();
+    let mut saw_end = false;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Distinguish a control frame from a chunk frame by the presence of the
+        // `control` key (control frames carry it; chunk frames carry
+        // `instances`). Parse generically first.
+        let value: serde_json::Value = serde_json::from_str(trimmed).map_err(into_invalid_data)?;
+        if value.get("control").is_some() {
+            let frame: MultiControlFrame =
+                serde_json::from_value(value).map_err(into_invalid_data)?;
+            map.insert(frame.partition, (frame.covered_events, frame.control));
+        } else {
+            let chunk: MultiInstanceChunk =
+                serde_json::from_value(value).map_err(into_invalid_data)?;
+            let end = chunk.end;
+            if !chunk.instances.is_empty() {
+                let entry = map.get_mut(&chunk.partition).ok_or_else(|| {
+                    invalid_data(&format!(
+                        "multi snapshot chunk for unknown partition {}",
+                        chunk.partition
+                    ))
+                })?;
+                for snap in chunk.instances {
+                    nanobpmn_engine_core::restore_instance_snapshot(&mut entry.1.state, snap);
+                }
+            }
+            if end {
+                saw_end = true;
+                break;
+            }
+        }
+    }
+    if !saw_end {
+        return Err(invalid_data(
+            "multi streaming snapshot is truncated (no terminal frame); refusing to \
+             restore an incomplete instance set",
+        ));
+    }
+    Ok(map)
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
