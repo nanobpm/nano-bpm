@@ -16,8 +16,8 @@ import {
   TraceTimeline,
   fmtClock,
   fmtDuration,
-} from "../components/TraceTimeline";
-import { Badge, ErrorText } from "../components/ui";
+} from "@nanobpm/process-explorer";
+import { Badge, ErrorText } from "@nanobpm/process-explorer/ui";
 
 function outcomeTone(outcome: TraceOutcome): "info" | "ok" | "neutral" {
   switch (outcome) {

@@ -20,7 +20,7 @@
 // belongs to which cell", so both the table grouping and the click resolution
 // route through it.
 
-import type { CalledInstance } from "../gen";
+import type { CalledInstance } from "./gen";
 
 /**
  * Extract the BPMN ids of every `callActivity` cell in a process model.

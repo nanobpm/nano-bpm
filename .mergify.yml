@@ -76,7 +76,7 @@ queue_rules:
 # `formal` filter (`formal/**`, `engine-core/src/**`, `engine-core/tests/**`,
 # `engine-core/examples/**`, `engine-core/Cargo.toml` or `.github/workflows/ci.yml`), and the two console jobs
 # (`console (typecheck + test)` and `console (journey e2e)`) are gated by the
-# `console` filter (inputs `console/**`, `spec-console/**`, `spec-app/**`,
+# `console` filter (inputs `console/**`, `process-explorer/**`, `spec-console/**`, `spec-app/**`,
 # `.github/workflows/ci.yml`, AGENTS.md and .mergify.yml for the merge-gate guard;
 # the typecheck job additionally runs on the `docs` filter), so each is
 # SKIPPED for PRs that don't touch its inputs (e.g. a console-/website-/docs-only

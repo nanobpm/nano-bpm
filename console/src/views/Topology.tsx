@@ -8,7 +8,7 @@ import {
   ErrorText,
   PageHeader,
   SectionLabel,
-} from "../components/ui";
+} from "@nanobpm/process-explorer/ui";
 import JourneyPicker from "../components/JourneyPicker";
 import { CONSOLE_PROFILE, IS_STUDIO } from "../lib/profile";
 import { useTour } from "../lib/tour/tourContext";

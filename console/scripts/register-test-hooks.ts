@@ -46,6 +46,20 @@ export async function resolve(specifier, context, nextResolve) {
         }
       }
     }
+    // A bare import (e.g. "react") from the shared Process Explorer package
+    // (../process-explorer, which has no install of its own): resolve it the
+    // way the app build does, against the console's node_modules.
+    if (
+      err.code === "ERR_MODULE_NOT_FOUND" &&
+      !specifier.startsWith(".") &&
+      context.parentURL &&
+      context.parentURL.includes("/process-explorer/src/")
+    ) {
+      return nextResolve(specifier, {
+        ...context,
+        parentURL: pathToFileURL(process.cwd() + "/").href,
+      });
+    }
     throw err;
   }
 }

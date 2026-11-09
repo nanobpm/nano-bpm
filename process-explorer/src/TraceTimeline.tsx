@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { ReactNode } from "react";
-import type { InstanceTrace, TraceElement } from "../gen";
+import type { InstanceTrace, TraceElement } from "./gen";
 import { SectionLabel } from "./ui";
 import { IncidentReason } from "./IncidentReason";
 import { fmtClock, fmtDuration } from "./traceTime.ts";

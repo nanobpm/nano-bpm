@@ -9,7 +9,7 @@ import {
   INSTANCE_DEEP_LINK_PARAM,
   readInstanceParam,
   explorerStackView,
-} from "../views/explorerFilters.ts";
+} from "@nanobpm/process-explorer/filters";
 
 test("nano-app-ready asks the host to reply with the theme", () => {
   assert.deepEqual(decideAppViewMessage({ type: "nano-app-ready" }), {

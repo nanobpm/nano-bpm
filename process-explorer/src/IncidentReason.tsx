@@ -5,11 +5,11 @@ import {
   useState,
   type CSSProperties,
 } from "react";
-import { copyText, selectElementText } from "../lib/clipboard";
+import { copyText, selectElementText } from "./clipboard";
 import {
   REASON_COLLAPSE_LINES,
   shouldCollapseReason,
-} from "../lib/incidentReason";
+} from "./incidentReasonText.ts";
 
 // Renders an incident *reason* legibly. Worker/engine reasons are frequently a
 // full multiline stderr dump (a failing `git clone`, an agent traceback), so we

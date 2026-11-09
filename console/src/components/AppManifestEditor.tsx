@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeEditor from "./CodeEditor";
-import { Badge, Button, SectionLabel } from "./ui";
+import { Badge, Button, SectionLabel } from "@nanobpm/process-explorer/ui";
 import { projectFileEx } from "../lib/api";
 import { setManifestSource } from "../lib/manifestIntellisense";
 import { saveProjectFile, type FileNode } from "../gen";

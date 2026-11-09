@@ -8,7 +8,7 @@ import {
   shouldCollapseReason,
   REASON_COLLAPSE_LINES,
   REASON_COLLAPSE_CHARS,
-} from "./incidentReason.ts";
+} from "./incidentReasonText.ts";
 
 test("countReasonLines counts newline-delimited lines; empty is zero", () => {
   assert.equal(countReasonLines(""), 0);

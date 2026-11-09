@@ -22,7 +22,7 @@ import {
   ErrorText,
   PageHeader,
   SectionLabel,
-} from "../components/ui";
+} from "@nanobpm/process-explorer/ui";
 
 type Tab = "server" | "ide" | "appearance";
 

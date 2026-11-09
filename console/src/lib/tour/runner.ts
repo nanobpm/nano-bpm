@@ -27,7 +27,7 @@ import type {
   TourContext,
 } from "./types";
 import { resolveSteps, type ResolvedStep } from "./registry.ts";
-import { copyText } from "../clipboard.ts";
+import { copyText } from "@nanobpm/process-explorer/clipboard";
 
 /** How long to wait for a step's target to mount before skipping it. */
 const WAIT_FOR_ELEMENT_MS = 5000;
