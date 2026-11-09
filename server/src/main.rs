@@ -28607,7 +28607,25 @@ mod clustered_startup_tests {
             "the orphan must be a distinct key, or the test cannot detect an unguarded sweep"
         );
 
-        let mut server = build_server_in_memory(vec![j0], cluster::Topology::single(1));
+        // Partition 1 is hosted but EMPTY (its deferred hosting failed before
+        // any recovery ran, so its live set is empty), and its journal attaches
+        // the shared cold store as a hosted partition always does — so an
+        // UNGUARDED sweep would enumerate partition 1's band and reap the
+        // orphan. Hosting it requires a two-partition topology: with
+        // `num_partitions == 1` the sweep never visits partition 1 and the
+        // band-bounded partition-0 sweep cannot reach the row, so the test
+        // would pass even without the latch (#1479 review finding).
+        let mut j1 = Journal::in_memory_partition(1);
+        j1.set_cold_spill(Arc::clone(&store), 1, 0);
+        let mut server = build_server_in_memory(
+            vec![j0, j1],
+            cluster::Topology {
+                node_id: 0,
+                peers: vec!["http://127.0.0.1:1".to_string()],
+                num_partitions: 2,
+                replication_factor: 1,
+            },
+        );
         server.spill_config = Some(SpillConfig {
             store: Arc::clone(&store),
             var: None,

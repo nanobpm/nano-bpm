@@ -1574,6 +1574,15 @@ impl Journal {
     /// engine state is authoritative for liveness. Returns the number of
     /// orphaned rows reaped.
     pub fn gc_offheap_orphans_locked(&mut self) -> u64 {
+        // Durability barrier (#1479 review): the actor fence orders the sweep
+        // after every earlier command, but not after their journal WRITES. A
+        // cancel applied in memory whose events are still queued on the writer
+        // would drop the key from `live`, and a crash before that write lands
+        // would restore the instance with its only spill row reaped. Block (we
+        // are on the engine's dedicated OS thread, never an async runtime)
+        // until every already-enqueued write is fsynced before capturing the
+        // protection sets; the fence is still held, so nothing new enqueues.
+        self.barrier().blocking_wait();
         let mut live = std::collections::HashSet::new();
         self.collect_live_instance_keys(&mut live);
         let spill_referenced = self.gc_spill_reference_keys();
