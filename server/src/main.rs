@@ -37323,24 +37323,46 @@ mod clustered_startup_tests {
         .await
     }
 
-    /// Cold-spills every dormant instance on EVERY engine (owned + replica) of
-    /// every node — spill is local and unreplicated, so each replica sheds a
-    /// different working set from the leader. Returns the total shed.
-    async fn parity_force_spill(nodes: [&ServerImpl; 3]) -> usize {
-        let mut shed = 0;
+    /// Spill tally for one [`parity_force_spill`] sweep: the per-command
+    /// variable-budget shed and the whole-instance cold shed are counted
+    /// separately so the test can assert each tier engaged on its own — the
+    /// cold tally says nothing about variable spill.
+    #[derive(Default)]
+    struct ParitySpill {
+        var: usize,
+        cold: usize,
+    }
+
+    /// Spills on EVERY engine (owned + replica) of every node — spill is local
+    /// and unreplicated, so each replica sheds a different working set from the
+    /// leader. Forces BOTH tiers deterministically: `force_spill_scan` runs the
+    /// per-command variable-budget shed (`Budget(0)` spills every spill
+    /// candidate) without waiting out the 256-command amortisation — the
+    /// RAM-pressure sweep (`maybe_var_spill_pressure`) is a no-op under
+    /// `Budget`, so without this the variable tier never engages — and
+    /// `force_cold_spill_all` evicts every dormant instance.
+    async fn parity_force_spill(nodes: [&ServerImpl; 3]) -> ParitySpill {
+        let mut total = ParitySpill::default();
         for node in nodes {
             for p in 0..3u64 {
                 if let Some(h) = node.engine_handle_for(p) {
-                    shed += h
+                    let sweep = h
                         .with(|journal| {
-                            journal.maybe_var_spill_pressure();
-                            journal.force_cold_spill_all()
+                            let before = journal.engine().resident_spillable_count();
+                            journal.force_spill_scan();
+                            let var = before - journal.engine().resident_spillable_count();
+                            ParitySpill {
+                                var,
+                                cold: journal.force_cold_spill_all(),
+                            }
                         })
                         .await;
+                    total.var += sweep.var;
+                    total.cold += sweep.cold;
                 }
             }
         }
-        shed
+        total
     }
 
     /// One replicated clock tick at `now` on every partition (only the leader
@@ -37379,7 +37401,12 @@ mod clustered_startup_tests {
         abandoned: usize,
         completed: usize,
         timed_completed: usize,
+        /// Whole-instance (cold) sheds, aggregated over every replica.
         shed: usize,
+        /// Variable-tier sheds, aggregated over every replica. Counted
+        /// separately from `shed`: a cold-only tally could be satisfied
+        /// without the variable spill path ever engaging.
+        var_shed: usize,
     }
 
     /// One round of the mixed workload: creates (with payload), cold/var spill,
@@ -37412,7 +37439,16 @@ mod clustered_startup_tests {
         // proposed.)
         let far_future = now_millis() + 600_000;
         parity_tick(nodes, far_future).await;
-        tally.shed += parity_force_spill(nodes).await;
+        // Create/tick acks are leader-durable: they do NOT wait for the
+        // learners. Barrier here so a delayed follower has applied the creates
+        // and timer firings before the spill sweep — otherwise it spills
+        // nothing, later applies the whole workload against hot state, and its
+        // cold/var rehydration paths go untested (while the aggregate tally is
+        // still satisfied by the other replicas).
+        parity_barrier(nodes).await;
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
         // Lease with a 1 ms timeout and abandon (rehydrating cold instances):
         // leader-local locks the followers never see, reclaimed by the expiry.
         for node in nodes {
@@ -37422,12 +37458,20 @@ mod clustered_startup_tests {
                 .len();
         }
         parity_tick(nodes, now_millis() + 1_200_000).await;
-        tally.shed += parity_force_spill(nodes).await;
+        // Same barrier: the expiry tick is leader-durable too, so every replica
+        // must have applied it before this sweep for the sweep to shed (and
+        // later rehydrate) on all three.
+        parity_barrier(nodes).await;
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
         for node in nodes {
             tally.completed += parity_activate_complete(node, "do-work", 4).await;
             tally.timed_completed += parity_activate_complete(node, "do-timed", 2).await;
         }
-        tally.shed += parity_force_spill(nodes).await;
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
     }
 
     /// Applied-index barrier: for every partition, every replica (leader and
@@ -37581,6 +37625,10 @@ mod clustered_startup_tests {
             parity_workload_round(nodes, &mut tally).await;
         }
         assert!(tally.shed > 0, "cold spill engaged");
+        assert!(
+            tally.var_shed > 0,
+            "variable spill engaged (Budget(0) sheds every spill candidate)"
+        );
         assert!(tally.abandoned > 0, "leases were abandoned for expiry");
         assert!(tally.completed > 0, "intake jobs completed");
         assert!(
@@ -37691,7 +37739,13 @@ mod clustered_startup_tests {
             installed.is_some_and(|i| i >= snap),
             "the rebuilt learner caught up by snapshot install (installed {installed:?}, purged to {snap})"
         );
-        assert!(tally.shed > 0 && tally.completed > 0 && tally.timed_completed > 0);
+        assert!(
+            tally.shed > 0
+                && tally.var_shed > 0
+                && tally.completed > 0
+                && tally.timed_completed > 0,
+            "cold and variable spill both engaged, and both job types completed"
+        );
         let active = assert_replica_parity(nodes).await;
         assert!(active > 0, "the parity comparison covers live instances");
         parity_shutdown(nodes, handles).await;

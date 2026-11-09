@@ -2487,12 +2487,17 @@ impl Journal {
         }
     }
 
-    /// Test-only: force an immediate, un-throttled spill scan. Production spills
+    /// Test hook: force an immediate, un-throttled spill scan. Production spills
     /// are amortised (see [`maybe_spill`]/[`SPILL_CHECK_INTERVAL`]), so tests that
     /// assert on the fully-shed state drive it deterministically through here
     /// instead of depending on the amortisation cadence.
-    #[cfg(test)]
-    pub(crate) fn force_spill_scan(&mut self) {
+    // Also compiled under `test-hooks` (enabled by the gateway bin's
+    // dev-dependencies) so the bin's inline tests — the Raft replica-parity
+    // guards (#100), which run under `VarSpillCfg::Budget(0)` where the
+    // RAM-pressure sweep is a no-op — can force the per-command budget shed
+    // deterministically instead of waiting out the 256-command amortisation.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn force_spill_scan(&mut self) {
         self.spill_check_skip = 0;
         self.maybe_spill();
     }
