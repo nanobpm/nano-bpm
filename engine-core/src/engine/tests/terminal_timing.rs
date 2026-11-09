@@ -167,6 +167,7 @@ fn the_first_terminal_transition_wins_and_a_pre_field_event_records_nothing() {
             job_key: ja,
             instance_key: inst,
             canceled_at: 99_000,
+            deadline: None,
         },
     );
     assert_eq!(
@@ -187,6 +188,7 @@ fn the_first_terminal_transition_wins_and_a_pre_field_event_records_nothing() {
             job_type: "jc".into(),
             worker: None,
             completed_at: 0,
+            deadline: None,
         },
     );
     let job = leader.job(jc).unwrap();
@@ -209,4 +211,27 @@ fn a_pre_field_journal_record_decodes_without_an_instant() {
         Event::JobCompleted { completed_at, .. } => assert_eq!(completed_at, 0),
         other => panic!("unexpected {other:?}"),
     }
+}
+
+#[test]
+fn a_leader_local_activation_omitted_from_the_journal_still_replays_the_same_terminal_deadline() {
+    // Leader-local (soft) activation is never journaled: a follower's journal
+    // omits every `JobActivated`, so the follower's live `job.deadline` is
+    // `None` at the terminal transition while the leader's is set. The terminal
+    // deadline must come from the replicated terminal EVENT, so every replica
+    // (and a snapshot reseed off any of them) agrees with the leader.
+    let (leader, journal, ja, jb) = leader_with_terminal_jobs();
+    let follower_journal: Vec<Event> = journal
+        .into_iter()
+        .filter(|e| !matches!(e, Event::JobActivated { .. }))
+        .collect();
+    let follower = Engine::replay(follower_journal);
+    for key in [ja, jb] {
+        assert_eq!(
+            follower.job(key).unwrap().terminal_end,
+            leader.job(key).unwrap().terminal_end,
+            "job {key}: follower diverged from leader"
+        );
+    }
+    assert_terminal_timing(&follower, ja, jb, "soft-activation follower");
 }

@@ -1493,6 +1493,7 @@ fn cancel_terminates_instance_and_cancels_its_job() {
         job_key,
         instance_key,
         canceled_at: 0,
+        deadline: None,
     }));
     assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key }));
     assert!(!events

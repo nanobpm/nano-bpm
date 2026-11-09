@@ -605,6 +605,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     canceled_at: self.now,
+                    deadline: self.job_terminal_deadline(job_key),
                 });
             }
             events.extend(self.cancel_all_timers_on(eik));
@@ -732,6 +733,7 @@ impl Engine {
                 job_key,
                 instance_key,
                 canceled_at: self.now,
+                deadline: self.job_terminal_deadline(job_key),
             });
         }
         events.extend(self.resolve_incidents_on(instance_key, root_eik));
@@ -1415,6 +1417,7 @@ impl Engine {
                         job_key,
                         instance_key,
                         canceled_at: self.now,
+                        deadline: self.job_terminal_deadline(job_key),
                     },
                 );
             }
@@ -1462,6 +1465,7 @@ impl Engine {
                         job_key,
                         instance_key,
                         canceled_at: self.now,
+                        deadline: self.job_terminal_deadline(job_key),
                     },
                 );
             }
@@ -1490,6 +1494,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     canceled_at: self.now,
+                    deadline: self.job_terminal_deadline(job_key),
                 },
             );
         }

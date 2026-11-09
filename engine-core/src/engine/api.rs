@@ -580,3 +580,13 @@ impl Engine {
         completed
     }
 }
+
+impl Engine {
+    /// The activation-lock deadline a job holds right now, stamped onto its
+    /// terminal `JobCompleted`/`JobCanceled` event (#1440) so every replica,
+    /// the event-driven read model and a snapshot reseed agree on it even when
+    /// the activation itself was leader-local (never journaled).
+    pub(super) fn job_terminal_deadline(&self, job_key: Key) -> Option<u64> {
+        self.state.jobs.get(&job_key).and_then(|j| j.deadline)
+    }
+}

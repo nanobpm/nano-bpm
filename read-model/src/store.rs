@@ -1059,6 +1059,14 @@ fn now_ms() -> u64 {
 /// `(0, 0)`; execution-listener jobs store `(1, start=0/end=1)`; task-listener
 /// jobs store `(2, creating=0/assigning=1/updating=2/completing=3/canceling=4)`.
 /// The listener index/scope are not projected.
+/// The record instant of a terminal job event (#1440): the engine's command
+/// instant when the event carries one, else (a pre-field record, `0`) the batch
+/// observation time. Shared by both terminal projectors so the live projection
+/// and a snapshot reseed (`Job::terminal_end`) derive `endTime` identically.
+fn terminal_instant(event_at: u64, now_ms: u64) -> u64 {
+    if event_at != 0 { event_at } else { now_ms }
+}
+
 fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
     match kind {
         JobKind::BpmnElement => (0, 0),
@@ -4188,14 +4196,17 @@ fn project_engine_state(
         // with `last_update_ms > created_at_ms` — is covered by
         // `replayed_activation_is_held_on_a_non_fresh_row`.) On CONFLICT the
         // floor is never lowered.
+        let terminal_end = job.terminal_end;
+        let end_ms = terminal_end.map(|t| t.at);
+        // Unknown (legacy `0`) creation falls back to the retained terminal
+        // instant when there is one — never the later batch time, which would
+        // put `creationTime` after `endTime` — else to the batch time.
         let last_update = if job.created_at != 0 {
             job.created_at
         } else {
-            now_ms
+            end_ms.unwrap_or(now_ms)
         };
         let creation_ms = last_update;
-        let terminal_end = job.terminal_end;
-        let end_ms = terminal_end.map(|t| t.at);
         let last_update = end_ms.unwrap_or(last_update);
         let deadline = job.deadline.or(terminal_end.and_then(|t| t.deadline));
         let replay_floor = job.created_at.max(job.activated_at.unwrap_or(0));
@@ -5598,7 +5609,11 @@ fn project_event(
         }
 
         Event::JobCompleted {
-            job_key, worker, ..
+            job_key,
+            worker,
+            completed_at,
+            deadline,
+            ..
         } => {
             // Set `worker` from the event so a *successful* completion is
             // attributable to the activating worker on the read-model
@@ -5612,11 +5627,16 @@ fn project_event(
             // AgentInstance) attributable via the
             // `AgentInstance.jobKey → completed Job.worker` join.
             //
-            // Timing (#1344): stamp `lastUpdateTime` and `endTime` from the batch
-            // observation time, but only on the first active→terminal transition
+            // Timing (#1344, #1440): stamp `lastUpdateTime` and `endTime` from the
+            // event's command instant (`completed_at`), falling back to the batch
+            // observation time only for a pre-field record (`0`) — the SAME
+            // instant a snapshot reseed seeds (`Job::terminal_end`), so live and
+            // reseeded rows agree. Only on the first active→terminal transition
             // (`end_ms IS NULL`), so a re-delivery is a no-op — mirroring
             // `ElementCompleted`. The deadline is NOT cleared: Camunda keeps the
-            // last projected deadline on a completed job.
+            // last deadline on a completed job; the event carries it (#1440) so a
+            // leader-local activation that was never exported still projects it,
+            // and a pre-field record (`None`) keeps the row's value.
             //
             // Replay safety (#1347): a replayed recovered-then-completed prefix
             // (`[JobFailed, JobRetriesUpdated, IncidentResolved, JobActivated,
@@ -5624,6 +5644,7 @@ fn project_event(
             // gate in `project`, so it can no longer clear the retained deadline.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
+                 deadline_ms = CASE WHEN end_ms IS NULL THEN COALESCE(?5, deadline_ms) ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
                  WHERE key = ?1",
@@ -5631,25 +5652,35 @@ fn project_event(
                     *job_key as i64,
                     job_state_code(JobState::Completed),
                     worker_attribution(worker.as_deref()),
-                    now_ms as i64,
+                    terminal_instant(*completed_at, now_ms) as i64,
+                    deadline.map(|d| d as i64),
                 ],
             )?;
         }
 
-        Event::JobCanceled { job_key, .. } => {
+        Event::JobCanceled {
+            job_key,
+            canceled_at,
+            deadline,
+            ..
+        } => {
             // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
+            // Instant and deadline come from the event exactly as for
+            // `JobCompleted` (#1440).
             // Guard on the first terminal transition so a re-delivery is a no-op;
             // a job that was already FAILED/ERRORED (no `end_ms`) still gets its
             // cancellation `endTime` here (#1344).
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, \
+                 deadline_ms = CASE WHEN end_ms IS NULL THEN COALESCE(?4, deadline_ms) ELSE deadline_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
                  WHERE key = ?1",
                 params![
                     *job_key as i64,
                     job_state_code(JobState::Canceled),
-                    now_ms as i64,
+                    terminal_instant(*canceled_at, now_ms) as i64,
+                    deadline.map(|d| d as i64),
                 ],
             )?;
         }
@@ -8432,8 +8463,25 @@ mod definition_xml_tests {
             },
         );
 
+        // A legacy (`created_at == 0`, pre-field snapshot) job that went
+        // terminal after the upgrade: its unknown creation must fall back to
+        // the retained terminal instant, never to the (later) reseed time, or
+        // `creationTime > endTime`.
+        let mut legacy = state.jobs.get(&8_600).unwrap().clone();
+        legacy.key = 8_601;
+        legacy.created_at = 0;
+        state.jobs.insert(8_601, legacy);
+
         let store = ReadStore::open(None).unwrap();
         store.seed_from_engine_state(&state).unwrap();
+
+        let legacy = job_row(&store, 8_601);
+        assert_eq!(legacy.end_ms, Some(600));
+        assert_eq!(
+            legacy.created_at_ms, 600,
+            "unknown creation falls back to the terminal instant, not the reseed time"
+        );
+        assert_eq!(legacy.last_update_ms, Some(600));
 
         let seeded = job_row(&store, 8_600);
         assert_eq!(
@@ -8534,19 +8582,38 @@ mod definition_xml_tests {
             7_000,
         );
 
-        // (a) Event-driven projection.
-        let projected = ReadStore::open(None).unwrap();
-        for (events, now) in &batches {
-            for e in events {
-                super::read_surface_tests::apply_at(&projected, e, *now);
+        // (a) Event-driven projection, under every export shape: batches
+        // observed at their command instant AND exported later than it (the
+        // terminal projectors must use the event's instant, not the batch
+        // time), and with/without `JobActivated` exported (leader-local soft
+        // activation is never journaled, so the terminal deadline must reach
+        // the projection via the terminal event).
+        let mut projections = Vec::new();
+        for (lag, soft) in [(0, false), (4_000, false), (0, true), (4_000, true)] {
+            let projected = ReadStore::open(None).unwrap();
+            for (events, now) in &batches {
+                for e in events {
+                    if soft && matches!(e, Event::JobActivated { .. }) {
+                        continue;
+                    }
+                    super::read_surface_tests::apply_at(&projected, e, *now + lag);
+                }
             }
+            projections.push((format!("lag={lag} soft={soft}"), projected));
         }
 
-        // (b) Snapshot recovery, from the live engine and from a replayed one.
+        // (b) Snapshot recovery, from the live engine and from a replayed one
+        // (including a follower whose journal omits the soft activations).
         let journal: Vec<Event> = batches.iter().flat_map(|(e, _)| e.clone()).collect();
+        let soft_journal: Vec<Event> = journal
+            .iter()
+            .filter(|e| !matches!(e, Event::JobActivated { .. }))
+            .cloned()
+            .collect();
         for (path, source) in [
             ("live", engine.snapshot()),
             ("replayed", Engine::replay(journal).snapshot()),
+            ("soft-replayed", Engine::replay(soft_journal).snapshot()),
         ] {
             let bytes = serde_json::to_vec(&source).unwrap();
             let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
@@ -8554,9 +8621,19 @@ mod definition_xml_tests {
             let seeded = ReadStore::open(None).unwrap();
             seeded.seed_from_engine_state(recovered.state()).unwrap();
 
-            for (key, end) in [(ja, 5_000), (jb, 7_000)] {
-                let want = super::read_surface_tests::job_row(&projected, key);
+            for ((key, end, deadline), (shape, projected)) in
+                [(ja, 5_000, 63_000), (jb, 7_000, 43_500)]
+                    .into_iter()
+                    .flat_map(|j| projections.iter().map(move |p| (j, p)))
+            {
+                let path = format!("{path} vs {shape}");
+                let want = super::read_surface_tests::job_row(projected, key);
                 let got = super::read_surface_tests::job_row(&seeded, key);
+                assert_eq!(
+                    want.deadline_ms,
+                    Some(deadline),
+                    "{path}: projected deadline"
+                );
                 assert_eq!(got.state, want.state, "{path}: job {key} state");
                 assert_eq!(want.end_ms, Some(end), "{path}: projected endTime");
                 assert_eq!(got.end_ms, want.end_ms, "{path}: job {key} endTime");
@@ -8743,6 +8820,7 @@ mod definition_xml_tests {
                 job_type: "worker".to_string(),
                 worker: Some("w2".to_string()),
                 completed_at: 0,
+                deadline: None,
             },
         ];
         let positions: Vec<u64> = history
@@ -11533,6 +11611,7 @@ mod element_instance_tests {
                     job_type: "review-round".to_string(),
                     worker: Some("host-a-senior".to_string()),
                     completed_at: 0,
+                    deadline: None,
                 },
                 // A completion with no activating worker leaves it NULL, not "".
                 &Event::JobCreated {
@@ -11552,6 +11631,7 @@ mod element_instance_tests {
                     job_type: "review-round".to_string(),
                     worker: None,
                     completed_at: 0,
+                    deadline: None,
                 },
             ])
             .unwrap();
@@ -11599,6 +11679,7 @@ mod element_instance_tests {
                     job_type: "review-round".to_string(),
                     worker: Some(String::new()),
                     completed_at: 0,
+                    deadline: None,
                 },
                 &Event::JobCreated {
                     job_key: 9202,
@@ -11700,6 +11781,7 @@ mod element_instance_tests {
                     job_type: "review-round".to_string(),
                     worker: None,
                     completed_at: 0,
+                    deadline: None,
                 },
             ])
             .unwrap();
@@ -11774,6 +11856,7 @@ mod element_instance_tests {
                 job_type: "review-round".to_string(),
                 worker: None,
                 completed_at: 0,
+                deadline: None,
             }])
             .unwrap();
 
@@ -11889,6 +11972,7 @@ mod element_instance_tests {
                     job_type: "review-round".to_string(),
                     worker: None,
                     completed_at: 0,
+                    deadline: None,
                 },
             ),
             (
@@ -11991,6 +12075,7 @@ mod element_instance_tests {
             job_type: String::new(),
             worker: None,
             completed_at: 0,
+            deadline: None,
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -12042,6 +12127,7 @@ mod element_instance_tests {
                 job_key: 7002,
                 instance_key: INST,
                 canceled_at: 0,
+                deadline: None,
             }])
             .unwrap();
         assert!(get(7002).end_ms.is_some(), "a cancelled job has an endTime");
@@ -12110,6 +12196,7 @@ mod element_instance_tests {
                     job_type: String::new(),
                     worker: None,
                     completed_at: 0,
+                    deadline: None,
                 },
             ])
             .unwrap();
@@ -12170,6 +12257,7 @@ mod element_instance_tests {
                 job_key: 8002,
                 instance_key: INST,
                 canceled_at: 0,
+                deadline: None,
             }])
             .unwrap();
         let canceled_end = get(8002).end_ms.expect("cancelled job has an endTime");

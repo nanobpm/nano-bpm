@@ -2344,6 +2344,7 @@ impl Engine {
                         job_type,
                         worker,
                         completed_at: self.now,
+                        deadline: self.job_terminal_deadline(job_key),
                     },
                 );
                 if !variables.is_empty() {
@@ -4338,6 +4339,7 @@ impl Engine {
                         job_key: j.key,
                         instance_key,
                         canceled_at: self.now,
+                        deadline: j.deadline,
                     })
                     .collect();
 
@@ -9379,6 +9381,7 @@ impl Engine {
                 job_key,
                 instance_key,
                 canceled_at: self.now,
+                deadline: self.job_terminal_deadline(job_key),
             });
         }
         events.extend(self.cancel_all_timers_on(child_eik));
@@ -9483,6 +9486,7 @@ impl Engine {
                     job_key,
                     instance_key,
                     canceled_at: self.now,
+                    deadline: self.job_terminal_deadline(job_key),
                 });
             }
             events.extend(self.cancel_all_timers_on(child));
@@ -11202,6 +11206,7 @@ impl Engine {
                 job_key,
                 instance_key,
                 canceled_at: self.now,
+                deadline: self.job_terminal_deadline(job_key),
             })
             .collect()
     }
@@ -15013,6 +15018,7 @@ impl Engine {
             job_key: j.key,
             instance_key,
             canceled_at: self.now,
+            deadline: j.deadline,
         }));
 
         let mut timers: Vec<&state::Timer> = self

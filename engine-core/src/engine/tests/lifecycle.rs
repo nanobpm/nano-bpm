@@ -1644,6 +1644,7 @@ fn terminate_end_kills_sibling_branch_and_completes_the_instance() {
         job_key: work_job,
         instance_key,
         canceled_at: 0,
+        deadline: Some(60_000),
     }));
     assert!(events.contains(&Event::ProcessInstanceCompleted { instance_key }));
     assert!(!events
@@ -1715,6 +1716,7 @@ fn subprocess_terminate_end_confines_to_the_subprocess_scope() {
         job_key: inner_work_job,
         instance_key,
         canceled_at: 0,
+        deadline: Some(60_000),
     }));
     // ...and the sub-process completes and continues on its outgoing flow —
     // the parent instance is NOT terminated.
@@ -6893,6 +6895,7 @@ fn top_level_terminate_end_runs_its_end_listener_before_terminating_siblings() {
                 job_key: work_job,
                 instance_key,
                 canceled_at: 0,
+                deadline: Some(60_000),
             }
         })
         .expect("the sibling job is cancelled");
@@ -6926,6 +6929,7 @@ fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope(
         job_key: work_job,
         instance_key,
         canceled_at: 0,
+        deadline: Some(60_000),
     }));
     // Zeebe's `TerminateEndEventBehavior` ordering: the terminate end's own
     // COMPLETED is recorded BEFORE any sibling teardown — a sibling with a
@@ -6941,6 +6945,7 @@ fn subprocess_terminate_end_runs_its_end_listener_before_tearing_down_the_scope(
                 job_key: work_job,
                 instance_key,
                 canceled_at: 0,
+                deadline: Some(60_000),
             }
         })
         .expect("the sibling job is cancelled");

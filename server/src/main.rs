@@ -25916,6 +25916,7 @@ mod adhoc_metrics_tests {
                 job_type: String::new(),
                 worker: None,
                 completed_at: 0,
+                deadline: None,
             }),
             None
         );
