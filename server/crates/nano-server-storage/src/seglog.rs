@@ -377,6 +377,7 @@ fn has_content(bytes: &[u8]) -> bool {
 /// replay — never a torn write — so it is fatal anywhere (#1065, #1071).
 fn read_segment_with<T>(
     path: &Path,
+    tail: TailPolicy,
     mut parse: impl FnMut(&str) -> Result<T, EventDecodeError>,
 ) -> io::Result<(Vec<T>, u64)> {
     let mut out = Vec::new();
@@ -393,7 +394,7 @@ fn read_segment_with<T>(
         if !carries(record) {
             continue;
         }
-        let torn_tail = Some(idx) == last;
+        let torn_tail = tail == TailPolicy::DropTorn && Some(idx) == last;
         let mut parsed = Vec::new();
         let mut failure: Option<(bool, io::Error)> = if record.intact {
             None
@@ -445,13 +446,24 @@ fn read_segment_with<T>(
     Ok((out, valid_end))
 }
 
+/// How [`read_segment_with`] treats a damaged/incomplete FINAL record (#1405).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TailPolicy {
+    /// The ACTIVE segment: a torn final record is a crash mid-append and is
+    /// dropped whole.
+    DropTorn,
+    /// A SEALED segment: every record was fsynced before the seal, so a damaged
+    /// final record is lost durable history and fails closed.
+    Strict,
+}
+
 /// The byte length of `path`'s valid record prefix (see
 /// [`read_segment_with`]): everything past it is a torn tail that recovery
 /// drops. [`ActiveSegment::open`] truncates the active segment to it before
 /// appending, so a retried write can never splice into a torn record's
 /// advertised length (#1405).
 fn valid_segment_len(path: &Path) -> io::Result<u64> {
-    read_segment_with(path, |line| {
+    read_segment_with(path, TailPolicy::DropTorn, |line| {
         let json = line.split_once('\t').map_or(line, |(_, rest)| rest);
         decode_event_json(json).map(|_| ())
     })
@@ -1444,7 +1456,13 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
 /// Reads and deserializes every event from a single segment/log file (empty if
 /// absent). Torn-tail and frame-atomicity contract: [`read_segment_with`].
 pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
-    read_segment_with(path, decode_event_json).map(|(events, _)| events)
+    read_segment_with(path, TailPolicy::DropTorn, decode_event_json).map(|(events, _)| events)
+}
+
+/// [`read_segment_events`] for a SEALED segment: no torn-tail tolerance — a
+/// damaged final record fails closed ([`TailPolicy::Strict`]).
+fn read_sealed_segment_events(path: &Path) -> io::Result<Vec<Event>> {
+    read_segment_with(path, TailPolicy::Strict, decode_event_json).map(|(events, _)| events)
 }
 
 /// Reads a segment/log file written by the shared multi-partition writer, where
@@ -1456,7 +1474,16 @@ pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
 /// key partition, so a directory written by the pre-tag multi-partition format
 /// still recovers with the same demux behaviour it had then.
 fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<Vec<(u64, Event)>> {
-    read_segment_with(path, |line| {
+    read_segment_events_tagged_with(path, num_partitions, TailPolicy::DropTorn)
+}
+
+/// [`read_segment_events_tagged`] under an explicit [`TailPolicy`].
+fn read_segment_events_tagged_with(
+    path: &Path,
+    num_partitions: usize,
+    tail: TailPolicy,
+) -> io::Result<Vec<(u64, Event)>> {
+    read_segment_with(path, tail, |line| {
         let (tag, json) = match line.split_once('\t') {
             Some((t, rest)) => (t.parse::<u64>().ok(), rest),
             None => (None, line),
@@ -1555,7 +1582,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     let mut events: Vec<Event> = Vec::new();
     let mut cursor = first_index.unwrap_or(0);
     for (start, path) in &sealed_files {
-        let seg_events = read_segment_events(path)?;
+        let seg_events = read_sealed_segment_events(path)?;
         let end = start + seg_events.len() as u64;
         sealed.push(SealedSeg {
             start: *start,
@@ -2252,17 +2279,35 @@ pub fn upsert_multi_snapshot_entry(
     covered: u64,
     snap: EngineSnapshot,
 ) -> io::Result<()> {
-    let mut entries: Vec<(u64, u64, EngineSnapshot)> = load_multi_snapshot(dir)?
-        .map(|m| {
-            m.into_iter()
-                .filter(|(p, _)| *p != partition)
-                .map(|(p, (c, e))| (p, c, e))
-                .collect()
-        })
-        .unwrap_or_default();
-    entries.push((partition, covered, snap));
-    entries.sort_by_key(|e| e.0);
-    write_multi_snapshot(dir, entries)
+    // Untouched partitions keep their STORED base identity verbatim: only the
+    // replaced entry is stamped from the current floor. Re-stamping every entry
+    // would let a partition whose adoption published a new floor but failed to
+    // write its base certify its unchanged, same-boundary snapshot as that base.
+    let mut entries: Vec<MultiSnapshotEntry> = match load_multi_snapshot_based(dir)? {
+        Some((engines, bases)) => engines
+            .into_iter()
+            .filter(|(p, _)| *p != partition)
+            .map(|(p, (c, engine))| MultiSnapshotEntry {
+                partition: p,
+                covered: c,
+                base_id: bases.get(&p).and_then(|(_, id)| *id),
+                engine,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    entries.push(MultiSnapshotEntry {
+        partition,
+        covered,
+        base_id: floor_stamp(dir, Some(partition), covered)?,
+        engine: snap,
+    });
+    entries.sort_by_key(|e| e.partition);
+    write_enveloped(
+        dir,
+        &dir.join(MULTI_SNAP_NAME),
+        &MultiPersistedSnapshot { entries },
+    )
 }
 
 /// Loads the combined per-partition snapshot, as a map from global partition id
@@ -2271,6 +2316,7 @@ pub fn upsert_multi_snapshot_entry(
 /// `Ok(None)` means ONLY "no combined snapshot file exists". A present-but-
 /// incompatible or corrupt file is a FATAL typed error ([`SnapshotLoadError`],
 /// surfaced as an [`io::Error`]) — never a silent `None`, never a rewind.
+#[cfg(test)]
 fn load_multi_snapshot(dir: &Path) -> io::Result<Option<MultiEngines>> {
     Ok(load_multi_snapshot_based(dir)?.map(|(m, _)| m))
 }
@@ -2381,7 +2427,7 @@ pub fn recover_multi(
     let mut cursor = first_index_opt.unwrap_or(0);
     let mut pp_running = pp_base.clone();
     for (start, path) in &sealed_files {
-        let seg_events = read_segment_events_tagged(path, num_partitions)?;
+        let seg_events = read_segment_events_tagged_with(path, num_partitions, TailPolicy::Strict)?;
         let end = start + seg_events.len() as u64;
         for (tag, _) in &seg_events {
             let p = (*tag as usize).min(num_partitions.saturating_sub(1));
@@ -6204,6 +6250,57 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1405: torn-tail tolerance is for the ACTIVE segment only. A sealed
+    /// segment was fully fsynced before its seal, so a damaged final record is
+    /// lost durable history — dropping it would let a later applied marker in
+    /// the active segment skip its effects forever. Both layouts fail closed.
+    #[test]
+    fn damaged_sealed_tail_fails_closed_in_both_layouts() {
+        let frame = |i: u64| {
+            let (mut ev, marker) = entry_lines(i);
+            ev.extend_from_slice(&marker);
+            frame_atomic(&ev, 2, false).unwrap()
+        };
+        let write_dir = |tag: &str, damage: bool| {
+            let dir = temp_dir(tag);
+            fs::create_dir_all(&dir).unwrap();
+            let mut tail = frame(2);
+            if damage {
+                let n = tail.len();
+                tail[n - 3] ^= 0x01;
+            }
+            let mut sealed = frame(1);
+            sealed.extend_from_slice(&tail);
+            fs::write(
+                dir.join(format!("{SEG_PREFIX}{:020}{SEG_SUFFIX}", 0)),
+                sealed,
+            )
+            .unwrap();
+            fs::write(dir.join(ACTIVE_NAME), frame(3)).unwrap();
+            dir
+        };
+        // Control: an intact sealed tail recovers in both layouts.
+        let ok = write_dir("sealed-tail-ok", false);
+        assert!(recover(&ok).is_ok(), "intact single-partition recovery");
+        let _ = fs::remove_dir_all(&ok);
+        let ok = write_dir("sealed-tail-ok-multi", false);
+        assert!(
+            recover_multi(&ok, &[0], 1, None).is_ok(),
+            "intact multi recovery"
+        );
+        let _ = fs::remove_dir_all(&ok);
+        // Damaged sealed tail: fatal, never a silent drop.
+        let bad = write_dir("sealed-tail-bad", true);
+        assert!(recover(&bad).is_err(), "single-partition must fail closed");
+        let _ = fs::remove_dir_all(&bad);
+        let bad = write_dir("sealed-tail-bad-multi", true);
+        assert!(
+            recover_multi(&bad, &[0], 1, None).is_err(),
+            "multi must fail closed"
+        );
+        let _ = fs::remove_dir_all(&bad);
+    }
+
     /// #1405: the same in-place damage inside a checksummed DEFLATE frame is a
     /// torn tail too — dropped whole at the tail, fatal mid-file.
     #[test]
@@ -6733,6 +6830,78 @@ mod tests {
         assert!(
             engines[&0].instance(donor_key).is_some(),
             "adopted base survives"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a lean adoption that crashes right after publishing the floor —
+    /// before the authoritative var store or the snapshot is touched — must
+    /// fail recovery closed. Publishing the floor AFTER the var store would let
+    /// a crash in between pair the new variables with the old lean snapshot.
+    #[test]
+    fn lean_adoption_crash_after_floor_fails_closed() {
+        let dir = temp_dir("lean-adopt-crash");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+        let (snap, _) = donor_snapshot("lean-adopt-crash-donor");
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                    .expect("open multi");
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j0.set_varstore(Arc::clone(&varstore));
+            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let (base, covered, _, _) = j0.snapshot_and_rotate_lean().expect("lean base");
+            let engine1 = engines.remove(&1).unwrap().snapshot();
+            write_multi_snapshot(&dir, vec![(0, covered, base), (1, 0, engine1)])
+                .expect("old lean snapshot");
+
+            j0.restore_engine_from_snapshot(snap);
+            let seg = j0.seg_shared().expect("segmented");
+            let permit = seg.try_checkpoint_permit().expect("gate free");
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(true));
+            let res = j0.checkpoint_base(Some(&permit));
+            crate::journal::FAIL_AFTER_FLOOR.with(|f| f.set(false));
+            assert!(res.is_err(), "injected crash");
+        }
+        assert!(
+            recover_multi(&dir, &[0, 1], 2, Some(&varstore)).is_err(),
+            "the old lean snapshot must not satisfy the newly published floor"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: upserting partition B must NOT re-stamp partition A's untouched
+    /// entry with A's current floor. If A published a new floor (same boundary)
+    /// but its base write failed, re-stamping would certify A's pre-adoption
+    /// snapshot as the adopted base and bypass fail-closed recovery.
+    #[test]
+    fn upsert_preserves_untouched_partitions_base_identity() {
+        let dir = temp_dir("upsert-preserve-base");
+        fs::create_dir_all(&dir).unwrap();
+        let empty = || Engine::new().snapshot();
+        write_multi_snapshot(&dir, vec![(0, 0, empty()), (1, 0, empty())]).unwrap();
+        // A's adoption publishes a floor at A's existing boundary, then its base
+        // write "fails" (never happens).
+        write_rebase_floor(&dir, Some(0), 0).unwrap();
+        let before = load_multi_snapshot_based(&dir).unwrap().unwrap().1;
+        assert_eq!(before[&0].1, None);
+        // B's upsert succeeds.
+        upsert_multi_snapshot_entry(&dir, 1, 0, empty()).unwrap();
+        let after = load_multi_snapshot_based(&dir).unwrap().unwrap().1;
+        assert_eq!(after[&0].1, None, "A's stored identity is preserved");
+        let floor = read_rebase_floor(&dir, Some(0)).unwrap().unwrap();
+        assert!(
+            !floor.satisfied_by(after[&0].0, after[&0].1),
+            "A's pre-adoption snapshot must not satisfy A's new floor"
         );
         let _ = fs::remove_dir_all(&dir);
     }

@@ -1023,6 +1023,14 @@ impl SharedWriter {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only crash injection for [`Journal::checkpoint_base`]: fail right
+    /// after the rebase floor is published, before any authoritative state is
+    /// touched (#1405).
+    pub(crate) static FAIL_AFTER_FLOOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl Journal {
     /// A non-persistent journal: the engine runs purely in memory and nothing is
     /// written. Used for tests and ephemeral runs.
@@ -3682,23 +3690,33 @@ impl Journal {
             ));
         }
         let refused = || io::Error::other("journal checkpoint refused (fenced or incomplete)");
-        let (snap, covered) = if let Some(vs) = self.varstore.clone() {
+        let floor_partition = (!seg.per_partition_total.is_empty()).then_some(self.partition_id);
+        // Publish the rebase floor BEFORE touching any authoritative state (the
+        // var store, then the snapshot): a crash at any later boundary leaves a
+        // floor no older snapshot satisfies, so recovery fails closed instead of
+        // mixing newly adopted variables with the old control state (#1405).
+        let snap = if let Some(vs) = self.varstore.clone() {
             let (snap, covered, upserts, forgets) =
                 self.snapshot_and_rotate_lean().ok_or_else(refused)?;
+            crate::seglog::write_rebase_floor(&seg.dir, floor_partition, covered)?;
+            #[cfg(test)]
+            if FAIL_AFTER_FLOOR.with(|f| f.get()) {
+                return Err(io::Error::other("injected crash after the floor"));
+            }
             let ups: Vec<(Key, &HashMap<String, Value>)> =
                 upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
             vs.checkpoint(self.partition_id, covered, &ups, &forgets)
                 .map_err(io::Error::other)?;
             (snap, covered)
         } else {
-            self.snapshot_and_rotate().ok_or_else(refused)?
+            let (snap, covered) = self.snapshot_and_rotate().ok_or_else(refused)?;
+            crate::seglog::write_rebase_floor(&seg.dir, floor_partition, covered)?;
+            (snap, covered)
         };
-        if seg.per_partition_total.is_empty() {
-            crate::seglog::write_rebase_floor(&seg.dir, None, covered)?;
-            crate::seglog::write_snapshot(&seg.dir, snap, covered)
-        } else {
-            crate::seglog::write_rebase_floor(&seg.dir, Some(self.partition_id), covered)?;
-            crate::seglog::upsert_multi_snapshot_entry(&seg.dir, self.partition_id, covered, snap)
+        let (snap, covered) = snap;
+        match floor_partition {
+            None => crate::seglog::write_snapshot(&seg.dir, snap, covered),
+            Some(p) => crate::seglog::upsert_multi_snapshot_entry(&seg.dir, p, covered, snap),
         }
     }
 

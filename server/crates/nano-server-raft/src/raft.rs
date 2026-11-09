@@ -984,17 +984,18 @@ impl PartitionStateMachine {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
-                Some(s) => s.path.clone(),
+                Some(s) => (s.path.clone(), s.meta.clone()),
                 None => return Ok(()),
             }
         };
+        let (path, meta) = path;
         let captured: nanobpmn_engine_core::EngineSnapshot =
             tokio::task::spawn_blocking(move || -> std::io::Result<_> {
                 let f = std::fs::File::open(&path)?;
                 nano_server_storage::snapstream::read_streaming_engine_snapshot_from(f)
             })
             .await??;
-        self.adopt_engine_snapshot(captured).await
+        self.adopt_engine_snapshot(captured, &meta).await
     }
 
     /// The ONE snapshot-adoption routine (#1405), shared by boot-time adoption
@@ -1006,10 +1007,25 @@ impl PartitionStateMachine {
     /// Adopting without checkpointing would leave a journal that lacks the
     /// snapshot's state; once a later entry is journaled, a restart prefers that
     /// journal and silently loses every snapshot-only instance.
+    ///
+    /// The adopted state's applied record is DERIVED from the snapshot's Raft
+    /// `meta` (the single source of truth), never trusted from the engine body:
+    /// a legacy snapshot body decodes with `raft_applied = None`, and
+    /// checkpointing that would let a crash before the snapshot pointer is
+    /// published boot with `last_applied = None` and re-execute committed
+    /// creates.
     async fn adopt_engine_snapshot(
         &self,
-        captured: nanobpmn_engine_core::EngineSnapshot,
+        mut captured: nanobpmn_engine_core::EngineSnapshot,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
     ) -> anyhow::Result<()> {
+        captured.raft_applied = match meta.last_log_id {
+            Some(log_id) => Some((
+                log_id.index,
+                journaled_raft_state(log_id, &meta.last_membership)?,
+            )),
+            None => None,
+        };
         self.engine
             .with(move |journal| {
                 journal.restore_engine_from_snapshot(captured);
@@ -1675,12 +1691,14 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // record, so a crash before the pointer below is published still boots
         // from a journal that wins at the snapshot's index. Fail closed: a
         // replica whose journal cannot hold the base must not keep applying.
-        self.adopt_engine_snapshot(captured).await.map_err(|e| {
-            StorageIOError::write_snapshot(
-                Some(meta.signature()),
-                &std::io::Error::other(e.to_string()),
-            )
-        })?;
+        self.adopt_engine_snapshot(captured, meta)
+            .await
+            .map_err(|e| {
+                StorageIOError::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e.to_string()),
+                )
+            })?;
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -4730,6 +4748,86 @@ mod tests {
         assert_eq!(applied.map(|l| l.index), Some(4), "the journal wins");
         let after = engine.with(|j| j.engine().snapshot().state).await;
         assert_eq!(after, expected, "installed snapshot + suffix, nothing lost");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A LEGACY snapshot body (pre-#1405: decodes with `raft_applied = None`)
+    /// adopted at runtime and interrupted BEFORE the Raft snapshot pointer is
+    /// published must still boot at the snapshot's applied index: the
+    /// checkpointed base derives its applied record from the snapshot's Raft
+    /// meta. Otherwise the restart keeps the adopted engine state but seeds
+    /// `last_applied = None`, and openraft re-executes the committed creates.
+    #[tokio::test]
+    async fn legacy_snapshot_adoption_interrupted_before_pointer_keeps_applied_index() {
+        let dir = unique_log_dir("1405-legacy-adopt");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let peer = durable_engine(&dir.join("peer"));
+        let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
+        apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        for i in 2..=3 {
+            apply_entry(&peer_sm, i, one(Command::create_instance("w"), i))
+                .await
+                .expect("create");
+        }
+        let mut builder = peer_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("snapshot at 3");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        let expected = peer.with(|j| j.engine().snapshot().state).await;
+        drop(peer_sm);
+        shutdown_engine(peer).await;
+        let mut legacy =
+            nano_server_storage::snapstream::read_streaming_engine_snapshot_from(&bytes[..])
+                .expect("decode body");
+        legacy.raft_applied = None;
+
+        let journal_dir = dir.join("replica");
+        let snaps = dir.join("replica-snapshots");
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm = new_sm(&engine, &snaps);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            // Adopt + checkpoint, then "crash" before the pointer is published.
+            sm.adopt_engine_snapshot(legacy, &snap.meta)
+                .await
+                .expect("adopt");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine, &snaps);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(3),
+            "the adopted base carries the snapshot's applied index"
+        );
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(after, expected, "adopted state survives the crash");
         drop(sm);
         shutdown_engine(engine).await;
         let _ = std::fs::remove_dir_all(&dir);
