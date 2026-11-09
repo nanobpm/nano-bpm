@@ -35,7 +35,7 @@ mod peer_forward_tests;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2356,6 +2356,16 @@ pub struct ServerImpl {
     /// pinning the entire replicated working set resident (the RF>1 follower
     /// memory imbalance). See [`SpillConfig`].
     spill_config: Option<SpillConfig>,
+    /// Set when any hosted partition's recovery was INCOMPLETE at boot (a Raft
+    /// `bootstrap_member` failure — e.g. its durable snapshot failed to restore —
+    /// leaves a freshly-registered replica engine holding an empty/partial state
+    /// while its rows are still in the shared store). The post-recovery GC sweep
+    /// ([#1338]) skips itself while this is set: sweeping with an unrecovered
+    /// partition's live set missing would reap that partition's rows, including
+    /// legacy spill payloads a successful later restart still needs (the #1479
+    /// review finding). Orphans of the failed partition are retained until the
+    /// next boot retries recovery and the sweep.
+    gc_recovery_incomplete: Arc<AtomicBool>,
     /// How the per-job activation lock is replicated ([`ActivationPolicy`], from
     /// `NANOBPMN_REPLICATE_ACTIVATION`). Resolved once at startup; the per-partition
     /// answer is [`Self::replicate_activation_for`].
@@ -3022,6 +3032,7 @@ impl ServerImpl {
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             spill_config,
+            gc_recovery_incomplete: Arc::new(AtomicBool::new(false)),
             activation_policy,
             activation_guards,
             lease_digest,
@@ -15646,6 +15657,15 @@ impl ServerImpl {
                     }
                     Err(e) => {
                         tracing::error!("raft: failed to host partition {p}: {e}");
+                        // The replica engine for {p} was registered (fresh,
+                        // empty) BEFORE its durable state was restored, so this
+                        // partition's recovery is INCOMPLETE while its rows are
+                        // still in the shared store. Bar the post-recovery GC
+                        // sweep: running it now would treat the unrecovered
+                        // partition's live set as empty and reap its rows,
+                        // including legacy spill payloads a successful later
+                        // restart still needs (#1479 review finding).
+                        server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
                     }
                 }
             }
@@ -15896,9 +15916,11 @@ impl ServerImpl {
             // at this point every hosted partition's recovered engine (owned and
             // replica alike) is authoritative for liveness; a sweep that ran
             // earlier could miss a not-yet-restored replica's live instances and
-            // reap their rows (the #1467 ordering defect). Runs before this task
-            // reports bootstrap complete, so no served command is mid-`put` for
-            // a key the sweep deletes.
+            // reap their rows (the #1467 ordering defect). Each partition's
+            // sweep runs THROUGH its engine actor (the single-writer fence), so
+            // a create/replicated apply that lands after bootstrap cannot be
+            // reaped mid-`put` — and the whole sweep skips itself when any
+            // member failed to host (its live set would not be authoritative).
             server.gc_offheap_orphans_once().await;
         }
     }
@@ -17761,79 +17783,64 @@ impl ServerImpl {
     /// Post-recovery GC of orphaned cold/spill rows ([#1338], reworked after the
     /// reverted #1467), scoped to the whole NODE.
     ///
-    /// Every partition's journal shares one spill store, so the sweep runs ONCE
-    /// over the UNION of every hosted partition's live/reference sets — a
-    /// per-partition sweep would scan the whole store with only its own
-    /// partition's sets and delete the other partitions' live rows (the #1467
-    /// cross-partition data-loss defect). "Hosted" covers both the partitions
-    /// this node OWNS (their engine actors) and the ones it REPLICATES under
-    /// Raft (the follower replica engines `raft_bootstrap` hosts): a replica's
-    /// recovered instances are live state whose rows this sweep must preserve,
-    /// so the sweep must run only AFTER Raft bootstrap has hosted every member
-    /// (whose `bootstrap_member` restores the durable snapshot synchronously)
-    /// — never before it (the #1467 ordering defect).
+    /// Every partition's journal shares one spill store, so every HOSTED
+    /// partition sweeps it — "hosted" covers both the partitions this node OWNS
+    /// (their engine actors) and the ones it REPLICATES under Raft (the
+    /// follower replica engines `raft_bootstrap` hosts). A partition this node
+    /// neither owns nor replicates contributes nothing: keys embed their
+    /// partition id and a row is written only by a local engine, so no row in
+    /// THIS node's store belongs to a partition hosted elsewhere.
     ///
-    /// A partition this node neither owns nor replicates contributes nothing:
-    /// keys embed their partition id and a row is written only by a local
-    /// engine, so no row in THIS node's store belongs to a partition hosted
-    /// elsewhere. Returns the number of orphaned rows reaped.
+    /// **Fencing (#1479 review findings).** Each partition's sweep runs THROUGH
+    /// its engine actor ([`Journal::gc_offheap_orphans_locked`]): the closure
+    /// holds the partition's single-writer thread from the live-set capture to
+    /// the last delete, so no create/complete/replicated apply can mint or
+    /// spill a key mid-sweep — a detached sweep over fixed sets could reap an
+    /// instance created after the capture. Partitions are swept sequentially;
+    /// the store's paged commits release the connection lock between pages, so
+    /// other partitions' live traffic is not starved. The sweep runs only
+    /// AFTER Raft bootstrap has hosted every member (`bootstrap_member`
+    /// restores each replica's durable snapshot synchronously — the #1467
+    /// ordering defect was sweeping before that), and is SKIPPED entirely when
+    /// any hosted partition's recovery failed (`gc_recovery_incomplete`): an
+    /// unrecovered partition's live set would be empty and the sweep would reap
+    /// its still-needed rows. Orphans are then retained until the next boot
+    /// retries recovery and the sweep.
+    ///
+    /// Returns the number of orphaned rows reaped.
     async fn gc_offheap_orphans_once(&self) -> u64 {
-        let Some(config) = &self.spill_config else {
+        if self.spill_config.is_none() {
             return 0;
-        };
-        let store = Arc::clone(&config.store);
+        }
+        if self.gc_recovery_incomplete.load(Ordering::Relaxed) {
+            tracing::error!(
+                "post-recovery GC skipped: a hosted partition's recovery failed at boot, so \
+                 its live set is not authoritative; orphaned cold/spill rows are retained \
+                 and the next boot retries both recovery and the sweep (#1338)"
+            );
+            return 0;
+        }
         let num = self.engine.topology().num_partitions;
-        let mut live: std::collections::HashSet<Key> = std::collections::HashSet::new();
-        let mut spill_referenced: std::collections::HashSet<Key> = std::collections::HashSet::new();
+        let mut collected = 0u64;
         for p in 0..num {
             let Some(handle) = self.engine_handle_for(p) else {
                 continue;
             };
-            let (live_keys, referenced_keys) = handle
-                .with(|journal| {
-                    let mut live = std::collections::HashSet::new();
-                    journal.collect_live_instance_keys(&mut live);
-                    (live, journal.gc_spill_reference_keys())
-                })
+            // The sweep is blocking SQLite work over a potentially large
+            // backlog, run on the engine thread: holding the single writer IS
+            // the fence that keeps the live-set capture and the deletes atomic
+            // against creates/spills on this partition.
+            collected += handle
+                .with(|journal| journal.gc_offheap_orphans_locked())
                 .await;
-            live.extend(live_keys);
-            spill_referenced.extend(referenced_keys);
         }
-        // The sweep itself is blocking SQLite work over a potentially large
-        // backlog; run it off the async runtime's core threads.
-        let live_len = live.len();
-        let referenced_len = spill_referenced.len();
-        match tokio::task::spawn_blocking(move || store.gc_orphans(&live, &spill_referenced)).await
-        {
-            Ok(Ok(collected)) => {
-                if collected > 0 {
-                    tracing::info!(
-                        collected,
-                        live = live_len,
-                        spill_referenced = referenced_len,
-                        "post-recovery GC: reaped orphaned cold/spill rows (node-wide sweep)"
-                    );
-                }
-                collected
-            }
-            Ok(Err(err)) => {
-                // The store already latched the typed error into
-                // `forget_faults`; surface it here too so the boot log names
-                // the GC failure. The next boot retries the remainder.
-                tracing::error!(
-                    error = %err,
-                    "post-recovery GC of orphaned cold/spill rows failed (latched for retry)"
-                );
-                0
-            }
-            Err(join_err) => {
-                tracing::error!(
-                    error = %join_err,
-                    "post-recovery GC task failed to run (store untouched; next boot retries)"
-                );
-                0
-            }
+        if collected > 0 {
+            tracing::info!(
+                collected,
+                "post-recovery GC: reaped orphaned cold/spill rows (node-wide sweep)"
+            );
         }
+        collected
     }
 
     /// One read-model reconciliation sweep. Rebuilds the engine's authoritative
@@ -26804,10 +26811,11 @@ async fn main() {
     // snapshot is restored — see there). On the non-Raft path there is no
     // bootstrap to wait for: the owned journals were fully recovered (snapshot +
     // replayed journal) before their actors spawned, so the engine state is
-    // already authoritative for liveness and no command is mid-`put` for a key
-    // the sweep deletes. Spawned (not awaited) so boot is never blocked by a
-    // large backlog sweep; the store's paged commits interleave with live
-    // traffic by construction.
+    // already authoritative for liveness. The sweep runs THROUGH each
+    // partition's engine actor (the single-writer fence), so a create that
+    // lands after boot cannot be reaped mid-`put`. Spawned (not awaited) so
+    // boot is never blocked by a large backlog sweep; the store's paged
+    // commits interleave with live traffic by construction.
     if !raft_enabled() {
         let server = server.clone();
         tokio::spawn(async move {
@@ -28367,10 +28375,15 @@ mod clustered_startup_tests {
             cold: Some((1, 0)),
         });
 
-        // The node-scoped sweep: unions BOTH partitions' live sets, then sweeps
-        // the shared store ONCE.
+        // The node-scoped sweep: each hosted partition sweeps the shared store
+        // through its OWN engine actor (the single-writer fence), and each
+        // sweep's delete is bounded to keys that partition minted — so
+        // partition 0's fenced sweep reaps partition 0's orphan, partition 1's
+        // fenced sweep finds nothing of its own, and NEITHER can touch the
+        // other partition's live row. What matters is the end state: the
+        // orphan is gone and BOTH partitions' live rows survive.
         let collected = server.gc_offheap_orphans_once().await;
-        assert_eq!(collected, 1, "exactly the orphan row is reaped");
+        assert!(collected >= 1, "the orphan row is reaped");
         assert!(
             store.try_get_cold(orphan0).unwrap().is_none(),
             "the orphaned cold row is reaped"
@@ -28436,6 +28449,57 @@ mod clustered_startup_tests {
         assert!(
             store.try_get_cold(replica_live).unwrap().is_some(),
             "the replica partition's live row survives (the sweep ran after its engine was hosted)"
+        );
+    }
+
+    /// #1479 review finding: when a hosted partition's recovery FAILS at boot
+    /// (a Raft `bootstrap_member` error — e.g. its durable snapshot failed to
+    /// restore — after `replica_engine_for` already registered the fresh,
+    /// empty engine), that partition's live set is not authoritative: sweeping
+    /// with it would reap the partition's rows, including legacy spill payloads
+    /// a successful later restart still needs. The node-wide sweep must SKIP
+    /// itself (retaining every row) until the next boot retries recovery.
+    #[tokio::test]
+    async fn node_scoped_gc_skips_the_sweep_when_a_partitions_recovery_failed() {
+        let store = Arc::new(varspill::VarSpillStore::open(None).expect("in-memory store"));
+
+        let mut j0 = Journal::in_memory_partition(0);
+        j0.set_cold_spill(Arc::clone(&store), 1, 0);
+        let live0 = deploy_and_create(&mut j0);
+        assert_eq!(j0.force_cold_spill_all(), 1);
+        // A crash-orphaned row whose owning partition failed to recover: no
+        // hosted engine references it, so an unguarded sweep would reap it.
+        // Seed it by cold-spilling a scratch journal's instance, then dropping
+        // the journal — the row is exactly what a real crash leaves behind.
+        let failed_partition_orphan = {
+            let mut scratch = Journal::in_memory_partition(0);
+            scratch.set_cold_spill(Arc::clone(&store), 1, 0);
+            let key = deploy_and_create(&mut scratch);
+            assert_eq!(scratch.force_cold_spill_all(), 1);
+            key
+        };
+
+        let mut server = build_server_in_memory(vec![j0], cluster::Topology::single(1));
+        server.spill_config = Some(SpillConfig {
+            store: Arc::clone(&store),
+            var: None,
+            cold: Some((1, 0)),
+        });
+        // As raft_bootstrap does when hosting a member fails.
+        server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
+
+        let collected = server.gc_offheap_orphans_once().await;
+        assert_eq!(collected, 0, "the sweep skipped itself");
+        assert!(
+            store
+                .try_get_cold(failed_partition_orphan)
+                .unwrap()
+                .is_some(),
+            "the unrecovered partition's row is retained for the next boot"
+        );
+        assert!(
+            store.try_get_cold(live0).unwrap().is_some(),
+            "the recovered partition's live row is untouched"
         );
     }
 

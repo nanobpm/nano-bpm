@@ -1543,10 +1543,11 @@ impl Journal {
 
     /// Post-recovery garbage collection of orphaned cold/spill rows ([#1338])
     /// scoped to THIS partition's recovered engine. The node-level entry point
-    /// is the server's post-bootstrap sweep, which unions every hosted
-    /// partition's sets before sweeping the shared store ONCE; this per-journal
-    /// variant exists for single-partition callers and tests. Returns the
-    /// number of orphaned rows reaped.
+    /// is the server's post-bootstrap sweep, which drives
+    /// [`gc_offheap_orphans_locked`](Self::gc_offheap_orphans_locked) once per
+    /// hosted partition through its engine actor; this unfenced per-journal
+    /// variant exists for tests that already hold the journal exclusively.
+    /// Returns the number of orphaned rows reaped.
     pub fn gc_offheap_orphans(&self) -> u64 {
         let mut live = std::collections::HashSet::new();
         self.collect_live_instance_keys(&mut live);
@@ -1554,13 +1555,42 @@ impl Journal {
         self.gc_offheap_orphans_with(&live, &spill_referenced)
     }
 
+    /// Post-recovery garbage collection of orphaned cold/spill rows ([#1338])
+    /// scoped to THIS partition's recovered engine, fenced against concurrent
+    /// writes. The node-level entry point is the server's post-bootstrap sweep,
+    /// which drives this once per hosted partition through the engine actor
+    /// (`DeepthiHandle::with`): the closure holds the partition's single-writer
+    /// thread for the whole sweep, so no create/complete/replicated apply can
+    /// mint or spill a key between the live-set capture and the deletes — a
+    /// detached sweep over fixed sets could reap an instance created after the
+    /// capture (its spill row written, its key absent from the sets), leaving a
+    /// spilled flag pointing at a missing row (the #1479 review finding). The
+    /// store's paged commits release the connection lock between pages, so
+    /// OTHER partitions' live traffic is not starved while this one sweeps.
+    ///
+    /// Runs AFTER recovery completes for this partition (under Raft: after
+    /// `bootstrap_member` restored its durable snapshot — the server skips the
+    /// sweep entirely when any hosted partition failed to recover), so the
+    /// engine state is authoritative for liveness. Returns the number of
+    /// orphaned rows reaped.
+    pub fn gc_offheap_orphans_locked(&mut self) -> u64 {
+        let mut live = std::collections::HashSet::new();
+        self.collect_live_instance_keys(&mut live);
+        let spill_referenced = self.gc_spill_reference_keys();
+        self.gc_offheap_orphans_with(&live, &spill_referenced)
+    }
+
     /// The store-diffing core of the post-recovery GC ([#1338], reworked after
-    /// the reverted #1467), split out so the node-level sweep can drive it with
-    /// the UNION of every hosted partition's sets (the store is shared across
-    /// partitions, so a per-partition sweep would delete the other partitions'
-    /// live rows — the #1467 data-loss defect) and tests can drive it with an
-    /// explicit live set (modelling a recovered engine whose cold index was not
-    /// rebuilt).
+    /// the reverted #1467), split out so the fenced entry point
+    /// ([`gc_offheap_orphans_locked`](Self::gc_offheap_orphans_locked)) and
+    /// tests can drive it with an explicit live set. The sweep reaps only rows
+    /// THIS partition minted (`gc_orphans` bounds the delete to
+    /// `self.partition_id()`), so a partition's fenced pass can never delete a
+    /// row its own single-writer fence does not cover — cross-partition rows
+    /// are reaped when their own partition sweeps (the #1479 fence-vs-union
+    /// finding: a per-partition sweep over the shared store with a
+    /// store-wide delete would reap the other partitions' live rows, the #1467
+    /// data-loss defect).
     ///
     /// **Durability/ordering contract.** `live` must be the authoritative
     /// live-instance set (every nonterminal instance — `Active`, `Suspended`,
@@ -1595,7 +1625,7 @@ impl Journal {
             Some(store) => store,
             None => return 0,
         };
-        match store.gc_orphans(live, spill_referenced) {
+        match store.gc_orphans(live, spill_referenced, self.partition_id()) {
             Ok(collected) => {
                 if collected > 0 {
                     tracing::info!(
@@ -4403,33 +4433,36 @@ mod tests {
         assert!(store.try_get_cold(orphan_key).unwrap().is_some());
         assert!(store.try_get_cold(live_key).unwrap().is_some());
 
-        // --- the restart: a recovered engine holds `live_key` live (parked) and
-        // no trace of `orphan_key`; its cold index is empty (never rebuilt).
-        // Partition 1 gives the recovered engine a disjoint key namespace so its
-        // own live instance cannot collide with the pre-crash keys.
-        let mut recovered = Journal::in_memory_partition(1);
+        // --- the restart: recover the pre-crash engine state into a FRESH
+        // journal through the real recovery path (snapshot restore, exactly as
+        // `bootstrap_member` / owned-partition boot do) — never by hand-seeding
+        // a live set. The recovered engine holds `live_key` (parked, never
+        // completed) and no trace of `orphan_key` (its completion was journaled
+        // and folded into the snapshot); the in-RAM cold index is empty (never
+        // rebuilt at boot). If recovery loses the live instance from the sets
+        // supplied to GC, the sweep deletes its row — this test fails, as it
+        // must: that is the production data-loss defect it guards.
+        let snapshot = journal.engine_snapshot();
+        let mut recovered = Journal::in_memory();
         recovered.set_cold_spill(Arc::clone(&store), 1, 0);
-        let _ = recovered
-            .apply_command(Command::DeployProcess(demo()))
-            .unwrap();
-        let (events, _) = recovered
-            .apply_command(Command::create_instance("demo"))
-            .unwrap();
-        let recovered_live = events.iter().find_map(|e| e.instance_key()).unwrap();
+        recovered.restore_engine_from_snapshot(snapshot);
+        assert!(
+            recovered.instance(live_key).is_some(),
+            "recovery restored the live instance"
+        );
+        assert!(
+            recovered.instance(orphan_key).is_none(),
+            "recovery carries no trace of the completed orphan"
+        );
         assert_eq!(
             recovered.cold_count(),
             0,
             "cold index is not rebuilt at boot"
         );
 
-        // The recovered engine's live set is `recovered_live` plus `live_key`
-        // (still live in the recovered history, its index entry lost).
-        let mut live = std::collections::HashSet::new();
-        recovered.collect_live_instance_keys(&mut live);
-        assert!(live.contains(&recovered_live));
-        live.insert(live_key);
-        let spill_referenced = recovered.gc_spill_reference_keys();
-        let collected = recovered.gc_offheap_orphans_with(&live, &spill_referenced);
+        // The real GC entry point, driven by the recovered engine's own live
+        // set — no augmentation.
+        let collected = recovered.gc_offheap_orphans();
         assert!(
             store.try_get_cold(orphan_key).unwrap().is_none(),
             "orphaned cold row is reaped"
@@ -4439,6 +4472,10 @@ mod tests {
             "the live instance's cold row is preserved"
         );
         assert_eq!(collected, 1, "exactly the orphan row is collected");
+        assert!(
+            recovered.instance(live_key).is_some(),
+            "the surviving instance is still resolvable after the sweep"
+        );
     }
 
     /// #1338: a spill (variable payload) row whose instance reached a terminal
