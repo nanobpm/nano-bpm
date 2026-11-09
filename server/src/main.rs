@@ -16,6 +16,7 @@ mod console_api;
 // that render the data stay feature-gated (issue #1294).
 mod consumers;
 mod falcon;
+mod mcp;
 #[cfg(feature = "console")]
 mod provisioning;
 mod query;
@@ -6025,7 +6026,7 @@ fn apply_create_instance_direct(
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
-    async fn create_process_instance_impl(
+    pub(crate) async fn create_process_instance_impl(
         &self,
         body: &models::ProcessInstanceCreationInstruction,
     ) -> Result<apis::process_instance::CreateProcessInstanceResponse, ()> {
@@ -8496,7 +8497,7 @@ impl ServerImpl {
         }
     }
 
-    async fn resolve_incident_impl(
+    pub(crate) async fn resolve_incident_impl(
         &self,
         path_params: &models::ResolveIncidentPathParams,
         body: &Option<models::IncidentResolutionRequest>,
@@ -8618,7 +8619,7 @@ impl ServerImpl {
         )
     }
 
-    async fn get_process_instance_impl(
+    pub(crate) async fn get_process_instance_impl(
         &self,
         path_params: &models::GetProcessInstancePathParams,
     ) -> Result<apis::process_instance::GetProcessInstanceResponse, ()> {
@@ -8691,7 +8692,7 @@ impl ServerImpl {
     /// on every node). Only the latest version per process id is retained, so an
     /// older version's key yields 404. A definition built programmatically (no
     /// source XML) is reported as 204.
-    async fn get_process_definition_xml_impl(
+    pub(crate) async fn get_process_definition_xml_impl(
         &self,
         path_params: &models::GetProcessDefinitionXmlPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionXmlResponse, ()> {
@@ -8738,7 +8739,7 @@ impl ServerImpl {
     /// RF>1 are reported as `follower`. `replication_factor` is the cluster's
     /// `effective_rf()`. A single-node cluster reports one broker leading every
     /// partition at RF=1.
-    async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
+    pub(crate) async fn get_topology_impl(&self) -> Result<apis::cluster::GetTopologyResponse, ()> {
         use apis::cluster::GetTopologyResponse as Resp;
 
         let version = env!("NANOBPM_VERSION").to_string();
@@ -10871,7 +10872,7 @@ impl ServerImpl {
         }
     }
 
-    async fn get_incident_impl(
+    pub(crate) async fn get_incident_impl(
         &self,
         path_params: &models::GetIncidentPathParams,
     ) -> Result<apis::incident::GetIncidentResponse, ()> {
@@ -10935,7 +10936,7 @@ impl ServerImpl {
         }
     }
 
-    async fn search_incidents_impl(
+    pub(crate) async fn search_incidents_impl(
         &self,
         body: &Option<models::IncidentSearchQuery>,
     ) -> Result<apis::incident::SearchIncidentsResponse, ()> {
@@ -12212,7 +12213,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_process_instances_impl(
+    pub(crate) async fn search_process_instances_impl(
         &self,
         body: &Option<models::ProcessInstanceSearchQuery>,
     ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
@@ -13730,7 +13731,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn search_user_tasks_impl(
+    pub(crate) async fn search_user_tasks_impl(
         &self,
         body: &Option<models::UserTaskSearchQuery>,
     ) -> Result<apis::user_task::SearchUserTasksResponse, ()> {
@@ -13779,7 +13780,7 @@ impl ServerImpl {
         ))
     }
 
-    async fn assign_user_task_impl(
+    pub(crate) async fn assign_user_task_impl(
         &self,
         path_params: &models::AssignUserTaskPathParams,
         body: &models::UserTaskAssignmentRequest,
@@ -13877,7 +13878,7 @@ impl ServerImpl {
         }
     }
 
-    async fn complete_user_task_impl(
+    pub(crate) async fn complete_user_task_impl(
         &self,
         path_params: &models::CompleteUserTaskPathParams,
         body: &Option<models::UserTaskCompletionRequest>,
@@ -13981,7 +13982,7 @@ impl ServerImpl {
     }
 
     /// Returns a single user task from the read model by key.
-    async fn get_user_task_impl(
+    pub(crate) async fn get_user_task_impl(
         &self,
         path_params: &models::GetUserTaskPathParams,
     ) -> Result<apis::user_task::GetUserTaskResponse, ()> {
@@ -14428,7 +14429,7 @@ impl ServerImpl {
     /// `scopeKey` of the scope that holds it — the process instance for root-scope
     /// variables, or a sub-process / multi-instance body / child element instance
     /// for a nested scope (Part C hierarchical scoping).
-    async fn search_variables_impl(
+    pub(crate) async fn search_variables_impl(
         &self,
         query_params: &models::SearchVariablesQueryParams,
         body: &Option<models::VariableSearchQuery>,
@@ -14496,7 +14497,7 @@ impl ServerImpl {
 
     /// Returns a single variable by its (read-model assigned) key, with its full
     /// untruncated value.
-    async fn get_variable_impl(
+    pub(crate) async fn get_variable_impl(
         &self,
         path_params: &models::GetVariablePathParams,
     ) -> Result<apis::variable::GetVariableResponse, ()> {
@@ -14561,7 +14562,7 @@ impl ServerImpl {
     /// process id is retained and searchable (Camunda/Zeebe parity); the
     /// `isLatestVersion` filter narrows to the highest version per id via the
     /// `is_latest` discriminator computed by the read store.
-    async fn search_process_definitions_impl(
+    pub(crate) async fn search_process_definitions_impl(
         &self,
         body: &Option<models::ProcessDefinitionSearchQuery>,
     ) -> Result<apis::process_definition::SearchProcessDefinitionsResponse, ()> {
@@ -14651,7 +14652,7 @@ impl ServerImpl {
     /// (Camunda `getProcessDefinition`). Resolves any deployed version — not just
     /// the latest — since every version is retained and independently
     /// addressable by key. A malformed or unknown key yields 404.
-    async fn get_process_definition_impl(
+    pub(crate) async fn get_process_definition_impl(
         &self,
         path_params: &models::GetProcessDefinitionPathParams,
     ) -> Result<apis::process_definition::GetProcessDefinitionResponse, ()> {
@@ -15037,7 +15038,7 @@ impl ServerImpl {
     /// minted deployment events (for cross-node broadcast). The caller must be the
     /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
     #[cfg(test)]
-    async fn deploy_resources_locally(
+    pub(crate) async fn deploy_resources_locally(
         &self,
         processes: Vec<ProcessDefinition>,
         resource_names: &std::collections::HashMap<String, String>,
@@ -27046,6 +27047,13 @@ async fn main() {
         });
     }
 
+    // MCP gateway (Camunda parity, issue #1499): a stateless streamable-HTTP
+    // MCP server at `/mcp/cluster` (slice 2; `/mcp/processes` lands in slice 3
+    // on the same seam). Off by default behind `NANOBPM_MCP_ENABLED`; the mount
+    // is a single call so sibling slices extend it without touching dispatch.
+    // Built before `server` is moved into the REST router below.
+    let mcp_server = server.clone();
+
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
         .route(
@@ -27222,6 +27230,15 @@ async fn main() {
     // secret. Merge it here so `/cluster` is reachable alongside `/falcon`.
     if let Some(cluster_router) = public_cluster_router {
         app = app.merge(cluster_router);
+    }
+
+    // MCP gateway (issue #1499 slice 2). Off by default; mounted only when
+    // `NANOBPM_MCP_ENABLED` is truthy so the server stays dark otherwise. The
+    // endpoint sits behind the same auth middleware as the REST API (the
+    // generated router's `ApiAuthBasic` guard applies app-wide).
+    if mcp::mcp_enabled() {
+        app = app.merge(mcp::mcp_router(mcp_server));
+        tracing::info!("MCP gateway enabled: /mcp/cluster");
     }
 
     if debug_rest_enabled() {
