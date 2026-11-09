@@ -877,6 +877,11 @@ pub struct PartitionStateMachine {
     /// reason a statically-owned leader keeps the shell resident (its exporter
     /// drives eviction there instead).
     leader: Arc<AtomicU64>,
+    /// Test-only barrier (#1405): signalled by an adoption the instant it is
+    /// about to wait on the checkpoint permit, so a test can deterministically
+    /// observe that adoption reached the wait BEFORE touching the engine.
+    #[cfg(test)]
+    adoption_permit_waiting: Arc<tokio::sync::Notify>,
 }
 
 impl PartitionStateMachine {
@@ -938,6 +943,8 @@ impl PartitionStateMachine {
             node_id,
             evict_eligible,
             leader,
+            #[cfg(test)]
+            adoption_permit_waiting: Arc::default(),
         })
     }
 
@@ -1082,7 +1089,11 @@ impl PartitionStateMachine {
     ) -> Option<nano_server_storage::seglog::CheckpointPermit> {
         let seg = self.engine.with(|journal| journal.seg_shared()).await;
         match seg {
-            Some(seg) => Some(seg.checkpoint_permit().await),
+            Some(seg) => {
+                #[cfg(test)]
+                self.adoption_permit_waiting.notify_one();
+                Some(seg.checkpoint_permit().await)
+            }
             None => None,
         }
     }
@@ -4893,7 +4904,10 @@ mod tests {
             let sm = Arc::clone(&sm);
             async move { sm.adopt_engine_snapshot(captured, &meta).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Deterministic barrier: adoption signals just before it waits on the
+        // permit. Had it restored the engine first, the state check below
+        // would observe the adopted state.
+        sm.adoption_permit_waiting.notified().await;
         assert!(!adopting.is_finished(), "adoption waits for the permit");
         assert_eq!(
             engine.with(|j| j.engine().snapshot().state).await,
