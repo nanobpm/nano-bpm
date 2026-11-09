@@ -161,10 +161,12 @@ pub struct Engine {
     /// timestamp is carried on the event.
     now: u64,
     /// Round-robin cursor for spreading start-triggered (message-/timer-start)
-    /// instances across the cluster's partitions. Not journaled — at RF=1 it
-    /// only balances load (the chosen target is baked onto the emitted
-    /// `StartInstanceDispatched` event, so replay is unaffected); a restart
-    /// simply resumes the rotation from zero.
+    /// instances across the cluster's partitions. Not derived from events (the
+    /// chosen target is baked onto the emitted `StartInstanceDispatched` event,
+    /// so replay is unaffected), so it is carried explicitly: in the snapshot
+    /// and in every [`Event::RaftEntryApplied`] record (#1405), which a replay
+    /// restores — a replica seeded from the journal then routes the next
+    /// round-robin start exactly like a peer that never restarted.
     start_dispatch_rr: u64,
     /// When `true`, a `CompleteJob` / `FailJob` / `ThrowJobError` is accepted for a
     /// job that has never been activated (the `activated` latch is not required).
@@ -710,11 +712,18 @@ impl Engine {
         let mut state = State::new();
         let mut next_local: u64 = 0;
         let mut raft_applied: Option<(u64, String)> = None;
+        let mut start_dispatch_rr: u64 = 0;
         for event in events {
             // A Raft applied-entry record (#1405) carries no keys and mutates no
             // state; it only reseeds `raft_applied`.
-            if let Event::RaftEntryApplied { index, raft_state } = event {
+            if let Event::RaftEntryApplied {
+                index,
+                raft_state,
+                start_dispatch_rr: rr,
+            } = event
+            {
                 raft_applied = Some((index, raft_state));
+                start_dispatch_rr = rr;
                 continue;
             }
             let max_key = event.max_key();
@@ -729,7 +738,7 @@ impl Engine {
             next_local,
             num_partitions: 1,
             now: 0,
-            start_dispatch_rr: 0,
+            start_dispatch_rr,
             lenient_completion: false,
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
@@ -745,6 +754,12 @@ impl Engine {
     /// recovered by replay: `(raft log index, opaque replication state)`.
     pub fn raft_applied(&self) -> Option<&(u64, String)> {
         self.raft_applied.as_ref()
+    }
+
+    /// The round-robin start-dispatch cursor (see the field). Journaled in each
+    /// [`Event::RaftEntryApplied`] record so a seeded replica resumes it (#1405).
+    pub fn start_dispatch_rr(&self) -> u64 {
+        self.start_dispatch_rr
     }
 
     /// Records that the Raft entry at `index` was applied, mirroring the

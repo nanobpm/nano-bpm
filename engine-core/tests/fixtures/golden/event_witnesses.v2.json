@@ -2,7 +2,8 @@
   {
     "RaftEntryApplied": {
       "index": 41,
-      "raft_state": "{\"opaque\":true}"
+      "raft_state": "{\"opaque\":true}",
+      "start_dispatch_rr": 7
     }
   },
   {

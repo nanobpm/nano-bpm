@@ -766,6 +766,7 @@ fn build_event_witnesses() -> Vec<Event> {
         Event::RaftEntryApplied {
             index: 41,
             raft_state: "{\"opaque\":true}".to_string(),
+            start_dispatch_rr: 7,
         },
         // The #901 bottom-to-top scope-subscription completion frame.
         Event::CompensationScopeSubscriptionCompleted {
@@ -926,6 +927,23 @@ fn pre_1300_start_instance_dispatched_decodes_with_defaults() {
             ..
         }
     ));
+}
+
+/// The #1405 additive `start_dispatch_rr` cursor defaults when absent: a
+/// `RaftEntryApplied` record journaled before the field existed still decodes
+/// (no format bump), resuming the rotation from zero as before.
+#[test]
+fn raft_entry_applied_without_cursor_decodes_with_default() {
+    let old = r#"{"RaftEntryApplied":{"index":9,"raft_state":"{}"}}"#;
+    let decoded = nanobpmn_engine_core::decode_event_json(old).expect("decode old record");
+    assert_eq!(
+        decoded,
+        Event::RaftEntryApplied {
+            index: 9,
+            raft_state: "{}".to_string(),
+            start_dispatch_rr: 0,
+        }
+    );
 }
 
 /// The #1374 additive fields default when absent: a pre-#1374

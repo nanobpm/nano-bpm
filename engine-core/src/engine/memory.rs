@@ -189,8 +189,14 @@ impl Engine {
         for event in events {
             // A Raft applied-entry record (#1405) only reseeds `raft_applied`;
             // it carries no keys and mutates no state.
-            if let Event::RaftEntryApplied { index, raft_state } = event {
+            if let Event::RaftEntryApplied {
+                index,
+                raft_state,
+                start_dispatch_rr,
+            } = event
+            {
                 self.raft_applied = Some((index, raft_state));
+                self.start_dispatch_rr = start_dispatch_rr;
                 continue;
             }
             let max_key = event.max_key();

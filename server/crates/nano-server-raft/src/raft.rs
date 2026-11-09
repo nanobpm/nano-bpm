@@ -1026,11 +1026,31 @@ impl PartitionStateMachine {
             (Some(journal), Some(snap)) if snap > journal.log_id => {
                 // The snapshot is strictly newer: install it (its metadata was
                 // adopted in `new`); openraft replays only the tail after it.
-                self.restore_from_current_snapshot().await
+                self.restore_from_current_snapshot().await?;
+                self.checkpoint_adopted_snapshot().await
             }
             (Some(_), _) => self.seed_last_applied_from_journal().await,
-            (None, _) => self.restore_from_current_snapshot().await,
+            (None, Some(_)) => {
+                self.restore_from_current_snapshot().await?;
+                self.checkpoint_adopted_snapshot().await
+            }
+            (None, None) => Ok(()),
         }
+    }
+
+    /// Makes an adopted Raft snapshot the journal's durable recovery base
+    /// (#1405). The journal predates the snapshot, so it does not hold the
+    /// snapshot's state; once later entries were journaled (each with a newer
+    /// `RaftEntryApplied` record) a restart would prefer the journal and lose
+    /// everything only the snapshot carried. Checkpointing right after the
+    /// adoption seals the journal at a snapshot of exactly the adopted state, so
+    /// any later restart rebuilds snapshot + suffix. A failed checkpoint fails
+    /// the bootstrap closed rather than run on a journal that would rewind.
+    async fn checkpoint_adopted_snapshot(&self) -> anyhow::Result<()> {
+        self.engine
+            .with(|journal| journal.checkpoint_base())
+            .await
+            .map_err(|e| anyhow::anyhow!("checkpointing the adopted Raft snapshot failed: {e}"))
     }
 
     /// Decodes the journal's last [`Event::RaftEntryApplied`] record, if any.
@@ -4239,6 +4259,184 @@ mod tests {
         shutdown_engine(engine).await;
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(fresh.parent().expect("parent"));
+    }
+
+    /// Adopting a NEWER Raft snapshot over an older journal must make that
+    /// snapshot the journal's recovery base (#1405). Otherwise, once a later
+    /// entry is journaled (with a newer applied-entry record), the next restart
+    /// prefers the journal — which never held the snapshot's state — and loses
+    /// everything only the snapshot carried. Restart must yield snapshot +
+    /// suffix, identical to a peer that applied every entry.
+    #[tokio::test]
+    async fn adopted_snapshot_becomes_the_journal_recovery_base() {
+        let dir = unique_log_dir("1405-adopt-base");
+        let snap_dir = dir.join("snapshots");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
+        let expected = {
+            let engine = durable_engine(&dir.join("peer"));
+            let mut sm = new_sm(&engine, &snap_dir);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            for i in 2..=3 {
+                apply_entry(&sm, i, one(Command::create_instance("w"), i))
+                    .await
+                    .expect("create");
+            }
+            let mut builder = sm.get_snapshot_builder().await;
+            let _ = builder.build_snapshot().await.expect("snapshot at 3");
+            apply_entry(&sm, 4, one(Command::create_instance("w"), 4))
+                .await
+                .expect("4");
+            let state = engine.with(|j| j.engine().snapshot().state).await;
+            drop(sm);
+            shutdown_engine(engine).await;
+            state
+        };
+        // A replica whose journal only reached entry 1 (its own snapshots
+        // elsewhere), then boots over the shared NEWER snapshot at 3.
+        let journal_dir = dir.join("replica");
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm = new_sm(&engine, &dir.join("own-snapshots"));
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm = new_sm(&engine, &snap_dir);
+            sm.restore_newest_boot_state()
+                .await
+                .expect("adopt snapshot");
+            let (applied, _) = sm.clone().applied_state().await.expect("applied");
+            assert_eq!(applied.map(|l| l.index), Some(3), "snapshot adopted");
+            apply_entry(&sm, 4, one(Command::create_instance("w"), 4))
+                .await
+                .expect("4");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        // Restart: the journal (now at 4) wins and must hold the snapshot base.
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine, &snap_dir);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(4), "the journal wins");
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(after, expected, "snapshot + suffix, nothing lost");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The round-robin start-dispatch cursor is the one engine field not
+    /// derived from events, so a replica seeding `last_applied` from its
+    /// journal (skipping command re-execution) must restore it from the
+    /// journaled `RaftEntryApplied` record (#1405). Otherwise the restarted
+    /// replica would route the next message start to a different partition
+    /// than a peer that never restarted.
+    #[tokio::test]
+    async fn restarted_replica_routes_round_robin_starts_like_its_peer() {
+        let dir = unique_log_dir("1405-rr");
+        let snaps = dir.join("snapshots");
+        let new_sm = |engine: &DeepthiHandle| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.clone(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let boot = |path: std::path::PathBuf| async move {
+            let engine = durable_engine(&path);
+            engine.with(|j| j.set_num_partitions(4)).await;
+            engine
+        };
+        let deploy = Command::DeployProcess(
+            ProcessBuilder::new("m")
+                .message_start_event("s", "go")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .expect("valid message-start process"),
+        );
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let start = || Command::correlate_message("go", "");
+        let journal_dir = dir.join("journal");
+        // Both replicas apply entries 1..=3 (a deploy + two round-robin starts).
+        let peer = boot(dir.join("peer")).await;
+        let peer_sm = new_sm(&peer);
+        let replica = boot(journal_dir.clone()).await;
+        let replica_sm = new_sm(&replica);
+        for sm in [&peer_sm, &replica_sm] {
+            apply_entry(sm, 1, one(deploy.clone(), 1)).await.expect("1");
+            apply_entry(sm, 2, one(start(), 2)).await.expect("2");
+            apply_entry(sm, 3, one(start(), 3)).await.expect("3");
+        }
+        let rr = peer.with(|j| j.engine().start_dispatch_rr()).await;
+        assert_eq!(rr, 2, "two round-robin starts advanced the cursor");
+        // The replica restarts and seeds `last_applied` from its journal.
+        drop(replica_sm);
+        shutdown_engine(replica).await;
+        let replica = boot(journal_dir).await;
+        let replica_sm = new_sm(&replica);
+        replica_sm
+            .restore_newest_boot_state()
+            .await
+            .expect("boot state");
+        let (applied, _) = replica_sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(3), "seeded from the journal");
+        assert_eq!(
+            replica.with(|j| j.engine().start_dispatch_rr()).await,
+            rr,
+            "cursor restored from the applied-entry record"
+        );
+        // The next start routes identically on both.
+        apply_entry(&peer_sm, 4, one(start(), 4)).await.expect("4");
+        apply_entry(&replica_sm, 4, one(start(), 4))
+            .await
+            .expect("4");
+        assert_eq!(
+            replica.with(|j| j.engine().snapshot()).await.state,
+            peer.with(|j| j.engine().snapshot()).await.state,
+        );
+        assert_eq!(
+            replica.with(|j| j.engine().start_dispatch_rr()).await,
+            peer.with(|j| j.engine().start_dispatch_rr()).await,
+        );
+        // Audit (#1405): the key generator is the other scalar not stored as
+        // state; it is derived from the replayed keys and must match too.
+        assert_eq!(
+            replica.with(|j| j.engine().snapshot().next_local).await,
+            peer.with(|j| j.engine().snapshot().next_local).await,
+        );
+        drop(peer_sm);
+        drop(replica_sm);
+        shutdown_engine(peer).await;
+        shutdown_engine(replica).await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A torn final frame drops the WHOLE entry (#1405): a crash mid-append of

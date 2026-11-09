@@ -2252,6 +2252,7 @@ impl Journal {
         events.push(Event::RaftEntryApplied {
             index,
             raft_state: raft_state.clone(),
+            start_dispatch_rr: self.engine.start_dispatch_rr(),
         });
         let events = Arc::new(events);
         let shared_backed = self.shared_exporter.is_some();
@@ -3413,6 +3414,52 @@ impl Journal {
             .copied()
             .unwrap_or(info.end);
         Some((snap, covered))
+    }
+
+    /// Makes the engine's CURRENT state this journal's durable recovery base
+    /// (#1405): seals the active segment at the current boundary and persists a
+    /// snapshot covering it (lean: the variable delta goes to the var store
+    /// first), in the layout this journal recovers from (single-partition
+    /// snapshot file, or this partition's entry in the combined multi-partition
+    /// snapshot). Called right after the engine adopts a Raft snapshot that is
+    /// NEWER than the journal: without it the journal would hold only the older
+    /// history, and once later entries were journaled a restart preferring the
+    /// journal would lose everything only the snapshot carried.
+    ///
+    /// An in-memory journal (no writer) has nothing durable to rebase and is a
+    /// no-op. A durable journal that cannot hold a snapshot base (non-segmented),
+    /// or a failed/refused checkpoint (fenced, unfoldable cold state), errors —
+    /// the caller must fail closed rather than run on a journal that would
+    /// silently lose state on the next restart.
+    pub fn checkpoint_base(&mut self) -> io::Result<()> {
+        if self.writer.is_none() {
+            return Ok(());
+        }
+        let Some(seg) = self.seg.clone() else {
+            return Err(io::Error::other(
+                "a non-segmented (legacy single-file) durable journal cannot hold a Raft \
+                 snapshot as its recovery base, so booting it over a newer snapshot would \
+                 lose that snapshot's state on a later restart; re-enable the segmented \
+                 journal (the default) for this replica (#1405)",
+            ));
+        };
+        let refused = || io::Error::other("journal checkpoint refused (fenced or incomplete)");
+        let (snap, covered) = if let Some(vs) = self.varstore.clone() {
+            let (snap, covered, upserts, forgets) =
+                self.snapshot_and_rotate_lean().ok_or_else(refused)?;
+            let ups: Vec<(Key, &HashMap<String, Value>)> =
+                upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+            vs.checkpoint(self.partition_id, covered, &ups, &forgets)
+                .map_err(io::Error::other)?;
+            (snap, covered)
+        } else {
+            self.snapshot_and_rotate().ok_or_else(refused)?
+        };
+        if seg.per_partition_total.is_empty() {
+            crate::seglog::write_snapshot(&seg.dir, snap, covered)
+        } else {
+            crate::seglog::upsert_multi_snapshot_entry(&seg.dir, self.partition_id, covered, snap)
+        }
     }
 
     /// The lean-snapshot counterpart of

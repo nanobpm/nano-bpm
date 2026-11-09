@@ -1842,6 +1842,31 @@ pub fn write_multi_snapshot(
     Ok(())
 }
 
+/// Replaces (or adds) ONE partition's entry in the combined snapshot, keeping
+/// every other partition's entry as it is (#1405). Used when a single partition
+/// must make its current state its journal recovery base out of band of the
+/// periodic all-partitions tick — e.g. right after adopting a newer Raft
+/// snapshot that the journal does not hold. A present-but-unreadable combined
+/// snapshot fails closed (never overwritten with a partial set).
+pub fn upsert_multi_snapshot_entry(
+    dir: &Path,
+    partition: u64,
+    covered: u64,
+    snap: EngineSnapshot,
+) -> io::Result<()> {
+    let mut entries: Vec<(u64, u64, EngineSnapshot)> = load_multi_snapshot(dir)?
+        .map(|m| {
+            m.into_iter()
+                .filter(|(p, _)| *p != partition)
+                .map(|(p, (c, e))| (p, c, e))
+                .collect()
+        })
+        .unwrap_or_default();
+    entries.push((partition, covered, snap));
+    entries.sort_by_key(|e| e.0);
+    write_multi_snapshot(dir, entries)
+}
+
 /// Loads the combined per-partition snapshot, as a map from global partition id
 /// to `(covered_count, snapshot)`.
 ///
@@ -5529,11 +5554,13 @@ mod tests {
         let ev = serde_json::to_string(&Event::RaftEntryApplied {
             index: index * 1000,
             raft_state: "cmd".into(),
+            start_dispatch_rr: 0,
         })
         .unwrap();
         let marker = serde_json::to_string(&Event::RaftEntryApplied {
             index,
             raft_state: "{}".into(),
+            start_dispatch_rr: 0,
         })
         .unwrap();
         (
@@ -5647,7 +5674,8 @@ mod tests {
                 events.last(),
                 Some(&Event::RaftEntryApplied {
                     index: 2,
-                    raft_state: "{}".into()
+                    raft_state: "{}".into(),
+                    start_dispatch_rr: 0,
                 })
             );
             drop(ActiveSegment::open(Arc::clone(&shared)).unwrap());
