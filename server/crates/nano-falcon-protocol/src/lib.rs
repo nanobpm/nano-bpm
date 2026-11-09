@@ -22,6 +22,29 @@ use serde_json::{Map, Value};
 mod lease_contract_tests {
     use super::*;
 
+    /// #963: the lease digest gained an additive `workers` list. A digest from
+    /// an older node (no `workers`) still decodes, and an empty list is omitted
+    /// so a worker-less digest is byte-identical to the old shape.
+    #[test]
+    fn lease_digest_workers_are_additive_on_the_wire() {
+        let old = serde_json::json!({
+            "type": "leaseDigest", "partition": 0, "leases": [[7, 1000]], "sentAt": 5
+        });
+        let frame: ClientFrame = serde_json::from_value(old.clone()).unwrap();
+        let ClientFrame::LeaseDigest { workers, .. } = &frame else {
+            panic!("decodes as a lease digest");
+        };
+        assert!(workers.is_empty());
+        assert_eq!(serde_json::to_value(&frame).unwrap(), old);
+
+        let new = serde_json::json!({
+            "type": "leaseDigest", "partition": 0, "leases": [[7, 1000]], "sentAt": 5,
+            "workers": [[7, "alice"]]
+        });
+        let frame: ClientFrame = serde_json::from_value(new.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&frame).unwrap(), new);
+    }
+
     #[test]
     fn atomic_job_updates_preserve_empty_changesets_and_lease() {
         let wire = serde_json::json!({
@@ -589,6 +612,13 @@ pub enum ClientFrame {
         partition: u64,
         leases: Vec<(u64, u64)>,
         sent_at: u64,
+        /// The activating worker of each lease `(jobKey, worker)`, so the
+        /// promoted leader attributes a terminal job to the real worker rather
+        /// than a recovery sentinel (#963). Additive: absent from a digest sent
+        /// by an older node (decodes empty → recovered leases are held but
+        /// unattributed) and omitted on the wire when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        workers: Vec<(u64, String)>,
     },
     /// **Intra-cluster only.** A best-effort retirement digest broadcast by a
     /// partition leader to its followers under RF>1. Carries the instance keys the

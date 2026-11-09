@@ -2964,8 +2964,39 @@ impl Journal {
     /// Recovers a soft activation lease from a digest on the underlying engine
     /// (Created → Activated until `deadline`). Soft state only — journals nothing.
     /// See [`Engine::recover_lease`].
-    pub fn recover_lease(&mut self, job_key: u64, deadline: u64, now: u64) -> bool {
-        self.engine.recover_lease(job_key, deadline, now)
+    pub fn recover_lease(
+        &mut self,
+        job_key: u64,
+        deadline: u64,
+        worker: Option<&str>,
+        now: u64,
+    ) -> bool {
+        // A promoted follower may hold this job only in its cold index (#963):
+        // page the owning instance in first, or the lease — and the digest's
+        // worker attribution — would be silently missed. Best-effort, like the
+        // digest itself: an unreadable row stays cold and is retried next tick.
+        // An already-expired lease is rejected *before* paging anything in —
+        // the engine would refuse it anyway, and rehydrating first would churn
+        // a cold instance in and out on every digest tick until the longest
+        // lease in the digest expires.
+        if deadline <= now {
+            return false;
+        }
+        if let Some(instance) = self
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.index.instance_for_job(job_key))
+        {
+            let _ = self.rehydrate_cold(instance);
+        }
+        self.engine.recover_lease(job_key, deadline, worker, now)
+    }
+
+    /// The activating worker of each soft lease (see
+    /// [`Engine::activated_lease_workers`]), broadcast in the lease digest so
+    /// a promoted leader restores the real attribution (#963).
+    pub fn activated_lease_workers(&self) -> Vec<(u64, String)> {
+        self.engine.activated_lease_workers()
     }
 
     // --- Read delegations mirroring the engine API the server uses. ---
@@ -4434,6 +4465,36 @@ mod tests {
             0,
             "the cold leaf was rehydrated through its resident parent"
         );
+    }
+
+    #[test]
+    fn recover_lease_rehydrates_a_cold_spilled_job_and_keeps_its_worker() {
+        // #963: a promoted follower may hold the digest's job only in its cold
+        // index; recovery must page it in, not silently miss the lease/worker.
+        let mut journal = cold_journal();
+        deploy_and_create(&mut journal);
+        let job_key = *journal.state().jobs.keys().next().expect("a job");
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(!journal.state().jobs.contains_key(&job_key));
+        assert!(journal.recover_lease(job_key, 10_000, Some("w-1"), 0));
+        assert_eq!(journal.cold_count(), 0);
+        assert_eq!(
+            journal.activated_lease_workers(),
+            vec![(job_key, "w-1".to_string())]
+        );
+    }
+
+    #[test]
+    fn recover_lease_does_not_rehydrate_an_expired_cold_lease() {
+        // #963: an expired digest entry must be rejected without paging the
+        // cold instance in (else every digest tick churns it through disk).
+        let mut journal = cold_journal();
+        deploy_and_create(&mut journal);
+        let job_key = *journal.state().jobs.keys().next().expect("a job");
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(!journal.recover_lease(job_key, 100, Some("w-1"), 100));
+        assert_eq!(journal.cold_count(), 1);
+        assert!(!journal.state().jobs.contains_key(&job_key));
     }
 
     #[test]

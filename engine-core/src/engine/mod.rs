@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use crate::command::Command;
+use crate::command::{Command, JobAttribution};
 use crate::event::{Event, MessageStartCorrelation};
 use crate::model::{ElementId, ElementKind, IncomingFlow, ProcessDefinition, SequenceFlow, Value};
 use crate::state::{self, Key, ProcessInstanceState, State};
@@ -124,6 +124,7 @@ pub struct EngineSnapshot {
 /// from a soft lease digest by a newly-promoted leader (see
 /// [`Engine::recover_lease`]). It marks the lease as "restored from a digest, not
 /// held by a live worker connection".
+/// Never a durable attribution: [`state::Job::attribution_worker`] filters it.
 pub const LEASE_DIGEST_WORKER: &str = "__lease_digest__";
 
 struct ActivationPlan {
@@ -639,6 +640,21 @@ impl Engine {
     /// See the `lenient_completion` field. Must be set identically on every replica.
     pub fn set_lenient_completion(&mut self, lenient: bool) {
         self.lenient_completion = lenient;
+    }
+
+    /// The worker a terminal job event attributes (#963): the replicated
+    /// command's stamp when present (authoritative on every replica, including
+    /// a "resolved absent" `worker: None`), else the live job's attribution for
+    /// an unstamped (legacy / locally-applied) command. The single capture
+    /// point for `JobCompleted` / `JobFailed` / `JobErrorThrown`.
+    fn terminal_worker(job: &state::Job, attribution: Option<&JobAttribution>) -> Option<String> {
+        match attribution {
+            Some(stamp) => stamp
+                .worker
+                .clone()
+                .filter(|w| !w.is_empty() && w != LEASE_DIGEST_WORKER),
+            None => job.attribution_worker(),
+        }
     }
 
     /// Whether lenient completion is enabled (see [`Self::set_lenient_completion`]).
@@ -2168,6 +2184,7 @@ impl Engine {
 
             Command::CompleteJob {
                 job_key,
+                attribution,
                 lease_token,
                 variables,
                 adhoc_result,
@@ -2231,7 +2248,7 @@ impl Engine {
                 // removed from state. `attribution_worker()` normalizes a
                 // snapshot-restored empty worker (`Some("")`) to `None`, so a
                 // pre-normalization snapshot can never leak an empty attribution.
-                let worker = job.attribution_worker();
+                let worker = Self::terminal_worker(job, attribution.as_ref());
                 let job_kind = job.kind;
 
                 // A task-listener job (ADR 0037 §6) gates a user task's deferred
@@ -3001,6 +3018,7 @@ impl Engine {
 
             Command::FailJob {
                 job_key,
+                attribution,
                 lease_token,
                 retries,
                 error_message,
@@ -3046,7 +3064,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let element_id = job.element_id.clone();
-                let worker = job.attribution_worker();
+                let worker = Self::terminal_worker(job, attribution.as_ref());
                 let retries = retries.max(0);
 
                 self.record_settlement(
@@ -3088,6 +3106,7 @@ impl Engine {
 
             Command::ThrowJobError {
                 job_key,
+                attribution,
                 lease_token,
                 error_code,
                 error_message,
@@ -3131,7 +3150,7 @@ impl Engine {
                 let instance_key = job.instance_key;
                 let element_instance_key = job.element_instance_key;
                 let task_element_id = job.element_id.clone();
-                let worker = job.attribution_worker();
+                let worker = Self::terminal_worker(job, attribution.as_ref());
 
                 Self::validate_job_lease(job, lease_token.as_deref(), true)?;
                 // The job is consumed by the thrown error either way.
