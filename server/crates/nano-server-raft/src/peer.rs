@@ -689,13 +689,17 @@ impl PeerLink {
 
     /// Fans a published message out to this peer so it correlates against the
     /// subscriptions on its owned partitions. The peer answers with
-    /// `{messageKey, correlatedInstanceKey}`.
+    /// `{messageKey, correlatedInstanceKey}`. `only_partitions` scopes the apply
+    /// to just those target partitions (the ones the fan-out has not yet
+    /// delivered); `None` applies every locally led target partition (legacy
+    /// behaviour for a peer predating the field).
     pub async fn publish_message(
         &self,
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, Value>>,
         business_id: Option<String>,
+        only_partitions: Option<Vec<u64>>,
     ) -> Result<PeerResult, PeerError> {
         self.request(|corr| ClientFrame::PublishMessage {
             corr,
@@ -703,6 +707,7 @@ impl PeerLink {
             correlation_key,
             variables,
             business_id,
+            only_partitions,
         })
         .await
     }

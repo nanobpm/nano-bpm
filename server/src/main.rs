@@ -8851,12 +8851,20 @@ impl ServerImpl {
     /// every node (each node correlates its own local subset), so the union still
     /// covers both owners. With a single partition the target set is `{0}` — one
     /// round-trip, identical to the pre-partitioning path.
+    ///
+    /// `only_partitions`, when set, further restricts the apply to the listed
+    /// target partitions: the cluster fan-out scopes each forwarded publish to
+    /// the partitions it has not yet delivered, so a partition already committed
+    /// on one node is never re-evaluated (and re-committed) on another when its
+    /// leadership moves mid-publish (#1307). `None` applies every local target —
+    /// the legacy behaviour for a peer frame predating the field.
     async fn correlate_message_everywhere(
         &self,
         name: String,
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
+        only_partitions: Option<&[u64]>,
     ) -> Result<Vec<Event>, EngineError> {
         // Reject an out-of-range business id before touching any partition, with
         // the engine's own rule: one partition must not apply the publish while
@@ -8871,6 +8879,10 @@ impl ServerImpl {
         let mut targets = vec![hash_partition];
         if hash_partition != 0 {
             targets.push(0);
+        }
+        // A scoped fan-out send applies only the partitions it still owes.
+        if let Some(only) = only_partitions {
+            targets.retain(|p| only.contains(p));
         }
 
         let mut all_events: Vec<Event> = Vec::new();
@@ -8914,16 +8926,25 @@ impl ServerImpl {
     /// partition nor partition 0 (no local `CorrelateMessage` was applied, so no
     /// key was minted); the cluster fan-out then sources it from an owning peer.
     /// The local building block for both the gateway fan-out and the peer-side
-    /// `PublishMessage` handler.
+    /// `PublishMessage` handler. `only_partitions`, when set, restricts the apply
+    /// to the listed target partitions (a scoped fan-out send); `None` applies
+    /// every local target (the legacy behaviour).
     pub(crate) async fn correlate_message_local(
         &self,
         name: String,
         correlation_key: String,
         variables: std::collections::HashMap<String, Value>,
         business_id: Option<String>,
+        only_partitions: Option<Vec<u64>>,
     ) -> Result<(Option<u64>, Option<u64>), EngineError> {
         let events = self
-            .correlate_message_everywhere(name, correlation_key, variables, business_id)
+            .correlate_message_everywhere(
+                name,
+                correlation_key,
+                variables,
+                business_id,
+                only_partitions.as_deref(),
+            )
             .await?;
         let message_key = message_key_of(&events);
         let instance = events.iter().find_map(|e| match e {
@@ -8972,6 +8993,7 @@ impl ServerImpl {
                 correlation_key.clone(),
                 engine_vars,
                 business_id.clone(),
+                None,
             )
             .await?;
 
@@ -8986,6 +9008,11 @@ impl ServerImpl {
                 &correlation_key,
                 topology.num_partitions,
             );
+            let target_partitions: Vec<u64> = if hash_partition == 0 {
+                vec![0]
+            } else {
+                vec![hash_partition, 0]
+            };
             // Address the node that currently accepts writes for each target
             // (its Raft leader after a failover), not the static owner. #1307.
             //
@@ -9002,16 +9029,39 @@ impl ServerImpl {
             // rather than replayed. Bounded — a genuinely partitioned cluster
             // degrades to the pre-existing best-effort warn-and-continue, and
             // the gateway surfaces 503 when no key was minted anywhere.
+            //
+            // Each send is scoped to the partitions it still owes
+            // (`only_partitions`), and a partition is marked COMPLETED the moment
+            // any node provably applies it (a local apply, or a peer's 200
+            // carrying a minted key / correlated instance). A completed partition
+            // is never re-sent — so a leadership move between sends, or a retry,
+            // cannot commit the same partition twice and start duplicate
+            // instances for one request (#1307).
             const PUBLISH_FANOUT_ATTEMPTS: usize = 8;
             let mut attempt = 0;
+            let mut completed: std::collections::HashSet<u64> = std::collections::HashSet::new();
             loop {
                 attempt += 1;
-                let mut target_nodes = vec![
-                    self.partition_write_node(hash_partition),
-                    self.partition_write_node(0),
-                ];
-                target_nodes.sort_unstable();
-                target_nodes.dedup();
+                // The partitions each addressed node is asked to apply this
+                // attempt: only those not already completed. Keyed by node so
+                // one send carries exactly the partitions that node is expected
+                // to write.
+                let mut sends: std::collections::BTreeMap<u32, Vec<u64>> =
+                    std::collections::BTreeMap::new();
+                for &p in &target_partitions {
+                    if completed.contains(&p) {
+                        continue;
+                    }
+                    let node = self.partition_write_node(p);
+                    if node == topology.node_id {
+                        // This node is the best-known writer but did not apply
+                        // the partition locally (a leadership gap): no peer can
+                        // help, and re-resolving below waits for the local view.
+                        continue;
+                    }
+                    sends.entry(node).or_default().push(p);
+                }
+                let remote_targets = sends.len();
                 let mut delivered = false;
                 // Retry is only safe when every remote outcome this attempt is
                 // KNOWN not to have applied: a failed dial (nothing was sent)
@@ -9021,19 +9071,15 @@ impl ServerImpl {
                 // republish would mint a second message key (no dedup), so it
                 // ends the loop instead.
                 let mut ambiguous = false;
-                let mut remote_targets = 0usize;
-                for node in target_nodes {
-                    if node == topology.node_id {
-                        continue;
-                    }
-                    remote_targets += 1;
-                    match self.peers.link(node).await {
+                for (node, partitions) in &sends {
+                    match self.peers.link(*node).await {
                         Ok(link) => match link
                             .publish_message(
                                 name.clone(),
                                 correlation_key.clone(),
                                 variables.clone(),
                                 business_id.clone(),
+                                Some(partitions.clone()),
                             )
                             .await
                         {
@@ -9055,18 +9101,23 @@ impl ServerImpl {
                                         .and_then(|s| s.parse::<u64>().ok());
                                 }
                                 // A 200 carrying a key or an instance proves the
-                                // publish reached a writer; a 200 with neither
-                                // means the addressed node leads no target
-                                // partition (a stale static owner) and silently
-                                // dropped it — NOT delivery. Track THIS attempt's
-                                // response, not the accumulated values: once a
-                                // key is minted the loop exits, so a stale
-                                // attempt's null must not be masked by it.
-                                delivered |= body.is_some_and(|b| {
+                                // publish reached a writer for the partitions this
+                                // send carried: mark them completed so no later
+                                // attempt re-sends them. A 200 with neither means
+                                // the addressed node leads none of them (a stale
+                                // static owner) and silently dropped it — NOT
+                                // delivery, so those partitions stay owed.
+                                let applied = body.is_some_and(|b| {
                                     b.get("messageKey").is_some_and(|v| v.as_str().is_some())
                                         || b.get("correlatedInstanceKey")
                                             .is_some_and(|v| v.as_str().is_some())
                                 });
+                                if applied {
+                                    delivered = true;
+                                    for &p in partitions {
+                                        completed.insert(p);
+                                    }
+                                }
                             }
                             Ok(res) => {
                                 ambiguous = true;
@@ -9085,26 +9136,33 @@ impl ServerImpl {
                         }
                     }
                 }
+                // A partition this node writes itself was applied by the local
+                // correlate above; nothing is owed remotely for it.
+                let all_resolved = target_partitions.iter().all(|p| {
+                    completed.contains(p) || self.partition_write_node(*p) == topology.node_id
+                });
                 // No remote target (this node writes every target partition):
                 // the local correlate already applied the whole publish.
-                if !publish_fanout_should_retry(
-                    remote_targets,
-                    delivered,
-                    ambiguous,
-                    attempt,
-                    PUBLISH_FANOUT_ATTEMPTS,
-                ) {
+                if all_resolved
+                    || !publish_fanout_should_retry(
+                        remote_targets,
+                        delivered,
+                        ambiguous,
+                        attempt,
+                        PUBLISH_FANOUT_ATTEMPTS,
+                    )
+                {
                     break;
                 }
-                // Nothing was delivered anywhere: the routing view is stale
-                // (e.g. a non-replica gateway still pointing at the pre-failover
-                // static owner). Drop the cached links to the addressed nodes so
-                // the next attempt redials, wait for this node's leader view to
-                // catch up, and re-resolve the write nodes.
-                self.peers
-                    .drop_link(self.partition_write_node(hash_partition))
-                    .await;
-                self.peers.drop_link(self.partition_write_node(0)).await;
+                // Something is still owed and nothing was delivered for it: the
+                // routing view is stale (e.g. a non-replica gateway still
+                // pointing at the pre-failover static owner). Drop the cached
+                // links to the addressed nodes so the next attempt redials, wait
+                // for this node's leader view to catch up, and re-resolve the
+                // write nodes.
+                for &node in sends.keys() {
+                    self.peers.drop_link(node).await;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
@@ -43732,6 +43790,7 @@ mod subscription_placement_tests {
                 order.clone(),
                 std::collections::HashMap::new(),
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -43804,6 +43863,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 order.clone(),
                 std::collections::HashMap::new(),
+                None,
                 None,
             )
             .await
@@ -43878,6 +43938,7 @@ mod subscription_placement_tests {
                 order.clone(),
                 std::collections::HashMap::new(),
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -43933,6 +43994,7 @@ mod subscription_placement_tests {
                     "order-placed".into(),
                     format!("order-{i}"),
                     std::collections::HashMap::new(),
+                    None,
                     None,
                 )
                 .await
@@ -44049,6 +44111,7 @@ mod subscription_placement_tests {
                     order.clone(),
                     std::collections::HashMap::new(),
                     None,
+                    None,
                 )
                 .await
                 .expect("correlation with a valid business id");
@@ -44114,6 +44177,7 @@ mod subscription_placement_tests {
                 key,
                 std::collections::HashMap::new(),
                 None,
+                None,
             )
             .await
             .expect("correlation with a valid business id");
@@ -44152,6 +44216,7 @@ mod subscription_placement_tests {
                 "payment-received".into(),
                 "order-x".into(),
                 std::collections::HashMap::new(),
+                None,
                 None,
             )
             .await
