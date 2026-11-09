@@ -18,17 +18,16 @@
 clippy.toml allow-unwrap-in-tests does not cover non-#[test] helper fns in tests/*.rs"
 )]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Path to the compiled server binary, provided by Cargo for integration tests.
-const SERVER_BIN: &str = env!("CARGO_BIN_EXE_nanobpm-gateway-rest-server");
+use common::server_command;
 
 /// The generated REST layer mounts every route under this base path.
 const BASE_PATH: &str = "/v2";
@@ -139,14 +138,8 @@ impl ServerProcess {
     /// server process, so tests can exercise env-gated behaviour (e.g. the
     /// backpressure watermark) against the real binary.
     fn boot_with_env(journal: &Path, env: &[(&str, &str)]) -> Self {
-        let mut command = Command::new(SERVER_BIN);
-        command
-            .env("NANOBPMN_JOURNAL", journal)
-            .env("PORT", "0")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        #[cfg(unix)]
-        command.process_group(0);
+        let mut command = server_command();
+        command.env("NANOBPMN_JOURNAL", journal).env("PORT", "0");
         for (key, value) in env {
             command.env(key, value);
         }

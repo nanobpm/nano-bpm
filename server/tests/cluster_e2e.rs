@@ -24,16 +24,17 @@
 clippy.toml allow-unwrap-in-tests does not cover non-#[test] helper fns in tests/*.rs"
 )]
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const SERVER_BIN: &str = env!("CARGO_BIN_EXE_nanobpm-gateway-rest-server");
+use common::server_command;
+
 const BASE_PATH: &str = "/v2";
 const NUM_PARTITIONS: u64 = 4;
 
@@ -152,7 +153,7 @@ impl Node {
         extra_env: &[(&str, &str)],
     ) -> Self {
         std::fs::create_dir_all(data_dir).expect("create node data dir");
-        let mut cmd = Command::new(SERVER_BIN);
+        let mut cmd = server_command();
         cmd.env("NANOBPMN_DATA_DIR", data_dir)
             .env("NANOBPMN_NODES", nodes)
             .env("NANOBPMN_NODE_ID", node_id.to_string())
@@ -161,13 +162,7 @@ impl Node {
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        #[cfg(unix)]
-        cmd.process_group(0);
-        let mut child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn server binary");
+        let mut child = cmd.spawn().expect("spawn server binary");
         let stdout_thread = drain_stdout(&mut child, port);
         let node = Self {
             child,
