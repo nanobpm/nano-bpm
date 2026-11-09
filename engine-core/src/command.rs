@@ -152,6 +152,22 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         business_id: Option<String>,
+        /// The job's activation-lock deadline as resolved on the proposing
+        /// leader (#1440). Raft re-runs this command on every replica, but a
+        /// leader-local (soft) activation is never journaled, so a follower's
+        /// engine has no lock for the job and would stamp `None` onto the
+        /// terminal event — diverging from the leader's event, snapshot and
+        /// post-failover state. The leader stamps its resolved deadline here
+        /// before proposing; the engine folds it into the job's lock at the
+        /// top of apply (soft state, never journaled) so the centrally-stamped
+        /// terminal event is byte-identical on every replica. `None`/skipped
+        /// for the direct (single-node / test) path, where the engine reads
+        /// its own lock — the ordinary case is byte-unchanged.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        terminal_deadline: Option<u64>,
     },
     /// Assign a user task to `assignee`. The task must be in the `Created` state.
     /// When `allow_override` is `false` and the task already has an assignee, the
@@ -960,6 +976,7 @@ impl Command {
             adhoc_result: None,
             task_listener_result: None,
             business_id: None,
+            terminal_deadline: None,
         }
     }
 
@@ -976,6 +993,7 @@ impl Command {
             adhoc_result: None,
             task_listener_result: Some(task_listener_result),
             business_id: None,
+            terminal_deadline: None,
         }
     }
 
@@ -988,6 +1006,7 @@ impl Command {
             adhoc_result: None,
             task_listener_result: None,
             business_id: None,
+            terminal_deadline: None,
         }
     }
 
@@ -1005,6 +1024,7 @@ impl Command {
             adhoc_result: Some(adhoc_result),
             task_listener_result: None,
             business_id: None,
+            terminal_deadline: None,
         }
     }
 
@@ -1285,6 +1305,20 @@ impl Command {
         self
     }
 
+    /// Set the leader-resolved terminal deadline a replicated `CompleteJob`
+    /// carries (#1440) — see the field's doc. No-op shape for every other
+    /// command kind is deliberately NOT offered: only completion settles a job
+    /// against a possibly-unjournaled soft lock.
+    pub fn with_terminal_deadline(mut self, deadline: Option<u64>) -> Self {
+        match &mut self {
+            Self::CompleteJob {
+                terminal_deadline, ..
+            } => *terminal_deadline = deadline,
+            _ => panic!("with_terminal_deadline requires a CompleteJob command"),
+        }
+        self
+    }
+
     /// Convenience constructor for a `CorrelateMessage` with no variables.
     pub fn correlate_message(
         message_name: impl Into<String>,
@@ -1372,6 +1406,7 @@ mod kind_tests {
                 adhoc_result: None,
                 task_listener_result: None,
                 business_id: None,
+                terminal_deadline: None,
             }
             .kind(),
             "complete_job"

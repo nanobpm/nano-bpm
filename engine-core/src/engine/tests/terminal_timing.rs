@@ -235,3 +235,142 @@ fn a_leader_local_activation_omitted_from_the_journal_still_replays_the_same_ter
     }
     assert_terminal_timing(&follower, ja, jb, "soft-activation follower");
 }
+
+#[test]
+fn a_follower_applying_a_replicated_completion_stamps_the_leader_resolved_deadline() {
+    // The REAL Raft path: replicas do not replay the leader's events — each
+    // re-runs the replicated COMMAND on its own engine and journals the events
+    // it produces. A follower's engine never saw the leader-local (soft)
+    // activation, so its job has no lock; without the command-carried
+    // `terminal_deadline` its terminal event (and snapshot) would lose the
+    // deadline the leader persisted. This drives both sides through
+    // `apply_command_at` on the SAME replicated command and requires the two
+    // journals — and the two retained terminal records — to be identical.
+    let mut leader = Engine::new();
+    leader.set_lenient_completion(true);
+    leader
+        .apply_command_at(Command::DeployProcess(three_branches()), 1_000)
+        .unwrap();
+    leader
+        .apply_command_at(Command::create_instance("three"), 2_000)
+        .unwrap();
+    // Soft activation on the leader ONLY: it sets the lock in the leader's
+    // state but (being leader-local) is never replicated.
+    leader
+        .apply_command_at(Command::activate_jobs("ja", "w", 1, 60_000, 3_000), 3_000)
+        .unwrap();
+    let ja = job_of(&leader, "ja");
+    let leader_deadline = leader.job(ja).unwrap().deadline;
+    assert_eq!(leader_deadline, Some(63_000));
+
+    // The follower: same replicated prefix MINUS the soft activation.
+    let mut follower = Engine::new();
+    follower.set_lenient_completion(true);
+    follower
+        .apply_command_at(Command::DeployProcess(three_branches()), 1_000)
+        .unwrap();
+    follower
+        .apply_command_at(Command::create_instance("three"), 2_000)
+        .unwrap();
+    assert_eq!(follower.job(ja).unwrap().deadline, None);
+
+    // The leader stamps its resolved deadline onto the command before
+    // proposing it (server/crates/nano-server-raft `propose_partition_command`).
+    let command =
+        Command::complete_job(ja).with_terminal_deadline(leader.job_terminal_deadline(ja));
+    let leader_events = leader.apply_command_at(command.clone(), 5_000).unwrap();
+    let follower_events = follower.apply_command_at(command, 5_000).unwrap();
+
+    // The terminal event each replica journals carries the SAME
+    // leader-resolved deadline. (The events' `worker` attribution is a
+    // separate, pre-existing leader-local divergence class — a soft
+    // activation's worker is as unjournaled as its lock; only the deadline is
+    // terminal-retained state, so it is the field this fix replicates.)
+    let terminal = |events: &[Event]| {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::JobCompleted { deadline, .. } => Some(*deadline),
+                _ => None,
+            })
+            .expect("a JobCompleted event")
+    };
+    assert_eq!(terminal(&leader_events), Some(63_000));
+    assert_eq!(
+        terminal(&follower_events),
+        terminal(&leader_events),
+        "the follower's terminal event must carry the leader's deadline"
+    );
+    assert_eq!(
+        follower.job(ja).unwrap().terminal_end,
+        leader.job(ja).unwrap().terminal_end,
+    );
+    assert_eq!(
+        follower.job(ja).unwrap().terminal_end,
+        Some(JobTerminalEnd {
+            at: 5_000,
+            deadline: Some(63_000),
+        }),
+        "the command-carried deadline reaches the follower's retained terminal record"
+    );
+}
+
+#[test]
+fn a_replicated_completion_without_the_leader_stamp_falls_back_to_local_state() {
+    // The direct (single-node / test) path proposes no `terminal_deadline`:
+    // the engine reads its own lock — unchanged pre-#1440 behaviour.
+    let mut engine = Engine::new();
+    engine
+        .apply_command_at(Command::DeployProcess(three_branches()), 1_000)
+        .unwrap();
+    engine
+        .apply_command_at(Command::create_instance("three"), 2_000)
+        .unwrap();
+    engine
+        .apply_command_at(Command::activate_jobs("ja", "w", 1, 60_000, 3_000), 3_000)
+        .unwrap();
+    let ja = job_of(&engine, "ja");
+    engine
+        .apply_command_at(Command::complete_job(ja), 5_000)
+        .unwrap();
+    assert_eq!(
+        engine.job(ja).unwrap().terminal_end,
+        Some(JobTerminalEnd {
+            at: 5_000,
+            deadline: Some(63_000),
+        }),
+    );
+}
+
+#[test]
+fn a_cascade_recancel_of_a_terminal_job_restates_its_first_terminal_deadline() {
+    // First-terminal-wins across a cascade: a job that went terminal with a
+    // retained deadline (its live lock long cleared) can be swept again by a
+    // later instance-discard cascade. The re-cancel must restate the RETAINED
+    // terminal deadline, not the cleared live lock (`None`), or a follower
+    // applying the cascade would persist a different terminal record.
+    let (mut leader, _, ja, jb) = leader_with_terminal_jobs();
+    let inst = leader.job(ja).unwrap().instance_key;
+    // Both jobs are terminal; their live locks are cleared. Terminating the
+    // instance cascades a discard over every in-play token — and any job it
+    // still sees as cancellable.
+    assert_eq!(leader.job(ja).unwrap().deadline, None);
+    assert_eq!(leader.job(jb).unwrap().deadline, None);
+    let events = leader
+        .apply_command_at(Command::cancel_instance(inst), 9_000)
+        .unwrap();
+    // The terminal jobs were already terminal, so the cascade does not
+    // re-cancel them (only Created/Activated/Failed jobs are swept); the
+    // retained records are untouched.
+    assert_eq!(
+        leader.job(ja).unwrap().terminal_end,
+        Some(expected()[0].1),
+        "terminal record survives the cascade"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })),
+        "the instance itself terminated"
+    );
+}

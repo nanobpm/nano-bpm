@@ -551,6 +551,7 @@ impl TestEngine {
             adhoc_result: None,
             task_listener_result: None,
             business_id: None,
+            terminal_deadline: None,
         })
         .map_err(|e| js_err(&format!("complete error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -597,6 +598,7 @@ impl TestEngine {
             adhoc_result: Some(adhoc_result),
             task_listener_result: None,
             business_id: None,
+            terminal_deadline: None,
         })
         .map_err(|e| js_err(&format!("complete agent job error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -5619,6 +5621,7 @@ mod read_channel_tests {
             adhoc_result: None,
             task_listener_result: None,
             business_id: Some("order-1".into()),
+            terminal_deadline: None,
         })
         .unwrap();
         let task = parse(&eng.search_user_tasks("").unwrap())["items"][0].clone();

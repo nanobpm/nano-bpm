@@ -586,7 +586,19 @@ impl Engine {
     /// terminal `JobCompleted`/`JobCanceled` event (#1440) so every replica,
     /// the event-driven read model and a snapshot reseed agree on it even when
     /// the activation itself was leader-local (never journaled).
-    pub(super) fn job_terminal_deadline(&self, job_key: Key) -> Option<u64> {
-        self.state.jobs.get(&job_key).and_then(|j| j.deadline)
+    ///
+    /// Falls back to the job's already-retained terminal deadline
+    /// (`Job::terminal_end`): a cascade re-cancel of an ALREADY-terminal job
+    /// must restate the deadline its first terminal transition recorded, not
+    /// `None` (the live lock is cleared by that transition) — first-terminal-
+    /// wins on every replica.
+    ///
+    /// `pub` for the Raft host: the proposing leader reads this to stamp the
+    /// replicated `CompleteJob` command's `terminal_deadline` (#1440).
+    pub fn job_terminal_deadline(&self, job_key: Key) -> Option<u64> {
+        self.state
+            .jobs
+            .get(&job_key)
+            .and_then(|j| j.deadline.or(j.terminal_end.and_then(|t| t.deadline)))
     }
 }

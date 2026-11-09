@@ -513,6 +513,7 @@ pub unsafe extern "C" fn nbpmn_complete_job(engine: *mut Engine, job_key: u64) -
         adhoc_result: None,
         task_listener_result: None,
         business_id: None,
+        terminal_deadline: None,
     };
     match engine.apply_command(cmd) {
         Ok(_) => 0,

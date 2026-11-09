@@ -5642,9 +5642,32 @@ fn project_event(
             // (`[JobFailed, JobRetriesUpdated, IncidentResolved, JobActivated,
             // JobCompleted]`) is held event-by-event by the durable position
             // gate in `project`, so it can no longer clear the retained deadline.
+            //
+            // Deadline authority (#1440): a MODERN record (`completed_at != 0`)
+            // carries the deadline the engine resolved at completion — `None`
+            // INCLUDED. A soft activation followed by an unexported lock change
+            // (`JobTimeoutUpdated`) and an unjournaled soft expiry completes
+            // with `deadline == None`; keeping the row's stale projected
+            // deadline here would diverge from a snapshot reseed, which seeds
+            // `None` from `Job::terminal_end`. So a modern record OVERWRITES
+            // (`?6`); only a pre-field record (`completed_at == 0`, `?5 == 0`)
+            // falls back to keeping the row's value.
+            //
+            // Mixed-version creation repair (#1440): a legacy `JobCreated`
+            // (`created_at == 0`) seeds `created_at_ms` from its batch
+            // observation time, which can be LATER than a modern completion's
+            // command instant (replay with export lag) — leaving
+            // `creationTime > endTime`. The terminal instant is the best
+            // available lower bound for an unknown creation (the job must have
+            // existed to complete), so on the first terminal transition clamp
+            // a fallback creation down to it. A genuine engine-carried
+            // creation is always `<=` the completion instant, so the clamp is
+            // a no-op for it; and the `end_ms IS NULL` guard keeps a
+            // re-delivery from touching the row at all.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
-                 deadline_ms = CASE WHEN end_ms IS NULL THEN COALESCE(?5, deadline_ms) ELSE deadline_ms END, \
+                 deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?5 THEN COALESCE(?6, deadline_ms) ELSE ?6 END ELSE deadline_ms END, \
+                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?4) ELSE created_at_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
                  WHERE key = ?1",
@@ -5653,6 +5676,7 @@ fn project_event(
                     job_state_code(JobState::Completed),
                     worker_attribution(worker.as_deref()),
                     terminal_instant(*completed_at, now_ms) as i64,
+                    *completed_at == 0,
                     deadline.map(|d| d as i64),
                 ],
             )?;
@@ -5666,13 +5690,15 @@ fn project_event(
         } => {
             // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
             // Instant and deadline come from the event exactly as for
-            // `JobCompleted` (#1440).
+            // `JobCompleted` (#1440) — including the modern-record deadline
+            // authority and the mixed-version creation clamp (see there).
             // Guard on the first terminal transition so a re-delivery is a no-op;
             // a job that was already FAILED/ERRORED (no `end_ms`) still gets its
             // cancellation `endTime` here (#1344).
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, \
-                 deadline_ms = CASE WHEN end_ms IS NULL THEN COALESCE(?4, deadline_ms) ELSE deadline_ms END, \
+                 deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?4 THEN COALESCE(?5, deadline_ms) ELSE ?5 END ELSE deadline_ms END, \
+                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?3) ELSE created_at_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
                  WHERE key = ?1",
@@ -5680,6 +5706,7 @@ fn project_event(
                     *job_key as i64,
                     job_state_code(JobState::Canceled),
                     terminal_instant(*canceled_at, now_ms) as i64,
+                    *canceled_at == 0,
                     deadline.map(|d| d as i64),
                 ],
             )?;
@@ -13244,6 +13271,181 @@ mod read_surface_tests {
             Some(1_000),
             "legacy re-delivery must not move lastUpdateTime"
         );
+    }
+
+    /// Defect-class guard (#1440 review): a MIXED-VERSION replay projects a
+    /// legacy `JobCreated` (`created_at == 0`) at its batch observation time,
+    /// then a MODERN terminal event whose command instant is EARLIER (export
+    /// lag) — leaving `creationTime > endTime` without repair. The first
+    /// terminal projection must clamp the unknown-creation fallback down to the
+    /// terminal instant (the best lower bound: the job must have existed to
+    /// terminate), matching the snapshot-reseed fallback, and a re-delivery of
+    /// the terminal event must stay a no-op. Both terminal projectors share
+    /// the class.
+    #[test]
+    fn mixed_version_replay_repairs_an_unknown_creation_at_the_terminal_transition() {
+        for (terminal, want_state) in [
+            (
+                Event::JobCompleted {
+                    job_key: 8350,
+                    instance_key: 7350,
+                    created_at: 0,
+                    job_type: "worker".to_string(),
+                    worker: None,
+                    completed_at: 5_000,
+                    deadline: None,
+                },
+                nanobpmn_engine_core::JobState::Completed,
+            ),
+            (
+                Event::JobCanceled {
+                    job_key: 8350,
+                    instance_key: 7350,
+                    canceled_at: 5_000,
+                    deadline: None,
+                },
+                nanobpmn_engine_core::JobState::Canceled,
+            ),
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            // Legacy CREATED projected at a LATER batch time (export lag).
+            apply_at(
+                &store,
+                &Event::JobCreated {
+                    job_key: 8350,
+                    instance_key: 7350,
+                    element_instance_key: 7351,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 0,
+                    priority: 0,
+                    retries: 3,
+                },
+                9_000,
+            );
+            let seeded = job_row(&store, 8350);
+            assert_eq!(seeded.created_at_ms, 9_000, "legacy batch-time fallback");
+
+            apply_at(&store, &terminal, 9_500);
+            let row = job_row(&store, 8350);
+            assert_eq!(row.state, want_state);
+            assert_eq!(row.end_ms, Some(5_000));
+            assert_eq!(
+                row.created_at_ms, 5_000,
+                "unknown creation is clamped to the terminal instant, not left after it"
+            );
+            assert_eq!(row.last_update_ms, Some(5_000));
+
+            // A re-delivery of the terminal event is a no-op (the clamp is
+            // guarded by `end_ms IS NULL`).
+            apply_at(&store, &terminal, 9_900);
+            let again = job_row(&store, 8350);
+            assert_eq!(again.created_at_ms, 5_000);
+            assert_eq!(again.end_ms, Some(5_000));
+            assert_eq!(again.last_update_ms, Some(5_000));
+        }
+    }
+
+    /// Defect-class guard (#1440 review, "previously missed"): a MODERN
+    /// terminal record's `deadline` is authoritative — `None` INCLUDED. A soft
+    /// activation whose lock was changed by a durable `JobTimeoutUpdated` and
+    /// then expired WITHOUT an exported event completes with `deadline ==
+    /// None`; keeping the row's stale projected deadline would diverge from a
+    /// snapshot reseed (which seeds `None` from `Job::terminal_end`). Only a
+    /// PRE-FIELD record (`completed_at`/`canceled_at == 0`) keeps the row's
+    /// value. Both terminal projectors share the class.
+    #[test]
+    fn a_modern_terminal_absence_clears_the_stale_projected_deadline() {
+        for (terminal, legacy_terminal) in [
+            (
+                Event::JobCompleted {
+                    job_key: 8360,
+                    instance_key: 7360,
+                    created_at: 1_000,
+                    job_type: "worker".to_string(),
+                    worker: None,
+                    completed_at: 5_000,
+                    deadline: None,
+                },
+                Event::JobCompleted {
+                    job_key: 8361,
+                    instance_key: 7361,
+                    created_at: 1_000,
+                    job_type: "worker".to_string(),
+                    worker: None,
+                    completed_at: 0,
+                    deadline: None,
+                },
+            ),
+            (
+                Event::JobCanceled {
+                    job_key: 8360,
+                    instance_key: 7360,
+                    canceled_at: 5_000,
+                    deadline: None,
+                },
+                Event::JobCanceled {
+                    job_key: 8361,
+                    instance_key: 7361,
+                    canceled_at: 0,
+                    deadline: None,
+                },
+            ),
+        ] {
+            let store = ReadStore::open(None).unwrap();
+            for key in [8360_i64, 8361] {
+                apply_at(
+                    &store,
+                    &Event::JobCreated {
+                        job_key: key as u64,
+                        instance_key: (key - 1000) as u64,
+                        element_instance_key: (key - 999) as u64,
+                        element_id: "t".to_string(),
+                        job_type: "worker".to_string(),
+                        created_at: 1_000,
+                        priority: 0,
+                        retries: 3,
+                    },
+                    1_000,
+                );
+                // The stale projected deadline: a durable timeout update
+                // projected while the soft lock was still held.
+                apply_at(
+                    &store,
+                    &Event::JobTimeoutUpdated {
+                        job_key: key as u64,
+                        instance_key: (key - 1000) as u64,
+                        deadline: 60_000,
+                        operation_reference: None,
+                    },
+                    2_000,
+                );
+                assert_eq!(
+                    job_row(&store, key as u64).deadline_ms,
+                    Some(60_000),
+                    "precondition: the projection holds the stale deadline"
+                );
+            }
+
+            // Modern record: `None` is authoritative — the stale deadline goes.
+            apply_at(&store, &terminal, 5_000);
+            let modern = job_row(&store, 8360);
+            assert_eq!(modern.end_ms, Some(5_000));
+            assert_eq!(
+                modern.deadline_ms, None,
+                "a modern terminal record with no deadline clears the stale projection \
+                 (the reseed seeds None from Job::terminal_end)"
+            );
+
+            // Pre-field record: no terminal metadata — the row's value is kept.
+            apply_at(&store, &legacy_terminal, 5_000);
+            let legacy = job_row(&store, 8361);
+            assert_eq!(
+                legacy.deadline_ms,
+                Some(60_000),
+                "a pre-field record keeps the projected deadline"
+            );
+        }
     }
 
     /// Defect-class guard (#1344, finding 2): replaying a whole committed prefix

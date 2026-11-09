@@ -19585,6 +19585,24 @@ impl ServerImpl {
             }
             return Err((503, format!("partition {p} leader unavailable; retry")));
         }
+        // #1440: a leader-local (soft) activation is never journaled, so a
+        // follower re-running this completion has no lock to read and would
+        // stamp `None` onto the terminal event — diverging from the leader's
+        // event, snapshot and post-failover state. Resolve the deadline on the
+        // leader's engine (the single writer, so this cannot race the apply
+        // below) and carry it on the replicated command; the engine folds it
+        // into the job's soft lock at apply so the centrally-stamped terminal
+        // event is byte-identical on every replica.
+        let command = if let Command::CompleteJob { job_key, .. } = command {
+            let deadline = self
+                .engine_handle_for(p)
+                .ok_or((500, format!("partition {p} has no engine")))?
+                .with(move |journal| journal.engine().job_terminal_deadline(job_key))
+                .await;
+            command.with_terminal_deadline(deadline)
+        } else {
+            command
+        };
         let response = part
             .propose_result(command, now_millis())
             .await
