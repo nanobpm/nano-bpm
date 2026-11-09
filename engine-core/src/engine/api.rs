@@ -85,9 +85,12 @@ impl Engine {
     ///
     /// Always overwrites any existing stamp: the proposer is the single
     /// authority (a command forwarded from a non-leader must not keep that
-    /// node's view). A job unknown here leaves the command unstamped so the
-    /// engine's own validation rejects it identically on every replica. Any
-    /// other command is left untouched.
+    /// node's view). A job not resident here (unknown, or cold-spilled and
+    /// rehydrated only later at apply time) is stamped as *resolved absent*
+    /// (`worker: None`), so every replica attributes it identically instead of
+    /// falling back to its own live state; an unknown job is still rejected by
+    /// the engine's own validation on every replica. Any other command is left
+    /// untouched.
     pub fn stamp_terminal_attribution(&self, command: &mut Command) {
         let (job_key, attribution) = match command {
             Command::CompleteJob {
@@ -107,8 +110,12 @@ impl Engine {
             } => (*job_key, attribution),
             _ => return,
         };
-        *attribution = self.state.jobs.get(&job_key).map(|job| JobAttribution {
-            worker: job.attribution_worker(),
+        *attribution = Some(JobAttribution {
+            worker: self
+                .state
+                .jobs
+                .get(&job_key)
+                .and_then(|job| job.attribution_worker()),
         });
     }
 

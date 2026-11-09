@@ -2971,6 +2971,17 @@ impl Journal {
         worker: Option<&str>,
         now: u64,
     ) -> bool {
+        // A promoted follower may hold this job only in its cold index (#963):
+        // page the owning instance in first, or the lease — and the digest's
+        // worker attribution — would be silently missed. Best-effort, like the
+        // digest itself: an unreadable row stays cold and is retried next tick.
+        if let Some(instance) = self
+            .cold
+            .as_ref()
+            .and_then(|cold| cold.index.instance_for_job(job_key))
+        {
+            let _ = self.rehydrate_cold(instance);
+        }
         self.engine.recover_lease(job_key, deadline, worker, now)
     }
 
@@ -4446,6 +4457,23 @@ mod tests {
             journal.cold_count(),
             0,
             "the cold leaf was rehydrated through its resident parent"
+        );
+    }
+
+    #[test]
+    fn recover_lease_rehydrates_a_cold_spilled_job_and_keeps_its_worker() {
+        // #963: a promoted follower may hold the digest's job only in its cold
+        // index; recovery must page it in, not silently miss the lease/worker.
+        let mut journal = cold_journal();
+        deploy_and_create(&mut journal);
+        let job_key = *journal.state().jobs.keys().next().expect("a job");
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(!journal.state().jobs.contains_key(&job_key));
+        assert!(journal.recover_lease(job_key, 10_000, Some("w-1"), 0));
+        assert_eq!(journal.cold_count(), 0);
+        assert_eq!(
+            journal.activated_lease_workers(),
+            vec![(job_key, "w-1".to_string())]
         );
     }
 

@@ -7,6 +7,7 @@
 //! soft state — otherwise leader and follower persist different terminal
 //! events for the same log entry.
 use super::*;
+#[cfg(feature = "serde")]
 use crate::JobAttribution;
 
 /// A leader and a lenient follower that both applied the same replicated
@@ -144,6 +145,47 @@ fn a_digest_recovered_lease_attributes_the_real_worker_never_the_sentinel() {
         .apply_command(Command::complete_job(job_key))
         .unwrap();
     assert_eq!(terminal_worker(&events), Some(None));
+}
+
+#[test]
+fn a_job_not_resident_on_the_proposer_is_stamped_resolved_absent() {
+    // A job unknown/cold on the proposer at stamp time may be rehydrated (and
+    // activated) before apply: it must still carry an authoritative stamp, or
+    // replicas would each fall back to their own divergent live state.
+    let leader = Engine::new();
+    for (label, mut command) in every_terminal_command(424_242) {
+        leader.stamp_terminal_attribution(&mut command);
+        let attribution = match &command {
+            Command::CompleteJob { attribution, .. }
+            | Command::FailJob { attribution, .. }
+            | Command::ThrowJobError { attribution, .. } => attribution.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            attribution.map(|a| a.worker),
+            Some(None),
+            "{label}: resolved absent, not unstamped"
+        );
+    }
+}
+
+#[test]
+fn a_worker_less_digest_lease_never_retains_the_sentinel_in_state() {
+    // fail (terminal) and throw retain the worker in state for attribution;
+    // a resolved-absent event must not leave the replica-local digest
+    // sentinel behind (it would diverge the leader's snapshot).
+    for command in [
+        |k| Command::fail_job(k, 0, "boom"),
+        |k| Command::throw_job_error(k, "E", "boom"),
+    ] {
+        let (_, mut promoted, job_key) = leader_and_follower("W");
+        assert!(promoted.recover_lease(job_key, 1_000, None, 0));
+        let mut command: Command = command(job_key);
+        promoted.stamp_terminal_attribution(&mut command);
+        promoted.apply_command(command).unwrap();
+        let job = promoted.state().jobs.get(&job_key).expect("job retained");
+        assert_eq!(job.worker, None, "sentinel scrubbed from retained state");
+    }
 }
 
 /// The stamp survives the replicated wire (the Raft log carries serialized
