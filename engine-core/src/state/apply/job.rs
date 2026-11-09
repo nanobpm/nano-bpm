@@ -39,6 +39,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_code: None,
                     has_failed_with_retries_left: false,
                     settled_tokens: Vec::new(),
+                    terminal_end: None,
                 },
             );
             resync_job_index(state, *job_key);
@@ -89,6 +90,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_code: None,
                     has_failed_with_retries_left: false,
                     settled_tokens: Vec::new(),
+                    terminal_end: None,
                 },
             );
             resync_job_index(state, *job_key);
@@ -139,6 +141,7 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     error_code: None,
                     has_failed_with_retries_left: false,
                     settled_tokens: Vec::new(),
+                    terminal_end: None,
                 },
             );
             resync_job_index(state, *job_key);
@@ -307,8 +310,14 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             }
         }
 
-        Event::JobCompleted { job_key, .. } => {
+        Event::JobCompleted {
+            job_key,
+            completed_at,
+            deadline,
+            ..
+        } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
+                stamp_terminal_end(job, *completed_at, *deadline);
                 job.state = JobState::Completed;
                 job.worker = None;
                 job.deadline = None;
@@ -419,8 +428,14 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             }
         }
 
-        Event::JobCanceled { job_key, .. } => {
+        Event::JobCanceled {
+            job_key,
+            canceled_at,
+            deadline,
+            ..
+        } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
+                stamp_terminal_end(job, *canceled_at, *deadline);
                 job.state = JobState::Canceled;
                 job.worker = None;
                 job.deadline = None;
@@ -431,5 +446,18 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
             resync_job_index(state, *job_key);
         }
         _ => unreachable!(),
+    }
+}
+
+/// Records the job's first terminal transition (#1440) with the deadline the
+/// terminal EVENT carries — not the replica's `job.deadline`, which differs
+/// between leader and followers for a leader-local (never-journaled) soft
+/// activation. First-transition-wins (a
+/// re-delivered or later terminal event is a no-op), mirroring the read model's
+/// `end_ms IS NULL` guard. A pre-field event carries `0` (no instant): nothing
+/// is recorded rather than inventing an epoch-zero `endTime`.
+fn stamp_terminal_end(job: &mut crate::state::Job, at: u64, deadline: Option<u64>) {
+    if job.terminal_end.is_none() && at != 0 {
+        job.terminal_end = Some(crate::state::JobTerminalEnd { at, deadline });
     }
 }

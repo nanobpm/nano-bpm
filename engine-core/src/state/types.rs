@@ -373,6 +373,30 @@ pub struct Job {
         serde(default, skip_serializing_if = "Vec::is_empty")
     )]
     pub settled_tokens: Vec<JobSettlement>,
+    /// Timing of the job's first terminal transition (#1440): the
+    /// `JobCompleted`/`JobCanceled` instant and the deadline the job held just
+    /// before it (Camunda keeps the last projected deadline on a completed /
+    /// canceled job). The engine retains a terminal job until its owning
+    /// instance is evicted, so a snapshot can carry a COMPLETED job of a still-
+    /// active instance; this is what lets a snapshot-seeded read model recover
+    /// `endTime`/`lastUpdateTime`/`deadline` without the (compacted) events.
+    /// `None` while the job is live, and for jobs that went terminal before
+    /// this field existed or via a pre-field event with no instant.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub terminal_end: Option<JobTerminalEnd>,
+}
+
+/// See [`Job::terminal_end`] (#1440).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct JobTerminalEnd {
+    /// Logical instant (ms since the Unix epoch) of the terminal transition.
+    pub at: u64,
+    /// The activation-lock deadline the job held when it went terminal.
+    pub deadline: Option<u64>,
 }
 
 impl Job {
@@ -2399,6 +2423,7 @@ mod job_attribution_worker_tests {
             error_code: None,
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
+            terminal_end: None,
         }
     }
 
