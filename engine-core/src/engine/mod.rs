@@ -95,7 +95,16 @@ struct Paused {
 /// and explicitly nullable history metrics.
 /// Persistence decoders retain numeric tokens and literal legacy prompt strings
 /// so version-1 journals and snapshots still load.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 2;
+/// Version `3` reframes the LOCAL (non-Raft) `snapshot.*.bin` / `msnapshot.bin`
+/// payload as the #1337 chunked sidecar stream (control frame + bounded
+/// instance-chunk frames + a terminal end frame) so a snapshot never
+/// materializes the whole cold/spilled set in RAM (#1463). The versioned
+/// `EngineSnapshot` *payload shape* itself is unchanged — a v3 control frame
+/// carries the same `EngineSnapshot` value a v2 monolith did — so version-2
+/// (and headerless version-0) snapshots still load under this build, and a
+/// pre-v3 build fails a v3 file closed as `FormatMismatch` (then migrates it by
+/// replay, #1071).
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 3;
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
 /// identically. Produced by [`Engine::snapshot`] and consumed by
@@ -15616,6 +15625,29 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
         .map(|(k, _)| *k)
         .collect();
     owned.into_iter().filter_map(|k| map.remove(&k)).collect()
+}
+
+/// Removes from `map` every entity owned by an instance in `owners`, grouped by
+/// owning instance, in a single pass over `map`. Entities whose owner is not in
+/// `owners` stay in `map`. The linear-time counterpart of calling
+/// [`drain_owned`] once per instance (which is quadratic over a backlog).
+#[cfg(feature = "serde")]
+fn group_owned<V: OwnedByInstance>(
+    map: &mut HashMap<Key, V>,
+    owners: &HashSet<Key>,
+) -> HashMap<Key, Vec<V>> {
+    let mut grouped: HashMap<Key, Vec<V>> = HashMap::new();
+    let owned: Vec<Key> = map
+        .iter()
+        .filter(|(_, v)| owners.contains(&v.instance_key()))
+        .map(|(k, _)| *k)
+        .collect();
+    for k in owned {
+        if let Some(v) = map.remove(&k) {
+            grouped.entry(v.instance_key()).or_default().push(v);
+        }
+    }
+    grouped
 }
 
 /// A process start event's deploy-time-resolved trigger.

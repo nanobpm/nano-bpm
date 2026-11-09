@@ -1165,6 +1165,10 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
                 capture,
                 &cold_keys,
                 stores,
+                // Raft snapshots are self-contained (never lean/control-only):
+                // resolve every spilled placeholder so a follower installs every
+                // variable with no dependency on any store.
+                false,
             )
         })
         .await

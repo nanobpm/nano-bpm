@@ -2469,7 +2469,7 @@ impl Journal {
     /// assert on the fully-shed state drive it deterministically through here
     /// instead of depending on the amortisation cadence.
     #[cfg(test)]
-    fn force_spill_scan(&mut self) {
+    pub(crate) fn force_spill_scan(&mut self) {
         self.spill_check_skip = 0;
         self.maybe_spill();
     }
@@ -2816,18 +2816,17 @@ impl Journal {
     /// instances stay off-heap while the snapshot restores every variable and
     /// every instance with no dependency on the spill store.
     ///
-    /// **Memory (#1337):** the Raft snapshot path no longer materializes the
-    /// whole cold set — `get_snapshot_builder` captures the streaming halves
+    /// **Memory (#1337, #1463):** neither snapshot path materializes the whole
+    /// cold set any more. The Raft path captures the streaming halves
     /// ([`streaming_snapshot_parts`](Journal::streaming_snapshot_parts)) and
     /// `build_snapshot` streams the cold/spilled rows straight from the spill
-    /// store to disk in bounded chunks, so the capture peak is one chunk, not the
-    /// working set. This local-rotation capture (`snapshot_and_rotate`) still
-    /// folds the full set into one in-memory `EngineSnapshot` for the
-    /// single-file `snapshot.*.bin` format; converting that on-disk format to
-    /// the chunked sidecar is the remaining local-path follow-up (a breaking
-    /// snapshot-format change requiring an explicit `SNAPSHOT_FORMAT_VERSION`
-    /// bump and replay-migrator validation, deliberately out of #1337's Raft
-    /// scope).
+    /// store to disk in bounded chunks; the local (non-Raft) rotation uses
+    /// [`streaming_snapshot_and_rotate`](Journal::streaming_snapshot_and_rotate)
+    /// and
+    /// [`seglog::write_snapshot_streaming`](crate::seglog::write_snapshot_streaming),
+    /// which seal the same chunked sidecar framing (snapshot format v3). This
+    /// best-effort value wrapper still folds, but it backs no durable recovery
+    /// point.
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         let mut snap = self.engine.snapshot();
         // Best-effort (see the doc above): a failed fold is logged and left
@@ -3367,7 +3366,23 @@ impl Journal {
             capture,
             &cold_keys,
             stores,
+            false,
         )
+    }
+
+    /// Reads a cold instance's whole snapshot row without restoring it into the
+    /// engine — the validation read for the streaming capture (#1463 review).
+    /// `Ok(Some)` the row is present and readable; `Ok(None)` it is definitively
+    /// absent (the payload is already lost); `Err` the store/row is unreadable
+    /// (possibly transient). Never becomes resident in engine state.
+    fn peek_cold_instance(&self, key: Key) -> Result<Option<()>, String> {
+        let Some(cold) = self.cold.as_ref() else {
+            return Err("no cold store wired; cannot establish row presence".to_string());
+        };
+        cold.store
+            .try_get_cold(key)
+            .map(|opt| opt.map(|_| ()))
+            .map_err(|e| e.to_string())
     }
 
     /// Reads a spilled instance's variables without consuming them: from the
@@ -3451,6 +3466,191 @@ impl Journal {
         // journaled before the seal (#1384 review), so the loss survives restart.
         // The capture borrows `self` mutably, so it runs before the `writer` borrow.
         let snap = self.try_engine_snapshot_quarantining_with_incidents()?;
+        self.rotate_sealing().map(|covered| (snap, covered))
+    }
+
+    /// The streaming/sidecar counterpart of
+    /// [`snapshot_and_rotate`](Journal::snapshot_and_rotate) (#1463): captures the
+    /// same consistent engine state and seals the active segment at the same
+    /// boundary, but returns the **decomposed streaming parts**
+    /// ([`streaming_snapshot_parts`](Journal::streaming_snapshot_parts)) instead
+    /// of one folded in-memory [`EngineSnapshot`]. The caller streams them to
+    /// disk off the engine thread with
+    /// [`write_streaming_snapshot_from_stores`](crate::snapstream::write_streaming_snapshot_from_stores)
+    /// (via [`seglog::write_snapshot_streaming`](crate::seglog::write_snapshot_streaming)),
+    /// so the whole cold/spilled set is never resident at once on the local
+    /// (non-Raft) snapshot path either.
+    ///
+    /// Fail-closed exactly like [`snapshot_and_rotate`](Journal::snapshot_and_rotate):
+    /// every off-heap row is validated **before** the seal, but row-at-a-time and
+    /// dropped immediately (never folded into one in-memory snapshot — that would
+    /// recreate the whole-cold-set peak this path exists to avoid, #1463 review).
+    /// A definitively-absent row is quarantined with its journaled
+    /// `VariablesLost` incident before the seal (#1384), and a proven-absent COLD
+    /// key is excluded from the returned `cold_keys` so the streaming writer does
+    /// not reject the lost row on every tick (which would block snapshots and
+    /// compaction forever).
+    ///
+    /// **Capture→write races (#1463 review):** the returned store handles are
+    /// shared `Arc`s, so a command resuming between the capture and the off-thread
+    /// write can rehydrate (forgetting a row) or re-spill (rewriting one). That
+    /// race is **fail-closed, never a torn snapshot**: a row the writer can no
+    /// longer read aborts the write and removes the partial file (exactly like an
+    /// unreadable row), so an incomplete snapshot is never sealed and the covered
+    /// prefix never compacts — the tick retries. A re-spilled row is rewritten
+    /// under the same key with equal-or-newer state, so the write either resolves
+    /// the current payload or fails closed; it never seals a stale one.
+    pub fn streaming_snapshot_and_rotate(
+        &mut self,
+    ) -> Option<(
+        crate::snapstream::StreamingCapture,
+        Vec<Key>,
+        crate::snapstream::SpillStores,
+        u64,
+    )> {
+        self.seg.as_ref()?;
+        // Validate + quarantine row-at-a-time (journaling any `VariablesLost`
+        // incident BEFORE the seal), collecting the cold keys proven ABSENT so
+        // they are excluded from the streaming write. No whole-set fold happens
+        // here — each peeked row is dropped before the next is read.
+        let absent_cold = self.validate_offheap_for_streaming()?;
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        let cold_keys: Vec<Key> = cold_keys
+            .into_iter()
+            .filter(|k| !absent_cold.contains(k))
+            .collect();
+        let covered = self.rotate_sealing()?;
+        Some((capture, cold_keys, stores, covered))
+    }
+
+    /// The fail-closed, row-at-a-time off-heap validation behind
+    /// [`streaming_snapshot_and_rotate`](Journal::streaming_snapshot_and_rotate)
+    /// (#1463 review): the streaming counterpart of
+    /// [`try_engine_snapshot_quarantining_with_incidents`](Journal::try_engine_snapshot_quarantining_with_incidents)
+    /// that never materializes the whole cold/spilled set.
+    ///
+    /// Every resident spilled instance and every indexed cold row is peeked
+    /// (read + dropped, never folded into one snapshot). An UNREADABLE row fails
+    /// closed (`None` — abort before the seal, retry next tick). A DEFINITIVELY
+    /// ABSENT row is quarantined and its `VariablesLost` incident journaled
+    /// before the seal (local policy; under replicated apply the capture is
+    /// STRICT — an orphan aborts the rotation, #1384). Returns the cold keys
+    /// proven absent (to be excluded from the streaming write).
+    fn validate_offheap_for_streaming(&mut self) -> Option<Vec<Key>> {
+        use std::collections::HashSet;
+        let strict = self.replicated_apply;
+        let mut absent_cold: Vec<Key> = Vec::new();
+        let mut orphans: HashSet<Key> = HashSet::new();
+
+        self.begin_fold();
+
+        // Resident spilled instances: peek each payload (dropped immediately).
+        let spilled_keys: Vec<Key> = self
+            .engine
+            .state()
+            .instances
+            .values()
+            .filter(|i| i.variables_spilled)
+            .map(|i| i.key)
+            .collect();
+        for key in spilled_keys {
+            match self.peek_spilled_variables(key) {
+                Ok(Some(_)) => {}
+                Ok(None) if !strict => {
+                    self.note_orphan(
+                        key,
+                        "snapshot: spilled instance has no variable row in the spill store; \
+                         its spilled variables are lost — quarantined (snapshotted with its \
+                         surviving resident variables) so snapshots and compaction are not \
+                         blocked",
+                    );
+                    orphans.insert(key);
+                }
+                Ok(None) => {
+                    self.note_blocker(
+                        key,
+                        None,
+                        "snapshot (strict): spilled instance has no variable row; aborting \
+                         this snapshot",
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    self.note_blocker(
+                        key,
+                        Some(&err),
+                        "snapshot: spilled instance's variable row could not be read; \
+                         aborting this snapshot (will retry)",
+                    );
+                    return None;
+                }
+            }
+        }
+
+        // Cold rows: peek each (read + dropped, never restored into the engine).
+        let cold_keys: Vec<Key> = self
+            .cold
+            .as_ref()
+            .map(|c| c.index.keys().collect())
+            .unwrap_or_default();
+        for key in cold_keys {
+            match self.peek_cold_instance(key) {
+                Ok(Some(())) => {}
+                Ok(None) if !strict => {
+                    self.note_orphan(
+                        key,
+                        "snapshot: cold instance has no row in the spill store; it is lost \
+                         — quarantined (omitted) so snapshots and compaction are not blocked",
+                    );
+                    absent_cold.push(key);
+                    orphans.insert(key);
+                }
+                Ok(None) => {
+                    self.note_blocker(
+                        key,
+                        None,
+                        "snapshot (strict): cold instance has no row; aborting this snapshot",
+                    );
+                    return None;
+                }
+                Err(err) => {
+                    self.note_blocker(
+                        key,
+                        Some(&err.to_string()),
+                        "snapshot: cold instance's row could not be read; aborting this \
+                         snapshot (will retry)",
+                    );
+                    return None;
+                }
+            }
+        }
+        self.fold_succeeded();
+
+        // Journal the VariablesLost incident for each orphan BEFORE the seal
+        // (#1384), mirroring `try_engine_snapshot_quarantining_with_incidents`.
+        // Under replicated apply we returned None on the first orphan already.
+        for &key in &orphans {
+            // Clear the LIVE spilled flag for a resident orphan (a cold orphan is
+            // off-heap already), keeping the surviving resident map, so resolving
+            // the incident does not leave it spilled and re-raise next snapshot.
+            let resident = self
+                .engine
+                .instance(key)
+                .map(|i| Arc::clone(&i.variables))
+                .unwrap_or_default();
+            self.engine.rehydrate_variables(key, resident);
+            self.raise_quarantine_incident(key, "snapshot");
+        }
+        Some(absent_cold)
+    }
+
+    /// The seal half of a snapshot rotation, shared by
+    /// [`snapshot_and_rotate`](Journal::snapshot_and_rotate) and
+    /// [`streaming_snapshot_and_rotate`](Journal::streaming_snapshot_and_rotate):
+    /// routes the rotate through the ordered writer channel (after every write
+    /// the captured state already reflects) and returns this partition's covered
+    /// event count at the sealed boundary. `None` when the writer is gone.
+    fn rotate_sealing(&mut self) -> Option<u64> {
         let writer = self.writer.as_ref()?;
         let (reply_tx, reply_rx) = oneshot::channel();
         if writer.send(WriterMsg::Rotate(reply_tx)).is_err() {
@@ -3466,7 +3666,7 @@ impl Journal {
             .get(self.partition_id as usize)
             .copied()
             .unwrap_or(info.end);
-        Some((snap, covered))
+        Some(covered)
     }
 
     /// The lean-snapshot counterpart of
