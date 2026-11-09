@@ -26370,6 +26370,10 @@ async fn main() {
                     let mut prev_covered: u64 = 0;
                     loop {
                         ticker.tick().await;
+                        // Serialize this capture -> publish cycle with a Raft
+                        // snapshot adoption's base checkpoint (#1405): taken off
+                        // the engine actor, held until the tick ends.
+                        let _permit = shared.checkpoint_permit().await;
                         let snapped = handle.with(|journal| journal.snapshot_and_rotate()).await;
                         let Some((snap, covered)) = snapped else {
                             record_snapshot_health_tick(
@@ -26463,6 +26467,10 @@ async fn main() {
                     let mut prev_floor: u64 = 0;
                     loop {
                         ticker.tick().await;
+                        // Serialize this capture -> publish cycle with a Raft
+                        // snapshot adoption's base checkpoint (#1405): taken off
+                        // the engine actor, held until the tick ends.
+                        let _permit = shared.checkpoint_permit().await;
                         // Snapshot each owned partition; a `None` (writer gone)
                         // aborts this tick so compaction never runs on a partial
                         // watermark set.

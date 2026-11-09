@@ -1045,9 +1045,19 @@ impl PartitionStateMachine {
     /// adoption seals the journal at a snapshot of exactly the adopted state, so
     /// any later restart rebuilds snapshot + suffix. A failed checkpoint fails
     /// the bootstrap closed rather than run on a journal that would rewind.
+    ///
+    /// The journal's checkpoint permit is taken HERE, off the engine actor and
+    /// before entering it (the periodic checkpoint takes it the same way), so
+    /// the adoption checkpoint is serialized with any in-flight periodic
+    /// capture -> publish cycle without the two deadlocking on the actor.
     async fn checkpoint_adopted_snapshot(&self) -> anyhow::Result<()> {
+        let seg = self.engine.with(|journal| journal.seg_shared()).await;
+        let permit = match seg {
+            Some(seg) => Some(seg.checkpoint_permit().await),
+            None => None,
+        };
         self.engine
-            .with(|journal| journal.checkpoint_base())
+            .with(move |journal| journal.checkpoint_base(permit.as_ref()))
             .await
             .map_err(|e| anyhow::anyhow!("checkpointing the adopted Raft snapshot failed: {e}"))
     }

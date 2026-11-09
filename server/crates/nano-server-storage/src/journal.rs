@@ -3494,6 +3494,7 @@ impl Journal {
             num_partitions: full.num_partitions,
             now: full.now,
             start_dispatch_rr: full.start_dispatch_rr,
+            raft_applied: full.raft_applied,
         };
         let cold_keys: Vec<Key> = self
             .cold
@@ -3653,7 +3654,17 @@ impl Journal {
     /// or a failed/refused checkpoint (fenced, unfoldable cold state), errors —
     /// the caller must fail closed rather than run on a journal that would
     /// silently lose state on the next restart.
-    pub fn checkpoint_base(&mut self) -> io::Result<()> {
+    ///
+    /// A segmented journal requires its directory's
+    /// [`CheckpointPermit`](crate::seglog::CheckpointPermit) (else it errors): the whole cycle is serialized with the periodic
+    /// checkpoint, so an older periodic capture cannot be published over the
+    /// adopted base. A durable REBASE FLOOR is recorded before the base snapshot
+    /// is published, so recovery fails closed (never replays a history lacking
+    /// the adopted state) if that snapshot is later missing or unreadable.
+    pub fn checkpoint_base(
+        &mut self,
+        permit: Option<&crate::seglog::CheckpointPermit>,
+    ) -> io::Result<()> {
         if self.writer.is_none() {
             return Ok(());
         }
@@ -3665,6 +3676,11 @@ impl Journal {
                  journal (the default) for this replica (#1405)",
             ));
         };
+        if !permit.is_some_and(|p| p.is_for(&seg)) {
+            return Err(io::Error::other(
+                "checkpoint_base requires this journal directory's checkpoint permit (#1405)",
+            ));
+        }
         let refused = || io::Error::other("journal checkpoint refused (fenced or incomplete)");
         let (snap, covered) = if let Some(vs) = self.varstore.clone() {
             let (snap, covered, upserts, forgets) =
@@ -3678,10 +3694,19 @@ impl Journal {
             self.snapshot_and_rotate().ok_or_else(refused)?
         };
         if seg.per_partition_total.is_empty() {
+            crate::seglog::write_rebase_floor(&seg.dir, None, covered)?;
             crate::seglog::write_snapshot(&seg.dir, snap, covered)
         } else {
+            crate::seglog::write_rebase_floor(&seg.dir, Some(self.partition_id), covered)?;
             crate::seglog::upsert_multi_snapshot_entry(&seg.dir, self.partition_id, covered, snap)
         }
+    }
+
+    /// This journal's segmented seal state, if segmented — the source of the
+    /// [`CheckpointPermit`](crate::seglog::CheckpointPermit) that
+    /// [`checkpoint_base`](Journal::checkpoint_base) requires.
+    pub fn seg_shared(&self) -> Option<Arc<SegShared>> {
+        self.seg.clone()
     }
 
     /// The lean-snapshot counterpart of

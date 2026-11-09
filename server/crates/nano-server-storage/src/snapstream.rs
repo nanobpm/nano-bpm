@@ -580,6 +580,7 @@ where
         num_partitions,
         now,
         start_dispatch_rr,
+        raft_applied,
     } = snapshot;
     let (control_state, instances) =
         nanobpmn_engine_core::Engine::decompose_state_for_streaming(state);
@@ -590,6 +591,7 @@ where
         num_partitions,
         now,
         start_dispatch_rr,
+        raft_applied,
     };
     restore_control(control, 0);
     for snap in instances {
@@ -969,6 +971,7 @@ mod tests {
             num_partitions: full.num_partitions,
             now: full.now,
             start_dispatch_rr: full.start_dispatch_rr,
+            raft_applied: full.raft_applied,
         }
     }
 

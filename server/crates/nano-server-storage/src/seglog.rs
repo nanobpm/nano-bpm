@@ -479,9 +479,56 @@ pub struct SegShared {
     /// [`journal_compress_from_env`] on the segmented path; always `false` on the
     /// legacy single-file path.
     pub compress: bool,
+    /// Serializes every checkpoint cycle (capture -> seal -> publish) over this
+    /// journal directory (#1405). The periodic maintenance tick holds it from
+    /// capture through publish, and adopting a Raft snapshot as the recovery
+    /// base ([`Journal::checkpoint_base`](crate::journal::Journal::checkpoint_base))
+    /// requires a [`CheckpointPermit`] from it — so an older periodic capture can
+    /// never be published OVER a newer adopted base. Acquire it BEFORE entering
+    /// the engine actor (never on it) so the two paths cannot deadlock.
+    pub checkpoint_gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Proof of holding a journal directory's
+/// [`checkpoint_gate`](SegShared::checkpoint_gate) (#1405). Obtained only via
+/// [`SegShared::checkpoint_permit`], so a checkpoint that must not interleave
+/// with another cycle cannot be called without it.
+pub struct CheckpointPermit {
+    gate: Arc<tokio::sync::Mutex<()>>,
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl CheckpointPermit {
+    /// Whether this permit was issued by `shared`'s gate.
+    pub fn is_for(&self, shared: &SegShared) -> bool {
+        Arc::ptr_eq(&self.gate, &shared.checkpoint_gate)
+    }
 }
 
 impl SegShared {
+    /// Waits for this directory's checkpoint gate (see
+    /// [`checkpoint_gate`](SegShared::checkpoint_gate)). Call off the engine
+    /// actor, then hold the permit across the whole capture -> publish cycle.
+    pub async fn checkpoint_permit(&self) -> CheckpointPermit {
+        let gate = self.checkpoint_gate.clone();
+        let guard = gate.clone().lock_owned().await;
+        CheckpointPermit {
+            gate,
+            _guard: guard,
+        }
+    }
+
+    /// Non-blocking [`checkpoint_permit`](SegShared::checkpoint_permit): `None`
+    /// while another checkpoint cycle holds the gate.
+    pub fn try_checkpoint_permit(&self) -> Option<CheckpointPermit> {
+        let gate = self.checkpoint_gate.clone();
+        let guard = gate.clone().try_lock_owned().ok()?;
+        Some(CheckpointPermit {
+            gate,
+            _guard: guard,
+        })
+    }
+
     /// A non-segmenting shared state for the legacy single-file paths
     /// (`Journal::open_partition`, `SharedWriter`): an infinite seal threshold
     /// means the writer never rotates, so the file keeps its given path and
@@ -501,6 +548,7 @@ impl SegShared {
             per_partition_total: Vec::new(),
             per_partition_active_start: Vec::new(),
             compress: false,
+            checkpoint_gate: Arc::default(),
         })
     }
 
@@ -864,6 +912,119 @@ struct PersistedSnapshot {
 /// into every snapshot header.
 const INCARNATION_NAME: &str = "journal.incarnation";
 
+/// Infix marking a [`unique_tmp_path`] staging file, so recovery can sweep the
+/// leftovers of a crash mid-write.
+const UNIQUE_TMP_INFIX: &str = ".stage-";
+
+/// A staging path for an atomic `tmp + rename` publish of `path` that is unique
+/// per process AND per call (#1405): two concurrent publishers of the same file
+/// (e.g. a periodic checkpoint and a Raft-snapshot adoption) must never share a
+/// temp file, or one could rename the other's half-written bytes into place.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let mut name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(
+        "{UNIQUE_TMP_INFIX}{}-{seq}.tmp",
+        std::process::id()
+    ));
+    path.with_file_name(name)
+}
+
+/// Removes staging files a crash left behind mid-publish (see
+/// [`unique_tmp_path`]). Best-effort: a leftover is only wasted disk, never
+/// read as state.
+fn sweep_unique_tmp(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.contains(UNIQUE_TMP_INFIX) && name.ends_with(".tmp") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Filename of the durable REBASE FLOOR (#1405) for the single-partition layout,
+/// or for partition `p` of the multi-partition layout. Present only once a Raft
+/// snapshot was adopted as this journal's recovery base: the journal's own
+/// history does NOT contain the adopted state, so recovery is valid only from a
+/// snapshot covering at least the floor.
+fn rebase_floor_path(dir: &Path, partition: Option<u64>) -> PathBuf {
+    match partition {
+        None => dir.join("journal.rebase-floor"),
+        Some(p) => dir.join(format!("journal.rebase-floor.p{p}")),
+    }
+}
+
+/// Durably records the rebase floor (see [`rebase_floor_path`]) BEFORE the
+/// adopted base snapshot is published, so there is no crash window in which
+/// the base is relied on but unprotected: a crash between the two leaves a
+/// floor no snapshot satisfies, and recovery fails closed instead of replaying
+/// a history that lacks the adopted state.
+pub fn write_rebase_floor(dir: &Path, partition: Option<u64>, covered: u64) -> io::Result<()> {
+    let path = rebase_floor_path(dir, partition);
+    let tmp = unique_tmp_path(&path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(covered.to_string().as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    fsync_dir(dir);
+    Ok(())
+}
+
+/// Reads the rebase floor, if any. An unreadable or malformed floor is an error
+/// (fail closed): it means a base was adopted and we cannot tell how far.
+fn read_rebase_floor(dir: &Path, partition: Option<u64>) -> io::Result<Option<u64>> {
+    match fs::read_to_string(rebase_floor_path(dir, partition)) {
+        Ok(s) => s.trim().parse::<u64>().map(Some).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed journal rebase floor: {e}"),
+            )
+        }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Enforces the rebase floor (#1405): when a Raft snapshot was adopted as the
+/// recovery base, the only valid recovery is from a READABLE snapshot covering
+/// at least the floor. A missing, unreadable/incompatible (which would route to
+/// replay-migration) or older snapshot cannot reconstruct the adopted state from
+/// the journal's own history — replaying it would silently rewind (the #1065
+/// class) — so recovery fails closed and the node must be re-seeded from its
+/// Raft peers / snapshot.
+fn enforce_rebase_floor(
+    dir: &Path,
+    partition: Option<u64>,
+    loaded_covered: Option<u64>,
+) -> io::Result<()> {
+    let Some(floor) = read_rebase_floor(dir, partition)? else {
+        return Ok(());
+    };
+    match loaded_covered {
+        Some(covered) if covered >= floor => Ok(()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "journal{} was rebased onto an adopted Raft snapshot at {floor} but no readable \
+                 journal snapshot covers that base (found {loaded_covered:?}); the journal's own \
+                 history lacks the adopted state, so refusing to recover (would rewind, \
+                 #1065/#1405). Re-seed this replica from its Raft peers.",
+                partition
+                    .map(|p| format!(" partition {p}"))
+                    .unwrap_or_default()
+            ),
+        )),
+    }
+}
+
 /// The always-parseable envelope header prefixed to every persisted snapshot.
 ///
 /// Its shape MUST never change — a reader of any future format version has to be
@@ -1021,7 +1182,7 @@ fn write_enveloped<T: serde::Serialize>(dir: &Path, path: &Path, payload: &T) ->
         incarnation: read_or_init_incarnation(dir)?,
         engine_fingerprint: engine_fingerprint(),
     };
-    let tmp = path.with_extension("bin.tmp");
+    let tmp = unique_tmp_path(path);
     {
         // Stream to the file (BufWriter) rather than building a full `Vec<u8>`
         // first; under a large backlog the intermediate buffer is multi-GB (all
@@ -1269,7 +1430,17 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     // surviving tail) and rewrite a fresh NEW-format snapshot. Fail-closed only
     // when the history cannot fully reconstruct the engine (a pruned gap, or an
     // unreadable event frame — both snapshot AND journal gone).
-    let (engine, fresh) = match load_latest_snapshot(dir) {
+    sweep_unique_tmp(dir);
+    let loaded = load_latest_snapshot(dir);
+    enforce_rebase_floor(
+        dir,
+        None,
+        loaded
+            .as_ref()
+            .ok()
+            .and_then(|o| o.as_ref().map(|(_, c)| *c)),
+    )?;
+    let (engine, fresh) = match loaded {
         // A readable snapshot whose `covered` is BELOW the compaction floor is
         // stale (e.g. the newest snapshot was lost/removed post-compaction and an
         // older one resurfaced). Trusting it would `saturating_sub`-clamp `skip`
@@ -1379,6 +1550,7 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
         per_partition_total: Vec::new(),
         per_partition_active_start: Vec::new(),
         compress: journal_compress_from_env(),
+        checkpoint_gate: Arc::default(),
     });
 
     Ok((
@@ -2105,7 +2277,20 @@ pub fn recover_multi(
     // The full tagged history for a migration replay (cold-archived prefix +
     // surviving tail), populated only when we fall into the migrator below.
     let mut cold_tagged: Vec<(u64, Event)> = Vec::new();
-    let migrate = match load_multi_snapshot(dir) {
+    sweep_unique_tmp(dir);
+    let loaded = load_multi_snapshot(dir);
+    for &p in owned {
+        enforce_rebase_floor(
+            dir,
+            Some(p),
+            loaded
+                .as_ref()
+                .ok()
+                .and_then(|m| m.as_ref())
+                .and_then(|m| m.get(&p).map(|(c, _)| *c)),
+        )?;
+    }
+    let migrate = match loaded {
         Ok(Some(c)) => {
             combined = Some(c);
             false
@@ -2376,6 +2561,7 @@ pub fn recover_multi(
             .map(AtomicU64::new)
             .collect(),
         compress: journal_compress_from_env(),
+        checkpoint_gate: Arc::default(),
     });
 
     Ok(MultiSegRecovery {
@@ -3799,6 +3985,7 @@ mod tests {
             per_partition_total: Vec::new(),
             per_partition_active_start: Vec::new(),
             compress: true,
+            checkpoint_gate: Arc::default(),
         });
         {
             let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
@@ -5802,6 +5989,7 @@ mod tests {
             per_partition_total: Vec::new(),
             per_partition_active_start: Vec::new(),
             compress: false,
+            checkpoint_gate: Arc::default(),
         });
         let entry = |i: u64| {
             let (ev, marker) = entry_lines(i);
@@ -5868,6 +6056,7 @@ mod tests {
             per_partition_total: Vec::new(),
             per_partition_active_start: Vec::new(),
             compress: true,
+            checkpoint_gate: Arc::default(),
         });
         {
             let mut seg = ActiveSegment::open(Arc::clone(&shared)).unwrap();
@@ -5924,5 +6113,228 @@ mod tests {
             result.is_err(),
             "a failing export must surface as a typed error, not a panic"
         );
+    }
+
+    /// A donor journal's engine snapshot: deploy + three instances, returning
+    /// the snapshot and the third instance's key (one the adopting journal never
+    /// creates itself), standing in for a newer Raft snapshot (#1405).
+    fn donor_snapshot(tag: &str) -> (nanobpmn_engine_core::EngineSnapshot, u64) {
+        let dir = temp_dir(tag);
+        let (mut donor, _) = crate::journal::Journal::open_segmented(&dir).expect("donor");
+        let _ = donor.apply_command(Command::DeployProcess(demo())).unwrap();
+        let mut last = 0;
+        for _ in 0..3 {
+            let (ev, _) = donor
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            last = ev.iter().find_map(|e| e.instance_key()).unwrap();
+        }
+        let snap = donor.engine_snapshot();
+        drop(donor);
+        let _ = fs::remove_dir_all(&dir);
+        (snap, last)
+    }
+
+    /// Adopts `donor` as `dir`'s journal base (as the Raft bootstrap does), then
+    /// journals one more instance on top. Returns the donor-only key.
+    fn adopt_base(dir: &Path, tag: &str) -> u64 {
+        let (snap, donor_key) = donor_snapshot(tag);
+        let (mut journal, _) = crate::journal::Journal::open_segmented(dir).expect("open");
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        journal.restore_engine_from_snapshot(snap);
+        // The permit is mandatory on a segmented journal.
+        assert!(journal.checkpoint_base(None).is_err());
+        let seg = journal.seg_shared().expect("segmented");
+        let permit = seg.try_checkpoint_permit().expect("gate free");
+        journal
+            .checkpoint_base(Some(&permit))
+            .expect("checkpoint base");
+        drop(permit);
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        donor_key
+    }
+
+    fn snap_files(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| is_snap_file(&e.file_name().to_string_lossy()).is_some())
+            .map(|e| e.path())
+            .collect()
+    }
+
+    /// #1405: an adopted Raft base lives ONLY in the journal snapshot. When that
+    /// snapshot is later missing, recovery must fail closed — never replay the
+    /// journal's own history (which lacks the adopted state) as if complete.
+    #[test]
+    fn adopted_base_fails_closed_when_its_snapshot_is_missing() {
+        let dir = temp_dir("rebase-missing");
+        let donor_key = adopt_base(&dir, "rebase-missing-donor");
+        let (reopened, _) = crate::journal::Journal::open_segmented(&dir).expect("reopen");
+        assert!(
+            reopened.instance(donor_key).is_some(),
+            "adopted state survives"
+        );
+        drop(reopened);
+
+        let snaps = snap_files(&dir);
+        assert!(!snaps.is_empty());
+        for p in snaps {
+            fs::remove_file(p).unwrap();
+        }
+        let err = crate::journal::Journal::open_segmented(&dir)
+            .err()
+            .expect("missing adopted base must fail closed");
+        assert!(
+            err.to_string()
+                .contains("rebased onto an adopted Raft snapshot"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: an unreadable adopted base must not route to replay-migration
+    /// (which would rebuild from a history lacking the adopted state).
+    #[test]
+    fn adopted_base_fails_closed_when_its_snapshot_is_corrupt() {
+        let dir = temp_dir("rebase-corrupt");
+        let _ = adopt_base(&dir, "rebase-corrupt-donor");
+        for p in snap_files(&dir) {
+            fs::write(p, b"{not a snapshot").unwrap();
+        }
+        let err = crate::journal::Journal::open_segmented(&dir)
+            .err()
+            .expect("corrupt adopted base must fail closed");
+        assert!(
+            err.to_string()
+                .contains("rebased onto an adopted Raft snapshot"),
+            "{err}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: same guard on the multi-partition layout — a combined snapshot
+    /// whose entry for the rebased partition is missing fails closed.
+    #[test]
+    fn multi_adopted_base_fails_closed_when_its_entry_is_missing() {
+        let dir = temp_dir("rebase-multi-missing");
+        let (snap, _) = donor_snapshot("rebase-multi-missing-donor");
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.restore_engine_from_snapshot(snap);
+            let permit = seg.try_checkpoint_permit().expect("gate free");
+            j0.checkpoint_base(Some(&permit)).expect("checkpoint base");
+        }
+        recover_multi(&dir, &[0, 1], 2, None).expect("intact base recovers");
+        fs::remove_file(dir.join(MULTI_SNAP_NAME)).unwrap();
+        let err = recover_multi(&dir, &[0, 1], 2, None)
+            .err()
+            .expect("missing adopted base must fail closed");
+        assert!(err.to_string().contains("partition 0 was rebased"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a periodic checkpoint that captured BEFORE a Raft snapshot was
+    /// adopted must never publish OVER the adopted base. Deterministic
+    /// interleaving (barriers, no sleeps): the periodic cycle captures under the
+    /// gate, the adoption runs while the capture is in flight and must find the
+    /// gate held, the stale publish lands, and only then does the adoption's
+    /// base checkpoint run — so recovery sees the adopted state.
+    #[test]
+    fn periodic_checkpoint_cannot_publish_over_an_adopted_base() {
+        use std::sync::Barrier;
+
+        let dir = temp_dir("rebase-interleave");
+        let (snap, donor_key) = donor_snapshot("rebase-interleave-donor");
+        // Keep the exporter receiver alive so shared writes have a wired cell.
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, None)
+                    .expect("open multi");
+            let seg = Arc::clone(&recovery.shared);
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx, Arc::new(AtomicU64::new(0)));
+            let _ = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            let _ = j0.apply_command(Command::create_instance("demo")).unwrap();
+            let j0 = Arc::new(Mutex::new(j0));
+            let captured = Arc::new(Barrier::new(2));
+            let adopted = Arc::new(Barrier::new(2));
+
+            let periodic = {
+                let (j0, seg, dir) = (Arc::clone(&j0), Arc::clone(&seg), dir.clone());
+                let (captured, adopted) = (Arc::clone(&captured), Arc::clone(&adopted));
+                std::thread::spawn(move || {
+                    let _permit = seg.try_checkpoint_permit().expect("gate free");
+                    // A capture-only stale read (no seal): the SharedWriter in
+                    // this test has no exporter, so a real `snapshot_and_rotate`
+                    // would block on the rotate reply — and the gate, not the
+                    // seal, is what this interleaving exercises.
+                    let stale = j0.lock().unwrap().try_engine_snapshot().unwrap();
+                    let covered = 0;
+                    captured.wait();
+                    adopted.wait();
+                    write_multi_snapshot(&dir, vec![(0, covered, stale)]).unwrap();
+                })
+            };
+
+            captured.wait();
+            j0.lock().unwrap().restore_engine_from_snapshot(snap);
+            assert!(
+                seg.try_checkpoint_permit().is_none(),
+                "the adoption must wait for the in-flight periodic cycle"
+            );
+            adopted.wait();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let permit = rt.block_on(seg.checkpoint_permit());
+            j0.lock()
+                .unwrap()
+                .checkpoint_base(Some(&permit))
+                .expect("checkpoint base");
+            drop(permit);
+            periodic.join().unwrap();
+        }
+        let recovery = recover_multi(&dir, &[0, 1], 2, None).expect("recover");
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        assert!(
+            engines[&0].instance(donor_key).is_some(),
+            "adopted base survives"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: concurrent publishers of the same file never share a temp path.
+    #[test]
+    fn unique_tmp_paths_never_collide() {
+        let p = Path::new("/x/msnapshot.bin");
+        let (a, b) = (unique_tmp_path(p), unique_tmp_path(p));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), p.parent());
+        assert!(a.to_string_lossy().contains(UNIQUE_TMP_INFIX));
     }
 }
