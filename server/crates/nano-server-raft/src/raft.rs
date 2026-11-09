@@ -1831,10 +1831,13 @@ fn is_creation_intake(command: &Command) -> bool {
 struct Batcher {
     hi_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
     lo_tx: tokio::sync::mpsc::UnboundedSender<Submission>,
+    /// The proposing node's engine: terminal job commands are stamped from it
+    /// before entering the log (see [`stamp_for_proposal`]).
+    engine: DeepthiHandle,
 }
 
 impl Batcher {
-    fn spawn(raft: openraft::Raft<RaftConfig>) -> Self {
+    fn spawn(raft: openraft::Raft<RaftConfig>, engine: DeepthiHandle) -> Self {
         let (hi_tx, mut hi_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let (lo_tx, mut lo_rx) = tokio::sync::mpsc::unbounded_channel::<Submission>();
         let max_bytes = max_entry_bytes();
@@ -1918,10 +1921,15 @@ impl Batcher {
                 }
             }
         });
-        Self { hi_tx, lo_tx }
+        Self {
+            hi_tx,
+            lo_tx,
+            engine,
+        }
     }
 
     async fn submit(&self, command: Command, now: u64) -> Result<ReplicatedItem, ProposeError> {
+        let command = stamp_for_proposal(&self.engine, command).await;
         let (resp, rx) = tokio::sync::oneshot::channel();
         // Route fresh creation intake to the low-priority lane; the drain path
         // (completes, fails, ticks, admin) takes the high lane so it
@@ -1940,6 +1948,31 @@ impl Batcher {
             ProposeError::Other("raft propose batcher dropped the response".to_string())
         })?
     }
+}
+
+/// Stamps a terminal job command with the authoritative attribution resolved
+/// from the PROPOSING node's engine, before it enters the Raft log (#963).
+///
+/// Leader-local activation keeps the activation lock (and its worker) only in
+/// the leader's RAM, so a follower re-running the replicated command cannot
+/// derive the attribution itself. Every command enters the log through the
+/// [`Batcher`] (the sole `client_write` caller), so stamping here covers every
+/// terminal-job write path by construction: replicas apply the identical
+/// stamped command and persist identical terminal events.
+async fn stamp_for_proposal(engine: &DeepthiHandle, command: Command) -> Command {
+    if !matches!(
+        command,
+        Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
+    ) {
+        return command;
+    }
+    engine
+        .with(move |journal| {
+            let mut command = command;
+            journal.engine().stamp_terminal_attribution(&mut command);
+            command
+        })
+        .await
 }
 
 /// A Raft-managed partition: the openraft instance plus handles to its stores.
@@ -1978,6 +2011,7 @@ impl RaftPartition {
         let config = Arc::new(raft_config(partition_id).validate()?);
 
         let log_store = MemLogStore::default();
+        let stamp_engine = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(
@@ -1991,7 +2025,7 @@ impl RaftPartition {
         members.insert(node_id, BasicNode::new(addr));
         raft.initialize(members).await?;
 
-        let batcher = Batcher::spawn(raft.clone());
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine);
         Ok(Self {
             raft,
             node_id,
@@ -2020,6 +2054,7 @@ impl RaftPartition {
         let log_dir = log_dir.as_ref().to_path_buf();
         let log_store = crate::raft_logstore::RaftLogStore::open(&log_dir)?;
         let log_bytes = log_store.bytes_handle();
+        let stamp_engine = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -2044,7 +2079,7 @@ impl RaftPartition {
             raft.initialize(members).await?;
         }
 
-        let batcher = Batcher::spawn(raft.clone());
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine);
         Ok(Self {
             raft,
             node_id,
@@ -2089,6 +2124,7 @@ impl RaftPartition {
         // reads. Only meaningful for an evict-eligible follower; kept fresh by a
         // metrics watcher spawned below once the Raft handle exists.
         let leader = Arc::new(AtomicU64::new(u64::MAX));
+        let stamp_engine = engine.clone();
         let state_machine = Arc::new(PartitionStateMachine::new(
             engine,
             partition_id,
@@ -2126,7 +2162,7 @@ impl RaftPartition {
                 (raft, Arc::new(AtomicI64::new(0)))
             }
         };
-        let batcher = Batcher::spawn(raft.clone());
+        let batcher = Batcher::spawn(raft.clone(), stamp_engine);
         // Keep the state machine's leader signal fresh so its terminal-eviction
         // gate flips off the instant this member wins leadership. Only needed for
         // an evict-eligible follower; an owned member never evicts in `apply`.

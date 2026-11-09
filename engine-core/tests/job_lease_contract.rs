@@ -62,8 +62,8 @@ fn soft_digest_excludes_durable_tokens_and_cannot_restore_them() {
     let durable_key = activated_key(&activate(&mut engine, true, 0));
     assert_eq!(engine.activated_leases(), vec![(soft_key, 1_000)]);
     engine.expire_jobs(1_000);
-    assert!(!engine.recover_lease(durable_key, 2_000, 1_000));
-    assert!(engine.recover_lease(soft_key, 2_000, 1_000));
+    assert!(!engine.recover_lease(durable_key, 2_000, None, 1_000));
+    assert!(engine.recover_lease(soft_key, 2_000, None, 1_000));
 }
 
 #[test]
@@ -138,9 +138,9 @@ fn authoritative_unleased_activations_never_enter_soft_recovery() {
         }
         for key in &keys {
             assert!(restored.job_requires_durable_activation(*key));
-            assert!(!restored.recover_lease(*key, 2_000, 1_000));
+            assert!(!restored.recover_lease(*key, 2_000, None, 1_000));
         }
-        assert!(restored.recover_lease(soft_key, 2_000, 1_000));
+        assert!(restored.recover_lease(soft_key, 2_000, None, 1_000));
     }
 }
 

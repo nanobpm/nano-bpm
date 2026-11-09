@@ -23,6 +23,23 @@ pub struct JobActivationOptions {
     pub with_lease: bool,
 }
 
+/// The authoritative terminal metadata of a job, resolved on the proposing
+/// leader and carried on the replicated terminal command (#963).
+///
+/// Under leader-local activation the activation lock lives only in the
+/// leader's RAM, so a replica re-running a replicated terminal command has no
+/// activating worker of its own. Reading attribution from replica-local state
+/// would make leader and follower persist different terminal events for the
+/// same log entry. Stamping it on the command makes the durable outcome a pure
+/// function of the replicated log. `worker: None` is an explicit "resolved
+/// absent" (the job had no attributable worker when the leader proposed).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct JobAttribution {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub worker: Option<String>,
+}
+
 /// Which deployed decision a [`Command::EvaluateDecision`] evaluates.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -152,6 +169,17 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         business_id: Option<String>,
+        /// Authoritative terminal attribution resolved by the PROPOSING leader
+        /// (#963). `None` = unstamped (a legacy/locally-applied command: the
+        /// engine falls back to the live job). `Some(..)` is authoritative on
+        /// every replica, including `Some(JobAttribution { worker: None })` —
+        /// "resolved absent", distinct from unstamped. Skipped when unstamped,
+        /// so unstamped commands stay byte-identical on the wire.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        attribution: Option<JobAttribution>,
     },
     /// Assign a user task to `assignee`. The task must be in the `Created` state.
     /// When `allow_override` is `false` and the task already has an assignee, the
@@ -241,6 +269,17 @@ pub enum Command {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
+        /// Authoritative terminal attribution resolved by the PROPOSING leader
+        /// (#963). `None` = unstamped (a legacy/locally-applied command: the
+        /// engine falls back to the live job). `Some(..)` is authoritative on
+        /// every replica, including `Some(JobAttribution { worker: None })` —
+        /// "resolved absent", distinct from unstamped. Skipped when unstamped,
+        /// so unstamped commands stay byte-identical on the wire.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        attribution: Option<JobAttribution>,
     },
     /// Throw a business error from a job. If the job's activity has a matching
     /// error boundary event it is interrupted and the error-handling path runs;
@@ -264,6 +303,17 @@ pub enum Command {
             serde(default, skip_serializing_if = "HashMap::is_empty")
         )]
         variables: HashMap<String, Value>,
+        /// Authoritative terminal attribution resolved by the PROPOSING leader
+        /// (#963). `None` = unstamped (a legacy/locally-applied command: the
+        /// engine falls back to the live job). `Some(..)` is authoritative on
+        /// every replica, including `Some(JobAttribution { worker: None })` —
+        /// "resolved absent", distinct from unstamped. Skipped when unstamped,
+        /// so unstamped commands stay byte-identical on the wire.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        attribution: Option<JobAttribution>,
     },
     /// Update a job's remaining retries. Used to recover a job parked on a
     /// no-retries incident before resolving that incident. Does not by itself
@@ -955,6 +1005,7 @@ impl Command {
     pub fn complete_job(job_key: Key) -> Self {
         Command::CompleteJob {
             job_key,
+            attribution: None,
             lease_token: None,
             variables: HashMap::new(),
             adhoc_result: None,
@@ -971,6 +1022,7 @@ impl Command {
     ) -> Self {
         Command::CompleteJob {
             job_key,
+            attribution: None,
             lease_token: None,
             variables: HashMap::new(),
             adhoc_result: None,
@@ -983,6 +1035,7 @@ impl Command {
     pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
         Command::CompleteJob {
             job_key,
+            attribution: None,
             lease_token: None,
             variables,
             adhoc_result: None,
@@ -1000,6 +1053,7 @@ impl Command {
     ) -> Self {
         Command::CompleteJob {
             job_key,
+            attribution: None,
             lease_token: None,
             variables,
             adhoc_result: Some(adhoc_result),
@@ -1050,6 +1104,7 @@ impl Command {
     pub fn fail_job(job_key: Key, retries: i32, error_message: impl Into<String>) -> Self {
         Command::FailJob {
             job_key,
+            attribution: None,
             lease_token: None,
             retries,
             error_message: error_message.into(),
@@ -1064,6 +1119,7 @@ impl Command {
     ) -> Self {
         Command::ThrowJobError {
             job_key,
+            attribution: None,
             lease_token: None,
             error_code: error_code.into(),
             error_message: error_message.into(),
@@ -1081,6 +1137,7 @@ impl Command {
     ) -> Self {
         Command::ThrowJobError {
             job_key,
+            attribution: None,
             lease_token: None,
             error_code: error_code.into(),
             error_message: error_message.into(),
@@ -1367,6 +1424,7 @@ mod kind_tests {
         assert_eq!(
             Command::CompleteJob {
                 job_key: 1,
+                attribution: None,
                 lease_token: None,
                 variables: HashMap::new(),
                 adhoc_result: None,

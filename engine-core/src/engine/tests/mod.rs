@@ -16,6 +16,7 @@ mod execution_order;
 mod expression_failures;
 mod feel_fallbacks;
 mod incidents;
+mod job_attribution;
 mod job_settlement;
 mod jobs;
 mod lifecycle;

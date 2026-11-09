@@ -240,6 +240,11 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                     // existed.
                     if worker.is_some() {
                         job.worker = worker.clone();
+                    } else {
+                        // Never retain the non-attributable digest sentinel
+                        // (#963): it is replica-local soft state, so keeping it
+                        // would diverge the leader's snapshot from followers'.
+                        job.worker = job.attribution_worker();
                     }
                     job.state = JobState::Failed;
                 }
@@ -276,6 +281,10 @@ pub(super) fn apply_job(state: &mut State, event: &Event) {
                 // restart replay; fall back to any live value for pre-field events.
                 if worker.is_some() {
                     job.worker = worker.clone();
+                } else {
+                    // Scrub the replica-local digest sentinel (#963), as for
+                    // `JobFailed` above.
+                    job.worker = job.attribution_worker();
                 }
             }
             resync_job_index(state, *job_key);

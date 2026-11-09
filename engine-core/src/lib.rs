@@ -107,6 +107,7 @@ pub use cluster_vars::{ClusterVariableSnapshot, ClusterVariables, DEFAULT_TENANT
 #[cfg(feature = "serde")]
 pub use command::form_id_of;
 pub use command::JobActivationOptions;
+pub use command::JobAttribution;
 pub use command::{
     ActivateElementInstruction, AncestorScopeInstruction, Command, DecisionReference, FormResource,
     GenericResource, MoveInstruction, MoveSource, UserTaskChangeset, VariableInstruction,

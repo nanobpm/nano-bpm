@@ -77,9 +77,70 @@ impl Engine {
             .collect()
     }
 
+    /// Stamps the authoritative terminal attribution (#963) onto a
+    /// `CompleteJob` / `FailJob` / `ThrowJobError` about to be **proposed** for
+    /// replication, resolved from THIS (proposing) engine's live state. Every
+    /// replica then applies the identical stamped command and persists the same
+    /// terminal event, whatever its own replica-local soft-activation state.
+    ///
+    /// Always overwrites any existing stamp: the proposer is the single
+    /// authority (a command forwarded from a non-leader must not keep that
+    /// node's view). A job not resident here (unknown, or cold-spilled and
+    /// rehydrated only later at apply time) is stamped as *resolved absent*
+    /// (`worker: None`), so every replica attributes it identically instead of
+    /// falling back to its own live state; an unknown job is still rejected by
+    /// the engine's own validation on every replica. Any other command is left
+    /// untouched.
+    pub fn stamp_terminal_attribution(&self, command: &mut Command) {
+        let (job_key, attribution) = match command {
+            Command::CompleteJob {
+                job_key,
+                attribution,
+                ..
+            }
+            | Command::FailJob {
+                job_key,
+                attribution,
+                ..
+            }
+            | Command::ThrowJobError {
+                job_key,
+                attribution,
+                ..
+            } => (*job_key, attribution),
+            _ => return,
+        };
+        *attribution = Some(JobAttribution {
+            worker: self
+                .state
+                .jobs
+                .get(&job_key)
+                .and_then(|job| job.attribution_worker()),
+        });
+    }
+
+    /// Soft activation leases this engine holds, with the activating worker
+    /// for each — broadcast in the lease digest so a promoted leader restores
+    /// the real attribution, not a sentinel (#963). Same set as
+    /// [`Self::activated_leases`]; jobs without an attributable worker are
+    /// omitted.
+    pub fn activated_lease_workers(&self) -> Vec<(Key, String)> {
+        self.activated_leases()
+            .into_iter()
+            .filter_map(|(key, _)| {
+                self.state
+                    .jobs
+                    .get(&key)
+                    .and_then(|j| j.attribution_worker())
+                    .map(|w| (key, w))
+            })
+            .collect()
+    }
+
     /// Recovers a soft activation lease from a digest: if `job_key` is currently
     /// [`state::JobState::Created`], requires no durable activation, and `deadline` is still in the future, marks
-    /// it [`state::JobState::Activated`] until `deadline` under a synthetic worker.
+    /// it [`state::JobState::Activated`] until `deadline` under the digest's
+    /// `worker` (or a non-attributable sentinel when the digest has none).
     /// Returns `true` if a lease was set.
     ///
     /// This is a pure leader-local soft-state mutation — it emits and journals
@@ -90,7 +151,13 @@ impl Engine {
     /// deadline (the normal leader-local `expire_jobs` tick then reclaims them)
     /// rather than redelivering the instant it takes over. Idempotent: a job that
     /// is already activated (e.g. re-leased by this leader) is left untouched.
-    pub fn recover_lease(&mut self, job_key: Key, deadline: u64, now: u64) -> bool {
+    pub fn recover_lease(
+        &mut self,
+        job_key: Key,
+        deadline: u64,
+        worker: Option<&str>,
+        now: u64,
+    ) -> bool {
         if self.job_requires_durable_activation(job_key) {
             return false;
         }
@@ -98,7 +165,15 @@ impl Engine {
             if job.state == state::JobState::Created && job.lease_token.is_none() && deadline > now
             {
                 job.state = state::JobState::Activated;
-                job.worker = Some(LEASE_DIGEST_WORKER.to_string());
+                // The digest's real worker when the previous leader sent one;
+                // otherwise the sentinel, which `attribution_worker()` never
+                // attributes (#963).
+                job.worker = Some(
+                    worker
+                        .filter(|w| !w.is_empty())
+                        .unwrap_or(LEASE_DIGEST_WORKER)
+                        .to_string(),
+                );
                 job.deadline = Some(deadline);
                 job.activated = true;
                 self.state.activated_jobs.insert(job_key);
