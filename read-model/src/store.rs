@@ -5653,21 +5653,18 @@ fn project_event(
             // (`?6`); only a pre-field record (`completed_at == 0`, `?5 == 0`)
             // falls back to keeping the row's value.
             //
-            // Mixed-version creation repair (#1440): a legacy `JobCreated`
-            // (`created_at == 0`) seeds `created_at_ms` from its batch
-            // observation time, which can be LATER than a modern completion's
-            // command instant (replay with export lag) — leaving
-            // `creationTime > endTime`. The terminal instant is the best
-            // available lower bound for an unknown creation (the job must have
-            // existed to complete), so on the first terminal transition clamp
-            // a fallback creation down to it. A genuine engine-carried
-            // creation is always `<=` the completion instant, so the clamp is
-            // a no-op for it; and the `end_ms IS NULL` guard keeps a
-            // re-delivery from touching the row at all.
+            // `created_at_ms` is NOT clamped here (#1440 review): the engine
+            // stamps `JobCreated.created_at` and `JobCompleted.completed_at`
+            // from the same wall clock without enforcing monotonicity, so a
+            // backward clock adjustment can leave a GENUINE creation after the
+            // completion instant. Clamping would rewrite that real creation
+            // timestamp and diverge from a snapshot reseed (which preserves
+            // `job.created_at`). The projection therefore keeps the recorded
+            // creation, matching the reseed; a single backward-clock policy for
+            // BOTH paths is part of the #963 follow-up.
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = COALESCE(?3, NULLIF(worker, '')), \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?5 THEN COALESCE(?6, deadline_ms) ELSE ?6 END ELSE deadline_ms END, \
-                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?4) ELSE created_at_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?4 ELSE end_ms END \
                  WHERE key = ?1",
@@ -5691,14 +5688,13 @@ fn project_event(
             // Camunda stamps `endTime` on CANCELED too (but keeps the deadline).
             // Instant and deadline come from the event exactly as for
             // `JobCompleted` (#1440) — including the modern-record deadline
-            // authority and the mixed-version creation clamp (see there).
-            // Guard on the first terminal transition so a re-delivery is a no-op;
-            // a job that was already FAILED/ERRORED (no `end_ms`) still gets its
-            // cancellation `endTime` here (#1344).
+            // authority — and `created_at_ms` is likewise NOT clamped (see
+            // there). Guard on the first terminal transition so a re-delivery
+            // is a no-op; a job that was already FAILED/ERRORED (no `end_ms`)
+            // still gets its cancellation `endTime` here (#1344).
             tx.cexecute(
                 "UPDATE jobs SET state = ?2, worker = NULL, \
                  deadline_ms = CASE WHEN end_ms IS NULL THEN CASE WHEN ?4 THEN COALESCE(?5, deadline_ms) ELSE ?5 END ELSE deadline_ms END, \
-                 created_at_ms = CASE WHEN end_ms IS NULL THEN MIN(created_at_ms, ?3) ELSE created_at_ms END, \
                  last_update_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE last_update_ms END, \
                  end_ms = CASE WHEN end_ms IS NULL THEN ?3 ELSE end_ms END \
                  WHERE key = ?1",
@@ -8581,16 +8577,6 @@ mod definition_xml_tests {
         .iter()
         .find_map(|e| e.instance_key())
         .unwrap();
-        run(
-            &mut engine,
-            Command::activate_jobs("ja", "w", 1, 60_000, 3_000),
-            3_000,
-        );
-        run(
-            &mut engine,
-            Command::activate_jobs("jb", "w", 1, 40_000, 3_500),
-            3_500,
-        );
         let key_of = |engine: &Engine, ty: &str| {
             engine
                 .state()
@@ -8601,7 +8587,32 @@ mod definition_xml_tests {
                 .key
         };
         let (ja, jb) = (key_of(&engine, "ja"), key_of(&engine, "jb"));
-        run(&mut engine, Command::complete_job(ja), 5_000);
+        // DURABLE (leased) activations (#1440): the lock is journaled, so the
+        // terminal deadline is replicated and identical on every replica — the
+        // only case this PR carries a terminal deadline for. A leader-local
+        // (soft) activation records NO terminal deadline (see
+        // `a_soft_terminal_job_recovers_no_deadline`).
+        let lease = |with_lease| nanobpmn_engine_core::JobActivationOptions {
+            fetch_variables: Vec::new(),
+            with_lease,
+        };
+        run(
+            &mut engine,
+            Command::activate_jobs_by_key(vec![ja], "w", 60_000, 3_000, lease(true)),
+            3_000,
+        );
+        run(
+            &mut engine,
+            Command::activate_jobs_by_key(vec![jb], "w", 40_000, 3_500, lease(true)),
+            3_500,
+        );
+        // A leased completion must echo the activation's lease token (#1181).
+        let ja_lease = engine.state().jobs.get(&ja).unwrap().lease_token.clone();
+        run(
+            &mut engine,
+            Command::complete_job(ja).with_lease_token(ja_lease),
+            5_000,
+        );
         let b_eik = engine.state().jobs.get(&jb).unwrap().element_instance_key;
         run(
             &mut engine,
@@ -8612,9 +8623,9 @@ mod definition_xml_tests {
         // (a) Event-driven projection, under every export shape: batches
         // observed at their command instant AND exported later than it (the
         // terminal projectors must use the event's instant, not the batch
-        // time), and with/without `JobActivated` exported (leader-local soft
-        // activation is never journaled, so the terminal deadline must reach
-        // the projection via the terminal event).
+        // time), and with/without `JobActivated` exported (a durable lease is
+        // journaled, but the terminal deadline must reach the projection via
+        // the terminal event regardless of export shape).
         let mut projections = Vec::new();
         for (lag, soft) in [(0, false), (4_000, false), (0, true), (4_000, true)] {
             let projected = ReadStore::open(None).unwrap();
@@ -8630,7 +8641,7 @@ mod definition_xml_tests {
         }
 
         // (b) Snapshot recovery, from the live engine and from a replayed one
-        // (including a follower whose journal omits the soft activations).
+        // (including a follower whose journal omits the activations).
         let journal: Vec<Event> = batches.iter().flat_map(|(e, _)| e.clone()).collect();
         let soft_journal: Vec<Event> = journal
             .iter()
@@ -8674,6 +8685,81 @@ mod definition_xml_tests {
                 );
             }
         }
+    }
+
+    /// DOCUMENTED behaviour (#1440, follow-up #963): a leader-local (soft)
+    /// activation is unreplicated by design (ADR 0002), so its deadline is
+    /// replica-local. The engine therefore records NO terminal deadline for a
+    /// soft job (`Job::terminal_end.deadline == None`), and a snapshot reseed
+    /// seeds `deadline_ms = NULL` — matching the event-driven projection of a
+    /// follower that never saw the soft activation. Making terminal metadata
+    /// authoritative for soft jobs is the architectural follow-up in #963; this
+    /// pins the documented absence so a regression re-introducing replica-local
+    /// stamping is caught.
+    #[test]
+    fn a_soft_terminal_job_recovers_no_deadline() {
+        use nanobpmn_engine_core::{Command, Engine, EngineSnapshot, ProcessBuilder};
+
+        let def = ProcessBuilder::new("soft-terminal-seed")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("c", "jc")
+            .parallel_gateway("join")
+            .end_event("done")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "c")
+            .connect("a", "join")
+            .connect("c", "join")
+            .connect("join", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.set_lenient_completion(true);
+        engine
+            .apply_command_at(Command::DeployProcess(def), 1_000)
+            .unwrap();
+        engine
+            .apply_command_at(Command::create_instance("soft-terminal-seed"), 2_000)
+            .unwrap();
+        // Soft activation (`with_lease: false`): leader-local, never journaled.
+        engine
+            .apply_command_at(Command::activate_jobs("ja", "w", 1, 60_000, 3_000), 3_000)
+            .unwrap();
+        let ja = engine
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.job_type == "ja")
+            .unwrap()
+            .key;
+        assert_eq!(
+            engine.job(ja).unwrap().lease_token,
+            None,
+            "soft = unleashed"
+        );
+        engine
+            .apply_command_at(Command::complete_job(ja), 5_000)
+            .unwrap();
+
+        // The engine retains the terminal instant but NO deadline.
+        let terminal_end = engine.job(ja).unwrap().terminal_end.unwrap();
+        assert_eq!(terminal_end.at, 5_000);
+        assert_eq!(terminal_end.deadline, None, "soft job records no deadline");
+
+        // A snapshot reseed recovers the instant and a NULL deadline.
+        let bytes = serde_json::to_vec(&engine.snapshot()).unwrap();
+        let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let recovered = Engine::from_snapshot(decoded);
+        let seeded = ReadStore::open(None).unwrap();
+        seeded.seed_from_engine_state(recovered.state()).unwrap();
+        let row = super::read_surface_tests::job_row(&seeded, ja);
+        assert_eq!(row.end_ms, Some(5_000));
+        assert_eq!(
+            row.deadline_ms, None,
+            "a soft terminal job reseeds with no deadline (#963)"
+        );
     }
 
     /// Defect-class guard (#1244 review): a parked join is registered in the
@@ -13276,12 +13362,15 @@ mod read_surface_tests {
     /// Defect-class guard (#1440 review): a MIXED-VERSION replay projects a
     /// legacy `JobCreated` (`created_at == 0`) at its batch observation time,
     /// then a MODERN terminal event whose command instant is EARLIER (export
-    /// lag) — leaving `creationTime > endTime` without repair. The first
-    /// terminal projection must clamp the unknown-creation fallback down to the
-    /// terminal instant (the best lower bound: the job must have existed to
-    /// terminate), matching the snapshot-reseed fallback, and a re-delivery of
-    /// the terminal event must stay a no-op. Both terminal projectors share
-    /// the class.
+    /// lag). The projection must NOT clamp the recorded creation down to the
+    /// terminal instant: the engine stamps both from the same wall clock without
+    /// enforcing monotonicity, so a backward clock adjustment can leave a
+    /// genuine creation after the terminal instant, and clamping would rewrite
+    /// it and diverge from a snapshot reseed (which preserves `job.created_at`).
+    /// The projection keeps the recorded creation, matching the reseed; a single
+    /// backward-clock policy for both paths is part of the #963 follow-up. A
+    /// re-delivery of the terminal event must stay a no-op. Both terminal
+    /// projectors share the class.
     #[test]
     fn mixed_version_replay_repairs_an_unknown_creation_at_the_terminal_transition() {
         for (terminal, want_state) in [
@@ -13330,17 +13419,26 @@ mod read_surface_tests {
             let row = job_row(&store, 8350);
             assert_eq!(row.state, want_state);
             assert_eq!(row.end_ms, Some(5_000));
+            // The projection does NOT clamp creation down to the terminal
+            // instant (#1440 review): the engine stamps `JobCreated.created_at`
+            // and the terminal instant from the same wall clock without
+            // enforcing monotonicity, so a backward clock adjustment can leave
+            // a genuine creation after the terminal instant. Clamping would
+            // rewrite that real timestamp and diverge from a snapshot reseed
+            // (which preserves `job.created_at`). The projection keeps the
+            // recorded creation, matching the reseed; a single backward-clock
+            // policy for both paths is part of the #963 follow-up.
             assert_eq!(
-                row.created_at_ms, 5_000,
-                "unknown creation is clamped to the terminal instant, not left after it"
+                row.created_at_ms, 9_000,
+                "creation is preserved (not clamped), matching the snapshot reseed"
             );
             assert_eq!(row.last_update_ms, Some(5_000));
 
-            // A re-delivery of the terminal event is a no-op (the clamp is
+            // A re-delivery of the terminal event is a no-op (the write is
             // guarded by `end_ms IS NULL`).
             apply_at(&store, &terminal, 9_900);
             let again = job_row(&store, 8350);
-            assert_eq!(again.created_at_ms, 5_000);
+            assert_eq!(again.created_at_ms, 9_000);
             assert_eq!(again.end_ms, Some(5_000));
             assert_eq!(again.last_update_ms, Some(5_000));
         }

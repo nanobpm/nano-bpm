@@ -1100,6 +1100,10 @@
         "priority": 50,
         "retries": 2,
         "state": "Completed",
+        "terminal_end": {
+          "at": 1700000000003,
+          "deadline": null
+        },
         "worker": null
       },
       "15": {

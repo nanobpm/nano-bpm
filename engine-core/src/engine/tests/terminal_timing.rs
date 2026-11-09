@@ -45,6 +45,12 @@ fn job_of(engine: &Engine, job_type: &str) -> Key {
 /// Drives a parallel instance to one COMPLETED and one CANCELED job while a
 /// third branch keeps the instance active, returning the engine, the full
 /// event journal, and the two terminal job keys.
+///
+/// The jobs are activated with a DURABLE lease (`with_lease: true`), so the
+/// terminal deadline is replicated (journaled) and identical on every replica —
+/// the only case this PR carries a terminal deadline for (#1440). A leader-local
+/// (soft) activation records NO terminal deadline (see
+/// `a_soft_activation_records_no_terminal_deadline`).
 fn leader_with_terminal_jobs() -> (Engine, Vec<Event>, Key, Key) {
     let mut leader = Engine::new();
     let mut journal = Vec::new();
@@ -58,21 +64,48 @@ fn leader_with_terminal_jobs() -> (Engine, Vec<Event>, Key, Key) {
         .unwrap();
     let inst = created.iter().find_map(|e| e.instance_key()).unwrap();
     journal.extend(created);
-    journal.extend(
-        leader
-            .apply_command_at(Command::activate_jobs("ja", "w", 1, 60_000, 3_000), 3_000)
-            .unwrap(),
-    );
-    journal.extend(
-        leader
-            .apply_command_at(Command::activate_jobs("jb", "w", 1, 40_000, 3_500), 3_500)
-            .unwrap(),
-    );
     let ja = job_of(&leader, "ja");
     let jb = job_of(&leader, "jb");
     journal.extend(
         leader
-            .apply_command_at(Command::complete_job(ja), 5_000)
+            .apply_command_at(
+                Command::activate_jobs_by_key(
+                    vec![ja],
+                    "w",
+                    60_000,
+                    3_000,
+                    crate::JobActivationOptions {
+                        fetch_variables: Vec::new(),
+                        with_lease: true,
+                    },
+                ),
+                3_000,
+            )
+            .unwrap(),
+    );
+    journal.extend(
+        leader
+            .apply_command_at(
+                Command::activate_jobs_by_key(
+                    vec![jb],
+                    "w",
+                    40_000,
+                    3_500,
+                    crate::JobActivationOptions {
+                        fetch_variables: Vec::new(),
+                        with_lease: true,
+                    },
+                ),
+                3_500,
+            )
+            .unwrap(),
+    );
+    // A leased completion must echo the activation's lease token (the
+    // settlement fence, #1181).
+    let ja_lease = leader.job(ja).unwrap().lease_token.clone();
+    journal.extend(
+        leader
+            .apply_command_at(Command::complete_job(ja).with_lease_token(ja_lease), 5_000)
             .unwrap(),
     );
     let b_eik = active_eik_of(&leader, inst, "b");
@@ -216,10 +249,10 @@ fn a_pre_field_journal_record_decodes_without_an_instant() {
 #[test]
 fn a_leader_local_activation_omitted_from_the_journal_still_replays_the_same_terminal_deadline() {
     // Leader-local (soft) activation is never journaled: a follower's journal
-    // omits every `JobActivated`, so the follower's live `job.deadline` is
-    // `None` at the terminal transition while the leader's is set. The terminal
-    // deadline must come from the replicated terminal EVENT, so every replica
-    // (and a snapshot reseed off any of them) agrees with the leader.
+    // omits every `JobActivated`. But the fixture's jobs are DURABLE (leased),
+    // so their deadline is replicated on the terminal EVENT itself — every
+    // replica (and a snapshot reseed off any of them) reconstructs the SAME
+    // retained terminal deadline even when the activation events are absent.
     let (leader, journal, ja, jb) = leader_with_terminal_jobs();
     let follower_journal: Vec<Event> = journal
         .into_iter()
@@ -237,55 +270,72 @@ fn a_leader_local_activation_omitted_from_the_journal_still_replays_the_same_ter
 }
 
 #[test]
-fn a_follower_applying_a_replicated_completion_stamps_the_leader_resolved_deadline() {
+fn a_durable_leased_activation_replicates_its_terminal_deadline_to_a_follower() {
     // The REAL Raft path: replicas do not replay the leader's events — each
     // re-runs the replicated COMMAND on its own engine and journals the events
-    // it produces. A follower's engine never saw the leader-local (soft)
-    // activation, so its job has no lock; without the command-carried
-    // `terminal_deadline` its terminal event (and snapshot) would lose the
-    // deadline the leader persisted. This drives both sides through
+    // it produces. A DURABLE (leased) activation IS journaled, so the follower's
+    // engine holds the same lock as the leader and stamps the SAME terminal
+    // deadline with no command-carried metadata. This drives both sides through
     // `apply_command_at` on the SAME replicated command and requires the two
     // journals — and the two retained terminal records — to be identical.
     let mut leader = Engine::new();
-    leader.set_lenient_completion(true);
     leader
         .apply_command_at(Command::DeployProcess(three_branches()), 1_000)
         .unwrap();
     leader
         .apply_command_at(Command::create_instance("three"), 2_000)
-        .unwrap();
-    // Soft activation on the leader ONLY: it sets the lock in the leader's
-    // state but (being leader-local) is never replicated.
-    leader
-        .apply_command_at(Command::activate_jobs("ja", "w", 1, 60_000, 3_000), 3_000)
         .unwrap();
     let ja = job_of(&leader, "ja");
-    let leader_deadline = leader.job(ja).unwrap().deadline;
-    assert_eq!(leader_deadline, Some(63_000));
+    // Durable (leased) activation: the lock is journaled, so a follower that
+    // replays the same activation holds the identical deadline.
+    leader
+        .apply_command_at(
+            Command::activate_jobs_by_key(
+                vec![ja],
+                "w",
+                60_000,
+                3_000,
+                crate::JobActivationOptions {
+                    fetch_variables: Vec::new(),
+                    with_lease: true,
+                },
+            ),
+            3_000,
+        )
+        .unwrap();
+    assert_eq!(leader.job(ja).unwrap().deadline, Some(63_000));
+    let lease = leader.job(ja).unwrap().lease_token.clone();
 
-    // The follower: same replicated prefix MINUS the soft activation.
+    // The follower: same replicated prefix INCLUDING the durable activation.
     let mut follower = Engine::new();
-    follower.set_lenient_completion(true);
     follower
         .apply_command_at(Command::DeployProcess(three_branches()), 1_000)
         .unwrap();
     follower
         .apply_command_at(Command::create_instance("three"), 2_000)
         .unwrap();
-    assert_eq!(follower.job(ja).unwrap().deadline, None);
+    follower
+        .apply_command_at(
+            Command::activate_jobs_by_key(
+                vec![ja],
+                "w",
+                60_000,
+                3_000,
+                crate::JobActivationOptions {
+                    fetch_variables: Vec::new(),
+                    with_lease: true,
+                },
+            ),
+            3_000,
+        )
+        .unwrap();
+    assert_eq!(follower.job(ja).unwrap().deadline, Some(63_000));
 
-    // The leader stamps its resolved deadline onto the command before
-    // proposing it (server/crates/nano-server-raft `propose_partition_command`).
-    let command =
-        Command::complete_job(ja).with_terminal_deadline(leader.job_terminal_deadline(ja));
+    let command = Command::complete_job(ja).with_lease_token(lease);
     let leader_events = leader.apply_command_at(command.clone(), 5_000).unwrap();
     let follower_events = follower.apply_command_at(command, 5_000).unwrap();
 
-    // The terminal event each replica journals carries the SAME
-    // leader-resolved deadline. (The events' `worker` attribution is a
-    // separate, pre-existing leader-local divergence class — a soft
-    // activation's worker is as unjournaled as its lock; only the deadline is
-    // terminal-retained state, so it is the field this fix replicates.)
+    // Both replicas journal a terminal event carrying the SAME durable deadline.
     let terminal = |events: &[Event]| {
         events
             .iter()
@@ -299,11 +349,7 @@ fn a_follower_applying_a_replicated_completion_stamps_the_leader_resolved_deadli
     assert_eq!(
         terminal(&follower_events),
         terminal(&leader_events),
-        "the follower's terminal event must carry the leader's deadline"
-    );
-    assert_eq!(
-        follower.job(ja).unwrap().terminal_end,
-        leader.job(ja).unwrap().terminal_end,
+        "the follower's terminal event must carry the same durable deadline"
     );
     assert_eq!(
         follower.job(ja).unwrap().terminal_end,
@@ -311,34 +357,52 @@ fn a_follower_applying_a_replicated_completion_stamps_the_leader_resolved_deadli
             at: 5_000,
             deadline: Some(63_000),
         }),
-        "the command-carried deadline reaches the follower's retained terminal record"
+        "the durable deadline reaches the follower's retained terminal record"
     );
 }
 
 #[test]
-fn a_replicated_completion_without_the_leader_stamp_falls_back_to_local_state() {
-    // The direct (single-node / test) path proposes no `terminal_deadline`:
-    // the engine reads its own lock — unchanged pre-#1440 behaviour.
+fn a_soft_activation_records_no_terminal_deadline() {
+    // DOCUMENTED behaviour (#1440, follow-up #963): a leader-local (soft)
+    // activation is unreplicated by design (ADR 0002), so its deadline is
+    // replica-local. A terminal event stamped from it would diverge across
+    // replicas (a follower never saw the lock), so a soft job records NO
+    // terminal deadline. Making terminal metadata authoritative for soft jobs
+    // is the architectural follow-up tracked in #963 — this test pins the
+    // documented absence so a regression that re-introduces replica-local
+    // stamping is caught.
     let mut engine = Engine::new();
+    engine.set_lenient_completion(true);
     engine
         .apply_command_at(Command::DeployProcess(three_branches()), 1_000)
         .unwrap();
     engine
         .apply_command_at(Command::create_instance("three"), 2_000)
         .unwrap();
+    // Soft activation (`with_lease: false`): the lock is leader-local, never
+    // journaled, so `lease_token` is `None`.
     engine
         .apply_command_at(Command::activate_jobs("ja", "w", 1, 60_000, 3_000), 3_000)
         .unwrap();
     let ja = job_of(&engine, "ja");
+    assert_eq!(engine.job(ja).unwrap().deadline, Some(63_000));
+    assert_eq!(
+        engine.job(ja).unwrap().lease_token,
+        None,
+        "soft = unleashed"
+    );
+
     engine
         .apply_command_at(Command::complete_job(ja), 5_000)
         .unwrap();
+
     assert_eq!(
         engine.job(ja).unwrap().terminal_end,
         Some(JobTerminalEnd {
             at: 5_000,
-            deadline: Some(63_000),
+            deadline: None,
         }),
+        "a soft (unreplicated) activation records NO terminal deadline (#963)"
     );
 }
 

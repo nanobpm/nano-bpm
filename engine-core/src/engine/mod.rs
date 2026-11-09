@@ -2173,38 +2173,7 @@ impl Engine {
                 adhoc_result,
                 task_listener_result,
                 business_id,
-                terminal_deadline,
             } => {
-                // Leader-resolved terminal deadline (#1440): under Raft the
-                // proposing leader stamps the job's lock deadline onto the
-                // command so EVERY replica stamps the same value onto the
-                // terminal event — a leader-local (soft) activation is never
-                // journaled, so a follower's own state has no lock to read.
-                // Fold it into the job's live lock BEFORE anything reads it
-                // (the deadline is stamped centrally in `emit`); soft state
-                // only, never journaled, so replay is unaffected. A genuine
-                // replicated lock (durable activation) is never overwritten.
-                if let Some(deadline) = terminal_deadline {
-                    if let Some(job) = self.state.jobs.get_mut(&job_key) {
-                        // Fold the leader-observed lock in wherever this replica
-                        // has none of its own: a follower that never saw the
-                        // soft activation holds the job `Created` with no
-                        // deadline, a soft-locked replica holds it `Activated` —
-                        // both take the stamp. A genuine LEASED lock
-                        // (`lease_token.is_some()`, always journaled) is never
-                        // overwritten, and a job already holding a deadline
-                        // keeps it (first observation wins, identical on every
-                        // replica). A bare deadline on a `Created` job does not
-                        // gate activation (`job_activatable` admits `Created`
-                        // unconditionally) and no reducer reads it, so the fold
-                        // cannot wedge the job; a REJECTED completion leaves it
-                        // held until the expiry tick — the same lifecycle as a
-                        // digest-recovered lease (`recover_lease`).
-                        if job.deadline.is_none() && job.lease_token.is_none() {
-                            job.deadline = Some(deadline);
-                        }
-                    }
-                }
                 // Idempotent replay (#1181): the same fence re-asserting the
                 // outcome it already recorded is a no-op success on any replica.
                 if self.is_settlement_replay(
@@ -15175,15 +15144,18 @@ impl Engine {
     fn emit(&mut self, log: &mut Vec<Event>, event: Event) {
         // Terminal-deadline stamping (#1440) is centralized HERE — the engine's
         // single event choke point — so every emission site (completion, scope
-        // teardown, instance discard, boundary cascade, …) carries the job's
+        // teardown, instance discard, boundary cascade, …) stamps the job's
         // last lock deadline identically, and no site can drift to reading
-        // replica-local state directly. Raft re-runs each command on every
-        // replica, so the value must come from REPLICATED state: the live lock
-        // (journaled for durable activations), the retained `terminal_end`
-        // (first-terminal-wins), or — for a leader-local soft activation a
-        // follower never saw — the `CompleteJob` command's leader-stamped
-        // `terminal_deadline` (folded into the job's live lock at the top of
-        // the command's apply, so this read is identical on every replica).
+        // replica-local state directly.
+        //
+        // A terminal event carries a deadline ONLY for a DURABLE (leased)
+        // activation — one whose lock is journaled and therefore identical on
+        // every replica. A leader-local (soft) activation is unreplicated by
+        // design (ADR 0002): a follower never sees it, so a soft job's deadline
+        // is replica-local and a terminal event stamped from it would diverge
+        // across replicas. Soft jobs therefore record NO deadline. Making
+        // terminal metadata authoritative for soft jobs is the architectural
+        // follow-up tracked in #963 — do NOT stamp a soft deadline here.
         let event = match event {
             Event::JobCompleted {
                 job_key,

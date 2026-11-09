@@ -582,23 +582,29 @@ impl Engine {
 }
 
 impl Engine {
-    /// The activation-lock deadline a job holds right now, stamped onto its
-    /// terminal `JobCompleted`/`JobCanceled` event (#1440) so every replica,
-    /// the event-driven read model and a snapshot reseed agree on it even when
-    /// the activation itself was leader-local (never journaled).
+    /// The deadline stamped onto a job's terminal `JobCompleted`/`JobCanceled`
+    /// event (#1440) — `Some` ONLY for a DURABLE (leased) activation, one whose
+    /// lock is journaled and therefore identical on every replica. A
+    /// leader-local (soft) activation is unreplicated by design (ADR 0002): its
+    /// deadline is replica-local, so a soft job records NO terminal deadline
+    /// (`None`). Making terminal metadata authoritative for soft jobs is the
+    /// architectural follow-up tracked in #963.
     ///
     /// Falls back to the job's already-retained terminal deadline
     /// (`Job::terminal_end`): a cascade re-cancel of an ALREADY-terminal job
     /// must restate the deadline its first terminal transition recorded, not
     /// `None` (the live lock is cleared by that transition) — first-terminal-
     /// wins on every replica.
-    ///
-    /// `pub` for the Raft host: the proposing leader reads this to stamp the
-    /// replicated `CompleteJob` command's `terminal_deadline` (#1440).
     pub fn job_terminal_deadline(&self, job_key: Key) -> Option<u64> {
-        self.state
-            .jobs
-            .get(&job_key)
-            .and_then(|j| j.deadline.or(j.terminal_end.and_then(|t| t.deadline)))
+        let job = self.state.jobs.get(&job_key)?;
+        if job.lease_token.is_some() {
+            // A durable (journaled) lease: the lock is replicated, so its
+            // deadline is identical on every replica.
+            job.deadline
+        } else {
+            // A soft (leader-local) or already-terminal job: only the retained
+            // first-terminal record (itself replicated) is authoritative.
+            job.terminal_end.and_then(|t| t.deadline)
+        }
     }
 }
