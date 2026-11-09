@@ -2015,16 +2015,15 @@ fn load_multi_snapshot(
     dir: &Path,
 ) -> io::Result<Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>>> {
     let path = dir.join(MULTI_SNAP_NAME);
-    if !path.exists() {
-        return Ok(None);
-    }
     // Version dispatch (#1463), mirroring `load_latest_snapshot`: v3 is the
     // chunked per-partition stream; v0/v1/v2 are the monolithic
     // `MultiPersistedSnapshot` JSON (payload shape unchanged, still loads).
-    let version =
-        peek_snapshot_format_version(&path)?.ok_or_else(|| SnapshotLoadError::Corrupt {
-            reason: "multi snapshot file vanished between stat and read".to_string(),
-        })?;
+    // Only an explicit NotFound is "no snapshot"; any other metadata/open error
+    // (EACCES, ELOOP, ...) propagates — never `Path::exists`, which would mask
+    // it as absence and route recovery down the no-snapshot replay path.
+    let Some(version) = peek_snapshot_format_version(&path)? else {
+        return Ok(None);
+    };
     if version > SNAPSHOT_FORMAT_VERSION {
         return Err(SnapshotLoadError::FormatMismatch {
             found: version,
@@ -2986,9 +2985,13 @@ mod tests {
         let (mut journal, recovery) =
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
         let shared = Arc::clone(&recovery.shared);
-        let _ = journal
+        // Await durability: the group-commit writer thread appends
+        // asynchronously, so sampling the active file before the commit lands
+        // races it (an empty active segment under parallel-test load).
+        let (_, commit) = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
+        commit.blocking_wait();
         let expected = shared.uncompacted_usage();
         assert!(expected.1 > 0);
         // Interleaving: read active metadata, THEN the writer seals (rename).
@@ -4734,6 +4737,20 @@ mod tests {
             "round-tripped snapshot carries the deployed process"
         );
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1476: an inaccessible multi snapshot (a symlink loop -> ELOOP) is an
+    /// error, never masked as "no snapshot" (which would send recovery down the
+    /// no-snapshot replay path instead of failing closed).
+    #[cfg(unix)]
+    #[test]
+    fn inaccessible_multi_snapshot_is_an_error_not_absent() {
+        let dir = temp_dir("multi-snap-eloop");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(MULTI_SNAP_NAME);
+        std::os::unix::fs::symlink(&path, &path).unwrap();
+        assert!(load_multi_snapshot(&dir).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

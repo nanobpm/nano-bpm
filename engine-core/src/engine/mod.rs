@@ -15627,6 +15627,29 @@ fn drain_owned<V: OwnedByInstance>(map: &mut HashMap<Key, V>, instance_key: Key)
     owned.into_iter().filter_map(|k| map.remove(&k)).collect()
 }
 
+/// Removes from `map` every entity owned by an instance in `owners`, grouped by
+/// owning instance, in a single pass over `map`. Entities whose owner is not in
+/// `owners` stay in `map`. The linear-time counterpart of calling
+/// [`drain_owned`] once per instance (which is quadratic over a backlog).
+#[cfg(feature = "serde")]
+fn group_owned<V: OwnedByInstance>(
+    map: &mut HashMap<Key, V>,
+    owners: &HashSet<Key>,
+) -> HashMap<Key, Vec<V>> {
+    let mut grouped: HashMap<Key, Vec<V>> = HashMap::new();
+    let owned: Vec<Key> = map
+        .iter()
+        .filter(|(_, v)| owners.contains(&v.instance_key()))
+        .map(|(k, _)| *k)
+        .collect();
+    for k in owned {
+        if let Some(v) = map.remove(&k) {
+            grouped.entry(v.instance_key()).or_default().push(v);
+        }
+    }
+    grouped
+}
+
 /// A process start event's deploy-time-resolved trigger.
 enum ResolvedStart {
     Message(String),
