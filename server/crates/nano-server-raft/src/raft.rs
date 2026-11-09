@@ -1003,7 +1003,7 @@ impl PartitionStateMachine {
     /// and runtime `install_snapshot`: rebuilds the engine from `captured` IN
     /// PLACE (keeping the journal's exporter / partition / var-store / spill
     /// wiring) and then makes that state the journal's durable recovery base
-    /// ([`checkpoint_adopted_snapshot`](Self::checkpoint_adopted_snapshot)).
+    /// (see below).
     /// Adopting without checkpointing would leave a journal that lacks the
     /// snapshot's state; once a later entry is journaled, a restart prefers that
     /// journal and silently loses every snapshot-only instance.
@@ -1026,12 +1026,20 @@ impl PartitionStateMachine {
             )),
             None => None,
         };
+        // The checkpoint permit is acquired BEFORE the engine is restored and
+        // held through the base publication, and restore + checkpoint run in
+        // ONE actor turn: a periodic checkpoint can therefore never capture the
+        // adopted state (and overwrite its variables) between the restore and
+        // the base publication, which a crash would leave as an old snapshot
+        // paired with adopted variables.
+        let permit = self.adoption_checkpoint_permit().await;
         self.engine
             .with(move |journal| {
                 journal.restore_engine_from_snapshot(captured);
+                journal.checkpoint_base(permit.as_ref())
             })
-            .await;
-        self.checkpoint_adopted_snapshot().await
+            .await
+            .map_err(|e| anyhow::anyhow!("checkpointing the adopted Raft snapshot failed: {e}"))
     }
 
     /// Selects the NEWEST consistent boot state for a durable member (#1405):
@@ -1065,29 +1073,18 @@ impl PartitionStateMachine {
         }
     }
 
-    /// Makes an adopted Raft snapshot the journal's durable recovery base
-    /// (#1405). The journal predates the snapshot, so it does not hold the
-    /// snapshot's state; once later entries were journaled (each with a newer
-    /// `RaftEntryApplied` record) a restart would prefer the journal and lose
-    /// everything only the snapshot carried. Checkpointing right after the
-    /// adoption seals the journal at a snapshot of exactly the adopted state, so
-    /// any later restart rebuilds snapshot + suffix. A failed checkpoint fails
-    /// the bootstrap closed rather than run on a journal that would rewind.
-    ///
-    /// The journal's checkpoint permit is taken HERE, off the engine actor and
-    /// before entering it (the periodic checkpoint takes it the same way), so
-    /// the adoption checkpoint is serialized with any in-flight periodic
+    /// Acquires the journal's checkpoint permit for an adoption (#1405), off
+    /// the engine actor and before entering it (the periodic checkpoint takes
+    /// it the same way), so adoption is serialized with any in-flight periodic
     /// capture -> publish cycle without the two deadlocking on the actor.
-    async fn checkpoint_adopted_snapshot(&self) -> anyhow::Result<()> {
+    async fn adoption_checkpoint_permit(
+        &self,
+    ) -> Option<nano_server_storage::seglog::CheckpointPermit> {
         let seg = self.engine.with(|journal| journal.seg_shared()).await;
-        let permit = match seg {
+        match seg {
             Some(seg) => Some(seg.checkpoint_permit().await),
             None => None,
-        };
-        self.engine
-            .with(move |journal| journal.checkpoint_base(permit.as_ref()))
-            .await
-            .map_err(|e| anyhow::anyhow!("checkpointing the adopted Raft snapshot failed: {e}"))
+        }
     }
 
     /// Decodes the journal's last [`Event::RaftEntryApplied`] record, if any.
@@ -4828,6 +4825,88 @@ mod tests {
         );
         let after = engine.with(|j| j.engine().snapshot().state).await;
         assert_eq!(after, expected, "adopted state survives the crash");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: snapshot adoption must hold the journal checkpoint permit from
+    /// BEFORE the engine restore through the base publication. Otherwise a
+    /// periodic checkpoint could capture the adopted state (overwriting its
+    /// variables) before adoption publishes the rebase floor. Barrier: the test
+    /// holds the permit; adoption must not touch the engine until it is freed.
+    #[tokio::test]
+    async fn adoption_holds_checkpoint_permit_across_restore_and_publication() {
+        let dir = unique_log_dir("1405-adopt-permit");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let peer = durable_engine(&dir.join("peer"));
+        let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
+        apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        for i in 2..=3 {
+            apply_entry(&peer_sm, i, one(Command::create_instance("w"), i))
+                .await
+                .expect("create");
+        }
+        let mut builder = peer_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("snapshot at 3");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        let expected = peer.with(|j| j.engine().snapshot().state).await;
+        drop(peer_sm);
+        shutdown_engine(peer).await;
+        let captured =
+            nano_server_storage::snapstream::read_streaming_engine_snapshot_from(&bytes[..])
+                .expect("decode body");
+
+        let engine = durable_engine(&dir.join("replica"));
+        let sm = new_sm(&engine, &dir.join("replica-snapshots"));
+        apply_entry(&sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        let before = engine.with(|j| j.engine().snapshot().state).await;
+        let seg = engine
+            .with(|j| j.seg_shared())
+            .await
+            .expect("segmented journal");
+        let held = seg.try_checkpoint_permit().expect("gate free");
+        let meta = snap.meta.clone();
+        let adopting = tokio::spawn({
+            let sm = Arc::clone(&sm);
+            async move { sm.adopt_engine_snapshot(captured, &meta).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!adopting.is_finished(), "adoption waits for the permit");
+        assert_eq!(
+            engine.with(|j| j.engine().snapshot().state).await,
+            before,
+            "the engine is not restored while another checkpoint holds the permit"
+        );
+        drop(held);
+        adopting.await.expect("join").expect("adopt");
+        assert_eq!(engine.with(|j| j.engine().snapshot().state).await, expected);
+        assert!(
+            seg.try_checkpoint_permit().is_some(),
+            "the permit is released after publication"
+        );
         drop(sm);
         shutdown_engine(engine).await;
         let _ = std::fs::remove_dir_all(&dir);

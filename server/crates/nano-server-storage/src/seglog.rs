@@ -235,12 +235,20 @@ struct SegRecord {
 /// trailing line (a crash mid-append that was never fsynced, hence never acked)
 /// ends the walk, matching the writer's ack-after-write-before-fsync durability
 /// contract.
-fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
+///
+/// The returned flag is `true` when the walk stopped at such an INCOMPLETE
+/// physical record (torn header/checksum/body or unterminated line). Callers
+/// reading a SEALED segment ([`TailPolicy::Strict`]) must reject it: a sealed
+/// segment was fsynced whole, so a truncated record there is lost durable
+/// history, never a crash mid-append (#1405).
+fn decode_segment_records(raw: &[u8]) -> io::Result<(Vec<SegRecord>, bool)> {
     let mut out = Vec::new();
+    let mut incomplete = false;
     let mut i = 0;
     while i < raw.len() {
         if raw[i] == FRAME_MAGIC {
             if i + FRAME_HEADER_LEN > raw.len() {
+                incomplete = true;
                 break; // torn header tail — nothing durable past here
             }
             let codec = raw[i + 1];
@@ -253,6 +261,7 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
             let mut start = i + FRAME_HEADER_LEN;
             let crc = if codec_has_crc(codec) {
                 if start + FRAME_CRC_LEN > raw.len() {
+                    incomplete = true;
                     break; // torn checksum tail
                 }
                 let c = u32::from_le_bytes([
@@ -267,6 +276,7 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
                 None
             };
             let Some(end) = start.checked_add(comp_len).filter(|e| *e <= raw.len()) else {
+                incomplete = true;
                 break; // torn frame body
             };
             let payload = &raw[start..end];
@@ -333,21 +343,29 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
                     });
                     i += nl + 1;
                 }
-                None => break,
+                None => {
+                    incomplete = true;
+                    break;
+                }
             }
         }
     }
-    Ok(out)
+    Ok((out, incomplete))
 }
 
 /// Decodes a segment file into its logical plaintext bytes — the concatenated
 /// newline-terminated records the writer appended — transparently inflating any
 /// compressed frames (see [`decode_segment_records`]).
 ///
-/// Only ever called on SEALED segments (fsynced before rename, never torn), so
-/// a checksum-failing frame is corruption: fatal, never silently flattened.
-fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    let records = decode_segment_records(&fs::read(path)?)?;
+/// A checksum-failing frame is corruption: fatal, never silently flattened.
+/// Under [`TailPolicy::Strict`] (sealed segments — the archive path) an
+/// incomplete trailing physical record is fatal too; [`TailPolicy::DropTorn`]
+/// drops it as a crash mid-append (#1405).
+fn decode_segment_bytes(path: &Path, tail: TailPolicy) -> io::Result<Vec<u8>> {
+    let (records, incomplete) = decode_segment_records(&fs::read(path)?)?;
+    if incomplete && tail == TailPolicy::Strict {
+        return Err(incomplete_sealed_record(path));
+    }
     if records.iter().any(|r| !r.intact) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -355,6 +373,18 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(records.into_iter().flat_map(|r| r.bytes).collect())
+}
+
+/// The fail-closed error for an incomplete physical record in a SEALED
+/// segment (#1405).
+fn incomplete_sealed_record(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "incomplete journal record in sealed segment {}",
+            path.display()
+        ),
+    )
 }
 
 /// Whether `bytes` carries any content (a non-whitespace, non-NUL byte).
@@ -385,7 +415,10 @@ fn read_segment_with<T>(
     if !path.exists() {
         return Ok((out, valid_end));
     }
-    let records = decode_segment_records(&fs::read(path)?)?;
+    let (records, incomplete) = decode_segment_records(&fs::read(path)?)?;
+    if incomplete && tail == TailPolicy::Strict {
+        return Err(incomplete_sealed_record(path));
+    }
     // A damaged (non-intact) frame is content even when its bytes are blank:
     // it must be classified, never skipped past as padding.
     let carries = |r: &SegRecord| !r.intact || has_content(&r.bytes);
@@ -1888,7 +1921,7 @@ fn archive_cold_segment(dir: &Path, seg_path: &Path, start: u64, end: u64) -> io
     if final_path.exists() {
         return Ok(());
     }
-    let plaintext = decode_segment_bytes(seg_path)?;
+    let plaintext = decode_segment_bytes(seg_path, TailPolicy::Strict)?;
     let compressed = deflate_all(&plaintext)?;
     let tmp = final_path.with_extension("z.tmp");
     {
@@ -4073,7 +4106,7 @@ mod tests {
         let path = dir.join("frame.bin");
         fs::write(&path, &frame).unwrap();
         assert_eq!(
-            decode_segment_bytes(&path).unwrap(),
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
             buf,
             "exact round-trip"
         );
@@ -4130,7 +4163,10 @@ mod tests {
         let mut expected = head.clone();
         expected.extend_from_slice(&mid);
         expected.extend_from_slice(&tail);
-        assert_eq!(decode_segment_bytes(&path).unwrap(), expected);
+        assert_eq!(
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+            expected
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -4159,7 +4195,7 @@ mod tests {
         let path = dir.join("torn.jsonl");
         fs::write(&path, &file).unwrap();
         assert_eq!(
-            decode_segment_bytes(&path).unwrap(),
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
             durable,
             "durable prefix survives, torn frame dropped"
         );
@@ -4242,7 +4278,7 @@ mod tests {
         // events would be flaky — the process definition's element map has
         // nondeterministic iteration order).
         assert_eq!(
-            decode_segment_bytes(&active_path).unwrap(),
+            decode_segment_bytes(&active_path, TailPolicy::DropTorn).unwrap(),
             lines,
             "compressed active segment decodes byte-for-byte to the plaintext batch"
         );
@@ -4266,7 +4302,7 @@ mod tests {
         let path = dir.join("torn-plain.jsonl");
         fs::write(&path, &file).unwrap();
         assert_eq!(
-            decode_segment_bytes(&path).unwrap(),
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
             durable,
             "durable prefix survives, torn unterminated line dropped"
         );
@@ -6096,6 +6132,58 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1405: an INCOMPLETE physical record (torn frame header, checksum,
+    /// body, or an unterminated plaintext line) at the end of a SEALED segment
+    /// is lost fsynced history. Every strict reader — single-partition
+    /// recovery, the tagged multi-partition layout, and cold-archive decoding
+    /// — must reject it, while the ACTIVE-segment readers keep dropping it as
+    /// a crash mid-append.
+    #[test]
+    fn sealed_segment_readers_reject_every_incomplete_record_shape() {
+        let dir = temp_dir("sealed-incomplete");
+        fs::create_dir_all(&dir).unwrap();
+        let durable = b"0\t{}\n".to_vec();
+        let frame = frame_atomic(b"0\t{}\n", 1, false).unwrap();
+        let header_len = FRAME_HEADER_LEN;
+        let shapes: Vec<(&str, Vec<u8>)> = vec![
+            ("torn frame header", frame[..header_len - 1].to_vec()),
+            ("torn frame checksum", frame[..header_len + 2].to_vec()),
+            ("torn frame body", frame[..frame.len() - 1].to_vec()),
+            ("unterminated line", b"0\t{\"x\"".to_vec()),
+        ];
+        for (name, tail) in shapes {
+            let mut file = durable.clone();
+            file.extend_from_slice(&tail);
+            let path = dir.join("seg.jsonl");
+            fs::write(&path, &file).unwrap();
+            assert!(
+                decode_segment_bytes(&path, TailPolicy::Strict).is_err(),
+                "archive decode must reject a sealed {name}"
+            );
+            assert_eq!(
+                decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+                durable,
+                "active decode drops a torn {name}"
+            );
+            let strict = read_segment_with(&path, TailPolicy::Strict, |_| Ok(()));
+            assert!(
+                strict.is_err(),
+                "strict recovery must reject a sealed {name}"
+            );
+            assert!(
+                read_segment_events_tagged_with(&path, 1, TailPolicy::Strict).is_err(),
+                "tagged strict recovery must reject a sealed {name}"
+            );
+            let (_, end) = read_segment_with(&path, TailPolicy::DropTorn, |_| Ok(())).unwrap();
+            assert_eq!(
+                end,
+                durable.len() as u64,
+                "active recovery keeps the prefix ({name})"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// #1405: an atomic Raft-entry frame round-trips, is dropped WHOLE when
     /// torn at any byte, and an oversized entry is refused (never split).
     #[test]
@@ -6113,11 +6201,14 @@ mod tests {
         fs::write(&path, &file).unwrap();
         let mut whole = durable.clone();
         whole.extend_from_slice(&entry);
-        assert_eq!(decode_segment_bytes(&path).unwrap(), whole);
+        assert_eq!(
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+            whole
+        );
         for cut in 1..frame.len() {
             fs::write(&path, &file[..file.len() - cut]).unwrap();
             assert_eq!(
-                decode_segment_bytes(&path).unwrap(),
+                decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
                 durable,
                 "a frame torn {cut} byte(s) short is dropped whole"
             );
@@ -6246,7 +6337,7 @@ mod tests {
         fs::write(&path, &mid).unwrap();
         assert!(read_segment_events(&path).is_err());
         assert!(read_segment_events_tagged(&path, 1).is_err());
-        assert!(decode_segment_bytes(&path).is_err());
+        assert!(decode_segment_bytes(&path, TailPolicy::DropTorn).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6359,7 +6450,10 @@ mod tests {
         fs::write(&path, &file).unwrap();
         let mut both = payload.clone();
         both.extend_from_slice(&payload);
-        assert_eq!(decode_segment_bytes(&path).unwrap(), both);
+        assert_eq!(
+            decode_segment_bytes(&path, TailPolicy::DropTorn).unwrap(),
+            both
+        );
         assert_eq!(read_segment_events(&path).unwrap().len(), 4);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6478,7 +6572,10 @@ mod tests {
         }
         let mut expected = entry.clone();
         expected.extend_from_slice(&entry);
-        assert_eq!(decode_segment_bytes(&active_path).unwrap(), expected);
+        assert_eq!(
+            decode_segment_bytes(&active_path, TailPolicy::DropTorn).unwrap(),
+            expected
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
