@@ -35986,27 +35986,16 @@ mod clustered_startup_tests {
                 .await
                 .expect("propose");
         }
-        // Let the follower apply them so its log genuinely advances.
-        let leader_idx = part0
+        // The follower must genuinely hold these entries (the leader's progress
+        // records a non-zero `matching` for it), or the rebuild below is no
+        // reversion at all. A bounded metrics-watch barrier, not a sleep loop.
+        let leader_idx = part0.raft.metrics().borrow().last_applied.map(|l| l.index);
+        part1
             .raft
-            .metrics()
-            .borrow()
-            .last_applied
-            .map(|l| l.index)
-            .unwrap_or(0);
-        for _ in 0..300 {
-            let idx = part1
-                .raft
-                .metrics()
-                .borrow()
-                .last_applied
-                .map(|l| l.index)
-                .unwrap_or(0);
-            if idx >= leader_idx {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+            .wait(Some(std::time::Duration::from_secs(10)))
+            .applied_index_at_least(leader_idx, "follower catches up before the rebuild")
+            .await
+            .expect("the follower applies the leader's entries before it is rebuilt");
 
         // Rebuild the follower as a fresh receiver (empty log) — the reversion.
         node1.recover_shutdown_partitions_once().await; // no-op: not shutdown
@@ -36029,6 +36018,21 @@ mod clustered_startup_tests {
             .propose(Command::DeployProcess(proc), 9_000)
             .await
             .expect("the leader survives the follower's log reversion and keeps serving");
+        // In leader-durable mode the sole voter commits alone, so the proposal
+        // returning proves nothing about the reversion. Wait until the REBUILT
+        // follower has applied the new entry: that requires the leader to have
+        // replicated to it, meeting its reverted (empty) log and re-syncing it,
+        // which is exactly the path the loosened guard handles.
+        let after_idx = part0.raft.metrics().borrow().last_applied.map(|l| l.index);
+        node1
+            .raft_registry()
+            .get(0)
+            .expect("node 1 hosts the rebuilt member")
+            .raft
+            .wait(Some(std::time::Duration::from_secs(10)))
+            .applied_index_at_least(after_idx, "rebuilt follower re-syncs")
+            .await
+            .expect("the rebuilt follower re-syncs from the leader after its log reversion");
         assert!(
             !part0.is_shutdown(),
             "the leader core must not panic/Shutdown on a rebuilt follower's log reversion"
