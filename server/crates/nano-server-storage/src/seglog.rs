@@ -3004,6 +3004,46 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1462 defect-class guard. The seal-mid-sample test above failed under
+    /// parallel load because it sampled the active segment right after
+    /// `apply_command`. The group-commit writer appends asynchronously, so under
+    /// load the sample could see an empty file (`expected.1 == 0`). This was a
+    /// hidden timing dependency in the test, not a product race: the product
+    /// dedups a mid-sample seal by inode. The sync point is
+    /// `Commit::blocking_wait`. This test pins the contract every on-disk
+    /// sampling test relies on: once a commit resolves, its bytes are visible to
+    /// `uncompacted_usage`, exactly and monotonically. It has no sleeps; it is
+    /// ordered only by the commit acknowledgement.
+    #[test]
+    fn resolved_commit_bytes_are_visible_to_uncompacted_usage() {
+        let dir = temp_dir("usage-commit-visible");
+        let (mut journal, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+        let shared = Arc::clone(&recovery.shared);
+
+        let (_, c1) = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        c1.blocking_wait();
+        let (segs1, bytes1) = shared.uncompacted_usage();
+        let on_disk1 = fs::metadata(&shared.active_path).unwrap().len();
+        assert_eq!(segs1, 1, "only the active segment");
+        assert!(bytes1 > 0, "a resolved commit's bytes must be on disk");
+        assert_eq!(bytes1, on_disk1);
+
+        let (_, c2) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        c2.blocking_wait();
+        let (_, bytes2) = shared.uncompacted_usage();
+        assert!(bytes2 > bytes1, "each resolved commit grows the gauge");
+        assert_eq!(bytes2, fs::metadata(&shared.active_path).unwrap().len());
+
+        drop(journal);
+        drop(shared);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // ------------------------------------------------------------------------
     // #1463: the local (non-Raft) snapshot path streams the cold/spilled set.
     // ------------------------------------------------------------------------
