@@ -1050,6 +1050,10 @@ jobs:
         # doctests — covers the whole workspace suite.)
         # The default profile also sets `leak-timeout = { result = "fail" }`, so a
         # test that leaks a handle past exit FAILS here instead of warning (#1474).
+        # That profile is loaded because this step sets `working-directory: server`:
+        # nextest anchors config discovery at the workspace root (server/Cargo.toml
+        # declares its own [workspace]), so it reads server/.config/nextest.toml —
+        # the same mechanism the serial-heavy test-group config above relies on.
         run: cargo nextest run --workspace --features nanobpm-gateway-rest-server/console
   console:
     name: console (typecheck + test)
