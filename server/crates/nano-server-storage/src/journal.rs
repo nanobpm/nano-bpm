@@ -2975,6 +2975,13 @@ impl Journal {
         // page the owning instance in first, or the lease — and the digest's
         // worker attribution — would be silently missed. Best-effort, like the
         // digest itself: an unreadable row stays cold and is retried next tick.
+        // An already-expired lease is rejected *before* paging anything in —
+        // the engine would refuse it anyway, and rehydrating first would churn
+        // a cold instance in and out on every digest tick until the longest
+        // lease in the digest expires.
+        if deadline <= now {
+            return false;
+        }
         if let Some(instance) = self
             .cold
             .as_ref()
@@ -4475,6 +4482,19 @@ mod tests {
             journal.activated_lease_workers(),
             vec![(job_key, "w-1".to_string())]
         );
+    }
+
+    #[test]
+    fn recover_lease_does_not_rehydrate_an_expired_cold_lease() {
+        // #963: an expired digest entry must be rejected without paging the
+        // cold instance in (else every digest tick churns it through disk).
+        let mut journal = cold_journal();
+        deploy_and_create(&mut journal);
+        let job_key = *journal.state().jobs.keys().next().expect("a job");
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert!(!journal.recover_lease(job_key, 100, Some("w-1"), 100));
+        assert_eq!(journal.cold_count(), 1);
+        assert!(!journal.state().jobs.contains_key(&job_key));
     }
 
     #[test]
