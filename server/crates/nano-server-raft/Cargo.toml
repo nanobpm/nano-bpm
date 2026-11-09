@@ -15,7 +15,13 @@ nano-falcon-protocol = { path = "../nano-falcon-protocol" }
 nanobpmn-engine-core = { path = "../../../engine-core", features = ["serde"] }
 # Vendored openraft 0.9.24 (the `[patch.crates-io]` at the workspace root pins
 # the correctness fix). This crate is the primary — and only — openraft consumer.
-openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+# `loosen-follower-log-revert`: when a Shutdown partition is auto-recovered by
+# rebuilding its member as a fresh receiver (issue #53), the rebuilt follower
+# reverts to an empty log and the leader's replication progress would otherwise
+# hit openraft's `follower log reversion is not allowed` panic — taking the
+# LEADER's core down too. The feature downgrades that panic to a handled
+# re-sync, so recovering one partition can never cascade into another's death.
+openraft = { version = "0.9.24", features = ["serde", "storage-v2", "loosen-follower-log-revert"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "fs"] }
@@ -35,9 +41,9 @@ base64 = "0.22.1"
 # The #1405 fail-closed apply tests corrupt a replica's cold-spill row directly
 # (the #1388 failure shape), which needs raw SQLite access to the store file.
 rusqlite = { version = "0.32", features = ["bundled"] }
-# The same tests drive the cold-spill seam through the storage crate's
-# `test-hooks` (they link it as a non-test library, like the gateway bin's
-# inline tests do).
+# Enable the storage crate's `test-hooks` (e.g. `Journal::force_cold_spill_all`)
+# so the snapshot-streaming test (#1337) and the #1405 fail-closed apply tests can force the cold tier
+# deterministically instead of driving real RAM pressure.
 nano-server-storage = { path = "../nano-server-storage", features = ["test-hooks"] }
 
 [lints.rust]

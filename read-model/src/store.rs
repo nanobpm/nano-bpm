@@ -6536,6 +6536,9 @@ fn project_event(
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }
         | Event::StartInstanceDispatched { .. }
+        // Engine-internal settlement ledger (#1181); the terminal job event
+        // that follows carries everything the read model projects.
+        | Event::JobSettlementRecorded { .. }
         | Event::UserTaskCorrectionsApplied { .. }
         | Event::UserTaskTransitionDeferred { .. }
         | Event::UserTaskTransitionResolved { .. }
@@ -8152,6 +8155,7 @@ mod definition_xml_tests {
                 error_message: None,
                 error_code: None,
                 has_failed_with_retries_left: false,
+                settled_tokens: Vec::new(),
             },
         );
 
@@ -8414,6 +8418,7 @@ mod definition_xml_tests {
                 error_message: None,
                 error_code: None,
                 has_failed_with_retries_left: false,
+                settled_tokens: Vec::new(),
             },
         );
 
@@ -11615,6 +11620,7 @@ mod element_instance_tests {
                 error_message: None,
                 error_code: None,
                 has_failed_with_retries_left: false,
+                settled_tokens: Vec::new(),
             },
         );
 
@@ -11680,6 +11686,7 @@ mod element_instance_tests {
             error_message: None,
             error_code: None,
             has_failed_with_retries_left: false,
+            settled_tokens: Vec::new(),
         };
         let mut state = State::default();
         // Failed with retries left.
@@ -12284,6 +12291,7 @@ mod element_instance_tests {
                 error_message: None,
                 error_code: None,
                 has_failed_with_retries_left: false,
+                settled_tokens: Vec::new(),
             },
         );
         let store = ReadStore::open(None).unwrap();

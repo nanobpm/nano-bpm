@@ -33,6 +33,12 @@ const extraGuides = [
     path: join(root, "..", "docs", "extensions.md"),
     linkBase: "docs",
   },
+  {
+    slug: "runbook-snapshot-blockers",
+    title: "Runbook: snapshot blockers",
+    path: join(root, "..", "docs", "runbook-snapshot-blockers.md"),
+    linkBase: "docs",
+  },
 ];
 const outDir = join(root, "public", "docs");
 

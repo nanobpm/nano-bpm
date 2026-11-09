@@ -65,6 +65,7 @@ pub(crate) use nano_server_storage::metrics;
 pub(crate) use nano_server_storage::readstore;
 pub(crate) use nano_server_storage::remote_sink;
 pub(crate) use nano_server_storage::seglog;
+pub(crate) use nano_server_storage::snapshot_health;
 pub(crate) use nano_server_storage::varspill;
 pub(crate) use nano_server_storage::varstore;
 use nanobpm_gateway_rest::{apis, models, types};
@@ -1961,6 +1962,25 @@ fn bump(slot: &mut (u64, Option<u64>), at_ms: u64) {
     slot.1 = Some(slot.1.map_or(at_ms, |prev| prev.max(at_ms)));
 }
 
+/// Whether `events` actually settled a job (a terminal `JobCompleted` /
+/// `JobFailed` / `JobErrorThrown`). An idempotent settlement replay (#1181)
+/// succeeds with no events, and must not be counted again in job statistics or
+/// completion metrics.
+fn settles_a_job(events: &[Event]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            Event::JobCompleted { .. } | Event::JobFailed { .. } | Event::JobErrorThrown { .. }
+        )
+    })
+}
+
+/// The outcome of a job-lifecycle command (complete/fail/throw) on the stream
+/// path: the applied events (so the caller can tell a real settlement from an
+/// eventless idempotent replay via [`settles_a_job`], #1181) plus the
+/// durability handle.
+pub(crate) type JobStreamOutcome = Result<(Arc<Vec<Event>>, Commit), (u16, String)>;
+
 /// Best-effort recovery of a completed job's type from the emitted events, used
 /// when the read-model snapshot taken before applying the command didn't carry
 /// it (e.g. the projection had not yet caught up).
@@ -2439,6 +2459,21 @@ pub struct ServerImpl {
     /// in flight so the two paths can't race into competing groups. See
     /// [`HandoffPending`].
     handoff_pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, HandoffPending>>>,
+    /// Per-partition lock serializing a core REBUILD (promote / rebuild-as-receiver /
+    /// shutdown auto-recovery): the old core is fully shut down and awaited, then the
+    /// new core is constructed and registered, all under the partition's lock. Without
+    /// it two concurrent rebuild paths (the recovery tick's promote and a hand-off's
+    /// rebuild-as-receiver, or the liveness supervisor's auto-recovery) interleave
+    /// `shutdown`/`insert` and leave TWO cores serving the SAME partition — the
+    /// two-lineage overlap. Acquiring this lock for the whole rebuild asserts the
+    /// one-core-per-partition invariant.
+    partition_rebuild_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<u64, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Test-only probe: the live depth (and high-water mark) of rebuild critical
+    /// sections. The rebuild lock keeps the peak at most 1; a test asserts it never
+    /// reaches 2, proving two cores never overlap.
+    #[cfg(test)]
+    rebuild_depth_probe: RebuildDepthProbe,
     /// Cluster create-placement mode (`NANOBPMN_CREATE_PLACEMENT`, ADR 0014).
     /// [`PlacementMode::Off`] (default) keeps blind round-robin placement with
     /// forwarded creates ungated — byte-identical to the historical path.
@@ -3007,6 +3042,11 @@ impl ServerImpl {
                 handoff_catchup_ceiling_from_env().as_millis() as u64,
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            partition_rebuild_locks: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            #[cfg(test)]
+            rebuild_depth_probe: RebuildDepthProbe::default(),
             placement_mode,
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -4375,6 +4415,55 @@ struct HandoffPending {
     joint_suspected: bool,
 }
 
+/// Test-only RAII guard tracking the depth of a partition-rebuild critical
+/// section. `enter` increments the shared counter; `Drop` decrements it. The
+/// per-partition rebuild lock keeps the depth at most 1; a concurrent rebuild that
+/// slipped past the lock would push it to 2, which the test asserts against.
+///
+/// The probe records the PEAK (high-water) depth, so a transient overlap is caught
+/// even though the running depth returns to 0 once both rebuilds finish.
+#[cfg(test)]
+struct RebuildDepthGuard {
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl RebuildDepthGuard {
+    fn enter(probe: &RebuildDepthProbe) -> Self {
+        let depth = probe
+            .depth
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        // Record the high-water mark so a transient overlap is not lost when the
+        // sections later drain back to 0.
+        probe
+            .peak
+            .fetch_max(depth, std::sync::atomic::Ordering::SeqCst);
+        Self {
+            depth: probe.depth.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RebuildDepthGuard {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Test-only probe shared by every rebuild critical section: the live depth and
+/// its high-water mark. One per `ServerImpl` (the rebuild lock is per-partition,
+/// but the tests drive a single partition, so a node-wide probe suffices).
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RebuildDepthProbe {
+    depth: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    /// Rebuilds that found their predecessor core still live after teardown.
+    live_predecessors: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Recovery-tick passes a returning owner waits for an in-flight hand-off before
 /// re-sending (it never self-promotes while a reachable incumbent leads the
 /// partition — see [`ServerImpl::request_handoff_or_wait`]). At ~500 ms/pass this
@@ -5164,10 +5253,17 @@ const DEFAULT_HISTORY_MB: u64 = 8192;
 /// the node to preserve durability — see the journal write-failure path).
 const HISTORY_DISK_FRACTION_PCT: u64 = 60;
 
-/// Total filesystem capacity (bytes) of the volume holding `path`, via
-/// `statvfs`, or `None` when it can't be read.
-#[cfg(unix)]
+/// Total filesystem capacity (bytes) of the volume holding `path`, or `None`
+/// when it can't be read. Derived from [`disk_space_bytes`].
 fn detect_disk_capacity_bytes(path: &std::path::Path) -> Option<u64> {
+    disk_space_bytes(path).map(|(_, total)| total)
+}
+
+/// `(available, total)` bytes of the volume holding `path`, via `statvfs`, or
+/// `None` when it can't be read. `available` is what an unprivileged writer can
+/// still use (`f_bavail`), the figure the #1385 disk guard compares.
+#[cfg(unix)]
+fn disk_space_bytes(path: &std::path::Path) -> Option<(u64, u64)> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
     // SAFETY: `st` is zeroed then filled by statvfs; `c` is a valid NUL-terminated
@@ -5177,11 +5273,12 @@ fn detect_disk_capacity_bytes(path: &std::path::Path) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    Some(st.f_blocks as u64 * st.f_frsize as u64)
+    let frsize = st.f_frsize as u64;
+    Some((st.f_bavail as u64 * frsize, st.f_blocks as u64 * frsize))
 }
 
 #[cfg(not(unix))]
-fn detect_disk_capacity_bytes(_path: &std::path::Path) -> Option<u64> {
+fn disk_space_bytes(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
@@ -6852,10 +6949,16 @@ impl ServerImpl {
             // REST complete is not the stream CompleteJob path: do not record the
             // stream-completion diagnostic (`record_stream_outcome = false`). #1306.
             return Ok(
-                match self.propose_job_for_stream(job_key, command, false).await {
-                    Ok(commit) => {
+                match self
+                    .propose_partition_command(job_key, command, false)
+                    .await
+                {
+                    Ok((events, commit)) => {
                         commit.wait().await;
-                        self.note_job_completion("rest");
+                        let metadata = metadata.filter(|_| settles_a_job(&events));
+                        if settles_a_job(&events) {
+                            self.note_job_completion("rest");
+                        }
                         if let Some((job_type, worker)) = metadata {
                             self.job_statistics
                                 .record_completed(job_type, worker, now_millis());
@@ -6909,18 +7012,22 @@ impl ServerImpl {
         let completed_meta = engine_meta.unwrap_or((None, None));
         match result {
             Ok((events, commit)) => {
-                // Record REST job completion (drain-side; also feeds the drain guard).
-                self.note_job_completion("rest");
-                // Job-statistics (epic #903 / #907): a completed job, attributed to
-                // the worker that held it (captured before the command dropped it).
-                self.job_statistics.record_completed(
-                    completed_meta
-                        .0
-                        .clone()
-                        .unwrap_or_else(|| job_completed_type_from_events(&events)),
-                    completed_meta.1.clone(),
-                    now_millis(),
-                );
+                // An idempotent settlement replay (#1181) settles nothing: it is
+                // answered 204 but not counted twice.
+                if settles_a_job(&events) {
+                    // Record REST job completion (drain-side; also feeds the drain guard).
+                    self.note_job_completion("rest");
+                    // Job-statistics (epic #903 / #907): a completed job, attributed to
+                    // the worker that held it (captured before the command dropped it).
+                    self.job_statistics.record_completed(
+                        completed_meta
+                            .0
+                            .clone()
+                            .unwrap_or_else(|| job_completed_type_from_events(&events)),
+                        completed_meta.1.clone(),
+                        now_millis(),
+                    );
+                }
                 // REST API: await fsync before replying (synchronous durability).
                 // Contrast with falcon::pipeline_job_command, which replies
                 // immediately and awaits fsync in a detached task for throughput.
@@ -7049,10 +7156,16 @@ impl ServerImpl {
             );
             // REST fail is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
             return Ok(
-                match self.propose_job_for_stream(job_key, command, false).await {
-                    Ok(commit) => {
+                match self
+                    .propose_partition_command(job_key, command, false)
+                    .await
+                {
+                    Ok((events, commit)) => {
                         commit.wait().await;
-                        self.note_job_completion("rest");
+                        let metadata = metadata.filter(|_| settles_a_job(&events));
+                        if settles_a_job(&events) {
+                            self.note_job_completion("rest");
+                        }
                         if let Some((job_type, worker)) = metadata {
                             self.job_statistics
                                 .record_failed(job_type, worker, now_millis());
@@ -7100,13 +7213,17 @@ impl ServerImpl {
             .await;
         let failed_meta = engine_meta.unwrap_or((None, None));
         match result {
-            Ok((_, commit)) => {
+            Ok((events, commit)) => {
+                // An idempotent settlement replay (#1181) settles nothing.
+                let settled = settles_a_job(&events);
                 // Record REST job completion (fail also completes the job lifecycle;
                 // drain-side, so it feeds the drain guard too).
-                self.note_job_completion("rest");
+                if settled {
+                    self.note_job_completion("rest");
+                }
                 // Job-statistics (epic #903 / #907): a failed job, attributed to
                 // the worker that held it (captured before the command dropped it).
-                if let Some(job_type) = failed_meta.0.clone() {
+                if let Some(job_type) = failed_meta.0.clone().filter(|_| settled) {
                     self.job_statistics.record_failed(
                         job_type,
                         failed_meta.1.clone(),
@@ -7227,10 +7344,16 @@ impl ServerImpl {
             );
             // REST throw-error is not the stream CompleteJob path (`record_stream_outcome = false`). #1306.
             return Ok(
-                match self.propose_job_for_stream(job_key, command, false).await {
-                    Ok(commit) => {
+                match self
+                    .propose_partition_command(job_key, command, false)
+                    .await
+                {
+                    Ok((events, commit)) => {
                         commit.wait().await;
-                        self.note_job_completion("rest");
+                        let metadata = metadata.filter(|_| settles_a_job(&events));
+                        if settles_a_job(&events) {
+                            self.note_job_completion("rest");
+                        }
                         if let Some((job_type, worker)) = metadata {
                             self.job_statistics.record_error(
                                 job_type,
@@ -7295,12 +7418,13 @@ impl ServerImpl {
             .await;
         let error_meta = engine_meta.unwrap_or((None, None));
         match result {
-            Ok((_, commit)) => {
+            Ok((events, commit)) => {
                 commit.wait().await;
                 // Job-statistics (epic #903 / #907): a thrown BPMN business error,
                 // feeding `/v2/jobs/statistics/errors`, attributed to the worker
-                // that held the job (captured before the command dropped it).
-                if let Some(job_type) = error_meta.0.clone() {
+                // that held the job (captured before the command dropped it). An
+                // idempotent settlement replay (#1181) settles nothing.
+                if let Some(job_type) = error_meta.0.clone().filter(|_| settles_a_job(&events)) {
                     self.job_statistics.record_error(
                         job_type,
                         error_meta.1.clone(),
@@ -7912,7 +8036,7 @@ impl ServerImpl {
         };
         let commit = if self.raft.is_empty() {
             let result = self.apply_job_command_direct(job_key, command).await;
-            Self::map_job_outcome(result)?
+            Self::map_job_events(result)?.1
         } else {
             // REST job path, not stream CompleteJob: no stream diagnostic. #1306.
             self.propose_job_for_stream(job_key, command, false).await?
@@ -15495,6 +15619,14 @@ impl ServerImpl {
                 } else {
                     raft_log_dir_for(p)
                 };
+                // One core per partition (issue #1455): construct + register under
+                // the partition's rebuild lock, and skip if a concurrent
+                // promotion/hand-off rebuild already hosted a member — inserting
+                // over it would orphan a LIVE core without shutting it down.
+                let _rebuild_guard = server.partition_rebuild_lock(p).lock_owned().await;
+                if server.raft_registry().get(p).is_some() {
+                    continue;
+                }
                 match crate::raft::RaftPartition::bootstrap_member(
                     topology.node_id as u64,
                     p,
@@ -15563,7 +15695,11 @@ impl ServerImpl {
                     }
                     // `handle_promotion` (adopting the incumbent's epoch during the
                     // probe) may already have hosted a deferred partition as a fresh
-                    // receiver — don't clobber it.
+                    // receiver — don't clobber it. The check + construct + insert run
+                    // under the partition's rebuild lock (issue #1455) so a receiver
+                    // rebuild racing this path cannot slip in between the check and
+                    // the insert and be overwritten while still live.
+                    let _rebuild_guard = server.partition_rebuild_lock(p).lock_owned().await;
                     if server.raft_registry().get(p).is_some() {
                         continue;
                     }
@@ -15571,17 +15707,31 @@ impl ServerImpl {
                         continue;
                     };
                     let deferred = handoff_incumbents.contains(&p);
-                    let log_dir = if deferred { None } else { raft_log_dir_for(p) };
-                    match crate::raft::RaftPartition::bootstrap_member(
-                        topology.node_id as u64,
-                        p,
-                        engine,
-                        transport.clone(),
-                        log_dir,
-                        false, // owned: has an exporter, never evicts in `apply`
-                    )
-                    .await
-                    {
+                    let me = topology.node_id as u64;
+                    // owned: has an exporter, never evicts in `apply`.
+                    let hosted = if deferred {
+                        // A fresh receiver (empty log/vote/committed) so the
+                        // incumbent never meets a divergent committed prefix (#1454).
+                        crate::raft::RaftPartition::bootstrap_fresh_receiver(
+                            me,
+                            p,
+                            engine,
+                            transport.clone(),
+                            false,
+                        )
+                        .await
+                    } else {
+                        crate::raft::RaftPartition::bootstrap_member(
+                            me,
+                            p,
+                            engine,
+                            transport.clone(),
+                            raft_log_dir_for(p),
+                            false,
+                        )
+                        .await
+                    };
+                    match hosted {
                         Ok(part) => {
                             server.raft_registry().insert(Arc::new(part));
                             tracing::info!(
@@ -16260,6 +16410,29 @@ impl ServerImpl {
             }
             // Leaderless past the grace window. Promote iff this node is the
             // deterministic surviving successor for `p`.
+            // A live local core whose committed membership names THIS node the
+            // sole voter (e.g. just handed leadership by the incumbent) inherits
+            // the group's lineage: it only needs to campaign. A fresh self-promote
+            // would discard that log and form a competing lineage at a term that
+            // ties the incumbent's (the two-lineage split). Elect instead.
+            if let Some(part) = self.raft.get(p)
+                && !part.is_shutdown()
+                && {
+                    let metrics = part.raft.metrics();
+                    let m = metrics.borrow();
+                    let voters: Vec<u64> = m.membership_config.membership().voter_ids().collect();
+                    voters == [me]
+                }
+            {
+                if let Err(e) = part.raft.trigger().elect().await {
+                    tracing::warn!(
+                        partition = p,
+                        "leader-durable: could not trigger election: {e}"
+                    );
+                }
+                state.misses.remove(&p);
+                continue;
+            }
             if self.designated_successor(p).await == Some(me as u32) {
                 let next_epoch = self.next_promotion_epoch(p);
                 tracing::warn!(
@@ -16349,6 +16522,13 @@ impl ServerImpl {
     /// epoch — bounded loss, never permanent divergence (higher epoch always wins).
     async fn promote_partition(&self, p: u64, epoch: u64) {
         use crate::raft::RaftPartition;
+        // Serialize the rebuild against any concurrent rebuild/recover of the SAME
+        // partition (issue #1455): the old core is fully shut down and awaited,
+        // then the new core is built and registered — never two live cores for one
+        // partition.
+        let _rebuild_guard = self.partition_rebuild_lock(p).lock_owned().await;
+        #[cfg(test)]
+        let _depth_guard = RebuildDepthGuard::enter(&self.rebuild_depth_probe);
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
 
@@ -16360,9 +16540,7 @@ impl ServerImpl {
 
         // Tear down the stale group (a learner of the dead leader) before replacing
         // it, so its openraft task and sockets are released.
-        if let Some(old) = self.raft.get(p) {
-            old.raft.shutdown().await.ok();
-        }
+        self.retire_predecessor_core(p).await;
 
         // Form a fresh single-voter group on a clean in-memory log (the engine's
         // own journal remains the local durability source). Initialize with this
@@ -16788,6 +16966,17 @@ impl ServerImpl {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&partition);
+        // The incumbent committed a membership naming THIS node the sole voter and
+        // stepped down, so the group is momentarily leaderless. Campaign now, on
+        // the inherited lineage, rather than waiting out an election timeout: a
+        // leaderless window here would let the recovery tick's legacy path
+        // self-promote a FRESH single-voter group at a term that ties the
+        // incumbent's (the two-lineage split this hand-off exists to avoid; #53).
+        if let Some(part) = self.raft.get(partition)
+            && let Err(e) = part.raft.trigger().elect().await
+        {
+            tracing::warn!(partition, "hand-off: could not trigger election: {e}");
+        }
         tracing::info!(
             partition,
             epoch,
@@ -17186,6 +17375,34 @@ impl ServerImpl {
         }
     }
 
+    /// The per-partition rebuild lock for `p`, creating it on first use. Held for the
+    /// whole shutdown→rebuild→insert sequence so two concurrent rebuild paths can
+    /// never leave two cores serving the same partition (issue #1455).
+    fn partition_rebuild_lock(&self, p: u64) -> Arc<tokio::sync::Mutex<()>> {
+        self.partition_rebuild_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(p)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// Shut down and await the current core for `p` (if any) before a rebuild
+    /// constructs its replacement — the single canonical teardown step shared by
+    /// every rebuild path. Must be called with `p`'s rebuild lock held.
+    async fn retire_predecessor_core(&self, p: u64) {
+        if let Some(old) = self.raft.get(p) {
+            old.raft.shutdown().await.ok();
+            // Test-only: record any predecessor still live after teardown, so a
+            // test fails if a rebuild constructs a successor next to a live core.
+            #[cfg(test)]
+            if !old.is_shutdown() {
+                self.rebuild_depth_probe
+                    .live_predecessors
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
     /// Rebuild this node's member for `p` as a fresh receiver (uninitialized —
     /// receive-only) of `leader_node`'s group, replacing any existing member. A
     /// learner of an OLD lineage would reject a new leader's lower-term fresh log,
@@ -17194,19 +17411,29 @@ impl ServerImpl {
     /// the rebuild succeeded.
     async fn rebuild_as_receiver(&self, p: u64, leader_node: u64) -> bool {
         use crate::raft::RaftPartition;
+        // Serialize the rebuild against any concurrent promote/recover of the SAME
+        // partition: the old core is fully shut down and awaited, then the new core
+        // is built and registered — never two live cores for one partition.
+        let _rebuild_guard = self.partition_rebuild_lock(p).lock_owned().await;
+        // Test-only overlap probe: entering the critical section increments the
+        // depth, leaving it decrements. The rebuild lock keeps this at most 1; a
+        // concurrent rebuild that slipped past the lock would push it to 2.
+        #[cfg(test)]
+        let _depth_guard = RebuildDepthGuard::enter(&self.rebuild_depth_probe);
         let me = self.engine.topology().node_id as u64;
         let engine = match self.engine_handle_for(p) {
             Some(h) => h,
             None => self.replica_engine_for(p).await,
         };
-        if let Some(old) = self.raft.get(p) {
-            old.raft.shutdown().await.ok();
-        }
+        self.retire_predecessor_core(p).await;
         let transport = self.raft_transport();
         // Rejoining as a follower/receiver of the new leader: evict terminal
         // shells locally unless this node statically owns `p` (has an exporter).
         let evict_terminal = self.engine.local_for_partition(p).is_none();
-        match RaftPartition::bootstrap_member(me, p, engine, transport, None, evict_terminal).await
+        // A fresh receiver: empty log, vote and committed state, so the new leader
+        // never meets a divergent committed prefix (issue #1454).
+        match RaftPartition::bootstrap_fresh_receiver(me, p, engine, transport, evict_terminal)
+            .await
         {
             Ok(part) => {
                 self.raft.insert(Arc::new(part));
@@ -17218,6 +17445,185 @@ impl ServerImpl {
                 false
             }
         }
+    }
+
+    /// Auto-recover a partition whose Raft core entered `Shutdown` (issue #53).
+    ///
+    /// An openraft core terminates (state `Shutdown`) on a `Fatal` — an
+    /// unrecoverable storage error from apply/snapshot (the fail-closed #1405
+    /// path) or a defensive log-append rejection (a divergent local log). Left
+    /// alone the partition never applies again and every instance/job routed to
+    /// it is stranded (the RF>1 completion-freeze). PR #52 made this loud; this
+    /// makes it *recoverable*: tear the dead core down and rebuild a fresh member
+    /// in the registry, so the partition rejoins its group instead of waiting for
+    /// a manual process restart.
+    ///
+    /// The rebuild policy follows the partition's role, mirroring the boot path:
+    ///
+    /// - **A partition another node leads** (a follower/learner, or an owned
+    ///   partition a failover incumbent currently leads): rebuild as a FRESH
+    ///   receiver — an empty volatile log (`log_dir = None`), no `initialize`.
+    ///   The dead core's local log is exactly the divergent one that trips the
+    ///   defensive `LogIndexNotFound` collision, so discarding it lets the
+    ///   leader's authoritative lineage replicate in cleanly (via log
+    ///   backfill or a snapshot install). Safe because this node is not the
+    ///   durability source for a partition it does not lead.
+    /// - **A partition this node leads** (the sole/leader voter): rebuild
+    ///   resuming the durable on-disk log (`raft_log_dir_for`). The leader's log
+    ///   is the durability point and must not be discarded; the Shutdown cause
+    ///   was transient in-memory core state, so replaying the preserved durable
+    ///   log + snapshot reconstructs the engine with no data loss.
+    ///
+    /// Returns `true` when the partition was rebuilt (the registry now holds a
+    /// live member). A rebuild failure is logged and retried by the next
+    /// supervisor tick (the partition stays down but the node keeps trying).
+    async fn recover_shutdown_partition(&self, p: u64) -> bool {
+        use crate::raft::RaftPartition;
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id as u64;
+
+        // Serialize against a concurrent promote / rebuild-as-receiver of the
+        // SAME partition (#1455): never two live cores for one partition.
+        let _rebuild_guard = self.partition_rebuild_lock(p).lock_owned().await;
+        #[cfg(test)]
+        let _depth_guard = RebuildDepthGuard::enter(&self.rebuild_depth_probe);
+        // Re-check under the lock: a recovery that queued behind a concurrent
+        // rebuild must not tear down the live core that rebuild just installed.
+        match self.raft.get(p) {
+            Some(cur) if cur.is_shutdown() => {}
+            _ => return false,
+        }
+
+        // An RF=1 in-memory deployment cannot be safely recovered in place: with
+        // no durable log (`raft_log_dir_for` is `None`) and no replica peer to
+        // backfill from (RF=1 means this node is the partition's ONLY replica,
+        // regardless of how many nodes the cluster has), rebuilding would install an empty uninitialized learner
+        // that never elects itself — silently discarding the partition's state
+        // and leaving it unavailable while reporting "recovered" (issue #53
+        // review). Refuse the silent data loss: log loudly and leave the
+        // partition down for an operator restart (the only sound recovery for a
+        // volatile sole voter). Replicated (RF>1) and durable deployments
+        // proceed below.
+        if topology.effective_rf() == 1 && raft_log_dir_for(p).is_none() {
+            tracing::error!(
+                partition = p,
+                "raft partition core is SHUTDOWN on an RF=1 in-memory deployment (no replica to backfill from); \
+                 in-place recovery would discard its volatile state — NOT auto-recovering \
+                 (restart the node to recover; run with NANOBPMN_DATA_DIR for a durable log)"
+            );
+            return false;
+        }
+
+        let engine = match self.engine_handle_for(p) {
+            Some(h) => h,
+            None => self.replica_engine_for(p).await,
+        };
+        let transport = self.raft_transport();
+        // A partition this node does not statically own has no exporter, so its
+        // state machine must evict terminal shells itself (the RF>1 hot-state
+        // leak guard); an owned partition keeps shells for its read path.
+        let evict_terminal = self.engine.local_for_partition(p).is_none();
+        let i_own = topology.leader_of(p) == topology.node_id;
+        // Read the dead core's last-known leader BEFORE the swap: a live peer
+        // leader means we rejoin as its receiver (fresh log); anything else
+        // (we lead, or no leader is known) means we resume our own lineage.
+        let peer_leads = self
+            .raft
+            .get(p)
+            .and_then(|old| old.raft.metrics().borrow().current_leader)
+            .map(|l| l != me)
+            .unwrap_or(false);
+        let fresh_receiver = !i_own || peer_leads;
+        // In `quorum` mode (the default) a followed partition is a VOTER: its
+        // durable log + persisted vote back the write quorum, so recovering it
+        // onto an empty volatile log would discard committed state and could let
+        // a later election discard acknowledged writes (or let the voter vote
+        // twice in one term) — issue #53 review. A voter must resume its durable
+        // on-disk log regardless of the fresh-receiver heuristic; only in
+        // `leader-durable` mode is a follower a disposable non-voting learner
+        // whose sole durability point is the leader, safe to rebuild fresh.
+        let voter_must_resume = self.replication_mode == ReplicationMode::Quorum;
+        let log_dir = if fresh_receiver && !voter_must_resume {
+            None
+        } else {
+            raft_log_dir_for(p)
+        };
+        // A quorum VOTER with no durable log (an in-memory deployment) has nothing
+        // to resume: rebuilding it would hand the group an EMPTY voter — no log,
+        // no persisted vote — that can vote twice in a term or help elect a stale
+        // replica, discarding acknowledged writes (Raft's amnesia hazard; #53
+        // review). Refuse, loudly, and leave the partition down for an operator
+        // restart. Only leader-durable learners (non-voting, the leader is their
+        // sole durability point) and durable voters are rebuilt in place.
+        if voter_must_resume && log_dir.is_none() {
+            tracing::error!(
+                partition = p,
+                "raft partition core is SHUTDOWN on an in-memory quorum voter; \
+                 rebuilding it empty would let an amnesiac voter lose acknowledged writes — \
+                 NOT auto-recovering (restart the node to recover; run with NANOBPMN_DATA_DIR \
+                 for a durable log, or leader-durable replication for disposable learners)"
+            );
+            return false;
+        }
+        // Tear down the dead core first so its tasks fully stop before we
+        // construct the replacement (and so a durable log store's file handles
+        // are released before the new store reopens the same dir).
+        self.retire_predecessor_core(p).await;
+        // A rebuild with no durable log is an EMPTY receiver, so it goes through
+        // the one canonical fail-closed constructor every receiver path uses
+        // (#1454): it refuses to hand back a member carrying any log, vote,
+        // committed, applied or snapshot state, so a recovered follower can never
+        // present the leader with a divergent committed prefix.
+        let rebuilt_fresh = log_dir.is_none();
+        let rebuilt = match log_dir {
+            None => {
+                RaftPartition::bootstrap_fresh_receiver(me, p, engine, transport, evict_terminal)
+                    .await
+            }
+            dir @ Some(_) => {
+                RaftPartition::bootstrap_member(me, p, engine, transport, dir, evict_terminal).await
+            }
+        };
+        match rebuilt {
+            Ok(part) => {
+                self.raft.insert(Arc::new(part));
+                tracing::info!(
+                    "raft: node {me} auto-recovered shutdown partition {p} ({})",
+                    if rebuilt_fresh {
+                        "fresh receiver; the leader will backfill/snapshot it"
+                    } else {
+                        "resumed its durable on-disk lineage"
+                    }
+                );
+                true
+            }
+            Err(e) => {
+                tracing::error!(
+                    "raft: node {me} failed to auto-recover shutdown partition {p}: {e}; \
+                     the supervisor will retry"
+                );
+                false
+            }
+        }
+    }
+
+    /// One pass of the partition-Shutdown auto-recovery supervisor (issue #53).
+    /// For every hosted partition whose core is `Shutdown`, rebuild it in the
+    /// registry (see [`recover_shutdown_partition`](Self::recover_shutdown_partition)).
+    /// Returns the partition ids that were recovered this pass. Factored out of
+    /// the spawned loop so a test can drive it deterministically.
+    #[cfg(test)]
+    pub(crate) async fn recover_shutdown_partitions_once(&self) -> Vec<u64> {
+        let mut recovered = Vec::new();
+        for part in self.raft.all() {
+            if part.is_shutdown() {
+                let p = part.partition_id;
+                if self.recover_shutdown_partition(p).await {
+                    recovered.push(p);
+                }
+            }
+        }
+        recovered
     }
 
     /// Replicates a deployment's process definitions to every partition other
@@ -18254,14 +18660,13 @@ impl ServerImpl {
 /// next to the REST handlers that share the same command path and `jobs_available`
 /// wake discipline.
 impl ServerImpl {
-    /// Maps the result of a job lifecycle command (complete/fail/throw) into a
-    /// `(status, message)` outcome, awaiting durability and waking job pollers on
-    /// success. Mirrors the REST handlers' success/error arms.
-    fn map_job_outcome(
-        result: Result<(Arc<Vec<Event>>, Commit), EngineError>,
-    ) -> Result<Commit, (u16, String)> {
+    /// Maps a job-mutation outcome to `(events, commit)` so the caller can tell
+    /// a real settlement from an idempotent replay (#1181): a replay succeeds
+    /// with NO terminal job event and must not be counted again in the stream
+    /// completion metrics (`falcon::pipeline_job_command`).
+    fn map_job_events(result: Result<(Arc<Vec<Event>>, Commit), EngineError>) -> JobStreamOutcome {
         match result {
-            Ok((_, commit)) => Ok(commit),
+            Ok((events, commit)) => Ok((events, commit)),
             Err(EngineError::JobNotFound { job_key }) => {
                 Err((404, format!("No job with key {job_key}.")))
             }
@@ -19148,6 +19553,7 @@ impl ServerImpl {
             None,
         )
         .await
+        .map(|(_, commit)| commit)
     }
 
     pub(crate) async fn complete_job_for_stream_with_lease(
@@ -19158,7 +19564,7 @@ impl ServerImpl {
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
         business_id: Option<String>,
-    ) -> Result<Commit, (u16, String)> {
+    ) -> JobStreamOutcome {
         // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
         // task-listener result cannot carry variables. Reject here rather than
         // letting the command constructor silently drop them.
@@ -19176,7 +19582,7 @@ impl ServerImpl {
         if !self.raft.is_empty() {
             // The stream CompleteJob path owns the stream-completion diagnostic
             // (`record_stream_outcome = true`). #1306.
-            return self.propose_job_for_stream(job_key, command, true).await;
+            return self.propose_partition_command(job_key, command, true).await;
         }
         let result = self.apply_job_command_direct(job_key, command).await;
         if let Ok((events, _)) = &result {
@@ -19184,7 +19590,7 @@ impl ServerImpl {
             self.observe_job_sojourn(events, now_millis());
             self.record_adhoc_events(events);
         }
-        Self::map_job_outcome(result)
+        Self::map_job_events(result)
     }
 
     /// Stream `FailJob`. Returns the [`Commit`] for off-path pipelining; see
@@ -19198,6 +19604,7 @@ impl ServerImpl {
     ) -> Result<Commit, (u16, String)> {
         self.fail_job_for_stream_with_lease(job_key, None, retries, error_message)
             .await
+            .map(|(_, commit)| commit)
     }
 
     pub(crate) async fn fail_job_for_stream_with_lease(
@@ -19206,10 +19613,10 @@ impl ServerImpl {
         lease_token: Option<String>,
         retries: i32,
         error_message: String,
-    ) -> Result<Commit, (u16, String)> {
+    ) -> JobStreamOutcome {
         if !self.raft.is_empty() {
             return self
-                .propose_job_for_stream(
+                .propose_partition_command(
                     job_key,
                     job_command_with_lease(
                         Command::fail_job(job_key, retries, error_message),
@@ -19234,7 +19641,7 @@ impl ServerImpl {
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
         }
-        Self::map_job_outcome(result)
+        Self::map_job_events(result)
     }
 
     /// Stream `ThrowError`. Returns the [`Commit`] for off-path pipelining; see
@@ -19246,10 +19653,10 @@ impl ServerImpl {
         error_code: String,
         error_message: String,
         variables: std::collections::HashMap<String, Value>,
-    ) -> Result<Commit, (u16, String)> {
+    ) -> JobStreamOutcome {
         if !self.raft.is_empty() {
             return self
-                .propose_job_for_stream(
+                .propose_partition_command(
                     job_key,
                     job_command_with_lease(
                         Command::throw_job_error_with(
@@ -19279,7 +19686,7 @@ impl ServerImpl {
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
         }
-        Self::map_job_outcome(result)
+        Self::map_job_events(result)
     }
 
     /// Activates up to `max_jobs` of `job_type` for `worker` and returns the
@@ -23831,7 +24238,466 @@ fn metrics_body(server: &ServerImpl) -> String {
         legacy_lease_name_uses(),
     );
 
+    // Snapshot-health gauges (#1385): last-success age, consecutive failures,
+    // uncompacted journal footprint, quarantined orphans, data-dir free space
+    // and the degraded flag. Empty until the snapshot task has started.
+    body.push_str(&snapshot_health::global().render_prometheus(
+        std::time::Instant::now(),
+        &snapshot_health::HealthThresholds::from_env(),
+    ));
+
     body
+}
+
+/// Snapshot-health failure reason for a capture that aborted fail-closed
+/// (an unreadable off-heap payload, a strict orphan, or a gone writer); the
+/// blocking keys, when any, are reported alongside (#1385).
+const SNAPSHOT_CAPTURE_ABORTED: &str = "snapshot capture aborted (fail-closed)";
+
+/// `GET /health` (#1385): the snapshot/compaction pipeline's health as JSON —
+/// `status` (`healthy`/`degraded`), the `reasons` and `causes`, and the
+/// `blockingKeys` whose off-heap payload aborts snapshots. Answers **503** when
+/// degraded so an alerting probe (or a readiness check) notices without
+/// parsing the body; wire it to alerting/readiness, not liveness — a restart
+/// does not repair an unreadable store or a full disk.
+async fn health_handler() -> Response {
+    let report = snapshot_health::global().report(
+        std::time::Instant::now(),
+        &snapshot_health::HealthThresholds::from_env(),
+    );
+    health_response(&report)
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
+fn health_response(report: &snapshot_health::HealthReport) -> Response {
+    let status = if report.is_degraded() {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    let body = serde_json::to_string(report).unwrap_or_else(|_| "{}".to_string());
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("health response builds")
+}
+
+// ---------------------------------------------------------------------------
+// #1386 — admin tooling for snapshot blockers (follow-up to #1383).
+//
+// #1383 showed a single orphaned spilled instance could fail-close every
+// snapshot for weeks; #1385 made that *visible* (`GET /health` degrades and
+// names the blocking keys). This is the *act* half: an operator (or `c8ctl
+// nano doctor`) can list exactly which instances are blocking compaction and
+// which have already been quarantined as off-heap orphans, and cancel a
+// quarantined orphan so the partition's snapshots can fold again.
+// ---------------------------------------------------------------------------
+
+/// Serializes instance keys as decimal strings (#1386): partitioned keys
+/// exceed JavaScript's safe-integer range (`compose_key(4, 1)` > 2^53), so a
+/// JSON-number key would be silently rounded by a JS consumer and a cancel URL
+/// built from it would target the wrong instance. Matches the v2 API.
+fn serialize_keys_as_strings<S: serde::Serializer>(
+    keys: &[Key],
+    ser: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = ser.serialize_seq(Some(keys.len()))?;
+    for k in keys {
+        seq.serialize_element(&k.to_string())?;
+    }
+    seq.end()
+}
+
+/// One partition's raw orphan inputs (#1386), read under its engine actor.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PartitionOrphanInputs {
+    /// Instance keys whose off-heap payload aborted the latest snapshot fold.
+    snapshot_blockers: Vec<Key>,
+    /// The process-local quarantine observation set (historical, since start).
+    observed: Vec<Key>,
+    /// Instances carrying a durable, unresolved `VariablesLost` incident.
+    variables_lost: Vec<Key>,
+    /// Which of `observed ∪ variables_lost` are still live (non-terminal).
+    live: Vec<Key>,
+}
+
+/// Derives the actionable orphan list (#1386): the union of the process-local
+/// observations and the durable `VariablesLost` incidents (which survive a
+/// restart), restricted to instances still live — so a cancelled orphan drops
+/// out and a restart does not hide one. Sorted, deduplicated.
+fn pending_orphans(inputs: &PartitionOrphanInputs) -> Vec<Key> {
+    let mut keys: Vec<Key> = inputs
+        .observed
+        .iter()
+        .chain(inputs.variables_lost.iter())
+        .copied()
+        .filter(|k| inputs.live.contains(k))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+/// One partition's contribution to the snapshot-blockers report (#1386).
+/// Per-partition attribution tells the operator WHICH partition's journal is
+/// failing to fold. Keys are decimal strings on the wire.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PartitionSnapshotBlockers {
+    /// The partition these keys belong to.
+    partition: u64,
+    /// Instance keys whose off-heap payload aborted the latest snapshot fold.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
+    snapshot_blockers: Vec<Key>,
+    /// Live instances that lost off-heap data (observed quarantine or durable
+    /// `VariablesLost` incident) — the actionable cancel candidates.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
+    quarantined_orphans: Vec<Key>,
+    /// Every quarantine observed by this process since start, including ones
+    /// already cancelled. Historical/diagnostic only; not durable.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
+    observed_orphans: Vec<Key>,
+}
+
+/// The admin snapshot-blockers report (#1386), served at
+/// `GET /debug/snapshot-blockers` and consumed by `c8ctl nano doctor`.
+/// Aggregates every owned partition's blockers/orphans into a sorted,
+/// deduplicated top-level view plus the per-partition breakdown.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnapshotBlockersReport {
+    /// Every instance key blocking a snapshot fold, deduplicated and sorted.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
+    snapshot_blockers: Vec<Key>,
+    /// Every pending (live) off-heap orphan, deduplicated and sorted.
+    #[serde(serialize_with = "serialize_keys_as_strings")]
+    quarantined_orphans: Vec<Key>,
+    /// The per-partition breakdown behind the two top-level lists.
+    partitions: Vec<PartitionSnapshotBlockers>,
+}
+
+/// The pure core of the report (#1386): derives each partition's pending
+/// orphans and aggregates sorted, deduplicated top-level lists. Split out so
+/// it is tested deterministically without the spill machinery.
+fn build_snapshot_blockers_report(
+    parts: &[(u64, PartitionOrphanInputs)],
+) -> SnapshotBlockersReport {
+    let partitions: Vec<PartitionSnapshotBlockers> = parts
+        .iter()
+        .map(|(partition, inputs)| {
+            let mut observed = inputs.observed.clone();
+            observed.sort_unstable();
+            observed.dedup();
+            PartitionSnapshotBlockers {
+                partition: *partition,
+                snapshot_blockers: inputs.snapshot_blockers.clone(),
+                quarantined_orphans: pending_orphans(inputs),
+                observed_orphans: observed,
+            }
+        })
+        .collect();
+    let mut snapshot_blockers: Vec<Key> = partitions
+        .iter()
+        .flat_map(|p| p.snapshot_blockers.iter().copied())
+        .collect();
+    snapshot_blockers.sort_unstable();
+    snapshot_blockers.dedup();
+    let mut quarantined_orphans: Vec<Key> = partitions
+        .iter()
+        .flat_map(|p| p.quarantined_orphans.iter().copied())
+        .collect();
+    quarantined_orphans.sort_unstable();
+    quarantined_orphans.dedup();
+    SnapshotBlockersReport {
+        snapshot_blockers,
+        quarantined_orphans,
+        partitions,
+    }
+}
+
+/// Reads every owned partition's journal and aggregates its snapshot blockers
+/// and quarantined orphans (#1386). Runs each partition's cheap read on its own
+/// engine actor via [`DeepthiHandle::with`]; the aggregation itself is the pure
+/// [`build_snapshot_blockers_report`].
+async fn snapshot_blockers_report(server: &ServerImpl) -> SnapshotBlockersReport {
+    let topology = server.engine.topology();
+    let mut parts = Vec::new();
+    for p in 0..topology.num_partitions {
+        let Some(handle) = server.engine_handle_for(p) else {
+            continue;
+        };
+        let inputs = handle
+            .with(|journal| {
+                let observed = journal.quarantined_orphans();
+                let variables_lost: Vec<Key> = journal
+                    .incidents()
+                    .into_iter()
+                    .filter(|i| {
+                        matches!(i.kind, IncidentKind::VariablesLost)
+                            && matches!(i.state, IncidentState::Active)
+                    })
+                    .map(|i| i.instance_key)
+                    .collect();
+                let live = observed
+                    .iter()
+                    .chain(variables_lost.iter())
+                    .copied()
+                    .filter(|k| {
+                        journal.instance(*k).is_some_and(|i| {
+                            !matches!(
+                                i.state,
+                                ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+                            )
+                        })
+                    })
+                    .collect();
+                PartitionOrphanInputs {
+                    snapshot_blockers: journal.snapshot_blockers(),
+                    observed,
+                    variables_lost,
+                    live,
+                }
+            })
+            .await;
+        parts.push((p, inputs));
+    }
+    build_snapshot_blockers_report(&parts)
+}
+
+/// Maps a quarantined-orphan cancel outcome to the operator-meaningful HTTP
+/// status (#1386): 200 cancelled, 404 no such active instance, 503 a
+/// transient leader transition (retryable), 500 otherwise. Split out so the
+/// mapping is pinned by a deterministic unit test.
+fn snapshot_blocker_cancel_status(outcome: &CancelInstanceOutcome) -> StatusCode {
+    match outcome {
+        CancelInstanceOutcome::Canceled => StatusCode::OK,
+        CancelInstanceOutcome::NotFound(_) => StatusCode::NOT_FOUND,
+        CancelInstanceOutcome::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        CancelInstanceOutcome::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// `GET /debug/snapshot-blockers` (#1386): the snapshot blockers and
+/// quarantined off-heap orphans across every owned partition, as JSON. This is
+/// the read half of the operator runbook for a degraded `GET /health`.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
+async fn snapshot_blockers_handler(server: ServerImpl) -> Response {
+    let report = snapshot_blockers_report(&server).await;
+    let body = serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("snapshot-blockers response builds")
+}
+
+/// `POST /debug/snapshot-blockers/{key}/cancel` (#1386): cancels a quarantined
+/// off-heap orphan (or any instance blocking snapshots) so the partition's
+/// snapshots can fold again. Routes through the normal
+/// [`ServerImpl::cancel_instance_core`] path — leader-forwarding, durable
+/// commit, Raft-replicated like any other cancel — so the cancellation is
+/// itself durable and consistent under failure.
+#[allow(
+    clippy::expect_used,
+    reason = "infallible by construction: builds an http::Response from validated parts; the builder only errs on invalid header/status inputs, none of which occur here"
+)]
+async fn snapshot_blocker_cancel_handler(
+    server: ServerImpl,
+    axum::extract::Path(key): axum::extract::Path<Key>,
+) -> Response {
+    let outcome = server.cancel_instance_core(key).await;
+    let status = snapshot_blocker_cancel_status(&outcome);
+    let detail = match &outcome {
+        CancelInstanceOutcome::Canceled => format!("cancelled instance {key}"),
+        CancelInstanceOutcome::NotFound(d)
+        | CancelInstanceOutcome::Unavailable(d)
+        | CancelInstanceOutcome::Internal(d) => d.clone(),
+    };
+    let body = serde_json::json!({ "instanceKey": key.to_string(), "detail": detail }).to_string();
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("snapshot-blocker cancel response builds")
+}
+
+/// How often the storage-usage sampler refreshes the journal-backlog and
+/// disk-space gauges (#1385), independently of snapshot scheduling.
+const STORAGE_USAGE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Samples the uncompacted journal footprint and data-dir free space into the
+/// snapshot-health tracker. Records NO snapshot outcome, so it is safe to run
+/// on any cadence (and when snapshots are disabled entirely).
+fn sample_storage_usage(
+    health: &snapshot_health::SnapshotHealth,
+    shared: &seglog::SegShared,
+    quarantined: Option<u64>,
+    thresholds: &snapshot_health::HealthThresholds,
+) {
+    if let Some(q) = quarantined {
+        health.set_quarantined_orphans(q);
+    }
+    let (segments, bytes) = shared.uncompacted_usage();
+    health.set_journal_usage(segments, bytes);
+    health.set_disk(disk_space_bytes(&shared.dir));
+    log_health_alert_transitions(health, thresholds);
+}
+
+/// Logs each degraded cause once on entry (WARN) and once on exit (INFO).
+/// Edge-triggered via [`SnapshotHealth::alert_transitions`](snapshot_health::SnapshotHealth::alert_transitions),
+/// so calling it from both the storage sampler and the snapshot tick never
+/// double-logs, and a breach surfaces even with snapshots disabled (#1385).
+fn log_health_alert_transitions(
+    health: &snapshot_health::SnapshotHealth,
+    thresholds: &snapshot_health::HealthThresholds,
+) {
+    let (entered, cleared) = health.alert_transitions(thresholds);
+    for (cause, reason) in entered {
+        tracing::warn!(cause = cause.code(), "snapshot health DEGRADED: {reason}");
+    }
+    for cause in cleared {
+        tracing::info!(cause = cause.code(), "snapshot health recovered");
+    }
+}
+
+/// Seeds the storage gauges synchronously (so `/health` reflects an existing
+/// backlog / low disk before the first request) and keeps them fresh on a
+/// fixed cadence decoupled from the snapshot interval — with
+/// `NANOBPMN_SNAPSHOT_INTERVAL_MS=0`, or before the first delayed snapshot
+/// tick, a breached threshold must still surface (#1385).
+///
+/// The quarantined-orphan count is refreshed here too (from the owned engine
+/// handles), not only on snapshot ticks, so it is correct with snapshots
+/// disabled. The synchronous seed leaves it untouched (reading it needs the
+/// engine writer); the first, immediate async tick fills it in.
+///
+/// Each tick samples disk/backlog BEFORE awaiting the engine actors: a
+/// long-running snapshot fold or rotation wait holds an actor query pending,
+/// and the storage gauges must keep refreshing while it does — otherwise
+/// `/health` and the disk guards sit stale while other partitions keep growing
+/// the journal. The quarantine count trails by the actor's queue latency and
+/// is applied whenever the query returns.
+fn spawn_storage_usage_sampler(shared: Arc<seglog::SegShared>, handles: Vec<DeepthiHandle>) {
+    let health = snapshot_health::global();
+    sample_storage_usage(
+        health,
+        &shared,
+        None,
+        &snapshot_health::HealthThresholds::from_env(),
+    );
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(STORAGE_USAGE_SAMPLE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            // Disk/backlog first: no actor involvement, so a busy engine
+            // cannot stall the storage-health refresh.
+            sample_storage_usage(
+                health,
+                &shared,
+                None,
+                &snapshot_health::HealthThresholds::from_env(),
+            );
+            // Then the actor query; the count updates whenever it returns.
+            let (quarantined, _) = journal_quarantine_state(&handles).await;
+            health.set_quarantined_orphans(quarantined);
+        }
+    });
+}
+
+/// Sums quarantined off-heap orphans and collects (sorted, deduped) snapshot
+/// blockers across `handles`. The single source for both the storage sampler
+/// and the snapshot tick (#1385).
+async fn journal_quarantine_state(
+    handles: &[DeepthiHandle],
+) -> (u64, Vec<nanobpmn_engine_core::Key>) {
+    let mut quarantined = 0u64;
+    let mut blockers = Vec::new();
+    for handle in handles {
+        let (q, b) = handle
+            .with(|journal| {
+                (
+                    journal.quarantined_orphans().len() as u64,
+                    journal.snapshot_blockers(),
+                )
+            })
+            .await;
+        quarantined += q;
+        blockers.extend(b);
+    }
+    blockers.sort_unstable();
+    blockers.dedup();
+    (quarantined, blockers)
+}
+
+/// Feeds one snapshot-maintenance tick's outcome into the snapshot-health
+/// tracker (#1385) and does the tick's logging: a failure is logged only when
+/// [`SnapshotHealth::record_failure`](snapshot_health::SnapshotHealth::record_failure)
+/// says it is news (first of a streak, changed reason/blockers, or a periodic
+/// reminder), a recovery once, and each degraded cause once on entry/exit.
+/// Shared by the single- and multi-partition snapshot loops so both report
+/// identically.
+async fn record_snapshot_health_tick(
+    health: &snapshot_health::SnapshotHealth,
+    handles: &[DeepthiHandle],
+    shared: &seglog::SegShared,
+    outcome: Result<(), String>,
+) {
+    let now = std::time::Instant::now();
+    let (quarantined, blockers) = journal_quarantine_state(handles).await;
+    let (segments, bytes) = shared.uncompacted_usage();
+    let disk = disk_space_bytes(&shared.dir);
+    apply_snapshot_health_tick(
+        health,
+        now,
+        quarantined,
+        (segments, bytes),
+        disk,
+        outcome.map_err(|reason| (reason, blockers)),
+        &snapshot_health::HealthThresholds::from_env(),
+    );
+}
+
+/// The synchronous core of [`record_snapshot_health_tick`]: updates the
+/// tracker from already-sampled inputs and logs. Split out so the tick's
+/// state machine is tested deterministically (injected `now`, usage, disk).
+fn apply_snapshot_health_tick(
+    health: &snapshot_health::SnapshotHealth,
+    now: std::time::Instant,
+    quarantined: u64,
+    (segments, bytes): (u64, u64),
+    disk: Option<(u64, u64)>,
+    outcome: Result<(), (String, Vec<nanobpmn_engine_core::Key>)>,
+    thresholds: &snapshot_health::HealthThresholds,
+) {
+    health.set_quarantined_orphans(quarantined);
+    health.set_journal_usage(segments, bytes);
+    health.set_disk(disk);
+    match outcome {
+        Ok(()) => {
+            if health.record_success(now) {
+                tracing::info!("journal snapshots recovered; compaction resumed");
+            }
+        }
+        Err((reason, blockers)) => {
+            let failures_before = health.report(now, thresholds).consecutive_failures;
+            if health.record_failure(now, &reason, blockers.clone()) {
+                tracing::warn!(
+                    consecutive_failures = failures_before + 1,
+                    blocking_keys = ?blockers,
+                    "journal snapshot failed: {reason} (repeats are suppressed; see GET /health)"
+                );
+            }
+        }
+    }
+    log_health_alert_transitions(health, thresholds);
 }
 
 #[allow(
@@ -24470,6 +25336,436 @@ fn adhoc_event_kind(ev: &Event) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+mod snapshot_health_tick_tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+
+    fn thresholds() -> snapshot_health::HealthThresholds {
+        snapshot_health::HealthThresholds {
+            degraded_after_failures: 2,
+            uncompacted_bytes_max: 10_000,
+            disk_free_min_percent: 10.0,
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nano-1385-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    // #1385: a streak of fail-closed ticks (the #1383 mode) degrades /health
+    // with 503 naming the blocker; the next successful tick returns it to 200.
+    #[test]
+    fn failing_ticks_degrade_health_to_503_and_success_recovers() {
+        let h = snapshot_health::SnapshotHealth::new();
+        let t = thresholds();
+        let base = Instant::now();
+        h.start(base);
+        for i in 1..=3u64 {
+            apply_snapshot_health_tick(
+                &h,
+                base + Duration::from_secs(i * 60),
+                1,
+                (4, 500),
+                Some((50, 100)),
+                Err((SNAPSHOT_CAPTURE_ABORTED.to_string(), vec![7])),
+                &t,
+            );
+        }
+        let r = h.report(base + Duration::from_secs(180), &t);
+        assert!(r.is_degraded(), "{r:?}");
+        assert_eq!(r.blocking_keys, vec![7]);
+        assert_eq!(r.quarantined_orphans, 1);
+        assert_eq!(r.last_success_age_seconds, Some(180));
+        assert_eq!(
+            health_response(&r).status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(h.failure_logs_suppressed(), 2, "one log line per streak");
+
+        apply_snapshot_health_tick(
+            &h,
+            base + Duration::from_secs(240),
+            1,
+            (1, 100),
+            Some((50, 100)),
+            Ok(()),
+            &t,
+        );
+        let r = h.report(base + Duration::from_secs(240), &t);
+        assert_eq!(r.status, "healthy");
+        assert_eq!(health_response(&r).status(), StatusCode::OK);
+    }
+
+    // #1385 disk guard across a crash/restart: the uncompacted footprint is
+    // read from DISK, so a node restarted over a journal that stopped
+    // compacting reports (and degrades on) the backlog immediately rather than
+    // starting from a falsely clean in-memory zero. Drives the real async tick
+    // against a real segmented journal behind an engine actor.
+    #[tokio::test]
+    async fn restarted_node_reports_pre_crash_uncompacted_backlog() {
+        let dir = scratch("restart");
+        {
+            let (mut journal, _recovery) =
+                journal::Journal::open_segmented(&dir).expect("open segmented");
+            let _ = journal
+                .apply_command(Command::DeployProcess(
+                    nanobpmn_engine_core::ProcessBuilder::new("p")
+                        .start_event("s")
+                        .end_event("e")
+                        .connect("s", "e")
+                        .build()
+                        .unwrap(),
+                ))
+                .unwrap();
+            for _ in 0..50 {
+                let _ = journal
+                    .apply_command(Command::create_instance("p"))
+                    .unwrap();
+            }
+        } // crash: no snapshot was ever taken, nothing was compacted.
+
+        let (journal, recovery) = journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        let shared = Arc::clone(&recovery.shared);
+        let handle = DeepthiHandle::spawn(journal, 0, None);
+        let h = snapshot_health::SnapshotHealth::new();
+        h.start(Instant::now());
+        record_snapshot_health_tick(
+            &h,
+            std::slice::from_ref(&handle),
+            &shared,
+            Err(SNAPSHOT_CAPTURE_ABORTED.to_string()),
+        )
+        .await;
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(
+            r.uncompacted_bytes > 1,
+            "pre-crash journal bytes seen: {r:?}"
+        );
+        assert!(r.uncompacted_segments >= 1);
+        assert_eq!(r.consecutive_failures, 1);
+        assert!(
+            r.blocking_keys.is_empty(),
+            "no payload blocker in this journal"
+        );
+        assert_eq!(r.causes, vec!["journal_uncompacted_bytes"]);
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1385: the storage sampler surfaces a journal backlog WITHOUT any
+    /// snapshot tick (snapshots disabled / before the first tick) and records
+    /// no snapshot outcome.
+    #[test]
+    fn storage_sampler_surfaces_backlog_without_a_snapshot_tick() {
+        let dir = std::env::temp_dir().join(format!(
+            "nano-sampler-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (mut journal, recovery) =
+            journal::Journal::open_segmented(&dir).expect("open segmented");
+        // Await the commit so the deploy is fsynced to the segment BEFORE the
+        // sampler reads its on-disk length below — otherwise the sampler races
+        // the background writer and can observe a zero-length active segment
+        // (#1466).
+        let (_, commit) = journal
+            .apply_command(Command::DeployProcess(
+                nanobpmn_engine_core::ProcessBuilder::new("p")
+                    .start_event("s")
+                    .end_event("e")
+                    .connect("s", "e")
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        commit.blocking_wait();
+        let h = snapshot_health::SnapshotHealth::new();
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        sample_storage_usage(&h, &recovery.shared, Some(2), &tiny_budget);
+        // The sampler itself logs the entry transition (edge-triggered), so a
+        // breach is logged even with snapshots disabled: nothing is left
+        // pending for a later snapshot tick to log.
+        let (entered, _) = h.alert_transitions(&tiny_budget);
+        assert!(entered.is_empty(), "sampler consumed the entry transition");
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(r.uncompacted_bytes > 1, "backlog seen: {r:?}");
+        assert_eq!(r.consecutive_failures, 0, "no snapshot outcome recorded");
+        // Quarantine count is refreshed by the sampler, not only by snapshot
+        // ticks, so it is correct with snapshots disabled.
+        assert_eq!(
+            r.quarantined_orphans, 2,
+            "sampler refreshed quarantine count"
+        );
+        assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
+        drop(journal);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1385: a busy engine actor (a long snapshot fold / rotation wait holds
+    /// its quarantine query pending) must NOT stall the disk/backlog refresh —
+    /// the sampler applies those measurements before awaiting the actor, so
+    /// `/health` and the disk guards never sit stale behind it.
+    #[tokio::test]
+    async fn storage_sampler_refreshes_usage_while_an_actor_query_is_pending() {
+        let dir = scratch("sampler-pending-actor");
+        let (mut journal, recovery) =
+            journal::Journal::open_segmented(&dir).expect("open segmented");
+        // Await the commit so the deploy is fsynced to the segment BEFORE the
+        // sampler reads its on-disk length below — otherwise the sampler races
+        // the background writer and can observe a zero-length active segment
+        // (#1466). Async test, so use the async `wait` (not `blocking_wait`).
+        let (_, commit) = journal
+            .apply_command(Command::DeployProcess(
+                nanobpmn_engine_core::ProcessBuilder::new("p")
+                    .start_event("s")
+                    .end_event("e")
+                    .connect("s", "e")
+                    .build()
+                    .unwrap(),
+            ))
+            .unwrap();
+        commit.wait().await;
+        let handle = DeepthiHandle::spawn(journal, 0, None);
+
+        // Occupy the single writer with a job that parks until released, then
+        // enqueue the sampler's quarantine query behind it: the query cannot
+        // return until the barrier opens.
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        // `spawn_job` enqueues without awaiting: awaiting `with` here would
+        // deadlock, since the barrier's other party is the release below.
+        handle.spawn_job({
+            let hold = Arc::clone(&hold);
+            move |_journal| {
+                hold.wait();
+            }
+        });
+        let query = tokio::spawn({
+            let handle = handle.clone();
+            async move { journal_quarantine_state(std::slice::from_ref(&handle)).await }
+        });
+        tokio::task::yield_now().await;
+
+        // The sampler's disk/backlog half does not touch the actor, so it
+        // lands even with the query above still queued behind the barrier.
+        let h = snapshot_health::SnapshotHealth::new();
+        let tiny_budget = snapshot_health::HealthThresholds {
+            uncompacted_bytes_max: 1,
+            ..thresholds()
+        };
+        sample_storage_usage(&h, &recovery.shared, None, &tiny_budget);
+        let r = h.report(Instant::now(), &tiny_budget);
+        assert!(
+            r.uncompacted_bytes > 1,
+            "backlog refreshed despite the pending actor query: {r:?}"
+        );
+        assert!(r.causes.contains(&"journal_uncompacted_bytes"), "{r:?}");
+        assert!(
+            !query.is_finished(),
+            "quarantine query is still parked behind the held actor"
+        );
+
+        // Release the actor: the pending query now completes and the sampler
+        // applies the quarantine count independently of the usage sample.
+        hold.wait();
+        let (quarantined, _) = query.await.expect("quarantine query answered");
+        h.set_quarantined_orphans(quarantined);
+        assert_eq!(
+            h.report(Instant::now(), &tiny_budget).quarantined_orphans,
+            0
+        );
+        drop(handle);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_space_reads_the_data_volume() {
+        let (free, total) = disk_space_bytes(&std::env::temp_dir()).expect("statvfs");
+        assert!(total > 0 && free <= total);
+        assert_eq!(
+            detect_disk_capacity_bytes(&std::env::temp_dir()),
+            Some(total)
+        );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_blockers_admin_tests {
+    use super::*;
+
+    /// #1386: the admin report aggregates the per-partition snapshot blockers
+    /// and quarantined off-heap orphans into one sorted, deduplicated,
+    /// per-partition-attributed body an operator (or `c8ctl nano doctor`) can
+    /// read to learn exactly WHICH instances are blocking compaction and which
+    /// have already lost their spilled payload.
+    fn inputs(
+        blockers: &[Key],
+        observed: &[Key],
+        lost: &[Key],
+        live: &[Key],
+    ) -> PartitionOrphanInputs {
+        PartitionOrphanInputs {
+            snapshot_blockers: blockers.to_vec(),
+            observed: observed.to_vec(),
+            variables_lost: lost.to_vec(),
+            live: live.to_vec(),
+        }
+    }
+
+    #[test]
+    fn report_aggregates_blockers_and_orphans_across_partitions() {
+        let parts = vec![
+            (0u64, inputs(&[11, 12], &[101], &[], &[101])),
+            (1u64, inputs(&[12, 13], &[101, 102], &[], &[101, 102])),
+            (2u64, inputs(&[], &[], &[], &[])),
+        ];
+        let report = build_snapshot_blockers_report(&parts);
+        assert_eq!(report.snapshot_blockers, vec![11, 12, 13]);
+        assert_eq!(report.quarantined_orphans, vec![101, 102]);
+        assert_eq!(
+            report
+                .partitions
+                .iter()
+                .map(|p| (
+                    p.partition,
+                    p.snapshot_blockers.clone(),
+                    p.quarantined_orphans.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, vec![11, 12], vec![101]),
+                (1, vec![12, 13], vec![101, 102]),
+                (2, vec![], vec![]),
+            ]
+        );
+    }
+
+    /// #1386: a cancelled (no longer live) orphan drops out of the actionable
+    /// list but stays in the historical `observedOrphans`.
+    #[test]
+    fn cancelled_orphan_drops_out_of_pending_list() {
+        let report =
+            build_snapshot_blockers_report(&[(0u64, inputs(&[], &[101, 102], &[], &[102]))]);
+        assert_eq!(report.quarantined_orphans, vec![102]);
+        assert_eq!(report.partitions[0].observed_orphans, vec![101, 102]);
+    }
+
+    /// #1386: after a restart the process-local observation set is empty, but a
+    /// durable `VariablesLost` incident still surfaces the live orphan.
+    #[test]
+    fn durable_variables_lost_incident_surfaces_orphan_after_restart() {
+        let report = build_snapshot_blockers_report(&[(0u64, inputs(&[], &[], &[55, 55], &[55]))]);
+        assert_eq!(report.quarantined_orphans, vec![55]);
+        assert!(report.partitions[0].observed_orphans.is_empty());
+    }
+
+    /// #1386: the report is empty (not an error) when nothing blocks snapshots
+    /// and no orphan has been quarantined — the steady healthy state.
+    #[test]
+    fn report_is_empty_when_healthy() {
+        let report = build_snapshot_blockers_report(&[(0u64, PartitionOrphanInputs::default())]);
+        assert!(report.snapshot_blockers.is_empty());
+        assert!(report.quarantined_orphans.is_empty());
+        assert_eq!(report.partitions.len(), 1);
+    }
+
+    /// #1386: the cancel outcome maps to an operator-meaningful HTTP status —
+    /// 200 when the orphan was cancelled, 404 when no such active instance,
+    /// 503 on a transient leader transition (retryable), 500 otherwise.
+    #[test]
+    fn cancel_outcome_maps_to_http_status() {
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::Canceled),
+            StatusCode::OK
+        );
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::NotFound("x".into())),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::Unavailable("x".into())),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            snapshot_blocker_cancel_status(&CancelInstanceOutcome::Internal("x".into())),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// #1386: the report serializes to the JSON shape the CLI/runbook document —
+    /// top-level `snapshotBlockers` / `quarantinedOrphans` plus a per-partition
+    /// breakdown — so the contract is pinned against drift.
+    #[test]
+    fn report_serializes_to_the_documented_json_shape() {
+        // A key above 2^53 (JS safe-integer range) must survive exactly.
+        let big: Key = 9_007_199_254_740_993;
+        let report = build_snapshot_blockers_report(&[(0u64, inputs(&[7], &[big], &[], &[big]))]);
+        let json = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(json["snapshotBlockers"], serde_json::json!(["7"]));
+        assert_eq!(
+            json["quarantinedOrphans"],
+            serde_json::json!(["9007199254740993"])
+        );
+        assert_eq!(
+            json["partitions"],
+            serde_json::json!([{
+                "partition": 0,
+                "snapshotBlockers": ["7"],
+                "quarantinedOrphans": ["9007199254740993"],
+                "observedOrphans": ["9007199254740993"],
+            }])
+        );
+    }
+
+    /// #1386: the async report reader runs against a real `ServerImpl` (every
+    /// owned partition's journal behind its engine actor) and returns a
+    /// well-formed report — empty in the healthy steady state, with one entry
+    /// per owned partition. Drives the same `handle.with(|journal| …)` path the
+    /// HTTP handler uses, so the read half is proven end-to-end, not just at
+    /// the pure-function level.
+    #[tokio::test]
+    async fn report_reader_fans_out_across_owned_partitions() {
+        let server = build_server_in_memory(
+            vec![
+                Journal::in_memory_partition(0),
+                Journal::in_memory_partition(1),
+            ],
+            cluster::Topology::single(2),
+        );
+        let report = snapshot_blockers_report(&server).await;
+        // Healthy: nothing blocks snapshots, no orphan quarantined.
+        assert!(report.snapshot_blockers.is_empty(), "{report:?}");
+        assert!(report.quarantined_orphans.is_empty(), "{report:?}");
+        // One entry per owned partition, attributed by partition id.
+        assert_eq!(
+            report
+                .partitions
+                .iter()
+                .map(|p| p.partition)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+    }
+}
+
+#[cfg(test)]
 mod adhoc_metrics_tests {
     use super::Event;
     use super::adhoc_event_kind;
@@ -25046,6 +26342,10 @@ async fn main() {
                 tracing::info!("started a fresh journal at {}", journal_path.display());
             }
 
+            if let Some(shared) = seg_shared.clone() {
+                spawn_storage_usage_sampler(shared, server.engine.all().to_vec());
+            }
+
             // Bounded-disk maintenance: periodically snapshot the engine, seal the
             // active segment at the snapshot boundary, and compact (delete) sealed
             // segments the snapshot AND the read model no longer need. Only the
@@ -25055,6 +26355,8 @@ async fn main() {
                 && let Some(handle) = server.engine.all().first().cloned()
             {
                 let store = server.store.clone();
+                let health = snapshot_health::global();
+                health.start(std::time::Instant::now());
                 tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
                     // Skip the immediate first tick.
@@ -25070,10 +26372,23 @@ async fn main() {
                         ticker.tick().await;
                         let snapped = handle.with(|journal| journal.snapshot_and_rotate()).await;
                         let Some((snap, covered)) = snapped else {
+                            record_snapshot_health_tick(
+                                health,
+                                std::slice::from_ref(&handle),
+                                &shared,
+                                Err(SNAPSHOT_CAPTURE_ABORTED.to_string()),
+                            )
+                            .await;
                             continue;
                         };
                         if let Err(e) = seglog::write_snapshot(&shared.dir, snap, covered) {
-                            tracing::warn!("journal snapshot write failed: {e}");
+                            record_snapshot_health_tick(
+                                health,
+                                std::slice::from_ref(&handle),
+                                &shared,
+                                Err(format!("journal snapshot write failed: {e}")),
+                            )
+                            .await;
                             continue;
                         }
                         // Never delete a segment the read model has not yet
@@ -25096,12 +26411,23 @@ async fn main() {
                             );
                         }
                         prev_covered = covered;
+                        record_snapshot_health_tick(
+                            health,
+                            std::slice::from_ref(&handle),
+                            &shared,
+                            Ok(()),
+                        )
+                        .await;
                     }
                 });
                 tracing::info!(
                     "segmented journal enabled (snapshot/compaction every {:?})",
                     interval
                 );
+            }
+
+            if let Some((shared, _)) = multi_seg.clone() {
+                spawn_storage_usage_sampler(shared, server.engine.all().to_vec());
             }
 
             // Bounded-disk maintenance for the single-node multi-partition
@@ -25116,6 +26442,8 @@ async fn main() {
                 let store = server.store.clone();
                 let lean = varstore.is_some();
                 let varstore = varstore.clone();
+                let health = snapshot_health::global();
+                health.start(std::time::Instant::now());
                 tokio::spawn(async move {
                     let mut ticker = tokio::time::interval(interval);
                     // Skip the immediate first tick.
@@ -25147,7 +26475,9 @@ async fn main() {
                         // covered boundary once this partition's variables are
                         // durable, gating compaction on the var store too.
                         let mut var_position = vec![u64::MAX; num_partitions as usize];
-                        let mut ok = true;
+                        // The first failure of this tick, for snapshot health
+                        // (#1385); `None` = every partition snapshotted.
+                        let mut failure: Option<String> = None;
                         for handle in &handles {
                             let pid = handle.with(|journal| journal.partition_id()).await;
                             if let Some(vs) = &varstore {
@@ -25167,10 +26497,9 @@ async fn main() {
                                         if let Err(e) =
                                             vs.checkpoint(pid, covered_p, &ups, &forgets)
                                         {
-                                            tracing::warn!(
+                                            failure = Some(format!(
                                                 "var store checkpoint failed (partition {pid}): {e}"
-                                            );
-                                            ok = false;
+                                            ));
                                             break;
                                         }
                                         if (pid as usize) < covered.len() {
@@ -25180,7 +26509,9 @@ async fn main() {
                                         entries.push((pid, covered_p, snap));
                                     }
                                     None => {
-                                        ok = false;
+                                        failure = Some(format!(
+                                            "{SNAPSHOT_CAPTURE_ABORTED} (partition {pid})"
+                                        ));
                                         break;
                                     }
                                 }
@@ -25193,13 +26524,17 @@ async fn main() {
                                         entries.push((pid, covered_p, snap));
                                     }
                                     None => {
-                                        ok = false;
+                                        failure = Some(format!(
+                                            "{SNAPSHOT_CAPTURE_ABORTED} (partition {pid})"
+                                        ));
                                         break;
                                     }
                                 }
                             }
                         }
-                        if !ok {
+                        if let Some(reason) = failure {
+                            record_snapshot_health_tick(health, &handles, &shared, Err(reason))
+                                .await;
                             continue;
                         }
                         // The covered watermarks for the partitions THIS node owns
@@ -25211,7 +26546,13 @@ async fn main() {
                         // floor at 0 forever (unbounded cold archive, #1076).
                         let owned_covered: Vec<u64> = entries.iter().map(|e| e.1).collect();
                         if let Err(e) = seglog::write_multi_snapshot(&shared.dir, entries) {
-                            tracing::warn!("multi-partition snapshot write failed: {e}");
+                            record_snapshot_health_tick(
+                                health,
+                                &handles,
+                                &shared,
+                                Err(format!("multi-partition snapshot write failed: {e}")),
+                            )
+                            .await;
                             continue;
                         }
                         let exported = store.exported_watermarks(num_partitions as usize);
@@ -25244,6 +26585,7 @@ async fn main() {
                             );
                         }
                         prev_floor = seglog::cold_prune_floor(&owned_covered);
+                        record_snapshot_health_tick(health, &handles, &shared, Ok(())).await;
 
                         // Bound the durable var-store WAL: truncate it back to zero
                         // on its own cadence so a sustained write load can't grow it
@@ -25430,16 +26772,23 @@ async fn main() {
     // peer-pressure view + own create-load index — used to confirm whether a
     // rejoining peer is pinned out of create placement by a stale SHED reading).
     let peers_dbg = server.clone();
+    // Captured for the #1386 snapshot-blockers admin routes (list blockers /
+    // quarantined orphans; cancel a quarantined orphan).
+    let snapshot_blockers_srv = server.clone();
+    let snapshot_blocker_cancel_srv = server.clone();
 
     // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
     // (e.g. on an unrecoverable storage error) and then silently stop applying,
     // stranding that partition's share of instances/jobs — the mechanism behind
-    // the RF>1 completion-freeze. This makes the failure LOUD: it polls every
-    // partition on a slow cadence, publishes the `nanobpm_raft_partition_shutdown`
-    // gauge, and logs a rate-limited ERROR (once per partition per shutdown edge)
-    // so a dead partition can never again fail silently.
+    // the RF>1 completion-freeze. This makes the failure LOUD (the
+    // `nanobpm_raft_partition_shutdown` gauge + a rate-limited ERROR) AND
+    // self-healing (issue #53): on the shutdown edge it rebuilds the partition's
+    // member in the registry so the partition rejoins its group instead of
+    // waiting for a manual process restart. The gauge returns to 0 once the
+    // rebuilt member is live.
     {
         let reg = server.raft_registry().clone();
+        let recover_server = server.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             let mut alarmed: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -25453,6 +26802,12 @@ async fn main() {
                     let down = part.is_shutdown();
                     metrics::set_raft_partition_shutdown(pid, down);
                     if down {
+                        // The ERROR log is edge-triggered (once per shutdown edge,
+                        // via `alarmed`); the RECOVERY attempt is not — a failed
+                        // rebuild leaves the partition Shutdown, so it must be
+                        // retried on EVERY down tick, not gated by `alarmed`
+                        // (otherwise one transient failure strands the partition
+                        // until the next process restart — issue #53 review).
                         if alarmed.insert(pid) {
                             let m = part.raft.metrics().borrow().clone();
                             let applied = m.last_applied.map(|l| l.index as i128).unwrap_or(-1);
@@ -25464,8 +26819,15 @@ async fn main() {
                                 applied = applied as i64,
                                 "raft partition core is SHUTDOWN and no longer applying; \
                                  its instances/jobs are stranded (RF>1 completion-freeze) — \
-                                 the node must be restarted (clean) to recover this partition"
+                                 auto-recovering the partition in place (issue #53)"
                             );
+                        }
+                        // Rebuild the dead partition in the registry so it
+                        // rejoins its group. A rebuild failure is retried on
+                        // the next tick (the partition stays down meanwhile).
+                        if recover_server.recover_shutdown_partition(pid).await {
+                            alarmed.remove(&pid);
+                            metrics::set_raft_partition_shutdown(pid, false);
                         }
                     } else {
                         alarmed.remove(&pid);
@@ -25543,6 +26905,24 @@ async fn main() {
         .route(
             "/v2/system/memory",
             axum::routing::get(system_memory_handler),
+        )
+        // #1386 snapshot-blockers admin tooling: list which instances block
+        // compaction / were quarantined as off-heap orphans, and cancel a
+        // quarantined orphan so snapshots can fold again. The operator runbook
+        // for a degraded `GET /health` (docs/runbook-snapshot-blockers.md).
+        .route(
+            "/debug/snapshot-blockers",
+            axum::routing::get(move || {
+                let srv = snapshot_blockers_srv.clone();
+                async move { snapshot_blockers_handler(srv).await }
+            }),
+        )
+        .route(
+            "/debug/snapshot-blockers/{key}/cancel",
+            axum::routing::post(move |path: axum::extract::Path<Key>| {
+                let srv = snapshot_blocker_cancel_srv.clone();
+                async move { snapshot_blocker_cancel_handler(srv, path).await }
+            }),
         );
 
     // Spec-generated response-contract guard (issue #1011): validate every
@@ -25557,6 +26937,10 @@ async fn main() {
 
     // disabled it 404s, removing the endpoint from the attack surface. Computed
     // on scrape, so it costs nothing at steady state.
+    // Snapshot-health status (#1385): always mounted (an operator must be able
+    // to see a degraded node even with Prometheus scraping disabled).
+    app = app.route("/health", axum::routing::get(health_handler));
+
     if obs_config.metrics {
         app = app.route(
             "/metrics",
@@ -34271,6 +35655,417 @@ mod clustered_startup_tests {
         part1.raft.shutdown().await.expect("clean shutdown node 1");
     }
 
+    /// A multi-node RF=1 in-memory cluster has no replica to backfill a
+    /// partition from, so a Shutdown core there must NOT be "recovered" onto an
+    /// empty uninitialized member (silent data loss + permanent unavailability
+    /// reported as recovered). Guard keys on `effective_rf() == 1`, not cluster
+    /// size (issue #53 review).
+    #[tokio::test]
+    async fn a_shutdown_rf1_in_memory_partition_on_a_multi_node_cluster_is_not_recovered() {
+        use std::collections::BTreeMap;
+
+        use openraft::BasicNode;
+
+        use crate::raft::RaftPartition;
+
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec!["http://unused-0".into(), "http://unused-1".into()],
+            num_partitions: 4,
+            replication_factor: 1,
+        };
+        assert!(!topology.is_single_node());
+        assert_eq!(topology.effective_rf(), 1);
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let node0 = build_server_in_memory(journals, topology);
+        assert!(
+            raft_log_dir_for(0).is_none(),
+            "test requires in-memory mode"
+        );
+
+        let part0 = Arc::new(
+            RaftPartition::bootstrap_member(
+                0,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                node0.raft_transport(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot raft member on node 0"),
+        );
+        node0.raft_registry().insert(part0.clone());
+        let mut members = BTreeMap::new();
+        members.insert(0u64, BasicNode::new("http://unused-0".to_string()));
+        part0
+            .initialize(members)
+            .await
+            .expect("form sole-voter group");
+        part0.raft.shutdown().await.expect("drive core to shutdown");
+        assert!(part0.is_shutdown());
+
+        assert!(
+            !node0.recover_shutdown_partition(0).await,
+            "an RF=1 in-memory partition must not be recovered onto an empty member"
+        );
+        let still = node0.raft_registry().get(0).expect("p0 still registered");
+        assert!(
+            Arc::ptr_eq(&still, &part0),
+            "the dead core must not be swapped for an empty uninitialized member"
+        );
+    }
+    /// Two served in-memory nodes hosting partition 0, node 0 leading, in the
+    /// given replication `mode` (quorum: 2 voters; leader-durable: voter +
+    /// learner). Shared by the #53 Shutdown-recovery tests.
+    async fn two_node_p0_group(
+        mode: ReplicationMode,
+    ) -> (
+        ServerImpl,
+        ServerImpl,
+        Arc<crate::raft::RaftPartition>,
+        Arc<crate::raft::RaftPartition>,
+    ) {
+        use std::collections::BTreeMap;
+
+        use openraft::BasicNode;
+
+        use crate::raft::RaftPartition;
+
+        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 0");
+        let p0 = l0.local_addr().expect("addr0").port();
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind node 1");
+        let p1 = l1.local_addr().expect("addr1").port();
+        let peers = vec![
+            format!("http://127.0.0.1:{p0}"),
+            format!("http://127.0.0.1:{p1}"),
+        ];
+
+        let build_node = |node_id: u32| {
+            let topology = cluster::Topology {
+                node_id,
+                peers: peers.clone(),
+                num_partitions: 4,
+                replication_factor: 2,
+            };
+            let journals: Vec<Journal> = topology
+                .local_partitions()
+                .iter()
+                .map(|p| Journal::in_memory_partition(*p))
+                .collect();
+            build_server_in_memory(journals, topology)
+        };
+        let mut node0 = build_node(0);
+        let mut node1 = build_node(1);
+        node0.replication_mode = mode;
+        node1.replication_mode = mode;
+
+        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
+            let registry = falcon::Registry::new();
+            falcon::spawn_dispatcher(server.clone(), registry.clone());
+            let app = peer_facing_app(server.clone(), registry);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+        }
+
+        // Host a 2-voter group for partition 0 on both nodes; node 0 leads.
+        let part0 = Arc::new(
+            RaftPartition::bootstrap_member(
+                0,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                node0.raft_transport(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot raft member on node 0"),
+        );
+        node0.raft_registry().insert(part0.clone());
+        let part1 = Arc::new(
+            RaftPartition::bootstrap_member(
+                1,
+                0,
+                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+                node1.raft_transport(),
+                None,
+                false,
+            )
+            .await
+            .expect("boot raft member on node 1"),
+        );
+        node1.raft_registry().insert(part1.clone());
+
+        // Quorum: a 2-VOTER group. Leader-durable: node 0 is the sole voter and
+        // node 1 a non-voting learner (ADR 0003), the shape that mode forms.
+        let mut members = BTreeMap::new();
+        members.insert(0u64, BasicNode::new(peers[0].clone()));
+        if mode == ReplicationMode::Quorum {
+            members.insert(1u64, BasicNode::new(peers[1].clone()));
+        }
+        part0.initialize(members).await.expect("form group");
+
+        // Wait for node 0 to be the established leader.
+        let mut leader_ok = false;
+        for _ in 0..300 {
+            if part0.raft.metrics().borrow().current_leader == Some(0) {
+                leader_ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leader_ok, "node 0 should win the initial election");
+        if mode == ReplicationMode::LeaderDurable {
+            part0
+                .add_learner_blocking(1, BasicNode::new(peers[1].clone()))
+                .await
+                .expect("add node 1 as a learner");
+        }
+        (node0, node1, part0, part1)
+    }
+
+    /// #53 review: an in-memory QUORUM voter must never be rebuilt empty. With no
+    /// durable log to resume, the rebuilt member would rejoin as an amnesiac
+    /// voter — no log, no persisted vote — able to vote twice in a term or help
+    /// elect a stale replica and discard acknowledged writes. Recovery must
+    /// refuse and keep the dead core registered (loud, for an operator restart).
+    #[tokio::test]
+    async fn an_in_memory_quorum_voter_is_not_rebuilt_empty() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::Quorum).await;
+        part1
+            .raft
+            .shutdown()
+            .await
+            .expect("drive the voter to shutdown");
+        assert!(part1.is_shutdown(), "the voter's core reports Shutdown");
+
+        assert!(
+            !node1.recover_shutdown_partition(0).await,
+            "an in-memory quorum voter must not be recovered onto an empty member"
+        );
+        let still = node1.raft_registry().get(0).expect("p0 still registered");
+        assert!(
+            Arc::ptr_eq(&still, &part1),
+            "the dead voter must not be swapped for an empty member"
+        );
+        assert!(
+            node1.recover_shutdown_partitions_once().await.is_empty(),
+            "the supervisor pass must not recover it either"
+        );
+
+        part0.raft.shutdown().await.ok();
+    }
+
+    /// Issue #53: a partition whose Raft core enters `Shutdown` must be
+    /// auto-recovered in place (rebuilt in the registry so it rejoins its group),
+    /// not left dead until a manual process restart.
+    ///
+    /// Two served nodes host partition 0 in leader-durable mode (node 0 the sole
+    /// voter and leader, node 1 a disposable learner; an in-memory quorum voter
+    /// is refused instead, see `an_in_memory_quorum_voter_is_not_rebuilt_empty`).
+    /// The follower (node 1) core is driven to `Shutdown` (a graceful `shutdown()`
+    /// terminates the core, which reports `ServerState::Shutdown` — the same
+    /// terminal state a `Fatal` storage error produces). Before the fix the
+    /// partition stays dead forever: `applied` freezes and the registry keeps the
+    /// corpse. The recovery supervisor must rebuild it so it catches back up and
+    /// applies new entries.
+    #[tokio::test]
+    async fn a_shutdown_partition_is_auto_recovered_in_place() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+
+        // Commit one entry so the group has real state the follower must re-attain.
+        let proc = ProcessBuilder::new("survives-recovery")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc), 1_000)
+            .await
+            .expect("propose deploy via the leader");
+
+        // Drive the FOLLOWER (node 1) core into Shutdown. A graceful shutdown
+        // terminates the RaftCore, which reports `ServerState::Shutdown` — the
+        // same terminal state an unrecoverable `Fatal` storage error produces.
+        assert!(!part1.is_shutdown(), "follower starts healthy");
+        part1
+            .raft
+            .shutdown()
+            .await
+            .expect("drive follower to shutdown");
+        // The registry still holds the (now-dead) member; it reads Shutdown.
+        let reg_part = node1.raft_registry().get(0).expect("node 1 hosts p0");
+        assert!(
+            reg_part.is_shutdown(),
+            "the hosted member reports Shutdown after its core terminated"
+        );
+
+        // The defect: without recovery the partition stays dead. The supervisor
+        // pass must rebuild it. Run one deterministic recovery pass on node 1.
+        let recovered = node1.recover_shutdown_partitions_once().await;
+        assert!(
+            recovered.contains(&0),
+            "the shutdown partition must be recovered in place, got {recovered:?}"
+        );
+
+        // The rebuilt member is live (not Shutdown) and registered.
+        let rebuilt = node1.raft_registry().get(0).expect("node 1 still hosts p0");
+        assert!(
+            !rebuilt.is_shutdown(),
+            "the rebuilt member is a live core, not Shutdown"
+        );
+
+        // Proof of recovery: the leader commits a NEW entry after the rebuild and
+        // the rebuilt follower catches up and applies it (it rejoins the group and
+        // backfills from the leader). This is the real acceptance signal — the
+        // partition is no longer stranded.
+        let proc2 = ProcessBuilder::new("post-recovery")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc2), 2_000)
+            .await
+            .expect("propose a post-recovery deploy via the leader");
+        let target = part0
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .unwrap_or(0);
+
+        let mut caught_up = false;
+        for _ in 0..500 {
+            let idx = node1
+                .raft_registry()
+                .get(0)
+                .and_then(|p| p.raft.metrics().borrow().last_applied.map(|l| l.index))
+                .unwrap_or(0);
+            if idx >= target {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            caught_up,
+            "the rebuilt follower must catch up to the leader's applied index {target}"
+        );
+
+        // And the recovered member applied BOTH processes (no state lost across
+        // the rebuild — the leader backfilled the pre-shutdown entry too).
+        let dump = node1
+            .engine_handle_for(0)
+            .expect("node 1 has a p0 engine")
+            .with(|j| format!("{:?}", j.state()))
+            .await;
+        assert!(
+            dump.contains("survives-recovery") && dump.contains("post-recovery"),
+            "the recovered follower holds both the pre- and post-recovery deployments"
+        );
+
+        part0.raft.shutdown().await.ok();
+        if let Some(p) = node1.raft_registry().get(0) {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
+    /// Defect-class guard (issue #53 follow-through): rebuilding a follower as a
+    /// fresh receiver reverts its local log, and the leader's replication
+    /// progress must NOT panic on that reversion (openraft's
+    /// `follower log reversion is not allowed` guard, loosened via the
+    /// `loosen-follower-log-revert` feature). Before the loosening, recovering one
+    /// partition cascaded into the LEADER's death (a `Panicked` Fatal) — turning
+    /// a single-partition failure into a two-partition outage. This drives the
+    /// exact reversion and asserts the leader survives and keeps serving.
+    #[tokio::test]
+    async fn the_leader_survives_a_rebuilt_followers_log_reversion() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
+
+        // Commit several entries so the follower has a non-trivial log to revert.
+        for i in 0..3u64 {
+            let proc = ProcessBuilder::new(format!("p{i}"))
+                .start_event("s")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .expect("valid process");
+            part0
+                .propose(Command::DeployProcess(proc), 1_000 + i)
+                .await
+                .expect("propose");
+        }
+        // The follower must genuinely hold these entries (the leader's progress
+        // records a non-zero `matching` for it), or the rebuild below is no
+        // reversion at all. A bounded metrics-watch barrier, not a sleep loop.
+        let leader_idx = part0.raft.metrics().borrow().last_applied.map(|l| l.index);
+        part1
+            .raft
+            .wait(Some(std::time::Duration::from_secs(10)))
+            .applied_index_at_least(leader_idx, "follower catches up before the rebuild")
+            .await
+            .expect("the follower applies the leader's entries before it is rebuilt");
+
+        // Rebuild the follower as a fresh receiver (empty log) — the reversion.
+        node1.recover_shutdown_partitions_once().await; // no-op: not shutdown
+        part1.raft.shutdown().await.ok();
+        assert!(
+            node1.recover_shutdown_partition(0).await,
+            "rebuild follower"
+        );
+
+        // The leader commits MORE entries against the reverted follower. Without
+        // the loosened guard this panics the leader core; with it the leader
+        // re-syncs the follower and keeps serving.
+        let proc = ProcessBuilder::new("after-revert")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        part0
+            .propose(Command::DeployProcess(proc), 9_000)
+            .await
+            .expect("the leader survives the follower's log reversion and keeps serving");
+        // In leader-durable mode the sole voter commits alone, so the proposal
+        // returning proves nothing about the reversion. Wait until the REBUILT
+        // follower has applied the new entry: that requires the leader to have
+        // replicated to it, meeting its reverted (empty) log and re-syncing it,
+        // which is exactly the path the loosened guard handles.
+        let after_idx = part0.raft.metrics().borrow().last_applied.map(|l| l.index);
+        node1
+            .raft_registry()
+            .get(0)
+            .expect("node 1 hosts the rebuilt member")
+            .raft
+            .wait(Some(std::time::Duration::from_secs(10)))
+            .applied_index_at_least(after_idx, "rebuilt follower re-syncs")
+            .await
+            .expect("the rebuilt follower re-syncs from the leader after its log reversion");
+        assert!(
+            !part0.is_shutdown(),
+            "the leader core must not panic/Shutdown on a rebuilt follower's log reversion"
+        );
+
+        part0.raft.shutdown().await.ok();
+        if let Some(p) = node1.raft_registry().get(0) {
+            p.raft.shutdown().await.ok();
+        }
+    }
+
     #[test]
     fn raft_refuses_unsegmented_journal() {
         // #1405: a Raft node on the legacy unsegmented journal fails at startup.
@@ -37512,12 +39307,302 @@ mod clustered_startup_tests {
                 .unwrap_or(false),
             "the owner reclaimed at incumbent_epoch + 1 (>= 2), not a fresh epoch-1 self-promote"
         );
+        // ONE raft lineage: the owner campaigned on the log it inherited from the
+        // incumbent (term > the incumbent's term 1), rather than discarding it and
+        // self-promoting a fresh single-voter group whose term-1 vote ties the
+        // incumbent's — the split that, once a follower-log reversion no longer
+        // panics the stale leader (#53's `loosen-follower-log-revert`), never heals.
+        let owner_core = node0.raft_registry().get(0).expect("partition 0 hosted");
+        let m = owner_core.raft.metrics().borrow().clone();
+        assert!(
+            m.current_term >= 2,
+            "the owner inherited the incumbent's lineage (term {}), not a fresh group",
+            m.current_term
+        );
+        assert!(
+            m.last_log_index.unwrap_or(0) >= 6,
+            "the owner kept the incumbent's log (last index {:?}), not a fresh log",
+            m.last_log_index
+        );
 
         for node in [&node0, &node1, &node2] {
             for p in 0..3u64 {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();
                 }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    /// A partition rebuilt as a receiver starts from a blank Raft slate — empty
+    /// log, default vote, nothing committed/applied — even when the core it
+    /// replaces led its own lineage with committed entries; and the hand-off onto
+    /// that receiver converges to one leader (issue #1454). A receiver carrying
+    /// the old committed prefix would present the new leader with a divergent
+    /// committed lineage, the Raft safety violation openraft asserts on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rebuilt_receiver_starts_empty_and_the_handoff_converges() {
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Node 0 boots as the owner of partition 0: its core carries a committed
+        // lineage (at least the initializing membership entry).
+        let old = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition 0 hosted at boot");
+        let mut committed = None;
+        for _ in 0..300 {
+            committed = old
+                .raft
+                .with_raft_state(|s| s.committed)
+                .await
+                .ok()
+                .flatten();
+            if committed.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            committed.is_some(),
+            "the owner's boot lineage has a committed entry"
+        );
+
+        // Rebuild it as a receiver of node 1: the successor must be provably empty.
+        assert!(node0.rebuild_as_receiver(0, 1).await, "rebuild succeeds");
+        let fresh = node0.raft_registry().get(0).expect("receiver registered");
+        assert!(
+            !Arc::ptr_eq(&old, &fresh),
+            "a new core replaced the old one"
+        );
+        fresh
+            .ensure_fresh_receiver_state()
+            .await
+            .expect("a rebuilt receiver starts with empty log/vote/committed state");
+        assert_eq!(
+            fresh
+                .raft
+                .with_raft_state(|s| s.committed)
+                .await
+                .expect("state"),
+            None,
+            "nothing committed on the rebuilt receiver"
+        );
+
+        // Node 1 takes the partition over, then hands it back to node 0: the
+        // hand-off onto the (rebuilt) receiver converges with node 0 leading.
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "node 1 leads partition 0 after promoting");
+        let owner_addr = node0
+            .engine
+            .topology()
+            .peer_addr(0)
+            .expect("node 0 has an address")
+            .to_string();
+        node1.handle_handoff_request(0, 0, owner_addr).await;
+        let mut owner_leads = false;
+        for _ in 0..400 {
+            if node0.i_lead_raft(0) {
+                owner_leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            owner_leads,
+            "the hand-off converges: node 0 leads partition 0"
+        );
+        assert!(
+            !node1.i_lead_raft(0),
+            "node 1 stepped down after handing off"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    /// #53 x #1455: the Shutdown auto-recovery path takes the same per-partition
+    /// rebuild lock as promote / rebuild-as-receiver, so it can never run
+    /// concurrently with them (two live cores for one partition), and it
+    /// re-checks under the lock that the core is STILL shutdown — a recovery
+    /// that queued behind a concurrent rebuild must not tear down the live core
+    /// that rebuild just installed.
+    ///
+    /// Deterministic, independent of worker scheduling: with the lock held, BOTH
+    /// futures are polled in-line and must be `Pending` with no critical section
+    /// entered (removing the lock from either path lets its first poll enter the
+    /// section → depth > 0 → fail). Then the lock is released and both complete;
+    /// the depth must peak at 1 (no overlap), and the queued recovery must not
+    /// tear down the live core the rebuild installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_recovery_is_serialized_with_rebuilds_and_skips_a_live_core() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::task::Poll;
+
+        let (node0, _node1, _node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+        let probe = node0.rebuild_depth_probe.clone();
+
+        // Kill partition 0's core so it is Shutdown (the #53 trigger).
+        let dead = node0.raft_registry().get(0).expect("partition 0 hosted");
+        dead.raft.shutdown().await.ok();
+        assert!(dead.is_shutdown());
+
+        // Hold the rebuild lock, then poll a hand-off rebuild AND the shutdown
+        // recovery in-line. Both must block on the held lock WITHOUT entering
+        // the critical section — this is what actually proves the lock (not the
+        // scheduler) serializes them: if either path dropped the lock, its first
+        // poll would enter the section and drive the depth probe above 0 here.
+        let guard = node0.partition_rebuild_lock(0).lock_owned().await;
+        let mut rebuild = Box::pin(node0.rebuild_as_receiver(0, 1));
+        let mut recover = Box::pin(node0.recover_shutdown_partition(0));
+        let polled = std::future::poll_fn(|cx| {
+            Poll::Ready((
+                rebuild.as_mut().poll(cx).is_pending(),
+                recover.as_mut().poll(cx).is_pending(),
+            ))
+        })
+        .await;
+        assert_eq!(
+            polled,
+            (true, true),
+            "both rebuild + recovery block on the held lock"
+        );
+        assert_eq!(
+            probe.depth.load(SeqCst),
+            0,
+            "neither future entered the critical section while the lock is held"
+        );
+
+        drop(guard);
+        let (rebuilt, _recovered) = tokio::join!(rebuild, recover);
+        assert!(rebuilt, "the receiver rebuild succeeded");
+        assert_eq!(
+            probe.peak.load(SeqCst),
+            1,
+            "shutdown recovery overlapped a concurrent rebuild of the same partition"
+        );
+        let live = node0.raft_registry().get(0).expect("partition 0 hosted");
+        assert!(
+            !live.is_shutdown(),
+            "exactly one live core serves partition 0"
+        );
+
+        // A recovery whose target was already replaced by a live core is a no-op:
+        // it must neither shut the live core down nor swap it out.
+        assert!(
+            !node0.recover_shutdown_partition(0).await,
+            "recovery of a partition whose core is live must be a no-op"
+        );
+        let after = node0.raft_registry().get(0).expect("partition 0 hosted");
+        assert!(Arc::ptr_eq(&live, &after), "the live core was swapped out");
+        assert!(!after.is_shutdown(), "the live core was torn down");
+
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    /// One core per partition, asserted: a concurrent promote and
+    /// rebuild-as-receiver of the SAME partition (the recovery-tick and hand-off
+    /// paths) are serialized by the per-partition rebuild lock; each fully shuts
+    /// down its predecessor before constructing a successor (issue #1455).
+    ///
+    /// Deterministic, independent of worker scheduling: with the lock held, BOTH
+    /// rebuild futures are polled in-line and must be `Pending` with no critical
+    /// section entered (removing the lock from either path makes its first poll
+    /// enter the section → depth > 0 → fail). Then the lock is released and both
+    /// complete; the depth must peak at 1, and every predecessor must be shut down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_rebuilds_of_one_partition_are_serialized_one_core() {
+        use std::future::Future;
+        use std::sync::atomic::Ordering::SeqCst;
+        use std::task::Poll;
+
+        let (node0, _node1, _node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+        let probe = node0.rebuild_depth_probe.clone();
+        let original = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition 0 is hosted at boot");
+
+        let guard = node0.partition_rebuild_lock(0).lock_owned().await;
+
+        let mut receiver = Box::pin(node0.rebuild_as_receiver(0, 1));
+        let mut promote = Box::pin(node0.promote_partition(0, 1_000));
+        let polled = std::future::poll_fn(|cx| {
+            Poll::Ready((
+                receiver.as_mut().poll(cx).is_pending(),
+                promote.as_mut().poll(cx).is_pending(),
+            ))
+        })
+        .await;
+        assert_eq!(polled, (true, true), "both rebuilds block on the held lock");
+        assert_eq!(
+            probe.peak.load(SeqCst),
+            0,
+            "no rebuild entered its critical section while the lock is held"
+        );
+        assert!(
+            !original.is_shutdown(),
+            "the predecessor is untouched while the rebuilds are queued"
+        );
+
+        drop(guard);
+        let (ok, ()) = tokio::join!(receiver, promote);
+        assert!(ok, "the receiver rebuild succeeded");
+
+        assert_eq!(
+            probe.peak.load(SeqCst),
+            1,
+            "the rebuild critical section was never entered by two rebuilds at once"
+        );
+        assert_eq!(
+            probe.live_predecessors.load(SeqCst),
+            0,
+            "every rebuild shut down its predecessor before constructing a successor"
+        );
+        assert!(
+            original.is_shutdown(),
+            "the original core was retired, not orphaned live"
+        );
+        let part = node0
+            .raft_registry()
+            .get(0)
+            .expect("partition 0 is hosted after the rebuilds");
+        assert!(
+            !Arc::ptr_eq(&part, &original),
+            "a successor core replaced the original"
+        );
+        assert!(!part.is_shutdown(), "the single surviving core is live");
+
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
             }
         }
         for h in handles.drain(..) {
@@ -38353,6 +40438,174 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the {job_type} job never projected into the read model");
+    }
+
+    /// #1181: a worker that lost the response to its settlement (network blip,
+    /// gateway restart, a hop to another gateway host) and replays the same
+    /// complete / fail with the SAME lease token gets an idempotent 204, not a
+    /// 409 "Job not activated" that would make it re-run the job elsewhere —
+    /// and the replay is not counted twice in job statistics.
+    #[tokio::test]
+    async fn rest_settlement_replay_under_the_same_lease_is_an_idempotent_204() {
+        let server = ServerImpl::default();
+        let from = chrono::Utc::now() - chrono::Duration::hours(1);
+        for _ in 0..2 {
+            server
+                .create_for_stream(Some("demo".into()), None, Default::default())
+                .await
+                .expect("create the demo instance");
+        }
+        await_job_key(&server, "demo-work").await;
+        let jobs = server
+            .activate_for_stream_with_lease("demo-work", "worker-a", 10, 60_000, None, true)
+            .await;
+        assert_eq!(jobs.len(), 2, "both demo-work jobs are activatable");
+        let token = |j: &models::ActivatedJobResult| -> String {
+            serde_json::to_value(j).unwrap()["jobLeaseToken"]
+                .as_str()
+                .expect("a leased activation carries a token")
+                .to_owned()
+        };
+
+        use apis::job::CompleteJobResponse as CResp;
+        let path = models::CompleteJobPathParams {
+            job_key: jobs[0].job_key.0.clone(),
+        };
+        let body = Some(
+            serde_json::from_value(serde_json::json!({ "jobLeaseToken": token(&jobs[0]) }))
+                .unwrap(),
+        );
+        for attempt in ["first", "replayed"] {
+            assert!(
+                matches!(
+                    server.complete_job_impl(&path, &body).await.unwrap(),
+                    CResp::Status204_TheJobWasCompletedSuccessfully
+                ),
+                "the {attempt} completion under the recorded lease is a 204"
+            );
+        }
+        let stale = Some(
+            serde_json::from_value(serde_json::json!({ "jobLeaseToken": "nano-lease:stale" }))
+                .unwrap(),
+        );
+        assert!(
+            !matches!(
+                server.complete_job_impl(&path, &stale).await.unwrap(),
+                CResp::Status204_TheJobWasCompletedSuccessfully
+            ),
+            "a token that never settled the job is never answered as a success"
+        );
+
+        use apis::job::FailJobResponse as FResp;
+        let path = models::FailJobPathParams {
+            job_key: jobs[1].job_key.0.clone(),
+        };
+        let body: Option<models::JobFailRequest> = Some(
+            serde_json::from_value(
+                serde_json::json!({ "retries": 0, "jobLeaseToken": token(&jobs[1]) }),
+            )
+            .unwrap(),
+        );
+        for attempt in ["first", "replayed"] {
+            assert!(
+                matches!(
+                    server.fail_job_impl(&path, &body).await.unwrap(),
+                    FResp::Status204_TheJobIsFailed
+                ),
+                "the {attempt} failure under the recorded lease is a 204"
+            );
+        }
+
+        let to = chrono::Utc::now() + chrono::Duration::hours(1);
+        use apis::job::GetGlobalJobStatisticsResponse as GResp;
+        let GResp::Status200_GlobalJobMetrics(g) = server
+            .get_global_job_statistics_impl(&models::GetGlobalJobStatisticsQueryParams {
+                from,
+                to,
+                job_type: Some("demo-work".into()),
+            })
+            .await
+            .expect("global stats run")
+        else {
+            panic!("expected 200 from global stats");
+        };
+        assert_eq!(
+            g.completed.count, 1,
+            "a replayed completion is not recounted"
+        );
+        assert_eq!(g.failed.count, 1, "a replayed failure is not recounted");
+    }
+
+    /// A leased REST throw-error replayed under its recorded token is a 204 that
+    /// records the error statistic only once (#1181).
+    #[tokio::test]
+    async fn rest_thrown_error_replay_under_the_same_lease_is_an_idempotent_204() {
+        let server = ServerImpl::default();
+        let proc = ProcessBuilder::new("erroring-replay")
+            .start_event("s")
+            .service_task("work", "err-replay")
+            .error_boundary_event("catch", "work", "E_BOOM")
+            .end_event("e")
+            .end_event("caught")
+            .connect("s", "work")
+            .connect("work", "e")
+            .connect("catch", "caught")
+            .build()
+            .expect("valid error-boundary process");
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "erroring-replay".to_string(),
+            "erroring-replay.bpmn".to_string(),
+        );
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        server
+            .create_for_stream(Some("erroring-replay".into()), None, Default::default())
+            .await
+            .expect("create the instance");
+        await_job_key(&server, "err-replay").await;
+        let jobs = server
+            .activate_for_stream_with_lease("err-replay", "worker-e", 10, 60_000, None, true)
+            .await;
+        assert_eq!(jobs.len(), 1, "the err-replay job is activatable");
+        let token = serde_json::to_value(&jobs[0]).unwrap()["jobLeaseToken"]
+            .as_str()
+            .expect("a leased activation carries a token")
+            .to_owned();
+
+        use apis::job::ThrowJobErrorResponse as ThResp;
+        let path = models::ThrowJobErrorPathParams {
+            job_key: jobs[0].job_key.0.clone(),
+        };
+        let req: models::JobErrorRequest = serde_json::from_value(serde_json::json!({
+            "errorCode": "E_BOOM",
+            "errorMessage": "kaboom",
+            "jobLeaseToken": token,
+        }))
+        .unwrap();
+        let before = server.job_statistics.lock_errors().len();
+        for attempt in ["first", "replayed"] {
+            assert!(
+                matches!(
+                    server.throw_job_error_impl(&path, &req).await.unwrap(),
+                    ThResp::Status204_AnErrorIsThrownForTheJob
+                ),
+                "the {attempt} throw under the recorded lease is a 204"
+            );
+        }
+        assert_eq!(
+            server.job_statistics.lock_errors().len() - before,
+            1,
+            "a replayed throw-error is not recounted in error statistics"
+        );
     }
 
     #[tokio::test]
@@ -43218,6 +45471,7 @@ mod call_activity_hierarchy_read_model_tests {
         )
         .await
         .unwrap()
+        .1
         .wait()
         .await;
         let mut committed = false;

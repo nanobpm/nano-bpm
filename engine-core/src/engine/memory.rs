@@ -826,4 +826,70 @@ impl Engine {
     pub fn rehydrate_instance(&mut self, snapshot: state::InstanceSnapshot) {
         state::restore_instance_snapshot(&mut self.state, snapshot);
     }
+
+    /// Streaming/sidecar snapshot support (#1337): lifts **every** instance —
+    /// active or terminal, resident or variable-spilled — and the entities it
+    /// owns out of a cloned [`State`], returning `(control, instances)` where
+    /// `control` is the same state with `instances` emptied and `instances` is
+    /// one self-contained [`state::InstanceSnapshot`] per instance.
+    ///
+    /// Unlike [`snapshot_instance`](Engine::snapshot_instance) this is a *snapshot
+    /// decomposition*, not a cold-spill eviction: it runs on a throwaway clone the
+    /// caller already owns, keeps terminal instances (a snapshot must carry them
+    /// so the read-model eviction and owed-activation rebuild still see them), and
+    /// keeps variable-spilled instances (the host resolves their payloads from the
+    /// spill tier as it streams each one out — that resolution is the whole point
+    /// of the sidecar, so the spilled set is never folded into one in-memory
+    /// state). The derived job indices are left as-is in `control` (they are
+    /// derived from `jobs`, which the host reassembles on restore), so the control
+    /// half is still a valid [`State`] skeleton.
+    ///
+    /// The host drops each returned `InstanceSnapshot` right after its chunk is
+    /// flushed, so the peak heap is bounded by the chunk, not the working set.
+    #[cfg(feature = "serde")]
+    pub fn decompose_state_for_streaming(
+        mut state: State,
+    ) -> (State, Vec<state::InstanceSnapshot>) {
+        let keys: Vec<Key> = state.instances.keys().copied().collect();
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            // Every job this instance owns, gathered without disturbing the
+            // control half's `jobs` map membership for other instances. Each job
+            // is also removed from the derived activatable/activated indices, and
+            // the instance's `jobs_by_instance` entry is dropped, so the control
+            // skeleton's derived indices stay consistent with the maps drained
+            // out of it (no dangling index entries pointing at removed jobs).
+            let mut jobs = Vec::new();
+            if let Some(job_keys) = state.jobs_by_instance.remove(&key) {
+                for job_key in job_keys {
+                    if let Some(job) = state.jobs.remove(&job_key) {
+                        // Keep the control skeleton's derived job indices
+                        // consistent with the drained `jobs` map (no dangling
+                        // index entries pointing at removed jobs).
+                        state.deindex_job(&job.job_type, job_key, job.priority);
+                        jobs.push(job);
+                    }
+                }
+            }
+            let timers = drain_owned(&mut state.timers, key);
+            let message_subscriptions = drain_owned(&mut state.message_subscriptions, key);
+            let signal_subscriptions = drain_owned(&mut state.signal_subscriptions, key);
+            let conditional_subscriptions = drain_owned(&mut state.conditional_subscriptions, key);
+            let user_tasks = drain_owned(&mut state.user_tasks, key);
+            let incidents = drain_owned(&mut state.incidents, key);
+            if let Some(instance) = state.instances.remove(&key) {
+                out.push(state::InstanceSnapshot {
+                    instance,
+                    jobs,
+                    timers,
+                    message_subscriptions,
+                    signal_subscriptions,
+                    conditional_subscriptions,
+                    user_tasks,
+                    incidents,
+                });
+            }
+        }
+        (state, out)
+    }
 }

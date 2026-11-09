@@ -160,6 +160,19 @@ updates may omit the token for operator updates, but a supplied token is checked
 Expiry alone does not supersede the token: the previous worker can finish until
 a subsequent activation replaces it.
 
+**Lease-token parity and idempotent settlement replay (#1181).** Since #1137,
+Nano mints an opaque, deadline-independent `nano-lease:<hex>` token per leased
+activation (`engine-core/src/lease.rs`), matching Camunda's
+`LeaseTokens.generate()`: the token is not derived from the job deadline and
+clients must not parse it. Nano additionally uses that token as the
+**settlement idempotency key**: once a complete, fail, or throw-error command
+settles a leased job, re-sending that command with the recorded token (for
+example, a worker retry after a lost response, from any replica or host) is a
+no-op success rather than a conflict. Camunda returns 404/409 for such a
+replay; this is a deliberate superset, so a client written against Camunda
+keeps working against Nano. A settlement bearing a stale or superseded fence
+(a token replaced by a later activation) is still rejected with HTTP 409.
+
 > **Naming (Camunda 8.10 rename, #1283).** Upstream renamed the job lease token
 > at the API boundary to `jobLeaseToken` everywhere (previously `leaseToken` on
 > job activation/commands and `jobLease` on agent-instance requests/history).

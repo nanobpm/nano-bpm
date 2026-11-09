@@ -991,8 +991,7 @@ impl PartitionStateMachine {
         let captured: nanobpmn_engine_core::EngineSnapshot =
             tokio::task::spawn_blocking(move || -> std::io::Result<_> {
                 let f = std::fs::File::open(&path)?;
-                serde_json::from_reader(std::io::BufReader::new(f))
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                nano_server_storage::snapstream::read_streaming_engine_snapshot_from(f)
             })
             .await??;
         self.engine
@@ -1154,24 +1153,37 @@ pub fn sweep_orphaned_snapshot_dirs() {
 /// serialize an already-consistent state — no engine round-trip, no race with a
 /// concurrent apply.
 ///
-/// `captured` is the **fail-closed** capture ([`Journal::try_engine_snapshot`]):
-/// `None` when any indexed off-heap payload (a cold instance, a spilled variable
-/// map) could not be folded in. `build_snapshot` turns that `None` into a
-/// [`StorageError`] **before** publishing anything, so openraft treats the build
-/// as failed and — critically — does **not** purge the covered log. An incomplete
-/// snapshot is therefore never minted as the durable recovery point: the log that
-/// can still regenerate the omitted state is preserved intact on disk, so no data
-/// is lost. This is a hard fail-stop, not a graceful retry: openraft propagates
-/// the `StorageError` as a `Fatal`, which drives this partition's Raft core to
-/// [`ServerState::Shutdown`](openraft::ServerState::Shutdown) (see
-/// [`is_shutdown`](RaftPartition::is_shutdown)). There is no auto-restart in this
-/// crate, so the partition stops applying entries and every instance/job routed
-/// here is stranded until the process is restarted — at which point recovery
-/// replays the preserved log. The unreadable payload is thus traded for
-/// availability loss, never data loss.
+/// `captured` holds the streaming capture parts ([`Journal::streaming_snapshot_parts`]):
+/// the control skeleton, the resident per-instance payloads, the cold routing
+/// keys, and the store handles to resolve off-heap rows. `build_snapshot`
+/// streams them to disk in bounded chunks, so the whole cold/spilled set is
+/// never folded into one in-memory `EngineSnapshot` (#1337). The serialize is
+/// **fail-closed**: if any cold/spilled row will not read, `build_snapshot`
+/// returns a [`StorageError`] **before** publishing anything, so openraft treats
+/// the build as failed and — critically — does **not** purge the covered log. An
+/// incomplete snapshot is therefore never minted as the durable recovery point:
+/// the log that can still regenerate the omitted state is preserved intact on
+/// disk, so no data is lost. This is a hard fail-stop, not a graceful retry:
+/// openraft propagates the `StorageError` as a `Fatal`, which drives this
+/// partition's Raft core to [`ServerState::Shutdown`](openraft::ServerState::Shutdown)
+/// (see [`is_shutdown`](RaftPartition::is_shutdown)). There is no auto-restart
+/// in this crate, so the partition stops applying entries and every
+/// instance/job routed here is stranded until the process is restarted — at
+/// which point recovery replays the preserved log. The unreadable payload is
+/// thus traded for availability loss, never data loss.
 pub struct PartitionSnapshotBuilder {
     sm: Arc<PartitionStateMachine>,
-    captured: Option<nanobpmn_engine_core::EngineSnapshot>,
+    /// The streaming capture parts (#1337): a small control skeleton plus the
+    /// resident per-instance payloads, the cold routing keys, and the store
+    /// handles to resolve off-heap rows during the streaming serialize. `None`
+    /// once taken by `build_snapshot`. Holding the parts — rather than one folded
+    /// `EngineSnapshot` — is what lets `build_snapshot` stream the cold set
+    /// straight from the spill store to disk without materializing it in RAM.
+    captured: Option<(
+        nano_server_storage::snapstream::StreamingCapture,
+        Vec<nanobpmn_engine_core::Key>,
+        nano_server_storage::snapstream::SpillStores,
+    )>,
     last_applied: Option<LogId<NodeId>>,
     last_membership: StoredMembership<NodeId, BasicNode>,
 }
@@ -1190,16 +1202,15 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // partition then stops applying entries and strands its instances/jobs
         // until the process restarts and replays the preserved log — availability
         // is sacrificed to guarantee the omitted state is never lost.
-        let captured = self.captured.take().ok_or_else(|| {
+        let (capture, cold_keys, stores) = self.captured.take().ok_or_else(|| {
             StorageError::from_io_error(
                 ErrorSubject::Snapshot(None),
                 ErrorVerb::Write,
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "refusing to build a Raft snapshot: an off-heap payload (cold \
-                     instance or spilled variable map) could not be folded in, so \
-                     the snapshot would be incomplete; aborting before the covered \
-                     log is purged",
+                    "refusing to build a Raft snapshot: the streaming capture parts \
+                     were already consumed (build_snapshot called twice); aborting \
+                     before the covered log is purged",
                 ),
             )
         })?;
@@ -1216,11 +1227,15 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             snapshot_id,
         };
 
-        // Stream the state capture straight to disk (bounded memory) rather than
-        // building a full `Vec<u8>` plus a second cached clone. `serde_json` here
-        // runs the same blocking serialize the old `to_vec` did — but into a
-        // buffered writer, so the peak transient is one buffer, not the whole
-        // serialized state twice.
+        // Stream the state capture straight to disk in bounded chunks (#1337)
+        // rather than folding the whole cold/spilled set into one in-memory
+        // `EngineSnapshot` and serializing it. The control skeleton + resident
+        // payloads are already captured; each cold instance is read row-by-row
+        // from the spill store and each spilled variable map resolved as it
+        // serializes, so the peak transient is one chunk, never the whole
+        // working set. Fail-closed: an unreadable cold/spilled row aborts the
+        // write (a `StorageError`) before the durable pointer is written and
+        // before the log is purged — exactly the old fail-closed fold semantics.
         //
         // Fix B: cap concurrent snapshot builds across this node's partitions. While
         // the resident SM is large (a returning owner / failover incumbent, see
@@ -1238,15 +1253,37 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
             .sm
             .snapshot_dir
             .join(format!("snap-{snapshot_idx}.bin"));
-        let file = std::fs::File::create(&path)
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let mut writer = std::io::BufWriter::new(file);
+        let covered = self.last_applied.map(|l| l.index).unwrap_or(0);
         let serialize_start = std::time::Instant::now();
-        serde_json::to_writer(&mut writer, &captured)
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let file = writer
-            .into_inner()
-            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e.into_error()))?;
+        // The streaming serialize blocks on file I/O and the spill-store reads;
+        // run it on a blocking task (not the async executor / engine actor). The
+        // store handles were captured on the engine thread, so this is purely
+        // synchronous — no nested engine round-trip.
+        let write_path = path.clone();
+        let write_result = tokio::task::spawn_blocking(move || {
+            let header = nano_server_storage::seglog::snapshot_envelope_header_line(
+                write_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )?;
+            nano_server_storage::snapstream::write_streaming_snapshot_from_stores(
+                &write_path,
+                &header,
+                covered,
+                capture,
+                &cold_keys,
+                stores,
+            )
+        })
+        .await
+        .map_err(|e| {
+            StorageIOError::write_snapshot(Some(meta.signature()), &std::io::Error::other(e))
+        })?;
+        // Fail closed: an unreadable off-heap row aborts the build before the
+        // durable pointer is written and before openraft purges the covered log.
+        write_result.map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        let file = std::fs::File::open(&path)
+            .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
         let serialize_dur = serialize_start.elapsed();
         let snapshot_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         // Durable enough to serve to a follower even across a crash: the log is
@@ -1515,13 +1552,18 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // between the engine read and the `last_applied`/membership read — the
         // captured state corresponds exactly to `last_applied`.
         //
-        // Capture **fail-closed** (`try_engine_snapshot`): when an off-heap
-        // payload cannot be folded in this yields `None`, which `build_snapshot`
-        // turns into a `StorageError` so the incomplete snapshot is never
-        // published and the covered log is never purged.
+        // Capture the streaming parts (#1337): the control skeleton + the
+        // resident per-instance payloads + the cold routing keys + the store
+        // handles to resolve off-heap rows. This never folds the whole
+        // cold/spilled set into one in-memory `EngineSnapshot` — that
+        // materialization is the #1337 defect. The capture only reads live state
+        // + the cold index; the cold / spilled rows are read from the store
+        // during `build_snapshot`'s streaming serialize, which fails closed (a
+        // `StorageError`, so the covered log is never purged) if any row will
+        // not read.
         let captured = self
             .engine
-            .with(|journal| journal.try_engine_snapshot())
+            .with(|journal| journal.streaming_snapshot_parts())
             .await;
         let (last_applied, last_membership) = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -1529,7 +1571,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         };
         PartitionSnapshotBuilder {
             sm: self.clone(),
-            captured,
+            captured: Some(captured),
             last_applied,
             last_membership,
         }
@@ -1581,17 +1623,18 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     ) -> Result<(), StorageError<NodeId>> {
         let SnapshotFile { file, path } = *snapshot;
 
-        // Stream-deserialize the received file from a blocking task (bounded
-        // memory: a BufReader, not the whole body as a `Vec<u8>`). openraft leaves
-        // the write cursor at the end, so rewind first.
+        // Stream-deserialize the received chunked snapshot (#1337) from a
+        // blocking task: read the control skeleton, then restore each instance
+        // chunk-by-chunk, so the receive side never holds more than one chunk in
+        // flight before it is folded into the rebuilt state. openraft leaves the
+        // write cursor at the end, so rewind first.
         let std_file = file.into_std().await;
         let captured: nanobpmn_engine_core::EngineSnapshot = tokio::task::spawn_blocking(
             move || -> std::io::Result<nanobpmn_engine_core::EngineSnapshot> {
                 use std::io::Seek;
                 let mut f = std_file;
                 f.seek(std::io::SeekFrom::Start(0))?;
-                serde_json::from_reader(std::io::BufReader::new(f))
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+                nano_server_storage::snapstream::read_streaming_engine_snapshot_from(f)
             },
         )
         .await
@@ -1727,8 +1770,13 @@ pub fn snapshot_recovery_engaged() -> bool {
 fn snapshot_build_sem() -> &'static tokio::sync::Semaphore {
     static SNAPSHOT_BUILD_SEM: std::sync::OnceLock<tokio::sync::Semaphore> =
         std::sync::OnceLock::new();
-    SNAPSHOT_BUILD_SEM
-        .get_or_init(|| tokio::sync::Semaphore::new(snapshot_build_concurrency() as usize))
+    SNAPSHOT_BUILD_SEM.get_or_init(new_snapshot_build_sem)
+}
+
+/// Constructs the snapshot-build semaphore, sized from
+/// [`snapshot_build_concurrency`] — the one place its capacity is derived.
+fn new_snapshot_build_sem() -> tokio::sync::Semaphore {
+    tokio::sync::Semaphore::new(snapshot_build_concurrency() as usize)
 }
 
 /// The per-partition snapshot cadence, in applied log entries, with a bounded
@@ -2309,6 +2357,67 @@ impl RaftPartition {
         if !self.raft.is_initialized().await? {
             self.raft.initialize(members).await?;
         }
+        Ok(())
+    }
+
+    /// Boots this node's member for `partition_id` as a **fresh receiver**: an
+    /// uninitialized, receive-only member with an EMPTY log, a default (never
+    /// granted) vote and no committed / applied / snapshot state, so whichever
+    /// leader it is handed to replicates its lineage onto a blank slate. A
+    /// receiver that came up carrying a prior lineage would present the new
+    /// leader with a divergent COMMITTED prefix — a Raft safety violation that
+    /// openraft (rightly) asserts on (`committed log should never be truncated`,
+    /// issue #1454).
+    ///
+    /// The single canonical constructor for every receiver path (the hand-off /
+    /// promotion rebuild-as-receiver and the boot-deferred receiver). It fails
+    /// closed: a member that is not provably empty is shut down and an error is
+    /// returned rather than letting it join a group.
+    pub async fn bootstrap_fresh_receiver(
+        node_id: NodeId,
+        partition_id: u64,
+        engine: DeepthiHandle,
+        transport: Arc<dyn RaftTransport>,
+        evict_eligible: bool,
+    ) -> anyhow::Result<Self> {
+        // No durable log dir: a receiver never resumes an on-disk lineage, and a
+        // volatile member anchors its snapshots in a fresh per-boot temp dir, so
+        // no prior snapshot can seed its applied state either.
+        let part = Self::bootstrap_member(
+            node_id,
+            partition_id,
+            engine,
+            transport,
+            None,
+            evict_eligible,
+        )
+        .await?;
+        if let Err(e) = part.ensure_fresh_receiver_state().await {
+            part.raft.shutdown().await.ok();
+            return Err(e);
+        }
+        Ok(part)
+    }
+
+    /// Fails unless this member's Raft state is that of a fresh receiver: no log,
+    /// a default vote, and nothing committed, applied or snapshotted.
+    pub async fn ensure_fresh_receiver_state(&self) -> anyhow::Result<()> {
+        let committed = self.raft.with_raft_state(|s| s.committed).await?;
+        let m = self.raft.metrics().borrow().clone();
+        anyhow::ensure!(
+            m.last_log_index.is_none()
+                && m.vote == openraft::Vote::default()
+                && committed.is_none()
+                && m.last_applied.is_none()
+                && m.snapshot.is_none(),
+            "partition {}: a fresh receiver must start empty, found last_log_index={:?} \
+             vote={:?} committed={committed:?} last_applied={:?} snapshot={:?}",
+            self.partition_id,
+            m.last_log_index,
+            m.vote,
+            m.last_applied,
+            m.snapshot,
+        );
         Ok(())
     }
 
@@ -3055,7 +3164,10 @@ mod tests {
         assert!(c >= 1, "concurrency must be floored at 1, got {c}");
         // The semaphore is sized from the same helper, so it always has >=1 permit
         // (acquire_many(concurrency) for the exclusive recovery path can succeed).
-        assert!(snapshot_build_sem().available_permits() >= 1);
+        // Probe a freshly constructed one: the process-global instance is shared
+        // with concurrently running tests whose snapshot builds hold its permits,
+        // so its *available* count is not a capacity measure.
+        assert_eq!(new_snapshot_build_sem().available_permits(), c as usize);
     }
 
     #[test]
@@ -3170,6 +3282,48 @@ mod tests {
             instance_key: 1
         }));
         assert!(!is_creation_intake(&deploy_command()));
+    }
+
+    /// A fresh receiver is provably empty, and the emptiness guard fails closed
+    /// on a member that carries a lineage (issue #1454): a receiver with a
+    /// committed prefix would present a new leader with a divergent committed
+    /// lineage.
+    #[tokio::test]
+    async fn fresh_receiver_starts_empty_and_the_guard_rejects_a_lineage() {
+        let fresh = RaftPartition::bootstrap_fresh_receiver(
+            1,
+            0,
+            DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+            Arc::new(NullTransport),
+            false,
+        )
+        .await
+        .expect("a fresh receiver boots empty");
+        fresh
+            .ensure_fresh_receiver_state()
+            .await
+            .expect("fresh receiver state is empty");
+        fresh.raft.shutdown().await.ok();
+
+        // An initialized single voter carries a log, a vote and a committed entry.
+        let led = RaftPartition::bootstrap_single(
+            0,
+            0,
+            "http://self".into(),
+            DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
+        )
+        .await
+        .expect("bootstrap single-voter raft");
+        let mut rejected = false;
+        for _ in 0..300 {
+            if led.ensure_fresh_receiver_state().await.is_err() {
+                rejected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(rejected, "a member with a lineage is not a fresh receiver");
+        led.raft.shutdown().await.ok();
     }
 
     #[tokio::test]
@@ -3292,9 +3446,8 @@ mod tests {
         let mut builder = src_sm.get_snapshot_builder().await;
         let snap = builder.build_snapshot().await.expect("build snapshot");
 
-        // The body is a compact EngineSnapshot on disk, not an event log: reading
-        // the file-backed snapshot back deserializes straight into an
-        // EngineSnapshot.
+        // The body is a compact chunked snapshot on disk (#1337), not an event
+        // log: streaming it back reassembles a self-contained EngineSnapshot.
         let mut reader = snap.snapshot;
         let mut bytes = Vec::new();
         {
@@ -3305,7 +3458,10 @@ mod tests {
                 .expect("read snapshot body");
         }
         let _: nanobpmn_engine_core::EngineSnapshot =
-            serde_json::from_slice(&bytes).expect("snapshot body is a state capture");
+            nano_server_storage::snapstream::read_streaming_engine_snapshot_from(
+                std::io::Cursor::new(&bytes),
+            )
+            .expect("snapshot body is a streaming state capture");
 
         // A brand-new, empty replica installs the snapshot and ends up with
         // byte-for-byte identical engine state — the cross-node catch-up path.
@@ -3356,6 +3512,120 @@ mod tests {
         );
     }
 
+    /// #1337 durability proof at the Raft surface: a snapshot built from a
+    /// journal whose instances are **cold** (wholly off-heap in the spill store)
+    /// must stream them straight from disk — never materializing the cold set in
+    /// RAM — and a fresh replica installing that snapshot must recover every cold
+    /// instance. Deterministic: the cold spill is forced synchronously, the
+    /// snapshot is built and installed through the real chunked transfer, and the
+    /// assertions run on the installed state (no sleeps, no retries).
+    #[tokio::test]
+    async fn snapshot_streams_cold_instances_to_a_fresh_replica() {
+        use nanobpmn_engine_core::Value;
+        let wait_proc = ProcessBuilder::new("wc")
+            .start_event("s")
+            .service_task("t", "work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid process");
+
+        // Source journal with a cold-spill tier wired, three instances forced
+        // wholly off-heap.
+        let store = Arc::new(
+            nano_server_storage::varspill::VarSpillStore::open(None).expect("in-memory store"),
+        );
+        let mut src_journal = Journal::in_memory_partition(0);
+        src_journal.set_cold_spill(Arc::clone(&store), 1, 0);
+        let src = DeepthiHandle::spawn(src_journal, 0, None);
+        src.with(move |j| {
+            let _ = j
+                .apply_command_at(Command::DeployProcess(wait_proc), 1)
+                .expect("deploy applies");
+        })
+        .await;
+        let mut cold_keys = Vec::new();
+        for i in 0..3u64 {
+            let key = src
+                .with(move |j| {
+                    let mut vars = HashMap::new();
+                    vars.insert("data".to_string(), Value::Str(format!("cold-{i}")));
+                    let (ev, _) = j
+                        .apply_command_at(
+                            Command::CreateInstance {
+                                process_id: "wc".into(),
+                                variables: vars,
+                                tags: Vec::new(),
+                                business_id: None,
+                                process_definition_key: None,
+                                version: None,
+                            },
+                            10 + i,
+                        )
+                        .expect("create applies");
+                    ev.iter().find_map(|e| e.instance_key()).unwrap()
+                })
+                .await;
+            cold_keys.push(key);
+        }
+        // Force every instance wholly off-heap (cold). Precondition for the test:
+        // the snapshot must recover instances that are NOT resident.
+        let spilled = src.with(|j| j.force_cold_spill_all()).await;
+        assert_eq!(spilled, 3, "all three instances went cold");
+        assert_eq!(src.with(|j| j.cold_count()).await, 3);
+        for key in &cold_keys {
+            let key = *key;
+            assert!(
+                src.with(move |j| j.instance(key).is_none()).await,
+                "precondition: instance {key} is off-heap"
+            );
+        }
+
+        // Build the snapshot (streams the cold set from the store, bounded memory).
+        let mut src_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
+        let mut builder = src_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("build snapshot");
+
+        // Ship it through the real chunked receive path into a fresh replica.
+        let mut reader = snap.snapshot;
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        let mut dst_sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(dst.clone(), 0).expect("snapshot dir"));
+        let mut received = dst_sm
+            .begin_receiving_snapshot()
+            .await
+            .expect("begin receiving");
+        {
+            use tokio::io::AsyncWriteExt;
+            received.write_all(&bytes).await.expect("write body");
+            received.flush().await.expect("flush body");
+        }
+        dst_sm
+            .install_snapshot(&snap.meta, received)
+            .await
+            .expect("install snapshot");
+
+        // Every cold instance recovered onto the fresh replica, with its payload.
+        let dst_state = dst.with(|j| j.state().clone()).await;
+        for key in &cold_keys {
+            let inst = dst_state
+                .instances
+                .get(key)
+                .unwrap_or_else(|| panic!("cold instance {key} recovered onto the replica"));
+            assert!(
+                matches!(inst.variables.get("data"), Some(Value::Str(_))),
+                "cold instance {key} recovered with its variables"
+            );
+        }
+    }
+
     /// Fail-closed Raft snapshot build (the #1331 companion to the journal's
     /// fail-closed rotation): when the off-heap fold fails, `get_snapshot_builder`
     /// captures `None` and `build_snapshot` must return a `StorageError` and
@@ -3369,8 +3639,8 @@ mod tests {
             Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
         let snap_dir = src_sm.snapshot_dir.clone();
 
-        // A builder whose capture is `None` — exactly what `get_snapshot_builder`
-        // produces when `try_engine_snapshot` cannot fold every off-heap payload.
+        // A builder whose capture is `None` — what `get_snapshot_builder` would
+        // have produced had the streaming capture already been consumed.
         let mut builder = PartitionSnapshotBuilder {
             sm: src_sm.clone(),
             captured: None,
@@ -3382,8 +3652,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("off-heap payload"),
-            "the error names the incomplete fold, got: {err}"
+            err.to_string().contains("already consumed"),
+            "the error names the consumed capture, got: {err}"
         );
 
         // Nothing was published: no durable pointer, no snapshot body on disk.
@@ -3398,9 +3668,9 @@ mod tests {
             "no snapshot file may be left behind for a failed build"
         );
 
-        // Control: a complete capture (`Some`) builds and publishes normally, so
-        // the fail-closed guard does not break the happy path.
-        let captured = src.with(|j| j.engine_snapshot()).await;
+        // Control: a complete capture builds and publishes normally, so the
+        // fail-closed guard does not break the happy path.
+        let captured = src.with(|j| j.streaming_snapshot_parts()).await;
         let mut ok_builder = PartitionSnapshotBuilder {
             sm: src_sm.clone(),
             captured: Some(captured),

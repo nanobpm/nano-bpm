@@ -163,6 +163,20 @@ enum OrphanPolicy {
     Quarantine,
 }
 
+/// Blocking-key tracking for the snapshot fold (#1385). A fail-closed fold
+/// aborts at the first unreadable payload; that key is recorded as the current
+/// blocker and its ERROR is logged once per outage (until a fold succeeds)
+/// instead of on every snapshot tick, which is what buried #1383 for 23 days.
+#[derive(Default)]
+struct SnapshotBlockers {
+    /// Blockers of the most recent fold attempt (empty after a success).
+    current: Mutex<Vec<Key>>,
+    /// Keys already logged during the ongoing outage.
+    logged: Mutex<HashSet<Key>>,
+    /// Repeat blocker log lines suppressed so far.
+    suppressed: AtomicU64,
+}
+
 /// The engine plus its durable event log.
 pub struct Journal {
     engine: Engine,
@@ -247,6 +261,10 @@ pub struct Journal {
     /// (SQLite/IO error or an undecodable row, #1388). The row and routing entry
     /// are kept for a retry; this makes each such failure observable.
     offheap_read_failures: AtomicU64,
+    /// Instances whose off-heap payload aborted the latest snapshot fold, and
+    /// log-dedupe state for them (#1385). Surfaced on `/health` so an operator
+    /// can name what blocks compaction instead of grepping a per-tick ERROR.
+    snapshot_blockers: SnapshotBlockers,
     /// `true` when this journal's commands are applied as replicated (Raft)
     /// state-machine application (#1384). There, a quarantine discovered while
     /// applying a command must stay deterministic across replicas, so it is
@@ -1029,6 +1047,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
@@ -1064,6 +1083,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
@@ -1186,6 +1206,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
@@ -1225,6 +1246,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
@@ -1269,6 +1291,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
@@ -1308,6 +1331,7 @@ impl Journal {
             varstore: None,
             quarantined: Mutex::default(),
             offheap_read_failures: AtomicU64::new(0),
+            snapshot_blockers: SnapshotBlockers::default(),
             replicated_apply: false,
             activation_cursor: HashMap::new(),
             raft_entry: None,
@@ -1889,9 +1913,8 @@ impl Journal {
     /// Test hook: cold-spills every currently dormant instance regardless of the
     /// memory watermark, returning the number shed. Lets tests exercise the
     /// spill/rehydrate seams deterministically without driving real RAM pressure.
-    // Also compiled under `test-hooks` (like `cold_spill_configured` above) so the
-    // raft crate's fail-closed apply tests (#1405) — which link this crate as a
-    // non-test library — can drive the cold-spill seam.
+    /// Also compiled under `test-hooks` so downstream crates' tests (the Raft
+    /// snapshot-streaming test, #1337) can force the cold tier deterministically.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn force_cold_spill_all(&mut self) -> usize {
         let store = match self.cold.as_ref() {
@@ -2075,6 +2098,41 @@ impl Journal {
         self.fresh
     }
 
+    /// A **durability barrier** for a command that produced no events (#1181):
+    /// the returned [`Commit`] resolves only after every write already enqueued
+    /// on this journal's writer is durable (written and fsynced). An idempotent
+    /// settlement replay applies with an empty event batch — nothing new to
+    /// persist — but it must not be acknowledged before the ORIGINAL
+    /// settlement it restates is durable: a crash in between would lose a
+    /// settlement the worker was told succeeded, and the job would re-execute.
+    /// The barrier rides the writer's strictly ordered queue (an empty write
+    /// request), so it joins the same group-commit batch as the still-pending
+    /// original and resolves with it. An in-memory journal (no writer) is
+    /// already durable, so the barrier is ready immediately.
+    pub fn barrier(&self) -> Commit {
+        let Some(writer) = self.writer.as_ref() else {
+            return Commit::ready();
+        };
+        let (ack, rx) = oneshot::channel();
+        match writer.send(WriterMsg::Write(WriteRequest {
+            bytes: Vec::new(),
+            events: 0,
+            partition: self.partition_id,
+            events_arc: None,
+            ack,
+        })) {
+            Ok(()) => {
+                // The writer decrements `inflight` by one per processed
+                // request, barriers included — account for it on enqueue.
+                crate::metrics::inflight_inc();
+                Commit(CommitInner::Pending(rx))
+            }
+            // The writer thread is gone (shutting down); treat as already
+            // settled so callers never hang.
+            Err(_) => Commit::ready(),
+        }
+    }
+
     /// Serializes `events` for the durable writer and forwards them to the
     /// read-model exporter, returning a [`Commit`] that resolves once they are
     /// fsynced. The events are shared via `Arc`, so the exporter handoff is a
@@ -2199,6 +2257,10 @@ impl Journal {
             return Err(EngineError::InstanceUnavailable { instance_key: 0 });
         }
         self.ensure_resident_for_command(&command)?;
+        let settles_job = matches!(
+            command,
+            Command::CompleteJob { .. } | Command::FailJob { .. } | Command::ThrowJobError { .. }
+        );
         let events = Arc::new(self.engine.apply_command_at(command, now)?);
         let mut activated: Vec<_> = events
             .iter()
@@ -2216,7 +2278,21 @@ impl Journal {
             buffer.extend(events.iter().cloned());
             return Ok((events, Commit::ready()));
         }
-        let commit = self.persist(&events);
+        // An eventless success (an idempotent settlement replay, #1181) has
+        // nothing new to persist, but acknowledging it must still wait until
+        // the ORIGINAL settlement it restates is durable — otherwise a crash
+        // loses an acknowledged settlement and the job re-executes. `persist`
+        // short-circuits empty batches to a ready commit, so take a writer
+        // barrier instead: it resolves once every write enqueued before it
+        // (the original included) is fsynced.
+        // Only settlement commands can be idempotent replays; any other eventless
+        // no-op (e.g. an idle expiry sweep) keeps its ready commit so it costs
+        // no fsync and no commit statistics.
+        let commit = if events.is_empty() && settles_job {
+            self.barrier()
+        } else {
+            self.persist(&events)
+        };
         self.maybe_spill();
         Ok((events, commit))
     }
@@ -2894,17 +2970,18 @@ impl Journal {
     /// instances stay off-heap while the snapshot restores every variable and
     /// every instance with no dependency on the spill store.
     ///
-    /// **Memory tradeoff (accepted, #1337):** making the snapshot self-contained
-    /// requires materializing the full working set — every spilled variable map
-    /// and every cold instance — into one in-memory `EngineSnapshot` at capture
-    /// time. Because spill is what lets the live working set exceed available
-    /// RAM, a periodic or Raft snapshot can transiently recreate that entire
-    /// working set on the engine heap at once, risking a long actor stall or OOM
-    /// on the memory-constrained deployments spill targets. This
-    /// bounded-by-working-set materialisation is the accepted self-containment
-    /// tradeoff for now; a streaming/sidecar snapshot representation that never
-    /// holds the whole cold set in RAM is a larger Raft-snapshot redesign tracked
-    /// separately in #1337.
+    /// **Memory (#1337):** the Raft snapshot path no longer materializes the
+    /// whole cold set — `get_snapshot_builder` captures the streaming halves
+    /// ([`streaming_snapshot_parts`](Journal::streaming_snapshot_parts)) and
+    /// `build_snapshot` streams the cold/spilled rows straight from the spill
+    /// store to disk in bounded chunks, so the capture peak is one chunk, not the
+    /// working set. This local-rotation capture (`snapshot_and_rotate`) still
+    /// folds the full set into one in-memory `EngineSnapshot` for the
+    /// single-file `snapshot.*.bin` format; converting that on-disk format to
+    /// the chunked sidecar is the remaining local-path follow-up (a breaking
+    /// snapshot-format change requiring an explicit `SNAPSHOT_FORMAT_VERSION`
+    /// bump and replay-migrator validation, deliberately out of #1337's Raft
+    /// scope).
     pub fn engine_snapshot(&self) -> nanobpmn_engine_core::EngineSnapshot {
         let mut snap = self.engine.snapshot();
         // Best-effort (see the doc above): a failed fold is logged and left
@@ -3063,6 +3140,7 @@ impl Journal {
         policy: OrphanPolicy,
     ) -> Option<Vec<Key>> {
         let mut orphans = Vec::new();
+        self.begin_fold();
         // Cold rows carry their variables inline (a variable-spilled instance is
         // never cold-shed — `Engine::snapshot_instance` refuses it), so the classic
         // fold keeps them as-is; the loop below only resolves *resident*
@@ -3097,26 +3175,28 @@ impl Journal {
                     orphans.push(instance.key);
                 }
                 Ok(None) => {
-                    tracing::error!(
-                        instance_key = instance.key,
+                    self.note_blocker(
+                        instance.key,
+                        None,
                         "snapshot (strict): spilled instance has no variable row; aborting \
-                         this snapshot"
+                         this snapshot",
                     );
                     return None;
                 }
                 // Unreadable (SQLite/IO/decode): possibly transient — fail closed
                 // so the rotation aborts before the seal and the next tick retries.
                 Err(err) => {
-                    tracing::error!(
-                        instance_key = instance.key,
-                        error = %err,
+                    self.note_blocker(
+                        instance.key,
+                        Some(&err),
                         "snapshot: spilled instance's variable row could not be read; \
-                         aborting this snapshot (will retry)"
+                         aborting this snapshot (will retry)",
                     );
                     return None;
                 }
             }
         }
+        self.fold_succeeded();
         Some(orphans)
     }
 
@@ -3132,6 +3212,70 @@ impl Journal {
         if first {
             tracing::error!(instance_key = key, "{msg}");
         }
+    }
+
+    /// Starts a snapshot fold attempt: forgets the previous attempt's blockers
+    /// (the log-dedupe set survives until a fold succeeds).
+    fn begin_fold(&self) {
+        self.snapshot_blockers
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// A fold completed: the outage (if any) is over, so a later recurrence of
+    /// the same blocker is logged afresh.
+    fn fold_succeeded(&self) {
+        self.begin_fold();
+        self.snapshot_blockers
+            .logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Records `key` as blocking the current fold, logging `msg` at ERROR only
+    /// the first time the key blocks during this outage (#1385); repeats are
+    /// counted in [`snapshot_blocker_logs_suppressed`](Journal::snapshot_blocker_logs_suppressed).
+    fn note_blocker(&self, key: Key, err: Option<&str>, msg: &str) {
+        self.snapshot_blockers
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(key);
+        let first = self
+            .snapshot_blockers
+            .logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+        if first {
+            match err {
+                Some(error) => tracing::error!(instance_key = key, error, "{msg}"),
+                None => tracing::error!(instance_key = key, "{msg}"),
+            }
+        } else {
+            self.snapshot_blockers
+                .suppressed
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(instance_key = key, "{msg} (repeat)");
+        }
+    }
+
+    /// Instance keys whose off-heap payload aborted the most recent snapshot
+    /// fold (#1385); empty after a successful fold.
+    pub fn snapshot_blockers(&self) -> Vec<Key> {
+        self.snapshot_blockers
+            .current
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Repeat snapshot-blocker ERROR lines suppressed so far (#1385).
+    pub fn snapshot_blocker_logs_suppressed(&self) -> u64 {
+        self.snapshot_blockers.suppressed.load(Ordering::Relaxed)
     }
 
     /// Number of off-heap rehydration reads that failed as unreadable so far
@@ -3293,25 +3437,103 @@ impl Journal {
                      — quarantined (omitted) so snapshots and compaction are not blocked",
                 ),
                 Ok(None) => {
-                    tracing::error!(
-                        instance_key = key,
-                        "snapshot (strict): cold instance has no row; aborting this snapshot"
+                    self.note_blocker(
+                        key,
+                        None,
+                        "snapshot (strict): cold instance has no row; aborting this snapshot",
                     );
                     return None;
                 }
                 // Unreadable: possibly transient — fail closed and retry.
                 Err(err) => {
-                    tracing::error!(
-                        instance_key = key,
-                        error = %err,
+                    self.note_blocker(
+                        key,
+                        Some(&err.to_string()),
                         "snapshot: cold instance's row could not be read; aborting this \
-                         snapshot (will retry)"
+                         snapshot (will retry)",
                     );
                     return None;
                 }
             }
         }
         Some(folded)
+    }
+
+    /// Decomposes the live engine into the streaming halves and the store handles
+    /// needed to stream them to disk — everything the caller needs to run the
+    /// serialize **off** the engine thread (#1337). Runs on the engine thread (a
+    /// consistent read of the live state + the cold routing index); the returned
+    /// parts own only `Arc` store handles and the resident payloads, so the
+    /// follow-up [`write_streaming_snapshot_from_stores`](crate::snapstream::write_streaming_snapshot_from_stores)
+    /// is purely synchronous and never folds the whole cold set into one
+    /// in-memory [`EngineSnapshot`].
+    ///
+    /// A variable-spilled resident instance keeps its placeholder here; its real
+    /// payload is resolved from the spill tier as it streams out. A cold instance
+    /// is not read at all here — only its key is captured, and the row is read
+    /// lazily during the stream.
+    pub fn streaming_snapshot_parts(
+        &self,
+    ) -> (
+        crate::snapstream::StreamingCapture,
+        Vec<Key>,
+        crate::snapstream::SpillStores,
+    ) {
+        let full = self.engine.snapshot();
+        // Move the captured state into decomposition (rather than cloning it):
+        // `Engine::snapshot` already cloned the resident `State` off the live
+        // engine, and `decompose_state_for_streaming` consumes it by value, so a
+        // second clone here would keep an unnecessary extra copy of its maps
+        // alive during decomposition — raising peak memory on exactly the
+        // memory-constrained nodes this change targets (#1464 review).
+        let (control_state, resident) = Engine::decompose_state_for_streaming(full.state);
+        let control = nanobpmn_engine_core::EngineSnapshot {
+            state: control_state,
+            partition_id: full.partition_id,
+            next_local: full.next_local,
+            num_partitions: full.num_partitions,
+            now: full.now,
+            start_dispatch_rr: full.start_dispatch_rr,
+        };
+        let cold_keys: Vec<Key> = self
+            .cold
+            .as_ref()
+            .map(|c| c.index.keys().collect())
+            .unwrap_or_default();
+        let stores = crate::snapstream::SpillStores {
+            cold: self.cold.as_ref().map(|c| Arc::clone(&c.store)),
+            spill: self.spill.as_ref().map(|s| Arc::clone(&s.store)),
+            varstore: self.varstore.as_ref().map(Arc::clone),
+        };
+        (
+            crate::snapstream::StreamingCapture { control, resident },
+            cold_keys,
+            stores,
+        )
+    }
+
+    /// Streaming/sidecar counterpart of [`try_engine_snapshot`](Journal::try_engine_snapshot)
+    /// (#1337): captures a self-contained snapshot **without** materializing the
+    /// whole cold/spilled set in one in-memory [`EngineSnapshot`], streaming it
+    /// to `path` as bounded chunk frames. Fail-closed, exactly like
+    /// [`try_engine_snapshot`](Journal::try_engine_snapshot): returns `Err` the
+    /// moment any cold row or spilled payload cannot be read, and the partial
+    /// file is removed, so an incomplete snapshot is never sealed.
+    pub fn write_streaming_snapshot_to(
+        &self,
+        path: &std::path::Path,
+        header_line: &str,
+        covered_events: u64,
+    ) -> std::io::Result<()> {
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        crate::snapstream::write_streaming_snapshot_from_stores(
+            path,
+            header_line,
+            covered_events,
+            capture,
+            &cold_keys,
+            stores,
+        )
     }
 
     /// Reads a spilled instance's variables without consuming them: from the
@@ -3528,7 +3750,9 @@ impl Journal {
         &self,
     ) -> Option<(nanobpmn_engine_core::EngineSnapshot, VarUpsertDelta)> {
         let mut snap = self.engine.snapshot_control_only();
+        self.begin_fold();
         let cold_upserts = self.fold_cold_into(&mut snap.state, OrphanPolicy::Quarantine)?;
+        self.fold_succeeded();
         for (key, _) in &cold_upserts {
             if let Some(inst) = snap.state.instances.get_mut(key)
                 && !inst.variables.is_empty()
@@ -3568,6 +3792,31 @@ mod tests {
     use nanobpmn_engine_core::ProcessBuilder;
 
     use super::*;
+
+    /// Minimal no-runtime `block_on` for the commit handles (a `Commit` resolves
+    /// on a plain `oneshot`, so a thread-parking waker suffices — no tokio
+    /// reactor needed).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        use std::sync::mpsc;
+        use std::task::{Context, Poll, Wake, Waker};
+
+        struct Parker(mpsc::Sender<()>);
+        impl Wake for Parker {
+            fn wake(self: Arc<Self>) {
+                let _ = self.0.send(());
+            }
+        }
+        let (tx, rx) = mpsc::channel::<()>();
+        let waker = Waker::from(Arc::new(Parker(tx)));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return out,
+                Poll::Pending => rx.recv().unwrap(),
+            }
+        }
+    }
 
     fn demo() -> nanobpmn_engine_core::ProcessDefinition {
         ProcessBuilder::new("demo")
@@ -3671,6 +3920,134 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert!(journal.state().jobs[&leased].deadline.is_some());
         assert!(journal.state().jobs[&soft].deadline.is_none());
+    }
+
+    /// #1181 regression: an eventless success (an idempotent settlement replay)
+    /// must NOT be acknowledged on a bare `Commit::ready()` from a file-backed
+    /// journal while the ORIGINAL settlement could still be in the writer's
+    /// queue — a crash in between would lose a settlement the worker was told
+    /// succeeded. The replay's commit must be a real writer-queue barrier
+    /// (`Pending`), which resolves once everything enqueued before it is
+    /// durable; an in-memory journal (nothing to fsync) stays `Ready`.
+    #[test]
+    fn an_eventless_replay_commit_is_a_real_durability_barrier() {
+        let dir = std::env::temp_dir().join(format!("nanobpmn-barrier-{}", std::process::id()));
+        let path = dir.join("test.journal");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut journal = Journal::open(&path).unwrap();
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let _ = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let activation = journal
+            .apply_command_at(
+                Command::activate_jobs_with_options(
+                    "demo-work",
+                    "w1",
+                    1,
+                    60_000,
+                    0,
+                    nanobpmn_engine_core::JobActivationOptions {
+                        with_lease: true,
+                        ..Default::default()
+                    },
+                ),
+                0,
+            )
+            .unwrap()
+            .0;
+        let (job_key, token) = activation
+            .iter()
+            .find_map(|e| match e {
+                Event::JobActivated {
+                    job_key,
+                    lease_token: Some(t),
+                    ..
+                } => Some((*job_key, t.clone())),
+                _ => None,
+            })
+            .unwrap();
+
+        let settle = Command::complete_job(job_key).with_lease_token(Some(token));
+        let (events, original) = journal.apply_command_at(settle.clone(), 1).unwrap();
+        assert!(!events.is_empty(), "the first settlement really settles");
+        assert!(
+            matches!(original, Commit(CommitInner::Pending(_))),
+            "a real settlement on a file-backed journal is a pending write"
+        );
+        let replay = journal.apply_command_at(settle, 2).unwrap();
+        assert!(
+            replay.0.is_empty(),
+            "the replay is an eventless idempotent success"
+        );
+        assert!(
+            matches!(replay.1, Commit(CommitInner::Pending(_))),
+            "the replay's ack rides the writer queue behind the original, never a bare ready commit"
+        );
+        // An unrelated eventless no-op (not a settlement) keeps a ready commit:
+        // no barrier, no fsync, no commit statistics.
+        let noop = journal
+            .apply_command_at(Command::ExpireJobs { now: 3 }, 3)
+            .unwrap();
+        assert!(noop.0.is_empty());
+        assert!(
+            matches!(noop.1, Commit(CommitInner::Ready)),
+            "a non-settlement no-op must not take a writer barrier"
+        );
+        // Both resolve once the writer drains (no deadlock).
+        block_on(original.wait());
+        block_on(replay.1.wait());
+
+        // The in-memory journal has no writer: its barrier is already durable.
+        let mut memory = Journal::in_memory();
+        let _ = memory
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let _ = memory
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let activation = memory
+            .apply_command_at(
+                Command::activate_jobs_with_options(
+                    "demo-work",
+                    "w1",
+                    1,
+                    60_000,
+                    0,
+                    nanobpmn_engine_core::JobActivationOptions {
+                        with_lease: true,
+                        ..Default::default()
+                    },
+                ),
+                0,
+            )
+            .unwrap()
+            .0;
+        let (job_key, token) = activation
+            .iter()
+            .find_map(|e| match e {
+                Event::JobActivated {
+                    job_key,
+                    lease_token: Some(t),
+                    ..
+                } => Some((*job_key, t.clone())),
+                _ => None,
+            })
+            .unwrap();
+        let settle = Command::complete_job(job_key).with_lease_token(Some(token));
+        let _ = memory.apply_command_at(settle.clone(), 1).unwrap();
+        let replay = memory.apply_command_at(settle, 2).unwrap();
+        assert!(replay.0.is_empty());
+        assert!(
+            matches!(replay.1, Commit(CommitInner::Ready)),
+            "an in-memory journal is already durable"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4770,6 +5147,132 @@ mod tests {
         assert_eq!(view(&spilled.engine_snapshot()), expected);
     }
 
+    // #1337 defect-class guard: the streaming/sidecar capture must produce the
+    // SAME logical snapshot as the folding capture (every instance, every
+    // variable) — spill is invisible either way — while never folding the whole
+    // cold set into one in-memory `EngineSnapshot`. This drives a journal with a
+    // mix of cold-spilled and variable-spilled instances through
+    // `write_streaming_snapshot_to`, restores it by streaming, and asserts the
+    // rebuilt engine matches a never-spilled twin.
+    #[test]
+    fn streaming_snapshot_is_invariant_under_variable_and_cold_spill() {
+        use nanobpmn_engine_core::Value;
+
+        fn drive(journal: &mut Journal, between: fn(&mut Journal)) -> Vec<Key> {
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let mut keys = Vec::new();
+            for i in 0..4 {
+                if i == 2 {
+                    between(journal);
+                }
+                let mut vars = std::collections::HashMap::new();
+                vars.insert("data".to_string(), Value::Str(format!("p{i}")));
+                vars.insert("n".to_string(), Value::Int(i));
+                let (events, _) = journal
+                    .apply_command(Command::create_instance_with("demo", vars))
+                    .unwrap();
+                keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+            }
+            keys
+        }
+        type InstanceView = (Key, Vec<(String, String)>, Vec<Key>);
+        fn view(snap: &nanobpmn_engine_core::EngineSnapshot) -> Vec<InstanceView> {
+            let mut out: Vec<_> = snap
+                .state
+                .instances
+                .values()
+                .map(|inst| {
+                    assert!(!inst.variables_spilled, "no placeholder in a snapshot");
+                    let mut vars: Vec<(String, String)> = inst
+                        .variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                        .collect();
+                    vars.sort();
+                    let mut jobs: Vec<Key> = snap
+                        .state
+                        .jobs
+                        .values()
+                        .filter(|j| j.instance_key == inst.key)
+                        .map(|j| j.key)
+                        .collect();
+                    jobs.sort();
+                    (inst.key, vars, jobs)
+                })
+                .collect();
+            out.sort();
+            out
+        }
+
+        let mut resident = Journal::in_memory();
+        let keys = drive(&mut resident, |_| {});
+        let expected = view(&resident.engine_snapshot());
+
+        // The spilled twin: first batch wholly cold, second batch variable-spilled.
+        let mut spilled = Journal::in_memory();
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+        spilled.set_spill(Arc::clone(&store), usize::MAX);
+        spilled.set_cold_spill(Arc::clone(&store), u64::MAX, u64::MAX);
+        let spilled_keys = drive(&mut spilled, |j| {
+            assert_eq!(
+                j.force_cold_spill_all(),
+                2,
+                "precondition: first batch cold"
+            );
+        });
+        assert_eq!(spilled_keys, keys);
+        spilled.set_spill(store, 0);
+        spilled.force_spill_scan();
+        assert_eq!(spilled.cold_count(), 2);
+        for key in &keys[2..] {
+            assert!(
+                spilled.engine.is_variables_spilled(*key),
+                "second batch spilled"
+            );
+        }
+
+        // Capture via the streaming sidecar. The cold instances must NOT become
+        // resident as a side effect (the whole point of #1337).
+        let dir = std::env::temp_dir().join(format!(
+            "nanobpmn-stream-snap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("snapshot.stream.bin");
+        spilled
+            .write_streaming_snapshot_to(&path, "{\"format_version\":3}", 0)
+            .expect("streaming capture succeeds");
+        assert_eq!(
+            spilled.cold_count(),
+            2,
+            "cold instances stayed off-heap through the streaming capture"
+        );
+
+        // Restore by streaming, rebuilding a full EngineSnapshot one instance at
+        // a time, and confirm it is logically identical to the never-spilled twin.
+        let mut control: Option<nanobpmn_engine_core::EngineSnapshot> = None;
+        let mut restored = Vec::new();
+        crate::snapstream::read_streaming_snapshot(
+            &path,
+            |c, _| control = Some(c),
+            |snap| restored.push(snap),
+        )
+        .expect("streaming restore");
+        let mut snap = control.expect("control frame present");
+        for is in restored {
+            nanobpmn_engine_core::restore_instance_snapshot(&mut snap.state, is);
+        }
+        assert_eq!(view(&snap), expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // #1331 (lean path): a cold-spilled (wholly off-heap) instance must survive a
     // restart from a LEAN checkpoint too. Lean mode and cold spill are configured
     // independently, so they co-occur; `snapshot_control_only` omits the cold
@@ -5208,6 +5711,53 @@ mod tests {
         assert!(journal.quarantined_orphans().is_empty());
         let _ = journal.engine_snapshot();
 
+        drop(journal);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // #1385: the #1383 failure mode (an unreadable payload fail-closing every
+    // snapshot) must NAME the blocking instance key for /health, log the
+    // blocker once rather than every tick, and clear once the store reads again
+    // — proven across a store outage and its repair, deterministically.
+    #[test]
+    fn unreadable_spill_store_names_blocker_dedupes_logs_and_clears_on_recovery() {
+        let path = restart_store_path("blocker-spill");
+        let (journal, keys) = spilled_journal(&path, 2);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE spill RENAME TO spill_offline;")
+            .unwrap();
+
+        for _ in 0..3 {
+            assert!(journal.try_engine_snapshot_quarantining().is_none());
+        }
+        let blockers = journal.snapshot_blockers();
+        assert_eq!(blockers.len(), 1, "the fold aborts at the first blocker");
+        assert!(
+            keys.contains(&blockers[0]),
+            "{blockers:?} names a real instance"
+        );
+        assert_eq!(
+            journal.snapshot_blocker_logs_suppressed(),
+            2,
+            "the same blocker is logged once, then only counted"
+        );
+        assert!(
+            journal.quarantined_orphans().is_empty(),
+            "unreadable != orphan"
+        );
+
+        conn.execute_batch("ALTER TABLE spill_offline RENAME TO spill;")
+            .unwrap();
+        assert!(journal.try_engine_snapshot_quarantining().is_some());
+        assert!(journal.snapshot_blockers().is_empty(), "cleared on success");
+
+        // A recurrence after recovery is a NEW incident and logs again.
+        conn.execute_batch("ALTER TABLE spill RENAME TO spill_offline;")
+            .unwrap();
+        assert!(journal.try_engine_snapshot_quarantining().is_none());
+        assert_eq!(journal.snapshot_blocker_logs_suppressed(), 2);
+
+        drop(conn);
         drop(journal);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

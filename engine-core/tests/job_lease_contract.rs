@@ -518,9 +518,25 @@ fn expired_and_failed_leases_allow_late_completion_but_not_unleased_reactivation
             Some(lease.as_str())
         );
         assert!(activate(&mut engine, false, 1_000).is_empty());
-        engine
-            .apply_command(Command::complete_job(job_key).with_job_lease(lease))
-            .unwrap();
+        if fail {
+            // #1181: the failed token already SETTLED that activation, so a
+            // completion under it is a conflict (one token settles one
+            // activation exactly once) — never a second settlement. The exact
+            // replay of the recorded outcome stays an idempotent no-op.
+            assert_eq!(
+                engine.apply_command(Command::complete_job(job_key).with_job_lease(lease.clone())),
+                Err(nanobpmn_engine_core::EngineError::JobLeaseMismatch { job_key })
+            );
+            engine
+                .apply_command(Command::fail_job(job_key, 1, "retry").with_job_lease(lease))
+                .unwrap();
+        } else {
+            // An EXPIRED lock settled nothing: the late completion under the
+            // retained lease is still honoured.
+            engine
+                .apply_command(Command::complete_job(job_key).with_job_lease(lease))
+                .unwrap();
+        }
     }
 }
 

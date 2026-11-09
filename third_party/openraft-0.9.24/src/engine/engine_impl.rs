@@ -430,7 +430,17 @@ where C: RaftTypeConfig
         let is_ok = res.is_ok();
 
         if let Some(tx) = tx {
-            let resp: AppendEntriesResponse<C::NodeId> = res.into();
+            // Build the response here (not via `From`) so a Conflict carries the
+            // follower's REAL last log id as a hint: the leader uses it to shrink
+            // its replication search window straight to the follower's actual
+            // frontier instead of walking down one RPC per step.
+            let resp: AppendEntriesResponse<C::NodeId> = match res {
+                Ok(()) => AppendEntriesResponse::Success,
+                Err(RejectAppendEntries::ByVote(v)) => AppendEntriesResponse::HigherVote(v),
+                Err(RejectAppendEntries::ByConflictingLogId { .. }) => {
+                    AppendEntriesResponse::Conflict(self.state.last_log_id().cloned())
+                }
+            };
             self.output.push_command(Command::Respond {
                 when: None,
                 resp: Respond::new(Ok(resp), tx),
