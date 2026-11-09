@@ -132,6 +132,17 @@ const RECLAIM_CHUNK_PAGES: u32 = 65_536;
 /// stalling it with one huge multi-hundred-thousand-row transaction.
 const FORGET_CHUNK: usize = 4_096;
 
+/// The off-heap tables [`VarSpillStore::gc_orphans`] sweeps, selecting the
+/// enumeration query for each.
+#[derive(Clone, Copy, Debug)]
+enum GcTable {
+    /// Variable payloads (`spill`): kept while their instance is live OR still
+    /// carries a spilled-flag reference.
+    Spill,
+    /// Whole-instance snapshots (`cold`): kept while their instance is live.
+    Cold,
+}
+
 /// Background thread that applies follower **retirement** `forget` deletes off the
 /// engine actor. The follower retirement backstop can reap up to 100k cold
 /// victims per tick; running that DELETE inline on the single-writer replica actor
@@ -454,17 +465,17 @@ impl VarSpillStore {
         // dropped by `forget` at eviction, so the store stays bounded by the
         // live set.
         //
-        // That bound is **best-effort across crashes** (accepted, #1338): a crash
-        // between writing a cold/spill row and the instance reaching a terminal
-        // state (or a row written by an engine predating self-contained
-        // snapshots, whose routing index was never persisted) leaves an orphaned
-        // row that `forget` never reaches, because the in-RAM cold index is not
-        // rebuilt at boot. A post-recovery reconciliation/GC that deletes rows no
-        // longer referenced by live state — while preserving rows still
-        // referenced by legacy spilled flags — is deliberately **not** added in
-        // this PR: it carries durability/ordering implications (what is
-        // authoritative, when to run it, how to avoid deleting a row a concurrent
-        // recovery still needs) and is tracked separately in #1338.
+        // That bound is restored after a crash by the post-recovery GC (#1338):
+        // a crash between writing a cold/spill row and the instance's terminal
+        // eviction `forget` (or a row written by an engine predating
+        // self-contained snapshots, whose routing index was never persisted)
+        // leaves an orphan that `forget` never reaches, because the in-RAM cold
+        // index is not rebuilt at boot. [`gc_orphans`](Self::gc_orphans) deletes
+        // every row no longer referenced by the recovered live state — while
+        // preserving rows still referenced by a legacy spilled flag — and runs
+        // once at boot, after recovery completes for the whole node (Raft
+        // replicas included) and before serving (see
+        // [`crate::journal::Journal::gc_offheap_orphans`]).
         //
         // Convert to INCREMENTAL auto-vacuum so freed pages can later be handed
         // back to the OS instead of plateauing at the high-water mark (a one-time
@@ -788,6 +799,50 @@ impl VarSpillStore {
         Ok(())
     }
 
+    /// Single-table variant of [`delete_keys`](Self::delete_keys) for the GC's
+    /// per-table passes. The two GC passes protect different sets — `spill`
+    /// rows are also kept for `spill_referenced` keys, `cold` rows are not — so
+    /// a pass must NOT touch the other table: a key that is spill-referenced
+    /// but not live keeps its spill row (the only surviving copy of a legacy
+    /// spilled instance's variables) while its orphaned cold row is reaped, and
+    /// a live-but-unreferenced key keeps its cold row while its stale spill row
+    /// is reaped. Deleting both tables on either pass would take a protected
+    /// row with the orphan (the #1479 review finding).
+    ///
+    /// `partition` bounds the delete to keys that partition MINTED
+    /// (`key >> 51 == partition`): each partition's fenced sweep reaps only its
+    /// own key range, so a cross-partition row is never deleted by a sweep
+    /// whose fence does not cover it — it is reaped when its OWN partition
+    /// sweeps under its own single-writer fence.
+    fn delete_keys_in_table(
+        conn: &Mutex<Connection>,
+        activity: &AtomicU64,
+        table: GcTable,
+        keys: &[Key],
+        partition: u64,
+    ) -> rusqlite::Result<u64> {
+        let sql = match table {
+            GcTable::Spill => "DELETE FROM spill WHERE key = ?1",
+            GcTable::Cold => "DELETE FROM cold WHERE key = ?1",
+        };
+        let mut deleted = 0u64;
+        for chunk in keys.chunks(FORGET_CHUNK) {
+            activity.fetch_add(1, Ordering::Relaxed);
+            let mut guard = conn.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = guard.transaction()?;
+            {
+                let mut del = tx.prepare_cached(sql)?;
+                for &key in chunk {
+                    if nanobpmn_engine_core::partition_of(key) == partition {
+                        deleted += del.execute(params![key as i64])? as u64;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+        Ok(deleted)
+    }
+
     /// Persists `vars` under `key`, replacing any prior payload.
     pub fn put(&self, key: Key, vars: &HashMap<String, Value>) -> rusqlite::Result<()> {
         let json = serde_json::to_string(vars)
@@ -885,6 +940,208 @@ impl VarSpillStore {
             // pending-delete record and leave orphan rows (#1366).
             self.faults.record(err, keys.to_vec());
         })
+    }
+
+    /// Post-recovery garbage collection of orphaned off-heap rows ([#1338],
+    /// reworked after the reverted #1467).
+    ///
+    /// Deletes every `spill` row whose key is absent from BOTH `live` (the
+    /// recovered engine's live instance keys for the sweeping partition) and
+    /// `spill_referenced` (live instances whose `variables_spilled` flag is
+    /// still set — a legacy snapshot can leave such a flag pointing at its
+    /// spill row, so the row is the only surviving copy of that instance's
+    /// variables and must be preserved), and every `cold` row whose key is
+    /// absent from `live` (a cold row is only reachable through the routing
+    /// index of a live instance). Returns the number of orphaned rows deleted.
+    ///
+    /// **Conservative live-key retention.** Every key in `live` is preserved
+    /// from BOTH tables regardless of flags: a live instance's spill row is
+    /// kept even if its `variables_spilled` flag has since cleared (the row is
+    /// then inert — a fresh spill rewrites it with `INSERT OR REPLACE` — and it
+    /// is dropped by the terminal eviction `forget`). Callers must not rely on
+    /// this sweep to reclaim live-but-no-longer-spilled rows; it exists to reap
+    /// rows NO live state references.
+    ///
+    /// **Durability/ordering contract.** The recovered engine state (snapshot +
+    /// replayed journal) of the sweeping partition is authoritative for
+    /// liveness, and the caller runs this through the partition's engine actor
+    /// ([`crate::journal::Journal::gc_offheap_orphans_locked`]) so the
+    /// single-writer thread is held from the live-set capture to the last
+    /// delete: no create/complete can mint or spill a key mid-sweep. The delete
+    /// is bounded to keys the sweeping partition MINTED (`partition`), so a
+    /// cross-partition row is never reaped by a sweep whose fence does not
+    /// cover it — it is reaped when its own partition sweeps under its own
+    /// fence. A row for an instance the recovered engine has driven to a
+    /// terminal state is dead — its eviction `forget` was lost to the crash —
+    /// and is reaped here.
+    ///
+    /// **Streamed, range-bounded enumeration.** Both tables are scanned by
+    /// keyset pagination in [`FORGET_CHUNK`]-key pages (`WHERE key > ?1 AND key
+    /// <= ?2 ORDER BY key LIMIT …`), each page is filtered and its orphans
+    /// deleted BEFORE the next page is fetched, so memory stays bounded by one
+    /// page plus one delete batch — never the whole on-disk backlog (#1467
+    /// finding: whole-table materialisation could exhaust startup memory on
+    /// constrained deployments). The scan is restricted to the sweeping
+    /// partition's own key band: keys embed a 13-bit partition prefix, so
+    /// partition `p` mints exactly `[p << 51, (p+1) << 51)`, a contiguous
+    /// SIGNED range when persisted as `key as i64` (negative for partitions ≥
+    /// 4096 — the band bounds handle the sign flip, where a scan starting at
+    /// `-1` would have skipped every high partition's rows permanently, #1479
+    /// review finding). Bounding the enumeration keeps a P-partition sweep at
+    /// O(own rows) instead of O(P × store) enumeration under each partition's
+    /// engine-actor fence (#1479 review finding). Rows are inserted by
+    /// monotonically increasing keys, so a row written concurrently behind the
+    /// cursor belongs to a live instance (kept by construction); a row written
+    /// ahead of the cursor is seen by a later page and filtered against the
+    /// same sets.
+    ///
+    /// A SQLite failure — enumerating OR deleting — propagates as the typed
+    /// [`rusqlite::Error`] and is latched into [`Self::forget_faults`] (never
+    /// silent, matching [`forget`](Self::forget); an enumeration failure
+    /// retains no keys because no delete was attempted). Already-committed
+    /// pages stay deleted and the caller retries the remainder on the next
+    /// boot.
+    ///
+    /// `partition` must be the id of the partition whose recovered engine
+    /// produced `live`/`spill_referenced`: the delete is bounded to keys that
+    /// partition minted, so a fenced sweep only ever reaps rows its own
+    /// single-writer fence covers (see
+    /// [`gc_orphans_in_table`](Self::gc_orphans_in_table)).
+    pub fn gc_orphans(
+        &self,
+        live: &std::collections::HashSet<Key>,
+        spill_referenced: &std::collections::HashSet<Key>,
+        partition: u64,
+    ) -> rusqlite::Result<u64> {
+        // Each pass deletes from its OWN table only. The two passes protect
+        // DIFFERENT sets — `spill` rows are also kept for `spill_referenced`
+        // keys, `cold` rows are not — so a shared both-tables delete is wrong
+        // in BOTH directions: the cold pass would take a spill-referenced
+        // key's payload along with its orphaned cold row (the #1479 review
+        // finding), and the spill pass would reap a live-but-unreferenced
+        // key's cold row early (a live instance's cold row is protected, not
+        // orphaned). `collected` therefore counts orphaned ROWS (a key with an
+        // orphan row in each table is reaped twice — once per pass).
+        let no_references = std::collections::HashSet::new();
+        let mut collected = self.gc_orphans_in_table(
+            GcTable::Spill,
+            live,
+            spill_referenced,
+            GcTable::Spill,
+            partition,
+        )?;
+        collected += self.gc_orphans_in_table(
+            GcTable::Cold,
+            live,
+            &no_references,
+            GcTable::Cold,
+            partition,
+        )?;
+        Ok(collected)
+    }
+
+    /// One table's paged sweep for [`gc_orphans`](Self::gc_orphans): enumerate
+    /// `table`'s keys in ascending keyset pages, filter each page against
+    /// `live`/`referenced`, and delete that page's orphans before fetching the
+    /// next page. The read cursor never overlaps its own delete transaction
+    /// (each page's query completes — and its statement drops — before the
+    /// delete runs), and the connection lock is released between pages so a
+    /// large backlog never holds it across live traffic.
+    ///
+    /// `deletes` selects the table the delete runs against. Each GC pass
+    /// deletes from its own table only: the two passes protect different sets
+    /// (`spill` rows are also kept for `spill_referenced` keys; `cold` rows are
+    /// not), so a both-tables delete would either take a spill-referenced
+    /// key's payload with its orphaned cold row (the #1479 review finding) or
+    /// reap a live-but-unreferenced key's cold row early.
+    ///
+    /// **The enumeration itself is bounded to `partition`'s key range** — keys
+    /// embed a 13-bit partition prefix, so partition `p` mints exactly
+    /// `[p << 51, (p+1) << 51)`, a contiguous SIGNED range when persisted as
+    /// `key as i64` (negative for partitions ≥ 4096). Restricting the scan to
+    /// that range keeps a P-partition sweep at O(own rows) instead of O(P ×
+    /// store) enumeration work — all of it previously done while the sweeping
+    /// partition's engine actor was held (#1479 review finding) — and makes the
+    /// delete's partition filter a belt-and-suspenders guard rather than the
+    /// only thing standing between a sweep and a cross-partition row.
+    fn gc_orphans_in_table(
+        &self,
+        table: GcTable,
+        live: &std::collections::HashSet<Key>,
+        referenced: &std::collections::HashSet<Key>,
+        deletes: GcTable,
+        partition: u64,
+    ) -> rusqlite::Result<u64> {
+        let sql = match table {
+            GcTable::Spill => {
+                "SELECT key FROM spill WHERE key > ?1 AND key <= ?2 ORDER BY key LIMIT ?3"
+            }
+            GcTable::Cold => {
+                "SELECT key FROM cold WHERE key > ?1 AND key <= ?2 ORDER BY key LIMIT ?3"
+            }
+        };
+        let mut collected = 0u64;
+        // The partition's key band as SIGNED bounds (keys are persisted as
+        // `key as i64`). The band starts at `partition << 51` itself — a
+        // never-minted key (local counters start at 1) — so the `>` cursor
+        // comparison includes the partition's whole range from its first real
+        // key. Partitions ≥ 4096 have bands above `i64::MAX`: both bounds are
+        // then negative in SQLite's signed ordering and the comparison still
+        // holds (#1479 review finding — starting the scan at `-1` had skipped
+        // them entirely).
+        let band_start: i64 = (partition << nanobpmn_engine_core::LOCAL_BITS) as i64;
+        let band_end: i64 = band_start.saturating_add(nanobpmn_engine_core::LOCAL_MASK as i64);
+        let mut cursor: i64 = band_start;
+        loop {
+            // One bounded page. The statement (and its read cursor) is dropped
+            // before the delete below, so the two never overlap on the
+            // connection. An enumeration failure is latched into
+            // `forget_faults` exactly like a delete failure (never silent; no
+            // keys are retained because no delete was attempted).
+            let page: Vec<Key> = {
+                let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                (|| {
+                    let mut stmt = conn.prepare_cached(sql)?;
+                    let rows = stmt
+                        .query_map(params![cursor, band_end, FORGET_CHUNK as i64], |r| {
+                            r.get::<_, i64>(0)
+                        })?;
+                    let mut page = Vec::with_capacity(FORGET_CHUNK);
+                    for key in rows {
+                        page.push(key? as Key);
+                    }
+                    Ok(page)
+                })()
+                .inspect_err(|err| self.faults.record(err, Vec::new()))?
+            };
+            if page.is_empty() {
+                return Ok(collected);
+            }
+            cursor = page[page.len() - 1] as i64;
+            let orphans: Vec<Key> = page
+                .into_iter()
+                .filter(|k| !live.contains(k) && !referenced.contains(k))
+                .collect();
+            if !orphans.is_empty() {
+                // Table- and partition-scoped delete: this pass reaps only its
+                // own table's orphan rows that THIS partition minted (see the
+                // fn-level docs for why both-tables / cross-partition deletion
+                // is wrong). The band-restricted enumeration already yields
+                // only this partition's keys; the delete's filter is the
+                // defence-in-depth half of the same bound.
+                let deleted = Self::delete_keys_in_table(
+                    &self.conn,
+                    &self.activity,
+                    deletes,
+                    &orphans,
+                    partition,
+                )
+                .inspect_err(|err| {
+                    self.faults.record(err, orphans.clone());
+                })?;
+                collected += deleted;
+            }
+        }
     }
 
     /// Like [`forget`](Self::forget), but hands the deletes to the background
@@ -1825,5 +2082,294 @@ mod tests {
         );
         // flush is a no-op when there is no worker.
         assert!(store.flush_forgets(), "forget worker flushed");
+    }
+
+    /// #1338 (rework of the reverted #1467): the orphan GC must enumerate the
+    /// store in BOUNDED keyset pages — never materialize a whole table — so a
+    /// large on-disk orphan backlog cannot exhaust startup memory. This seeds
+    /// more than one [`FORGET_CHUNK`] page of orphans (plus live rows) and
+    /// asserts every orphan is still reaped while the live rows survive.
+    #[test]
+    fn gc_orphans_streams_the_enumeration_in_bounded_pages() {
+        let store = VarSpillStore::open(None).unwrap();
+        // Live keys: retained by the sweep. Orphan keys: reaped. The two key
+        // ranges are disjoint and interleave page boundaries so a broken filter
+        // cannot pass by accident.
+        let live: std::collections::HashSet<Key> = (0..64u64).map(|i| i * 2).collect();
+        let orphans = FORGET_CHUNK + 137; // > 1 page, with a ragged tail page
+        for &key in &live {
+            store.put(key, &vars("live")).unwrap();
+            store.put_cold(key, &snapshot_for(key)).unwrap();
+        }
+        for i in 0..orphans as u64 {
+            let key = i * 2 + 1;
+            store.put(key, &vars("orphan")).unwrap();
+            store.put_cold(key, &snapshot_for(key)).unwrap();
+        }
+
+        let collected = store
+            .gc_orphans(&live, &std::collections::HashSet::new(), 0)
+            .expect("sweep succeeds");
+
+        // Each orphan key held one row per table and each pass reaps its own
+        // table's rows, so the count is the orphan ROWS (2 per key).
+        assert_eq!(collected, 2 * orphans as u64, "every orphan row reaped");
+        for &key in &live {
+            assert!(
+                store.try_get(key).unwrap().is_some(),
+                "live spill row {key} survives"
+            );
+            assert!(
+                store.try_get_cold(key).unwrap().is_some(),
+                "live cold row {key} survives"
+            );
+        }
+        for i in [0u64, 4097, 2 * (orphans as u64 - 1) + 1] {
+            let key = i.min(2 * (orphans as u64 - 1) + 1) | 1;
+            assert!(
+                store.try_get(key).unwrap().is_none(),
+                "orphan spill row {key} reaped"
+            );
+            assert!(
+                store.try_get_cold(key).unwrap().is_none(),
+                "orphan cold row {key} reaped"
+            );
+        }
+        // The spill-reference set preserves a row even when its key is not live.
+        let referenced: std::collections::HashSet<Key> = [999_991].into_iter().collect();
+        store.put(999_991, &vars("legacy")).unwrap();
+        let collected = store
+            .gc_orphans(&live, &referenced, 0)
+            .expect("sweep succeeds");
+        assert_eq!(collected, 0, "nothing left to reap");
+        assert!(
+            store.try_get(999_991).unwrap().is_some(),
+            "a spill-referenced row is preserved"
+        );
+    }
+
+    /// #1479 review finding: the two GC passes protect DIFFERENT sets — a
+    /// `spill` row is also kept for a `spill_referenced` key, a `cold` row is
+    /// not — so the cold pass must delete from the cold table ONLY. A key that
+    /// is spill-referenced but not live, with a row in BOTH tables (a legacy
+    /// spilled instance that was also cold-spilled), must lose only its
+    /// orphaned cold row: its spill payload is the only surviving copy of its
+    /// variables and is protected.
+    #[test]
+    fn gc_orphans_cold_pass_preserves_a_spill_referenced_keys_spill_row() {
+        let store = VarSpillStore::open(None).unwrap();
+        let key = 777_777u64;
+        // The key is in neither table's LIVE set, but its spill row is
+        // referenced (a legacy snapshot's still-set `variables_spilled` flag).
+        store.put(key, &vars("legacy")).unwrap();
+        store.put_cold(key, &snapshot_for(key)).unwrap();
+        let referenced: std::collections::HashSet<Key> = [key].into_iter().collect();
+
+        let collected = store
+            .gc_orphans(&std::collections::HashSet::new(), &referenced, 0)
+            .expect("sweep succeeds");
+
+        assert_eq!(collected, 1, "exactly the orphaned cold row is reaped");
+        assert!(
+            store.try_get_cold(key).unwrap().is_none(),
+            "the orphaned cold row is reaped"
+        );
+        assert!(
+            store.try_get(key).unwrap().is_some(),
+            "the spill-referenced payload survives the cold pass (table-scoped deletion)"
+        );
+    }
+
+    /// #1479 review finding: keys embed a 13-bit partition prefix and are
+    /// persisted as `key as i64`, so partitions ≥ 4096 have keys ABOVE
+    /// `i64::MAX` — negative in SQLite's signed ordering. The paged sweep must
+    /// cover the full signed range (starting at `i64::MIN`), or every high
+    /// partition's crash orphans are permanently skipped.
+    #[test]
+    fn gc_orphans_sweeps_high_partition_keys_beyond_i64_max() {
+        use nanobpmn_engine_core::compose_key;
+
+        let store = VarSpillStore::open(None).unwrap();
+        // Partition 4096 is the first whose keys set the sign bit.
+        let high_orphan = compose_key(4096, 7);
+        let high_live = compose_key(4096, 8);
+        assert!(
+            (high_orphan as i64) < 0,
+            "partition-4096 keys are negative as i64"
+        );
+        assert!((high_live as i64) < 0);
+        // A low-partition orphan ahead of them in signed order, so the sweep
+        // provably crosses the sign boundary.
+        let low_orphan = 42u64;
+
+        for &key in &[high_orphan, high_live, low_orphan] {
+            store.put(key, &vars("x")).unwrap();
+            store.put_cold(key, &snapshot_for(key)).unwrap();
+        }
+        let live: std::collections::HashSet<Key> = [high_live].into_iter().collect();
+
+        // Sweep as partition 4096: its own high keys are in range, the
+        // low-partition orphan is NOT (it is reaped by its own partition's
+        // sweep, not this one).
+        let collected = store
+            .gc_orphans(&live, &std::collections::HashSet::new(), 4096)
+            .expect("sweep succeeds");
+
+        assert_eq!(
+            collected, 2,
+            "the high-partition orphan is reaped across the sign boundary (2 rows)"
+        );
+        assert!(
+            store.try_get(high_orphan).unwrap().is_none(),
+            "high-partition orphan spill row reaped"
+        );
+        assert!(
+            store.try_get_cold(high_orphan).unwrap().is_none(),
+            "high-partition orphan cold row reaped"
+        );
+        assert!(
+            store.try_get(low_orphan).unwrap().is_some(),
+            "the low-partition orphan is out of this sweep's partition scope"
+        );
+        assert!(
+            store.try_get(high_live).unwrap().is_some(),
+            "the high-partition live spill row survives"
+        );
+        assert!(
+            store.try_get_cold(high_live).unwrap().is_some(),
+            "the high-partition live cold row survives"
+        );
+
+        // Sweeping as partition 0 then reaps the low orphan.
+        let collected = store
+            .gc_orphans(
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                0,
+            )
+            .expect("sweep succeeds");
+        assert_eq!(collected, 2, "the low-partition orphan's 2 rows are reaped");
+        assert!(store.try_get(low_orphan).unwrap().is_none());
+        assert!(store.try_get_cold(low_orphan).unwrap().is_none());
+    }
+
+    /// #1479 review finding: with P hosted partitions sharing the store, a
+    /// sweep that ENUMERATES both whole tables per partition does O(P × store)
+    /// work while each partition's engine actor is fenced for its full sweep.
+    /// The scan must be restricted to the sweeping partition's own key band
+    /// (`[p << 51, (p+1) << 51)` as signed i64). This drives the bound
+    /// directly: an orphan INSIDE the band is reaped while rows OUTSIDE it
+    /// (another partition's) must come back byte-for-byte untouched — a
+    /// whole-table enumeration would visit (and a cross-partition delete would
+    /// reap) them.
+    #[test]
+    fn gc_orphans_enumeration_never_visits_rows_outside_the_partitions_key_band() {
+        use nanobpmn_engine_core::compose_key;
+
+        let store = VarSpillStore::open(None).unwrap();
+        // Partition 1's band: an orphan (reaped) and a live key (kept).
+        let own_orphan = compose_key(1, 5);
+        let own_live = compose_key(1, 6);
+        store.put(own_orphan, &vars("orphan")).unwrap();
+        store
+            .put_cold(own_orphan, &snapshot_for(own_orphan))
+            .unwrap();
+        store.put(own_live, &vars("live")).unwrap();
+        store.put_cold(own_live, &snapshot_for(own_live)).unwrap();
+        // Partition 0's band: rows a whole-table scan would visit and a
+        // cross-partition delete would reap. They must come back byte-for-byte
+        // untouched.
+        let foreign = compose_key(0, 5);
+        store.put(foreign, &vars("foreign")).unwrap();
+        store.put_cold(foreign, &snapshot_for(foreign)).unwrap();
+
+        let live: std::collections::HashSet<Key> = [own_live].into_iter().collect();
+        let collected = store
+            .gc_orphans(&live, &std::collections::HashSet::new(), 1)
+            .expect("sweep succeeds");
+
+        assert_eq!(collected, 2, "exactly the in-band orphan's 2 rows reaped");
+        assert!(store.try_get(own_orphan).unwrap().is_none());
+        assert!(store.try_get_cold(own_orphan).unwrap().is_none());
+        assert!(
+            store.try_get(own_live).unwrap().is_some(),
+            "in-band live spill row survives"
+        );
+        assert!(
+            store.try_get_cold(own_live).unwrap().is_some(),
+            "in-band live cold row survives"
+        );
+        assert_eq!(
+            store.try_get(foreign).unwrap(),
+            Some(vars("foreign")),
+            "the out-of-band row is byte-for-byte untouched (never enumerated, never deleted)"
+        );
+        assert!(
+            store.try_get_cold(foreign).unwrap().is_some(),
+            "the out-of-band cold row is untouched"
+        );
+    }
+
+    /// #1467 finding (reworked in #1338): a SQLite failure while ENUMERATING the
+    /// store's keys must be latched into `forget_faults` exactly like a delete
+    /// failure — the documented contract ("never silent") covered deletes but
+    /// the reverted implementation returned enumeration errors via `?` before
+    /// reaching the fault recorder, leaving `forget_faults().error()` unset.
+    /// Deterministic: dropping the `spill` table makes the enumeration query
+    /// itself fail with a real SQLite error, no timing involved.
+    #[test]
+    fn gc_orphans_enumeration_error_is_latched_as_a_fault() {
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        {
+            let conn = store.conn.lock().unwrap_or_else(|e| e.into_inner());
+            conn.execute("DROP TABLE spill", []).unwrap();
+        }
+
+        let err = store
+            .gc_orphans(
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                0,
+            )
+            .expect_err("enumerating a dropped table fails");
+        assert!(
+            store.forget_faults().error().is_some(),
+            "the enumeration failure is latched as a fault (never silent)"
+        );
+        assert!(
+            store.forget_faults().retained_keys().is_empty(),
+            "no keys retained: no delete was attempted"
+        );
+        drop(err);
+    }
+
+    /// A minimal cold-row payload for key-seeding tests: a real
+    /// [`InstanceSnapshot`] of a freshly created instance parked on a job
+    /// (a start→end instance completes at once, leaving nothing Active to
+    /// snapshot).
+    fn snapshot_for(key: Key) -> nanobpmn_engine_core::InstanceSnapshot {
+        use nanobpmn_engine_core::{Command, Engine, ProcessBuilder};
+
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(
+                ProcessBuilder::new("demo")
+                    .start_event("s")
+                    .service_task("w", "jt")
+                    .end_event("e")
+                    .connect("s", "w")
+                    .connect("w", "e")
+                    .build()
+                    .expect("valid process"),
+            ))
+            .unwrap();
+        let events = engine
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let mut snapshot = engine.snapshot_instance(inst).expect("snapshot");
+        snapshot.instance.key = key;
+        snapshot
     }
 }
