@@ -590,21 +590,26 @@ impl Engine {
     /// (`None`). Making terminal metadata authoritative for soft jobs is the
     /// architectural follow-up tracked in #963.
     ///
-    /// Falls back to the job's already-retained terminal deadline
-    /// (`Job::terminal_end`): a cascade re-cancel of an ALREADY-terminal job
-    /// must restate the deadline its first terminal transition recorded, not
-    /// `None` (the live lock is cleared by that transition) — first-terminal-
-    /// wins on every replica.
+    /// The retained first-terminal record is checked BEFORE the live lease:
+    /// `JobCompleted` clears `job.deadline` but leaves `job.lease_token`
+    /// populated (the settlement fence, #1181), so a lease-first check would
+    /// read the cleared lock and return `None` even when `terminal_end.deadline`
+    /// holds the retained deadline. First-terminal-wins on every replica — a
+    /// cascade re-cancel of an ALREADY-terminal job must restate the deadline
+    /// its first terminal transition recorded, not `None`.
     pub fn job_terminal_deadline(&self, job_key: Key) -> Option<u64> {
         let job = self.state.jobs.get(&job_key)?;
-        if job.lease_token.is_some() {
+        if let Some(terminal_end) = job.terminal_end {
+            // Already terminal: only the retained first-terminal record (itself
+            // replicated) is authoritative — the live lock is cleared.
+            terminal_end.deadline
+        } else if job.lease_token.is_some() {
             // A durable (journaled) lease: the lock is replicated, so its
             // deadline is identical on every replica.
             job.deadline
         } else {
-            // A soft (leader-local) or already-terminal job: only the retained
-            // first-terminal record (itself replicated) is authoritative.
-            job.terminal_end.and_then(|t| t.deadline)
+            // A soft (leader-local) activation: nothing replicated to restate.
+            None
         }
     }
 }

@@ -407,6 +407,34 @@ fn a_soft_activation_records_no_terminal_deadline() {
 }
 
 #[test]
+fn a_completed_leased_job_restates_its_retained_terminal_deadline() {
+    // Regression (#1440 review): `JobCompleted` clears `job.deadline` but
+    // leaves `job.lease_token` populated (the settlement fence, #1181), so a
+    // lease-first `job_terminal_deadline` read the cleared live lock and
+    // returned `None` even though the retained terminal record still holds the
+    // deadline. The retained first-terminal record must be checked BEFORE the
+    // live lease.
+    let (leader, _, ja, jb) = leader_with_terminal_jobs();
+    // ja: COMPLETED with a durable lease — token retained, live deadline
+    // cleared, retained terminal deadline 63_000.
+    let job = leader.job(ja).unwrap();
+    assert_eq!(job.state, JobState::Completed);
+    assert_eq!(job.deadline, None, "the live lock is released");
+    assert!(
+        job.lease_token.is_some(),
+        "the settlement fence retains the lease token (#1181)"
+    );
+    assert_eq!(
+        leader.job_terminal_deadline(ja),
+        Some(63_000),
+        "a completed leased job restates its retained terminal deadline"
+    );
+    // jb: CANCELED — token cleared, retained terminal deadline 43_500.
+    assert_eq!(leader.job(jb).unwrap().lease_token, None);
+    assert_eq!(leader.job_terminal_deadline(jb), Some(43_500));
+}
+
+#[test]
 fn a_cascade_recancel_of_a_terminal_job_restates_its_first_terminal_deadline() {
     // First-terminal-wins across a cascade: a job that went terminal with a
     // retained deadline (its live lock long cleared) can be swept again by a

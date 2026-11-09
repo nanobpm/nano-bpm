@@ -4176,7 +4176,15 @@ fn project_engine_state(
         // On a CONFLICT we deliberately do NOT overwrite `created_at_ms` /
         // `last_update_ms` / `end_ms`: an existing read-model row already
         // carries the authoritative event-derived values, which a
-        // compaction-floor reseed must not clobber. Seed `created_at_ms` with
+        // compaction-floor reseed must not clobber — with ONE exception: when
+        // the existing row has NO terminal instant (`end_ms IS NULL`) and the
+        // snapshot carries one, the upsert accepts the snapshot's `end_ms` and
+        // must move `last_update_ms` to that same instant (the terminal
+        // transition IS the last update). Leaving `last_update_ms` at the
+        // pre-terminal value would surface a stale `lastUpdateTime` that no
+        // later terminal-event delivery can repair (the terminal projection is
+        // `end_ms`-guarded, so it is a no-op once `end_ms` is set). When an
+        // end time already exists, both values are preserved. Seed `created_at_ms` with
         // the SAME batch-observation fallback as `last_update_ms` when the
         // snapshot predates `created_at` (legacy `0`), so a recovered legacy
         // job surfaces a non-null `creationTime` (== `lastUpdateTime`) rather
@@ -4224,6 +4232,8 @@ fn project_engine_state(
              error_code = excluded.error_code, \
              has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
              end_ms = COALESCE(jobs.end_ms, excluded.end_ms), \
+             last_update_ms = CASE WHEN jobs.end_ms IS NULL AND excluded.end_ms IS NOT NULL \
+                 THEN excluded.last_update_ms ELSE jobs.last_update_ms END, \
              last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
             params![
                 job.key as i64,
@@ -8760,6 +8770,97 @@ mod definition_xml_tests {
             row.deadline_ms, None,
             "a soft terminal job reseeds with no deadline (#963)"
         );
+    }
+
+    /// Regression (#1440 review): a compaction-floor reseed can CONFLICT with a
+    /// live row that has no terminal instant yet (`end_ms IS NULL`) while the
+    /// snapshot's job went terminal. Accepting the snapshot's `end_ms` must
+    /// move `last_update_ms` to that same instant — the terminal transition IS
+    /// the last update — or the row surfaces a stale `lastUpdateTime` that no
+    /// later terminal-event delivery can repair (the terminal projection is
+    /// `end_ms`-guarded, so it is a no-op once `end_ms` is set). When the row
+    /// already carries an end time, BOTH values are preserved.
+    #[test]
+    fn a_reseed_accepting_a_missing_terminal_instant_moves_last_update() {
+        use nanobpmn_engine_core::{Command, Engine, EngineSnapshot, ProcessBuilder};
+
+        let def = ProcessBuilder::new("terminal-reseed-last-update")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("c", "jc")
+            .parallel_gateway("join")
+            .end_event("done")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "c")
+            .connect("a", "join")
+            .connect("c", "join")
+            .connect("join", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        engine.set_lenient_completion(true);
+        let store = ReadStore::open(None).unwrap();
+        let run = |engine: &mut Engine, cmd: Command, now: u64| {
+            let events = engine.apply_command_at(cmd, now).unwrap();
+            for e in &events {
+                super::read_surface_tests::apply_at(&store, e, now);
+            }
+            events
+        };
+        run(&mut engine, Command::DeployProcess(def), 1_000);
+        run(
+            &mut engine,
+            Command::create_instance("terminal-reseed-last-update"),
+            2_000,
+        );
+        let ja = engine
+            .state()
+            .jobs
+            .values()
+            .find(|j| j.job_type == "ja")
+            .unwrap()
+            .key;
+
+        // The store saw the job live (created at 2_000 — `end_ms` NULL,
+        // `last_update_ms` at the creation instant).
+        let live = super::read_surface_tests::job_row(&store, ja);
+        assert_eq!(live.end_ms, None, "the row is still live");
+        assert_eq!(live.last_update_ms, Some(2_000));
+
+        // The engine then drives the job terminal at 5_000 (soft activation:
+        // no deadline) while a sibling branch keeps the instance alive.
+        engine
+            .apply_command_at(Command::complete_job(ja), 5_000)
+            .unwrap();
+        assert_eq!(
+            engine.job(ja).unwrap().terminal_end,
+            Some(nanobpmn_engine_core::JobTerminalEnd {
+                at: 5_000,
+                deadline: None,
+            })
+        );
+
+        // A compaction-floor reseed over the still-live row accepts the
+        // snapshot's terminal instant — and must move `last_update_ms` with it.
+        let bytes = serde_json::to_vec(&engine.snapshot()).unwrap();
+        let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let recovered = Engine::from_snapshot(decoded);
+        store.seed_from_engine_state(recovered.state()).unwrap();
+        let row = super::read_surface_tests::job_row(&store, ja);
+        assert_eq!(row.end_ms, Some(5_000), "the terminal instant is accepted");
+        assert_eq!(
+            row.last_update_ms,
+            Some(5_000),
+            "accepting a missing terminal instant moves lastUpdateTime to it"
+        );
+
+        // A SECOND reseed (row already terminal) preserves both values.
+        store.seed_from_engine_state(recovered.state()).unwrap();
+        let row = super::read_surface_tests::job_row(&store, ja);
+        assert_eq!(row.end_ms, Some(5_000));
+        assert_eq!(row.last_update_ms, Some(5_000));
     }
 
     /// Defect-class guard (#1244 review): a parked join is registered in the
