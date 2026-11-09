@@ -4129,13 +4129,13 @@ mod tests {
             // must hand out no work from the aborted prefix.
             assert!(
                 engine
-                    .with(|j| j.select_activatable_job_keys("w", 10, u64::MAX / 2, false))
+                    .with(|j| j.select_activatable_job_keys("demo-work", 10, u64::MAX / 2, false))
                     .await
                     .is_empty()
             );
             assert!(
                 engine
-                    .with(|j| j.activate_jobs_with_fetch("w", "x", 10, 1, 1, Vec::new()))
+                    .with(|j| j.activate_jobs_with_fetch("demo-work", "x", 10, 1, 1, Vec::new()))
                     .await
                     .is_empty()
             );
