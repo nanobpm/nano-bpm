@@ -47,7 +47,7 @@ import {
   Input,
   PageHeader,
   Spinner,
-} from "../components/ui";
+} from "@nanobpm/process-explorer/ui";
 
 // The extension authoring & publishing guide, bundled into the offline docs site
 // (built from docs/extensions.md by console/scripts/build-docs.mjs) and served by

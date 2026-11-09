@@ -1,4 +1,4 @@
-import type { PaneResize } from "../lib/usePaneResize";
+import type { PaneResize } from "./usePaneResize";
 
 /**
  * The draggable divider for a {@link usePaneResize} pane. Spread the hook's

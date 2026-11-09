@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { browseFilesystem, type BrowseResult } from "../lib/api";
-import { Badge, Button } from "./ui";
+import { Badge, Button } from "@nanobpm/process-explorer/ui";
 
 /// A modal directory browser for the Import-by-reference flow. It walks the
 /// host filesystem via the loopback-only `/console/api/fs/browse` endpoint and

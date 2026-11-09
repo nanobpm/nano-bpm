@@ -8,7 +8,7 @@
 // way inline edit does, and (3) refusing to silently overwrite a name that
 // already exists on the chosen scope (that is what inline edit is for).
 
-import type { Variable } from "../gen";
+import type { Variable } from "./gen";
 
 /**
  * The single source of truth for the "value must be valid JSON" message. Both

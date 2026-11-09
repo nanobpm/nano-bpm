@@ -24,7 +24,7 @@ import {
   NavCard,
   SectionLabel,
   useIsNarrow,
-} from "./components/ui";
+} from "@nanobpm/process-explorer/ui";
 import {
   getExtensions,
   getMarketplace,

@@ -7,7 +7,7 @@ import {
   useState,
 } from "react";
 
-import { Badge, Button, Input, inputClass } from "./ui";
+import { Badge, Button, Input, inputClass } from "@nanobpm/process-explorer/ui";
 import {
   addTrigger,
   enqueueTriggerEvent,

@@ -6,7 +6,7 @@ import {
   type ReactNode,
 } from "react";
 import { updateProjectFromTemplate, type UpdatePlan } from "../gen";
-import { Button } from "./ui";
+import { Button } from "@nanobpm/process-explorer/ui";
 import {
   planChangeCount,
   planIsClean,

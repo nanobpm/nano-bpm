@@ -8,7 +8,7 @@ import {
   ErrorText,
   PageHeader,
   SectionLabel,
-} from "../components/ui";
+} from "@nanobpm/process-explorer/ui";
 
 export default function Metrics() {
   const state = useSyncExternalStore(

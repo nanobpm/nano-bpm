@@ -42,7 +42,7 @@ import {
 } from "../lib/provisioning";
 import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
-import { Button, PageHeader, SectionLabel } from "../components/ui";
+import { Button, PageHeader, SectionLabel } from "@nanobpm/process-explorer/ui";
 import { IS_STUDIO } from "../lib/profile";
 import { lazyImport } from "../lib/lazyWithReload";
 
