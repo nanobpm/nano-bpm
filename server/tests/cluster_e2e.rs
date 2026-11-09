@@ -165,8 +165,8 @@ impl Node {
         cmd.process_group(0);
         let mut child = cmd
             // Never hand the server (or anything it spawns) the test process's
-            // stdin: an inherited test-runner fd that outlives the test is what
-            // nextest reports as a LEAK (#1474).
+            // stdin: null stdin isolates the server from the test runner's
+            // input, so a stray read can never consume or block on it (#1474).
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
