@@ -994,12 +994,28 @@ impl PartitionStateMachine {
                 nano_server_storage::snapstream::read_streaming_engine_snapshot_from(f)
             })
             .await??;
+        self.adopt_engine_snapshot(captured).await
+    }
+
+    /// The ONE snapshot-adoption routine (#1405), shared by boot-time adoption
+    /// ([`restore_from_current_snapshot`](Self::restore_from_current_snapshot))
+    /// and runtime `install_snapshot`: rebuilds the engine from `captured` IN
+    /// PLACE (keeping the journal's exporter / partition / var-store / spill
+    /// wiring) and then makes that state the journal's durable recovery base
+    /// ([`checkpoint_adopted_snapshot`](Self::checkpoint_adopted_snapshot)).
+    /// Adopting without checkpointing would leave a journal that lacks the
+    /// snapshot's state; once a later entry is journaled, a restart prefers that
+    /// journal and silently loses every snapshot-only instance.
+    async fn adopt_engine_snapshot(
+        &self,
+        captured: nanobpmn_engine_core::EngineSnapshot,
+    ) -> anyhow::Result<()> {
         self.engine
             .with(move |journal| {
                 journal.restore_engine_from_snapshot(captured);
             })
             .await;
-        Ok(())
+        self.checkpoint_adopted_snapshot().await
     }
 
     /// Selects the NEWEST consistent boot state for a durable member (#1405):
@@ -1025,14 +1041,10 @@ impl PartitionStateMachine {
             (Some(journal), Some(snap)) if snap > journal.log_id => {
                 // The snapshot is strictly newer: install it (its metadata was
                 // adopted in `new`); openraft replays only the tail after it.
-                self.restore_from_current_snapshot().await?;
-                self.checkpoint_adopted_snapshot().await
+                self.restore_from_current_snapshot().await
             }
             (Some(_), _) => self.seed_last_applied_from_journal().await,
-            (None, Some(_)) => {
-                self.restore_from_current_snapshot().await?;
-                self.checkpoint_adopted_snapshot().await
-            }
+            (None, Some(_)) => self.restore_from_current_snapshot().await,
             (None, None) => Ok(()),
         }
     }
@@ -1657,11 +1669,18 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // journal's read-model exporter wiring (and partition id / var store /
         // spill tiers) MUST survive it, or an owned partition catching up via a
         // snapshot install stops projecting and leaks its completed backlog.
-        self.engine
-            .with(move |journal| {
-                journal.restore_engine_from_snapshot(captured);
-            })
-            .await;
+        // Adopt it through the single adoption routine, which also checkpoints
+        // it as the journal's recovery base BEFORE any later entry is accepted
+        // (#1405). The captured engine state carries the snapshot's applied
+        // record, so a crash before the pointer below is published still boots
+        // from a journal that wins at the snapshot's index. Fail closed: a
+        // replica whose journal cannot hold the base must not keep applying.
+        self.adopt_engine_snapshot(captured).await.map_err(|e| {
+            StorageIOError::write_snapshot(
+                Some(meta.signature()),
+                &std::io::Error::other(e.to_string()),
+            )
+        })?;
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -4621,6 +4640,96 @@ mod tests {
         assert_eq!(applied.map(|l| l.index), Some(4), "the journal wins");
         let after = engine.with(|j| j.engine().snapshot().state).await;
         assert_eq!(after, expected, "snapshot + suffix, nothing lost");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RUNTIME snapshot install (openraft's `install_snapshot`, a lagging
+    /// replica catching up) must make the installed state the journal's recovery
+    /// base exactly like boot-time adoption (#1405) — both go through the one
+    /// `adopt_engine_snapshot` routine. Otherwise: journal at entry 1, install a
+    /// snapshot at 3, journal entry 4, restart -> the journal (now at 4) wins but
+    /// only holds entries 1 and 4, silently losing every snapshot-only instance.
+    #[tokio::test]
+    async fn runtime_installed_snapshot_becomes_the_journal_recovery_base() {
+        let dir = unique_log_dir("1405-install-base");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
+        let peer = durable_engine(&dir.join("peer"));
+        let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
+        apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        for i in 2..=3 {
+            apply_entry(&peer_sm, i, one(Command::create_instance("w"), i))
+                .await
+                .expect("create");
+        }
+        let mut builder = peer_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("snapshot at 3");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        apply_entry(&peer_sm, 4, one(Command::create_instance("w"), 4))
+            .await
+            .expect("4");
+        let expected = peer.with(|j| j.engine().snapshot().state).await;
+        drop(peer_sm);
+        shutdown_engine(peer).await;
+
+        // A replica whose journal reached only entry 1 installs the snapshot at
+        // runtime, then journals entry 4.
+        let journal_dir = dir.join("replica");
+        let snaps = dir.join("replica-snapshots");
+        {
+            let engine = durable_engine(&journal_dir);
+            let mut sm = new_sm(&engine, &snaps);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            let mut received = sm
+                .begin_receiving_snapshot()
+                .await
+                .expect("begin receiving");
+            {
+                use tokio::io::AsyncWriteExt;
+                received.write_all(&bytes).await.expect("write body");
+                received.flush().await.expect("flush body");
+            }
+            sm.install_snapshot(&snap.meta, received)
+                .await
+                .expect("install snapshot");
+            apply_entry(&sm, 4, one(Command::create_instance("w"), 4))
+                .await
+                .expect("4");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        // Crash-restart: the journal (at 4) wins and must hold the installed base.
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine, &snaps);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(4), "the journal wins");
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(after, expected, "installed snapshot + suffix, nothing lost");
         drop(sm);
         shutdown_engine(engine).await;
         let _ = std::fs::remove_dir_all(&dir);

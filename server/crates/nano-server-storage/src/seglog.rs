@@ -103,8 +103,37 @@ const FRAME_MAGIC: u8 = 0x1E;
 const CODEC_RAW: u8 = 0;
 /// Frame body is raw-deflate (mirrors the Raft wire codec in `raft_net.rs`).
 const CODEC_DEFLATE: u8 = 1;
-/// Frame header: `magic(1) | codec(1) | raw_len(u32 LE) | comp_len(u32 LE)`.
+/// [`CODEC_RAW`] plus a CRC-32 of the plaintext (#1405). The only RAW codec
+/// this build writes; plain [`CODEC_RAW`] is read for compatibility.
+const CODEC_RAW_CRC: u8 = 2;
+/// [`CODEC_DEFLATE`] plus a CRC-32 of the inflated plaintext (#1405). The only
+/// deflate codec this build writes; plain [`CODEC_DEFLATE`] is read for
+/// compatibility.
+const CODEC_DEFLATE_CRC: u8 = 3;
+/// Frame header: `magic(1) | codec(1) | raw_len(u32 LE) | comp_len(u32 LE)`,
+/// followed — for the checksummed codecs only — by [`FRAME_CRC_LEN`] bytes of
+/// CRC-32 (LE) over the frame's PLAINTEXT.
 const FRAME_HEADER_LEN: usize = 10;
+/// Length of the plaintext CRC-32 trailing a checksummed codec's header.
+const FRAME_CRC_LEN: usize = 4;
+
+/// Whether `codec` carries a plaintext CRC-32 after its header.
+fn codec_has_crc(codec: u8) -> bool {
+    matches!(codec, CODEC_RAW_CRC | CODEC_DEFLATE_CRC)
+}
+
+/// Builds a checksummed frame: header, CRC-32 of `plaintext`, then `body`.
+fn checksummed_frame(codec: u8, plaintext: &[u8], raw_len: u32, body: &[u8]) -> Option<Vec<u8>> {
+    let comp_len = u32::try_from(body.len()).ok()?;
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + FRAME_CRC_LEN + body.len());
+    frame.push(FRAME_MAGIC);
+    frame.push(codec);
+    frame.extend_from_slice(&raw_len.to_le_bytes());
+    frame.extend_from_slice(&comp_len.to_le_bytes());
+    frame.extend_from_slice(&crc32fast::hash(plaintext).to_le_bytes());
+    frame.extend_from_slice(body);
+    Some(frame)
+}
 /// Don't frame batches below this — the header + deflate cost isn't worth it,
 /// and (crucially) the negligible/high-rate regime commits small batches that
 /// must stay verbatim so the single journal-writer thread is never taxed.
@@ -135,18 +164,11 @@ fn frame_compress(buf: &[u8], events: u64) -> Option<Vec<u8>> {
     }
     let comp = enc.finish().ok()?;
     // Only worth a frame if it meaningfully shrinks the physical write.
-    if comp.len().checked_add(FRAME_HEADER_LEN)? >= buf.len() {
+    if comp.len().checked_add(FRAME_HEADER_LEN + FRAME_CRC_LEN)? >= buf.len() {
         return None;
     }
     let raw_len = u32::try_from(buf.len()).ok()?;
-    let comp_len = u32::try_from(comp.len()).ok()?;
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + comp.len());
-    frame.push(FRAME_MAGIC);
-    frame.push(CODEC_DEFLATE);
-    frame.extend_from_slice(&raw_len.to_le_bytes());
-    frame.extend_from_slice(&comp_len.to_le_bytes());
-    frame.extend_from_slice(&comp);
-    Some(frame)
+    checksummed_frame(CODEC_DEFLATE_CRC, buf, raw_len, &comp)
 }
 
 /// The largest payload one atomic frame can carry: the frame header stores the
@@ -179,16 +201,14 @@ fn frame_atomic_capped(buf: &[u8], events: u64, compress: bool, cap: usize) -> i
     if compress && let Some(frame) = frame_compress(buf, events) {
         return Ok(frame);
     }
-    let len = u32::try_from(buf.len())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-        .to_le_bytes();
-    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN + buf.len());
-    frame.push(FRAME_MAGIC);
-    frame.push(CODEC_RAW);
-    frame.extend_from_slice(&len);
-    frame.extend_from_slice(&len);
-    frame.extend_from_slice(buf);
-    Ok(frame)
+    let len =
+        u32::try_from(buf.len()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    checksummed_frame(CODEC_RAW_CRC, buf, len, buf).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "atomic journal frame too large",
+        )
+    })
 }
 
 /// One physical journal record recovered from a segment file: either a single
@@ -200,6 +220,13 @@ fn frame_atomic_capped(buf: &[u8], events: u64, compress: bool, cap: usize) -> i
 struct SegRecord {
     bytes: Vec<u8>,
     end: usize,
+    /// `false` when a checksummed frame's plaintext fails its CRC-32 (or will
+    /// not inflate): a full-length frame whose bytes were not all durably
+    /// written (#1405). The reader treats it like any other torn record —
+    /// dropped WHOLE at the tail, fatal mid-file — so damage that still parses
+    /// (e.g. the trailing applied-entry marker overwritten by same-length
+    /// whitespace) can never expose a frame's events without its marker.
+    intact: bool,
 }
 
 /// Walks `raw` record-by-record: a [`FRAME_MAGIC`] byte begins a frame,
@@ -223,13 +250,28 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
                 u32::from_le_bytes([raw[i + 2], raw[i + 3], raw[i + 4], raw[i + 5]]) as usize;
             let comp_len =
                 u32::from_le_bytes([raw[i + 6], raw[i + 7], raw[i + 8], raw[i + 9]]) as usize;
-            let start = i + FRAME_HEADER_LEN;
+            let mut start = i + FRAME_HEADER_LEN;
+            let crc = if codec_has_crc(codec) {
+                if start + FRAME_CRC_LEN > raw.len() {
+                    break; // torn checksum tail
+                }
+                let c = u32::from_le_bytes([
+                    raw[start],
+                    raw[start + 1],
+                    raw[start + 2],
+                    raw[start + 3],
+                ]);
+                start += FRAME_CRC_LEN;
+                Some(c)
+            } else {
+                None
+            };
             let Some(end) = start.checked_add(comp_len).filter(|e| *e <= raw.len()) else {
                 break; // torn frame body
             };
             let payload = &raw[start..end];
             let bytes = match codec {
-                CODEC_RAW => {
+                CODEC_RAW | CODEC_RAW_CRC => {
                     // A RAW frame's two lengths are written identically; any
                     // disagreement is a damaged header that could shorten the
                     // frame and split off its marker (#1405) — fail closed.
@@ -240,6 +282,18 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
                         ));
                     }
                     payload.to_vec()
+                }
+                CODEC_DEFLATE_CRC => {
+                    use std::io::Read;
+
+                    use flate2::read::DeflateDecoder;
+                    // A torn checksummed deflate body is a damaged record, not
+                    // an I/O failure: hand it to the reader as non-intact.
+                    let mut buf = Vec::with_capacity(raw_len);
+                    match DeflateDecoder::new(payload).read_to_end(&mut buf) {
+                        Ok(_) if buf.len() == raw_len => buf,
+                        _ => Vec::new(),
+                    }
                 }
                 CODEC_DEFLATE => {
                     use std::io::Read;
@@ -262,7 +316,8 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
                     ));
                 }
             };
-            out.push(SegRecord { bytes, end });
+            let intact = crc.is_none_or(|c| bytes.len() == raw_len && crc32fast::hash(&bytes) == c);
+            out.push(SegRecord { bytes, end, intact });
             i = end;
         } else {
             // Legacy plaintext record: through the next newline (inclusive). An
@@ -274,6 +329,7 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
                     out.push(SegRecord {
                         bytes: raw[i..=i + nl].to_vec(),
                         end: i + nl + 1,
+                        intact: true,
                     });
                     i += nl + 1;
                 }
@@ -287,8 +343,17 @@ fn decode_segment_records(raw: &[u8]) -> io::Result<Vec<SegRecord>> {
 /// Decodes a segment file into its logical plaintext bytes — the concatenated
 /// newline-terminated records the writer appended — transparently inflating any
 /// compressed frames (see [`decode_segment_records`]).
+///
+/// Only ever called on SEALED segments (fsynced before rename, never torn), so
+/// a checksum-failing frame is corruption: fatal, never silently flattened.
 fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
     let records = decode_segment_records(&fs::read(path)?)?;
+    if records.iter().any(|r| !r.intact) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("journal frame checksum mismatch in {}", path.display()),
+        ));
+    }
     Ok(records.into_iter().flat_map(|r| r.bytes).collect())
 }
 
@@ -320,15 +385,29 @@ fn read_segment_with<T>(
         return Ok((out, valid_end));
     }
     let records = decode_segment_records(&fs::read(path)?)?;
-    let last = records.iter().rposition(|r| has_content(&r.bytes));
+    // A damaged (non-intact) frame is content even when its bytes are blank:
+    // it must be classified, never skipped past as padding.
+    let carries = |r: &SegRecord| !r.intact || has_content(&r.bytes);
+    let last = records.iter().rposition(carries);
     for (idx, record) in records.iter().enumerate() {
-        if !has_content(&record.bytes) {
+        if !carries(record) {
             continue;
         }
         let torn_tail = Some(idx) == last;
         let mut parsed = Vec::new();
-        let mut failure: Option<(bool, io::Error)> = None;
-        for line in record.bytes.split(|&b| b == b'\n') {
+        let mut failure: Option<(bool, io::Error)> = if record.intact {
+            None
+        } else {
+            Some((
+                true,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "journal frame checksum mismatch",
+                ),
+            ))
+        };
+        let lines: &[u8] = if record.intact { &record.bytes } else { &[] };
+        for line in lines.split(|&b| b == b'\n') {
             let line = match std::str::from_utf8(line) {
                 Ok(s) => s,
                 Err(e) => {
@@ -883,6 +962,12 @@ fn read_pphead(path: &Path) -> Option<Vec<u64>> {
 struct PersistedSnapshot {
     covered_events: u64,
     engine: EngineSnapshot,
+    /// The rebase-floor identity this snapshot was published under (#1405),
+    /// stamped by [`write_snapshot`] when its `covered_events` equals the
+    /// floor's boundary (see [`RebaseFloor`]). Additive: absent on every older
+    /// snapshot (decodes as `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
 }
 
 // ----------------------------------------------------------------------------
@@ -960,17 +1045,52 @@ fn rebase_floor_path(dir: &Path, partition: Option<u64>) -> PathBuf {
     }
 }
 
+/// A durable rebase floor (#1405): the journal boundary an adopted Raft base
+/// was checkpointed at, plus a unique IDENTITY for that adoption. Adopting a
+/// snapshot appends no journal events, so an OLDER checkpoint can sit at the
+/// very same boundary; the boundary alone cannot tell it from the adopted base.
+/// The id can: the base snapshot is stamped with it (see [`floor_stamp`]), so
+/// a same-boundary snapshot without it predates the adoption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RebaseFloor {
+    covered: u64,
+    /// `None` only for a legacy count-only floor file.
+    id: Option<u64>,
+}
+
+impl RebaseFloor {
+    /// Whether a snapshot covering `covered`, stamped `base_id`, holds the
+    /// adopted base: strictly past the boundary (a later checkpoint, which
+    /// captured the adopted state plus a suffix), or AT it and carrying this
+    /// floor's identity.
+    fn satisfied_by(&self, covered: u64, base_id: Option<u64>) -> bool {
+        covered > self.covered
+            || (covered == self.covered && (self.id.is_none() || base_id == self.id))
+    }
+}
+
+/// A fresh identity for one adoption: unique per process lifetime (counter)
+/// and across restarts (wall clock + pid).
+fn fresh_rebase_id() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    nanos ^ (u64::from(std::process::id()) << 40) ^ SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Durably records the rebase floor (see [`rebase_floor_path`]) BEFORE the
 /// adopted base snapshot is published, so there is no crash window in which
 /// the base is relied on but unprotected: a crash between the two leaves a
-/// floor no snapshot satisfies, and recovery fails closed instead of replaying
-/// a history that lacks the adopted state.
+/// floor no snapshot satisfies — not even an older checkpoint at the same
+/// boundary, which lacks this floor's fresh identity — and recovery fails
+/// closed instead of replaying a history that lacks the adopted state.
 pub fn write_rebase_floor(dir: &Path, partition: Option<u64>, covered: u64) -> io::Result<()> {
     let path = rebase_floor_path(dir, partition);
     let tmp = unique_tmp_path(&path);
     {
         let mut f = File::create(&tmp)?;
-        f.write_all(covered.to_string().as_bytes())?;
+        f.write_all(format!("{covered} {}", fresh_rebase_id()).as_bytes())?;
         f.sync_all()?;
     }
     fs::rename(&tmp, &path)?;
@@ -980,46 +1100,75 @@ pub fn write_rebase_floor(dir: &Path, partition: Option<u64>, covered: u64) -> i
 
 /// Reads the rebase floor, if any. An unreadable or malformed floor is an error
 /// (fail closed): it means a base was adopted and we cannot tell how far.
-fn read_rebase_floor(dir: &Path, partition: Option<u64>) -> io::Result<Option<u64>> {
-    match fs::read_to_string(rebase_floor_path(dir, partition)) {
-        Ok(s) => s.trim().parse::<u64>().map(Some).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("malformed journal rebase floor: {e}"),
-            )
-        }),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e),
+fn read_rebase_floor(dir: &Path, partition: Option<u64>) -> io::Result<Option<RebaseFloor>> {
+    let malformed = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("malformed journal rebase floor: {what}"),
+        )
+    };
+    let s = match fs::read_to_string(rebase_floor_path(dir, partition)) {
+        Ok(s) => s,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut parts = s.split_whitespace();
+    let covered = parts
+        .next()
+        .ok_or_else(|| malformed("empty"))?
+        .parse::<u64>()
+        .map_err(|e| malformed(&e.to_string()))?;
+    let id = parts
+        .next()
+        .map(|t| t.parse::<u64>().map_err(|e| malformed(&e.to_string())))
+        .transpose()?;
+    if parts.next().is_some() {
+        return Err(malformed("trailing data"));
     }
+    Ok(Some(RebaseFloor { covered, id }))
+}
+
+/// The base identity to stamp into a snapshot of `partition` covering
+/// `covered`: the floor's id when the snapshot sits exactly at the floor's
+/// boundary (the adopted base itself, or a later checkpoint of the same state,
+/// both of which hold the adopted state — the checkpoint permit serializes
+/// every capture -> publish cycle with the adoption, so no pre-adoption capture
+/// can publish after the floor). The floor file is the single source of truth.
+fn floor_stamp(dir: &Path, partition: Option<u64>, covered: u64) -> io::Result<Option<u64>> {
+    Ok(read_rebase_floor(dir, partition)?
+        .filter(|f| f.covered == covered)
+        .and_then(|f| f.id))
 }
 
 /// Enforces the rebase floor (#1405): when a Raft snapshot was adopted as the
-/// recovery base, the only valid recovery is from a READABLE snapshot covering
-/// at least the floor. A missing, unreadable/incompatible (which would route to
-/// replay-migration) or older snapshot cannot reconstruct the adopted state from
-/// the journal's own history — replaying it would silently rewind (the #1065
-/// class) — so recovery fails closed and the node must be re-seeded from its
-/// Raft peers / snapshot.
+/// recovery base, the only valid recovery is from a READABLE snapshot that
+/// holds it (see [`RebaseFloor::satisfied_by`]). A missing,
+/// unreadable/incompatible (which would route to replay-migration), older, or
+/// same-boundary-but-pre-adoption snapshot cannot reconstruct the adopted state
+/// from the journal's own history — replaying it would silently rewind (the
+/// #1065 class) — so recovery fails closed and the node must be re-seeded from
+/// its Raft peers / snapshot. `loaded` is the snapshot's `(covered, base_id)`.
 fn enforce_rebase_floor(
     dir: &Path,
     partition: Option<u64>,
-    loaded_covered: Option<u64>,
+    loaded: Option<(u64, Option<u64>)>,
 ) -> io::Result<()> {
     let Some(floor) = read_rebase_floor(dir, partition)? else {
         return Ok(());
     };
-    match loaded_covered {
-        Some(covered) if covered >= floor => Ok(()),
+    match loaded {
+        Some((covered, base_id)) if floor.satisfied_by(covered, base_id) => Ok(()),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "journal{} was rebased onto an adopted Raft snapshot at {floor} but no readable \
-                 journal snapshot covers that base (found {loaded_covered:?}); the journal's own \
+                "journal{} was rebased onto an adopted Raft snapshot at {} but no readable \
+                 journal snapshot holds that base (found {loaded:?}); the journal's own \
                  history lacks the adopted state, so refusing to recover (would rewind, \
                  #1065/#1405). Re-seed this replica from its Raft peers.",
                 partition
                     .map(|p| format!(" partition {p}"))
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                floor.covered,
             ),
         )),
     }
@@ -1330,7 +1479,16 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
 ///
 /// The loaded value keeps `covered_events` as the SECOND tuple element to match
 /// the callers in [`recover`].
+#[cfg(test)]
 fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>> {
+    Ok(load_latest_snapshot_based(dir)?.map(|(snap, covered, _)| (snap, covered)))
+}
+
+/// [`load_latest_snapshot`] plus the snapshot's rebase-floor identity
+/// ([`PersistedSnapshot::base_id`]).
+fn load_latest_snapshot_based(
+    dir: &Path,
+) -> io::Result<Option<(EngineSnapshot, u64, Option<u64>)>> {
     let mut best: Option<(u64, PathBuf)> = None;
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -1360,7 +1518,7 @@ fn load_latest_snapshot(dir: &Path) -> io::Result<Option<(EngineSnapshot, u64)>>
         serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
             reason: format!("snapshot payload deserialize failed: {e}"),
         })?;
-    Ok(Some((snap.engine, snap.covered_events)))
+    Ok(Some((snap.engine, snap.covered_events, snap.base_id)))
 }
 
 /// The outcome of recovering a segmented journal directory.
@@ -1431,15 +1589,16 @@ pub fn recover(dir: &Path) -> io::Result<(Engine, SegRecovery)> {
     // when the history cannot fully reconstruct the engine (a pruned gap, or an
     // unreadable event frame — both snapshot AND journal gone).
     sweep_unique_tmp(dir);
-    let loaded = load_latest_snapshot(dir);
+    let loaded = load_latest_snapshot_based(dir);
     enforce_rebase_floor(
         dir,
         None,
         loaded
             .as_ref()
             .ok()
-            .and_then(|o| o.as_ref().map(|(_, c)| *c)),
+            .and_then(|o| o.as_ref().map(|(_, c, id)| (*c, *id))),
     )?;
+    let loaded = loaded.map(|o| o.map(|(snap, covered, _)| (snap, covered)));
     let (engine, fresh) = match loaded {
         // A readable snapshot whose `covered` is BELOW the compaction floor is
         // stale (e.g. the newest snapshot was lost/removed post-compaction and an
@@ -1571,6 +1730,7 @@ pub fn write_snapshot(dir: &Path, snap: EngineSnapshot, covered_events: u64) -> 
     let payload = PersistedSnapshot {
         covered_events,
         engine: snap,
+        base_id: floor_stamp(dir, None, covered_events)?,
     };
     let final_path = dir.join(format!("{SNAP_PREFIX}{covered_events:020}{SNAP_SUFFIX}"));
     write_enveloped(dir, &final_path, &payload)?;
@@ -2039,6 +2199,9 @@ struct MultiSnapshotEntry {
     partition: u64,
     covered: u64,
     engine: EngineSnapshot,
+    /// See [`PersistedSnapshot::base_id`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_id: Option<u64>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2056,12 +2219,15 @@ pub fn write_multi_snapshot(
     let payload = MultiPersistedSnapshot {
         entries: entries
             .into_iter()
-            .map(|(partition, covered, engine)| MultiSnapshotEntry {
-                partition,
-                covered,
-                engine,
+            .map(|(partition, covered, engine)| {
+                Ok(MultiSnapshotEntry {
+                    partition,
+                    covered,
+                    base_id: floor_stamp(dir, Some(partition), covered)?,
+                    engine,
+                })
             })
-            .collect(),
+            .collect::<io::Result<_>>()?,
     };
     let final_path = dir.join(MULTI_SNAP_NAME);
     // Stream the JSON straight to the file through a BufWriter instead of
@@ -2105,9 +2271,19 @@ pub fn upsert_multi_snapshot_entry(
 /// `Ok(None)` means ONLY "no combined snapshot file exists". A present-but-
 /// incompatible or corrupt file is a FATAL typed error ([`SnapshotLoadError`],
 /// surfaced as an [`io::Error`]) — never a silent `None`, never a rewind.
-fn load_multi_snapshot(
-    dir: &Path,
-) -> io::Result<Option<std::collections::HashMap<u64, (u64, EngineSnapshot)>>> {
+fn load_multi_snapshot(dir: &Path) -> io::Result<Option<MultiEngines>> {
+    Ok(load_multi_snapshot_based(dir)?.map(|(m, _)| m))
+}
+
+/// Per-partition `(covered, base_id)` of a combined snapshot (see
+/// [`PersistedSnapshot::base_id`]).
+type MultiBases = std::collections::HashMap<u64, (u64, Option<u64>)>;
+
+/// A decoded combined snapshot: global partition id -> `(covered, snapshot)`.
+type MultiEngines = std::collections::HashMap<u64, (u64, EngineSnapshot)>;
+
+/// [`load_multi_snapshot`] plus each entry's `(covered, base_id)`.
+fn load_multi_snapshot_based(dir: &Path) -> io::Result<Option<(MultiEngines, MultiBases)>> {
     let bytes = match fs::read(dir.join(MULTI_SNAP_NAME)) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -2119,12 +2295,18 @@ fn load_multi_snapshot(
         serde_json::from_slice(payload).map_err(|e| SnapshotLoadError::Corrupt {
             reason: format!("multi-snapshot payload deserialize failed: {e}"),
         })?;
-    Ok(Some(
+    let bases = snap
+        .entries
+        .iter()
+        .map(|e| (e.partition, (e.covered, e.base_id)))
+        .collect();
+    Ok(Some((
         snap.entries
             .into_iter()
             .map(|e| (e.partition, (e.covered, e.engine)))
             .collect(),
-    ))
+        bases,
+    )))
 }
 
 /// The outcome of recovering a multi-partition segmented journal directory.
@@ -2278,7 +2460,7 @@ pub fn recover_multi(
     // surviving tail), populated only when we fall into the migrator below.
     let mut cold_tagged: Vec<(u64, Event)> = Vec::new();
     sweep_unique_tmp(dir);
-    let loaded = load_multi_snapshot(dir);
+    let loaded = load_multi_snapshot_based(dir);
     for &p in owned {
         enforce_rebase_floor(
             dir,
@@ -2287,9 +2469,10 @@ pub fn recover_multi(
                 .as_ref()
                 .ok()
                 .and_then(|m| m.as_ref())
-                .and_then(|m| m.get(&p).map(|(c, _)| *c)),
+                .and_then(|(_, bases)| bases.get(&p).copied()),
         )?;
     }
+    let loaded = loaded.map(|o| o.map(|(m, _)| m));
     let migrate = match loaded {
         Ok(Some(c)) => {
             combined = Some(c);
@@ -3064,9 +3247,15 @@ mod tests {
         let (mut journal, recovery) =
             crate::journal::Journal::open_segmented(&dir).expect("open segmented");
         let shared = Arc::clone(&recovery.shared);
-        let _ = journal
+        let (_, commit) = journal
             .apply_command(Command::DeployProcess(demo()))
             .unwrap();
+        // The append lands on the background writer thread: wait for it to be
+        // durable before sampling, or the active file can still be empty.
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(commit.wait());
         let expected = shared.uncompacted_usage();
         assert!(expected.1 > 0);
         // Interleaving: read active metadata, THEN the writer seals (rename).
@@ -3833,7 +4022,7 @@ mod tests {
             frame.len()
         );
         assert_eq!(frame[0], FRAME_MAGIC);
-        assert_eq!(frame[1], CODEC_DEFLATE);
+        assert_eq!(frame[1], CODEC_DEFLATE_CRC);
 
         let path = dir.join("frame.bin");
         fs::write(&path, &frame).unwrap();
@@ -4539,6 +4728,7 @@ mod tests {
         };
         // A perfectly VALID payload — the mismatch must trip on the header alone.
         let payload = PersistedSnapshot {
+            base_id: None,
             covered_events: covered,
             engine: demo_snapshot(),
         };
@@ -5203,6 +5393,7 @@ mod tests {
         let covered = 9;
         // Exactly the OLD on-disk format: bare compact JSON, no header line.
         let payload = PersistedSnapshot {
+            base_id: None,
             covered_events: covered,
             engine: demo_snapshot(),
         };
@@ -5311,6 +5502,7 @@ mod tests {
         };
         let payload = MultiPersistedSnapshot {
             entries: vec![MultiSnapshotEntry {
+                base_id: None,
                 partition: 0,
                 covered: 4,
                 engine: demo_snapshot(),
@@ -5337,6 +5529,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let payload = MultiPersistedSnapshot {
             entries: vec![MultiSnapshotEntry {
+                base_id: None,
                 partition: 2,
                 covered: 8,
                 engine: demo_snapshot(),
@@ -5867,7 +6060,7 @@ mod tests {
         let entry = b"{\"b\":2}\n{\"c\":3}\n".to_vec();
         let frame = frame_atomic(&entry, 2, false).unwrap();
         assert_eq!(frame[0], FRAME_MAGIC);
-        assert_eq!(frame[1], CODEC_RAW);
+        assert_eq!(frame[1], CODEC_RAW_CRC);
         let path = dir.join("j.jsonl");
         let mut file = durable.clone();
         file.extend_from_slice(&frame);
@@ -5948,6 +6141,129 @@ mod tests {
         fs::write(&path, &mid).unwrap();
         assert!(read_segment_events(&path).is_err());
         assert!(read_segment_events_tagged(&path, 1).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a full-length RAW frame whose trailing applied-entry marker was
+    /// replaced ON DISK by same-length whitespace (a reused-block torn tail that
+    /// still parses — the blank line is skipped, the events decode) is dropped
+    /// WHOLE by its checksum: the command events are never exposed without the
+    /// marker. Mid-file the same damage is fatal corruption.
+    #[test]
+    fn whitespace_overwritten_marker_drops_the_entire_frame() {
+        let dir = temp_dir("ws-marker");
+        fs::create_dir_all(&dir).unwrap();
+        let (durable_ev, durable_marker) = entry_lines(1);
+        let mut durable = durable_ev;
+        durable.extend_from_slice(&durable_marker);
+        let durable_frame = frame_atomic(&durable, 2, false).unwrap();
+        let (ev, marker) = entry_lines(2);
+        let mut payload = ev;
+        payload.extend_from_slice(&marker);
+        let mut torn = frame_atomic(&payload, 2, false).unwrap();
+        // Overwrite the marker bytes in place (header + checksum untouched).
+        let (marker_start, marker_end) = (torn.len() - marker.len(), torn.len() - 1);
+        for b in &mut torn[marker_start..marker_end] {
+            *b = b' ';
+        }
+        let path = dir.join("j.jsonl");
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&torn);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            read_segment_events(&path).unwrap().len(),
+            2,
+            "only the durable entry"
+        );
+        assert_eq!(read_segment_events_tagged(&path, 1).unwrap().len(), 2);
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        // An all-whitespace payload is still a damaged record, never padding.
+        let mut blank = frame_atomic(&payload, 2, false).unwrap();
+        let body = blank.len() - payload.len();
+        for b in &mut blank[body..] {
+            *b = b' ';
+        }
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&blank);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(read_segment_events(&path).unwrap().len(), 2);
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        // Mid-file: fatal, never skipped; and a sealed-segment decode refuses it.
+        let mut mid = torn.clone();
+        mid.extend_from_slice(&durable_frame);
+        fs::write(&path, &mid).unwrap();
+        assert!(read_segment_events(&path).is_err());
+        assert!(read_segment_events_tagged(&path, 1).is_err());
+        assert!(decode_segment_bytes(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: the same in-place damage inside a checksummed DEFLATE frame is a
+    /// torn tail too — dropped whole at the tail, fatal mid-file.
+    #[test]
+    fn damaged_deflate_frame_is_a_torn_tail() {
+        let dir = temp_dir("bad-deflate");
+        fs::create_dir_all(&dir).unwrap();
+        let (ev, marker) = entry_lines(1);
+        let mut durable = ev;
+        durable.extend_from_slice(&marker);
+        let durable_frame = frame_atomic(&durable, 2, false).unwrap();
+        let big: Vec<u8> = (0..64)
+            .flat_map(|i| format!("{{\"pad\":\"{}\"}}\n", "x".repeat(2000 + i)).into_bytes())
+            .collect();
+        let mut frame = frame_compress(&big, 64).expect("deflated");
+        assert_eq!(frame[1], CODEC_DEFLATE_CRC);
+        let mid_byte = FRAME_HEADER_LEN + FRAME_CRC_LEN + (frame.len() - FRAME_HEADER_LEN) / 2;
+        frame[mid_byte] ^= 0xFF;
+        let path = dir.join("j.jsonl");
+        let mut file = durable_frame.clone();
+        file.extend_from_slice(&frame);
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            valid_segment_len(&path).unwrap(),
+            durable_frame.len() as u64
+        );
+        let mut mid = frame;
+        mid.extend_from_slice(&durable_frame);
+        fs::write(&path, &mid).unwrap();
+        assert!(valid_segment_len(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: pre-checksum journals stay readable — legacy [`CODEC_RAW`] and
+    /// [`CODEC_DEFLATE`] frames (written by older builds) decode verbatim.
+    #[test]
+    fn legacy_unchecksummed_frames_still_decode() {
+        use flate2::{Compression, write::DeflateEncoder};
+        let dir = temp_dir("legacy-frames");
+        fs::create_dir_all(&dir).unwrap();
+        let (ev, marker) = entry_lines(1);
+        let mut payload = ev;
+        payload.extend_from_slice(&marker);
+        let len = u32::try_from(payload.len()).unwrap().to_le_bytes();
+        let mut file = vec![FRAME_MAGIC, CODEC_RAW];
+        file.extend_from_slice(&len);
+        file.extend_from_slice(&len);
+        file.extend_from_slice(&payload);
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(&payload).unwrap();
+        let comp = enc.finish().unwrap();
+        file.extend_from_slice(&[FRAME_MAGIC, CODEC_DEFLATE]);
+        file.extend_from_slice(&len);
+        file.extend_from_slice(&u32::try_from(comp.len()).unwrap().to_le_bytes());
+        file.extend_from_slice(&comp);
+        let path = dir.join("j.jsonl");
+        fs::write(&path, &file).unwrap();
+        let mut both = payload.clone();
+        both.extend_from_slice(&payload);
+        assert_eq!(decode_segment_bytes(&path).unwrap(), both);
+        assert_eq!(read_segment_events(&path).unwrap().len(), 4);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -6042,7 +6358,7 @@ mod tests {
             );
         }
         let frame = frame_atomic(&entry, 64, true).unwrap();
-        assert_eq!(frame[1], CODEC_DEFLATE, "big entry frame is deflated");
+        assert_eq!(frame[1], CODEC_DEFLATE_CRC, "big entry frame is deflated");
         let mut batch = entry.clone();
         batch.extend_from_slice(&frame);
         let active_path = dir.join(ACTIVE_NAME);
@@ -6246,6 +6562,99 @@ mod tests {
             .err()
             .expect("missing adopted base must fail closed");
         assert!(err.to_string().contains("partition 0 was rebased"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a crash AFTER the rebase floor is published but BEFORE the adopted
+    /// base snapshot is: an OLDER checkpoint at the very same boundary (adoption
+    /// appends no events) must not satisfy the floor — it lacks the floor's
+    /// identity — in BOTH layouts. A later checkpoint at that boundary, written
+    /// once the floor exists, is stamped with the identity and does satisfy it.
+    #[test]
+    fn floor_rejects_a_pre_adoption_checkpoint_at_the_same_boundary() {
+        let (old, _) = donor_snapshot("floor-identity-donor");
+        // Single-partition layout.
+        let dir = temp_dir("floor-identity-single");
+        fs::create_dir_all(&dir).unwrap();
+        write_snapshot(&dir, old.clone(), 0).unwrap();
+        write_rebase_floor(&dir, None, 0).unwrap();
+        let err = recover(&dir)
+            .err()
+            .expect("pre-adoption checkpoint must fail closed");
+        assert!(
+            err.to_string()
+                .contains("rebased onto an adopted Raft snapshot"),
+            "{err}"
+        );
+        // The base published under the floor carries its identity: recovers.
+        write_snapshot(&dir, old.clone(), 0).unwrap();
+        recover(&dir).expect("stamped base recovers");
+        // A NEW adoption at the same boundary invalidates the earlier stamp.
+        write_rebase_floor(&dir, None, 0).unwrap();
+        assert!(recover(&dir).is_err(), "stale identity must fail closed");
+        let _ = fs::remove_dir_all(&dir);
+
+        // Multi-partition layout.
+        let dir = temp_dir("floor-identity-multi");
+        fs::create_dir_all(&dir).unwrap();
+        drop(recover_multi(&dir, &[0, 1], 2, None).expect("init multi"));
+        write_multi_snapshot(&dir, vec![(0, 0, old.clone())]).unwrap();
+        write_rebase_floor(&dir, Some(0), 0).unwrap();
+        let err = recover_multi(&dir, &[0, 1], 2, None)
+            .err()
+            .expect("pre-adoption checkpoint must fail closed");
+        assert!(err.to_string().contains("partition 0 was rebased"), "{err}");
+        upsert_multi_snapshot_entry(&dir, 0, 0, old).unwrap();
+        recover_multi(&dir, &[0, 1], 2, None).expect("stamped base recovers");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: a legacy count-only floor stays readable (boundary-only check);
+    /// a malformed one fails closed.
+    #[test]
+    fn rebase_floor_file_formats() {
+        let dir = temp_dir("floor-format");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(rebase_floor_path(&dir, None), "7").unwrap();
+        assert_eq!(
+            read_rebase_floor(&dir, None).unwrap(),
+            Some(RebaseFloor {
+                covered: 7,
+                id: None
+            })
+        );
+        assert!(
+            RebaseFloor {
+                covered: 7,
+                id: None
+            }
+            .satisfied_by(7, None)
+        );
+        assert!(
+            !RebaseFloor {
+                covered: 7,
+                id: Some(1)
+            }
+            .satisfied_by(7, None)
+        );
+        assert!(
+            RebaseFloor {
+                covered: 7,
+                id: Some(1)
+            }
+            .satisfied_by(8, None)
+        );
+        assert!(
+            !RebaseFloor {
+                covered: 7,
+                id: Some(1)
+            }
+            .satisfied_by(6, Some(1))
+        );
+        for bad in ["", "x", "7 y", "7 1 2"] {
+            fs::write(rebase_floor_path(&dir, None), bad).unwrap();
+            assert!(read_rebase_floor(&dir, None).is_err(), "{bad:?}");
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 
