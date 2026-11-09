@@ -1128,8 +1128,8 @@ impl Journal {
         // Clear it — otherwise a later command for a key this node happened to
         // hold cold would route through `ensure_resident_for_command` →
         // `rehydrate_cold` and clobber the freshly installed resident state with
-        // the superseded cold row (#1331). (Reclaiming the now-orphaned on-disk
-        // cold rows is the separate store-reconciliation concern.)
+        // the superseded cold row (#1331). The now-unreferenced on-disk cold
+        // rows are reaped by the post-recovery GC (`gc_offheap_orphans`, #1338).
         if let Some(cold) = self.cold.as_mut() {
             cold.index = ColdIndex::default();
         }
@@ -1476,11 +1476,18 @@ impl Journal {
     /// an instance the engine has already driven to a terminal state, so its read
     /// row is an orphan (its terminal event was never projected).
     ///
-    /// The hot side is filtered to `Active` (non-terminal) instances. The engine
-    /// normally evicts a terminal instance the moment it is reached, but a leader
-    /// keeps terminal shells resident until its exporter drives eviction, and a
-    /// node that reclaimed a partition can retain a large backlog of resident
-    /// terminal shells whose completions it applied via raft catch-up (never
+    /// The hot side is filtered to **non-terminal** instances: `Active`,
+    /// `Suspended` and `Terminating` all retain their full runtime state (a
+    /// suspended instance resumes exactly; a terminating one is still draining
+    /// its `canceling` task listeners) and either can still carry
+    /// `variables_spilled`, so both the read-model reconciler and the
+    /// post-recovery off-heap GC ([#1338], reworked after #1467 excluded the
+    /// two non-`Active` nonterminal states and reaped their still-referenced
+    /// spill rows) must treat them as live. The engine normally evicts a
+    /// terminal instance the moment it is reached, but a leader keeps terminal
+    /// shells resident until its exporter drives eviction, and a node that
+    /// reclaimed a partition can retain a large backlog of resident terminal
+    /// shells whose completions it applied via raft catch-up (never
     /// exporter-evicted). Counting those resident-but-terminal shells as "live"
     /// would defeat reconciliation: an orphaned `Active` read row whose engine
     /// instance is resident-`Completed` would be treated as still live and never
@@ -1497,12 +1504,120 @@ impl Journal {
                     matches!(
                         inst.state,
                         nanobpmn_engine_core::ProcessInstanceState::Active
+                            | nanobpmn_engine_core::ProcessInstanceState::Suspended
+                            | nanobpmn_engine_core::ProcessInstanceState::Terminating
                     )
                 })
                 .map(|inst| inst.key),
         );
         if let Some(cold) = self.cold.as_ref() {
             out.extend(cold.index.keys());
+        }
+    }
+
+    /// The spill-reference set for the post-recovery GC ([#1338]): every
+    /// non-terminal instance whose `variables_spilled` flag is still set. A
+    /// legacy (pre-self-contained-snapshot) snapshot records a spilled instance
+    /// as an empty placeholder, so after log compaction the spill row is the
+    /// ONLY surviving copy of that instance's variables; the flag is what keeps
+    /// it referenced. The filter spans every nonterminal state — `Active`,
+    /// `Suspended` and `Terminating` alike can retain the flag (suspending or
+    /// cancel-listener-deferring never rehydrates the payload) — matching
+    /// [`collect_live_instance_keys`](Self::collect_live_instance_keys).
+    pub fn gc_spill_reference_keys(&self) -> std::collections::HashSet<Key> {
+        self.state()
+            .instances
+            .values()
+            .filter(|inst| {
+                inst.variables_spilled
+                    && matches!(
+                        inst.state,
+                        nanobpmn_engine_core::ProcessInstanceState::Active
+                            | nanobpmn_engine_core::ProcessInstanceState::Suspended
+                            | nanobpmn_engine_core::ProcessInstanceState::Terminating
+                    )
+            })
+            .map(|inst| inst.key)
+            .collect()
+    }
+
+    /// Post-recovery garbage collection of orphaned cold/spill rows ([#1338])
+    /// scoped to THIS partition's recovered engine. The node-level entry point
+    /// is the server's post-bootstrap sweep, which unions every hosted
+    /// partition's sets before sweeping the shared store ONCE; this per-journal
+    /// variant exists for single-partition callers and tests. Returns the
+    /// number of orphaned rows reaped.
+    pub fn gc_offheap_orphans(&self) -> u64 {
+        let mut live = std::collections::HashSet::new();
+        self.collect_live_instance_keys(&mut live);
+        let spill_referenced = self.gc_spill_reference_keys();
+        self.gc_offheap_orphans_with(&live, &spill_referenced)
+    }
+
+    /// The store-diffing core of the post-recovery GC ([#1338], reworked after
+    /// the reverted #1467), split out so the node-level sweep can drive it with
+    /// the UNION of every hosted partition's sets (the store is shared across
+    /// partitions, so a per-partition sweep would delete the other partitions'
+    /// live rows — the #1467 data-loss defect) and tests can drive it with an
+    /// explicit live set (modelling a recovered engine whose cold index was not
+    /// rebuilt).
+    ///
+    /// **Durability/ordering contract.** `live` must be the authoritative
+    /// live-instance set (every nonterminal instance — `Active`, `Suspended`,
+    /// `Terminating` — hot or cold) and `spill_referenced` the set of live
+    /// instances whose `variables_spilled` flag is still set, both taken AFTER
+    /// recovery completes for every partition the store serves (under Raft:
+    /// after bootstrap has hosted every replica and restored its durable
+    /// snapshot, so a live instance restored later is never missed). At that
+    /// point no command is mid-flight for a key the sweep would delete:
+    ///
+    /// - a **cold** row is reachable only through the routing index of a live
+    ///   instance; a row whose key is absent from `live` is dead (its terminal
+    ///   eviction `forget` was lost to a crash, or its routing index was never
+    ///   persisted by a pre-self-contained-snapshot engine) and is reaped;
+    /// - a **spill** row is reachable while its instance is live AND still
+    ///   carries the `variables_spilled` flag (a legacy snapshot can leave that
+    ///   flag pointing at the row — the only surviving copy of its variables);
+    ///   a row whose instance is terminal/evicted is dead and is reaped. The
+    ///   sweep conservatively retains every `live` key's spill row too (see
+    ///   [`VarSpillStore::gc_orphans`]); it is not the mechanism that reclaims
+    ///   live-but-no-longer-spilled rows.
+    ///
+    /// A SQLite failure is latched into the store's `forget_faults` (never
+    /// silent) and surfaced in the log; already-committed pages stay deleted
+    /// and the next boot retries the remainder.
+    pub fn gc_offheap_orphans_with(
+        &self,
+        live: &std::collections::HashSet<Key>,
+        spill_referenced: &std::collections::HashSet<Key>,
+    ) -> u64 {
+        let store = match self.spill_store() {
+            Some(store) => store,
+            None => return 0,
+        };
+        match store.gc_orphans(live, spill_referenced) {
+            Ok(collected) => {
+                if collected > 0 {
+                    tracing::info!(
+                        collected,
+                        live = live.len(),
+                        spill_referenced = spill_referenced.len(),
+                        "post-recovery GC: reaped orphaned cold/spill rows (crash between \
+                         row write and terminal forget, or a pre-self-contained-snapshot row)"
+                    );
+                }
+                collected
+            }
+            Err(err) => {
+                // The store already latched the typed error into `forget_faults`;
+                // surface it here too so the boot log names the GC failure. The
+                // next boot retries the un-deleted remainder.
+                tracing::error!(
+                    error = %err,
+                    "post-recovery GC of orphaned cold/spill rows failed (latched for retry)"
+                );
+                0
+            }
         }
     }
 
@@ -4233,6 +4348,321 @@ mod tests {
         assert!(
             !live2.contains(&completed_key),
             "the resident Completed instance stays excluded"
+        );
+    }
+
+    /// #1338 (rework of the reverted #1467): a crash between writing a cold row
+    /// and the instance's terminal eviction forget — or a row written by an
+    /// engine predating self-contained snapshots, whose routing index was never
+    /// persisted — leaves a row no live state references. Rows are deliberately
+    /// not wiped at boot (#1331) and the in-RAM cold index is not rebuilt at
+    /// boot, so nothing will ever `forget` it: an orphan. The post-recovery GC
+    /// must reap it while preserving a row that still belongs to a live
+    /// instance.
+    #[test]
+    fn post_recovery_gc_reaps_cold_rows_orphaned_by_a_crash_before_completion() {
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+
+        // Two parked instances cold-spilled to the store.
+        let mut journal = Journal::in_memory();
+        journal.set_cold_spill(Arc::clone(&store), 1, 0);
+        let orphan_key = deploy_and_create(&mut journal);
+        let live_key = deploy_and_create(&mut journal);
+        assert_eq!(journal.force_cold_spill_all(), 2);
+        assert!(store.try_get_cold(orphan_key).unwrap().is_some());
+        assert!(store.try_get_cold(live_key).unwrap().is_some());
+
+        // --- the crash window: `orphan_key` rehydrates and completes (its
+        // terminal event is journaled), but the node dies BEFORE the eviction
+        // forget reaches the store. Capture BOTH cold rows BEFORE the
+        // rehydration forget drops them, so we can restore exactly the rows a
+        // real crash leaves behind.
+        let orphan_row = store
+            .try_get_cold(orphan_key)
+            .unwrap()
+            .expect("orphan cold row present before rehydration");
+        let live_row = store
+            .try_get_cold(live_key)
+            .unwrap()
+            .expect("live cold row present before rehydration");
+        let jobs = journal.activate_jobs("demo-work", "w", 2, 1_000, 0);
+        let orphan_job = jobs
+            .iter()
+            .find(|j| j.instance_key == orphan_key)
+            .expect("orphan job activated")
+            .key;
+        let _ = journal
+            .apply_command(Command::complete_job(orphan_job))
+            .unwrap();
+        // Crash here: `evict_instances(&[orphan_key])` never runs, so its store
+        // forget is lost; `live_key`'s row was dropped by its own rehydration
+        // forget but its instance is still live. Re-write both rows the crash
+        // left behind.
+        store.put_cold(orphan_key, &orphan_row).unwrap();
+        store.put_cold(live_key, &live_row).unwrap();
+        assert!(store.try_get_cold(orphan_key).unwrap().is_some());
+        assert!(store.try_get_cold(live_key).unwrap().is_some());
+
+        // --- the restart: a recovered engine holds `live_key` live (parked) and
+        // no trace of `orphan_key`; its cold index is empty (never rebuilt).
+        // Partition 1 gives the recovered engine a disjoint key namespace so its
+        // own live instance cannot collide with the pre-crash keys.
+        let mut recovered = Journal::in_memory_partition(1);
+        recovered.set_cold_spill(Arc::clone(&store), 1, 0);
+        let _ = recovered
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let (events, _) = recovered
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let recovered_live = events.iter().find_map(|e| e.instance_key()).unwrap();
+        assert_eq!(
+            recovered.cold_count(),
+            0,
+            "cold index is not rebuilt at boot"
+        );
+
+        // The recovered engine's live set is `recovered_live` plus `live_key`
+        // (still live in the recovered history, its index entry lost).
+        let mut live = std::collections::HashSet::new();
+        recovered.collect_live_instance_keys(&mut live);
+        assert!(live.contains(&recovered_live));
+        live.insert(live_key);
+        let spill_referenced = recovered.gc_spill_reference_keys();
+        let collected = recovered.gc_offheap_orphans_with(&live, &spill_referenced);
+        assert!(
+            store.try_get_cold(orphan_key).unwrap().is_none(),
+            "orphaned cold row is reaped"
+        );
+        assert!(
+            store.try_get_cold(live_key).unwrap().is_some(),
+            "the live instance's cold row is preserved"
+        );
+        assert_eq!(collected, 1, "exactly the orphan row is collected");
+    }
+
+    /// #1338: a spill (variable payload) row whose instance reached a terminal
+    /// state but whose eviction forget was lost to a crash is an orphan and must
+    /// be reaped. A spill row whose instance is still live AND still carries the
+    /// `variables_spilled` flag — a legacy snapshot can leave that flag pointing
+    /// at the row, the only surviving copy of its variables — must be preserved.
+    #[test]
+    fn post_recovery_gc_reaps_orphaned_spill_rows_but_preserves_legacy_spilled_flags() {
+        use nanobpmn_engine_core::Value;
+
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        let mut journal = Journal::in_memory();
+        // Budget 0: any variable-carrying instance spills immediately.
+        journal.set_spill(Arc::clone(&store), 0);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("payload".to_string()));
+
+        // Two instances, both parked with non-empty variables so both spill.
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let (events, _) = journal
+                .apply_command(Command::create_instance_with("demo", vars.clone()))
+                .unwrap();
+            keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+        }
+        let (orphan_key, legacy_key) = (keys[0], keys[1]);
+        journal.force_spill_scan();
+        assert!(journal.engine.is_variables_spilled(orphan_key));
+        assert!(journal.engine.is_variables_spilled(legacy_key));
+        assert!(store.try_get(orphan_key).unwrap().is_some());
+        assert!(store.try_get(legacy_key).unwrap().is_some());
+
+        // Drive `orphan_key` to a terminal state WITHOUT its eviction forget
+        // (the crash window). Capture its spill payload BEFORE the activation
+        // rehydration forget drops it, so we can restore exactly the row a real
+        // crash leaves behind.
+        let orphan_vars = store
+            .try_get(orphan_key)
+            .unwrap()
+            .expect("orphan spill row present before activation");
+        // Activate ONLY the orphan's job (max_jobs 1), so `legacy_key` stays
+        // parked and still spilled — its row remains referenced by the flag.
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].instance_key, orphan_key,
+            "the oldest spilled instance activates first"
+        );
+        let orphan_job = jobs[0].key;
+        let _ = journal
+            .apply_command(Command::complete_job(orphan_job))
+            .unwrap();
+        // Completing rehydrates the orphan's variables (clearing its spilled
+        // flag) but the crash loses the eviction forget: re-write the surviving
+        // spill row. `legacy_key` stays parked and still spilled (referenced).
+        store.put(orphan_key, &orphan_vars).unwrap();
+        assert!(store.try_get(orphan_key).unwrap().is_some());
+
+        // The GC reaps the terminal instance's orphaned spill row and preserves
+        // the legacy spilled-flag row.
+        let collected = journal.gc_offheap_orphans();
+        assert!(
+            store.try_get(orphan_key).unwrap().is_none(),
+            "terminal instance's orphaned spill row is reaped"
+        );
+        assert!(
+            store.try_get(legacy_key).unwrap().is_some(),
+            "legacy spilled-flag row is preserved (still referenced)"
+        );
+        assert_eq!(collected, 1, "exactly the orphan row is collected");
+    }
+
+    /// #1467 finding (reworked in #1338): a resident **Suspended** instance
+    /// still carries `variables_spilled` — suspending never rehydrates the
+    /// payload — so its spill row is the only surviving copy of its variables.
+    /// The GC must treat it as referenced, or resuming the instance after the
+    /// sweep finds no variables (data loss).
+    #[test]
+    fn post_recovery_gc_preserves_a_suspended_instances_spill_row() {
+        use nanobpmn_engine_core::Value;
+
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        let mut journal = Journal::in_memory();
+        journal.set_spill(Arc::clone(&store), 0);
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("payload".to_string()));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("demo", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        journal.force_spill_scan();
+        assert!(journal.engine.is_variables_spilled(key));
+        assert!(store.try_get(key).unwrap().is_some());
+
+        // Suspend the parked instance: it stays nonterminal and still spilled.
+        let _ = journal
+            .apply_command(Command::suspend_instance(key))
+            .unwrap();
+        assert!(matches!(
+            journal.instance(key).map(|i| i.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Suspended)
+        ));
+        assert!(journal.engine.is_variables_spilled(key));
+
+        let collected = journal.gc_offheap_orphans();
+        assert!(
+            store.try_get(key).unwrap().is_some(),
+            "a Suspended instance's still-referenced spill row must survive the sweep"
+        );
+        assert_eq!(collected, 0, "nothing is orphaned here");
+    }
+
+    /// #1467 finding (reworked in #1338): a resident **Terminating** instance —
+    /// a cancel deferred on a user task's `canceling` listener chain (ADR 0037
+    /// §6) — is nonterminal and can still carry `variables_spilled`. Its spill
+    /// row must survive the sweep: the canceling listeners (and the terminal
+    /// eviction that follows them) still need the payload.
+    #[test]
+    fn post_recovery_gc_preserves_a_terminating_instances_spill_row() {
+        use nanobpmn_engine_core::{ProcessBuilder, TaskListener, TaskListenerEventType, Value};
+
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        let mut journal = Journal::in_memory();
+        journal.set_spill(Arc::clone(&store), 0);
+        // A parallel split: one branch parks on a spillable service-task job,
+        // the other on a user task carrying a `canceling` listener. Cancelling
+        // then defers on the listener chain, parking the instance in
+        // Terminating while its root variables stay spilled.
+        let def = ProcessBuilder::new("approval")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("work", "demo-work")
+            .user_task("review")
+            .parallel_gateway("join")
+            .end_event("end")
+            .connect("start", "fork")
+            .connect("fork", "work")
+            .connect("fork", "review")
+            .connect("work", "join")
+            .connect("review", "join")
+            .connect("join", "end")
+            .with_task_listeners(
+                "review",
+                vec![TaskListener {
+                    event_type: TaskListenerEventType::Canceling,
+                    job_type: "onCancel".to_string(),
+                    retries: None,
+                }],
+            )
+            .build()
+            .expect("valid listener process");
+        let _ = journal.apply_command(Command::DeployProcess(def)).unwrap();
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("payload".to_string()));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("approval", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        journal.force_spill_scan();
+        assert!(
+            journal.engine.is_variables_spilled(key),
+            "the instance spilled while Active on its service-task job"
+        );
+        assert!(store.try_get(key).unwrap().is_some());
+
+        // Cancel: the `canceling` listener defers termination, so the instance
+        // parks in Terminating — still nonterminal, still spilled (cancel never
+        // rehydrates a spilled payload).
+        let _ = journal
+            .apply_command(Command::cancel_instance(key))
+            .unwrap();
+        assert!(matches!(
+            journal.instance(key).map(|i| i.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Terminating)
+        ));
+        assert!(
+            journal.engine.is_variables_spilled(key),
+            "cancel does not rehydrate a spilled payload"
+        );
+
+        let collected = journal.gc_offheap_orphans();
+        assert!(
+            store.try_get(key).unwrap().is_some(),
+            "a Terminating instance's still-referenced spill row must survive the sweep"
+        );
+        assert_eq!(collected, 0, "nothing is orphaned here");
+    }
+
+    /// #1467 finding (reworked in #1338): the live set the GC diffs the store
+    /// against must include EVERY nonterminal instance — Active, Suspended and
+    /// Terminating — not just Active. A Suspended or Terminating instance keeps
+    /// its runtime state (and can retain `variables_spilled`), so excluding it
+    /// reaps rows that are still referenced.
+    #[test]
+    fn collect_live_instance_keys_includes_every_nonterminal_state() {
+        use nanobpmn_engine_core::ProcessInstanceState;
+
+        let mut journal = Journal::in_memory();
+        let suspended_key = deploy_and_create(&mut journal);
+        let active_key = deploy_and_create(&mut journal);
+        let _ = journal
+            .apply_command(Command::suspend_instance(suspended_key))
+            .unwrap();
+        assert!(matches!(
+            journal.instance(suspended_key).map(|i| i.state),
+            Some(ProcessInstanceState::Suspended)
+        ));
+
+        let mut live = std::collections::HashSet::new();
+        journal.collect_live_instance_keys(&mut live);
+        assert!(live.contains(&active_key), "an Active instance is live");
+        assert!(
+            live.contains(&suspended_key),
+            "a Suspended instance is nonterminal and must count as live"
         );
     }
 
