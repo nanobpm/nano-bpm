@@ -17548,6 +17548,23 @@ impl ServerImpl {
         } else {
             raft_log_dir_for(p)
         };
+        // A quorum VOTER with no durable log (an in-memory deployment) has nothing
+        // to resume: rebuilding it would hand the group an EMPTY voter — no log,
+        // no persisted vote — that can vote twice in a term or help elect a stale
+        // replica, discarding acknowledged writes (Raft's amnesia hazard; #53
+        // review). Refuse, loudly, and leave the partition down for an operator
+        // restart. Only leader-durable learners (non-voting, the leader is their
+        // sole durability point) and durable voters are rebuilt in place.
+        if voter_must_resume && log_dir.is_none() {
+            tracing::error!(
+                partition = p,
+                "raft partition core is SHUTDOWN on an in-memory quorum voter; \
+                 rebuilding it empty would let an amnesiac voter lose acknowledged writes — \
+                 NOT auto-recovering (restart the node to recover; run with NANOBPMN_DATA_DIR \
+                 for a durable log, or leader-durable replication for disposable learners)"
+            );
+            return false;
+        }
         // Tear down the dead core first so its tasks fully stop before we
         // construct the replacement (and so a durable log store's file handles
         // are released before the new store reopens the same dir).
@@ -35680,19 +35697,17 @@ mod clustered_startup_tests {
             "the dead core must not be swapped for an empty uninitialized member"
         );
     }
-    /// Issue #53: a partition whose Raft core enters `Shutdown` must be
-    /// auto-recovered in place (rebuilt in the registry so it rejoins its group),
-    /// not left dead until a manual process restart.
-    ///
-    /// Two served nodes form a 2-voter group for partition 0 (node 0 leads). The
-    /// follower (node 1) core is driven to `Shutdown` (a graceful `shutdown()`
-    /// terminates the core, which reports `ServerState::Shutdown` — the same
-    /// terminal state a `Fatal` storage error produces). Before the fix the
-    /// partition stays dead forever: `applied` freezes and the registry keeps the
-    /// corpse. The recovery supervisor must rebuild it so it catches back up and
-    /// applies new entries.
-    #[tokio::test]
-    async fn a_shutdown_partition_is_auto_recovered_in_place() {
+    /// Two served in-memory nodes hosting partition 0, node 0 leading, in the
+    /// given replication `mode` (quorum: 2 voters; leader-durable: voter +
+    /// learner). Shared by the #53 Shutdown-recovery tests.
+    async fn two_node_p0_group(
+        mode: ReplicationMode,
+    ) -> (
+        ServerImpl,
+        ServerImpl,
+        Arc<crate::raft::RaftPartition>,
+        Arc<crate::raft::RaftPartition>,
+    ) {
         use std::collections::BTreeMap;
 
         use openraft::BasicNode;
@@ -35726,8 +35741,10 @@ mod clustered_startup_tests {
                 .collect();
             build_server_in_memory(journals, topology)
         };
-        let node0 = build_node(0);
-        let node1 = build_node(1);
+        let mut node0 = build_node(0);
+        let mut node1 = build_node(1);
+        node0.replication_mode = mode;
+        node1.replication_mode = mode;
 
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
@@ -35766,9 +35783,13 @@ mod clustered_startup_tests {
         );
         node1.raft_registry().insert(part1.clone());
 
+        // Quorum: a 2-VOTER group. Leader-durable: node 0 is the sole voter and
+        // node 1 a non-voting learner (ADR 0003), the shape that mode forms.
         let mut members = BTreeMap::new();
         members.insert(0u64, BasicNode::new(peers[0].clone()));
-        members.insert(1u64, BasicNode::new(peers[1].clone()));
+        if mode == ReplicationMode::Quorum {
+            members.insert(1u64, BasicNode::new(peers[1].clone()));
+        }
         part0.initialize(members).await.expect("form group");
 
         // Wait for node 0 to be the established leader.
@@ -35781,6 +35802,63 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(leader_ok, "node 0 should win the initial election");
+        if mode == ReplicationMode::LeaderDurable {
+            part0
+                .add_learner_blocking(1, BasicNode::new(peers[1].clone()))
+                .await
+                .expect("add node 1 as a learner");
+        }
+        (node0, node1, part0, part1)
+    }
+
+    /// #53 review: an in-memory QUORUM voter must never be rebuilt empty. With no
+    /// durable log to resume, the rebuilt member would rejoin as an amnesiac
+    /// voter — no log, no persisted vote — able to vote twice in a term or help
+    /// elect a stale replica and discard acknowledged writes. Recovery must
+    /// refuse and keep the dead core registered (loud, for an operator restart).
+    #[tokio::test]
+    async fn an_in_memory_quorum_voter_is_not_rebuilt_empty() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::Quorum).await;
+        part1
+            .raft
+            .shutdown()
+            .await
+            .expect("drive the voter to shutdown");
+        assert!(part1.is_shutdown(), "the voter's core reports Shutdown");
+
+        assert!(
+            !node1.recover_shutdown_partition(0).await,
+            "an in-memory quorum voter must not be recovered onto an empty member"
+        );
+        let still = node1.raft_registry().get(0).expect("p0 still registered");
+        assert!(
+            Arc::ptr_eq(&still, &part1),
+            "the dead voter must not be swapped for an empty member"
+        );
+        assert!(
+            node1.recover_shutdown_partitions_once().await.is_empty(),
+            "the supervisor pass must not recover it either"
+        );
+
+        part0.raft.shutdown().await.ok();
+    }
+
+    /// Issue #53: a partition whose Raft core enters `Shutdown` must be
+    /// auto-recovered in place (rebuilt in the registry so it rejoins its group),
+    /// not left dead until a manual process restart.
+    ///
+    /// Two served nodes host partition 0 in leader-durable mode (node 0 the sole
+    /// voter and leader, node 1 a disposable learner; an in-memory quorum voter
+    /// is refused instead, see `an_in_memory_quorum_voter_is_not_rebuilt_empty`).
+    /// The follower (node 1) core is driven to `Shutdown` (a graceful `shutdown()`
+    /// terminates the core, which reports `ServerState::Shutdown` — the same
+    /// terminal state a `Fatal` storage error produces). Before the fix the
+    /// partition stays dead forever: `applied` freezes and the registry keeps the
+    /// corpse. The recovery supervisor must rebuild it so it catches back up and
+    /// applies new entries.
+    #[tokio::test]
+    async fn a_shutdown_partition_is_auto_recovered_in_place() {
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
 
         // Commit one entry so the group has real state the follower must re-attain.
         let proc = ProcessBuilder::new("survives-recovery")
@@ -35893,85 +35971,7 @@ mod clustered_startup_tests {
     /// exact reversion and asserts the leader survives and keeps serving.
     #[tokio::test]
     async fn the_leader_survives_a_rebuilt_followers_log_reversion() {
-        use std::collections::BTreeMap;
-
-        use openraft::BasicNode;
-
-        use crate::raft::RaftPartition;
-
-        let l0 = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind node 0");
-        let p0 = l0.local_addr().expect("addr0").port();
-        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind node 1");
-        let p1 = l1.local_addr().expect("addr1").port();
-        let peers = vec![
-            format!("http://127.0.0.1:{p0}"),
-            format!("http://127.0.0.1:{p1}"),
-        ];
-        let build_node = |node_id: u32| {
-            let topology = cluster::Topology {
-                node_id,
-                peers: peers.clone(),
-                num_partitions: 4,
-                replication_factor: 2,
-            };
-            let journals: Vec<Journal> = topology
-                .local_partitions()
-                .iter()
-                .map(|p| Journal::in_memory_partition(*p))
-                .collect();
-            build_server_in_memory(journals, topology)
-        };
-        let node0 = build_node(0);
-        let node1 = build_node(1);
-        for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
-            let registry = falcon::Registry::new();
-            falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = peer_facing_app(server.clone(), registry);
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.ok();
-            });
-        }
-
-        let part0 = Arc::new(
-            RaftPartition::bootstrap_member(
-                0,
-                0,
-                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
-                node0.raft_transport(),
-                None,
-                false,
-            )
-            .await
-            .expect("boot node 0"),
-        );
-        node0.raft_registry().insert(part0.clone());
-        let part1 = Arc::new(
-            RaftPartition::bootstrap_member(
-                1,
-                0,
-                DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None),
-                node1.raft_transport(),
-                None,
-                false,
-            )
-            .await
-            .expect("boot node 1"),
-        );
-        node1.raft_registry().insert(part1.clone());
-        let mut members = BTreeMap::new();
-        members.insert(0u64, BasicNode::new(peers[0].clone()));
-        members.insert(1u64, BasicNode::new(peers[1].clone()));
-        part0.initialize(members).await.expect("form group");
-        for _ in 0..300 {
-            if part0.raft.metrics().borrow().current_leader == Some(0) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        let (_node0, node1, part0, part1) = two_node_p0_group(ReplicationMode::LeaderDurable).await;
 
         // Commit several entries so the follower has a non-trivial log to revert.
         for i in 0..3u64 {
