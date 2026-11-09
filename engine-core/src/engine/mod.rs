@@ -2343,6 +2343,7 @@ impl Engine {
                         created_at,
                         job_type,
                         worker,
+                        completed_at: self.now,
                     },
                 );
                 if !variables.is_empty() {
@@ -4336,6 +4337,7 @@ impl Engine {
                     .map(|j| Event::JobCanceled {
                         job_key: j.key,
                         instance_key,
+                        canceled_at: self.now,
                     })
                     .collect();
 
@@ -9376,6 +9378,7 @@ impl Engine {
             events.push(Event::JobCanceled {
                 job_key,
                 instance_key,
+                canceled_at: self.now,
             });
         }
         events.extend(self.cancel_all_timers_on(child_eik));
@@ -9479,6 +9482,7 @@ impl Engine {
                 events.push(Event::JobCanceled {
                     job_key,
                     instance_key,
+                    canceled_at: self.now,
                 });
             }
             events.extend(self.cancel_all_timers_on(child));
@@ -11197,6 +11201,7 @@ impl Engine {
             .map(|job_key| Event::JobCanceled {
                 job_key,
                 instance_key,
+                canceled_at: self.now,
             })
             .collect()
     }
@@ -15007,6 +15012,7 @@ impl Engine {
         cancels.extend(jobs.iter().map(|j| Event::JobCanceled {
             job_key: j.key,
             instance_key,
+            canceled_at: self.now,
         }));
 
         let mut timers: Vec<&state::Timer> = self

@@ -26,6 +26,7 @@ mod modify_scopes;
 mod multi_instance;
 mod retry_phases;
 mod scoped_conditions;
+mod terminal_timing;
 mod timers_catch;
 mod user_task;
 

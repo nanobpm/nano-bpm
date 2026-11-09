@@ -4149,23 +4149,22 @@ fn project_engine_state(
     for job in state.jobs.values() {
         let (def_id, def_key) = instance_def(tx, job.instance_key);
         let (kind_code, event_code) = job_kind_codes(&job.kind);
-        // Timing (#1344): a snapshotted job is USUALLY live — a terminal job is
-        // evicted from engine state together with its owning instance — so
-        // `end_ms` stays NULL and `last_update_ms` seeds from the creation
+        // Timing (#1344, #1440): a snapshotted job is USUALLY live — a terminal
+        // job is evicted from engine state together with its owning instance —
+        // so `end_ms` stays NULL and `last_update_ms` seeds from the creation
         // instant, the best lower bound available without the per-event
-        // history, matching `creationTime <= lastUpdateTime`. KNOWN LIMITATION
-        // (#1346 review): the engine drops a job only when its owning INSTANCE
-        // goes terminal (`evict_instance`), so a parallel/multi-instance
-        // process can be snapshotted with a COMPLETED/CANCELED job whose
-        // sibling branch is still active. Such a job is seeded here as
-        // terminal with `end_ms = NULL` and `last_update_ms = creation_ms`,
-        // and its retained deadline is already gone from engine state
-        // (`JobCompleted` clears `Job::deadline`) — the terminal timing and
-        // deadline are event-derived and not recoverable from a snapshot.
-        // Pinned by
-        // `seed_from_engine_state_cannot_recover_terminal_job_timing`; the
-        // fix needs engine-retained terminal timing (#1440) — a reseed has no
-        // events to order, so the #1347 durable position cannot recover it.
+        // history, matching `creationTime <= lastUpdateTime`. But the engine
+        // drops a job only when its owning INSTANCE goes terminal, so a
+        // parallel/multi-instance process can be snapshotted with a
+        // COMPLETED/CANCELED job whose sibling branch is still active. For such
+        // a job the engine retains the terminal transition's instant and the
+        // deadline it held (`Job::terminal_end`, #1440): seed `end_ms` and
+        // `last_update_ms` from that instant and `deadline_ms` from the retained
+        // deadline — exactly what the event-driven `JobCompleted`/`JobCanceled`
+        // projection writes (the first terminal transition stamps `end_ms` and
+        // keeps the last projected deadline). A reseed has no events to order,
+        // so this engine-retained state is the only source (the #1347 durable
+        // position cannot recover it).
         // On a CONFLICT we deliberately do NOT overwrite `created_at_ms` /
         // `last_update_ms` / `end_ms`: an existing read-model row already
         // carries the authoritative event-derived values, which a
@@ -4195,20 +4194,25 @@ fn project_engine_state(
             now_ms
         };
         let creation_ms = last_update;
+        let terminal_end = job.terminal_end;
+        let end_ms = terminal_end.map(|t| t.at);
+        let last_update = end_ms.unwrap_or(last_update);
+        let deadline = job.deadline.or(terminal_end.and_then(|t| t.deadline));
         let replay_floor = job.created_at.max(job.activated_at.unwrap_or(0));
         tx.cexecute(
             "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
              state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
              job_kind, listener_event_type, lease_token, error_message, error_code, \
              has_failed_with_retries_left, created_at_ms, last_update_ms, business_id, \
-             last_event_identity_ms) \
+             last_event_identity_ms, end_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2), ?20) \
+             ?18, ?19, (SELECT business_id FROM process_instances WHERE key = ?2), ?20, ?21) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
              worker = excluded.worker, deadline_ms = excluded.deadline_ms, \
              lease_token = excluded.lease_token, error_message = excluded.error_message, \
              error_code = excluded.error_code, \
              has_failed_with_retries_left = excluded.has_failed_with_retries_left, \
+             end_ms = COALESCE(jobs.end_ms, excluded.end_ms), \
              last_event_identity_ms = MAX(COALESCE(jobs.last_event_identity_ms, 0), excluded.last_event_identity_ms)",
             params![
                 job.key as i64,
@@ -4226,7 +4230,7 @@ fn project_engine_state(
                 // capture is now `None`) would preserve the empty string and pin
                 // the row to a bogus empty worker (#1191).
                 worker_attribution(job.worker.as_deref()),
-                job.deadline.map(|d| d as i64),
+                deadline.map(|d| d as i64),
                 def_id,
                 def_key,
                 kind_code,
@@ -4241,6 +4245,7 @@ fn project_engine_state(
                 creation_ms as i64,
                 last_update as i64,
                 replay_floor as i64,
+                end_ms.map(|e| e as i64),
             ],
         )?;
     }
@@ -8154,6 +8159,7 @@ mod definition_xml_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: None,
             },
         );
 
@@ -8342,18 +8348,19 @@ mod definition_xml_tests {
         assert!(store.jobs().into_iter().all(|j| j.key != 9_900));
     }
 
-    /// Defect-class guard (#1346 review): `seed_from_engine_state` cannot recover
-    /// terminal-job timing. The engine drops a job only when its owning INSTANCE
-    /// goes terminal (`evict_instance`), so a parallel process can be snapshotted
-    /// with a COMPLETED job whose sibling branch is still ACTIVE. Seeding that
-    /// snapshot recreates the job as terminal with `end_ms = NULL` and
-    /// `last_update_ms = creation_ms` (and the retained deadline already gone
-    /// from engine state — `JobCompleted` clears `Job::deadline`). This pins the
-    /// current (lossy) behaviour so the gap is explicit and covered; the fix
-    /// needs engine-retained terminal timing (#1440).
+    /// Defect-class guard (#1346 review → fixed by #1440): a snapshot CAN now
+    /// recover terminal-job timing. The engine drops a job only when its owning
+    /// INSTANCE goes terminal (`evict_instance`), so a parallel process can be
+    /// snapshotted with a COMPLETED job whose sibling branch is still ACTIVE.
+    /// The engine retains the terminal transition's instant and the
+    /// last-projected deadline on the job (`Job::terminal_end`, stamped by the
+    /// `JobCompleted`/`JobCanceled` reducer from the event's `completed_at` /
+    /// `canceled_at`), and seeding that snapshot must recreate the row with
+    /// `end_ms`/`last_update_ms` at that instant and the retained deadline —
+    /// exactly what the event-driven projection would have written.
     #[test]
-    fn seed_from_engine_state_cannot_recover_terminal_job_timing() {
-        use nanobpmn_engine_core::{Job, JobKind, ProcessInstance, State};
+    fn seed_from_engine_state_recovers_terminal_job_timing() {
+        use nanobpmn_engine_core::{Job, JobKind, JobTerminalEnd, ProcessInstance, State};
 
         let mut state = State::default();
         // A still-ACTIVE owning instance (a parallel branch is still running)…
@@ -8392,7 +8399,8 @@ mod definition_xml_tests {
         state.instances.insert(7_600, inst);
         // …holding a COMPLETED job (engine kept it: `JobCompleted` only flips
         // `state`; eviction happens with the instance, which is still active).
-        // The engine has already cleared `deadline`/`activated_at` on completion.
+        // The live `deadline`/`activated_at` were cleared on completion, but the
+        // engine retained the terminal instant and the last-projected deadline.
         state.jobs.insert(
             8_600,
             Job {
@@ -8417,6 +8425,10 @@ mod definition_xml_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: Some(JobTerminalEnd {
+                    at: 600,
+                    deadline: Some(70_000),
+                }),
             },
         );
 
@@ -8429,21 +8441,135 @@ mod definition_xml_tests {
             nanobpmn_engine_core::JobState::Completed,
             "the seed projects the snapshotted terminal state"
         );
-        // The lossy gap: no `endTime`, `lastUpdateTime` falls back to creation,
-        // and the retained deadline is gone — none are derivable from a snapshot.
         assert_eq!(
-            seeded.end_ms, None,
-            "a snapshot carries no completion instant, so endTime is unrecoverable"
+            seeded.end_ms,
+            Some(600),
+            "the retained terminal instant recovers endTime"
         );
         assert_eq!(
             seeded.last_update_ms,
-            Some(seeded.created_at_ms),
-            "lastUpdateTime degrades to the creation instant"
+            Some(600),
+            "lastUpdateTime recovers to the terminal instant, not creation"
         );
         assert_eq!(
-            seeded.deadline_ms, None,
-            "the retained deadline is already gone from engine state"
+            seeded.deadline_ms,
+            Some(70_000),
+            "the retained terminal deadline recovers (Camunda keeps it on a completed job)"
         );
+    }
+
+    /// Defect-class guard (#1440) over the whole durability path, not a
+    /// hand-built `State`: drive a REAL engine to one COMPLETED and one
+    /// CANCELED job of a still-active parallel instance, then rebuild the read
+    /// model two ways — (a) event-driven, projecting the journal with each
+    /// batch observed at its command instant, and (b) a compaction-floor
+    /// reseed from the engine snapshot after a serialize → deserialize →
+    /// `Engine::from_snapshot` recovery (and from a journal-replayed engine,
+    /// the crash/restart / follower path). Every terminal job's timing columns
+    /// must be identical across both — the reseed may not lose what the event
+    /// projection would have written.
+    #[test]
+    fn seed_from_engine_snapshot_matches_event_projection_for_terminal_jobs() {
+        use nanobpmn_engine_core::{Command, Engine, EngineSnapshot, ProcessBuilder};
+
+        let def = ProcessBuilder::new("terminal-seed")
+            .start_event("start")
+            .parallel_gateway("fork")
+            .service_task("a", "ja")
+            .service_task("b", "jb")
+            .service_task("c", "jc")
+            .parallel_gateway("join")
+            .end_event("done")
+            .connect("start", "fork")
+            .connect("fork", "a")
+            .connect("fork", "b")
+            .connect("fork", "c")
+            .connect("a", "join")
+            .connect("b", "join")
+            .connect("c", "join")
+            .connect("join", "done")
+            .build()
+            .unwrap();
+        let mut engine = Engine::new();
+        let mut batches: Vec<(Vec<Event>, u64)> = Vec::new();
+        let mut run = |engine: &mut Engine, cmd: Command, now: u64| {
+            let events = engine.apply_command_at(cmd, now).unwrap();
+            batches.push((events.clone(), now));
+            events
+        };
+        run(&mut engine, Command::DeployProcess(def), 1_000);
+        let inst = run(
+            &mut engine,
+            Command::create_instance("terminal-seed"),
+            2_000,
+        )
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+        run(
+            &mut engine,
+            Command::activate_jobs("ja", "w", 1, 60_000, 3_000),
+            3_000,
+        );
+        run(
+            &mut engine,
+            Command::activate_jobs("jb", "w", 1, 40_000, 3_500),
+            3_500,
+        );
+        let key_of = |engine: &Engine, ty: &str| {
+            engine
+                .state()
+                .jobs
+                .values()
+                .find(|j| j.job_type == ty)
+                .unwrap()
+                .key
+        };
+        let (ja, jb) = (key_of(&engine, "ja"), key_of(&engine, "jb"));
+        run(&mut engine, Command::complete_job(ja), 5_000);
+        let b_eik = engine.state().jobs.get(&jb).unwrap().element_instance_key;
+        run(
+            &mut engine,
+            Command::modify_instance(inst, vec![], vec![b_eik]),
+            7_000,
+        );
+
+        // (a) Event-driven projection.
+        let projected = ReadStore::open(None).unwrap();
+        for (events, now) in &batches {
+            for e in events {
+                super::read_surface_tests::apply_at(&projected, e, *now);
+            }
+        }
+
+        // (b) Snapshot recovery, from the live engine and from a replayed one.
+        let journal: Vec<Event> = batches.iter().flat_map(|(e, _)| e.clone()).collect();
+        for (path, source) in [
+            ("live", engine.snapshot()),
+            ("replayed", Engine::replay(journal).snapshot()),
+        ] {
+            let bytes = serde_json::to_vec(&source).unwrap();
+            let decoded: EngineSnapshot = serde_json::from_slice(&bytes).unwrap();
+            let recovered = Engine::from_snapshot(decoded);
+            let seeded = ReadStore::open(None).unwrap();
+            seeded.seed_from_engine_state(recovered.state()).unwrap();
+
+            for (key, end) in [(ja, 5_000), (jb, 7_000)] {
+                let want = super::read_surface_tests::job_row(&projected, key);
+                let got = super::read_surface_tests::job_row(&seeded, key);
+                assert_eq!(got.state, want.state, "{path}: job {key} state");
+                assert_eq!(want.end_ms, Some(end), "{path}: projected endTime");
+                assert_eq!(got.end_ms, want.end_ms, "{path}: job {key} endTime");
+                assert_eq!(
+                    got.last_update_ms, want.last_update_ms,
+                    "{path}: job {key} lastUpdateTime"
+                );
+                assert_eq!(
+                    got.deadline_ms, want.deadline_ms,
+                    "{path}: job {key} retained deadline"
+                );
+            }
+        }
     }
 
     /// Defect-class guard (#1244 review): a parked join is registered in the
@@ -8616,6 +8742,7 @@ mod definition_xml_tests {
                 created_at: 600,
                 job_type: "worker".to_string(),
                 worker: Some("w2".to_string()),
+                completed_at: 0,
             },
         ];
         let positions: Vec<u64> = history
@@ -11405,6 +11532,7 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: Some("host-a-senior".to_string()),
+                    completed_at: 0,
                 },
                 // A completion with no activating worker leaves it NULL, not "".
                 &Event::JobCreated {
@@ -11423,6 +11551,7 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: None,
+                    completed_at: 0,
                 },
             ])
             .unwrap();
@@ -11469,6 +11598,7 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: Some(String::new()),
+                    completed_at: 0,
                 },
                 &Event::JobCreated {
                     job_key: 9202,
@@ -11569,6 +11699,7 @@ mod element_instance_tests {
                     created_at: 1,
                     job_type: "review-round".to_string(),
                     worker: None,
+                    completed_at: 0,
                 },
             ])
             .unwrap();
@@ -11619,6 +11750,7 @@ mod element_instance_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: None,
             },
         );
 
@@ -11641,6 +11773,7 @@ mod element_instance_tests {
                 created_at: 2,
                 job_type: "review-round".to_string(),
                 worker: None,
+                completed_at: 0,
             }])
             .unwrap();
 
@@ -11685,6 +11818,7 @@ mod element_instance_tests {
             error_code: None,
             has_failed_with_retries_left: false,
             settled_tokens: Vec::new(),
+            terminal_end: None,
         };
         let mut state = State::default();
         // Failed with retries left.
@@ -11754,6 +11888,7 @@ mod element_instance_tests {
                     created_at: 2,
                     job_type: "review-round".to_string(),
                     worker: None,
+                    completed_at: 0,
                 },
             ),
             (
@@ -11855,6 +11990,7 @@ mod element_instance_tests {
             created_at: 0,
             job_type: String::new(),
             worker: None,
+            completed_at: 0,
         };
         let get = |k: Key| store.jobs().into_iter().find(|j| j.key == k).unwrap();
 
@@ -11905,6 +12041,7 @@ mod element_instance_tests {
             .export(&[&Event::JobCanceled {
                 job_key: 7002,
                 instance_key: INST,
+                canceled_at: 0,
             }])
             .unwrap();
         assert!(get(7002).end_ms.is_some(), "a cancelled job has an endTime");
@@ -11972,6 +12109,7 @@ mod element_instance_tests {
                     created_at: 0,
                     job_type: String::new(),
                     worker: None,
+                    completed_at: 0,
                 },
             ])
             .unwrap();
@@ -12031,6 +12169,7 @@ mod element_instance_tests {
             .export(&[&Event::JobCanceled {
                 job_key: 8002,
                 instance_key: INST,
+                canceled_at: 0,
             }])
             .unwrap();
         let canceled_end = get(8002).end_ms.expect("cancelled job has an endTime");
@@ -12290,6 +12429,7 @@ mod element_instance_tests {
                 error_code: None,
                 has_failed_with_retries_left: false,
                 settled_tokens: Vec::new(),
+                terminal_end: None,
             },
         );
         let store = ReadStore::open(None).unwrap();

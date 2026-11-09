@@ -1491,7 +1491,8 @@ fn cancel_terminates_instance_and_cancels_its_job() {
     // The job is cancelled and the instance is terminated (not completed).
     assert!(events.contains(&Event::JobCanceled {
         job_key,
-        instance_key
+        instance_key,
+        canceled_at: 0,
     }));
     assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key }));
     assert!(!events

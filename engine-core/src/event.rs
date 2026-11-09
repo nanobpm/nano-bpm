@@ -759,6 +759,12 @@ pub enum Event {
         /// activating worker. Observational: not used by replay.
         #[cfg_attr(feature = "serde", serde(default))]
         worker: Option<String>,
+        /// The logical instant of the completion (the completing command's
+        /// `now`, #1440). Retained on the job (`Job::terminal_end`) so a
+        /// snapshot-seeded read model recovers `endTime`/`lastUpdateTime`.
+        /// `0` for events serialized before this field existed (unknown).
+        #[cfg_attr(feature = "serde", serde(default))]
+        completed_at: u64,
     },
     /// A **leased** job's settlement was recorded in the settlement ledger
     /// (#1181): the lease token (per-activation fence) that settled it and the
@@ -1078,7 +1084,15 @@ pub enum Event {
     },
     /// A job was cancelled because its activity was interrupted by a boundary
     /// event firing.
-    JobCanceled { job_key: Key, instance_key: Key },
+    JobCanceled {
+        job_key: Key,
+        instance_key: Key,
+        /// The logical instant of the cancellation (the canceling command's
+        /// `now`, #1440); see `Event::JobCompleted::completed_at`. `0` for
+        /// events serialized before this field existed (unknown).
+        #[cfg_attr(feature = "serde", serde(default))]
+        canceled_at: u64,
+    },
 
     /// A message was published. In nano messages are not buffered, so this
     /// records no durable state; it carries the minted `message_key` (returned to

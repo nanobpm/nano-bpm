@@ -604,6 +604,7 @@ impl Engine {
                 events.push(Event::JobCanceled {
                     job_key,
                     instance_key,
+                    canceled_at: self.now,
                 });
             }
             events.extend(self.cancel_all_timers_on(eik));
@@ -730,6 +731,7 @@ impl Engine {
             events.push(Event::JobCanceled {
                 job_key,
                 instance_key,
+                canceled_at: self.now,
             });
         }
         events.extend(self.resolve_incidents_on(instance_key, root_eik));
@@ -1412,6 +1414,7 @@ impl Engine {
                     Event::JobCanceled {
                         job_key,
                         instance_key,
+                        canceled_at: self.now,
                     },
                 );
             }
@@ -1458,6 +1461,7 @@ impl Engine {
                     Event::JobCanceled {
                         job_key,
                         instance_key,
+                        canceled_at: self.now,
                     },
                 );
             }
@@ -1485,6 +1489,7 @@ impl Engine {
                 Event::JobCanceled {
                     job_key,
                     instance_key,
+                    canceled_at: self.now,
                 },
             );
         }
