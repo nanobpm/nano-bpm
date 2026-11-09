@@ -1931,6 +1931,29 @@ impl Journal {
         spilled
     }
 
+    /// Test hook: rehydrates every cold instance back into hot state through the
+    /// production rehydration path, returning `(restored, failed)` where `failed`
+    /// counts instances that were absent or unreadable. Lets a replica-parity
+    /// test (#100) compare full per-instance/per-job state across replicas after
+    /// proving each replica's off-heap rows are readable.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn rehydrate_all_cold(&mut self) -> (usize, usize) {
+        let keys: Vec<Key> = match self.cold.as_ref() {
+            Some(cold) => cold.index.keys().collect(),
+            None => return (0, 0),
+        };
+        let mut restored = 0usize;
+        let mut failed = 0usize;
+        for key in keys {
+            match self.rehydrate_cold(key) {
+                ColdRehydration::Restored => restored += 1,
+                ColdRehydration::NotCold => {}
+                ColdRehydration::Absent | ColdRehydration::Unreadable => failed += 1,
+            }
+        }
+        (restored, failed)
+    }
+
     /// Wires the read-model exporter channel. Set before any command is applied
     /// (including demo seeding) so every journaled event is projected.
     ///

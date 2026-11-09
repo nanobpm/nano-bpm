@@ -854,6 +854,20 @@ impl VarSpillStore {
         json.map(|j| decode(&j)).transpose()
     }
 
+    /// Test hook: overwrites the cold row for `key` with undecodable bytes so
+    /// the next read of it is *unreadable* (not absent). Returns whether a row
+    /// was rewritten. Lets cross-crate tests inject the #1405 failure mode.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn corrupt_cold_row(&self, key: Key) -> bool {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "UPDATE cold SET snapshot = 'not-json{' WHERE key = ?1",
+            params![key as i64],
+        )
+        .map(|n| n == 1)
+        .unwrap_or(false)
+    }
+
     /// Drops any spilled variable and cold-snapshot rows for `keys`, in one
     /// transaction. Called when instances reach a terminal state and are evicted
     /// from hot state: their spilled payloads are now dead and would otherwise
