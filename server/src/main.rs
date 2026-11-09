@@ -1758,6 +1758,17 @@ mod converted_lock_poison_tests {
 /// `created` counts are *not* logged here: a job's creation is durably recorded
 /// in the read model (the `jobs.created_at_ms` column), so those are answered
 /// from there.
+/// Outcome of [`ServerImpl::apply_routed_command`] (#1307).
+enum RoutedApply {
+    /// Applied (replicated, under Raft) on this node; carries the produced events.
+    Applied(Vec<Event>),
+    /// This node does not accept writes for the target partition (not the owner,
+    /// or — under Raft — not its current leader); route to the writer instead.
+    NotHere,
+    /// The write path rejected or failed the command.
+    Failed(u16, String),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobMetricStatus {
     Completed,
@@ -8840,10 +8851,6 @@ impl ServerImpl {
     /// every node (each node correlates its own local subset), so the union still
     /// covers both owners. With a single partition the target set is `{0}` — one
     /// round-trip, identical to the pre-partitioning path.
-    #[allow(
-        clippy::expect_used,
-        reason = "invariant by construction: correlation only fails on a business id, already validated earlier on this path"
-    )]
     async fn correlate_message_everywhere(
         &self,
         name: String,
@@ -8870,30 +8877,24 @@ impl ServerImpl {
         for target in targets {
             // Skip a target this node does not own; the cluster broadcast routes
             // the publish to the owning node, which correlates it locally.
-            let Some(handle) = self.engine.local_for_partition(target) else {
-                continue;
+            // Under Raft "owns" means "currently LEADS": the publish is proposed
+            // through the target partition's replicated log (#1307), and the
+            // cluster fan-out reaches the leader node when it is a peer.
+            let command = Command::CorrelateMessage {
+                message_name: name.clone(),
+                correlation_key: correlation_key.clone(),
+                variables: variables.clone(),
+                business_id: business_id.clone(),
             };
-            let name = name.clone();
-            let correlation_key = correlation_key.clone();
-            let variables = variables.clone();
-            let business_id = business_id.clone();
-            let (events, commit) = handle
-                .with(move |engine| {
-                    engine
-                        .apply_command_at(
-                            Command::CorrelateMessage {
-                                message_name: name,
-                                correlation_key,
-                                variables,
-                                business_id,
-                            },
-                            now_millis(),
-                        )
-                        .expect("CorrelateMessage fails only on a business id, checked above")
-                })
-                .await;
-            commit.wait().await;
-            all_events.extend(events.iter().cloned());
+            match self.apply_routed_command(target, command).await {
+                RoutedApply::Applied(events) => all_events.extend(events),
+                RoutedApply::NotHere => {}
+                RoutedApply::Failed(status, message) => {
+                    tracing::warn!(
+                        "message correlation on partition {target} failed ({status}): {message}"
+                    );
+                }
+            }
         }
         // Drive the token advance for any subscription whose instance lives on
         // another partition (the publish settled it here via
@@ -8985,7 +8986,12 @@ impl ServerImpl {
                 &correlation_key,
                 topology.num_partitions,
             );
-            let mut target_nodes = vec![topology.owner_of(hash_partition), topology.owner_of(0)];
+            // Address the node that currently accepts writes for each target
+            // (its Raft leader after a failover), not the static owner. #1307.
+            let mut target_nodes = vec![
+                self.partition_write_node(hash_partition),
+                self.partition_write_node(0),
+            ];
             target_nodes.sort_unstable();
             target_nodes.dedup();
             for node in target_nodes {
@@ -9082,10 +9088,6 @@ impl ServerImpl {
     /// **peer**, the source event is forwarded over the Falcon protocol and the
     /// owning node drives its own pump (so the recursion continues there). A
     /// no-op single-partition.
-    #[allow(
-        clippy::expect_used,
-        reason = "invariant by construction: a routed subscription command cannot fail"
-    )]
     async fn drive_subscription_routing(&self, events: Vec<Event>) {
         let num_partitions = self.engine.topology().num_partitions;
         if num_partitions <= 1 {
@@ -9096,23 +9098,18 @@ impl ServerImpl {
             let Some((target, command)) = Self::route_event(&event, num_partitions) else {
                 continue;
             };
-            match self.engine.local_for_partition(target) {
-                Some(handle) => {
-                    let (produced, commit) = handle
-                        .with(move |engine| {
-                            engine
-                                .apply_command_at(command, now_millis())
-                                .expect("routed subscription command never fails")
-                        })
-                        .await;
-                    commit.wait().await;
-                    work.extend(produced.iter().cloned());
-                }
-                None => {
-                    // The target partition is owned by a peer: forward the source
-                    // event so the owner applies it (and drives any further
-                    // routing) on its own engine.
+            match self.apply_routed_command(target, command).await {
+                RoutedApply::Applied(produced) => work.extend(produced),
+                RoutedApply::NotHere => {
+                    // The target partition is owned (led, under Raft) by a peer:
+                    // forward the source event so that node applies it (and
+                    // drives any further routing) through its own write path.
                     self.forward_route_subscription(target, event).await;
+                }
+                RoutedApply::Failed(status, message) => {
+                    tracing::warn!(
+                        "subscription routing on partition {target} failed ({status}): {message}"
+                    );
                 }
             }
         }
@@ -9209,6 +9206,69 @@ impl ServerImpl {
         }
     }
 
+    /// The node that accepts writes for partition `p`: the current Raft leader
+    /// when Raft is enabled and a leader is known, else the static owner. The
+    /// cross-partition routing pump and the message-publish fan-out address
+    /// THIS node, so routing follows leadership after a failover (#1307).
+    fn partition_write_node(&self, p: u64) -> u32 {
+        let topology = self.engine.topology();
+        self.raft
+            .get(p)
+            .and_then(|part| part.raft.metrics().borrow().current_leader)
+            .and_then(|leader| u32::try_from(leader).ok())
+            .unwrap_or_else(|| topology.owner_of(p))
+    }
+
+    /// THE single apply funnel for the cross-partition routing pump
+    /// (`correlate_message_everywhere`, `drive_subscription_routing`): applies a
+    /// routing-computed `command` on partition `target` — the partition-indexed
+    /// analogue of [`apply_partition_command`](Self::apply_partition_command).
+    ///
+    /// With Raft enabled the command is PROPOSED through `target`'s replicated
+    /// log when this node leads it (so every replica applies it and a failover
+    /// cannot lose it), and is [`RoutedApply::NotHere`] otherwise — the caller
+    /// forwards to the leader instead of applying on a local replica, which
+    /// would diverge from the log (#1307). Without Raft it applies directly on
+    /// the locally owned engine and awaits durability.
+    async fn apply_routed_command(&self, target: u64, command: Command) -> RoutedApply {
+        if !self.raft.is_empty() {
+            let Some(part) = self.raft.get(target) else {
+                return RoutedApply::NotHere;
+            };
+            let node_id = self.engine.topology().node_id as u64;
+            if part.raft.metrics().borrow().current_leader != Some(node_id) {
+                return RoutedApply::NotHere;
+            }
+            return match part.propose_result(command, now_millis()).await {
+                Ok(item) => match item.error {
+                    Some((status, message)) => RoutedApply::Failed(status, message),
+                    None => RoutedApply::Applied(item.events),
+                },
+                Err(crate::raft::ProposeError::Leader) => RoutedApply::NotHere,
+                Err(other) => RoutedApply::Failed(500, other.to_string()),
+            };
+        }
+        let Some(handle) = self.engine.local_for_partition(target) else {
+            return RoutedApply::NotHere;
+        };
+        let (result, commit) = handle
+            .with(
+                move |journal| match journal.apply_command_at(command, now_millis()) {
+                    Ok((events, commit)) => (Ok(events), commit),
+                    Err(error) => (Err(error), Commit::ready()),
+                },
+            )
+            .await;
+        commit.wait().await;
+        match result {
+            Ok(events) => RoutedApply::Applied(events.iter().cloned().collect()),
+            Err(error) => {
+                let (status, message) = crate::raft::engine_error_status(&error);
+                RoutedApply::Failed(status, message)
+            }
+        }
+    }
+
     /// Forwards a cross-partition subscription follow-up `event` to the peer that
     /// owns `target_partition`, over the Falcon protocol. The owner applies it and
     /// drives its own pump for any further follow-ups. Best-effort: a delivery
@@ -9216,7 +9276,16 @@ impl ServerImpl {
     /// event on replay; at RF=1 a lost open just leaves the instance parked until
     /// a retry/restart re-routes it).
     async fn forward_route_subscription(&self, target_partition: u64, event: Event) {
-        let owner = self.engine.topology().owner_of(target_partition);
+        let owner = self.partition_write_node(target_partition);
+        if owner == self.engine.topology().node_id {
+            // No peer to hand it to: this node is the best-known writer but does
+            // not lead the partition right now (a leadership gap). Never apply
+            // around the log; the source command re-emits the event on replay.
+            tracing::warn!(
+                "subscription routing: partition {target_partition} has no reachable leader; dropped"
+            );
+            return;
+        }
         match self.peers.link(owner).await {
             Ok(link) => {
                 if let Err(e) = link.route_subscription(event).await {
@@ -39044,6 +39113,169 @@ mod clustered_startup_tests {
         );
     }
 
+    /// #1307: the cross-partition routing pump (subscription opening routed to
+    /// the correlation-key partition, and the message publish on that partition)
+    /// must enter the target partition's Raft log, not apply on the owner's
+    /// engine around it. Proven under the failure it guards: after the routed
+    /// subscription opens, the partition's leader is KILLED; the newly elected
+    /// leader must still hold the subscription and correlate the publish, and
+    /// the parked instance must advance on every surviving replica. Before the
+    /// fix the open was applied directly on the owner, so no other replica ever
+    /// had the subscription and the failover silently lost it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cross_partition_message_routing_replicates_through_raft_and_survives_failover() {
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("start")
+            .message_intermediate_catch_event("catch", "go", "orderId")
+            .end_event("end")
+            .connect("start", "catch")
+            .connect("catch", "end")
+            .build()
+            .expect("valid waiter process");
+        let (node0, node1, node2, handles) =
+            boot_rf3_intake_cluster_with(false, false, None, None, vec![waiter]).await;
+
+        // A correlation key whose subscription lives on partition 1 (led by the
+        // peer node 1), while the instance lives on partition 0 (node 0).
+        let sub_partition = 1u64;
+        let order_id = (0..)
+            .map(|i| format!("order-{i}"))
+            .find(|k| nanobpmn_engine_core::subscription_partition(k, 3) == sub_partition)
+            .expect("some key hashes to partition 1");
+
+        let leader_applied = |nodes: &[&ServerImpl], p: u64| -> Option<u64> {
+            nodes.iter().find_map(|n| {
+                let part = n.raft_registry().get(p)?;
+                let metrics = part.raft.metrics();
+                let metrics = metrics.borrow();
+                (metrics.current_leader == Some(n.engine.topology().node_id as u64))
+                    .then(|| metrics.last_applied.map(|l| l.index).unwrap_or(0))
+            })
+        };
+        let all = [&node0, &node1, &node2];
+        let p1_before =
+            leader_applied(&all, sub_partition).expect("partition 1 has a leader at boot");
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str(order_id.clone()));
+        let (instance_key, _) = node0
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("raft-routed create commits");
+        let instance_partition = partition_of(instance_key);
+        assert_ne!(
+            instance_partition, sub_partition,
+            "routing is cross-partition"
+        );
+
+        // Every replica of partition 1 must hold the routed subscription — it
+        // can only get there through partition 1's replicated log.
+        let has_sub = |node: &ServerImpl| {
+            let node = node.clone();
+            async move {
+                let Some(handle) = node.engine_handle_for(sub_partition) else {
+                    return false;
+                };
+                handle
+                    .with(move |j| {
+                        j.state()
+                            .message_subscriptions
+                            .values()
+                            .any(|s| s.instance_key == instance_key)
+                    })
+                    .await
+            }
+        };
+        let mut replicated = false;
+        for _ in 0..250 {
+            if has_sub(&node0).await && has_sub(&node1).await && has_sub(&node2).await {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            replicated,
+            "the routed subscription open must replicate to every partition-1 replica"
+        );
+        let p1_after_open = leader_applied(&all, sub_partition).expect("partition 1 leader");
+        assert!(
+            p1_after_open > p1_before,
+            "the routed subscription open entered partition 1's Raft log ({p1_before} -> {p1_after_open})"
+        );
+
+        // Kill partition 1's leader (node 1): stop every Raft group it hosts and
+        // its peer endpoint, so a surviving replica must take over partition 1.
+        for p in 0..3u64 {
+            if let Some(part) = node1.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        handles[1].abort();
+        let survivors = [&node0, &node2];
+        let mut new_leader = None;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            new_leader = leader_applied(&survivors, sub_partition);
+            if new_leader.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let p1_failover = new_leader.expect("a survivor is elected partition-1 leader");
+
+        // Observe the instance partition on both survivors (the leader's own
+        // engine and the follower replica) so completion is asserted per replica.
+        let taps = [
+            tap_replica_events(&node0, instance_partition).await,
+            tap_replica_events(&node2, instance_partition).await,
+        ];
+
+        // Publish through the surviving gateway: the correlation is proposed on
+        // the NEW partition-1 leader, and the routed continuation advances the
+        // instance through partition 0's log.
+        let (message_key, _) = node0
+            .correlate_message_cluster("go".into(), order_id, None, None)
+            .await
+            .expect("publish succeeds");
+        assert!(message_key.is_some(), "the new leader minted a message key");
+        let p1_after_publish =
+            leader_applied(&survivors, sub_partition).expect("partition 1 leader");
+        assert!(
+            p1_after_publish > p1_failover,
+            "the routed correlation entered partition 1's Raft log ({p1_failover} -> {p1_after_publish})"
+        );
+
+        let mut done = [false, false];
+        for _ in 0..250 {
+            for (seen, tap) in done.iter_mut().zip(&taps) {
+                while let Ok(batch) = tap.try_recv() {
+                    *seen |= batch.events.iter().any(|e| {
+                        matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
+                    });
+                }
+            }
+            if done.iter().all(|d| *d) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            done.iter().all(|d| *d),
+            "the message correlated after failover must complete the instance on every surviving replica (node0, node2): {done:?}"
+        );
+
+        for node in survivors {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles {
+            h.abort();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancel_instance_replicates_through_raft() {
         // #1306: cancelling a running instance is a durable operator mutation, so
@@ -47884,12 +48116,12 @@ mod no_direct_engine_apply_guard {
         // Uses the clock-implicit `apply_command` for the batched resource/DRG/
         // form/generic-resource commands.
         "ServerImpl::deploy_resources_locally_with_forms",
-        // Documented engine-internal bypasses. The cross-partition routing pump
-        // is a tracked follow-up (#1307): these apply on routing-computed
-        // partitions rather than by an entity key, and `activate_on` is an
-        // intentional leader-local activation step.
-        "ServerImpl::correlate_message_everywhere",
-        "ServerImpl::drive_subscription_routing",
+        // The partition-indexed Raft-aware funnel the cross-partition routing
+        // pump (`correlate_message_everywhere`, `drive_subscription_routing`)
+        // applies through: proposes via the target's Raft leader, applies
+        // locally only when Raft is off. #1307.
+        "ServerImpl::apply_routed_command",
+        // `activate_on` is an intentional leader-local activation step.
         "ServerImpl::activate_on",
     ];
 
