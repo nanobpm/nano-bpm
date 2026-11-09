@@ -37737,17 +37737,35 @@ mod clustered_startup_tests {
             .raft
             .metrics()
             .borrow()
-            .last_log_index;
-        let reached = node1
-            .raft_registry()
-            .get(0)
-            .expect("follower p0")
+            .last_log_index
+            .expect("leader has a log after the completion");
+        let follower_p0 = node1.raft_registry().get(0).expect("follower p0");
+        let reached = follower_p0
             .raft
-            .wait(Some(std::time::Duration::from_secs(5)))
-            .applied_index_at_least(idx, "follower applies the completion")
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .metrics(
+                |m| {
+                    m.state == openraft::ServerState::Shutdown
+                        || m.last_applied.is_some_and(|l| l.index >= idx)
+                },
+                "follower applies the completion or fails closed",
+            )
             .await
-            .is_ok();
-        if reached {
+            .expect("follower neither applied the completion nor failed closed (a bare timeout is a failure)");
+        let applied_idx = reached.last_applied.map(|l| l.index);
+        let reached = applied_idx.is_some_and(|i| i >= idx);
+        if !reached {
+            // Fail-closed branch: the follower must have entered Shutdown AND
+            // must not have applied the completion entry.
+            assert!(
+                follower_p0.is_shutdown(),
+                "follower stopped short of the completion without failing closed"
+            );
+            assert!(
+                applied_idx.is_none_or(|i| i < idx),
+                "a fail-closed follower must not apply the completion (applied {applied_idx:?}, completion at {idx})"
+            );
+        } else {
             let still_live = follower
                 .with(move |j| {
                     let mut live = std::collections::HashSet::new();
