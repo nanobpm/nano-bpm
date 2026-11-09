@@ -8988,51 +8988,104 @@ impl ServerImpl {
             );
             // Address the node that currently accepts writes for each target
             // (its Raft leader after a failover), not the static owner. #1307.
-            let mut target_nodes = vec![
-                self.partition_write_node(hash_partition),
-                self.partition_write_node(0),
-            ];
-            target_nodes.sort_unstable();
-            target_nodes.dedup();
-            for node in target_nodes {
-                if node == topology.node_id {
-                    continue;
-                }
-                match self.peers.link(node).await {
-                    Ok(link) => match link
-                        .publish_message(
-                            name.clone(),
-                            correlation_key.clone(),
-                            variables.clone(),
-                            business_id.clone(),
-                        )
-                        .await
-                    {
-                        Ok(res) if res.status == 200 => {
-                            let body = res.body.as_ref();
-                            // When this node owns no target partition it minted
-                            // no key; take the one the owning peer minted so the
-                            // client still gets a message key.
-                            if message_key.is_none() {
-                                message_key = body
-                                    .and_then(|b| b.get("messageKey"))
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| s.parse::<u64>().ok());
+            //
+            // A gateway that hosts NO replica of a target partition never learns
+            // that partition's leader (its local Raft metrics know only its own
+            // groups), so `partition_write_node` there can fall back to the
+            // static owner — which a failover may have killed. Publishing to
+            // that stale node is silently lossy: a reachable non-leader applies
+            // nothing (its publish handler no-ops on partitions it does not
+            // lead) and answers 200 with a null messageKey. So retry the fan-out
+            // while no node has minted a key or correlated an instance: each
+            // attempt re-reads the (possibly updated) leader view and drops the
+            // cached peer link, so a dead leader's stale connection is redialed
+            // rather than replayed. Bounded — a genuinely partitioned cluster
+            // degrades to the pre-existing best-effort warn-and-continue, and
+            // the gateway surfaces 503 when no key was minted anywhere.
+            const PUBLISH_FANOUT_ATTEMPTS: usize = 8;
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                let mut target_nodes = vec![
+                    self.partition_write_node(hash_partition),
+                    self.partition_write_node(0),
+                ];
+                target_nodes.sort_unstable();
+                target_nodes.dedup();
+                let mut delivered = false;
+                for node in target_nodes {
+                    if node == topology.node_id {
+                        continue;
+                    }
+                    match self.peers.link(node).await {
+                        Ok(link) => match link
+                            .publish_message(
+                                name.clone(),
+                                correlation_key.clone(),
+                                variables.clone(),
+                                business_id.clone(),
+                            )
+                            .await
+                        {
+                            Ok(res) if res.status == 200 => {
+                                let body = res.body.as_ref();
+                                // When this node owns no target partition it minted
+                                // no key; take the one the owning peer minted so the
+                                // client still gets a message key.
+                                if message_key.is_none() {
+                                    message_key = body
+                                        .and_then(|b| b.get("messageKey"))
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<u64>().ok());
+                                }
+                                if instance.is_none() {
+                                    instance = body
+                                        .and_then(|b| b.get("correlatedInstanceKey"))
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<u64>().ok());
+                                }
+                                // A 200 carrying a key or an instance proves the
+                                // publish reached a writer; a 200 with neither
+                                // means the addressed node leads no target
+                                // partition (a stale static owner) and silently
+                                // dropped it — NOT delivery. Track THIS attempt's
+                                // response, not the accumulated values: once a
+                                // key is minted the loop exits, so a stale
+                                // attempt's null must not be masked by it.
+                                delivered |= body.is_some_and(|b| {
+                                    b.get("messageKey").is_some_and(|v| v.as_str().is_some())
+                                        || b.get("correlatedInstanceKey")
+                                            .is_some_and(|v| v.as_str().is_some())
+                                });
                             }
-                            if instance.is_none() {
-                                instance = body
-                                    .and_then(|b| b.get("correlatedInstanceKey"))
-                                    .and_then(|v| v.as_str())
-                                    .and_then(|s| s.parse::<u64>().ok());
+                            Ok(res) => {
+                                tracing::warn!(
+                                    "message fan-out to node {node}: status {}",
+                                    res.status
+                                )
                             }
+                            Err(e) => {
+                                tracing::warn!("message fan-out to node {node} failed: {e}")
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!("message fan-out: node {node} unreachable: {e}")
                         }
-                        Ok(res) => {
-                            tracing::warn!("message fan-out to node {node}: status {}", res.status)
-                        }
-                        Err(e) => tracing::warn!("message fan-out to node {node} failed: {e}"),
-                    },
-                    Err(e) => tracing::warn!("message fan-out: node {node} unreachable: {e}"),
+                    }
                 }
+                if delivered || attempt >= PUBLISH_FANOUT_ATTEMPTS {
+                    break;
+                }
+                // Nothing was delivered anywhere: the routing view is stale
+                // (e.g. a non-replica gateway still pointing at the pre-failover
+                // static owner). Drop the cached links to the addressed nodes so
+                // the next attempt redials, wait for this node's leader view to
+                // catch up, and re-resolve the write nodes.
+                self.peers
+                    .drop_link(self.partition_write_node(hash_partition))
+                    .await;
+                self.peers.drop_link(self.partition_write_node(0)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         }
         Ok((message_key, instance))
@@ -39222,6 +39275,28 @@ mod clustered_startup_tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         let p1_failover = new_leader.expect("a survivor is elected partition-1 leader");
+
+        // The election poll above fires on the NEW leader's own metrics, which
+        // can precede node 0 learning of the leadership change — and the publish
+        // below routes through NODE 0's leader view. Wait until node 0's
+        // partition-1 view agrees on a surviving leader, or the publish can
+        // still target dead node 1 and fail despite a replicated subscription.
+        let mut node0_view = None;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            node0_view = node0
+                .raft_registry()
+                .get(sub_partition)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                .and_then(|leader| u32::try_from(leader).ok());
+            if node0_view.is_some_and(|l| l != 1) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            node0_view.is_some_and(|l| l != 1),
+            "node 0 must observe the partition-1 leadership move off dead node 1 before publishing (view: {node0_view:?})"
+        );
 
         // Observe the instance partition on both survivors (the leader's own
         // engine and the follower replica) so completion is asserted per replica.

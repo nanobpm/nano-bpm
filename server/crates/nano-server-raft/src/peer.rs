@@ -1105,6 +1105,16 @@ impl PeerSet {
         self.breaker.lock().await.remove(&node_id);
     }
 
+    /// Drops the cached link to `node_id` so the next `link()` redials. Used by
+    /// the message-publish fan-out when a publish answered by the addressed node
+    /// proved it is not the partition's writer (a 200 with no minted key): the
+    /// cached connection may pin a stale, pre-failover peer, so a retry must
+    /// redial rather than replay the same dead link (#1307). A no-op when no
+    /// link is cached.
+    pub async fn drop_link(&self, node_id: u32) {
+        self.links.lock().await.remove(&node_id);
+    }
+
     /// Returns a live link to peer `node_id`, dialing it if there is no cached
     /// link or the cached one has dropped. Concurrent callers for the same peer
     /// share the single in-flight dial (serialized by the map lock).
