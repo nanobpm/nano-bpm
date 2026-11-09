@@ -1048,6 +1048,8 @@ jobs:
         # from these serial-heavy tests, parallel.
         # (The moved modules carry no doctests, so nextest — which cannot run
         # doctests — covers the whole workspace suite.)
+        # The default profile also sets `leak-timeout = { result = "fail" }`, so a
+        # test that leaks a handle past exit FAILS here instead of warning (#1474).
         run: cargo nextest run --workspace --features nanobpm-gateway-rest-server/console
   console:
     name: console (typecheck + test)

@@ -43,3 +43,10 @@ serial-heavy = { max-threads = 1 }
 filter = 'binary(cluster_e2e) or test(seglog::tests) or test(triggers::tests::pack_driver_) or test(triggers::tests::pack_worker_)'
 test-group = 'serial-heavy'
 threads-required = 'num-test-threads'
+
+# A test whose process exits while something still holds its stdout/stderr open
+# (a leaked child process or inherited handle) is a defect, not a warning (#1474).
+# Fail it instead of reporting LEAK, so the defect class cannot creep back into
+# any test. CI's `server (clippy + test)` job runs this default profile.
+[profile.default]
+leak-timeout = { period = "500ms", result = "fail" }

@@ -164,6 +164,10 @@ impl Node {
         #[cfg(unix)]
         cmd.process_group(0);
         let mut child = cmd
+            // Never hand the server (or anything it spawns) the test process's
+            // stdin: an inherited test-runner fd that outlives the test is what
+            // nextest reports as a LEAK (#1474).
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
