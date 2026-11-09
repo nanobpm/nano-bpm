@@ -637,9 +637,7 @@
   },
   {
     "JobCompleted": {
-      "completed_at": 1700000000003,
       "created_at": 1700000000001,
-      "deadline": 1700000030002,
       "instance_key": 7,
       "job_key": 10,
       "job_type": "payment",
