@@ -26473,6 +26473,7 @@ async fn main() {
                             nano_server_storage::snapstream::StreamingCapture,
                             Vec<nanobpmn_engine_core::Key>,
                             nano_server_storage::snapstream::SpillStores,
+                            bool,
                         )> = Vec::with_capacity(handles.len());
                         let mut covered = vec![0u64; num_partitions as usize];
                         // Per-partition durable-variable position. `u64::MAX` means
@@ -26530,8 +26531,12 @@ async fn main() {
                                         if (pid as usize) < covered.len() {
                                             covered[pid as usize] = covered_p;
                                         }
-                                        stream_entries
-                                            .push((pid, covered_p, capture, cold_keys, stores));
+                                        // Non-lean: a self-contained snapshot
+                                        // (control_only = false — resolve every
+                                        // spilled placeholder against the stores).
+                                        stream_entries.push((
+                                            pid, covered_p, capture, cold_keys, stores, false,
+                                        ));
                                     }
                                     None => {
                                         failure = Some(format!(
@@ -26560,11 +26565,13 @@ async fn main() {
                         } else {
                             stream_entries.iter().map(|e| e.1).collect()
                         };
-                        // Lean path: control-only snapshots written inline. Non-lean
-                        // path (#1463): stream the combined snapshot off the engine
-                        // thread so no partition's cold set is held in RAM.
+                        // Lean path: control-only snapshots written inline (the
+                        // authoritative var store holds the payloads, so a spilled
+                        // placeholder is serialized as-is). Non-lean path (#1463):
+                        // stream the combined snapshot off the engine thread so no
+                        // partition's cold set is held in RAM.
                         let write_result = if varstore.is_some() {
-                            seglog::write_multi_snapshot(&shared.dir, entries)
+                            seglog::write_multi_snapshot_lean(&shared.dir, entries)
                         } else {
                             let write_dir = shared.dir.clone();
                             tokio::task::spawn_blocking(move || {

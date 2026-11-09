@@ -132,6 +132,15 @@ where
     pub cold: &'a [Key],
     pub read_cold: RC,
     pub resolve_spilled: RS,
+    /// When true, a variable-spilled instance is serialized **as-is** (empty
+    /// placeholder + the spilled flag), never resolved through `resolve_spilled`.
+    /// This is the lean-snapshot mode (#1463 review): the authoritative durable
+    /// var store holds the payload in lockstep, so the snapshot is control-only
+    /// by design and resolving the placeholder would both fail (no spill store
+    /// is wired for it) and be wrong (the snapshot must stay variable-free).
+    /// When false (the self-contained default), every spilled flag is resolved
+    /// so the snapshot restores every variable with no dependency on any store.
+    pub control_only: bool,
 }
 
 /// Streams a self-contained snapshot to `path` without ever holding the whole
@@ -173,6 +182,7 @@ where
         cold,
         mut read_cold,
         mut resolve_spilled,
+        control_only,
     } = req;
     let tmp = path.with_extension("tmp");
     let outcome = write_streaming_snapshot_inner(
@@ -184,6 +194,7 @@ where
         cold,
         &mut read_cold,
         &mut resolve_spilled,
+        control_only,
     );
     match outcome {
         Ok(()) => {
@@ -222,6 +233,7 @@ fn write_streaming_snapshot_inner<I, RC, RS>(
     cold: &[Key],
     read_cold: &mut RC,
     resolve_spilled: &mut RS,
+    control_only: bool,
 ) -> std::io::Result<()>
 where
     I: IntoIterator<Item = InstanceSnapshot>,
@@ -266,10 +278,11 @@ where
     let mut chunk: Vec<InstanceSnapshot> = Vec::with_capacity(STREAM_CHUNK_INSTANCES);
 
     // Resident instances: resolve a spilled payload just before it serializes,
-    // then stream it out. Consuming `instances` by value drops each payload as
+    // then stream it out — UNLESS control_only (lean mode), which serializes the
+    // placeholder as-is. Consuming `instances` by value drops each payload as
     // its chunk flushes.
     for mut snap in instances {
-        if snap.instance.variables_spilled {
+        if snap.instance.variables_spilled && !control_only {
             resolve_spilled(&mut snap)?;
         }
         chunk.push(snap);
@@ -282,10 +295,10 @@ where
     // when the chunk fills — the cold set never becomes resident. A cold row can
     // itself be variable-spilled (spilled before it was cold-evicted), so it is
     // resolved through the same `resolve_spilled` path as a resident instance to
-    // keep the snapshot self-contained.
+    // keep the snapshot self-contained (skipped under control_only).
     for &key in cold {
         let mut snap = read_cold(key)?;
-        if snap.instance.variables_spilled {
+        if snap.instance.variables_spilled && !control_only {
             resolve_spilled(&mut snap)?;
         }
         chunk.push(snap);
@@ -324,9 +337,15 @@ pub struct SpillStores {
 ///   `stores.varstore` (lean mode) or `stores.spill` (classic), and its spilled
 ///   flag cleared in the serialized copy so the snapshot is self-contained.
 ///
+/// `control_only` (the lean checkpoint, #1463 review) instead serializes a
+/// variable-spilled placeholder **as-is**: the authoritative var store holds the
+/// payload in lockstep, so the snapshot stays variable-free by design and the
+/// placeholder is never resolved.
+///
 /// Purely synchronous and owning only `Arc` store handles — safe to call from a
 /// blocking task off the engine actor. Fail-closed: any unreadable/absent row
 /// aborts the write and removes the partial file.
+#[allow(clippy::too_many_arguments)]
 pub fn write_streaming_snapshot_from_stores(
     path: &Path,
     header_line: &str,
@@ -334,6 +353,7 @@ pub fn write_streaming_snapshot_from_stores(
     capture: StreamingCapture,
     cold_keys: &[Key],
     stores: SpillStores,
+    control_only: bool,
 ) -> std::io::Result<()> {
     let SpillStores {
         cold: cold_store,
@@ -410,6 +430,7 @@ pub fn write_streaming_snapshot_from_stores(
                 ))),
             }
         },
+        control_only,
     })
 }
 
@@ -669,16 +690,17 @@ struct MultiInstanceChunk {
 
 /// Streams a combined multi-partition snapshot to `path` without ever holding
 /// any partition's whole cold set in memory (#1463). `entries` is
-/// `(partition, covered_events, capture, cold_keys, stores)` per owned
-/// partition; each partition's control frame is written first, then every
+/// `(partition, covered_events, capture, cold_keys, stores, control_only)` per
+/// owned partition; each partition's control frame is written first, then every
 /// partition's instances stream through shared bounded chunk frames (cold rows
-/// read lazily from that partition's stores). Fail-closed and atomic (tmp +
-/// fsync + rename, partial file removed on error), exactly like
-/// [`write_streaming_snapshot_from_stores`].
+/// read lazily from that partition's stores). `control_only` (the lean
+/// checkpoint) serializes a variable-spilled placeholder as-is rather than
+/// resolving it. Fail-closed and atomic (tmp + fsync + rename, partial file
+/// removed on error), exactly like [`write_streaming_snapshot_from_stores`].
 pub fn write_multi_streaming_snapshot(
     path: &Path,
     header_line: &str,
-    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores)>,
+    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
 ) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let outcome = write_multi_streaming_snapshot_inner(&tmp, header_line, entries);
@@ -705,7 +727,7 @@ pub fn write_multi_streaming_snapshot(
 fn write_multi_streaming_snapshot_inner(
     tmp: &Path,
     header_line: &str,
-    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores)>,
+    entries: Vec<(u64, u64, StreamingCapture, Vec<Key>, SpillStores, bool)>,
 ) -> std::io::Result<()> {
     let file = File::create(tmp)?;
     let mut w = BufWriter::new(file);
@@ -714,7 +736,7 @@ fn write_multi_streaming_snapshot_inner(
     w.write_all(b"\n")?;
 
     // Every partition's control frame first (instance-free skeletons).
-    for (partition, covered_events, capture, _, _) in &entries {
+    for (partition, covered_events, capture, _, _, _) in &entries {
         serde_json::to_writer(
             &mut w,
             &MultiControlFrame {
@@ -729,7 +751,7 @@ fn write_multi_streaming_snapshot_inner(
 
     // Then stream every partition's instances through shared bounded chunks.
     let mut chunk: Vec<(u64, InstanceSnapshot)> = Vec::with_capacity(STREAM_CHUNK_INSTANCES);
-    for (partition, _covered, capture, cold_keys, stores) in entries {
+    for (partition, _covered, capture, cold_keys, stores, control_only) in entries {
         let SpillStores {
             cold: cold_store,
             spill: spill_store,
@@ -743,7 +765,9 @@ fn write_multi_streaming_snapshot_inner(
                     w: &mut BufWriter<File>,
                     mut snap: InstanceSnapshot|
          -> std::io::Result<()> {
-            if snap.instance.variables_spilled {
+            // Lean (control_only): serialize the spilled placeholder as-is — the
+            // authoritative var store holds the payload. Self-contained: resolve.
+            if snap.instance.variables_spilled && !control_only {
                 resolve(&mut snap)?;
             }
             chunk.push((partition, snap));
@@ -1057,6 +1081,7 @@ mod tests {
             cold: &[],
             read_cold: |_key| Err(invalid_data("no cold tier in this test")),
             resolve_spilled: |_snap| Ok(()),
+            control_only: false,
         })
         .expect("streaming write");
 
@@ -1124,6 +1149,7 @@ mod tests {
                     .ok_or_else(|| invalid_data("missing cold row"))
             },
             resolve_spilled: |_snap| Ok(()),
+            control_only: false,
         })
         .expect("streaming write with cold tier");
 
@@ -1194,6 +1220,7 @@ mod tests {
                 snap.instance.variables_spilled = false;
                 Ok(())
             },
+            control_only: false,
         })
         .expect("streaming write of a spilled cold instance");
 
@@ -1234,6 +1261,7 @@ mod tests {
             cold: &[],
             read_cold: |_key| Err(invalid_data("no cold tier")),
             resolve_spilled: |_snap| Ok(()),
+            control_only: false,
         })
         .expect("write");
 
@@ -1352,6 +1380,7 @@ mod tests {
                 spill: Some(spill),
                 varstore: Some(varstore),
             },
+            false,
         );
         assert!(
             result.is_err(),

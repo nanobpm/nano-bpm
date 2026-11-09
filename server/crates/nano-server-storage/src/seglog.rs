@@ -1438,6 +1438,7 @@ fn write_snapshot_parts(
         capture,
         cold_keys,
         stores,
+        false,
     )?;
 
     // Drop superseded snapshots (keep only the newest covered count).
@@ -1926,6 +1927,29 @@ pub fn write_multi_snapshot(
     dir: &Path,
     entries: Vec<(u64, u64, EngineSnapshot)>,
 ) -> io::Result<()> {
+    write_multi_snapshot_with_mode(dir, entries, false)
+}
+
+/// The lean-checkpoint counterpart of [`write_multi_snapshot`] (#1463 review):
+/// the snapshots are **control-only** (a variable-spilled instance retains its
+/// empty placeholder + the spilled flag; the authoritative durable var store
+/// holds the payload in lockstep). They are serialized as-is — never resolved
+/// against a spill store — so a lean checkpoint with a spilled instance writes
+/// successfully instead of failing closed on the placeholder.
+pub fn write_multi_snapshot_lean(
+    dir: &Path,
+    entries: Vec<(u64, u64, EngineSnapshot)>,
+) -> io::Result<()> {
+    write_multi_snapshot_with_mode(dir, entries, true)
+}
+
+/// Shared value-taking combined write behind [`write_multi_snapshot`] and
+/// [`write_multi_snapshot_lean`].
+fn write_multi_snapshot_with_mode(
+    dir: &Path,
+    entries: Vec<(u64, u64, EngineSnapshot)>,
+    control_only: bool,
+) -> io::Result<()> {
     let parts = entries
         .into_iter()
         .map(|(partition, covered, snap)| {
@@ -1946,6 +1970,7 @@ pub fn write_multi_snapshot(
                 },
                 Vec::new(),
                 crate::snapstream::SpillStores::default(),
+                control_only,
             )
         })
         .collect();
@@ -1961,7 +1986,9 @@ pub fn write_multi_snapshot(
 /// combined snapshot is never sealed.
 ///
 /// `entries` is `(global_partition_id, covered_count, capture, cold_keys,
-/// stores)` per owned partition.
+/// stores, control_only)` per owned partition. `control_only` marks a lean
+/// checkpoint (a variable-spilled placeholder is serialized as-is, never
+/// resolved — the authoritative var store holds the payload).
 pub fn write_multi_snapshot_streaming(
     dir: &Path,
     entries: Vec<(
@@ -1970,6 +1997,7 @@ pub fn write_multi_snapshot_streaming(
         crate::snapstream::StreamingCapture,
         Vec<nanobpmn_engine_core::Key>,
         crate::snapstream::SpillStores,
+        bool,
     )>,
 ) -> io::Result<()> {
     let final_path = dir.join(MULTI_SNAP_NAME);
@@ -3077,6 +3105,63 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// #1476 review (stale cold routing key): a cold instance whose row is
+    /// **definitively absent** from the spill store (quarantined by the capture)
+    /// must not be re-captured into `cold_keys` and rejected by the streaming
+    /// writer on every tick — that would block snapshots and compaction forever.
+    /// The streaming rotation excludes the proven-absent key, so the write
+    /// succeeds (without the lost instance) and compaction proceeds.
+    #[test]
+    fn streaming_rotation_excludes_a_quarantined_absent_cold_row() {
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("streaming-absent-cold");
+        let (mut journal, _recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+
+        let _ = journal
+            .apply_command(Command::DeployProcess(demo()))
+            .unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("data".to_string(), Value::Str("lost".to_string()));
+        let (events, _) = journal
+            .apply_command(Command::create_instance_with("demo", vars))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+        // Cold-spill the instance, then DELETE its row out from under the index
+        // (simulating a lost cold row).
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+        journal.set_cold_spill(Arc::clone(&store), 0, 0);
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert_eq!(journal.cold_count(), 1);
+        store.forget(&[key]).expect("delete the cold row");
+        assert!(
+            store.try_get_cold(key).expect("read").is_none(),
+            "precondition: the cold row is definitively absent"
+        );
+
+        // The streaming rotation must quarantine the absent row (journaled
+        // incident) and EXCLUDE its key, so the write succeeds and seals.
+        let (capture, cold_keys, stores, covered) = journal
+            .streaming_snapshot_and_rotate()
+            .expect("streaming snapshot+rotate must not abort on a quarantined absent row");
+        assert!(
+            cold_keys.is_empty(),
+            "the proven-absent cold key is excluded from the write"
+        );
+        write_snapshot_streaming(&dir, capture, &cold_keys, stores, covered)
+            .expect("the write succeeds without the lost row");
+
+        // The loss was journaled as a VariablesLost incident before the seal.
+        assert!(
+            journal.quarantined_orphans().contains(&key),
+            "the absent cold row is quarantined"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// RED for #1463 (multi-partition arm): the combined `msnapshot.bin` write
     /// must stream every owned partition's cold set too — one partition's
     /// cold-spilled instances must not be folded into memory, and a reopen
@@ -3143,8 +3228,8 @@ mod tests {
             write_multi_snapshot_streaming(
                 &dir,
                 vec![
-                    (0, covered0, cap0, cold0, stores0),
-                    (1, covered1, cap1, cold1, stores1),
+                    (0, covered0, cap0, cold0, stores0, false),
+                    (1, covered1, cap1, cold1, stores1, false),
                 ],
             )
             .expect("write combined streaming snapshot");
@@ -3774,6 +3859,104 @@ mod tests {
             inst.variables.get("c"),
             Some(&Value::Int(3i64)),
             "post-checkpoint merge from the journal tail"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// RED for the #1476 review finding (lean regression): a lean checkpoint
+    /// whose instance is **variable-spilled** at capture time must still write.
+    /// The lean control-only snapshot deliberately retains
+    /// `variables_spilled = true` (the var store is authoritative for the
+    /// payload), so the combined-snapshot writer must NOT try to resolve that
+    /// placeholder against the (empty) spill stores — it must serialize the
+    /// control-only placeholder as-is. Before the fix, `write_multi_snapshot`'s
+    /// streaming decomposition resolved every spilled flag and failed closed,
+    /// blocking every lean snapshot (and so all compaction) whenever an instance
+    /// was variable-spilled.
+    #[test]
+    fn lean_multi_snapshot_writes_a_variable_spilled_instance_as_control_only() {
+        use nanobpmn_engine_core::Value;
+
+        let dir = temp_dir("lean-spilled");
+        let (tx, _rx) = std::sync::mpsc::channel::<crate::journal::ExportBatch>();
+        let varstore = Arc::new(crate::varstore::VarStore::open(None).expect("open var store"));
+
+        let key = {
+            let (writer, recovery) =
+                crate::journal::SharedWriter::open_segmented(&dir, &[0, 1], 2, Some(&varstore))
+                    .expect("open multi");
+            let mut engines: std::collections::HashMap<u64, Engine> =
+                recovery.engines.into_iter().collect();
+            let mut j0 = crate::journal::Journal::from_engine_shared(
+                0,
+                engines.remove(&0).unwrap(),
+                true,
+                &writer,
+            );
+            let mut j1 = crate::journal::Journal::from_engine_shared(
+                1,
+                engines.remove(&1).unwrap(),
+                true,
+                &writer,
+            );
+            j0.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j1.set_exporter(tx.clone(), Arc::new(AtomicU64::new(0)));
+            j0.set_varstore(Arc::clone(&varstore));
+            j1.set_varstore(Arc::clone(&varstore));
+            // Classic spill wired too, budget 0: the instance is variable-spilled
+            // (placeholder + flag) at checkpoint time. Lean mode writes the spill
+            // through to the authoritative var store, so the payload is durable.
+            let spill = Arc::new(crate::varspill::VarSpillStore::open(None).unwrap());
+            j0.set_spill(spill, 0);
+
+            let (deploy_events, _) = j0.apply_command(Command::DeployProcess(demo())).unwrap();
+            j1.install_deployment(&deploy_events);
+            let mut vars = std::collections::HashMap::new();
+            vars.insert(
+                "data".to_string(),
+                Value::Str("spilled-payload".to_string()),
+            );
+            let (e0, _) = j0
+                .apply_command(Command::create_instance_with("demo", vars))
+                .unwrap();
+            let key = e0.iter().find_map(|e| e.instance_key()).unwrap();
+            j0.force_spill_scan();
+            assert!(
+                j0.engine().is_variables_spilled(key),
+                "precondition: variable-spilled at checkpoint"
+            );
+
+            let mut entries = Vec::new();
+            for (j, pid) in [(&mut j0, 0u64), (&mut j1, 1u64)] {
+                let (snap, covered, upserts, forgets) =
+                    j.snapshot_and_rotate_lean().expect("lean checkpoint");
+                let ups: Vec<(
+                    nanobpmn_engine_core::Key,
+                    &std::collections::HashMap<String, Value>,
+                )> = upserts.iter().map(|(k, v)| (*k, v.as_ref())).collect();
+                varstore.checkpoint(pid, covered, &ups, &forgets).unwrap();
+                entries.push((pid, covered, snap));
+            }
+            // The lean snapshot retains the spilled placeholder; the write must
+            // succeed (control-only serialization), not fail resolving it.
+            write_multi_snapshot_lean(&dir, entries)
+                .expect("write lean snapshot with a spilled instance");
+
+            key
+        };
+
+        // Reopen: control from the lean snapshot, variables installed from the
+        // authoritative store (the spilled payload is durable there).
+        let recovery = recover_multi(&dir, &[0, 1], 2, Some(&varstore)).expect("reopen multi");
+        assert!(!recovery.fresh);
+        let engines: std::collections::HashMap<u64, Engine> =
+            recovery.engines.into_iter().collect();
+        let inst = engines[&0].instance(key).expect("instance restored");
+        assert_eq!(
+            inst.variables.get("data"),
+            Some(&Value::Str("spilled-payload".to_string())),
+            "the spilled payload is recovered from the authoritative var store"
         );
 
         let _ = fs::remove_dir_all(&dir);
