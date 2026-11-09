@@ -45,6 +45,39 @@ mod lease_contract_tests {
         assert_eq!(serde_json::to_value(&frame).unwrap(), new);
     }
 
+    /// #1307: `PublishMessage` gained an additive `onlyPartitions` list (the
+    /// partitions a scoped fan-out send still owes). A frame from an older node
+    /// (no `onlyPartitions`) still decodes — as `None`, the legacy
+    /// apply-every-local-target behaviour — so a mixed-version cluster keeps
+    /// working during a rolling upgrade.
+    #[test]
+    fn publish_message_only_partitions_is_additive_on_the_wire() {
+        let old = serde_json::json!({
+            "type": "publishMessage", "corr": 1, "name": "m", "correlationKey": "k"
+        });
+        let frame: ClientFrame = serde_json::from_value(old).unwrap();
+        let ClientFrame::PublishMessage {
+            only_partitions, ..
+        } = &frame
+        else {
+            panic!("decodes as a publish message");
+        };
+        assert_eq!(*only_partitions, None, "an unscoped frame decodes as None");
+
+        let scoped = serde_json::json!({
+            "type": "publishMessage", "corr": 2, "name": "m", "correlationKey": "k",
+            "onlyPartitions": [1]
+        });
+        let frame: ClientFrame = serde_json::from_value(scoped).unwrap();
+        let ClientFrame::PublishMessage {
+            only_partitions, ..
+        } = &frame
+        else {
+            panic!("decodes as a publish message");
+        };
+        assert_eq!(*only_partitions, Some(vec![1]));
+    }
+
     #[test]
     fn atomic_job_updates_preserve_empty_changesets_and_lease() {
         let wire = serde_json::json!({
@@ -333,6 +366,16 @@ pub enum ClientFrame {
         /// `None`.
         #[serde(default)]
         business_id: Option<String>,
+        /// When set, the peer applies the publish on ONLY these partitions (the
+        /// ones the fan-out has not yet delivered); when `None` (a frame from a
+        /// peer predating this field) it applies every locally led target
+        /// partition — the legacy behaviour. The gateway scopes each send so a
+        /// partition already committed by one node is never re-evaluated on
+        /// another: without it, a leadership move between fan-out sends (or a
+        /// retry) can commit the same partition twice and start duplicate
+        /// instances for one request (#1307).
+        #[serde(default)]
+        only_partitions: Option<Vec<u64>>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key process-instance
     /// cancellation to the peer that owns the instance's partition. Answered by a

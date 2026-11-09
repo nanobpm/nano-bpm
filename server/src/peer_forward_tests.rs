@@ -95,3 +95,114 @@ async fn peer_set_dials_lazily_and_forwards() {
     let link2 = peers.link(1).await.expect("reuse cached link");
     assert!(link2.is_connected());
 }
+
+/// Serves a real intra-cluster falcon endpoint backed by a single node owning
+/// ALL `num_partitions` partitions, and returns its HTTP base URL. The peer's
+/// publish handler therefore leads every target partition, which is exactly
+/// what a scoped-vs-unscoped `PublishMessage` is asserted against.
+async fn serve_multi_partition_peer(num_partitions: u64) -> String {
+    let topology = crate::cluster::Topology {
+        node_id: 0,
+        peers: vec!["http://n0".to_string()],
+        num_partitions,
+        replication_factor: 1,
+    };
+    let journals: Vec<crate::Journal> = topology
+        .local_partitions()
+        .iter()
+        .map(|p| crate::Journal::in_memory_partition(*p))
+        .collect();
+    let server = crate::build_server_in_memory(journals, topology);
+    let registry = crate::falcon::Registry::new();
+    crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
+    let app = crate::falcon::cluster_router(server, registry, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let port = listener.local_addr().expect("local addr").port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// #1307: a forwarded `PublishMessage` must apply on ONLY the partitions the
+/// fan-out still owes (`only_partitions`), never re-committing a partition a
+/// prior send already delivered — the duplicate-publication guard for a
+/// leadership move between fan-out sends. Deploy a message-start process (its
+/// subscription lives solely on partition 0), then publish with a correlation
+/// key that hashes to partition 1:
+///
+///  - scoped to `[1]` (partition 0 already delivered): NO instance is created —
+///    the peer must not re-apply partition 0 (partition 1 still mints a key);
+///  - unscoped (`None`, the legacy frame): the publish fires partition 0 and
+///    starts exactly one instance.
+#[tokio::test]
+async fn publish_message_only_partitions_scopes_the_peer_apply() {
+    let base = serve_multi_partition_peer(4).await;
+    let link = PeerLink::connect(&base).await.expect("connect to peer");
+
+    // A message-start process: its start subscription lives on partition 0.
+    let intake_bpmn = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="intake">
+          <bpmn:startEvent id="s">
+            <bpmn:messageEventDefinition messageRef="Message_1" />
+          </bpmn:startEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Message_1" name="order-placed" />
+      </bpmn:definitions>"#;
+    let res = link
+        .deploy(
+            vec![("intake.bpmn".to_string(), intake_bpmn.to_string())],
+            None,
+        )
+        .await
+        .expect("forwarded deploy");
+    assert_eq!(res.status, 200, "deploy should succeed: {res:?}");
+
+    // A correlation key whose catch/boundary partition is 1 (not 0), so the two
+    // target partitions are distinct and the scope is observable.
+    let order_id = (0..)
+        .map(|i| format!("order-{i}"))
+        .find(|k| nanobpmn_engine_core::subscription_partition(k, 4) == 1)
+        .expect("some key hashes to partition 1");
+
+    // Scoped to partition 1 only: partition 0 is NOT re-applied, so the
+    // message-start subscription there must NOT fire — no instance is created.
+    // (Partition 1 still mints a message key: `CorrelateMessage` always records
+    // the publication, matching Zeebe.)
+    let res = link
+        .publish_message(
+            "order-placed".to_string(),
+            order_id.clone(),
+            None,
+            None,
+            Some(vec![1]),
+        )
+        .await
+        .expect("scoped publish returns a result");
+    assert_eq!(res.status, 200, "scoped publish should be 200: {res:?}");
+    let body = res.body.expect("publish result carries a body");
+    assert!(
+        body.get("correlatedInstanceKey")
+            .is_none_or(|v| v.is_null()),
+        "a publish scoped to partition 1 must not fire the partition-0 message-start subscription: {body}"
+    );
+
+    // Unscoped (legacy): the publish reaches partition 0 and starts an instance.
+    let res = link
+        .publish_message("order-placed".to_string(), order_id, None, None, None)
+        .await
+        .expect("unscoped publish returns a result");
+    assert_eq!(res.status, 200);
+    let body = res.body.expect("publish result carries a body");
+    assert!(
+        body.get("messageKey").is_some_and(|v| v.as_str().is_some()),
+        "the unscoped publish fires partition 0 and mints a message key: {body}"
+    );
+}

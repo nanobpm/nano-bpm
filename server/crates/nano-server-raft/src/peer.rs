@@ -689,13 +689,17 @@ impl PeerLink {
 
     /// Fans a published message out to this peer so it correlates against the
     /// subscriptions on its owned partitions. The peer answers with
-    /// `{messageKey, correlatedInstanceKey}`.
+    /// `{messageKey, correlatedInstanceKey}`. `only_partitions` scopes the apply
+    /// to just those target partitions (the ones the fan-out has not yet
+    /// delivered); `None` applies every locally led target partition (legacy
+    /// behaviour for a peer predating the field).
     pub async fn publish_message(
         &self,
         name: String,
         correlation_key: String,
         variables: Option<serde_json::Map<String, Value>>,
         business_id: Option<String>,
+        only_partitions: Option<Vec<u64>>,
     ) -> Result<PeerResult, PeerError> {
         self.request(|corr| ClientFrame::PublishMessage {
             corr,
@@ -703,6 +707,7 @@ impl PeerLink {
             correlation_key,
             variables,
             business_id,
+            only_partitions,
         })
         .await
     }
@@ -1103,6 +1108,16 @@ impl PeerSet {
     pub async fn heal_node(&self, node_id: u32) {
         self.unreachable.lock().await.remove(&node_id);
         self.breaker.lock().await.remove(&node_id);
+    }
+
+    /// Drops the cached link to `node_id` so the next `link()` redials. Used by
+    /// the message-publish fan-out when a publish answered by the addressed node
+    /// proved it is not the partition's writer (a 200 with no minted key): the
+    /// cached connection may pin a stale, pre-failover peer, so a retry must
+    /// redial rather than replay the same dead link (#1307). A no-op when no
+    /// link is cached.
+    pub async fn drop_link(&self, node_id: u32) {
+        self.links.lock().await.remove(&node_id);
     }
 
     /// Returns a live link to peer `node_id`, dialing it if there is no cached

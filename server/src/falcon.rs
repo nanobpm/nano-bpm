@@ -1408,10 +1408,11 @@ async fn handle_client_frame(
             correlation_key,
             variables,
             business_id,
+            only_partitions,
         } => {
             let vars = to_engine_vars(variables);
             let (message_key, instance) = match server
-                .correlate_message_local(name, correlation_key, vars, business_id)
+                .correlate_message_local(name, correlation_key, vars, business_id, only_partitions)
                 .await
             {
                 Ok(correlated) => correlated,
@@ -3304,6 +3305,7 @@ mod registry_tests {
             correlation_key: "k".into(),
             variables: None,
             business_id: Some(business_id),
+            only_partitions: None,
         };
         let status_of = |frame: Option<ServerFrame>| match frame {
             Some(ServerFrame::CommandResult { status, .. }) => status,
