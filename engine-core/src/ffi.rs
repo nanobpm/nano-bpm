@@ -508,6 +508,7 @@ pub unsafe extern "C" fn nbpmn_complete_job(engine: *mut Engine, job_key: u64) -
     }
     let cmd = Command::CompleteJob {
         job_key,
+        attribution: None,
         lease_token: None,
         variables: Default::default(),
         adhoc_result: None,
@@ -552,6 +553,7 @@ pub unsafe extern "C" fn nbpmn_fail_job(
     };
     let cmd = Command::FailJob {
         job_key,
+        attribution: None,
         lease_token: None,
         retries,
         error_message,

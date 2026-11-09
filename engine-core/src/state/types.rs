@@ -386,10 +386,14 @@ impl Job {
     /// closes the remaining path: a job **restored from a snapshot written before
     /// that normalization existed** can still carry `Some("")`, which would
     /// otherwise be captured verbatim into a terminal event and stamped as an
-    /// empty attribution downstream (#1191). Single source for the three terminal
+    /// empty attribution downstream (#1191). Likewise the digest-recovery
+    /// sentinel [`crate::engine::LEASE_DIGEST_WORKER`] is a placeholder, not a
+    /// worker, and is never attributed (#963). Single source for the three terminal
     /// capture sites in the engine, so the invariant cannot drift between them.
     pub fn attribution_worker(&self) -> Option<String> {
-        self.worker.clone().filter(|w| !w.is_empty())
+        self.worker
+            .clone()
+            .filter(|w| !w.is_empty() && w != crate::engine::LEASE_DIGEST_WORKER)
     }
 }
 

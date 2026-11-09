@@ -546,6 +546,7 @@ impl TestEngine {
         }
         self.apply(Command::CompleteJob {
             job_key: key,
+            attribution: None,
             lease_token,
             variables,
             adhoc_result: None,
@@ -592,6 +593,7 @@ impl TestEngine {
         }
         self.apply(Command::CompleteJob {
             job_key: key,
+            attribution: None,
             lease_token,
             variables,
             adhoc_result: Some(adhoc_result),
@@ -619,6 +621,7 @@ impl TestEngine {
         }
         self.apply(Command::FailJob {
             job_key: key,
+            attribution: None,
             lease_token,
             retries,
             error_message: message.to_string(),
@@ -789,6 +792,7 @@ impl TestEngine {
         }
         self.apply(Command::ThrowJobError {
             job_key: key,
+            attribution: None,
             error_code: error_code.to_string(),
             error_message: error_message.to_string(),
             variables: HashMap::new(),
@@ -5614,6 +5618,7 @@ mod read_channel_tests {
         let job_key: u64 = jobs[0]["key"].as_str().unwrap().parse().unwrap();
         eng.apply(Command::CompleteJob {
             job_key,
+            attribution: None,
             lease_token: None,
             variables: Default::default(),
             adhoc_result: None,

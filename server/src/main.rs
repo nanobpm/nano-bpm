@@ -1707,7 +1707,7 @@ mod converted_lock_poison_tests {
         // --- lease digests ---
         poison(server.lease_digests.clone());
         assert!(server.lease_digests.is_poisoned());
-        server.record_lease_digest(0, vec![(1, 2)], 0);
+        server.record_lease_digest(0, vec![(1, 2)], Vec::new(), 0);
         assert!(
             server
                 .lease_digests
@@ -4756,6 +4756,9 @@ struct RecoveryState {
 #[derive(Clone, Debug)]
 struct ReceivedDigest {
     leases: Vec<(u64, u64)>,
+    /// `(job_key, worker)` attribution for the leases (#963); empty from an
+    /// older sender.
+    workers: std::collections::HashMap<u64, String>,
 }
 
 /// The resolved active-backlog admission policy (see
@@ -17904,14 +17907,26 @@ impl ServerImpl {
     /// leader (soft state; never journaled). Consulted on leadership takeover by
     /// [`Self::run_lease_digest`]. A no-op-cost overwrite: only the most recent
     /// digest per partition is retained.
-    pub fn record_lease_digest(&self, partition: u64, leases: Vec<(u64, u64)>, _sent_at: u64) {
+    pub fn record_lease_digest(
+        &self,
+        partition: u64,
+        leases: Vec<(u64, u64)>,
+        workers: Vec<(u64, String)>,
+        _sent_at: u64,
+    ) {
         if !self.lease_digest {
             return;
         }
         self.lease_digests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(partition, ReceivedDigest { leases });
+            .insert(
+                partition,
+                ReceivedDigest {
+                    leases,
+                    workers: workers.into_iter().collect(),
+                },
+            );
     }
 
     /// One pass of the soft lease-digest protocol, driven by the 500ms tick when
@@ -17947,11 +17962,13 @@ impl ServerImpl {
                 .cloned();
             if let Some(digest) = stored {
                 let leases = digest.leases.clone();
+                let workers = digest.workers.clone();
                 let recover_handle = handle.clone();
                 recover_handle
                     .with(move |journal| {
                         for (job_key, deadline) in &leases {
-                            journal.recover_lease(*job_key, *deadline, now);
+                            let worker = workers.get(job_key).map(String::as_str);
+                            journal.recover_lease(*job_key, *deadline, worker, now);
                         }
                     })
                     .await;
@@ -17966,7 +17983,14 @@ impl ServerImpl {
                 }
             }
             // 2. Broadcast our current leases to this partition's followers.
-            let leases = handle.with(|journal| journal.activated_leases()).await;
+            let (leases, workers) = handle
+                .with(|journal| {
+                    (
+                        journal.activated_leases(),
+                        journal.activated_lease_workers(),
+                    )
+                })
+                .await;
             let followers: Vec<u32> = self
                 .engine
                 .topology()
@@ -17977,7 +18001,9 @@ impl ServerImpl {
             for follower in followers {
                 if let Ok(link) = self.peers.link(follower).await {
                     // Fire-and-forget: a failed send just skips this round.
-                    let _ = link.send_lease_digest(p, leases.clone(), now).await;
+                    let _ = link
+                        .send_lease_digest(p, leases.clone(), workers.clone(), now)
+                        .await;
                 }
             }
         }
@@ -39399,6 +39425,245 @@ mod clustered_startup_tests {
                 }
             }
         }
+    }
+
+    /// Taps `node`'s replica engine for `partition`: every event it applies is
+    /// forwarded to the returned receiver (the in-memory journal's exporter
+    /// hook). Used to observe the events a FOLLOWER materializes from the
+    /// replicated log (#963).
+    async fn tap_replica_events(
+        node: &ServerImpl,
+        partition: u64,
+    ) -> std::sync::mpsc::Receiver<nano_server_storage::journal::ExportBatch> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        node.engine_handle_for(partition)
+            .expect("node materializes the partition")
+            .with(move |journal| {
+                journal.set_exporter(tx, Arc::new(std::sync::atomic::AtomicU64::new(0)))
+            })
+            .await;
+        rx
+    }
+
+    /// The worker of the first terminal job event (`JobCompleted` / `JobFailed`
+    /// / `JobErrorThrown`) for `job_key` in `events`.
+    fn terminal_job_worker(events: &[Event], job_key: u64) -> Option<Option<String>> {
+        events.iter().find_map(|e| match e {
+            Event::JobCompleted {
+                job_key: k, worker, ..
+            }
+            | Event::JobFailed {
+                job_key: k, worker, ..
+            }
+            | Event::JobErrorThrown {
+                job_key: k, worker, ..
+            } if *k == job_key => Some(worker.clone()),
+            _ => None,
+        })
+    }
+
+    /// Waits until the tapped replica has applied a terminal event for
+    /// `job_key` (replication is asynchronous) and returns its attribution.
+    async fn replica_terminal_worker(
+        rx: &std::sync::mpsc::Receiver<nano_server_storage::journal::ExportBatch>,
+        job_key: u64,
+    ) -> Option<String> {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            while let Ok(batch) = rx.try_recv() {
+                if let Some(worker) = terminal_job_worker(&batch.events, job_key) {
+                    return worker;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the replica never applied a terminal event for job {job_key}");
+    }
+
+    async fn lease_on(node: &ServerImpl, worker: &str) -> u64 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            let jobs = node
+                .activate_for_stream("do-work", worker, 1, 600_000, None)
+                .await;
+            if let Some(job) = jobs.first() {
+                return job.job_key.0.parse().expect("numeric job key");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no job leased on the leader");
+    }
+
+    async fn shutdown_all(nodes: &[&ServerImpl]) {
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_local_terminal_jobs_attribute_the_same_worker_on_every_replica() {
+        // #963: under leader-local activation the lease (and its worker) lives
+        // only in the leader's RAM. Each replica re-derives events from the
+        // replicated COMMAND, so a follower used to persist `worker: None`
+        // where the leader persisted the real worker — divergent durable
+        // records for the same log entry. Every terminal kind must agree.
+        for kind in ["complete", "fail", "throw"] {
+            let (node0, node1, node2, _h) = boot_rf3_intake_cluster_with(
+                false,
+                false,
+                Some(ActivationPolicy::LeaderLocal),
+                None,
+                Vec::new(),
+            )
+            .await;
+            let followers = [
+                tap_replica_events(&node1, 0).await,
+                tap_replica_events(&node2, 0).await,
+            ];
+            let (instance_key, _c) = node0
+                .create_for_stream(Some("intake".into()), None, Default::default())
+                .await
+                .expect("raft-routed create commits");
+            assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+            let job_key = lease_on(&node0, "alice").await;
+
+            let outcome = match kind {
+                "complete" => {
+                    node0
+                        .complete_job_for_stream_with_lease(
+                            job_key,
+                            None,
+                            Default::default(),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await
+                }
+                "fail" => {
+                    node0
+                        .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+                        .await
+                }
+                _ => {
+                    node0
+                        .throw_error_for_stream_with_lease(
+                            job_key,
+                            None,
+                            "E".into(),
+                            "boom".into(),
+                            Default::default(),
+                        )
+                        .await
+                }
+            };
+            let (leader_events, _) = outcome.expect("the terminal command commits");
+            let on_leader = terminal_job_worker(&leader_events, job_key)
+                .expect("the leader emits a terminal job event");
+            assert_eq!(on_leader.as_deref(), Some("alice"), "{kind}: leader");
+            for rx in &followers {
+                assert_eq!(
+                    replica_terminal_worker(rx, job_key).await,
+                    on_leader,
+                    "{kind}: a follower must persist the leader's attribution"
+                );
+            }
+            shutdown_all(&[&node0, &node1, &node2]).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lease_recovered_after_failover_attributes_the_real_worker_on_every_replica() {
+        // #963 (digest facet): the promoted leader rebuilds the in-flight lease
+        // from the previous leader's digest. The digest now carries the worker,
+        // so a terminal settlement after failover is attributed to the real
+        // worker — never the `__lease_digest__` sentinel, never NULL — and the
+        // surviving follower agrees with the new leader.
+        let (node0, node1, node2) = boot_rf3_intake_cluster_cfg(true).await;
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("raft-routed create commits");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        let job_key = lease_on(&node0, "alice").await;
+
+        // Broadcast the held lease, and wait until BOTH followers recorded it
+        // (the digest is fire-and-forget).
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        node0.run_lease_digest(now).await;
+        for node in [&node1, &node2] {
+            let mut recorded = false;
+            for _ in 0..LEADER_SHIP_POLL_ITERS {
+                let workers = node
+                    .lease_digests
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&0)
+                    .map(|d| d.workers.clone());
+                if let Some(workers) = workers {
+                    assert_eq!(workers.get(&job_key).map(String::as_str), Some("alice"));
+                    recorded = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                recorded,
+                "the digest (with its worker) reaches every follower"
+            );
+        }
+
+        shutdown_all(&[&node0]).await;
+        let new_leader = wait_new_leader(&node1, &node2, 0).await;
+        let survivor = if std::ptr::eq(new_leader, &node1) {
+            &node2
+        } else {
+            &node1
+        };
+        let survivor_rx = tap_replica_events(survivor, 0).await;
+        let handle = new_leader
+            .engine_handle_for(0)
+            .expect("new leader materializes partition 0");
+        let mut present = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if handle
+                .with(move |j| j.engine().state().jobs.contains_key(&job_key))
+                .await
+            {
+                present = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(present, "the job replicated to the new leader");
+        let recover_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        new_leader.run_lease_digest(recover_now).await;
+
+        let (leader_events, _) = new_leader
+            .fail_job_for_stream_with_lease(job_key, None, 0, "boom".into())
+            .await
+            .expect("the fail commits on the new leader");
+        let on_leader =
+            terminal_job_worker(&leader_events, job_key).expect("terminal event on the new leader");
+        assert_eq!(
+            on_leader.as_deref(),
+            Some("alice"),
+            "real worker, not the sentinel"
+        );
+        assert_eq!(
+            replica_terminal_worker(&survivor_rx, job_key).await,
+            on_leader,
+            "the surviving follower agrees with the new leader"
+        );
+        shutdown_all(&[&node1, &node2]).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

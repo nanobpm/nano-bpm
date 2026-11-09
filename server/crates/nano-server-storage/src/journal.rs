@@ -2964,8 +2964,21 @@ impl Journal {
     /// Recovers a soft activation lease from a digest on the underlying engine
     /// (Created → Activated until `deadline`). Soft state only — journals nothing.
     /// See [`Engine::recover_lease`].
-    pub fn recover_lease(&mut self, job_key: u64, deadline: u64, now: u64) -> bool {
-        self.engine.recover_lease(job_key, deadline, now)
+    pub fn recover_lease(
+        &mut self,
+        job_key: u64,
+        deadline: u64,
+        worker: Option<&str>,
+        now: u64,
+    ) -> bool {
+        self.engine.recover_lease(job_key, deadline, worker, now)
+    }
+
+    /// The activating worker of each soft lease (see
+    /// [`Engine::activated_lease_workers`]), broadcast in the lease digest so
+    /// a promoted leader restores the real attribution (#963).
+    pub fn activated_lease_workers(&self) -> Vec<(u64, String)> {
+        self.engine.activated_lease_workers()
     }
 
     // --- Read delegations mirroring the engine API the server uses. ---
