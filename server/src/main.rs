@@ -9013,10 +9013,20 @@ impl ServerImpl {
                 target_nodes.sort_unstable();
                 target_nodes.dedup();
                 let mut delivered = false;
+                // Retry is only safe when every remote outcome this attempt is
+                // KNOWN not to have applied: a failed dial (nothing was sent)
+                // or a 200 with neither key nor instance (a non-leader no-op).
+                // A send/reply failure or a non-200 after the frame left this
+                // node is ambiguous — the target may have committed — and a
+                // republish would mint a second message key (no dedup), so it
+                // ends the loop instead.
+                let mut ambiguous = false;
+                let mut remote_targets = 0usize;
                 for node in target_nodes {
                     if node == topology.node_id {
                         continue;
                     }
+                    remote_targets += 1;
                     match self.peers.link(node).await {
                         Ok(link) => match link
                             .publish_message(
@@ -9059,12 +9069,14 @@ impl ServerImpl {
                                 });
                             }
                             Ok(res) => {
+                                ambiguous = true;
                                 tracing::warn!(
                                     "message fan-out to node {node}: status {}",
                                     res.status
                                 )
                             }
                             Err(e) => {
+                                ambiguous = true;
                                 tracing::warn!("message fan-out to node {node} failed: {e}")
                             }
                         },
@@ -9073,7 +9085,15 @@ impl ServerImpl {
                         }
                     }
                 }
-                if delivered || attempt >= PUBLISH_FANOUT_ATTEMPTS {
+                // No remote target (this node writes every target partition):
+                // the local correlate already applied the whole publish.
+                if !publish_fanout_should_retry(
+                    remote_targets,
+                    delivered,
+                    ambiguous,
+                    attempt,
+                    PUBLISH_FANOUT_ATTEMPTS,
+                ) {
                     break;
                 }
                 // Nothing was delivered anywhere: the routing view is stale
@@ -48437,5 +48457,41 @@ mod no_direct_engine_apply_guard {
         assert!(!ALLOWED.contains(&"ServerImpl::create_process_instance_impl"));
         assert!(!ALLOWED.contains(&"ServerImpl::create_forwarded"));
         assert!(!ALLOWED.contains(&"ServerImpl::create_for_stream"));
+    }
+}
+
+/// Whether `correlate_message_cluster` may re-send its publish fan-out (#1307).
+/// Retrying is only safe when nothing could have been applied remotely: there
+/// was at least one remote target, none minted a key or correlated, no outcome
+/// was ambiguous (a send/reply failure or non-200 may have committed — a
+/// republish would mint a duplicate message key), and attempts remain. A
+/// wholly-local publish (no remote target) never retries.
+fn publish_fanout_should_retry(
+    remote_targets: usize,
+    delivered: bool,
+    ambiguous: bool,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    remote_targets > 0 && !delivered && !ambiguous && attempt < max_attempts
+}
+
+#[cfg(test)]
+mod publish_fanout_retry_tests {
+    use super::publish_fanout_should_retry as retry;
+
+    #[test]
+    fn retries_only_on_definite_non_delivery() {
+        assert!(retry(1, false, false, 1, 8));
+        assert!(
+            !retry(0, false, false, 1, 8),
+            "wholly-local publish must not retry"
+        );
+        assert!(!retry(1, true, false, 1, 8), "delivered");
+        assert!(
+            !retry(1, false, true, 1, 8),
+            "ambiguous outcome must not republish"
+        );
+        assert!(!retry(1, false, false, 8, 8), "bounded");
     }
 }
