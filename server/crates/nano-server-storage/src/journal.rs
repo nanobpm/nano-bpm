@@ -2085,6 +2085,29 @@ impl Journal {
         spilled
     }
 
+    /// Test hook: rehydrates every cold instance back into hot state through the
+    /// production rehydration path, returning `(restored, failed)` where `failed`
+    /// counts instances that were absent or unreadable. Lets a replica-parity
+    /// test (#100) compare full per-instance/per-job state across replicas after
+    /// proving each replica's off-heap rows are readable.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn rehydrate_all_cold(&mut self) -> (usize, usize) {
+        let keys: Vec<Key> = match self.cold.as_ref() {
+            Some(cold) => cold.index.keys().collect(),
+            None => return (0, 0),
+        };
+        let mut restored = 0usize;
+        let mut failed = 0usize;
+        for key in keys {
+            match self.rehydrate_cold(key) {
+                ColdRehydration::Restored => restored += 1,
+                ColdRehydration::NotCold => {}
+                ColdRehydration::Absent | ColdRehydration::Unreadable => failed += 1,
+            }
+        }
+        (restored, failed)
+    }
+
     /// Wires the read-model exporter channel. Set before any command is applied
     /// (including demo seeding) so every journaled event is projected.
     ///
@@ -2618,12 +2641,17 @@ impl Journal {
         }
     }
 
-    /// Test-only: force an immediate, un-throttled spill scan. Production spills
+    /// Test hook: force an immediate, un-throttled spill scan. Production spills
     /// are amortised (see [`maybe_spill`]/[`SPILL_CHECK_INTERVAL`]), so tests that
     /// assert on the fully-shed state drive it deterministically through here
     /// instead of depending on the amortisation cadence.
-    #[cfg(test)]
-    pub(crate) fn force_spill_scan(&mut self) {
+    // Also compiled under `test-hooks` (enabled by the gateway bin's
+    // dev-dependencies) so the bin's inline tests — the Raft replica-parity
+    // guards (#100), which run under `VarSpillCfg::Budget(0)` where the
+    // RAM-pressure sweep is a no-op — can force the per-command budget shed
+    // deterministically instead of waiting out the 256-command amortisation.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn force_spill_scan(&mut self) {
         self.spill_check_skip = 0;
         self.maybe_spill();
     }

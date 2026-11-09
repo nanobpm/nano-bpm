@@ -37535,6 +37535,27 @@ mod clustered_startup_tests {
         ServerImpl,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
+        boot_rf3_intake_cluster_with(digest, leader_durable, None, None, Vec::new()).await
+    }
+
+    /// As [`boot_rf3_intake_cluster_cfg2`], plus: `spill` builds a per-node spill
+    /// config (each node gets its own store, applied to its owned engines and —
+    /// via `ServerImpl::spill_config` — to every replica engine it later builds),
+    /// `activation` pins the activation-replication policy on every node (the
+    /// env reader can't be used under parallel tests), and `extra` deploys
+    /// additional processes alongside `intake`/`auto`.
+    async fn boot_rf3_intake_cluster_with(
+        digest: bool,
+        leader_durable: bool,
+        activation: Option<ActivationPolicy>,
+        spill: Option<fn() -> SpillConfig>,
+        extra: Vec<ProcessDefinition>,
+    ) -> (
+        ServerImpl,
+        ServerImpl,
+        ServerImpl,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
         let mut listeners = Vec::new();
         let mut ports = Vec::new();
         for i in 0..3u32 {
@@ -37596,6 +37617,33 @@ mod clustered_startup_tests {
             }
         }
 
+        if let Some(policy) = activation {
+            for node in [&mut node0, &mut node1, &mut node2] {
+                node.activation_policy = policy;
+                node.lease_digest = policy.broadcasts_lease_digest();
+                let lenient = policy.may_be_leader_local();
+                for handle in node.engine.all() {
+                    handle
+                        .with(move |journal| journal.set_lenient_completion(lenient))
+                        .await;
+                }
+            }
+        }
+
+        // Spill tiers: one store per node (a node's spill rows are local state),
+        // applied to the owned engines now and to every replica engine built
+        // later in `raft_bootstrap` / recovery via `spill_config`.
+        if let Some(make_spill) = spill {
+            for node in [&mut node0, &mut node1, &mut node2] {
+                let config = make_spill();
+                for handle in node.engine.all() {
+                    let config = config.clone();
+                    handle.with(move |journal| config.apply(journal)).await;
+                }
+                node.spill_config = Some(config);
+            }
+        }
+
         let proc = ProcessBuilder::new("intake")
             .start_event("start")
             .service_task("work", "do-work")
@@ -37615,9 +37663,14 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         names.insert("auto".to_string(), "auto.bpmn".to_string());
+        for extra_proc in &extra {
+            names.insert(extra_proc.id.clone(), format!("{}.bpmn", extra_proc.id));
+        }
+        let mut procs = vec![proc, auto];
+        procs.extend(extra);
         let (_r, events) = node0
             .deploy_resources_locally(
-                vec![proc, auto],
+                procs,
                 &names,
                 Vec::new(),
                 &std::collections::HashMap::new(),
@@ -37676,6 +37729,575 @@ mod clustered_startup_tests {
             "every partition must have its owning node as leader before creates"
         );
         (node0, node1, node2, serve_handles)
+    }
+
+    // --- issue #100: leader/follower replica parity --------------------------
+    //
+    // Defect class: once the log is fully applied, the leader and every follower
+    // must agree on per-instance and per-job state. #100 observed followers
+    // stranding a load-scaling fraction of instances as `Active` (a completion
+    // the leader applied but a follower did not). The guards below drive every
+    // local, non-replicated mechanism that can make a follower's apply differ
+    // from the leader's — cold spill, variable spill, leader-local lock expiry,
+    // replicated timer firing, and snapshot-install catch-up after a log purge —
+    // then wait on an applied-index barrier (never a sleep) and compare the
+    // exact KEY sets, not counts.
+
+    /// Spill tiers for the parity guards: variable spill sheds on every command
+    /// (budget 0) and cold spill is forced deterministically via
+    /// `force_cold_spill_all`; the RAM-gated sweep watermark is unreachable so it
+    /// never fires on its own. One in-memory store per call (= per node).
+    fn parity_spill_config() -> SpillConfig {
+        SpillConfig {
+            store: Arc::new(
+                varspill::VarSpillStore::open(None).expect("in-memory var-spill store"),
+            ),
+            var: Some(VarSpillCfg::Budget(0)),
+            cold: Some((u64::MAX, u64::MAX)),
+        }
+    }
+
+    /// `start -> timer(1ms) -> service(do-timed) -> end`: its job only exists
+    /// once a replicated `TriggerTimers` fires the catch event.
+    fn parity_timed_process() -> ProcessDefinition {
+        ProcessBuilder::new("timed")
+            .start_event("start")
+            .timer_intermediate_catch_event("wait", 1)
+            .service_task("work", "do-timed")
+            .end_event("end")
+            .connect("start", "wait")
+            .connect("wait", "work")
+            .connect("work", "end")
+            .build()
+            .expect("valid timed process")
+    }
+
+    async fn boot_parity_cluster() -> (
+        ServerImpl,
+        ServerImpl,
+        ServerImpl,
+        Vec<tokio::task::JoinHandle<()>>,
+    ) {
+        boot_rf3_intake_cluster_with(
+            false,
+            true,
+            Some(ActivationPolicy::LeaderLocal),
+            Some(parity_spill_config),
+            vec![parity_timed_process()],
+        )
+        .await
+    }
+
+    /// Spill tally for one [`parity_force_spill`] sweep: the per-command
+    /// variable-budget shed and the whole-instance cold shed are counted
+    /// separately so the test can assert each tier engaged on its own — the
+    /// cold tally says nothing about variable spill.
+    #[derive(Default)]
+    struct ParitySpill {
+        var: usize,
+        cold: usize,
+    }
+
+    /// Spills on EVERY engine (owned + replica) of every node — spill is local
+    /// and unreplicated, so each replica sheds a different working set from the
+    /// leader. Forces BOTH tiers deterministically: `force_spill_scan` runs the
+    /// per-command variable-budget shed (`Budget(0)` spills every spill
+    /// candidate) without waiting out the 256-command amortisation — the
+    /// RAM-pressure sweep (`maybe_var_spill_pressure`) is a no-op under
+    /// `Budget`, so without this the variable tier never engages — and
+    /// `force_cold_spill_all` evicts every dormant instance.
+    async fn parity_force_spill(nodes: [&ServerImpl; 3]) -> ParitySpill {
+        let mut total = ParitySpill::default();
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(h) = node.engine_handle_for(p) {
+                    let sweep = h
+                        .with(|journal| {
+                            let before = journal.engine().resident_spillable_count();
+                            journal.force_spill_scan();
+                            let var = before - journal.engine().resident_spillable_count();
+                            ParitySpill {
+                                var,
+                                cold: journal.force_cold_spill_all(),
+                            }
+                        })
+                        .await;
+                    total.var += sweep.var;
+                    total.cold += sweep.cold;
+                }
+            }
+        }
+        total
+    }
+
+    /// One replicated clock tick at `now` on every partition (only the leader
+    /// proposes): fires due timers and expires due leases.
+    async fn parity_tick(nodes: [&ServerImpl; 3], now: u64) {
+        for node in nodes {
+            for p in 0..3u64 {
+                node.tick_partition_via_raft(p, now, true).await;
+            }
+        }
+    }
+
+    /// Activates up to `max` jobs of `job_type` on `node` and completes them all
+    /// with a payload. Returns how many completed.
+    async fn parity_activate_complete(node: &ServerImpl, job_type: &str, max: usize) -> usize {
+        let jobs = node
+            .activate_for_stream(job_type, "parity-worker", max, 60_000, None)
+            .await;
+        let n = jobs.len();
+        for job in jobs {
+            let key = job.job_key.0.parse::<u64>().expect("numeric job key");
+            let mut vars = std::collections::HashMap::new();
+            vars.insert("result".to_string(), Value::Str("r".repeat(512)));
+            node.complete_job_for_stream(key, vars, None, None)
+                .await
+                .expect("completion commits through the leader")
+                .wait()
+                .await;
+        }
+        n
+    }
+
+    #[derive(Default)]
+    struct ParityTally {
+        created: usize,
+        abandoned: usize,
+        completed: usize,
+        timed_completed: usize,
+        /// Whole-instance (cold) sheds, aggregated over every replica.
+        shed: usize,
+        /// Variable-tier sheds, aggregated over every replica. Counted
+        /// separately from `shed`: a cold-only tally could be satisfied
+        /// without the variable spill path ever engaging.
+        var_shed: usize,
+    }
+
+    /// One round of the mixed workload: creates (with payload), cold/var spill,
+    /// abandoned short leases expired by a replicated tick that also fires the
+    /// timers, then activate+complete of both job types, with spill between.
+    async fn parity_workload_round(nodes: [&ServerImpl; 3], tally: &mut ParityTally) {
+        for node in nodes {
+            for i in 0..6 {
+                let mut vars = std::collections::HashMap::new();
+                vars.insert(
+                    "payload".to_string(),
+                    Value::Str(format!("{i}").repeat(256)),
+                );
+                node.create_for_stream(Some("intake".into()), None, vars)
+                    .await
+                    .expect("intake create acks");
+                tally.created += 1;
+            }
+            for _ in 0..3 {
+                node.create_for_stream(Some("timed".into()), None, Default::default())
+                    .await
+                    .expect("timed create acks");
+                tally.created += 1;
+            }
+        }
+        // Fire the timers while their instances are still hot. (The Raft tick's
+        // pre-check only sees HOT timers, so a timer whose instance is cold on
+        // the leader is never proposed — a liveness defect tracked in #1483;
+        // it cannot cause replica divergence because nothing is
+        // proposed.)
+        let far_future = now_millis() + 600_000;
+        parity_tick(nodes, far_future).await;
+        // Create/tick acks are leader-durable: they do NOT wait for the
+        // learners. Barrier here so a delayed follower has applied the creates
+        // and timer firings before the spill sweep — otherwise it spills
+        // nothing, later applies the whole workload against hot state, and its
+        // cold/var rehydration paths go untested (while the aggregate tally is
+        // still satisfied by the other replicas).
+        parity_barrier(nodes).await;
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
+        // Lease with a 1 ms timeout and abandon (rehydrating cold instances):
+        // leader-local locks the followers never see, reclaimed by the expiry.
+        for node in nodes {
+            tally.abandoned += node
+                .activate_for_stream("do-work", "abandoner", 3, 1, None)
+                .await
+                .len();
+        }
+        parity_tick(nodes, now_millis() + 1_200_000).await;
+        // Same barrier: the expiry tick is leader-durable too, so every replica
+        // must have applied it before this sweep for the sweep to shed (and
+        // later rehydrate) on all three.
+        parity_barrier(nodes).await;
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
+        for node in nodes {
+            tally.completed += parity_activate_complete(node, "do-work", 4).await;
+            tally.timed_completed += parity_activate_complete(node, "do-timed", 2).await;
+        }
+        let spill = parity_force_spill(nodes).await;
+        tally.shed += spill.cold;
+        tally.var_shed += spill.var;
+    }
+
+    /// Applied-index barrier: for every partition, every replica (leader and
+    /// learners) has applied up to the leader's last log index.
+    async fn parity_barrier(nodes: [&ServerImpl; 3]) {
+        for p in 0..3u64 {
+            let leader = nodes[p as usize]
+                .raft_registry()
+                .get(p)
+                .expect("owner hosts its partition");
+            let metrics = leader.raft.metrics().borrow().clone();
+            assert_eq!(
+                metrics.current_leader,
+                Some(p),
+                "node {p} leads partition {p}"
+            );
+            let idx = metrics.last_log_index;
+            for (n, node) in nodes.iter().enumerate() {
+                node.raft_registry()
+                    .get(p)
+                    .unwrap_or_else(|| panic!("node {n} replicates partition {p}"))
+                    .raft
+                    .wait(Some(std::time::Duration::from_secs(30)))
+                    .applied_index_at_least(idx, "replica applies the full log")
+                    .await
+                    .unwrap_or_else(|e| {
+                        panic!("node {n} must apply partition {p} up to {idx:?}: {e}")
+                    });
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReplicaView {
+        /// Live instance keys, hot ∪ cold, BEFORE rehydration.
+        live: std::collections::BTreeSet<Key>,
+        /// `Active` instance keys after rehydrating every cold instance.
+        active: std::collections::BTreeSet<Key>,
+        /// Non-terminal job keys (`Created`/`Activated`/`Failed`).
+        jobs: std::collections::BTreeSet<Key>,
+        /// Cold rows that could not be rehydrated (absent or unreadable).
+        unreadable: usize,
+    }
+
+    async fn replica_view(node: &ServerImpl, p: u64) -> ReplicaView {
+        node.engine_handle_for(p)
+            .expect("replica engine exists")
+            .with(|journal| {
+                let mut live = std::collections::HashSet::new();
+                journal.collect_live_instance_keys(&mut live);
+                let (_restored, unreadable) = journal.rehydrate_all_cold();
+                let state = journal.engine().state();
+                ReplicaView {
+                    live: live.into_iter().collect(),
+                    active: state
+                        .instances
+                        .values()
+                        .filter(|i| matches!(i.state, ProcessInstanceState::Active))
+                        .map(|i| i.key)
+                        .collect(),
+                    jobs: state
+                        .jobs
+                        .values()
+                        .filter(|j| {
+                            matches!(
+                                j.state,
+                                nanobpmn_engine_core::JobState::Created
+                                    | nanobpmn_engine_core::JobState::Activated
+                                    | nanobpmn_engine_core::JobState::Failed
+                            )
+                        })
+                        .map(|j| j.key)
+                        .collect(),
+                    unreadable,
+                }
+            })
+            .await
+    }
+
+    /// Asserts every replica of every partition holds exactly the leader's
+    /// Active-instance and non-terminal-job key sets; on mismatch, reports the
+    /// diverging keys. Returns the total number of Active instances (so callers
+    /// can prove the comparison is non-vacuous).
+    async fn assert_replica_parity(nodes: [&ServerImpl; 3]) -> usize {
+        let mut total_active = 0;
+        for p in 0..3u64 {
+            let leader = replica_view(nodes[p as usize], p).await;
+            assert_eq!(leader.unreadable, 0, "leader p{p} off-heap rows readable");
+            assert_eq!(
+                leader.live, leader.active,
+                "leader p{p}: the hot∪cold live set equals the rehydrated Active set"
+            );
+            total_active += leader.active.len();
+            for (n, node) in nodes.iter().enumerate() {
+                if n == p as usize {
+                    continue;
+                }
+                let view = replica_view(node, p).await;
+                let diff = |a: &std::collections::BTreeSet<Key>,
+                            b: &std::collections::BTreeSet<Key>| {
+                    (
+                        a.difference(b).copied().collect::<Vec<_>>(),
+                        b.difference(a).copied().collect::<Vec<_>>(),
+                    )
+                };
+                assert_eq!(view.unreadable, 0, "node {n} p{p} off-heap rows readable");
+                let (only_f, only_l) = diff(&view.live, &leader.live);
+                assert!(
+                    only_f.is_empty() && only_l.is_empty(),
+                    "node {n} p{p} live instances diverge: follower-only {only_f:?}, leader-only {only_l:?}"
+                );
+                let (only_f, only_l) = diff(&view.active, &leader.active);
+                assert!(
+                    only_f.is_empty() && only_l.is_empty(),
+                    "node {n} p{p} Active instances diverge: follower-only {only_f:?}, leader-only {only_l:?}"
+                );
+                let (only_f, only_l) = diff(&view.jobs, &leader.jobs);
+                assert!(
+                    only_f.is_empty() && only_l.is_empty(),
+                    "node {n} p{p} non-terminal jobs diverge: follower-only {only_f:?}, leader-only {only_l:?}"
+                );
+            }
+        }
+        total_active
+    }
+
+    async fn parity_shutdown(nodes: [&ServerImpl; 3], handles: Vec<tokio::task::JoinHandle<()>>) {
+        for node in nodes {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles {
+            h.abort();
+        }
+    }
+
+    /// #100 guard: under leader-durable RF=3 with leader-local activation and
+    /// lenient followers, a create/activate/complete workload with cold spill,
+    /// variable spill, lock expiry and timer firing leaves every replica with
+    /// the leader's exact Active-instance and non-terminal-job key sets once the
+    /// log is fully applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn replicas_agree_on_instance_and_job_state_after_full_apply() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        let mut tally = ParityTally::default();
+        for _ in 0..3 {
+            parity_workload_round(nodes, &mut tally).await;
+        }
+        assert!(tally.shed > 0, "cold spill engaged");
+        assert!(
+            tally.var_shed > 0,
+            "variable spill engaged (Budget(0) sheds every spill candidate)"
+        );
+        assert!(tally.abandoned > 0, "leases were abandoned for expiry");
+        assert!(tally.completed > 0, "intake jobs completed");
+        assert!(
+            tally.timed_completed > 0,
+            "timers fired and their jobs completed"
+        );
+
+        parity_barrier(nodes).await;
+        let active = assert_replica_parity(nodes).await;
+        assert!(active > 0, "the parity comparison covers live instances");
+        assert!(
+            active < tally.created,
+            "the parity comparison covers completed instances too"
+        );
+        parity_shutdown(nodes, handles).await;
+    }
+
+    /// #100 guard, snapshot-install path: after the leader snapshots and PURGES
+    /// its log mid-workload, a learner rebuilt empty can only catch up by
+    /// installing the leader's snapshot (cold set included). It must then apply
+    /// the rest of the workload and agree with the leader key-for-key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_learner_caught_up_by_snapshot_install_agrees_with_the_leader() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        let mut tally = ParityTally::default();
+        parity_workload_round(nodes, &mut tally).await;
+        parity_barrier(nodes).await;
+
+        // Snapshot partition 0 on its leader, then purge the log it covers.
+        let leader = node0.raft_registry().get(0).expect("node 0 hosts p0");
+        let applied = leader
+            .raft
+            .metrics()
+            .borrow()
+            .last_applied
+            .map(|l| l.index)
+            .expect("p0 applied the workload");
+        leader
+            .raft
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger snapshot");
+        let snap = leader
+            .raft
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .metrics(
+                |m| m.snapshot.is_some_and(|s| s.index >= applied),
+                "leader snapshot covers the applied workload",
+            )
+            .await
+            .expect("leader builds its snapshot")
+            .snapshot
+            .expect("snapshot present")
+            .index;
+        leader
+            .raft
+            .trigger()
+            .purge_log(snap)
+            .await
+            .expect("trigger purge");
+        leader
+            .raft
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .metrics(
+                |m| m.purged.is_some_and(|l| l.index >= snap),
+                "leader purges its log up to the snapshot",
+            )
+            .await
+            .expect("leader purges the snapshotted prefix");
+
+        // Rebuild node 1's p0 member as an EMPTY receiver with a FRESH engine:
+        // the purged prefix is unavailable, so the leader must install its snapshot.
+        node1
+            .raft_registry()
+            .get(0)
+            .expect("node 1 replicates p0")
+            .raft
+            .shutdown()
+            .await
+            .ok();
+        node1
+            .raft_replicas
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&0);
+        assert!(
+            node1.recover_shutdown_partition(0).await,
+            "node 1 rebuilds its p0 member as a fresh receiver"
+        );
+
+        // More workload on top of the snapshot: completions of jobs the learner
+        // only knows from the installed snapshot, plus new creates/timers/expiry.
+        parity_workload_round(nodes, &mut tally).await;
+        parity_barrier(nodes).await;
+
+        let installed = node1
+            .raft_registry()
+            .get(0)
+            .expect("rebuilt p0 member")
+            .raft
+            .metrics()
+            .borrow()
+            .snapshot
+            .map(|s| s.index);
+        assert!(
+            installed.is_some_and(|i| i >= snap),
+            "the rebuilt learner caught up by snapshot install (installed {installed:?}, purged to {snap})"
+        );
+        assert!(
+            tally.shed > 0
+                && tally.var_shed > 0
+                && tally.completed > 0
+                && tally.timed_completed > 0,
+            "cold and variable spill both engaged, and both job types completed"
+        );
+        let active = assert_replica_parity(nodes).await;
+        assert!(active > 0, "the parity comparison covers live instances");
+        parity_shutdown(nodes, handles).await;
+    }
+
+    /// #100 candidate (a) = #1405: a follower whose own cold row is UNREADABLE
+    /// when a replicated completion arrives must not silently advance past the
+    /// entry with the instance stranded `Active`. Either it fails closed (does not
+    /// reach the leader's applied index) or, once applied, it agrees with the
+    /// leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "candidate (a) of #100 is #1405; enable when PR #1452 (fail closed on unreadable state during apply) lands"]
+    async fn a_follower_with_an_unreadable_cold_row_never_diverges_silently() {
+        let (node0, node1, node2, handles) = boot_parity_cluster().await;
+        let nodes = [&node0, &node1, &node2];
+        let (instance_key, _) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("create acks");
+        assert_eq!(partition_of(instance_key), 0);
+        parity_barrier(nodes).await;
+        let follower = node1.engine_handle_for(0).expect("node 1 replica of p0");
+        assert!(follower.with(|j| j.force_cold_spill_all()).await > 0);
+        assert!(
+            node1
+                .spill_config
+                .as_ref()
+                .expect("spill configured")
+                .store
+                .corrupt_cold_row(instance_key),
+            "inject an unreadable cold row on the follower"
+        );
+
+        assert_eq!(
+            parity_activate_complete(&node0, "do-work", 1).await,
+            1,
+            "the leader activates and completes the job"
+        );
+        let idx = node0
+            .raft_registry()
+            .get(0)
+            .expect("leader p0")
+            .raft
+            .metrics()
+            .borrow()
+            .last_log_index
+            .expect("leader has a log after the completion");
+        let follower_p0 = node1.raft_registry().get(0).expect("follower p0");
+        let reached = follower_p0
+            .raft
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .metrics(
+                |m| {
+                    m.state == openraft::ServerState::Shutdown
+                        || m.last_applied.is_some_and(|l| l.index >= idx)
+                },
+                "follower applies the completion or fails closed",
+            )
+            .await
+            .expect("follower neither applied the completion nor failed closed (a bare timeout is a failure)");
+        let applied_idx = reached.last_applied.map(|l| l.index);
+        let reached = applied_idx.is_some_and(|i| i >= idx);
+        if !reached {
+            // Fail-closed branch: the follower must have entered Shutdown AND
+            // must not have applied the completion entry.
+            assert!(
+                follower_p0.is_shutdown(),
+                "follower stopped short of the completion without failing closed"
+            );
+            assert!(
+                applied_idx.is_none_or(|i| i < idx),
+                "a fail-closed follower must not apply the completion (applied {applied_idx:?}, completion at {idx})"
+            );
+        } else {
+            let still_live = follower
+                .with(move |j| {
+                    let mut live = std::collections::HashSet::new();
+                    j.collect_live_instance_keys(&mut live);
+                    live.contains(&instance_key)
+                })
+                .await;
+            assert!(
+                !still_live,
+                "follower advanced past the completion but still holds {instance_key} live"
+            );
+        }
+        parity_shutdown(nodes, handles).await;
     }
 
     fn self_observed_failover_leader(views: &[(u64, Option<u64>); 2]) -> Option<usize> {
