@@ -15766,6 +15766,17 @@ impl ServerImpl {
                         }
                         Err(e) => {
                             tracing::error!("raft: failed to host owned partition {p}: {e}");
+                            // Same latch as the non-deferred hosting loop above:
+                            // this partition's engine was recovered (or seeded
+                            // fresh) BEFORE its durable Raft log was opened, so a
+                            // failure here leaves its recovery INCOMPLETE while
+                            // its cold/spill rows are still in the shared store.
+                            // Bar the post-recovery GC sweep: running it now
+                            // would treat the unrecovered partition's live set as
+                            // empty and reap its still-needed rows (#1479 review
+                            // finding — the deferred path is reachable only with
+                            // NANOBPMN_RECLAIM_HANDOFF=1, but fails identically).
+                            server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
                         }
                     }
                 }
@@ -28469,17 +28480,64 @@ mod clustered_startup_tests {
         assert_eq!(j0.force_cold_spill_all(), 1);
         // A crash-orphaned row whose owning partition failed to recover: no
         // hosted engine references it, so an unguarded sweep would reap it.
-        // Seed it by cold-spilling a scratch journal's instance, then dropping
-        // the journal — the row is exactly what a real crash leaves behind.
+        // Seed it in a HOSTED-but-EMPTY partition (1) — a partition whose
+        // recovered live set is legitimately empty, exactly the state a failed
+        // recovery leaves behind — so the orphan key is DISTINCT from every
+        // live key: seeding it in partition 0 would collide with `live0` (both
+        // journals mint the same first key) and the test would pass even
+        // without the guard, because the normal sweep preserves that live key
+        // (#1479 review finding).
+        //
+        // The scratch instance must be TERMINAL in its engine, not merely
+        // dropped: `deploy_and_create` leaves it Active in the scratch engine's
+        // hot state, and the spilled cold index then keeps its key in the
+        // scratch journal's live set — so even an UNGUARDED sweep preserves
+        // the row and the test cannot detect a missing latch. Drive the crash
+        // window exactly as the storage crate's crash-orphan test does:
+        // capture the cold row, cancel the instance (its eviction forget drops
+        // the row), then re-write the row the crash left behind — the terminal
+        // instance's key is now in NO live set, so only the latch keeps the
+        // row alive.
         let failed_partition_orphan = {
-            let mut scratch = Journal::in_memory_partition(0);
+            let mut scratch = Journal::in_memory_partition(1);
             scratch.set_cold_spill(Arc::clone(&store), 1, 0);
             let key = deploy_and_create(&mut scratch);
             assert_eq!(scratch.force_cold_spill_all(), 1);
+            let orphan_row = store
+                .try_get_cold(key)
+                .unwrap()
+                .expect("cold row present before the cancel");
+            let _ = scratch
+                .apply_command(Command::cancel_instance(key))
+                .unwrap();
+            assert!(
+                store.try_get_cold(key).unwrap().is_none(),
+                "the cancel's eviction forget dropped the row"
+            );
+            store.put_cold(key, &orphan_row).unwrap();
             key
         };
+        assert_ne!(
+            failed_partition_orphan, live0,
+            "the orphan must be a distinct key, or the test cannot detect an unguarded sweep"
+        );
 
-        let mut server = build_server_in_memory(vec![j0], cluster::Topology::single(1));
+        // Partition 1 is hosted but EMPTY (its recovered live set is
+        // legitimately empty — as a failed recovery would leave it), so only
+        // the recovery-failure latch keeps its orphaned row alive. Its journal
+        // still attaches the shared cold store (a hosted partition always
+        // does), so an unguarded sweep WOULD enumerate and reap the orphan.
+        let mut j1 = Journal::in_memory_partition(1);
+        j1.set_cold_spill(Arc::clone(&store), 1, 0);
+        let mut server = build_server_in_memory(
+            vec![j0, j1],
+            cluster::Topology {
+                node_id: 0,
+                peers: vec!["http://127.0.0.1:1".to_string()],
+                num_partitions: 2,
+                replication_factor: 1,
+            },
+        );
         server.spill_config = Some(SpillConfig {
             store: Arc::clone(&store),
             var: None,
@@ -28496,6 +28554,76 @@ mod clustered_startup_tests {
                 .unwrap()
                 .is_some(),
             "the unrecovered partition's row is retained for the next boot"
+        );
+        assert!(
+            store.try_get_cold(live0).unwrap().is_some(),
+            "the recovered partition's live row is untouched"
+        );
+    }
+
+    /// #1479 review finding: with `NANOBPMN_RECLAIM_HANDOFF=1` an owned
+    /// partition is hosted by the DEFERRED hosting loop (after the incumbent
+    /// probe), whose error branch must set the SAME `gc_recovery_incomplete`
+    /// latch the non-deferred loop sets — a failure opening the Raft log there
+    /// leaves the partition's recovery incomplete while its rows sit in the
+    /// shared store, and an unlatched sweep would reap them. This drives the
+    /// latch's effect directly: a deferred-owned partition's orphan row is in
+    /// the store, the latch is set as the deferred error branch does, and the
+    /// node-wide sweep must skip itself even though every hosted engine's live
+    /// set is authoritative for its own partition.
+    #[tokio::test]
+    async fn node_scoped_gc_skips_the_sweep_when_a_deferred_owned_partitions_hosting_failed() {
+        let store = Arc::new(varspill::VarSpillStore::open(None).expect("in-memory store"));
+
+        // This node owns partitions 0 and 1. Partition 1's deferred hosting
+        // (NANOBPMN_RECLAIM_HANDOFF=1) FAILED, so its engine was never
+        // recovered: only its crash-orphaned cold row remains in the store.
+        let mut j0 = Journal::in_memory_partition(0);
+        j0.set_cold_spill(Arc::clone(&store), 1, 0);
+        let live0 = deploy_and_create(&mut j0);
+        assert_eq!(j0.force_cold_spill_all(), 1);
+        let deferred_partition_orphan = {
+            let mut scratch = Journal::in_memory_partition(1);
+            scratch.set_cold_spill(Arc::clone(&store), 1, 0);
+            let key = deploy_and_create(&mut scratch);
+            assert_eq!(scratch.force_cold_spill_all(), 1);
+            // Terminal in the scratch engine (see the recovery-failure test
+            // above): otherwise its key stays in the scratch live set and even
+            // an unguarded sweep preserves the row. Capture the cold row,
+            // cancel (the eviction forget drops it), then re-write the row the
+            // crash left behind.
+            let orphan_row = store
+                .try_get_cold(key)
+                .unwrap()
+                .expect("cold row present before the cancel");
+            let _ = scratch
+                .apply_command(Command::cancel_instance(key))
+                .unwrap();
+            store.put_cold(key, &orphan_row).unwrap();
+            key
+        };
+        assert_ne!(
+            deferred_partition_orphan, live0,
+            "the orphan must be a distinct key, or the test cannot detect an unguarded sweep"
+        );
+
+        let mut server = build_server_in_memory(vec![j0], cluster::Topology::single(1));
+        server.spill_config = Some(SpillConfig {
+            store: Arc::clone(&store),
+            var: None,
+            cold: Some((1, 0)),
+        });
+        // As the deferred hosting loop's error branch does (NANOBPMN_RECLAIM_HANDOFF=1).
+        server.gc_recovery_incomplete.store(true, Ordering::Relaxed);
+
+        let collected = server.gc_offheap_orphans_once().await;
+        assert_eq!(collected, 0, "the sweep skipped itself");
+        assert!(
+            store
+                .try_get_cold(deferred_partition_orphan)
+                .unwrap()
+                .is_some(),
+            "the deferred-owned partition's row is retained for the next boot"
         );
         assert!(
             store.try_get_cold(live0).unwrap().is_some(),

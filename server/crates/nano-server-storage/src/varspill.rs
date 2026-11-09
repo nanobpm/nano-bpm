@@ -975,21 +975,25 @@ impl VarSpillStore {
     /// terminal state is dead — its eviction `forget` was lost to the crash —
     /// and is reaped here.
     ///
-    /// **Streamed enumeration.** Both tables are scanned by keyset pagination
-    /// in [`FORGET_CHUNK`]-key pages (`WHERE key > ?1 ORDER BY key LIMIT …`),
-    /// each page is filtered and its orphans deleted BEFORE the next page is
-    /// fetched, so memory stays bounded by one page plus one delete batch —
-    /// never the whole on-disk backlog (#1467 finding: whole-table
-    /// materialisation could exhaust startup memory on constrained
-    /// deployments). Keys are persisted as `key as i64` and the 13-bit
-    /// partition prefix puts partitions ≥ 4096 above `i64::MAX`, so the scan
-    /// starts at `i64::MIN` and paginates over the full SIGNED range — starting
-    /// at `-1` would permanently skip every high partition's rows and leave
-    /// their crash orphans unreclaimed (#1479 review finding). Rows are
-    /// inserted by monotonically increasing keys, so a row written concurrently
-    /// behind the cursor belongs to a live instance (kept by construction); a
-    /// row written ahead of the cursor is seen by a later page and filtered
-    /// against the same sets.
+    /// **Streamed, range-bounded enumeration.** Both tables are scanned by
+    /// keyset pagination in [`FORGET_CHUNK`]-key pages (`WHERE key > ?1 AND key
+    /// <= ?2 ORDER BY key LIMIT …`), each page is filtered and its orphans
+    /// deleted BEFORE the next page is fetched, so memory stays bounded by one
+    /// page plus one delete batch — never the whole on-disk backlog (#1467
+    /// finding: whole-table materialisation could exhaust startup memory on
+    /// constrained deployments). The scan is restricted to the sweeping
+    /// partition's own key band: keys embed a 13-bit partition prefix, so
+    /// partition `p` mints exactly `[p << 51, (p+1) << 51)`, a contiguous
+    /// SIGNED range when persisted as `key as i64` (negative for partitions ≥
+    /// 4096 — the band bounds handle the sign flip, where a scan starting at
+    /// `-1` would have skipped every high partition's rows permanently, #1479
+    /// review finding). Bounding the enumeration keeps a P-partition sweep at
+    /// O(own rows) instead of O(P × store) enumeration under each partition's
+    /// engine-actor fence (#1479 review finding). Rows are inserted by
+    /// monotonically increasing keys, so a row written concurrently behind the
+    /// cursor belongs to a live instance (kept by construction); a row written
+    /// ahead of the cursor is seen by a later page and filtered against the
+    /// same sets.
     ///
     /// A SQLite failure — enumerating OR deleting — propagates as the typed
     /// [`rusqlite::Error`] and is latched into [`Self::forget_faults`] (never
@@ -1049,8 +1053,17 @@ impl VarSpillStore {
     /// (`spill` rows are also kept for `spill_referenced` keys; `cold` rows are
     /// not), so a both-tables delete would either take a spill-referenced
     /// key's payload with its orphaned cold row (the #1479 review finding) or
-    /// reap a live-but-unreferenced key's cold row early. The delete is further
-    /// bounded to keys `partition` minted (see [`gc_orphans`](Self::gc_orphans)).
+    /// reap a live-but-unreferenced key's cold row early.
+    ///
+    /// **The enumeration itself is bounded to `partition`'s key range** — keys
+    /// embed a 13-bit partition prefix, so partition `p` mints exactly
+    /// `[p << 51, (p+1) << 51)`, a contiguous SIGNED range when persisted as
+    /// `key as i64` (negative for partitions ≥ 4096). Restricting the scan to
+    /// that range keeps a P-partition sweep at O(own rows) instead of O(P ×
+    /// store) enumeration work — all of it previously done while the sweeping
+    /// partition's engine actor was held (#1479 review finding) — and makes the
+    /// delete's partition filter a belt-and-suspenders guard rather than the
+    /// only thing standing between a sweep and a cross-partition row.
     fn gc_orphans_in_table(
         &self,
         table: GcTable,
@@ -1060,15 +1073,25 @@ impl VarSpillStore {
         partition: u64,
     ) -> rusqlite::Result<u64> {
         let sql = match table {
-            GcTable::Spill => "SELECT key FROM spill WHERE key > ?1 ORDER BY key LIMIT ?2",
-            GcTable::Cold => "SELECT key FROM cold WHERE key > ?1 ORDER BY key LIMIT ?2",
+            GcTable::Spill => {
+                "SELECT key FROM spill WHERE key > ?1 AND key <= ?2 ORDER BY key LIMIT ?3"
+            }
+            GcTable::Cold => {
+                "SELECT key FROM cold WHERE key > ?1 AND key <= ?2 ORDER BY key LIMIT ?3"
+            }
         };
         let mut collected = 0u64;
-        // Every real key fits the signed range when persisted as `key as i64`,
-        // but partitions ≥ 4096 land ABOVE `i64::MAX` (their 13-bit partition
-        // prefix sets the sign bit), so the first page must start at the very
-        // bottom of the signed range — not at `-1`, which would skip them.
-        let mut cursor: i64 = i64::MIN;
+        // The partition's key band as SIGNED bounds (keys are persisted as
+        // `key as i64`). The band starts at `partition << 51` itself — a
+        // never-minted key (local counters start at 1) — so the `>` cursor
+        // comparison includes the partition's whole range from its first real
+        // key. Partitions ≥ 4096 have bands above `i64::MAX`: both bounds are
+        // then negative in SQLite's signed ordering and the comparison still
+        // holds (#1479 review finding — starting the scan at `-1` had skipped
+        // them entirely).
+        let band_start: i64 = (partition << nanobpmn_engine_core::LOCAL_BITS) as i64;
+        let band_end: i64 = band_start.saturating_add(nanobpmn_engine_core::LOCAL_MASK as i64);
+        let mut cursor: i64 = band_start;
         loop {
             // One bounded page. The statement (and its read cursor) is dropped
             // before the delete below, so the two never overlap on the
@@ -1080,7 +1103,9 @@ impl VarSpillStore {
                 (|| {
                     let mut stmt = conn.prepare_cached(sql)?;
                     let rows = stmt
-                        .query_map(params![cursor, FORGET_CHUNK as i64], |r| r.get::<_, i64>(0))?;
+                        .query_map(params![cursor, band_end, FORGET_CHUNK as i64], |r| {
+                            r.get::<_, i64>(0)
+                        })?;
                     let mut page = Vec::with_capacity(FORGET_CHUNK);
                     for key in rows {
                         page.push(key? as Key);
@@ -1101,9 +1126,9 @@ impl VarSpillStore {
                 // Table- and partition-scoped delete: this pass reaps only its
                 // own table's orphan rows that THIS partition minted (see the
                 // fn-level docs for why both-tables / cross-partition deletion
-                // is wrong). The count reflects actual deletes — a scanned
-                // orphan another partition minted is left for that partition's
-                // own fenced sweep, not counted here.
+                // is wrong). The band-restricted enumeration already yields
+                // only this partition's keys; the delete's filter is the
+                // defence-in-depth half of the same bound.
                 let deleted = Self::delete_keys_in_table(
                     &self.conn,
                     &self.activity,
@@ -2226,6 +2251,63 @@ mod tests {
         assert_eq!(collected, 2, "the low-partition orphan's 2 rows are reaped");
         assert!(store.try_get(low_orphan).unwrap().is_none());
         assert!(store.try_get_cold(low_orphan).unwrap().is_none());
+    }
+
+    /// #1479 review finding: with P hosted partitions sharing the store, a
+    /// sweep that ENUMERATES both whole tables per partition does O(P × store)
+    /// work while each partition's engine actor is fenced for its full sweep.
+    /// The scan must be restricted to the sweeping partition's own key band
+    /// (`[p << 51, (p+1) << 51)` as signed i64). This drives the bound
+    /// directly: an orphan INSIDE the band is reaped while rows OUTSIDE it
+    /// (another partition's) must come back byte-for-byte untouched — a
+    /// whole-table enumeration would visit (and a cross-partition delete would
+    /// reap) them.
+    #[test]
+    fn gc_orphans_enumeration_never_visits_rows_outside_the_partitions_key_band() {
+        use nanobpmn_engine_core::compose_key;
+
+        let store = VarSpillStore::open(None).unwrap();
+        // Partition 1's band: an orphan (reaped) and a live key (kept).
+        let own_orphan = compose_key(1, 5);
+        let own_live = compose_key(1, 6);
+        store.put(own_orphan, &vars("orphan")).unwrap();
+        store
+            .put_cold(own_orphan, &snapshot_for(own_orphan))
+            .unwrap();
+        store.put(own_live, &vars("live")).unwrap();
+        store.put_cold(own_live, &snapshot_for(own_live)).unwrap();
+        // Partition 0's band: rows a whole-table scan would visit and a
+        // cross-partition delete would reap. They must come back byte-for-byte
+        // untouched.
+        let foreign = compose_key(0, 5);
+        store.put(foreign, &vars("foreign")).unwrap();
+        store.put_cold(foreign, &snapshot_for(foreign)).unwrap();
+
+        let live: std::collections::HashSet<Key> = [own_live].into_iter().collect();
+        let collected = store
+            .gc_orphans(&live, &std::collections::HashSet::new(), 1)
+            .expect("sweep succeeds");
+
+        assert_eq!(collected, 2, "exactly the in-band orphan's 2 rows reaped");
+        assert!(store.try_get(own_orphan).unwrap().is_none());
+        assert!(store.try_get_cold(own_orphan).unwrap().is_none());
+        assert!(
+            store.try_get(own_live).unwrap().is_some(),
+            "in-band live spill row survives"
+        );
+        assert!(
+            store.try_get_cold(own_live).unwrap().is_some(),
+            "in-band live cold row survives"
+        );
+        assert_eq!(
+            store.try_get(foreign).unwrap(),
+            Some(vars("foreign")),
+            "the out-of-band row is byte-for-byte untouched (never enumerated, never deleted)"
+        );
+        assert!(
+            store.try_get_cold(foreign).unwrap().is_some(),
+            "the out-of-band cold row is untouched"
+        );
     }
 
     /// #1467 finding (reworked in #1338): a SQLite failure while ENUMERATING the
