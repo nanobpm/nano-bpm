@@ -536,6 +536,16 @@ impl ReadModel {
             .collect()
     }
 
+    /// Every message **start event** subscription across all shards (the
+    /// definition-scoped `START_EVENT` subscriptions carrying MCP tool metadata,
+    /// #1499).
+    pub fn message_start_subscriptions(&self) -> Vec<MessageStartSubscriptionRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.message_start_subscriptions())
+            .collect()
+    }
+
     /// Every open timer / signal / conditional wait across all shards
     /// (TIMER / SIGNAL / CONDITION wait states).
     pub fn event_waits(&self) -> Vec<EventWaitRow> {

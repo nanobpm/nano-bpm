@@ -38,7 +38,7 @@ use crate::backend;
 /// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
 /// already-current database short-circuit the additive reconcile on open, and it
 /// is the monotonic ladder the issue #831 fix is built around.
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 /// The schema version that introduced `event_waits`.
 const EVENT_WAITS_SCHEMA_VERSION: i64 = 9;
 /// `meta` key flagging that `event_waits` awaits an engine-state backfill.
@@ -55,6 +55,14 @@ const JOB_REPLAY_FLOOR_SCHEMA_VERSION: i64 = 12;
 /// below `exported_position`, so the migration backfills the column to that
 /// cursor (see [`ReadStore::ensure_schema_on`]).
 const JOB_EVENT_POSITION_SCHEMA_VERSION: i64 = 13;
+/// The schema version that introduced `message_start_subscriptions` (the
+/// definition-scoped message start event subscriptions carrying the MCP tool
+/// metadata, #1499). Purely additive (a new table): a database migrated across
+/// it starts with the table empty and the next deployment's
+/// `MessageStartSubscriptionCreated` (or the #732 engine-state reprojection)
+/// populates it.
+#[allow(dead_code)]
+const MESSAGE_START_SUBSCRIPTIONS_SCHEMA_VERSION: i64 = 14;
 
 /// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
@@ -64,7 +72,7 @@ const JOB_EVENT_POSITION_SCHEMA_VERSION: i64 = 13;
 /// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
 /// wipe trigger (that destructive behaviour was the root cause of issue #831).
 #[cfg(test)]
-const SCHEMA_FINGERPRINT: i64 = -6165013068443496289;
+const SCHEMA_FINGERPRINT: i64 = -2607941217815480261;
 
 /// The read model is a SQLite projection of the engine's event stream. Its
 /// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
@@ -320,6 +328,15 @@ CREATE TABLE message_subscriptions (
     non_interrupting       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
+CREATE TABLE message_start_subscriptions (
+    message_name           TEXT PRIMARY KEY,
+    process_definition_key INTEGER NOT NULL,
+    process_id             TEXT NOT NULL,
+    start_element_id       TEXT NOT NULL,
+    tool_name              TEXT,
+    tool_properties        TEXT NOT NULL DEFAULT '{}',
+    created_at_ms          INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE event_waits (
     wait_key               INTEGER PRIMARY KEY,
     wait_type              TEXT NOT NULL,
@@ -1547,6 +1564,35 @@ pub struct MessageSubscriptionRow {
     /// The owning process instance's `businessId` as it stood when this
     /// artifact was created (snapshot — a later assignment does not enrich it).
     pub business_id: Option<String>,
+}
+
+/// A projected **message start event** subscription: the definition-scoped
+/// subscription a deployed process's message start event holds, materialized
+/// from `MessageStartSubscriptionCreated` (Camunda 8.10 `START_EVENT` type,
+/// #1499). Keyed by message name — re-deploying a process with the same start
+/// message replaces the row. Unlike a [`MessageSubscriptionRow`] it is not
+/// bound to an instance (`instance_key`/`element_instance_key` are absent) and
+/// never settles; it stays open for the life of the deployment. Carries the MCP
+/// tool metadata the start event declared via `zeebe:properties`
+/// (`io.camunda.tool:*`).
+pub struct MessageStartSubscriptionRow {
+    /// The BPMN message name that triggers a new instance (the primary key).
+    pub message_name: String,
+    /// The definition (and version) whose instances this start event creates.
+    pub process_definition_key: Key,
+    pub process_id: String,
+    /// The start event element a new instance begins at.
+    pub start_element_id: String,
+    /// The MCP tool name (`io.camunda.tool:name`), when the start event
+    /// declares one.
+    pub tool_name: Option<String>,
+    /// The start event's `io.camunda.tool:*` zeebe:properties subset as a JSON
+    /// object string (the wire representation of the REST `toolProperties`
+    /// field). `"{}"` when the start event declares no tool properties.
+    pub tool_properties: String,
+    /// Projection-time timestamp (ms since epoch) of when this row was
+    /// materialised; surfaces as `lastUpdatedDate` in the search API.
+    pub created_at_ms: u64,
 }
 
 /// The kind of a non-job, non-message event wait (the TIMER / SIGNAL /
@@ -2956,6 +3002,22 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// All message **start event** subscriptions in this shard (the
+    /// definition-scoped `START_EVENT` subscriptions, #1499), keyed by message
+    /// name.
+    pub fn message_start_subscriptions(&self) -> Vec<MessageStartSubscriptionRow> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {MESSAGE_START_SUBSCRIPTION_COLS} FROM message_start_subscriptions"
+            ))
+            .or_corrupt("prepare message_start_subscriptions");
+        let rows = stmt
+            .query_map([], map_message_start_subscription)
+            .or_corrupt("query message_start_subscriptions");
+        rows.filter_map(Result::ok).collect()
+    }
+
     /// All open timer / signal / conditional waits in this shard.
     pub fn event_waits(&self) -> Vec<EventWaitRow> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -3493,6 +3555,24 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
         correlation_key: r.get(5)?,
         created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
         business_id: r.get(7)?,
+    })
+}
+
+/// Column list for `message_start_subscriptions` selects.
+const MESSAGE_START_SUBSCRIPTION_COLS: &str = "message_name, process_definition_key, process_id, \
+     start_element_id, tool_name, tool_properties, created_at_ms";
+
+fn map_message_start_subscription(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<MessageStartSubscriptionRow> {
+    Ok(MessageStartSubscriptionRow {
+        message_name: r.get(0)?,
+        process_definition_key: r.get::<_, i64>(1)? as Key,
+        process_id: r.get(2)?,
+        start_element_id: r.get(3)?,
+        tool_name: r.get(4)?,
+        tool_properties: r.get(5)?,
+        created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
     })
 }
 
@@ -4382,6 +4462,35 @@ fn project_engine_state(
         }
     }
 
+    // 11) Message start event subscriptions (definition-scoped, #1499). These
+    //     never settle, so every one held in engine state is live; project them
+    //     all, keyed by message name like the event projector.
+    for sub in state.message_start_subscriptions.values() {
+        let tool_properties_json =
+            serde_json::to_string(&sub.tool_properties).unwrap_or_else(|_| "{}".to_string());
+        tx.cexecute(
+            "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
+             process_id, start_element_id, tool_name, tool_properties, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(message_name) DO UPDATE SET \
+             process_definition_key = excluded.process_definition_key, \
+             process_id = excluded.process_id, \
+             start_element_id = excluded.start_element_id, \
+             tool_name = excluded.tool_name, \
+             tool_properties = excluded.tool_properties, \
+             created_at_ms = excluded.created_at_ms",
+            params![
+                sub.message_name,
+                sub.process_definition_key as i64,
+                sub.process_id,
+                sub.start_element_id,
+                sub.tool_name,
+                tool_properties_json,
+                now_ms as i64,
+            ],
+        )?;
+    }
+
     project_event_waits_from_state(tx, state)
 }
 
@@ -5011,6 +5120,46 @@ fn project_event(
                     ],
                 )?;
             }
+        }
+
+        // A process-level message start event subscription opened at deploy time
+        // (#1499): the definition-scoped `START_EVENT` row, carrying the MCP tool
+        // metadata the start event declared via `zeebe:properties`. Keyed by
+        // message name — a redeploy with the same start message replaces the row
+        // (mirroring the engine's `message_start_subscriptions` map). The
+        // `tool_properties` map is stored as a JSON object string (the REST
+        // `toolProperties` wire shape).
+        Event::MessageStartSubscriptionCreated {
+            process_definition_key,
+            process_id,
+            message_name,
+            start_element_id,
+            tool_name,
+            tool_properties,
+        } => {
+            let tool_properties_json =
+                serde_json::to_string(tool_properties).unwrap_or_else(|_| "{}".to_string());
+            tx.cexecute(
+                "INSERT INTO message_start_subscriptions (message_name, process_definition_key, \
+                 process_id, start_element_id, tool_name, tool_properties, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(message_name) DO UPDATE SET \
+                 process_definition_key = excluded.process_definition_key, \
+                 process_id = excluded.process_id, \
+                 start_element_id = excluded.start_element_id, \
+                 tool_name = excluded.tool_name, \
+                 tool_properties = excluded.tool_properties, \
+                 created_at_ms = excluded.created_at_ms",
+                params![
+                    message_name,
+                    *process_definition_key as i64,
+                    process_id,
+                    start_element_id,
+                    tool_name,
+                    tool_properties_json,
+                    now_ms as i64,
+                ],
+            )?;
         }
 
         // A message correlated to an open subscription: record it in the
@@ -6584,7 +6733,6 @@ fn project_event(
         | Event::ElementCompleting { .. }
         | Event::GatewayRouteSelected { .. }
         | Event::MessagePublished { .. }
-        | Event::MessageStartSubscriptionCreated { .. }
         | Event::MessageSubscriptionClosing { .. }
         | Event::MessageSubscriptionOpening { .. }
         | Event::MultiInstanceActivated { .. }

@@ -226,6 +226,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
             process_id,
             message_name,
             start_element_id,
+            tool_name,
+            tool_properties,
         } => {
             // Keyed by message name: re-deploying a process with the same start
             // message replaces the older version's subscription.
@@ -236,6 +238,8 @@ pub(super) fn apply_subscription(state: &mut State, event: &Event) {
                     process_id: process_id.clone(),
                     message_name: message_name.clone(),
                     start_element_id: start_element_id.clone(),
+                    tool_name: tool_name.clone(),
+                    tool_properties: tool_properties.clone(),
                 },
             );
         }

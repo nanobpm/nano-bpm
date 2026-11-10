@@ -12348,48 +12348,74 @@ impl ServerImpl {
 
     /// Searches open message subscriptions (Zeebe `searchMessageSubscriptions`).
     ///
-    /// Backed by the `message_subscriptions` read-model table, which retains only
-    /// *open*, instance-scoped subscriptions (a running element instance parked on
-    /// a message catch), dropped on correlate/cancel/terminate. Every retained row
-    /// therefore surfaces with `state = CREATED` and `type = PROCESS_EVENT`;
-    /// settled subscriptions and message-*start* (`START_EVENT`) subscriptions are
-    /// not materialised and so are not returned. Process-definition attributes are
-    /// resolved by joining each subscription's instance to `process_instances`.
+    /// Backed by two read-model tables:
+    /// * `message_subscriptions` retains only *open*, instance-scoped
+    ///   subscriptions (a running element instance parked on a message catch),
+    ///   dropped on correlate/cancel/terminate. Every retained row surfaces with
+    ///   `state = CREATED` and `type = PROCESS_EVENT`; settled subscriptions are
+    ///   not materialised and so are not returned. Process-definition attributes
+    ///   are resolved by joining each subscription's instance to
+    ///   `process_instances`.
+    /// * `message_start_subscriptions` (#1499) retains the definition-scoped
+    ///   message *start event* subscriptions, one per deployed start message.
+    ///   These surface with `type = START_EVENT`, a null `processInstanceKey` /
+    ///   `elementInstanceKey` / `correlationKey` (they are not bound to an
+    ///   instance), and the MCP tool metadata (`toolName` / `toolProperties`)
+    ///   the start event declared via `zeebe:properties` (`io.camunda.tool:*`).
     async fn search_message_subscriptions_impl(
         &self,
         body: &Option<models::MessageSubscriptionSearchQuery>,
     ) -> Result<apis::message_subscription::SearchMessageSubscriptionsResponse, ()> {
         use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
 
-        // Every open read-model subscription is a created, process-event catch.
         let state_str = models::MessageSubscriptionStateEnum::Created.to_string();
-        let type_str = models::MessageSubscriptionTypeEnum::ProcessEvent.to_string();
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let subs = self.store.message_subscriptions();
+        let start_subs = self.store.message_start_subscriptions();
 
-        // Resolve process-definition attributes by joining to the owning instance.
+        // Resolve process-definition attributes by joining to the owning instance
+        // (PROCESS_EVENT rows) or directly to the deployed definition
+        // (START_EVENT rows).
         let instances = self.store.process_instances();
         let by_instance: std::collections::HashMap<u64, &readstore::ProcessInstanceRow> =
             instances.iter().map(|inst| (inst.key, inst)).collect();
+        let definitions = self.store.process_definitions();
+        let by_definition_key: std::collections::HashMap<u64, &readstore::ProcessDefinitionRow> =
+            definitions.iter().map(|d| (d.key, d)).collect();
 
         struct MsgSubEntry {
             subscription_key: u64,
             process_definition_id: String,
             process_definition_key: Option<String>,
-            process_instance_key: u64,
+            /// `Some` for instance-scoped (`PROCESS_EVENT`) subscriptions; `None`
+            /// for definition-scoped (`START_EVENT`) ones.
+            process_instance_key: Option<u64>,
             element_id: String,
-            element_instance_key: u64,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT`.
+            element_instance_key: Option<u64>,
             last_updated_ms: u64,
             message_name: String,
-            correlation_key: String,
+            /// `Some` for `PROCESS_EVENT`; `None` for `START_EVENT` (a start
+            /// subscription correlates by message name only).
+            correlation_key: Option<String>,
             process_definition_version: Option<i32>,
             /// The owning instance's business id (joined, like the definition
             /// attributes): the single source for both filter and result.
+            /// `None` for `START_EVENT` rows (not bound to an instance).
             business_id: Option<String>,
+            /// The MCP tool name from the start event's `io.camunda.tool:name`
+            /// zeebe:property (#1499). `None` when the property is absent and on
+            /// `PROCESS_EVENT` rows.
+            tool_name: Option<String>,
+            /// The start event's `io.camunda.tool:*` zeebe:properties subset.
+            /// Empty when none and on `PROCESS_EVENT` rows.
+            tool_properties: std::collections::HashMap<String, String>,
+            /// The Zeebe `messageSubscriptionType` of this row.
+            is_start_event: bool,
         }
 
-        let entries: Vec<MsgSubEntry> = subs
+        let mut entries: Vec<MsgSubEntry> = subs
             .into_iter()
             .filter_map(|sub| {
                 // Skip subscriptions whose owning instance is not yet projected
@@ -12404,20 +12430,50 @@ impl ServerImpl {
                     subscription_key: sub.subscription_key,
                     process_definition_id: inst.process_definition_id.clone(),
                     process_definition_key: Some(inst.process_definition_key.clone()),
-                    process_instance_key: sub.instance_key,
+                    process_instance_key: Some(sub.instance_key),
                     element_id: sub.element_id,
-                    element_instance_key: sub.element_instance_key,
+                    element_instance_key: Some(sub.element_instance_key),
                     last_updated_ms: sub.created_at_ms,
                     message_name: sub.message_name,
-                    correlation_key: sub.correlation_key,
+                    correlation_key: Some(sub.correlation_key),
                     process_definition_version: Some(inst.version),
                     business_id: sub.business_id,
+                    tool_name: None,
+                    tool_properties: std::collections::HashMap::new(),
+                    is_start_event: false,
                 })
             })
             .collect();
 
-        // All Zeebe `MessageSubscriptionFilter` fields are honoured. Fields Nano
-        // does not yet project (`processDefinitionName`, `toolName`,
+        // Definition-scoped message start event subscriptions (#1499). The
+        // subscription key is the process definition key (nano keys message
+        // start subscriptions by it — see `MessageStartEventCorrelated`).
+        entries.extend(start_subs.into_iter().filter_map(|sub| {
+            let def = by_definition_key.get(&sub.process_definition_key)?;
+            Some(MsgSubEntry {
+                subscription_key: sub.process_definition_key,
+                process_definition_id: def.process_id.clone(),
+                process_definition_key: Some(sub.process_definition_key.to_string()),
+                process_instance_key: None,
+                element_id: sub.start_element_id,
+                element_instance_key: None,
+                last_updated_ms: sub.created_at_ms,
+                message_name: sub.message_name,
+                correlation_key: None,
+                process_definition_version: Some(def.version),
+                business_id: None,
+                tool_name: sub.tool_name,
+                tool_properties: serde_json::from_str(&sub.tool_properties).unwrap_or_default(),
+                is_start_event: true,
+            })
+        }));
+
+        // All Zeebe `MessageSubscriptionFilter` fields are honoured. `toolName`
+        // is projected for START_EVENT rows (the start event's
+        // `io.camunda.tool:name` zeebe:property, #1499) and absent elsewhere, so
+        // an equality/`$like` filter matches only tool-marked start
+        // subscriptions while `$exists: false` matches every row without a tool
+        // name. Fields Nano does not yet project (`processDefinitionName`,
         // `inboundConnectorType`) are matched against an absent value, so an
         // equality/`$like` filter on them correctly yields no rows (rather than
         // being silently ignored) while `$exists: false` still matches.
@@ -12426,6 +12482,11 @@ impl ServerImpl {
             .filter(|e| match filter {
                 None => true,
                 Some(f) => {
+                    let type_str = if e.is_start_event {
+                        models::MessageSubscriptionTypeEnum::StartEvent.to_string()
+                    } else {
+                        models::MessageSubscriptionTypeEnum::ProcessEvent.to_string()
+                    };
                     query::match_message_subscription_key(
                         &f.message_subscription_key,
                         &e.subscription_key.to_string(),
@@ -12433,17 +12494,24 @@ impl ServerImpl {
                         &f.process_definition_key,
                         e.process_definition_key.as_deref().unwrap_or(""),
                     ) && query::match_string(&f.process_definition_id, &e.process_definition_id)
-                        && query::match_process_instance_key(
+                        && query::match_process_instance_key_opt(
                             &f.process_instance_key,
-                            &e.process_instance_key.to_string(),
+                            e.process_instance_key
+                                .map(|k| k.to_string())
+                                .as_deref(),
                         )
                         && query::match_string(&f.element_id, &e.element_id)
-                        && query::match_element_instance_key(
+                        && query::match_element_instance_key_opt(
                             &f.element_instance_key,
-                            &e.element_instance_key.to_string(),
+                            e.element_instance_key
+                                .map(|k| k.to_string())
+                                .as_deref(),
                         )
                         && query::match_string(&f.message_name, &e.message_name)
-                        && query::match_string(&f.correlation_key, &e.correlation_key)
+                        && query::match_string_opt(
+                            &f.correlation_key,
+                            e.correlation_key.as_deref(),
+                        )
                         && query::match_message_subscription_state(
                             &f.message_subscription_state,
                             &state_str,
@@ -12462,7 +12530,7 @@ impl ServerImpl {
                             Some(e.last_updated_ms as i64),
                         )
                         && query::match_string_opt(&f.process_definition_name, None)
-                        && query::match_string_opt(&f.tool_name, None)
+                        && query::match_string_opt(&f.tool_name, e.tool_name.as_deref())
                         && query::match_string_opt(&f.inbound_connector_type, None)
                         && query::match_string_opt(&f.business_id, e.business_id.as_deref())
                 }
@@ -12487,11 +12555,17 @@ impl ServerImpl {
                 "processDefinitionVersion" => {
                     query::SortVal::Num(e.process_definition_version.unwrap_or(0) as i64)
                 }
-                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
+                "processInstanceKey" => {
+                    query::SortVal::Num(e.process_instance_key.unwrap_or(0) as i64)
+                }
                 "elementId" => query::SortVal::Str(e.element_id.clone()),
-                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "elementInstanceKey" => {
+                    query::SortVal::Num(e.element_instance_key.unwrap_or(0) as i64)
+                }
                 "messageName" => query::SortVal::Str(e.message_name.clone()),
-                "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
+                "correlationKey" => {
+                    query::SortVal::Str(e.correlation_key.clone().unwrap_or_default())
+                }
                 "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
                 "businessId" => query::SortVal::Str(e.business_id.clone().unwrap_or_default()),
                 _ => query::SortVal::Num(e.subscription_key as i64),
@@ -12525,26 +12599,42 @@ impl ServerImpl {
                         Some(k) => types::Nullable::Present(models::ProcessDefinitionKey(k)),
                         None => types::Nullable::Null,
                     },
-                    process_instance_key: types::Nullable::Present(models::ProcessInstanceKey(
-                        e.process_instance_key.to_string(),
-                    )),
+                    process_instance_key: match e.process_instance_key {
+                        Some(k) => types::Nullable::Present(models::ProcessInstanceKey(
+                            k.to_string(),
+                        )),
+                        None => types::Nullable::Null,
+                    },
                     root_process_instance_key: types::Nullable::Null,
                     element_id: e.element_id,
-                    element_instance_key: types::Nullable::Present(models::ElementInstanceKey(
-                        e.element_instance_key.to_string(),
-                    )),
+                    element_instance_key: match e.element_instance_key {
+                        Some(k) => types::Nullable::Present(models::ElementInstanceKey(
+                            k.to_string(),
+                        )),
+                        None => types::Nullable::Null,
+                    },
                     message_subscription_state: models::MessageSubscriptionStateEnum::Created,
                     last_updated_date: last_updated,
                     message_name: e.message_name,
-                    correlation_key: types::Nullable::Present(e.correlation_key),
-                    message_subscription_type: models::MessageSubscriptionTypeEnum::ProcessEvent,
-                    tool_properties: std::collections::HashMap::new(),
+                    correlation_key: match e.correlation_key {
+                        Some(k) => types::Nullable::Present(k),
+                        None => types::Nullable::Null,
+                    },
+                    message_subscription_type: if e.is_start_event {
+                        models::MessageSubscriptionTypeEnum::StartEvent
+                    } else {
+                        models::MessageSubscriptionTypeEnum::ProcessEvent
+                    },
+                    tool_properties: e.tool_properties,
                     process_definition_name: types::Nullable::Null,
                     process_definition_version: match e.process_definition_version {
                         Some(v) => types::Nullable::Present(v),
                         None => types::Nullable::Null,
                     },
-                    tool_name: types::Nullable::Null,
+                    tool_name: match e.tool_name {
+                        Some(name) => types::Nullable::Present(name),
+                        None => types::Nullable::Null,
+                    },
                     inbound_connector_type: types::Nullable::Null,
                     tenant_id: "<default>".to_string(),
                 }
@@ -32723,9 +32813,13 @@ mod clustered_startup_tests {
             "lastUpdatedDate after 2100 excludes"
         );
 
-        // Fields Nano does not project (processDefinitionName / toolName /
+        // Fields Nano does not project (processDefinitionName /
         // inboundConnectorType) are treated as absent: an equality filter yields
         // no rows (not silently ignored) while `$exists: false` matches.
+        // (`toolName` is no longer in this list — it is projected for
+        // START_EVENT subscriptions, #1499; this process deploys no message
+        // start event, so its PROCESS_EVENT row still carries no tool name and
+        // behaves like an absent field here.)
         for field_setter in [
             |f: &mut models::MessageSubscriptionFilter, v: models::StringFilterProperty| {
                 f.process_definition_name = Some(v)
@@ -32762,6 +32856,281 @@ mod clustered_startup_tests {
                 "$exists:false matches an unprojected field"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn search_message_subscriptions_projects_tool_name_on_start_events() {
+        // MCP gateway parity (#1499): a process whose message start event
+        // carries `zeebe:properties` tool markers deploys a definition-scoped
+        // START_EVENT subscription whose `toolName` / `toolProperties` are
+        // projected from `io.camunda.tool:*`, and the `toolName` filter honours
+        // the Zeebe semantics (equality / `$like` on an absent value match no
+        // rows; `$exists: false` matches rows with no tool name; `$exists: true`
+        // matches rows that have one).
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+
+        // A tool-marked message start process (the vendored Camunda e2e
+        // fixture), a plain message start process (no tool markers), and an
+        // instance-scoped catch process (a PROCESS_EVENT row once running).
+        let tool_xml =
+            include_str!("../../engine-core/tests/fixtures/mcp-process-with-inputs.bpmn");
+        let tool = parse_bpmn(tool_xml).expect("tool fixture parses");
+        let plain = ProcessBuilder::new("plain-start")
+            .message_start_event("s", "plain-message")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid plain message-start process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("mcpProcessWithInputs".to_string(), "mcp.bpmn".to_string());
+        names.insert("plain-start".to_string(), "plain.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        let mut defs = tool;
+        defs.push(plain);
+        defs.push(waiter);
+        server
+            .deploy_resources_locally(
+                defs,
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        // Start an instance of the waiter so a PROCESS_EVENT row exists too.
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+
+        // Poll until all three rows are projected (two START_EVENT + one
+        // PROCESS_EVENT).
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            let resp = server
+                .search_message_subscriptions_impl(&None)
+                .await
+                .expect("search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if result.items.len() == 3 {
+                items = result.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            items.len(),
+            3,
+            "two START_EVENT rows plus one PROCESS_EVENT row are projected"
+        );
+
+        // The tool-marked START_EVENT row carries the full tool metadata.
+        let tool_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "mcpProcessWithInputs")
+            .expect("the tool process's start subscription is projected");
+        assert_eq!(
+            tool_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(tool_row.element_id, "StartEvent_1");
+        assert_eq!(tool_row.message_name, "mcp-process-with-inputs");
+        assert_eq!(
+            tool_row.tool_name,
+            types::Nullable::Present("mcp-process-with-inputs".to_string())
+        );
+        assert_eq!(
+            tool_row.tool_properties.get("io.camunda.tool:input_1_name"),
+            Some(&"firstName".to_string())
+        );
+        assert_eq!(tool_row.tool_properties.len(), 9);
+        // A definition-scoped subscription is not bound to an instance.
+        assert_eq!(tool_row.process_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.element_instance_key, types::Nullable::Null);
+        assert_eq!(tool_row.correlation_key, types::Nullable::Null);
+        assert_eq!(
+            tool_row.message_subscription_state,
+            models::MessageSubscriptionStateEnum::Created
+        );
+        assert_eq!(tool_row.process_definition_version, types::Nullable::Present(1));
+
+        // The plain message start row is a START_EVENT with no tool metadata.
+        let plain_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "plain-start")
+            .expect("the plain process's start subscription is projected");
+        assert_eq!(
+            plain_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::StartEvent
+        );
+        assert_eq!(plain_row.tool_name, types::Nullable::Null);
+        assert!(plain_row.tool_properties.is_empty());
+
+        // The instance-scoped catch row is a PROCESS_EVENT with no tool metadata.
+        let catch_row = items
+            .iter()
+            .find(|i| i.process_definition_id == "waiter")
+            .expect("the waiter's catch subscription is projected");
+        assert_eq!(
+            catch_row.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::ProcessEvent
+        );
+        assert_eq!(catch_row.tool_name, types::Nullable::Null);
+        assert!(matches!(
+            catch_row.process_instance_key,
+            types::Nullable::Present(_)
+        ));
+
+        // Helper: run one filter and return the matched processDefinitionIds.
+        async fn matched_ids(
+            server: &ServerImpl,
+            filter: models::MessageSubscriptionFilter,
+        ) -> Vec<String> {
+            let resp = server
+                .search_message_subscriptions_impl(&Some(models::MessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                }))
+                .await
+                .expect("filtered search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            let mut ids: Vec<String> = result
+                .items
+                .into_iter()
+                .map(|i| i.process_definition_id)
+                .collect();
+            ids.sort();
+            ids
+        }
+        let tool_filter = |v: models::StringFilterProperty| models::MessageSubscriptionFilter {
+            tool_name: Some(v),
+            ..models::MessageSubscriptionFilter::new()
+        };
+
+        // toolName equality matches only the tool-marked START_EVENT row.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String(
+                    "mcp-process-with-inputs".to_string()
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // Equality on a value no row carries matches nothing.
+        assert!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::String("nope".to_string()))
+            )
+            .await
+            .is_empty(),
+            "equality on an absent tool name matches no rows"
+        );
+        // `$like` behaves like equality w.r.t. absent values.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_like: Some("mcp-process-*".to_string()),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: true` matches only the row that has a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(true),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["mcpProcessWithInputs".to_string()]
+        );
+        // `$exists: false` matches every row without a tool name.
+        assert_eq!(
+            matched_ids(
+                &server,
+                tool_filter(models::StringFilterProperty::AdvancedStringFilter(
+                    models::AdvancedStringFilter {
+                        dollar_exists: Some(false),
+                        ..models::AdvancedStringFilter::new()
+                    }
+                ))
+            )
+            .await,
+            vec!["plain-start".to_string(), "waiter".to_string()]
+        );
+
+        // messageSubscriptionType filters select each side.
+        let type_filter = |t: models::MessageSubscriptionTypeEnum| {
+            models::MessageSubscriptionFilter {
+                message_subscription_type: Some(
+                    models::MessageSubscriptionTypeFilterProperty::MessageSubscriptionTypeEnum(t),
+                ),
+                ..models::MessageSubscriptionFilter::new()
+            }
+        };
+        assert_eq!(
+            matched_ids(&server, type_filter(models::MessageSubscriptionTypeEnum::StartEvent))
+                .await,
+            vec!["mcpProcessWithInputs".to_string(), "plain-start".to_string()]
+        );
+        assert_eq!(
+            matched_ids(
+                &server,
+                type_filter(models::MessageSubscriptionTypeEnum::ProcessEvent)
+            )
+            .await,
+            vec!["waiter".to_string()]
+        );
+
+        // Correlating the tool message starts a new instance of the tool
+        // process (the subscription mints instances; the START_EVENT row stays).
+        let correlate = server
+            .correlate_message_impl(&models::MessageCorrelationRequest {
+                business_id: None,
+                name: "mcp-process-with-inputs".to_string(),
+                correlation_key: None,
+                variables: None,
+                tenant_id: None,
+            })
+            .await
+            .expect("correlate returns");
+        assert!(
+            matches!(
+                correlate,
+                apis::message::CorrelateMessageResponse::Status200_TheMessageIsCorrelatedToOneOrMoreProcessInstances(_)
+            ),
+            "the tool message starts an instance"
+        );
     }
 
     #[tokio::test]

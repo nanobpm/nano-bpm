@@ -130,6 +130,13 @@ pub(crate) fn parse_with_captures(
     // Gates `zeebe:header` reads to a real `zeebe:taskHeaders` container; each
     // header attaches to the innermost open activity on the io_stack.
     let mut in_task_headers = false;
+    // Gates `zeebe:property` reads to a real `zeebe:properties` container; each
+    // property attaches to the innermost open flow node on the io_stack (#1499).
+    // Without this gate a stray `<zeebe:property>` elsewhere in
+    // `extensionElements` (or the standard BPMN `<property>` data element, which
+    // `is_ignorable_tag` already treats as noise) would be misread as an
+    // extension property.
+    let mut in_properties = false;
     // Gates `zeebe:linkedResource` reads to a real `zeebe:linkedResources`
     // container; each link attaches to the innermost open activity on the
     // io_stack. Without this a stray `linkedResource` tag elsewhere in
@@ -1170,6 +1177,28 @@ pub(crate) fn parse_with_captures(
                                     in_task_headers = true;
                                 }
                             }
+                            // zeebe:properties and its nested zeebe:property
+                            // entries (#1499): generic vendor metadata
+                            // (`<zeebe:property name="…" value="…"/>`) attached to
+                            // the innermost open flow node on the io_stack —
+                            // Camunda's MCP tool markers (`io.camunda.tool:*`) and
+                            // inbound connector type (`inbound.type`) ride this
+                            // channel. Same container gate as `taskHeaders`: a
+                            // self-closing `<zeebe:properties />` has no children
+                            // and emits no end tag.
+                            "properties" => {
+                                if !self_closing {
+                                    in_properties = true;
+                                }
+                            }
+                            "property" if in_properties => {
+                                if let (Some(&idx), Some(name)) =
+                                    (io_stack.last(), attr(attrs, "name"))
+                                {
+                                    let value = attr(attrs, "value").unwrap_or("").to_string();
+                                    acc.nodes[idx].properties.insert(name.to_string(), value);
+                                }
+                            }
                             // zeebe:header key="…" value="…" inside a
                             // zeebe:taskHeaders container: a static custom header
                             // attached to the innermost open activity. Surfaced
@@ -1624,6 +1653,7 @@ pub(crate) fn parse_with_captures(
                     in_io_mapping = false;
                     in_execution_listeners = false;
                     in_task_listeners = false;
+                    in_properties = false;
                     extension_depth = 0;
                 }
                 "serviceTask" => {
@@ -1699,6 +1729,7 @@ pub(crate) fn parse_with_captures(
                     extension_depth = extension_depth.saturating_sub(1);
                 }
                 "taskHeaders" => in_task_headers = false,
+                "properties" => in_properties = false,
                 "linkedResources" => in_linked_resources = false,
                 "executionListeners" => in_execution_listeners = false,
                 "taskListeners" => in_task_listeners = false,

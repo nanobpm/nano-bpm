@@ -132,6 +132,12 @@ pub(super) struct NodeAcc {
     /// For a start event: the `zeebe:formDefinition formId` declared on it — the
     /// process's start form. `None` on other nodes and start events with no form.
     pub(super) start_form_id: Option<String>,
+    /// `zeebe:properties` extension properties (`<zeebe:property name value/>`)
+    /// declared on this node, in a deterministic map. Carried onto the built
+    /// [`Element::properties`](crate::model::Element::properties) so vendor
+    /// metadata (Camunda MCP tool markers, inbound connector types, …) survives
+    /// parsing (#1499). Empty when the node declares none.
+    pub(super) properties: std::collections::BTreeMap<String, String>,
     /// True when this `intermediateThrowEvent`/`endEvent` carries a
     /// `messageEventDefinition`. Together with a `zeebe:taskDefinition` it is a
     /// Zeebe *job worker* message event: activation creates a job and the job's
@@ -409,6 +415,7 @@ impl ProcessAcc {
             task_headers: std::collections::BTreeMap::new(),
             linked_resources: Vec::new(),
             start_form_id: None,
+            properties: std::collections::BTreeMap::new(),
             is_message_throw: false,
             is_compensation_throw: false,
             is_escalation_throw: false,
@@ -1444,6 +1451,8 @@ impl ProcessAcc {
             let node_start_listeners = node.start_listeners.clone();
             let node_end_listeners = node.end_listeners.clone();
             let node_task_listeners = node.task_listeners.clone();
+            let properties_id = node.id.clone();
+            let node_properties = node.properties.clone();
             // Only treat as multi-instance when an input collection was actually
             // declared; a bare `multiInstanceLoopCharacteristics` with no
             // `zeebe:loopCharacteristics inputCollection` degenerates to an
@@ -1696,6 +1705,9 @@ impl ProcessAcc {
             }
             if let Some(name) = node_name {
                 builder = builder.with_name(name_id, name);
+            }
+            if !node_properties.is_empty() {
+                builder = builder.with_properties(properties_id, node_properties);
             }
         }
         let associations = self.associations;
