@@ -3120,6 +3120,36 @@ fn seed_versions<'a, T>(
     all
 }
 
+/// Serialized-size budget for one `InstallDeployment` seed batch. Kept well
+/// under the cluster WebSocket handler's 16 MiB default frame limit so frame
+/// envelope overhead (and JSON escaping) never pushes a batch over it.
+const SEED_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Splits ordered seed events into consecutive batches whose JSON-serialized
+/// size stays within `max_bytes`, preserving order (so DRG-before-decision
+/// ordering survives batch boundaries). An event that alone exceeds the budget
+/// is sent in its own batch — it cannot be split, and it was already accepted
+/// as a single deployment, so it fits the frame limit on its own.
+fn chunk_seed_events(events: Vec<Event>, max_bytes: usize) -> Vec<Vec<Event>> {
+    let mut batches: Vec<Vec<Event>> = Vec::new();
+    let mut current: Vec<Event> = Vec::new();
+    let mut current_bytes = 0usize;
+    for event in events {
+        // `+ 1` accounts for the array separator.
+        let size = serde_json::to_vec(&event).map_or(0, |v| v.len()) + 1;
+        if !current.is_empty() && current_bytes + size > max_bytes {
+            batches.push(std::mem::take(&mut current));
+            current_bytes = 0;
+        }
+        current_bytes += size;
+        current.push(event);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
 /// The pure state → seed-events derivation behind
 /// [`deployment_replication_events`].
 fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State) -> Vec<Event> {
@@ -15757,19 +15787,30 @@ impl ServerImpl {
             if events.is_empty() {
                 return;
             }
+            let batches = chunk_seed_events(events, SEED_BATCH_MAX_BYTES);
             let topology = server.engine.topology().clone();
             for node in 0..topology.num_nodes() {
                 if node == topology.node_id {
                     continue;
                 }
-                loop {
+                // Send size-bounded batches (in order, so DRG-before-decision
+                // holds across batch boundaries) so an accumulated version
+                // history never exceeds the peer's WebSocket frame limit. A
+                // failed batch is retried on its own; acknowledged batches are
+                // not resent (install is idempotent per key either way).
+                let mut batch_idx = 0;
+                while batch_idx < batches.len() {
                     match server.peers.link(node).await {
-                        Ok(link) => match link.install_deployment(events.clone()).await {
+                        Ok(link) => match link.install_deployment(batches[batch_idx].clone()).await
+                        {
                             Ok(_) => {
-                                tracing::info!(
-                                    "seed deployment broadcast to node {node} acknowledged"
-                                );
-                                break;
+                                batch_idx += 1;
+                                if batch_idx == batches.len() {
+                                    tracing::info!(
+                                        "seed deployment broadcast to node {node} acknowledged"
+                                    );
+                                }
+                                continue;
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -28905,6 +28946,54 @@ mod clustered_startup_tests {
     /// owner still resolves those definitions via the index fallback. The seed
     /// must include them, or a freshly-seeded peer cannot resolve what the
     /// owner can.
+    /// #720: an accumulated version history (17 x 1 MiB generic resources)
+    /// exceeds the peer's 16 MiB frame limit as ONE `InstallDeployment` frame.
+    /// The seed must be split into ordered, size-bounded batches.
+    #[test]
+    fn seed_events_are_chunked_under_frame_budget_in_order() {
+        let mib = "x".repeat(1024 * 1024);
+        let events: Vec<Event> = (0..17)
+            .map(|i| Event::GenericResourceDeployed {
+                deployment_key: 0,
+                resource_key: i,
+                version: i as i32 + 1,
+                resource_id: "r.md".into(),
+                resource_name: "r.md".into(),
+                content: mib.clone(),
+            })
+            .collect();
+        let total: usize = events
+            .iter()
+            .map(|e| serde_json::to_vec(e).map_or(0, |v| v.len()))
+            .sum();
+        assert!(
+            total > 16 * 1024 * 1024,
+            "fixture must exceed the frame limit"
+        );
+        let batches = chunk_seed_events(events, SEED_BATCH_MAX_BYTES);
+        assert!(batches.len() > 1);
+        for b in &batches {
+            let size = serde_json::to_vec(b).map_or(usize::MAX, |v| v.len());
+            assert!(size <= SEED_BATCH_MAX_BYTES, "batch {size} over budget");
+        }
+        let keys: Vec<Key> = batches
+            .iter()
+            .flatten()
+            .map(|e| match e {
+                Event::GenericResourceDeployed { resource_key, .. } => *resource_key,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            (0..17).collect::<Vec<Key>>(),
+            "order preserved, nothing lost"
+        );
+        // An oversized single event still ships, alone.
+        let one = chunk_seed_events(batches.concat(), 10);
+        assert_eq!(one.len(), 17);
+    }
+
     #[tokio::test]
     async fn deployment_seed_includes_legacy_snapshot_latest_index_entries() {
         let node0 = clustered_node(0);
