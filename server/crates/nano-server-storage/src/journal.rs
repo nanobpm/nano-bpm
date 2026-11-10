@@ -2902,7 +2902,8 @@ impl Journal {
 
     /// Replicated-apply variant of
     /// [`rehydrate_activation_candidates`](Self::rehydrate_activation_candidates)
-    /// (#1470): pages in EVERY cold instance holding a job of this type, in
+    /// (#1470): pages in EVERY cold instance holding a job of this type (not
+    /// just `max_jobs` of them), in
     /// deterministic key order (no replica-local rotation cursor), and fails
     /// closed with [`EngineError::InstanceUnavailable`] on the first unreadable
     /// row, so an impaired replica never activates a different job set than a
@@ -2915,16 +2916,19 @@ impl Journal {
         let Some(cold) = self.cold.as_ref() else {
             return Ok(());
         };
+        if max_jobs == 0 {
+            return Ok(()); // a zero-job request activates nothing on any replica
+        }
+        // No `max_jobs` cutoff: which jobs win selection depends on engine
+        // ordering across ALL candidates, and residency differs per replica.
+        // Stopping early could leave a later cold-and-unreadable candidate
+        // unread on one replica while a resident copy is selected on another.
         let candidates = cold
             .index
             .instances_for_job_type_rotated(job_type, None, usize::MAX);
-        let mut restored = 0usize;
         for key in candidates {
-            if restored >= max_jobs {
-                break;
-            }
             match self.rehydrate_cold(key) {
-                ColdRehydration::Restored => restored += 1,
+                ColdRehydration::Restored => {}
                 ColdRehydration::Unreadable => {
                     return Err(EngineError::InstanceUnavailable { instance_key: key });
                 }
@@ -6541,6 +6545,30 @@ mod tests {
             impaired.cold_count(),
             2,
             "nothing applied on the impaired replica"
+        );
+        drop((healthy, impaired));
+        for p in paths {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    // #1470: an unreadable candidate BEYOND the `max_jobs` cutoff must still
+    // fail closed — selection order spans every candidate, so stopping early
+    // could let replicas with differing residency activate different jobs.
+    #[test]
+    fn replicated_activate_jobs_fails_closed_on_unreadable_candidate_beyond_cutoff() {
+        let (mut healthy, mut impaired, keys, paths) = replica_pair("raft-act-cut-1470", demo, 2);
+        corrupt_row(&paths[1], "cold", "snapshot", keys[1]);
+        let cmd = Command::activate_jobs("demo-work", "w", 1, 60_000, 0);
+
+        let (events, _) = healthy.apply_command(cmd.clone()).unwrap();
+        assert!(!events.is_empty(), "healthy replica activates a job");
+        assert_eq!(
+            impaired.apply_command(cmd).err(),
+            Some(EngineError::InstanceUnavailable {
+                instance_key: keys[1]
+            }),
+            "impaired replica must read past the cutoff and fail closed"
         );
         drop((healthy, impaired));
         for p in paths {
