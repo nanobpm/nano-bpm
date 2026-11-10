@@ -81,3 +81,15 @@ test('libduckdb version derives from processos/Cargo.lock', () => {
   const lock = readFileSync(join(root, 'processos', 'Cargo.lock'), 'utf8');
   assert.match(duckdbVersion(lockedCrateVersion(lock)), /^\d+\.\d+\.\d+$/);
 });
+
+// A job with system binaryen (wasm-opt on PATH) makes wasm-pack skip the
+// binaryen download, so its tools-cache entry lacks binaryen. The key and the
+// restore prefix must be partitioned on that, or a job without system binaryen
+// restores the incomplete (immutable) entry and still hits Releases.
+test('the wasm-pack tools cache is partitioned on system binaryen availability', () => {
+  const t = code(readFileSync(join(root, '.github', 'actions', 'wasm-pack-cache', 'action.yml'), 'utf8'));
+  assert.match(t, /command -v wasm-opt/);
+  const keys = t.match(/wasm-pack-tools-[^\n]*/g) ?? [];
+  assert.equal(keys.length, 2, 'expected a key and a restore-keys prefix');
+  for (const k of keys) assert.match(k, /steps\.wasmpack\.outputs\.binaryen/, k);
+});

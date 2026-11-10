@@ -16,6 +16,16 @@ runs:
       run: |
         echo "version=$(make -s print-wasm-pack-version)" >> "$GITHUB_OUTPUT"
         echo "WASM_PACK_CACHE=$HOME/.cache/nanobpm-wasm-pack" >> "$GITHUB_ENV"
+        # wasm-pack uses a system `wasm-opt` from PATH when present and then
+        # never downloads binaryen, so a job with system binaryen would save a
+        # tools entry WITHOUT binaryen. Partition the key on that so such an
+        # incomplete entry is never restored by a job that needs the download
+        # (cache entries are immutable and could not be repaired).
+        if command -v wasm-opt >/dev/null 2>&1; then
+          echo "binaryen=system" >> "$GITHUB_OUTPUT"
+        else
+          echo "binaryen=cached" >> "$GITHUB_OUTPUT"
+        fi
     - name: Cache the wasm-pack binary
       uses: actions/cache@v4
       with:
@@ -25,9 +35,9 @@ runs:
       uses: actions/cache@v4
       with:
         path: ~/.cache/nanobpm-wasm-pack
-        key: wasm-pack-tools-${{ runner.os }}-${{ runner.arch }}-${{ steps.wasmpack.outputs.version }}-${{ hashFiles('engine-wasm/Cargo.lock') }}
+        key: wasm-pack-tools-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.wasmpack.outputs.binaryen }}-${{ steps.wasmpack.outputs.version }}-${{ hashFiles('engine-wasm/Cargo.lock') }}
         restore-keys: |
-          wasm-pack-tools-${{ runner.os }}-${{ runner.arch }}-${{ steps.wasmpack.outputs.version }}-
+          wasm-pack-tools-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.wasmpack.outputs.binaryen }}-${{ steps.wasmpack.outputs.version }}-
     - name: Install wasm-pack
       shell: bash
       run: make install-wasm-pack
