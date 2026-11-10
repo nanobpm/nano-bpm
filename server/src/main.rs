@@ -27049,8 +27049,9 @@ async fn main() {
 
     // MCP gateway (Camunda parity, issue #1499): a stateless streamable-HTTP
     // MCP server at `/mcp/cluster` (slice 2; `/mcp/processes` lands in slice 3
-    // on the same seam). Off by default behind `NANOBPM_MCP_ENABLED`; the mount
-    // is a single call so sibling slices extend it without touching dispatch.
+    // on the same seam). On by default; `NANOBPM_MCP_ENABLED=false/0/off/no`
+    // opts out. The mount is a single call so sibling slices extend it without
+    // touching dispatch.
     // Built before `server` is moved into the REST router below.
     let mcp_server = server.clone();
 
@@ -27232,10 +27233,11 @@ async fn main() {
         app = app.merge(cluster_router);
     }
 
-    // MCP gateway (issue #1499 slice 2). Off by default; mounted only when
-    // `NANOBPM_MCP_ENABLED` is truthy so the server stays dark otherwise. The
-    // endpoint sits behind the same auth middleware as the REST API (the
-    // generated router's `ApiAuthBasic` guard applies app-wide).
+    // MCP gateway (issue #1499 slice 2). On by default (operator decision,
+    // epic #1499); mounted unless `NANOBPM_MCP_ENABLED` is explicitly falsy
+    // (`false`/`0`/`off`/`no`). The endpoint sits behind the same auth
+    // middleware as the REST API (the generated router's `ApiAuthBasic` guard
+    // applies app-wide).
     if mcp::mcp_enabled() {
         app = app.merge(mcp::mcp_router(mcp_server));
         tracing::info!("MCP gateway enabled: /mcp/cluster");

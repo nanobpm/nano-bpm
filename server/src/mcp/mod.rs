@@ -8,7 +8,8 @@
 //! drift from the REST behaviour.
 //!
 //! Two servers are mounted (both behind the same auth as the REST API and the
-//! `NANOBPM_MCP_ENABLED` gate, default off):
+//! `NANOBPM_MCP_ENABLED` gate, default on — set it to `false`/`0`/`off`/`no`
+//! to disable):
 //!
 //! - `/mcp/cluster` — Camunda's 18 static cluster tools (slice 2, this module).
 //! - `/mcp/processes` — dynamic per-process tools (slice 3, builds on the seam
@@ -45,17 +46,21 @@ const PROTOCOL_VERSION: &str = "2025-03-26";
 /// The `serverInfo` identity reported on `initialize`.
 const SERVER_NAME: &str = "nanobpm-mcp-gateway";
 
-/// The env gate (default **off**, matching `camunda.mcp.enabled`). Slice 4 owns
-/// the full config/docs/banner; this slice reads the key so the server is dark
-/// unless explicitly enabled. Accepts the usual truthy spellings.
+/// The env gate (default **on** — operator decision, epic #1499). Slice 4 owns
+/// the full config/docs/banner; this slice reads the key so the server is live
+/// unless explicitly disabled. Accepts the usual falsy spellings to opt out.
 pub(crate) const MCP_ENABLED_ENV: &str = "NANOBPM_MCP_ENABLED";
 
-/// Whether the MCP surface is enabled. Truthy spellings: `1`, `true`, `yes`,
-/// `on` (case-insensitive). Unset or anything else leaves it off.
+/// Whether the MCP surface is enabled. **On by default**; only an explicit
+/// falsy value — `0`, `false`, `no`, `off` (case-insensitive) — disables it.
+/// Unset or anything else leaves it on.
 pub(crate) fn mcp_enabled() -> bool {
-    std::env::var(MCP_ENABLED_ENV)
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false)
+    !matches!(
+        std::env::var(MCP_ENABLED_ENV)
+            .map(|v| v.to_ascii_lowercase())
+            .as_deref(),
+        Ok("0" | "false" | "no" | "off")
+    )
 }
 
 /// A named MCP tool: its advertised `tools/list` metadata plus the dispatch
@@ -324,6 +329,58 @@ mod tests {
         cluster_tool_servers().remove(0)
     }
 
+    /// A guard serialising tests that mutate the process environment (cargo
+    /// runs them in one process with shared env). Holds a static lock for the
+    /// guard's lifetime and restores the variable's prior value on drop.
+    struct EnvVarGuard {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvVarGuard {
+        /// Set `NANOBPM_MCP_ENABLED` to `value` for the closure's duration.
+        fn with_set<R>(self, value: &str, f: impl FnOnce() -> R) -> R {
+            // SAFETY: the guard holds the env lock, so no other test thread
+            // mutates the environment concurrently.
+            unsafe { std::env::set_var(self.key, value) };
+            f()
+        }
+
+        /// Unset `NANOBPM_MCP_ENABLED` for the closure's duration.
+        fn with_unset<R>(self, f: impl FnOnce() -> R) -> R {
+            // SAFETY: the guard holds the env lock, so no other test thread
+            // mutates the environment concurrently.
+            unsafe { std::env::remove_var(self.key) };
+            f()
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the guard still holds the env lock at drop time.
+            match &self.prior {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// Take the env lock and capture `NANOBPM_MCP_ENABLED`'s current value so
+    /// the guard can restore it on drop.
+    fn env_lock() -> EnvVarGuard {
+        static L: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let lock = L
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        EnvVarGuard {
+            key: MCP_ENABLED_ENV,
+            prior: std::env::var_os(MCP_ENABLED_ENV),
+            _lock: lock,
+        }
+    }
+
     /// `tools/list` returns exactly the 18 cluster tools, in snapshot order,
     /// with the right names and read-only annotations.
     #[test]
@@ -572,12 +629,26 @@ mod tests {
         assert_eq!(result["serverInfo"]["name"].as_str(), Some(SERVER_NAME));
     }
 
-    /// The MCP endpoint is dark unless `NANOBPM_MCP_ENABLED` is truthy. This
-    /// mirrors the REST surface's env-gate pattern (e.g. `NANOBPM_CORS`).
+    /// The MCP endpoint is on by default; only an explicit falsy
+    /// `NANOBPM_MCP_ENABLED` value (`false`/`0`/`off`/`no`, case-insensitive)
+    /// disables it. This mirrors the REST surface's env-gate pattern (e.g.
+    /// `NANOBPM_CORS`, which is likewise on unless set to `off`).
+    ///
+    /// Mutates the process env, so it serialises on a local lock — cargo runs
+    /// tests in one process with shared env.
     #[test]
-    fn mcp_enabled_gate_defaults_off() {
-        // Unset → off. (The test env never sets NANOBPM_MCP_ENABLED.)
-        assert!(!mcp_enabled(), "MCP is off by default");
+    fn mcp_enabled_gate_defaults_on_with_explicit_opt_out() {
+        env_lock().with_unset(|| assert!(mcp_enabled(), "MCP is on by default (unset)"));
+        for truthy in ["1", "true", "TRUE", "yes", "on", "enabled", ""] {
+            env_lock().with_set(truthy, || {
+                assert!(mcp_enabled(), "MCP stays on for {truthy:?}")
+            });
+        }
+        for falsy in ["false", "FALSE", "0", "off", "OFF", "no", "No"] {
+            env_lock().with_set(falsy, || {
+                assert!(!mcp_enabled(), "MCP is off for {falsy:?}")
+            });
+        }
     }
 
     /// The two operations Nano has not implemented yet still list (parity) and
