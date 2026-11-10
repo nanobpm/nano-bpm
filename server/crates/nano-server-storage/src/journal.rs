@@ -6495,7 +6495,9 @@ mod tests {
             let mut journal = Journal::in_memory();
             let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
             journal.set_cold_spill(store, 1, 0);
-            let _ = journal.apply_command(Command::DeployProcess(model())).unwrap();
+            let _ = journal
+                .apply_command(Command::DeployProcess(model()))
+                .unwrap();
             let mut keys = Vec::new();
             for _ in 0..n {
                 let (events, _) = journal
@@ -6524,13 +6526,22 @@ mod tests {
         let cmd = Command::activate_jobs("demo-work", "w", 1, 60_000, 0);
 
         let (events, _) = healthy.apply_command(cmd.clone()).unwrap();
-        assert!(!events.is_empty(), "healthy replica activates the oldest job");
+        assert!(
+            !events.is_empty(),
+            "healthy replica activates the oldest job"
+        );
         assert_eq!(
             impaired.apply_command(cmd).err(),
-            Some(EngineError::InstanceUnavailable { instance_key: keys[0] }),
+            Some(EngineError::InstanceUnavailable {
+                instance_key: keys[0]
+            }),
             "impaired replica must fail closed, not activate a different job"
         );
-        assert_eq!(impaired.cold_count(), 2, "nothing applied on the impaired replica");
+        assert_eq!(
+            impaired.cold_count(),
+            2,
+            "nothing applied on the impaired replica"
+        );
         drop((healthy, impaired));
         for p in paths {
             let _ = std::fs::remove_dir_all(p.parent().unwrap());
@@ -6563,7 +6574,9 @@ mod tests {
         assert!(!events.is_empty(), "healthy replica fires the due timer");
         assert_eq!(
             impaired.apply_command(cmd).err(),
-            Some(EngineError::InstanceUnavailable { instance_key: keys[0] }),
+            Some(EngineError::InstanceUnavailable {
+                instance_key: keys[0]
+            }),
             "impaired replica must fail closed, not skip the due timer"
         );
         assert_eq!(impaired.cold_count(), 1, "timer stays cold and armed");
