@@ -79,6 +79,43 @@ describe("foldTranscript", () => {
       ["assistant:A", "assistant:B", "output:plain harness output"],
     );
   });
+
+  it("parses events regardless of JSON property order or whitespace", () => {
+    const blocks = foldTranscript([
+      // Marker not the first property.
+      '{"kind":"message","text":"Hello","nwfTranscriptEvent":1}',
+      // Whitespace before the marker.
+      '{  "nwfTranscriptEvent" : 1, "kind": "message", "text": " world", "final": true }',
+      // Reordered tool call + result still pair.
+      '{"args":{"command":"ls"},"kind":"tool-call","callId":"t1","name":"Bash","nwfTranscriptEvent":1}',
+      '{"ok":true,"content":"done","nwfTranscriptEvent":1,"callId":"t1","kind":"tool-result"}',
+      // A JSON line without the marker stays raw output.
+      '{"some":"other json"}',
+    ]);
+    assert.deepEqual(blocks, [
+      {
+        kind: "text",
+        role: "assistant",
+        text: "Hello world",
+        messageId: undefined,
+        open: false,
+      },
+      {
+        kind: "tool",
+        name: "Bash",
+        detail: "ls",
+        callId: "t1",
+        ok: true,
+        result: "done",
+      },
+      {
+        kind: "text",
+        role: "output",
+        text: '{"some":"other json"}',
+        open: false,
+      },
+    ]);
+  });
 });
 
 describe("appendChunks", () => {

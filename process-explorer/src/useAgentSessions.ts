@@ -57,23 +57,37 @@ export function useLiveTranscript(
 ): LiveBlock[] | undefined {
   const follow = useExplorerData().agents?.followTranscript;
   const on = enabled && agentInstanceKey !== undefined && follow !== undefined;
-  const [blocks, setBlocks] = useState<LiveBlock[] | undefined>(undefined);
+  // The run key travels with the blocks: between a selection change and the
+  // effect's reset the render still holds the previous run's state, and the
+  // keyed LiveTail would mount under the new run's header showing the old
+  // transcript. Returning blocks only for the run they were folded from closes
+  // that stale-render window.
+  const [state, setState] = useState<
+    { key: string; blocks: LiveBlock[] } | undefined
+  >(undefined);
   useEffect(() => {
     if (!on) {
-      setBlocks(undefined);
+      setState(undefined);
       return;
     }
+    const key = agentInstanceKey!;
     let stopped = false;
     let from = 0;
     let carry = "";
     const lines: string[] = [];
     let timer: ReturnType<typeof setTimeout> | undefined;
-    setBlocks([]);
+    setState({ key, blocks: [] });
     const tick = async () => {
       try {
-        const page = await follow!(agentInstanceKey!, from);
-        if (stopped) return;
-        if (page) {
+        // Drain every page the producer already has — `completed` describes the
+        // stream, not the page: a completed stream can still span pages, so a
+        // single read would lose all later pages. An empty page (no entries, no
+        // offset advance) is the end of its data.
+        for (;;) {
+          const page = await follow!(key, from);
+          if (stopped) return;
+          if (!page) break;
+          const advanced = page.nextOffset !== from;
           from = page.nextOffset;
           const r = appendChunks(
             carry,
@@ -82,9 +96,22 @@ export function useLiveTranscript(
           carry = r.carry;
           if (r.lines.length) {
             lines.push(...r.lines);
-            setBlocks(foldTranscript(lines));
+            setState({ key, blocks: foldTranscript(lines) });
           }
-          if (page.status === "completed") return;
+          if (page.status === "completed") {
+            if (page.entries.length === 0 && !advanced) {
+              // A final line with no trailing newline never leaves `carry`
+              // while polling; flush it before the last fold.
+              if (carry.trim()) {
+                lines.push(carry);
+                carry = "";
+                setState({ key, blocks: foldTranscript(lines) });
+              }
+              return;
+            }
+            continue;
+          }
+          if (page.entries.length === 0 && !advanced) break;
         }
       } catch {
         // A failed poll is retried on the next tick.
@@ -97,5 +124,5 @@ export function useLiveTranscript(
       if (timer) clearTimeout(timer);
     };
   }, [on, agentInstanceKey, follow]);
-  return blocks;
+  return on && state?.key === agentInstanceKey ? state.blocks : undefined;
 }

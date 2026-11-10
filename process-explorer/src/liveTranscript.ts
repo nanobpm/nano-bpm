@@ -71,9 +71,19 @@ export function foldTranscript(lines: string[]): LiveBlock[] {
     const line = raw.trim();
     if (!line) continue;
     let ev: Ev | null = null;
-    if (line.startsWith('{"nwfTranscriptEvent"')) {
+    if (line.startsWith("{")) {
       try {
-        ev = JSON.parse(line) as Ev;
+        // Parse first, then check the marker: JSON property order and whitespace
+        // are not significant, so a prefix match would misrender a valid event
+        // whose marker is not the first property.
+        const parsed: unknown = JSON.parse(line);
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          (parsed as Ev).nwfTranscriptEvent !== undefined
+        ) {
+          ev = parsed as Ev;
+        }
       } catch {
         ev = null;
       }
