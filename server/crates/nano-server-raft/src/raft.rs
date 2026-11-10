@@ -806,6 +806,27 @@ pub fn durable_log_has_purge_hole(log_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The replication state journaled in each [`Event::RaftEntryApplied`] record
+/// (#1405): the applied log id and the membership in effect after it. Opaque to
+/// engine-core (carried as a JSON string), decoded only here.
+#[derive(Serialize, Deserialize)]
+struct JournaledRaftState {
+    log_id: LogId<NodeId>,
+    membership: StoredMembership<NodeId, BasicNode>,
+}
+
+/// Serializes the [`JournaledRaftState`] for `log_id` + `membership`.
+fn journaled_raft_state(
+    log_id: LogId<NodeId>,
+    membership: &StoredMembership<NodeId, BasicNode>,
+) -> std::io::Result<String> {
+    serde_json::to_string(&JournaledRaftState {
+        log_id,
+        membership: membership.clone(),
+    })
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// Metadata held by the Raft state machine: the last applied log id and
 /// membership. The materialized engine state itself lives on the partition's
 /// [`DeepthiHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
@@ -856,6 +877,11 @@ pub struct PartitionStateMachine {
     /// reason a statically-owned leader keeps the shell resident (its exporter
     /// drives eviction there instead).
     leader: Arc<AtomicU64>,
+    /// Test-only barrier (#1405): signalled by an adoption the instant it is
+    /// about to wait on the checkpoint permit, so a test can deterministically
+    /// observe that adoption reached the wait BEFORE touching the engine.
+    #[cfg(test)]
+    adoption_permit_waiting: Arc<tokio::sync::Notify>,
 }
 
 impl PartitionStateMachine {
@@ -917,6 +943,8 @@ impl PartitionStateMachine {
             node_id,
             evict_eligible,
             leader,
+            #[cfg(test)]
+            adoption_permit_waiting: Arc::default(),
         })
     }
 
@@ -963,21 +991,147 @@ impl PartitionStateMachine {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
-                Some(s) => s.path.clone(),
+                Some(s) => (s.path.clone(), s.meta.clone()),
                 None => return Ok(()),
             }
         };
+        let (path, meta) = path;
         let captured: nanobpmn_engine_core::EngineSnapshot =
             tokio::task::spawn_blocking(move || -> std::io::Result<_> {
                 let f = std::fs::File::open(&path)?;
                 nano_server_storage::snapstream::read_streaming_engine_snapshot_from(f)
             })
             .await??;
+        self.adopt_engine_snapshot(captured, &meta).await
+    }
+
+    /// The ONE snapshot-adoption routine (#1405), shared by boot-time adoption
+    /// ([`restore_from_current_snapshot`](Self::restore_from_current_snapshot))
+    /// and runtime `install_snapshot`: rebuilds the engine from `captured` IN
+    /// PLACE (keeping the journal's exporter / partition / var-store / spill
+    /// wiring) and then makes that state the journal's durable recovery base
+    /// (see below).
+    /// Adopting without checkpointing would leave a journal that lacks the
+    /// snapshot's state; once a later entry is journaled, a restart prefers that
+    /// journal and silently loses every snapshot-only instance.
+    ///
+    /// The adopted state's applied record is DERIVED from the snapshot's Raft
+    /// `meta` (the single source of truth), never trusted from the engine body:
+    /// a legacy snapshot body decodes with `raft_applied = None`, and
+    /// checkpointing that would let a crash before the snapshot pointer is
+    /// published boot with `last_applied = None` and re-execute committed
+    /// creates.
+    async fn adopt_engine_snapshot(
+        &self,
+        mut captured: nanobpmn_engine_core::EngineSnapshot,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+    ) -> anyhow::Result<()> {
+        captured.raft_applied = match meta.last_log_id {
+            Some(log_id) => Some((
+                log_id.index,
+                journaled_raft_state(log_id, &meta.last_membership)?,
+            )),
+            None => None,
+        };
+        // The checkpoint permit is acquired BEFORE the engine is restored and
+        // held through the base publication, and restore + checkpoint run in
+        // ONE actor turn: a periodic checkpoint can therefore never capture the
+        // adopted state (and overwrite its variables) between the restore and
+        // the base publication, which a crash would leave as an old snapshot
+        // paired with adopted variables.
+        let permit = self.adoption_checkpoint_permit().await;
         self.engine
             .with(move |journal| {
                 journal.restore_engine_from_snapshot(captured);
+                journal.checkpoint_base(permit.as_ref())
             })
-            .await;
+            .await
+            .map_err(|e| anyhow::anyhow!("checkpointing the adopted Raft snapshot failed: {e}"))
+    }
+
+    /// Selects the NEWEST consistent boot state for a durable member (#1405):
+    /// the journal-rebuilt engine (applied index = its last
+    /// [`Event::RaftEntryApplied`] record) or the durable Raft snapshot
+    /// (applied index = its meta), together with the matching applied/membership
+    /// metadata. The engine was rebuilt from the journal, so when the journal is
+    /// at or ahead of the snapshot restoring the OLDER snapshot over it would
+    /// discard the journaled suffix — and openraft would then re-execute (and
+    /// re-journal) that suffix, running every non-idempotent create twice.
+    /// Only a snapshot strictly ahead of the journal (or a journal with no
+    /// applied-entry record at all) is restored. The single canonical boot-state
+    /// rule for every durable bootstrap path.
+    async fn restore_newest_boot_state(&self) -> anyhow::Result<()> {
+        let journaled = self.journaled_applied().await?;
+        let snapshot = self
+            .current_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|s| s.meta.last_log_id);
+        match (journaled, snapshot) {
+            (Some(journal), Some(snap)) if snap > journal.log_id => {
+                // The snapshot is strictly newer: install it (its metadata was
+                // adopted in `new`); openraft replays only the tail after it.
+                self.restore_from_current_snapshot().await
+            }
+            (Some(_), _) => self.seed_last_applied_from_journal().await,
+            (None, Some(_)) => self.restore_from_current_snapshot().await,
+            (None, None) => Ok(()),
+        }
+    }
+
+    /// Acquires the journal's checkpoint permit for an adoption (#1405), off
+    /// the engine actor and before entering it (the periodic checkpoint takes
+    /// it the same way), so adoption is serialized with any in-flight periodic
+    /// capture -> publish cycle without the two deadlocking on the actor.
+    async fn adoption_checkpoint_permit(
+        &self,
+    ) -> Option<nano_server_storage::seglog::CheckpointPermit> {
+        let seg = self.engine.with(|journal| journal.seg_shared()).await;
+        match seg {
+            Some(seg) => {
+                #[cfg(test)]
+                self.adoption_permit_waiting.notify_one();
+                Some(seg.checkpoint_permit().await)
+            }
+            None => None,
+        }
+    }
+
+    /// Decodes the journal's last [`Event::RaftEntryApplied`] record, if any.
+    /// An undecodable record fails closed rather than guessing.
+    async fn journaled_applied(&self) -> anyhow::Result<Option<JournaledRaftState>> {
+        let Some((index, raft_state)) = self.engine.with(|journal| journal.raft_applied()).await
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raft_state).map(Some).map_err(|e| {
+            anyhow::anyhow!("undecodable Raft applied-entry record at index {index}: {e}")
+        })
+    }
+
+    /// Seeds `last_applied` (and the membership it established) from the
+    /// journal's last [`Event::RaftEntryApplied`] record (#1405), when it is
+    /// AHEAD of what the state machine already knows (no Raft snapshot, or an
+    /// older one). The engine was rebuilt from that journal, so every entry at
+    /// or below the record is already applied; without the seed openraft would
+    /// re-apply them from `last_applied = None` and execute non-idempotent
+    /// commands twice. An undecodable record fails closed (bootstrap errors)
+    /// rather than guessing.
+    async fn seed_last_applied_from_journal(&self) -> anyhow::Result<()> {
+        let Some(recorded) = self.journaled_applied().await? else {
+            return Ok(());
+        };
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if Some(recorded.log_id) > inner.last_applied {
+            tracing::info!(
+                partition = inner.partition_id,
+                last_applied = %recorded.log_id,
+                "raft: seeding last_applied from the journal's applied-entry record (#1405)"
+            );
+            inner.last_applied = Some(recorded.log_id);
+            inner.last_membership = recorded.membership;
+        }
         Ok(())
     }
 }
@@ -1068,7 +1222,8 @@ pub struct PartitionSnapshotBuilder {
     /// The streaming capture parts (#1337): a small control skeleton plus the
     /// resident per-instance payloads, the cold routing keys, and the store
     /// handles to resolve off-heap rows during the streaming serialize. `None`
-    /// once taken by `build_snapshot`. Holding the parts — rather than one folded
+    /// once taken by `build_snapshot`, or when the journal was fenced after an
+    /// aborted Raft entry (#1405) so no capture was taken. Holding the parts — rather than one folded
     /// `EngineSnapshot` — is what lets `build_snapshot` stream the cold set
     /// straight from the spill store to disk without materializing it in RAM.
     captured: Option<(
@@ -1100,8 +1255,9 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
                 ErrorVerb::Write,
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "refusing to build a Raft snapshot: the streaming capture parts \
-                     were already consumed (build_snapshot called twice); aborting \
+                    "refusing to build a Raft snapshot: no streaming capture (the \
+                     journal is fenced after an aborted Raft entry, #1405, or the parts \
+                     were already consumed by a second build_snapshot call); aborting \
                      before the covered log is purged",
                 ),
             )
@@ -1162,6 +1318,8 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
                 &write_path,
                 &header,
                 covered,
+                // Not a seglog journal base: no rebase-floor identity (#1405).
+                None,
                 capture,
                 &cold_keys,
                 stores,
@@ -1267,39 +1425,94 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     responses.push(ReplicatedResponse::default());
                 }
                 EntryPayload::Normal(batch) => {
-                    // Phase 1: apply every command in the batch in ONE actor hop,
-                    // returning per-command (events, commit) or the engine rejection.
+                    // Entry-level atomic apply (#1405): apply every command of the
+                    // batch against the LIVE journal in ONE actor hop, BUFFERING
+                    // the events, then journal the WHOLE entry — every command's
+                    // events plus a `RaftEntryApplied` record naming this log id —
+                    // as ONE atomic journal frame with a single durability barrier.
+                    // The reader drops a torn frame whole, so a crash can never
+                    // keep part of an entry, and the journal knows atomically which
+                    // entry it last applied (bootstrap seeds `last_applied` from it,
+                    // see `seed_last_applied_from_journal`).
+                    //
+                    // Per-command error classification
+                    // (`EngineError::is_environmental`, #1388):
+                    //
+                    // * DETERMINISTIC rejection — a pure function of `(command,
+                    //   replicated state)`, identical on every replica. It is
+                    //   recorded against its command and the batch CONTINUES.
+                    //
+                    // * ENVIRONMENTAL failure — an off-heap row THIS replica cannot
+                    //   read. The entry FAILS CLOSED: the buffer is discarded (the
+                    //   journal never sees any of the entry), `last_applied` does not
+                    //   move, and a `StorageError` makes openraft shut this replica's
+                    //   Raft core down. The live engine may hold the entry's partial
+                    //   effects, but they were never durable: recovery rebuilds from
+                    //   the journal, so nothing needs undoing and no non-idempotent
+                    //   prefix command can execute twice.
+                    //
                     // The command `kind` is captured alongside each outcome so the
                     // error-mapping phase below can apply the command-specific HTTP
-                    // status contract (`engine_error_status_for`) — a rejection like
-                    // `AdHocUnknownElement` maps to a different status for
-                    // `CompleteJob` than for `ActivateAdHocActivities`. #1308.
-                    type ApplyOutcome = Result<
-                        (Arc<Vec<Event>>, crate::journal::Commit),
-                        nanobpmn_engine_core::EngineError,
-                    >;
-                    let outcomes: Vec<(&'static str, ApplyOutcome)> = self
+                    // status contract (`engine_error_status_for`).
+                    type ApplyOutcome = Result<Arc<Vec<Event>>, nanobpmn_engine_core::EngineError>;
+                    let raft_state = {
+                        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        journaled_raft_state(log_id, &inner.last_membership)
+                    }
+                    .map_err(|e| {
+                        StorageError::from_io_error(ErrorSubject::StateMachine, ErrorVerb::Write, e)
+                    })?;
+                    type EntryOutcomes = Vec<(&'static str, ApplyOutcome)>;
+                    let applied: std::io::Result<(EntryOutcomes, crate::journal::Commit)> = self
                         .engine
                         .with(move |journal| {
-                            batch
-                                .items
-                                .into_iter()
-                                .map(|ReplicatedCommand { command, now }| {
-                                    // Per-command actor profiling (off unless
-                                    // NANOBPM_CMD_PROFILE): time + allocated-byte
-                                    // delta by command kind, on the engine thread.
-                                    let timer = crate::cmd_profile::start();
-                                    let kind = command.kind();
-                                    let outcome = journal.apply_command_at(command, now);
-                                    crate::cmd_profile::finish(timer, kind);
-                                    (kind, outcome)
-                                })
-                                .collect()
+                            journal.begin_raft_entry();
+                            let mut outcomes = Vec::with_capacity(batch.items.len());
+                            for ReplicatedCommand { command, now } in batch.items {
+                                // Per-command actor profiling (off unless
+                                // NANOBPM_CMD_PROFILE): time + allocated-byte
+                                // delta by command kind, on the engine thread.
+                                let timer = crate::cmd_profile::start();
+                                let kind = command.kind();
+                                let outcome = journal.apply_command_at(command, now);
+                                crate::cmd_profile::finish(timer, kind);
+                                match outcome {
+                                    Err(e) if e.is_environmental() => {
+                                        journal.abort_raft_entry();
+                                        return Err(std::io::Error::other(format!(
+                                            "environmental failure applying committed \
+                                             batch: {e}"
+                                        )));
+                                    }
+                                    outcome => outcomes.push((kind, outcome.map(|(ev, _)| ev))),
+                                }
+                            }
+                            let (_, commit) = journal
+                                .commit_raft_entry(log_id.index, raft_state)
+                                .inspect_err(|_| journal.abort_raft_entry())?;
+                            Ok((outcomes, commit))
                         })
                         .await;
+                    let (outcomes, commit) = match applied {
+                        Ok(ok) => ok,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "raft apply: failing closed on a committed entry \
+                                 (nothing journaled, last_applied NOT advanced) — \
+                                 recover this replica from its journal (#1405)"
+                            );
+                            return Err(StorageError::from_io_error(
+                                ErrorSubject::StateMachine,
+                                ErrorVerb::Write,
+                                e,
+                            ));
+                        }
+                    };
+                    // The entry's single durability barrier.
+                    commit.wait().await;
 
-                    // Phase 2: await the durable barriers (now coalesced by the
-                    // group-commit writer) and build the per-command responses.
+                    // Build the per-command responses.
                     let mut items = Vec::with_capacity(outcomes.len());
                     // A follower replica has no read-model exporter to drive
                     // hot-state eviction, so reclaim each instance's shell (+ its
@@ -1314,8 +1527,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     let mut terminal: Vec<nanobpmn_engine_core::Key> = Vec::new();
                     for outcome in outcomes {
                         match outcome {
-                            (_, Ok((events, commit))) => {
-                                commit.wait().await;
+                            (_, Ok(events)) => {
                                 if evict_terminal {
                                     terminal.extend(
                                         events.iter().filter_map(|e| e.terminal_instance_key()),
@@ -1351,9 +1563,35 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
                     responses.push(ReplicatedResponse { items });
                 }
                 EntryPayload::Membership(mem) => {
+                    // Journal the applied-entry record carrying the NEW
+                    // membership (#1405) so a snapshot-less bootstrap that seeds
+                    // `last_applied` from the journal also recovers the
+                    // membership the skipped log prefix established.
+                    let membership = StoredMembership::new(Some(log_id), mem);
+                    let raft_state = journaled_raft_state(log_id, &membership).map_err(|e| {
+                        StorageError::from_io_error(ErrorSubject::StateMachine, ErrorVerb::Write, e)
+                    })?;
+                    let commit = self
+                        .engine
+                        .with(move |journal| {
+                            journal.begin_raft_entry();
+                            journal
+                                .commit_raft_entry(log_id.index, raft_state)
+                                .map(|(_, commit)| commit)
+                                .inspect_err(|_| journal.abort_raft_entry())
+                        })
+                        .await
+                        .map_err(|e| {
+                            StorageError::from_io_error(
+                                ErrorSubject::StateMachine,
+                                ErrorVerb::Write,
+                                e,
+                            )
+                        })?;
+                    commit.wait().await;
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     inner.last_applied = Some(log_id);
-                    inner.last_membership = StoredMembership::new(Some(log_id), mem);
+                    inner.last_membership = membership;
                     responses.push(ReplicatedResponse::default());
                 }
             }
@@ -1387,7 +1625,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         };
         PartitionSnapshotBuilder {
             sm: self.clone(),
-            captured: Some(captured),
+            captured,
             last_applied,
             last_membership,
         }
@@ -1463,11 +1701,20 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         // journal's read-model exporter wiring (and partition id / var store /
         // spill tiers) MUST survive it, or an owned partition catching up via a
         // snapshot install stops projecting and leaks its completed backlog.
-        self.engine
-            .with(move |journal| {
-                journal.restore_engine_from_snapshot(captured);
-            })
-            .await;
+        // Adopt it through the single adoption routine, which also checkpoints
+        // it as the journal's recovery base BEFORE any later entry is accepted
+        // (#1405). The captured engine state carries the snapshot's applied
+        // record, so a crash before the pointer below is published still boots
+        // from a journal that wins at the snapshot's index. Fail closed: a
+        // replica whose journal cannot hold the base must not keep applying.
+        self.adopt_engine_snapshot(captured, meta)
+            .await
+            .map_err(|e| {
+                StorageIOError::write_snapshot(
+                    Some(meta.signature()),
+                    &std::io::Error::other(e.to_string()),
+                )
+            })?;
 
         {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -2063,6 +2310,10 @@ impl RaftPartition {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )?);
+        // A durable journal-backed engine already holds every entry its journal
+        // recorded: boot from the newer of journal and snapshot so openraft
+        // re-applies neither's entries (#1405).
+        state_machine.restore_newest_boot_state().await?;
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(
             Arc::new(NullTransport),
@@ -2139,7 +2390,17 @@ impl RaftPartition {
         // metadata, so openraft's `get_initial_state` reconciles cleanly and only
         // replays the post-snapshot log tail. Without this a rejoining node whose
         // log was purged fails to host the partition entirely.
-        state_machine.restore_from_current_snapshot().await?;
+        //
+        // A durable log resumes on-disk: the engine was rebuilt from its durable
+        // journal, so the NEWER of journal and snapshot wins, with matching
+        // applied metadata, and openraft only re-applies entries neither holds
+        // (#1405). A volatile (fresh-receiver) member restores its snapshot (if
+        // any) and otherwise installs the leader's.
+        if log_dir.is_some() {
+            state_machine.restore_newest_boot_state().await?;
+        } else {
+            state_machine.restore_from_current_snapshot().await?;
+        }
         let snapshot_progress = Arc::new(SnapshotSendProgress::default());
         let network = PartitionNetwork::new(transport, partition_id, snapshot_progress.clone());
         // One `Raft` handle, two possible log stores. The handle erases the log
@@ -3511,7 +3772,7 @@ mod tests {
         let captured = src.with(|j| j.streaming_snapshot_parts()).await;
         let mut ok_builder = PartitionSnapshotBuilder {
             sm: src_sm.clone(),
-            captured: Some(captured),
+            captured,
             last_applied: None,
             last_membership: StoredMembership::default(),
         };
@@ -3792,6 +4053,1178 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&log_dir);
+    }
+
+    // ---- #1405: an environmental (off-heap read) failure during apply must fail
+    // the replica CLOSED (StorageError → Raft core shutdown), never advance
+    // `last_applied` past a command a healthy replica applied; and a DETERMINISTIC
+    // rejection must NOT drop the independent later commands of the same batch. ----
+
+    /// A service-task process whose instance parks on the `demo-work` job (the
+    /// cold-spillable shape the #1388 journal tests use).
+    fn wait_process_command() -> Command {
+        let proc = ProcessBuilder::new("w")
+            .start_event("s")
+            .service_task("t", "demo-work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid wait process");
+        Command::DeployProcess(proc)
+    }
+
+    /// Drives `sm.apply` with one Normal entry carrying `commands` at `index`,
+    /// returning the outcome. This is the exact function openraft calls when a
+    /// committed entry reaches a replica.
+    #[allow(
+        clippy::result_large_err,
+        reason = "test helper returning openraft's StorageError verbatim; the production apply signature is fixed by the RaftStateMachine trait"
+    )]
+    async fn apply_entry(
+        sm: &Arc<PartitionStateMachine>,
+        index: u64,
+        commands: Vec<ReplicatedCommand>,
+    ) -> Result<Vec<ReplicatedResponse>, StorageError<NodeId>> {
+        use openraft::CommittedLeaderId;
+        let entry = Entry::<RaftConfig> {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+            payload: EntryPayload::Normal(ReplicatedBatch::new(commands)),
+        };
+        let mut sm = sm.clone();
+        RaftStateMachine::apply(&mut sm, vec![entry]).await
+    }
+
+    /// Boots a single-partition state machine over a fresh engine backed by a
+    /// cold-spill store at `store_path`, returning the engine handle + SM.
+    async fn cold_backed_sm(
+        store_path: &std::path::Path,
+    ) -> (DeepthiHandle, Arc<PartitionStateMachine>) {
+        let engine = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        engine
+            .with({
+                let store_path = store_path.to_path_buf();
+                move |j| {
+                    let store = Arc::new(
+                        nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                            .expect("open cold-spill store"),
+                    );
+                    j.set_cold_spill(store, 1, 0);
+                }
+            })
+            .await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+        (engine, sm)
+    }
+
+    /// Deploys `wait_process_command`, creates an instance, activates its
+    /// `demo-work` job, then expires the activation lock (entry 4) so the instance
+    /// goes idle and becomes cold-spillable. Returns `(job_key, instance_key)`.
+    async fn setup_parked_job(
+        sm: &Arc<PartitionStateMachine>,
+        engine: &DeepthiHandle,
+    ) -> (u64, u64) {
+        let setup = [
+            ReplicatedCommand {
+                command: wait_process_command(),
+                now: 1,
+            },
+            ReplicatedCommand {
+                command: Command::create_instance("w"),
+                now: 2,
+            },
+            ReplicatedCommand {
+                command: Command::activate_jobs("demo-work", "w", 1, 60_000, 3),
+                now: 3,
+            },
+            // Release the activation lock so the parked instance goes idle and is
+            // cold-spillable (a locked job keeps its instance hot).
+            ReplicatedCommand {
+                command: Command::ExpireJobs { now: 64_000 },
+                now: 64_000,
+            },
+        ];
+        let mut job_key = None;
+        for (i, cmd) in setup.into_iter().enumerate() {
+            let outcome = apply_entry(sm, (i + 1) as u64, vec![cmd])
+                .await
+                .expect("setup entry applies");
+            if i == 2 {
+                job_key = outcome[0].items[0].events.iter().find_map(|e| match e {
+                    Event::JobActivated { job_key, .. } => Some(*job_key),
+                    _ => None,
+                });
+            }
+        }
+        let job_key = job_key.expect("activation produced a job");
+        let instance_key = engine
+            .with(|j| j.state().instances.keys().next().copied())
+            .await
+            .expect("one live instance");
+        (job_key, instance_key)
+    }
+
+    /// Corrupts `instance_key`'s cold row in the store at `store_path` so any
+    /// read of it fails environmentally (`EngineError::InstanceUnavailable`).
+    fn corrupt_cold_row(store_path: &std::path::Path, instance_key: u64) {
+        let conn = rusqlite::Connection::open(store_path).expect("open store");
+        assert_eq!(
+            conn.execute(
+                "UPDATE cold SET snapshot = 'not-json{{' WHERE key = ?1",
+                [instance_key as i64],
+            )
+            .expect("corrupt"),
+            1
+        );
+    }
+
+    /// The core defect (#1405): a batch whose LATER command hits an unreadable
+    /// cold row on this replica must fail the WHOLE entry closed — `last_applied`
+    /// must NOT advance and the failed command must journal nothing — so a healthy
+    /// peer that applies the batch does not diverge from this replica.
+    #[tokio::test]
+    async fn apply_fails_closed_on_unreadable_state_instead_of_advancing_last_applied() {
+        let store_dir = unique_log_dir("1405-failclosed");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+        let (engine, sm) = cold_backed_sm(&store_path).await;
+        let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
+
+        // Spill the instance cold, then corrupt its row so the CompleteJob read
+        // fails environmentally on THIS replica.
+        engine
+            .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
+            .await;
+        corrupt_cold_row(&store_path, instance_key);
+
+        // A batch [deploy, complete_job]: the deploy succeeds, the completion hits
+        // the unreadable row. The whole entry must abort closed at index 5.
+        let batch = vec![
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 5,
+            },
+            ReplicatedCommand {
+                command: Command::complete_job(job_key),
+                now: 6,
+            },
+        ];
+        let refused = apply_entry(&sm, 5, batch).await;
+        assert!(refused.is_err(), "the impaired replica fails closed");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(4),
+            "last_applied stays at the pre-batch index (4), never advanced past the \
+             command a healthy replica applied"
+        );
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Finding #2 (data loss): a batch mixing a DETERMINISTIC rejection with an
+    /// independent later valid command must apply the valid command — the
+    /// rejection is per-command, not a batch abort. `[CompleteJob(unknown),
+    /// DeployProcess(valid)]` must still deploy.
+    #[tokio::test]
+    async fn deterministic_rejection_does_not_drop_later_independent_commands() {
+        let store_dir = unique_log_dir("1405-detrej");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+        let (engine, sm) = cold_backed_sm(&store_path).await;
+
+        // Entry 1: [CompleteJob(unknown key) -> deterministic JobNotFound,
+        //           DeployProcess(valid) -> must still apply].
+        let batch = vec![
+            ReplicatedCommand {
+                command: Command::complete_job(999_999),
+                now: 1,
+            },
+            ReplicatedCommand {
+                command: deploy_command(),
+                now: 2,
+            },
+        ];
+        let outcome = apply_entry(&sm, 1, batch)
+            .await
+            .expect("the entry applies (no environmental failure)");
+        let items = &outcome[0].items;
+        assert_eq!(items.len(), 2, "both commands get a per-command outcome");
+        assert!(
+            items[0].error.is_some(),
+            "the unknown-job completion is a per-command rejection (got {:?})",
+            items[0]
+        );
+        assert!(
+            items[1].error.is_none() && !items[1].events.is_empty(),
+            "the independent valid deploy is NOT dropped by the earlier rejection \
+             (got {:?})",
+            items[1]
+        );
+        // The deploy actually landed in replicated state.
+        let procs = engine.with(|j| j.state().processes.len()).await;
+        assert_eq!(
+            procs, 1,
+            "the valid deploy was applied, not silently dropped"
+        );
+        // And the entry was consumed (last_applied advanced) — deterministic
+        // rejections keep replicas in lockstep.
+        let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
+        assert_eq!(applied.map(|l| l.index), Some(1));
+
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Spawns an engine over the durable SEGMENTED journal rooted at `dir`
+    /// (replaying whatever it already holds).
+    fn durable_engine(dir: &std::path::Path) -> DeepthiHandle {
+        let (journal, _) = Journal::open_segmented(dir).expect("open segmented journal");
+        DeepthiHandle::spawn(journal, 0, None)
+    }
+
+    /// Attaches the cold-spill store at `store_path` to `engine`.
+    async fn attach_cold(engine: &DeepthiHandle, store_path: &std::path::Path) {
+        let store_path = store_path.to_path_buf();
+        engine
+            .with(move |j| {
+                let store = Arc::new(
+                    nano_server_storage::varspill::VarSpillStore::open(Some(&store_path))
+                        .expect("open cold-spill store"),
+                );
+                j.set_cold_spill(store, 1, 0);
+            })
+            .await;
+    }
+
+    /// Deterministically shuts a durable engine down: swaps its journal out of
+    /// the actor and drops it HERE, which joins the journal's writer thread
+    /// (`Journal::drop`). On return every acked write is on disk and no writer
+    /// still holds the journal open — so a reopen can never race the old
+    /// writer (the detached actor thread drops only the in-memory stand-in).
+    async fn shutdown_engine(engine: DeepthiHandle) {
+        let journal = engine
+            .with(|j| std::mem::replace(j, Journal::in_memory_partition(0)))
+            .await;
+        drop(engine);
+        drop(journal);
+    }
+
+    /// The commands of the entry the impaired replica fails closed on: a
+    /// DETERMINISTIC rejection, a NON-IDEMPOTENT create, then the completion
+    /// that hits the unreadable cold row.
+    fn failing_entry(job_key: u64) -> Vec<ReplicatedCommand> {
+        vec![
+            ReplicatedCommand {
+                command: Command::complete_job(999_999),
+                now: 5,
+            },
+            ReplicatedCommand {
+                command: Command::create_instance("w"),
+                now: 6,
+            },
+            ReplicatedCommand {
+                command: Command::complete_job(job_key),
+                now: 7,
+            },
+        ]
+    }
+
+    /// Crash/restart proof (#1405): an impaired replica fails closed on a
+    /// committed entry `[CompleteJob(unknown), CreateInstance, CompleteJob(
+    /// unreadable)]` whose NON-IDEMPOTENT create already ran against live
+    /// state. Entry-level atomicity means the journal saw NONE of it: reopening
+    /// the real disk-backed journal shows zero instances from the entry and an
+    /// applied index still at the previous entry. Re-applying after the store
+    /// heals yields exactly one new instance, byte-identical to a clean replica
+    /// — with the deterministic rejection ahead of the create in the same
+    /// entry (the old per-command-ordinal drift shape).
+    #[tokio::test]
+    async fn failed_closed_entry_journals_nothing_and_reapplies_exactly_once() {
+        let store_dir = unique_log_dir("1405-restart");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+        let journal_dir = store_dir.join("journal");
+
+        // Phase 1: the impaired replica fails closed on entry 5.
+        let (job_key, instance_key) = {
+            let engine = durable_engine(&journal_dir);
+            attach_cold(&engine, &store_path).await;
+            let sm: Arc<PartitionStateMachine> =
+                Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+            let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
+            engine
+                .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
+                .await;
+            corrupt_cold_row(&store_path, instance_key);
+            assert!(apply_entry(&sm, 5, failing_entry(job_key)).await.is_err());
+            let (applied, _) = sm.clone().applied_state().await.expect("applied_state");
+            assert_eq!(applied.map(|l| l.index), Some(4));
+            drop(sm);
+            shutdown_engine(engine).await;
+            (job_key, instance_key)
+        };
+
+        // Phase 2: RESTART over the same durable journal. NOTHING of entry 5
+        // is journaled: no instance from its create, applied index still 4.
+        let engine2 = durable_engine(&journal_dir);
+        let keys: Vec<u64> = engine2
+            .with(|j| j.state().instances.keys().copied().collect())
+            .await;
+        assert_eq!(
+            keys,
+            vec![instance_key],
+            "only the setup instance: the failed-closed entry's create was never journaled"
+        );
+        assert_eq!(
+            engine2.with(|j| j.raft_applied().map(|(i, _)| i)).await,
+            Some(4),
+            "the journal's applied-entry record still names entry 4"
+        );
+
+        heal_cold_row(&store_path, instance_key);
+        attach_cold(&engine2, &store_path).await;
+        let sm2: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine2.clone(), 0).expect("sm"));
+        sm2.seed_last_applied_from_journal()
+            .await
+            .expect("seed from journal");
+        let (seeded, _) = sm2.clone().applied_state().await.expect("applied_state");
+        assert_eq!(seeded.map(|l| l.index), Some(4), "seeded from the journal");
+
+        let recovered = apply_entry(&sm2, 5, failing_entry(job_key))
+            .await
+            .expect("the healed replica re-applies the entry");
+        let items = &recovered[0].items;
+        assert!(
+            items[0].error.is_some(),
+            "the unknown-job rejection replicates"
+        );
+        assert!(
+            items[1].error.is_none() && items[2].error.is_none(),
+            "create + completion apply after recovery (got {items:?})"
+        );
+        let created = items
+            .iter()
+            .flat_map(|i| i.events.iter())
+            .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+            .count();
+        assert_eq!(created, 1, "the create executed exactly once");
+
+        // Parity with a CLEAN replica that applied the same entry first time.
+        let clean_dir = unique_log_dir("1405-restart-clean");
+        std::fs::create_dir_all(&clean_dir).expect("clean store dir");
+        let (clean_engine, clean_sm) = cold_backed_sm(&clean_dir.join("replica.sqlite")).await;
+        let (clean_job, _) = setup_parked_job(&clean_sm, &clean_engine).await;
+        assert_eq!(clean_job, job_key, "same key sequence on the clean replica");
+        let clean = apply_entry(&clean_sm, 5, failing_entry(job_key))
+            .await
+            .expect("clean replica applies the entry");
+        assert!(clean[0].items[1].error.is_none() && clean[0].items[2].error.is_none());
+
+        let recovered_snapshot = engine2.with(|j| j.engine().snapshot()).await;
+        let clean_snapshot = clean_engine.with(|j| j.engine().snapshot()).await;
+        assert_eq!(
+            recovered_snapshot.state, clean_snapshot.state,
+            "recovered replica is byte-identical to the clean replica"
+        );
+
+        drop(sm2);
+        shutdown_engine(engine2).await;
+        let _ = std::fs::remove_dir_all(&store_dir);
+        let _ = std::fs::remove_dir_all(&clean_dir);
+    }
+
+    /// Heals `instance_key`'s cold row at `store_path` with the bytes a
+    /// healthy replica holds after [`setup_parked_job`].
+    fn heal_cold_row(store_path: &std::path::Path, instance_key: u64) {
+        let snap = {
+            let mut e = nanobpmn_engine_core::Engine::with_partition(0);
+            let _ = e.apply_command_at(wait_process_command(), 1).expect("d");
+            let _ = e
+                .apply_command_at(Command::create_instance("w"), 2)
+                .expect("c");
+            let _ = e
+                .apply_command_at(Command::activate_jobs("demo-work", "w", 1, 60_000, 3), 3)
+                .expect("a");
+            let _ = e
+                .apply_command_at(Command::ExpireJobs { now: 64_000 }, 64_000)
+                .expect("x");
+            e.snapshot_instance(instance_key)
+                .expect("instance snapshot")
+        };
+        let store = nano_server_storage::varspill::VarSpillStore::open(Some(store_path))
+            .expect("reopen store");
+        store.put_cold(instance_key, &snap).expect("heal the row");
+    }
+
+    /// Fencing after an abort (#1405): once an entry fails closed, the live
+    /// engine holds its partial, non-durable effects, so even after the cold
+    /// read CLEARS a periodic checkpoint must not persist them. Abort → heal →
+    /// checkpoint tick → restart: the journal-rebuilt replica holds no trace of
+    /// the refused entry, so re-applying it creates exactly once.
+    #[tokio::test]
+    async fn aborted_entry_fences_checkpoints_until_rebuilt() {
+        let store_dir = unique_log_dir("1405-fence");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        let store_path = store_dir.join("replica.sqlite");
+        let journal_dir = store_dir.join("journal");
+        let job_key = {
+            let engine = durable_engine(&journal_dir);
+            attach_cold(&engine, &store_path).await;
+            let sm: Arc<PartitionStateMachine> =
+                Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+            let (job_key, instance_key) = setup_parked_job(&sm, &engine).await;
+            engine
+                .with(|j| assert_eq!(j.force_cold_spill_all(), 1, "spilled cold"))
+                .await;
+            corrupt_cold_row(&store_path, instance_key);
+            assert!(apply_entry(&sm, 5, failing_entry(job_key)).await.is_err());
+            // The cold read clears, then the periodic checkpoint ticks.
+            heal_cold_row(&store_path, instance_key);
+            assert!(engine.with(|j| j.is_fenced()).await, "fenced after abort");
+            assert!(
+                engine.with(|j| j.snapshot_and_rotate()).await.is_none(),
+                "a checkpoint of the aborted prefix is refused"
+            );
+            assert!(
+                engine
+                    .with(|j| j.snapshot_and_rotate_lean())
+                    .await
+                    .is_none()
+            );
+            assert!(engine.with(|j| j.try_engine_snapshot()).await.is_none());
+            // The streaming capture paths (production non-lean checkpoint loop
+            // and the Raft snapshot builder) are fenced too.
+            assert!(
+                engine
+                    .with(|j| j.streaming_snapshot_and_rotate())
+                    .await
+                    .is_none(),
+                "a streaming checkpoint of the aborted prefix is refused"
+            );
+            assert!(
+                engine
+                    .with(|j| j.streaming_snapshot_parts())
+                    .await
+                    .is_none(),
+                "a Raft snapshot capture of the aborted prefix is refused"
+            );
+            let mut builder = sm.clone().get_snapshot_builder().await;
+            assert!(
+                builder.build_snapshot().await.is_err(),
+                "the Raft snapshot builder fails closed while fenced"
+            );
+            // Leader-local soft activation bypasses `apply_command_at`; it too
+            // must hand out no work from the aborted prefix.
+            assert!(
+                engine
+                    .with(|j| j.select_activatable_job_keys("demo-work", 10, u64::MAX / 2, false))
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .with(|j| j.activate_jobs_with_fetch("demo-work", "x", 10, 1, 1, Vec::new()))
+                    .await
+                    .is_empty()
+            );
+            assert!(
+                engine
+                    .with(move |j| j.resident_activated_job(job_key))
+                    .await
+                    .is_none()
+            );
+            assert!(
+                engine
+                    .with(|j| j.apply_command_at(Command::create_instance("w"), 9))
+                    .await
+                    .is_err_and(|e| e.is_environmental()),
+                "no further mutation while fenced"
+            );
+            drop(sm);
+            shutdown_engine(engine).await;
+            job_key
+        };
+        let engine = durable_engine(&journal_dir);
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            1,
+            "only the setup instance: nothing of the refused entry was checkpointed"
+        );
+        attach_cold(&engine, &store_path).await;
+        let sm: Arc<PartitionStateMachine> =
+            Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+        sm.seed_last_applied_from_journal().await.expect("seed");
+        let out = apply_entry(&sm, 5, failing_entry(job_key))
+            .await
+            .expect("re-apply after rebuild");
+        let created = out[0]
+            .items
+            .iter()
+            .flat_map(|i| i.events.iter())
+            .filter(|e| matches!(e, Event::ProcessInstanceCreated { .. }))
+            .count();
+        assert_eq!(created, 1);
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            2,
+            "no duplicate"
+        );
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&store_dir);
+    }
+
+    /// Boot-state selection (#1405): a durable journal AHEAD of the Raft
+    /// snapshot must win. Restoring the older snapshot over the journal-rebuilt
+    /// engine would discard the journaled suffix and make openraft re-execute
+    /// it — a duplicate `ProcessInstanceCreated` and shifted key counters.
+    #[tokio::test]
+    async fn boot_prefers_a_journal_ahead_of_an_older_snapshot() {
+        let dir = unique_log_dir("1405-boot-newest");
+        let journal_dir = dir.join("journal");
+        let snap_dir = dir.join("snapshots");
+        let new_sm = |engine: &DeepthiHandle| -> Arc<PartitionStateMachine> {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snap_dir.clone(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let before = {
+            let engine = durable_engine(&journal_dir);
+            let mut sm = new_sm(&engine);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            apply_entry(&sm, 2, one(Command::create_instance("w"), 2))
+                .await
+                .expect("2");
+            let mut builder = sm.get_snapshot_builder().await;
+            let _ = builder.build_snapshot().await.expect("snapshot at 2");
+            apply_entry(&sm, 3, one(Command::create_instance("w"), 3))
+                .await
+                .expect("3");
+            let state = engine.with(|j| j.engine().snapshot().state).await;
+            drop(sm);
+            shutdown_engine(engine).await;
+            state
+        };
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine);
+        let (adopted, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(adopted.map(|l| l.index), Some(2), "the snapshot is older");
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(3),
+            "the journal's index wins"
+        );
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(
+            after, before,
+            "journal state kept: no suffix lost, no counter shift"
+        );
+        drop(sm);
+        shutdown_engine(engine).await;
+
+        // The converse: a snapshot strictly AHEAD of the journal is restored.
+        let fresh = unique_log_dir("1405-boot-snapshot-ahead").join("journal");
+        let engine = durable_engine(&fresh);
+        let sm = new_sm(&engine);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        assert_eq!(engine.with(|j| j.state().instances.len()).await, 1);
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(2), "the snapshot's index");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(fresh.parent().expect("parent"));
+    }
+
+    /// Adopting a NEWER Raft snapshot over an older journal must make that
+    /// snapshot the journal's recovery base (#1405). Otherwise, once a later
+    /// entry is journaled (with a newer applied-entry record), the next restart
+    /// prefers the journal — which never held the snapshot's state — and loses
+    /// everything only the snapshot carried. Restart must yield snapshot +
+    /// suffix, identical to a peer that applied every entry.
+    #[tokio::test]
+    async fn adopted_snapshot_becomes_the_journal_recovery_base() {
+        let dir = unique_log_dir("1405-adopt-base");
+        let snap_dir = dir.join("snapshots");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
+        let expected = {
+            let engine = durable_engine(&dir.join("peer"));
+            let mut sm = new_sm(&engine, &snap_dir);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            for i in 2..=3 {
+                apply_entry(&sm, i, one(Command::create_instance("w"), i))
+                    .await
+                    .expect("create");
+            }
+            let mut builder = sm.get_snapshot_builder().await;
+            let _ = builder.build_snapshot().await.expect("snapshot at 3");
+            apply_entry(&sm, 4, one(Command::create_instance("w"), 4))
+                .await
+                .expect("4");
+            let state = engine.with(|j| j.engine().snapshot().state).await;
+            drop(sm);
+            shutdown_engine(engine).await;
+            state
+        };
+        // A replica whose journal only reached entry 1 (its own snapshots
+        // elsewhere), then boots over the shared NEWER snapshot at 3.
+        let journal_dir = dir.join("replica");
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm = new_sm(&engine, &dir.join("own-snapshots"));
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm = new_sm(&engine, &snap_dir);
+            sm.restore_newest_boot_state()
+                .await
+                .expect("adopt snapshot");
+            let (applied, _) = sm.clone().applied_state().await.expect("applied");
+            assert_eq!(applied.map(|l| l.index), Some(3), "snapshot adopted");
+            apply_entry(&sm, 4, one(Command::create_instance("w"), 4))
+                .await
+                .expect("4");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        // Restart: the journal (now at 4) wins and must hold the snapshot base.
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine, &snap_dir);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(4), "the journal wins");
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(after, expected, "snapshot + suffix, nothing lost");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RUNTIME snapshot install (openraft's `install_snapshot`, a lagging
+    /// replica catching up) must make the installed state the journal's recovery
+    /// base exactly like boot-time adoption (#1405) — both go through the one
+    /// `adopt_engine_snapshot` routine. Otherwise: journal at entry 1, install a
+    /// snapshot at 3, journal entry 4, restart -> the journal (now at 4) wins but
+    /// only holds entries 1 and 4, silently losing every snapshot-only instance.
+    #[tokio::test]
+    async fn runtime_installed_snapshot_becomes_the_journal_recovery_base() {
+        let dir = unique_log_dir("1405-install-base");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        // The reference peer: entries 1..=3, a snapshot at 3, then entry 4.
+        let peer = durable_engine(&dir.join("peer"));
+        let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
+        apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        for i in 2..=3 {
+            apply_entry(&peer_sm, i, one(Command::create_instance("w"), i))
+                .await
+                .expect("create");
+        }
+        let mut builder = peer_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("snapshot at 3");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        apply_entry(&peer_sm, 4, one(Command::create_instance("w"), 4))
+            .await
+            .expect("4");
+        let expected = peer.with(|j| j.engine().snapshot().state).await;
+        drop(peer_sm);
+        shutdown_engine(peer).await;
+
+        // A replica whose journal reached only entry 1 installs the snapshot at
+        // runtime, then journals entry 4.
+        let journal_dir = dir.join("replica");
+        let snaps = dir.join("replica-snapshots");
+        {
+            let engine = durable_engine(&journal_dir);
+            let mut sm = new_sm(&engine, &snaps);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            let mut received = sm
+                .begin_receiving_snapshot()
+                .await
+                .expect("begin receiving");
+            {
+                use tokio::io::AsyncWriteExt;
+                received.write_all(&bytes).await.expect("write body");
+                received.flush().await.expect("flush body");
+            }
+            sm.install_snapshot(&snap.meta, received)
+                .await
+                .expect("install snapshot");
+            apply_entry(&sm, 4, one(Command::create_instance("w"), 4))
+                .await
+                .expect("4");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        // Crash-restart: the journal (at 4) wins and must hold the installed base.
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine, &snaps);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(4), "the journal wins");
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(after, expected, "installed snapshot + suffix, nothing lost");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A LEGACY snapshot body (pre-#1405: decodes with `raft_applied = None`)
+    /// adopted at runtime and interrupted BEFORE the Raft snapshot pointer is
+    /// published must still boot at the snapshot's applied index: the
+    /// checkpointed base derives its applied record from the snapshot's Raft
+    /// meta. Otherwise the restart keeps the adopted engine state but seeds
+    /// `last_applied = None`, and openraft re-executes the committed creates.
+    #[tokio::test]
+    async fn legacy_snapshot_adoption_interrupted_before_pointer_keeps_applied_index() {
+        let dir = unique_log_dir("1405-legacy-adopt");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let peer = durable_engine(&dir.join("peer"));
+        let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
+        apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        for i in 2..=3 {
+            apply_entry(&peer_sm, i, one(Command::create_instance("w"), i))
+                .await
+                .expect("create");
+        }
+        let mut builder = peer_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("snapshot at 3");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        let expected = peer.with(|j| j.engine().snapshot().state).await;
+        drop(peer_sm);
+        shutdown_engine(peer).await;
+        let mut legacy =
+            nano_server_storage::snapstream::read_streaming_engine_snapshot_from(&bytes[..])
+                .expect("decode body");
+        legacy.raft_applied = None;
+
+        let journal_dir = dir.join("replica");
+        let snaps = dir.join("replica-snapshots");
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm = new_sm(&engine, &snaps);
+            apply_entry(&sm, 1, one(wait_process_command(), 1))
+                .await
+                .expect("1");
+            // Adopt + checkpoint, then "crash" before the pointer is published.
+            sm.adopt_engine_snapshot(legacy, &snap.meta)
+                .await
+                .expect("adopt");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        let engine = durable_engine(&journal_dir);
+        let sm = new_sm(&engine, &snaps);
+        sm.restore_newest_boot_state().await.expect("boot state");
+        let (applied, _) = sm.clone().applied_state().await.expect("applied");
+        assert_eq!(
+            applied.map(|l| l.index),
+            Some(3),
+            "the adopted base carries the snapshot's applied index"
+        );
+        let after = engine.with(|j| j.engine().snapshot().state).await;
+        assert_eq!(after, expected, "adopted state survives the crash");
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #1405: snapshot adoption must hold the journal checkpoint permit from
+    /// BEFORE the engine restore through the base publication. Otherwise a
+    /// periodic checkpoint could capture the adopted state (overwriting its
+    /// variables) before adoption publishes the rebase floor. Barrier: the test
+    /// holds the permit; adoption must not touch the engine until it is freed.
+    #[tokio::test]
+    async fn adoption_holds_checkpoint_permit_across_restore_and_publication() {
+        let dir = unique_log_dir("1405-adopt-permit");
+        let new_sm = |engine: &DeepthiHandle, snaps: &std::path::Path| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.to_path_buf(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let peer = durable_engine(&dir.join("peer"));
+        let mut peer_sm = new_sm(&peer, &dir.join("peer-snapshots"));
+        apply_entry(&peer_sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        for i in 2..=3 {
+            apply_entry(&peer_sm, i, one(Command::create_instance("w"), i))
+                .await
+                .expect("create");
+        }
+        let mut builder = peer_sm.get_snapshot_builder().await;
+        let snap = builder.build_snapshot().await.expect("snapshot at 3");
+        let mut bytes = Vec::new();
+        {
+            use tokio::io::AsyncReadExt;
+            let mut reader = snap.snapshot;
+            reader.read_to_end(&mut bytes).await.expect("read body");
+        }
+        let expected = peer.with(|j| j.engine().snapshot().state).await;
+        drop(peer_sm);
+        shutdown_engine(peer).await;
+        let captured =
+            nano_server_storage::snapstream::read_streaming_engine_snapshot_from(&bytes[..])
+                .expect("decode body");
+
+        let engine = durable_engine(&dir.join("replica"));
+        let sm = new_sm(&engine, &dir.join("replica-snapshots"));
+        apply_entry(&sm, 1, one(wait_process_command(), 1))
+            .await
+            .expect("1");
+        let before = engine.with(|j| j.engine().snapshot().state).await;
+        let seg = engine
+            .with(|j| j.seg_shared())
+            .await
+            .expect("segmented journal");
+        let held = seg.try_checkpoint_permit().expect("gate free");
+        let meta = snap.meta.clone();
+        let adopting = tokio::spawn({
+            let sm = Arc::clone(&sm);
+            async move { sm.adopt_engine_snapshot(captured, &meta).await }
+        });
+        // Deterministic barrier: adoption signals just before it waits on the
+        // permit. Had it restored the engine first, the state check below
+        // would observe the adopted state.
+        sm.adoption_permit_waiting.notified().await;
+        assert!(!adopting.is_finished(), "adoption waits for the permit");
+        assert_eq!(
+            engine.with(|j| j.engine().snapshot().state).await,
+            before,
+            "the engine is not restored while another checkpoint holds the permit"
+        );
+        drop(held);
+        adopting.await.expect("join").expect("adopt");
+        assert_eq!(engine.with(|j| j.engine().snapshot().state).await, expected);
+        assert!(
+            seg.try_checkpoint_permit().is_some(),
+            "the permit is released after publication"
+        );
+        drop(sm);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The round-robin start-dispatch cursor is the one engine field not
+    /// derived from events, so a replica seeding `last_applied` from its
+    /// journal (skipping command re-execution) must restore it from the
+    /// journaled `RaftEntryApplied` record (#1405). Otherwise the restarted
+    /// replica would route the next message start to a different partition
+    /// than a peer that never restarted.
+    #[tokio::test]
+    async fn restarted_replica_routes_round_robin_starts_like_its_peer() {
+        let dir = unique_log_dir("1405-rr");
+        let snaps = dir.join("snapshots");
+        let new_sm = |engine: &DeepthiHandle| {
+            Arc::new(
+                PartitionStateMachine::new(
+                    engine.clone(),
+                    0,
+                    snaps.clone(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("sm"),
+            )
+        };
+        let boot = |path: std::path::PathBuf| async move {
+            let engine = durable_engine(&path);
+            engine.with(|j| j.set_num_partitions(4)).await;
+            engine
+        };
+        let deploy = Command::DeployProcess(
+            ProcessBuilder::new("m")
+                .message_start_event("s", "go")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .expect("valid message-start process"),
+        );
+        let one = |command: Command, now: u64| vec![ReplicatedCommand { command, now }];
+        let start = || Command::correlate_message("go", "");
+        let journal_dir = dir.join("journal");
+        // Both replicas apply entries 1..=3 (a deploy + two round-robin starts).
+        let peer = boot(dir.join("peer")).await;
+        let peer_sm = new_sm(&peer);
+        let replica = boot(journal_dir.clone()).await;
+        let replica_sm = new_sm(&replica);
+        for sm in [&peer_sm, &replica_sm] {
+            apply_entry(sm, 1, one(deploy.clone(), 1)).await.expect("1");
+            apply_entry(sm, 2, one(start(), 2)).await.expect("2");
+            apply_entry(sm, 3, one(start(), 3)).await.expect("3");
+        }
+        let rr = peer.with(|j| j.engine().start_dispatch_rr()).await;
+        assert_eq!(rr, 2, "two round-robin starts advanced the cursor");
+        // The replica restarts and seeds `last_applied` from its journal.
+        drop(replica_sm);
+        shutdown_engine(replica).await;
+        let replica = boot(journal_dir).await;
+        let replica_sm = new_sm(&replica);
+        replica_sm
+            .restore_newest_boot_state()
+            .await
+            .expect("boot state");
+        let (applied, _) = replica_sm.clone().applied_state().await.expect("applied");
+        assert_eq!(applied.map(|l| l.index), Some(3), "seeded from the journal");
+        assert_eq!(
+            replica.with(|j| j.engine().start_dispatch_rr()).await,
+            rr,
+            "cursor restored from the applied-entry record"
+        );
+        // The next start routes identically on both.
+        apply_entry(&peer_sm, 4, one(start(), 4)).await.expect("4");
+        apply_entry(&replica_sm, 4, one(start(), 4))
+            .await
+            .expect("4");
+        assert_eq!(
+            replica.with(|j| j.engine().snapshot()).await.state,
+            peer.with(|j| j.engine().snapshot()).await.state,
+        );
+        assert_eq!(
+            replica.with(|j| j.engine().start_dispatch_rr()).await,
+            peer.with(|j| j.engine().start_dispatch_rr()).await,
+        );
+        // Audit (#1405): the key generator is the other scalar not stored as
+        // state; it is derived from the replayed keys and must match too.
+        assert_eq!(
+            replica.with(|j| j.engine().snapshot().next_local).await,
+            peer.with(|j| j.engine().snapshot().next_local).await,
+        );
+        drop(peer_sm);
+        drop(replica_sm);
+        shutdown_engine(peer).await;
+        shutdown_engine(replica).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A torn final frame drops the WHOLE entry (#1405): a crash mid-append of
+    /// a two-command entry can never keep the first command without the
+    /// second, nor the events without the applied-entry record.
+    #[tokio::test]
+    async fn torn_final_frame_drops_the_whole_entry() {
+        let dir = unique_log_dir("1405-torn");
+        let journal_dir = dir.join("journal");
+        {
+            let engine = durable_engine(&journal_dir);
+            let sm: Arc<PartitionStateMachine> =
+                Arc::new(PartitionStateMachine::new_temp(engine.clone(), 0).expect("sm"));
+            apply_entry(
+                &sm,
+                1,
+                vec![ReplicatedCommand {
+                    command: wait_process_command(),
+                    now: 1,
+                }],
+            )
+            .await
+            .expect("entry 1");
+            let two_creates = (0..2)
+                .map(|i| ReplicatedCommand {
+                    command: Command::create_instance("w"),
+                    now: 2 + i,
+                })
+                .collect();
+            apply_entry(&sm, 2, two_creates).await.expect("entry 2");
+            drop(sm);
+            shutdown_engine(engine).await;
+        }
+        // Sanity: intact, the journal holds both creates of entry 2.
+        {
+            let engine = durable_engine(&journal_dir);
+            assert_eq!(engine.with(|j| j.state().instances.len()).await, 2);
+            shutdown_engine(engine).await;
+        }
+        // Tear the tail of entry 2's frame (a crash mid-append).
+        let active = journal_dir.join(nano_server_storage::seglog::ACTIVE_NAME);
+        let len = std::fs::metadata(&active).expect("active segment").len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&active)
+            .expect("open active")
+            .set_len(len - 3)
+            .expect("truncate");
+
+        let engine = durable_engine(&journal_dir);
+        assert_eq!(
+            engine.with(|j| j.state().processes.len()).await,
+            1,
+            "entry 1 survives"
+        );
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            0,
+            "NEITHER create of the torn entry survives — all or nothing"
+        );
+        assert_eq!(
+            engine.with(|j| j.raft_applied().map(|(i, _)| i)).await,
+            Some(1),
+            "the applied-entry record of the torn entry is gone with it"
+        );
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Bootstrap without a Raft snapshot must NOT re-apply entries the durable
+    /// journal already holds (#1405): before the fix `last_applied` started at
+    /// `None`, so openraft re-applied the whole committed log on top of the
+    /// journal-rebuilt engine and every non-idempotent create ran twice.
+    #[tokio::test]
+    async fn bootstrap_without_snapshot_does_not_reapply_journaled_entries() {
+        let dir = unique_log_dir("1405-bootstrap");
+        let journal_dir = dir.join("journal");
+        let log_dir = dir.join("raftlog");
+        {
+            let engine = durable_engine(&journal_dir);
+            let part = RaftPartition::bootstrap_single_durable(
+                0,
+                0,
+                "http://self".into(),
+                engine.clone(),
+                &log_dir,
+            )
+            .await
+            .expect("bootstrap durable raft");
+            part.propose(wait_process_command(), 1)
+                .await
+                .expect("deploy");
+            part.propose(Command::create_instance("w"), 2)
+                .await
+                .expect("create");
+            part.raft.shutdown().await.expect("clean shutdown");
+            drop(part);
+            shutdown_engine(engine).await;
+        }
+        assert!(
+            read_snapshot_ptr(&log_dir.join("snapshots")).is_none(),
+            "no Raft snapshot: the bootstrap path under test"
+        );
+
+        let engine = durable_engine(&journal_dir);
+        assert_eq!(engine.with(|j| j.state().instances.len()).await, 1);
+        let journaled = engine
+            .with(|j| j.raft_applied().map(|(i, _)| i))
+            .await
+            .expect("the journal recorded its last applied entry");
+        let part = RaftPartition::bootstrap_single_durable(
+            0,
+            0,
+            "http://self".into(),
+            engine.clone(),
+            &log_dir,
+        )
+        .await
+        .expect("recover durable raft");
+        assert!(
+            part.raft.metrics().borrow().last_applied.map(|l| l.index) >= Some(journaled),
+            "last_applied seeded from the journal"
+        );
+        assert_eq!(
+            engine.with(|j| j.state().instances.len()).await,
+            1,
+            "the journaled create was NOT re-applied on bootstrap"
+        );
+        part.raft.shutdown().await.expect("clean shutdown");
+        drop(part);
+        shutdown_engine(engine).await;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The opaque replication state journaled in `RaftEntryApplied` decodes back
+    /// to the exact log id the seed relies on (#1405).
+    #[test]
+    fn journaled_raft_state_round_trips() {
+        use openraft::CommittedLeaderId;
+        let log_id = LogId::new(CommittedLeaderId::new(3, 1), 17);
+        let json = journaled_raft_state(log_id, &StoredMembership::default()).expect("encode");
+        let back: JournaledRaftState = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.log_id, log_id);
     }
 
     /// Polls `cond` until it holds or `timeout_ms` elapses.

@@ -25089,6 +25089,23 @@ fn boot_offheap_reconcile_allowed(raft: bool) -> bool {
     !raft
 }
 
+/// Refuses a Raft-backed node over the legacy unsegmented journal
+/// (`NANOBPMN_JOURNAL_SEGMENTED=0`, #1405). Raft apply journals each committed
+/// entry as one atomic frame ending in a keyless `RaftEntryApplied` record; the
+/// legacy multi-partition recovery loops route records by key
+/// (`partition_of(max_key)`) and cannot attribute that record to its
+/// partition, so a Raft node on them would lose or cross-apply its applied
+/// index. Fail at startup with an operator-actionable error instead.
+fn check_raft_journal_mode(raft: bool, segmented: bool) -> Result<(), String> {
+    if raft && !segmented {
+        return Err("NANOBPMN_RAFT is enabled but the journal is unsegmented \
+                    (NANOBPMN_JOURNAL_SEGMENTED=0): Raft-backed partitions require the \
+                    segmented journal — unset NANOBPMN_JOURNAL_SEGMENTED (or set it to 1)"
+            .to_string());
+    }
+    Ok(())
+}
+
 fn raft_enabled() -> bool {
     std::env::var("NANOBPMN_RAFT")
         .map(|v| {
@@ -26265,6 +26282,11 @@ async fn main() {
 
     let server = match journal_path {
         Some(journal_path) => {
+            if let Err(e) = check_raft_journal_mode(raft_enabled(), seglog::segmented_enabled()) {
+                tracing::error!("{e}");
+                eprintln!("nanobpm: refusing to start: {e}");
+                std::process::exit(2);
+            }
             // Persistent run: the read model is a per-partition sharded projection
             // of the journal(s), so reconcile every shard against the log before
             // serving. Each branch opens its shards (file-backed under `db_path`)
@@ -26683,6 +26705,10 @@ async fn main() {
                     let mut prev_covered: u64 = 0;
                     loop {
                         ticker.tick().await;
+                        // Serialize this capture -> publish cycle with a Raft
+                        // snapshot adoption's base checkpoint (#1405): taken off
+                        // the engine actor, held until the tick ends.
+                        let _permit = shared.checkpoint_permit().await;
                         // Capture the streaming halves + seal on the engine
                         // thread (a consistent read), then stream to disk OFF it
                         // so the whole cold/spilled set is never resident at once
@@ -26794,6 +26820,10 @@ async fn main() {
                     let mut prev_floor: u64 = 0;
                     loop {
                         ticker.tick().await;
+                        // Serialize this capture -> publish cycle with a Raft
+                        // snapshot adoption's base checkpoint (#1405): taken off
+                        // the engine actor, held until the tick ends.
+                        let _permit = shared.checkpoint_permit().await;
                         // Snapshot each owned partition; a `None` (writer gone)
                         // aborts this tick so compaction never runs on a partial
                         // watermark set. The non-lean path captures the STREAMING
@@ -36796,6 +36826,16 @@ mod clustered_startup_tests {
         if let Some(p) = node1.raft_registry().get(0) {
             p.raft.shutdown().await.ok();
         }
+    }
+
+    #[test]
+    fn raft_refuses_unsegmented_journal() {
+        // #1405: a Raft node on the legacy unsegmented journal fails at startup.
+        let err = check_raft_journal_mode(true, false).expect_err("raft + unsegmented refused");
+        assert!(err.contains("NANOBPMN_JOURNAL_SEGMENTED"), "{err}");
+        assert!(check_raft_journal_mode(true, true).is_ok());
+        assert!(check_raft_journal_mode(false, false).is_ok());
+        assert!(check_raft_journal_mode(false, true).is_ok());
     }
 
     #[test]

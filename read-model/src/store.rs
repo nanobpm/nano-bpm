@@ -6599,6 +6599,8 @@ fn project_event(
         | Event::ProcessInstanceTerminating { .. }
         | Event::ProcessStartTimerArmed { .. }
         | Event::ProcessStartTimerFired { .. }
+        // A Raft applied-entry record (#1405): no read-model state.
+        | Event::RaftEntryApplied { .. }
         | Event::ScopedCompensationCleared { .. }
         | Event::SequenceFlowTaken { .. }
         | Event::SignalBroadcast { .. }

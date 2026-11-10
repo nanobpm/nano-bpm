@@ -1200,6 +1200,29 @@ pub enum Event {
         message_name: String,
         correlation_key: String,
     },
+    /// A Raft applied-entry record (#1405): the LAST record of the single
+    /// atomic journal frame that carries every event of one committed Raft log
+    /// entry, so the journal knows — in the same all-or-nothing write as the
+    /// entry's effects — which Raft entry it last applied. `index` is the Raft
+    /// log index; `raft_state` is the replication layer's opaque serialization
+    /// of the applied log id and membership (engine-core never interprets it).
+    /// On a Raft bootstrap without a snapshot the state machine seeds its
+    /// `last_applied` from the journal-recovered record, so entries already in
+    /// the journal are never re-applied. State-neutral: the applier ignores it
+    /// and it carries no keys, so the read model is unaffected.
+    ///
+    /// `start_dispatch_rr` is the engine's round-robin start-dispatch cursor
+    /// after the entry applied. It is the one piece of engine state that is not
+    /// derived from events, so a replica that seeds `last_applied` from this
+    /// record (skipping command re-execution) restores it from here and routes
+    /// the next round-robin start identically to a peer that never restarted.
+    /// Additive: a pre-existing record decodes with `0`.
+    RaftEntryApplied {
+        index: u64,
+        raft_state: String,
+        #[cfg_attr(feature = "serde", serde(default))]
+        start_dispatch_rr: u64,
+    },
     /// An open message subscription was cancelled before correlating because the
     /// element it guarded left the flow first (e.g. a boundary subscription whose
     /// activity completed normally, or a sibling boundary subscription when
@@ -1817,6 +1840,7 @@ impl Event {
             | Event::MessageStartSubscriptionCreated { .. }
             | Event::ProcessStartTimerArmed { .. }
             | Event::ProcessStartTimerFired { .. }
+            | Event::RaftEntryApplied { .. }
             | Event::StartInstanceDispatched { .. } => None,
         }
     }

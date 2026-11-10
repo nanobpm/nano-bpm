@@ -20,6 +20,9 @@ anyhow = "1.0.102"
 # Journal frame compression in `seglog` (best-effort deflate framing; the
 # reader tolerates mixed framed/plaintext records).
 flate2 = "1.1.9"
+# Plaintext CRC-32 on journal frames (#1405): detects a torn frame whose
+# damaged bytes still parse (already in the tree via flate2).
+crc32fast = "1"
 # Async HTTP client for `remote_sink`'s remote read-model export sink. rustls
 # matches the gateway bin's reqwest build (feature unification makes the union
 # in the full workspace build; declared here so this crate is correct when
