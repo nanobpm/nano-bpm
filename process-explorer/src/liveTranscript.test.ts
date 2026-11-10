@@ -1,6 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { appendChunks, foldTranscript } from "./liveTranscript.ts";
+import {
+  appendChunks,
+  createTranscriptFolder,
+  foldTranscript,
+  LIVE_FOLD_TAIL,
+} from "./liveTranscript.ts";
 
 const ev = (o: Record<string, unknown>) =>
   JSON.stringify({ nwfTranscriptEvent: 1, ...o });
@@ -126,5 +131,100 @@ describe("appendChunks", () => {
       lines: ['{"b":2}'],
       carry: "",
     });
+  });
+});
+
+describe("createTranscriptFolder", () => {
+  it("matches foldTranscript when fed the same lines in one push or many", () => {
+    const lines = [
+      ev({
+        kind: "message",
+        role: "user",
+        text: "Do it",
+        mode: "snapshot",
+        final: true,
+      }),
+      ev({ kind: "message", role: "assistant", text: "Look", messageId: "m1" }),
+      ev({ kind: "message", role: "assistant", text: "ing", messageId: "m1" }),
+      ev({
+        kind: "tool-call",
+        name: "Bash",
+        callId: "t1",
+        args: { command: "git log" },
+      }),
+      ev({ kind: "tool-result", callId: "t1", ok: true, content: "done" }),
+      ev({ kind: "message", role: "assistant", text: "Next" }),
+      "plain harness output",
+    ];
+    const batch = foldTranscript(lines);
+    const onePush = createTranscriptFolder(Number.MAX_SAFE_INTEGER);
+    assert.deepEqual(onePush.push(lines), batch);
+    const perLine = createTranscriptFolder(Number.MAX_SAFE_INTEGER);
+    for (const line of lines) perLine.push([line]);
+    assert.deepEqual(perLine.blocks(), batch);
+  });
+
+  it("appends deltas to an open message across pushes", () => {
+    const f = createTranscriptFolder();
+    f.push([ev({ kind: "message", role: "assistant", text: "Hel" })]);
+    f.push([ev({ kind: "message", role: "assistant", text: "lo" })]);
+    const blocks = f.push([
+      ev({ kind: "message", role: "assistant", text: "!", final: true }),
+    ]);
+    assert.deepEqual(blocks, [
+      {
+        kind: "text",
+        role: "assistant",
+        text: "Hello!",
+        messageId: undefined,
+        open: false,
+      },
+    ]);
+  });
+
+  it("pairs a tool result with a call pruned from the display tail", () => {
+    const f = createTranscriptFolder();
+    f.push([ev({ kind: "tool-call", name: "Bash", callId: "t1", args: {} })]);
+    // Bury the call under more blocks than the tail retains.
+    f.push(
+      Array.from({ length: LIVE_FOLD_TAIL + 10 }, (_, i) =>
+        ev({
+          kind: "message",
+          role: "assistant",
+          text: `m${i}`,
+          start: true,
+          final: true,
+        }),
+      ),
+    );
+    const blocks = f.push([
+      ev({ kind: "tool-result", callId: "t1", ok: true, content: "done" }),
+    ]);
+    assert.equal(blocks.length, LIVE_FOLD_TAIL);
+    // The call itself is pruned from the display; the pairing must not crash or
+    // corrupt the tail, and a later unmatched result is simply dropped.
+    assert.equal(blocks[0].kind, "text");
+    f.push([ev({ kind: "tool-result", callId: "nope", content: "x" })]);
+    assert.equal(f.blocks().length, LIVE_FOLD_TAIL);
+  });
+
+  it("bounds retained blocks to the tail plus the open message", () => {
+    const f = createTranscriptFolder();
+    const many = Array.from({ length: LIVE_FOLD_TAIL * 3 }, (_, i) =>
+      ev({
+        kind: "message",
+        role: "assistant",
+        text: `m${i}`,
+        start: true,
+        final: true,
+      }),
+    );
+    const blocks = f.push(many);
+    assert.equal(blocks.length, LIVE_FOLD_TAIL);
+    // The tail is the newest blocks, in order.
+    assert.deepEqual(
+      blocks.map((b) => (b.kind === "text" ? b.text : b.name)),
+      many.slice(-LIVE_FOLD_TAIL).map((_, i) => `m${LIVE_FOLD_TAIL * 2 + i}`),
+    );
   });
 });

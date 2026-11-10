@@ -4,7 +4,7 @@ import { useExplorerData } from "./dataSource.tsx";
 import { orderHistory } from "./agentHistory.ts";
 import {
   appendChunks,
-  foldTranscript,
+  createTranscriptFolder,
   type LiveBlock,
 } from "./liveTranscript.ts";
 
@@ -55,7 +55,14 @@ export function useLiveTranscript(
   agentInstanceKey: string | undefined,
   enabled: boolean,
 ): LiveBlock[] | undefined {
-  const follow = useExplorerData().agents?.followTranscript;
+  // Keep the agents object, not the bare method: a host implementation whose
+  // followTranscript uses `this` (e.g. to reach its API client) loses that
+  // receiver through `agents?.followTranscript` and throws on every poll — the
+  // catch below then suppresses it and the panel stays at "Waiting for the
+  // agent…". Calling it as `agents.followTranscript(...)` preserves the
+  // receiver, as the agent queries above do.
+  const agents = useExplorerData().agents;
+  const follow = agents?.followTranscript;
   const on = enabled && agentInstanceKey !== undefined && follow !== undefined;
   // The run key travels with the blocks: between a selection change and the
   // effect's reset the render still holds the previous run's state, and the
@@ -74,7 +81,10 @@ export function useLiveTranscript(
     let stopped = false;
     let from = 0;
     let carry = "";
-    const lines: string[] = [];
+    // Fold incrementally: replaying the full log on every poll is quadratic
+    // work over an ever-growing transcript and retains it all, so new lines
+    // fold into the folder's bounded state instead (see createTranscriptFolder).
+    const folder = createTranscriptFolder();
     let timer: ReturnType<typeof setTimeout> | undefined;
     setState({ key, blocks: [] });
     const tick = async () => {
@@ -84,7 +94,7 @@ export function useLiveTranscript(
         // single read would lose all later pages. An empty page (no entries, no
         // offset advance) is the end of its data.
         for (;;) {
-          const page = await follow!(key, from);
+          const page = await agents!.followTranscript!(key, from);
           if (stopped) return;
           if (!page) break;
           const advanced = page.nextOffset !== from;
@@ -95,17 +105,16 @@ export function useLiveTranscript(
           );
           carry = r.carry;
           if (r.lines.length) {
-            lines.push(...r.lines);
-            setState({ key, blocks: foldTranscript(lines) });
+            setState({ key, blocks: folder.push(r.lines) });
           }
           if (page.status === "completed") {
             if (page.entries.length === 0 && !advanced) {
               // A final line with no trailing newline never leaves `carry`
               // while polling; flush it before the last fold.
               if (carry.trim()) {
-                lines.push(carry);
+                const rest = carry;
                 carry = "";
-                setState({ key, blocks: foldTranscript(lines) });
+                setState({ key, blocks: folder.push([rest]) });
               }
               return;
             }
@@ -123,6 +132,6 @@ export function useLiveTranscript(
       stopped = true;
       if (timer) clearTimeout(timer);
     };
-  }, [on, agentInstanceKey, follow]);
+  }, [on, agentInstanceKey, agents, follow]);
   return on && state?.key === agentInstanceKey ? state.blocks : undefined;
 }

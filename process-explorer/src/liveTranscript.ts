@@ -54,22 +54,51 @@ export function toolDetail(args: unknown): string {
   return typeof v === "string" ? v.split("\n")[0].slice(0, 200) : "";
 }
 
-/// Fold transcript lines into blocks. Message deltas append to the open block of
-/// the same role (and messageId, when given); a snapshot replaces it; `final`
-/// closes it; a tool call or result is a boundary.
-export function foldTranscript(lines: string[]): LiveBlock[] {
-  const out: LiveBlock[] = [];
-  const openText = () => {
-    const b = out[out.length - 1];
-    return b?.kind === "text" && b.open ? b : undefined;
+/// How many display blocks the incremental folder retains. LiveTail renders
+/// only the newest few, so folding keeps a small tail rather than the whole
+/// run's blocks.
+export const LIVE_FOLD_TAIL = 24;
+
+/// Incremental transcript folder: feed lines as they stream in, read the
+/// display tail back out. Replaying the full log through `foldTranscript` on
+/// every poll is quadratic work over an ever-growing transcript and retains it
+/// all; this keeps each poll's fold proportional to the new lines and bounds
+/// retained memory to the display tail plus the state later events can still
+/// update (the open message, and tool calls awaiting their result).
+export interface TranscriptFolder {
+  /// Fold more lines in. Returns the retained display tail.
+  push(lines: string[]): LiveBlock[];
+  /// The retained display tail.
+  blocks(): LiveBlock[];
+}
+
+export function createTranscriptFolder(
+  tail = LIVE_FOLD_TAIL,
+): TranscriptFolder {
+  // Newest `tail` display blocks, minus the open text block while it is open:
+  // a message's deltas can span many polls and arbitrarily many pruned blocks,
+  // so the block they append to must survive pruning until it closes.
+  let blocks: LiveBlock[] = [];
+  let open: Extract<LiveBlock, { kind: "text" }> | undefined;
+  // Tool calls still awaiting their result. A result pairs with the most recent
+  // unmatched call, which may already be pruned from the display tail; these
+  // entries are small (no args, no result payload) and a result removes one.
+  const pendingTools: Extract<LiveBlock, { kind: "tool" }>[] = [];
+
+  const prune = () => {
+    if (blocks.length > tail) blocks = blocks.slice(blocks.length - tail);
   };
-  const closeText = () => {
-    const b = openText();
-    if (b) b.open = false;
+  const closeOpen = () => {
+    if (!open) return;
+    open.open = false;
+    blocks.push(open);
+    open = undefined;
+    prune();
   };
-  for (const raw of lines) {
+
+  const foldLine = (raw: string) => {
     const line = raw.trim();
-    if (!line) continue;
+    if (!line) return;
     let ev: Ev | null = null;
     if (line.startsWith("{")) {
       try {
@@ -90,62 +119,78 @@ export function foldTranscript(lines: string[]): LiveBlock[] {
     }
     if (!ev) {
       // Raw harness output: shown as is.
-      closeText();
-      out.push({ kind: "text", role: "output", text: raw, open: false });
-      continue;
+      closeOpen();
+      blocks.push({ kind: "text", role: "output", text: raw, open: false });
+      prune();
+      return;
     }
     if (ev.kind === "message") {
       const role = ev.role ?? "assistant";
-      let b = openText();
       const same =
-        b &&
-        b.role === role &&
+        open &&
+        open.role === role &&
         !ev.start &&
         (ev.messageId === undefined ||
-          b.messageId === undefined ||
-          b.messageId === ev.messageId);
+          open.messageId === undefined ||
+          open.messageId === ev.messageId);
       if (!same) {
-        closeText();
-        b = {
+        closeOpen();
+        open = {
           kind: "text",
           role,
           text: "",
           messageId: ev.messageId,
           open: true,
         };
-        out.push(b);
       }
-      b = b!;
+      const b = open!;
       if (ev.mode === "snapshot") b.text = ev.text ?? "";
       else b.text += ev.text ?? "";
       if (ev.messageId) b.messageId = ev.messageId;
-      if (ev.final) b.open = false;
+      if (ev.final) closeOpen();
     } else if (ev.kind === "tool-call") {
-      closeText();
-      out.push({
+      closeOpen();
+      const b: Extract<LiveBlock, { kind: "tool" }> = {
         kind: "tool",
         name: ev.name ?? "tool",
         detail: toolDetail(ev.args),
         callId: ev.callId,
-      });
+      };
+      blocks.push(b);
+      prune();
+      pendingTools.push(b);
     } else if (ev.kind === "tool-result") {
-      closeText();
-      for (let i = out.length - 1; i >= 0; i--) {
-        const b = out[i];
-        if (
-          b.kind === "tool" &&
-          b.ok === undefined &&
-          (ev.callId === undefined || b.callId === ev.callId)
-        ) {
+      closeOpen();
+      for (let i = pendingTools.length - 1; i >= 0; i--) {
+        const b = pendingTools[i];
+        if (ev.callId === undefined || b.callId === ev.callId) {
           b.ok = ev.ok !== false;
           b.result = (ev.content ?? "").slice(0, 2000);
+          pendingTools.splice(i, 1);
           break;
         }
       }
     }
     // turn / step / lifecycle / permission: no block of their own here.
-  }
-  return out;
+  };
+
+  return {
+    push(lines) {
+      for (const raw of lines) foldLine(raw);
+      return this.blocks();
+    },
+    blocks() {
+      return open ? [...blocks, open] : blocks;
+    },
+  };
+}
+
+/// Fold transcript lines into blocks. Message deltas append to the open block of
+/// the same role (and messageId, when given); a snapshot replaces it; `final`
+/// closes it; a tool call or result is a boundary. Batch form of
+/// `createTranscriptFolder` without pruning; a live poll folds incrementally.
+export function foldTranscript(lines: string[]): LiveBlock[] {
+  return createTranscriptFolder(Number.MAX_SAFE_INTEGER).push(lines);
 }
 
 /// Split appended chunks into complete lines, carrying a partial last line over.
