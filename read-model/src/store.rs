@@ -5982,11 +5982,21 @@ fn project_event(
             if let Some(job_key) = job_key
                 && !job_event_is_stale(tx, *job_key, position)?
             {
-                tx.cexecute(
-                    "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL WHERE key = ?1",
-                    params![*job_key as i64, job_state_code(JobState::Created)],
+                // Only a FAILED job is parked on the incident; mirror the
+                // engine reducer and never resurrect a job that was canceled
+                // (e.g. by an interrupting boundary, #1508) or otherwise ended.
+                let changed = tx.cexecute(
+                    "UPDATE jobs SET state = ?2, worker = NULL, deadline_ms = NULL \
+                     WHERE key = ?1 AND state = ?3",
+                    params![
+                        *job_key as i64,
+                        job_state_code(JobState::Created),
+                        job_state_code(JobState::Failed)
+                    ],
                 )?;
-                stamp_job_position(tx, *job_key, position)?;
+                if changed > 0 {
+                    stamp_job_position(tx, *job_key, position)?;
+                }
             }
         }
 
@@ -8963,6 +8973,56 @@ mod definition_xml_tests {
         assert!(
             store.element_instance(parked).is_none(),
             "a reset parked join leaves no element-instance row"
+        );
+    }
+
+    /// #1508 follow-up: an interrupting boundary emits `JobCanceled` and THEN
+    /// `IncidentResolved` for the same parked job. The resolution is newer than
+    /// the cancellation, so the position gate does not hold it; the projection
+    /// must still mirror the engine reducer and reset ONLY a `Failed` job —
+    /// never resurrect a `Canceled` one to `Created`.
+    #[test]
+    fn resolving_an_incident_never_resurrects_a_canceled_job() {
+        let store = ReadStore::open(None).unwrap();
+        let history = [
+            Event::JobCreated {
+                job_key: 8_950,
+                instance_key: 7_950,
+                element_instance_key: 7_951,
+                element_id: "t".to_string(),
+                job_type: "worker".to_string(),
+                created_at: 100,
+                priority: 0,
+                retries: 1,
+            },
+            Event::JobFailed {
+                job_key: 8_950,
+                instance_key: 7_950,
+                retries: 0,
+                worker: None,
+                error_message: None,
+            },
+            Event::JobCanceled {
+                job_key: 8_950,
+                instance_key: 7_950,
+                canceled_at: 300,
+                deadline: None,
+            },
+            Event::IncidentResolved {
+                incident_key: 55_950,
+                instance_key: 7_950,
+                job_key: Some(8_950),
+                resolved_at: 400,
+                operation_reference: None,
+            },
+        ];
+        for (i, e) in history.iter().enumerate() {
+            apply_at(&store, e, 2_000 + i as u64);
+        }
+        assert_eq!(
+            job_row(&store, 8_950).state,
+            nanobpmn_engine_core::JobState::Canceled,
+            "a canceled job stays Canceled after its incident is resolved"
         );
     }
 
