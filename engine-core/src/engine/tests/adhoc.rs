@@ -4382,3 +4382,104 @@ fn interrupting_boundary_on_adhoc_resolves_the_container_root_incident() {
         "the instance reaches EndInterrupted and completes"
     );
 }
+
+/// Issue #1508 follow-up — the error-catch branch must not RESURRECT the
+/// caught container's own FAILED agent job. The agent job fails with zero
+/// retries (a `JobNoRetries` incident on the container root), then an
+/// externally activated tool throws a BPMN error caught by the container's
+/// error boundary. Resolving the root incident used to reset the still-`Failed`
+/// agent job to `Created`, leaving it activatable against a completed
+/// container; it must be cancelled first.
+#[test]
+fn error_caught_at_adhoc_cancels_the_failed_agent_job_before_resolving() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="Host">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="probe-agent" />
+              <zeebe:adHoc outputCollection="r" outputElement="=toolCallResult" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="Tool">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="probe-tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:boundaryEvent id="Bnd" attachedToRef="Host">
+            <bpmn:errorEventDefinition errorRef="E" />
+          </bpmn:boundaryEvent>
+          <bpmn:endEvent id="EndNormal" />
+          <bpmn:endEvent id="EndCaught" />
+          <bpmn:sequenceFlow id="F1" sourceRef="s" targetRef="Host" />
+          <bpmn:sequenceFlow id="F2" sourceRef="Host" targetRef="EndNormal" />
+          <bpmn:sequenceFlow id="F3" sourceRef="Bnd" targetRef="EndCaught" />
+        </bpmn:process>
+        <bpmn:error id="E" errorCode="TOOL_ERR" />
+      </bpmn:definitions>"#;
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            crate::bpmn::parse_bpmn(xml).unwrap().remove(0),
+        ))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("p"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let agent = engine
+        .activate_jobs("probe-agent", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "Host")
+        .expect("agent job emitted for the ad-hoc container");
+    engine
+        .apply_command(Command::fail_job(agent.key, 0, "boom"))
+        .unwrap();
+    assert_eq!(engine.active_incidents().len(), 1);
+
+    engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: agent.element_instance_key,
+            activate_elements: vec![activate_element("Tool")],
+            cancel_remaining: false,
+        })
+        .unwrap();
+    let tool = engine
+        .activate_jobs("probe-tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "Tool")
+        .expect("tool job emitted");
+    let events = engine
+        .apply_command(Command::throw_job_error(tool.key, "TOOL_ERR", "bad"))
+        .unwrap();
+
+    let cancel_pos = events
+        .iter()
+        .position(|e| matches!(e, Event::JobCanceled { job_key, .. } if *job_key == agent.key))
+        .expect("the failed agent job is cancelled when the container is caught");
+    let resolve_pos = events
+        .iter()
+        .position(|e| matches!(e, Event::IncidentResolved { .. }))
+        .expect("the root incident is resolved");
+    assert!(cancel_pos < resolve_pos, "cancel precedes resolve");
+    assert!(
+        matches!(
+            engine.job(agent.key).map(|j| &j.state),
+            Some(crate::state::JobState::Canceled)
+        ),
+        "the agent job must stay Canceled, not be resurrected to Created"
+    );
+    assert!(
+        engine
+            .activate_jobs("probe-agent", "W", 10, 1_000, 0)
+            .is_empty(),
+        "no agent job is activatable against the completed container"
+    );
+    assert!(engine.active_incidents().is_empty());
+    assert!(engine.is_completed(inst));
+}

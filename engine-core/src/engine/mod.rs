@@ -3250,8 +3250,24 @@ impl Engine {
                         // (e.g. a FAILED listener job's `JobNoRetries`) would
                         // otherwise keep a stale ACTIVE incident after the catch
                         // completes it. The throwing job is already consumed
-                        // (`JobErrorThrown` above), so no job-resurrection guard
-                        // is in play here.
+                        // (`JobErrorThrown` above).
+                        //
+                        // Cancel any still-live job on the caught root FIRST: an
+                        // ad-hoc container's FAILED agent job would otherwise be
+                        // flipped back to `Created` by the incident resolution
+                        // below and become activatable against a completed
+                        // container (job resurrection).
+                        if let Some(job_key) = self.active_job_on(caught_eik) {
+                            self.emit(
+                                &mut log,
+                                Event::JobCanceled {
+                                    job_key,
+                                    instance_key,
+                                    canceled_at: self.now,
+                                    deadline: None, // stamped centrally in `emit` (#1440)
+                                },
+                            );
+                        }
                         for event in self.resolve_incidents_on(instance_key, caught_eik) {
                             self.emit(&mut log, event);
                         }
