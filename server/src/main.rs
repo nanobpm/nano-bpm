@@ -3098,40 +3098,74 @@ impl ServerImpl {
 /// appliers are idempotent per key and retain every version in their own
 /// `*_versions` map, so re-installing an already-known version is a no-op.
 fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
-    let state = deploy_journal.engine().state();
-    let mut events: Vec<Event> = state
-        .process_versions
-        .values()
-        .map(|deployed| Event::ProcessDeployed {
-            // The deployment key is not used by the applier (definitions are
-            // keyed by processDefinitionKey); 0 is a harmless placeholder.
-            deployment_key: 0,
-            process_definition_key: deployed.key,
-            version: deployed.version,
-            process: deployed.definition.clone(),
-        })
-        .collect();
+    deployment_replication_events_from_state(deploy_journal.engine().state())
+}
+
+/// Every deployed version of one resource kind, keyed (and ordered) by its
+/// unique per-version key: the version-retention map UNIONED with the
+/// latest-by-id index. A pre-retention (legacy) snapshot restores the index
+/// but deserializes the version map empty, and the owner still resolves those
+/// definitions through the index fallback, so the seed must include them too
+/// (otherwise a freshly-seeded peer cannot resolve what the owner can).
+fn seed_versions<'a, T>(
+    versions: &'a std::collections::HashMap<Key, T>,
+    latest: &'a std::collections::HashMap<String, T>,
+    key: impl Fn(&T) -> Key,
+) -> std::collections::BTreeMap<Key, &'a T> {
+    let mut all: std::collections::BTreeMap<Key, &'a T> =
+        versions.iter().map(|(k, v)| (*k, v)).collect();
+    for v in latest.values() {
+        all.entry(key(v)).or_insert(v);
+    }
+    all
+}
+
+/// The pure state → seed-events derivation behind
+/// [`deployment_replication_events`].
+fn deployment_replication_events_from_state(state: &nanobpmn_engine_core::State) -> Vec<Event> {
+    let mut events: Vec<Event> =
+        seed_versions(&state.process_versions, &state.processes, |d| d.key)
+            .into_values()
+            .map(|deployed| Event::ProcessDeployed {
+                // The deployment key is not used by the applier (definitions are
+                // keyed by processDefinitionKey); 0 is a harmless placeholder.
+                deployment_key: 0,
+                process_definition_key: deployed.key,
+                version: deployed.version,
+                process: deployed.definition.clone(),
+            })
+            .collect();
     // Re-emit each deployed DRG version followed by its decision versions so a
     // freshly seeded replica can evaluate business rule tasks pinned to any
     // historical key. DecisionRequirementsDeployed must precede its
     // DecisionDeployed events (the applier resolves the DRG by its exact key in
     // `decision_requirements_versions`), so emit them grouped per DRG version.
-    let mut drgs: Vec<_> = state.decision_requirements_versions.values().collect();
-    drgs.sort_by_key(|drg| drg.key);
-    for drg in drgs {
+    // Decisions are bucketed by DRG key once (O(n log n)), not rescanned per DRG.
+    let mut decisions_by_drg: std::collections::HashMap<Key, Vec<_>> =
+        std::collections::HashMap::new();
+    for decision in
+        seed_versions(&state.decision_versions, &state.decisions, |d| d.key).into_values()
+    {
+        decisions_by_drg
+            .entry(decision.decision_requirements_key)
+            .or_default()
+            .push(decision);
+    }
+    for drg in seed_versions(
+        &state.decision_requirements_versions,
+        &state.decision_requirements,
+        |d| d.key,
+    )
+    .into_values()
+    {
         events.push(Event::DecisionRequirementsDeployed {
             deployment_key: 0,
             decision_requirements_key: drg.key,
             version: drg.version,
             drg: drg.drg.clone(),
         });
-        let mut decisions: Vec<_> = state
-            .decision_versions
-            .values()
-            .filter(|d| d.decision_requirements_key == drg.key)
-            .collect();
-        decisions.sort_by_key(|d| d.key);
-        for decision in decisions {
+        // Bucket entries are already key-ordered (BTreeMap iteration).
+        for decision in decisions_by_drg.remove(&drg.key).unwrap_or_default() {
             events.push(Event::DecisionDeployed {
                 deployment_key: 0,
                 decision_requirements_key: decision.decision_requirements_key,
@@ -3143,9 +3177,8 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
         }
     }
     // Re-emit each deployed form version so a freshly seeded replica can serve
-    // it via GetFormByKey. Forms are independent (no sub-resources), so order
-    // is free.
-    for form in state.form_versions.values() {
+    // it via GetFormByKey. Forms are independent (no sub-resources).
+    for form in seed_versions(&state.form_versions, &state.forms, |f| f.key).into_values() {
         events.push(Event::FormDeployed {
             deployment_key: 0,
             form_key: form.key,
@@ -3156,9 +3189,10 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
         });
     }
     // Re-emit each deployed generic-resource version so a freshly seeded
-    // replica can serve it via GetResourceByKey / searchResources. Resources
-    // are independent, so order is free.
-    for resource in state.resource_versions.values() {
+    // replica can serve it via GetResourceByKey / searchResources.
+    for resource in
+        seed_versions(&state.resource_versions, &state.resources, |r| r.key).into_values()
+    {
         events.push(Event::GenericResourceDeployed {
             deployment_key: 0,
             resource_key: resource.key,
@@ -28864,6 +28898,103 @@ mod clustered_startup_tests {
             assert_eq!(drgv1, Some(1), "DRG v1 key resolves on the peer");
             assert_eq!(drgv2, Some(2), "DRG v2 key resolves on the peer");
         }
+    }
+
+    /// #720 review: a restored pre-retention (legacy) snapshot carries only the
+    /// latest-by-id indexes (every `*_versions` map deserializes empty), yet the
+    /// owner still resolves those definitions via the index fallback. The seed
+    /// must include them, or a freshly-seeded peer cannot resolve what the
+    /// owner can.
+    #[tokio::test]
+    async fn deployment_seed_includes_legacy_snapshot_latest_index_entries() {
+        let node0 = clustered_node(0);
+        let process = ProcessBuilder::new("legacy-proc")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .expect("valid process");
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(
+            r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="legacy-drg" name="Legacy DRG">
+              <decision id="legacy-decision" name="Legacy Decision">
+                <decisionTable hitPolicy="FIRST">
+                  <input id="i"><inputExpression id="ie" typeRef="string"><text>x</text></inputExpression></input>
+                  <output id="o" name="result" typeRef="string" />
+                  <rule id="r1"><inputEntry id="ie1"><text>-</text></inputEntry>
+                    <outputEntry id="oe1"><text>"ok"</text></outputEntry></rule>
+                </decisionTable>
+              </decision>
+            </definitions>"##,
+        )
+        .expect("valid DMN");
+        let form = nanobpmn_engine_core::FormResource {
+            id: "legacy-form".to_string(),
+            resource_name: "legacy.form".to_string(),
+            schema: r#"{"id":"legacy-form","type":"default","components":[]}"#.to_string(),
+        };
+        let resource = nanobpmn_engine_core::GenericResource {
+            resource_id: "legacy.md".to_string(),
+            resource_name: "legacy.md".to_string(),
+            content: "# legacy".to_string(),
+        };
+        let mut state = node0
+            .engine
+            .deploy_partition()
+            .with(move |journal| {
+                let _ = journal
+                    .apply_command(Command::DeployResources(vec![process]))
+                    .expect("deploy process");
+                let _ = journal
+                    .apply_command(Command::DeployDecisionRequirements(vec![drg]))
+                    .expect("deploy DRG");
+                let _ = journal
+                    .apply_command(Command::DeployForms(vec![form]))
+                    .expect("deploy form");
+                let _ = journal
+                    .apply_command(Command::DeployGenericResources(vec![resource]))
+                    .expect("deploy resource");
+                journal.state().clone()
+            })
+            .await;
+        // Shape the state like a restored pre-retention snapshot.
+        state.process_versions.clear();
+        state.decision_requirements_versions.clear();
+        state.decision_versions.clear();
+        state.form_versions.clear();
+        state.resource_versions.clear();
+
+        let events = deployment_replication_events_from_state(&state);
+        let has = |f: &dyn Fn(&Event) -> bool| events.iter().any(f);
+        let pk = state.processes["legacy-proc"].key;
+        let drgk = state.decision_requirements["legacy-drg"].key;
+        let dk = state.decisions["legacy-decision"].key;
+        let fk = state.forms["legacy-form"].key;
+        let rk = state.resources["legacy.md"].key;
+        assert!(has(
+            &|e| matches!(e, Event::ProcessDeployed { process_definition_key, .. } if *process_definition_key == pk)
+        ));
+        assert!(has(
+            &|e| matches!(e, Event::DecisionRequirementsDeployed { decision_requirements_key, .. } if *decision_requirements_key == drgk)
+        ));
+        assert!(has(
+            &|e| matches!(e, Event::DecisionDeployed { decision_key, .. } if *decision_key == dk)
+        ));
+        assert!(has(
+            &|e| matches!(e, Event::FormDeployed { form_key, .. } if *form_key == fk)
+        ));
+        assert!(has(
+            &|e| matches!(e, Event::GenericResourceDeployed { resource_key, .. } if *resource_key == rk)
+        ));
+        // DRG precedes its decision.
+        let drg_pos = events
+            .iter()
+            .position(|e| matches!(e, Event::DecisionRequirementsDeployed { decision_requirements_key, .. } if *decision_requirements_key == drgk))
+            .expect("drg seeded");
+        let dec_pos = events
+            .iter()
+            .position(|e| matches!(e, Event::DecisionDeployed { decision_key, .. } if *decision_key == dk))
+            .expect("decision seeded");
+        assert!(drg_pos < dec_pos, "DRG must precede its decision");
     }
 
     /// #1467 finding F1 (reworked in #1338): every journal SHARES one spill
