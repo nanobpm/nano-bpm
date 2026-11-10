@@ -1822,14 +1822,20 @@ impl Journal {
             | Command::UpdateJob { job_key, .. } => {
                 targets.extend(cold.index.instance_for_job(*job_key));
             }
-            // Opportunistic batch commands (#1388): an unreadable candidate
-            // must not fail the whole poll/tick closed (that would let one bad
-            // row starve every healthy job or timer). Rehydrate best-effort —
-            // the unreadable instance stays cold and is retried next time.
+            // Opportunistic batch commands (#1388): locally, an unreadable
+            // candidate must not fail the whole poll/tick closed (that would
+            // let one bad row starve every healthy job or timer). Rehydrate
+            // best-effort — the unreadable instance stays cold and is retried
+            // next time. Under replicated (Raft) apply the skip would let a
+            // healthy and an impaired replica apply the same committed entry
+            // to DIFFERENT job/timer sets, so it fails closed instead (#1470).
             Command::ActivateJobs {
                 job_type, max_jobs, ..
             } => {
                 let (job_type, max_jobs) = (job_type.clone(), *max_jobs);
+                if self.strict_cold_reads() {
+                    return self.rehydrate_activation_candidates_strict(&job_type, max_jobs);
+                }
                 self.rehydrate_activation_candidates(&job_type, max_jobs);
                 return Ok(());
             }
@@ -1883,11 +1889,20 @@ impl Journal {
                 );
             }
             Command::TriggerTimers { now } => {
+                let strict = self.strict_cold_reads();
+                let mut unavailable = None;
                 for key in cold.index.instances_due(*now) {
-                    // An unreadable row stays cold and armed; next tick retries.
-                    let _ = self.rehydrate_cold(key);
+                    // Locally an unreadable row stays cold and armed; the next
+                    // tick retries. Under Raft apply it fails the entry closed
+                    // (#1470) so no replica fires a different timer set.
+                    if self.rehydrate_cold(key) == ColdRehydration::Unreadable && strict {
+                        unavailable.get_or_insert(key);
+                    }
                 }
-                return Ok(());
+                return match unavailable {
+                    Some(instance_key) => Err(EngineError::InstanceUnavailable { instance_key }),
+                    None => Ok(()),
+                };
             }
             _ => {}
         }
@@ -2874,6 +2889,49 @@ impl Journal {
         self.rehydrate_activation_candidates(job_type, max_jobs);
         self.engine
             .select_activatable_job_keys(job_type, max_jobs, now, with_lease)
+    }
+
+    /// `true` while a command is applied as replicated (Raft) state-machine
+    /// application — an armed Raft entry or a replicated-apply journal (#1470).
+    /// There a cold-read failure must fail the command closed: skipping it
+    /// best-effort would make replicas with differing off-heap readability
+    /// apply the same committed entry to different results.
+    fn strict_cold_reads(&self) -> bool {
+        self.replicated_apply || self.raft_entry.is_some()
+    }
+
+    /// Replicated-apply variant of
+    /// [`rehydrate_activation_candidates`](Self::rehydrate_activation_candidates)
+    /// (#1470): pages in EVERY cold instance holding a job of this type, in
+    /// deterministic key order (no replica-local rotation cursor), and fails
+    /// closed with [`EngineError::InstanceUnavailable`] on the first unreadable
+    /// row, so an impaired replica never activates a different job set than a
+    /// healthy one.
+    fn rehydrate_activation_candidates_strict(
+        &mut self,
+        job_type: &str,
+        max_jobs: usize,
+    ) -> Result<(), EngineError> {
+        let Some(cold) = self.cold.as_ref() else {
+            return Ok(());
+        };
+        let candidates = cold
+            .index
+            .instances_for_job_type_rotated(job_type, None, usize::MAX);
+        let mut restored = 0usize;
+        for key in candidates {
+            if restored >= max_jobs {
+                break;
+            }
+            match self.rehydrate_cold(key) {
+                ColdRehydration::Restored => restored += 1,
+                ColdRehydration::Unreadable => {
+                    return Err(EngineError::InstanceUnavailable { instance_key: key });
+                }
+                ColdRehydration::NotCold | ColdRehydration::Absent => {}
+            }
+        }
+        Ok(())
     }
 
     fn rehydrate_activation_candidates(&mut self, job_type: &str, max_jobs: usize) {
@@ -6420,6 +6478,99 @@ mod tests {
             }
         }
         panic!("healthy cold instance starved behind an unreadable oldest row");
+    }
+
+    /// Two replicas of the same state, both cold-spilled to their own file
+    /// store, applying under replicated (Raft) semantics (#1470). `model`
+    /// builds the process; returns (healthy, impaired, instance keys, paths).
+    fn replica_pair(
+        tag: &str,
+        model: fn() -> nanobpmn_engine_core::ProcessDefinition,
+        n: usize,
+    ) -> (Journal, Journal, Vec<Key>, Vec<std::path::PathBuf>) {
+        let mut out = Vec::new();
+        let mut paths = Vec::new();
+        for side in ["healthy", "impaired"] {
+            let path = restart_store_path(&format!("{tag}-{side}"));
+            let mut journal = Journal::in_memory();
+            let store = Arc::new(crate::varspill::VarSpillStore::open(Some(&path)).unwrap());
+            journal.set_cold_spill(store, 1, 0);
+            let _ = journal.apply_command(Command::DeployProcess(model())).unwrap();
+            let mut keys = Vec::new();
+            for _ in 0..n {
+                let (events, _) = journal
+                    .apply_command_at(Command::create_instance(model().id.clone()), 0)
+                    .unwrap();
+                keys.push(events.iter().find_map(|e| e.instance_key()).unwrap());
+            }
+            assert_eq!(journal.force_cold_spill_all(), n);
+            journal.set_replicated_apply(true);
+            out.push((journal, keys));
+            paths.push(path);
+        }
+        let (impaired, keys) = out.pop().unwrap();
+        let (healthy, healthy_keys) = out.pop().unwrap();
+        assert_eq!(keys, healthy_keys, "replicas mint identical keys");
+        (healthy, impaired, keys, paths)
+    }
+
+    // #1470: under Raft apply an unreadable cold activation candidate must fail
+    // the entry closed instead of activating a different job set than a
+    // healthy replica applying the same committed entry.
+    #[test]
+    fn replicated_activate_jobs_fails_closed_on_unreadable_cold_candidate() {
+        let (mut healthy, mut impaired, keys, paths) = replica_pair("raft-act-1470", demo, 2);
+        corrupt_row(&paths[1], "cold", "snapshot", keys[0]);
+        let cmd = Command::activate_jobs("demo-work", "w", 1, 60_000, 0);
+
+        let (events, _) = healthy.apply_command(cmd.clone()).unwrap();
+        assert!(!events.is_empty(), "healthy replica activates the oldest job");
+        assert_eq!(
+            impaired.apply_command(cmd).err(),
+            Some(EngineError::InstanceUnavailable { instance_key: keys[0] }),
+            "impaired replica must fail closed, not activate a different job"
+        );
+        assert_eq!(impaired.cold_count(), 2, "nothing applied on the impaired replica");
+        drop((healthy, impaired));
+        for p in paths {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
+    }
+
+    fn timed_demo() -> nanobpmn_engine_core::ProcessDefinition {
+        ProcessBuilder::new("timed")
+            .start_event("start")
+            .service_task("work", "demo-work")
+            .timer_boundary_event("timeout", "work", 10)
+            .end_event("end")
+            .end_event("timed-out")
+            .connect("start", "work")
+            .connect("work", "end")
+            .connect("timeout", "timed-out")
+            .build()
+            .expect("valid timed process")
+    }
+
+    // #1470: the same shape for a due cold timer under Raft apply.
+    #[test]
+    fn replicated_trigger_timers_fails_closed_on_unreadable_due_cold_timer() {
+        let (mut healthy, mut impaired, keys, paths) =
+            replica_pair("raft-timer-1470", timed_demo, 1);
+        corrupt_row(&paths[1], "cold", "snapshot", keys[0]);
+        let cmd = Command::TriggerTimers { now: 1_000 };
+
+        let (events, _) = healthy.apply_command(cmd.clone()).unwrap();
+        assert!(!events.is_empty(), "healthy replica fires the due timer");
+        assert_eq!(
+            impaired.apply_command(cmd).err(),
+            Some(EngineError::InstanceUnavailable { instance_key: keys[0] }),
+            "impaired replica must fail closed, not skip the due timer"
+        );
+        assert_eq!(impaired.cold_count(), 1, "timer stays cold and armed");
+        drop((healthy, impaired));
+        for p in paths {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        }
     }
 
     #[test]
