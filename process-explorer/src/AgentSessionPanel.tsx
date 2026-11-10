@@ -563,15 +563,13 @@ const LIVE_BLOCKS = 12;
 function LiveTail({ blocks }: { blocks: LiveBlock[] }) {
   const end = useRef<HTMLDivElement>(null);
   const shown = blocks.slice(-LIVE_BLOCKS);
-  const last = blocks[blocks.length - 1];
-  const fingerprint = last
-    ? last.kind === "text"
-      ? last.text.length
-      : `${last.name}${last.ok}`
-    : 0;
+  // Scroll after every render: any dependency fingerprint (block count, last
+  // block's text length, …) is lossy — an equal-length message with more line
+  // breaks grows the scroll height without changing the fingerprint, leaving
+  // new output offscreen.
   useEffect(() => {
     end.current?.scrollIntoView({ block: "end" });
-  }, [blocks.length, fingerprint]);
+  });
   return (
     <section
       aria-label="Live transcript"
