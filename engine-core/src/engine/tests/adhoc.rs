@@ -4323,3 +4323,62 @@ fn adhoc_call_activity_tool_preserves_chained_input_projection_across_spawn_retr
         "the respawn seed's y must match the clean first-spawn seed",
     );
 }
+
+/// Issue #1508 regression — the ad-hoc-container branch: an interrupting
+/// boundary firing while the container's OWN agent job is parked on a
+/// `JobNoRetries` incident must RESOLVE that incident on the container root,
+/// not leave it ACTIVE on the completed container. `terminate_subprocess_scope`
+/// resolves only *descendant* incidents, never the scope root's.
+#[test]
+fn interrupting_boundary_on_adhoc_resolves_the_container_root_incident() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_agent_with_interrupting_message_boundary(),
+        ))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("customerId", Value::Str("C1".into()))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Activate the container's agent job, then fail it with no retries so the
+    // container ROOT carries a JobNoRetries incident.
+    let agent = engine
+        .activate_jobs("probe-agent", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "Host")
+        .expect("agent job emitted for the ad-hoc container");
+    engine
+        .apply_command(Command::fail_job(agent.key, 0, "boom"))
+        .unwrap();
+    assert_eq!(
+        engine.active_incidents().len(),
+        1,
+        "JobNoRetries parked on the ad-hoc container root"
+    );
+
+    // The interrupting message boundary fires while the container carries that
+    // incident: the failed agent job is cancelled and the root incident is
+    // resolved — not left ACTIVE on the removed container.
+    let fired = engine.correlate_message("probe-cancel", "C1", HashMap::new(), 0);
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "the boundary resolves the incident on the container root (#1508)"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no ACTIVE incident remains on the completed container (#1508)"
+    );
+    assert!(
+        engine.is_completed(inst),
+        "the instance reaches EndInterrupted and completes"
+    );
+}

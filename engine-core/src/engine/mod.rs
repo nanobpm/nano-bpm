@@ -3242,6 +3242,19 @@ impl Engine {
                         if caught_eik != element_instance_key {
                             self.terminate_subprocess_scope(&mut log, instance_key, caught_eik);
                         }
+                        // Resolve any incident parked on the caught element
+                        // instance itself (#1508): `terminate_subprocess_scope`
+                        // resolves only *descendant* incidents, never the scope
+                        // root's, and `ElementCompleted` touches no incident
+                        // state — so a sub-process root carrying an incident
+                        // (e.g. a FAILED listener job's `JobNoRetries`) would
+                        // otherwise keep a stale ACTIVE incident after the catch
+                        // completes it. The throwing job is already consumed
+                        // (`JobErrorThrown` above), so no job-resurrection guard
+                        // is in play here.
+                        for event in self.resolve_incidents_on(instance_key, caught_eik) {
+                            self.emit(&mut log, event);
+                        }
                         self.emit(
                             &mut log,
                             Event::ElementCompleting {

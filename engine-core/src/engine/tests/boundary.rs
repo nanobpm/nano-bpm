@@ -1290,3 +1290,378 @@ fn should_fire_a_non_interrupting_conditional_boundary_repeatedly() {
         .unwrap();
     assert!(engine.is_completed(key));
 }
+
+// --- Issue #1508: an interrupting boundary must resolve the interrupted
+// element's own active incident (Zeebe resolves an element instance's
+// incidents when the element is terminated) -------------------------------
+
+/// Issue #1508 regression — the plain job-backed-activity branch: an
+/// interrupting timer boundary firing on a service task parked on a
+/// `JobNoRetries` incident must RESOLVE that incident, not leave it ACTIVE on
+/// the completed element (where it is unresolvable — its job is already
+/// `CANCELED` — and keeps a stale `hasIncident` on the instance).
+#[test]
+fn interrupting_boundary_on_a_service_task_resolves_its_job_incident() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_timer_boundary()))
+        .unwrap();
+    let events = engine
+        .apply_command_at(Command::create_instance("ship"), 1_000)
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Activate the job, then fail it with no retries: a JobNoRetries incident
+    // parks on the service task's element instance.
+    let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 1_000)[0].key;
+    engine
+        .apply_command(Command::fail_job(job_key, 0, "boom"))
+        .unwrap();
+    assert_eq!(engine.active_incidents().len(), 1);
+    let incident_key = engine.active_incidents()[0].key;
+
+    // The interrupting boundary fires: the job is cancelled, the incident on
+    // the interrupted element is resolved, and the boundary flow runs.
+    let fired = engine.trigger_timers(6_000);
+    assert_eq!(
+        engine.state().jobs[&job_key].state,
+        state::JobState::Canceled,
+        "the interrupted task's job is cancelled"
+    );
+    assert!(
+        fired.iter().any(|e| matches!(
+            e,
+            Event::IncidentResolved { incident_key: k, .. } if *k == incident_key
+        )),
+        "the boundary resolves the incident on the interrupted element (#1508)"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no ACTIVE incident remains on the completed element (#1508)"
+    );
+    assert!(
+        engine.instance(instance_key).is_none()
+            || engine.instance(instance_key).unwrap().incidents.is_empty(),
+        "the instance's hasIncident index is cleared (#1508)"
+    );
+    assert!(engine.is_completed(instance_key));
+}
+
+/// Issue #1508 regression — a user task parked on a FAILED `creating`
+/// task-listener job carries a `JobNoRetries` incident on its own element
+/// instance; an interrupting timer boundary firing on the user task must
+/// resolve that incident too (the listener job is cancelled with the task).
+#[test]
+fn interrupting_boundary_on_a_user_task_resolves_its_listener_incident() {
+    let def = ProcessBuilder::new("approval-guarded")
+        .start_event("start")
+        .user_task("review")
+        .timer_boundary_event("sla", "review", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "review")
+        .connect("review", "done")
+        .connect("sla", "escalated")
+        .with_task_listeners(
+            "review",
+            vec![tl(TaskListenerEventType::Creating, "creating-listener")],
+        )
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command_at(Command::create_instance("approval-guarded"), 1_000)
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The task parks on its creating-listener job; fail it with no retries so
+    // the user task's element instance carries a JobNoRetries incident.
+    let listener = engine.activate_jobs("creating-listener", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "the task is parked on its listener job");
+    engine
+        .apply_command(Command::fail_job(listener[0].key, 0, "boom"))
+        .unwrap();
+    assert_eq!(engine.active_incidents().len(), 1);
+
+    // The interrupting boundary fires while the task carries that incident.
+    let fired = engine.trigger_timers(6_000);
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "the boundary resolves the incident on the interrupted user task (#1508)"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no ACTIVE incident remains on the completed user task (#1508)"
+    );
+    assert!(engine.is_completed(instance_key));
+}
+
+/// Issue #1508 regression — the sub-process-root branch: an incident parked on
+/// the sub-process ROOT itself (an output-mapping failure holding it in
+/// COMPLETING) must be resolved when an interrupting timer boundary fires on
+/// the sub-process. `terminate_subprocess_scope` resolves only *descendant*
+/// incidents, never the scope root's.
+#[test]
+fn interrupting_boundary_on_a_subprocess_resolves_a_root_incident() {
+    // start -> sub[ sub_start -> inner(work) -> sub_end ] --normal--> done
+    //          sub --(PT5S interrupting timer boundary)--> escalated
+    // The sub-process carries an OUTPUT mapping that fails at drain time, so
+    // the root parks in COMPLETING with an IoMapping incident while its
+    // boundary timer is still armed (disarm runs after the projection).
+    let def = ProcessBuilder::new("sub-timer-io")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .with_io(
+            "sub",
+            crate::model::IoMapping {
+                inputs: Vec::new(),
+                outputs: vec![crate::model::Mapping {
+                    source: "=assert(bad, bad instance of number) + 1".to_string(),
+                    target: "exported".to_string(),
+                }],
+            },
+        )
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "work")
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .timer_boundary_event("timeout", "sub", 5_000)
+        .end_event("done")
+        .end_event("escalated")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "done")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let events = engine
+        .apply_command_at(
+            Command::create_instance_with(
+                "sub-timer-io",
+                vars(&[("bad", Value::Str("oops".into()))]),
+            ),
+            1_000,
+        )
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Completing the inner job drives the sub-process into its output-mapping
+    // projection, which fails on `=bad + 1` (string + int): the sub-process
+    // ROOT parks in COMPLETING carrying an IoMapping incident, its boundary
+    // timer still armed.
+    let job_key = engine.activate_jobs("work", "w", 1, 60_000, 1_000)[0].key;
+    engine
+        .apply_command_at(Command::complete_job(job_key), 2_000)
+        .unwrap();
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the failed output mapping parked an incident"
+    );
+    assert_eq!(
+        active[0].element_id, "sub",
+        "the incident sits on the sub-process ROOT"
+    );
+    assert!(
+        engine
+            .timers()
+            .iter()
+            .any(|t| t.element_id == "sub" && t.state == state::TimerState::Created),
+        "the boundary timer is still armed while the root carries the incident"
+    );
+
+    // The interrupting boundary fires while the sub-process root carries that
+    // incident.
+    let fired = engine.trigger_timers(6_000);
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "the boundary resolves the incident on the sub-process root (#1508)"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no ACTIVE incident remains on the completed sub-process (#1508)"
+    );
+    assert!(engine.is_completed(instance_key));
+}
+
+/// Issue #1508 regression — the call-activity branch: an incident parked on
+/// the call-activity element itself (a `CalledElementError` — the callee is
+/// not deployed, so no child is spawned) must be resolved when an
+/// interrupting timer boundary fires on the call activity. The boundary is
+/// armed before the spawn attempt, so it is live while the incident parks.
+#[test]
+fn interrupting_boundary_on_a_call_activity_resolves_its_own_incident() {
+    let orchestrator = ProcessBuilder::new("orch-missing-callee")
+        .start_event("start")
+        .call_activity("c1", "not-deployed")
+        .timer_boundary_event("timeout", "c1", 5_000)
+        .end_event("end")
+        .end_event("escalated")
+        .connect("start", "c1")
+        .connect("c1", "end")
+        .connect("timeout", "escalated")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(orchestrator))
+        .unwrap();
+    let created = engine
+        .apply_command_at(Command::create_instance("orch-missing-callee"), 1_000)
+        .unwrap();
+    let parent_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The callee is not deployed: the spawn fails and a CalledElementError
+    // incident parks on the call-activity element instance itself, with the
+    // boundary timer still armed.
+    let active = engine.active_incidents();
+    assert_eq!(
+        active.len(),
+        1,
+        "the missing callee raised an incident on the call activity"
+    );
+    assert_eq!(active[0].element_id, "c1");
+    assert!(
+        engine
+            .timers()
+            .iter()
+            .any(|t| t.element_id == "c1" && t.state == state::TimerState::Created),
+        "the boundary timer is still armed while the call activity carries the incident"
+    );
+
+    // The interrupting boundary fires while the call activity carries that
+    // incident.
+    let fired = engine.trigger_timers(6_000);
+    assert!(
+        fired
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "the boundary resolves the incident on the call activity (#1508)"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no ACTIVE incident remains on the completed call activity (#1508)"
+    );
+    assert!(engine.is_completed(parent_key));
+}
+
+/// Issue #1508 regression — the error-boundary catch path: an interrupting
+/// ERROR boundary caught at an enclosing sub-process must resolve an incident
+/// parked on the sub-process ROOT itself, not only the incidents of the
+/// descendants `terminate_subprocess_scope` sweeps. The root incident here is
+/// raised by a NON-interrupting cycle timer boundary whose re-arm expression
+/// no longer evaluates (it reads a variable the throwing job's error
+/// variables removed) — it parks on the sub-process root while the inner job
+/// is still live to throw.
+#[test]
+fn error_boundary_caught_at_a_subprocess_resolves_a_root_incident() {
+    // start -> sub[ sub_start -> inner(work) -> sub_end ] --normal--> done
+    //          sub --(error boundary BUSINESS_ERROR)--> sad -> sad_end
+    //          sub --(NON-interrupting FEEL cycle timer "tick")--> ticked
+    let def = ProcessBuilder::new("sub-error-root-incident")
+        .start_event("start")
+        .sub_process("sub", "sub_start")
+        .start_event("sub_start")
+        .contained_in("sub_start", "sub")
+        .service_task("inner", "work")
+        .contained_in("inner", "sub")
+        .end_event("sub_end")
+        .contained_in("sub_end", "sub")
+        .error_boundary_event("catch", "sub", "BUSINESS_ERROR")
+        .non_interrupting_timer_cycle_boundary_event("tick", "sub", 5_000)
+        .with_timer(
+            "tick",
+            crate::model::TimerDef {
+                kind: crate::model::TimerDefKind::Cycle,
+                expr: "=interval".to_string(),
+            },
+        )
+        .service_task("sad", "sad-flow")
+        .service_task("ticked", "tick-work")
+        .end_event("done")
+        .end_event("sad_end")
+        .end_event("tick_end")
+        .connect("start", "sub")
+        .connect("sub_start", "inner")
+        .connect("inner", "sub_end")
+        .connect("sub", "done")
+        .connect("catch", "sad")
+        .connect("sad", "sad_end")
+        .connect("tick", "ticked")
+        .connect("ticked", "tick_end")
+        .build()
+        .unwrap();
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command_at(
+            Command::create_instance_with(
+                "sub-error-root-incident",
+                vars(&[("interval", Value::Str("PT5S".into()))]),
+            ),
+            1_000,
+        )
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let job_key = engine.activate_jobs("work", "w", 1, 60_000, 1_000)[0].key;
+
+    // Fire the non-interrupting cycle timer once; then remove the variable its
+    // re-arm expression reads so the SECOND fire's re-arm fails and parks an
+    // incident on the sub-process ROOT while the inner job is still live.
+    let first = engine.trigger_timers(6_000);
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, Event::SequenceFlowTaken { from, .. } if from == "tick")),
+        "the first cycle fired"
+    );
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            vars(&[("interval", Value::Null)]),
+        ))
+        .unwrap();
+    let second = engine.trigger_timers(11_000);
+    assert!(
+        second
+            .iter()
+            .any(|e| matches!(e, Event::IncidentRaised { element_id, .. } if element_id == "sub")),
+        "the failed re-arm raised an incident on the sub-process root"
+    );
+    assert_eq!(engine.active_incidents().len(), 1);
+
+    // The inner job throws a business error the sub-process boundary catches.
+    // The catch tears the sub-process down — and must resolve the root
+    // incident parked on it, not leave it ACTIVE on the completed sub-process.
+    let events = engine
+        .apply_command(Command::throw_job_error(job_key, "BUSINESS_ERROR", "boom"))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::IncidentResolved { .. })),
+        "the error catch resolves the incident on the sub-process root (#1508)"
+    );
+    assert!(
+        engine.active_incidents().is_empty(),
+        "no ACTIVE incident remains on the caught sub-process (#1508)"
+    );
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::SequenceFlowTaken { from, to, .. } if from == "catch" && to == "sad"
+    )));
+}

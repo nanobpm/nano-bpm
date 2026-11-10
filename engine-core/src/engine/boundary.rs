@@ -1421,18 +1421,8 @@ impl Engine {
                     },
                 );
             }
-            // Resolve any incident sitting on the body ROOT itself before it is
-            // torn down. `terminate_subprocess_scope` resolves incidents for every
-            // *descendant* it sweeps (`scope_teardown_events` -> `resolve_incidents_on`),
-            // but never for the scope root — so a body parked on a FAILED
-            // start/end-listener job (its `JobNoRetries` incident) would keep the
-            // completed instance carrying a stale `hasIncident` for a vanished body,
-            // and a later external resolve could re-drive the dead token. The
-            // `JobCanceled` above makes the parked job terminal first, so the
-            // `IncidentResolved` reducer's `Failed`-only guard leaves it cancelled.
-            for ev in self.resolve_incidents_on(instance_key, element_instance_key) {
-                self.emit(log, ev);
-            }
+            // An incident sitting on the body ROOT itself is resolved by the
+            // common tail below (one canonical site for every branch, #1508).
             self.terminate_subprocess_scope(log, instance_key, element_instance_key);
             self.emit(
                 log,
@@ -1497,6 +1487,23 @@ impl Engine {
                     deadline: None, // stamped centrally in `emit` (#1440)
                 },
             );
+        }
+        // Resolve every ACTIVE incident parked on the interrupted element
+        // instance itself — once, unconditionally, for every branch above
+        // (#1508, Zeebe parity: terminating an element resolves its incidents).
+        // `terminate_subprocess_scope` resolves only *descendant* incidents
+        // (`scope_teardown_events` -> `resolve_incidents_on`), never the scope
+        // root's, and `ElementCompleted` touches no incident state — so without
+        // this the completed element kept a stale ACTIVE incident whose job is
+        // already `CANCELED` (unresolvable: `UpdateJobRetries` 409s on a
+        // non-active job) and a stale `hasIncident` on the instance. Emitted
+        // here — after the branch-specific teardown and its `JobCanceled`, so
+        // the `IncidentResolved` reducer's `Failed`-only job-resurrection guard
+        // leaves the just-cancelled job terminal, and before the element's own
+        // `ElementCompleting`/`ElementCompleted`. An element carrying no
+        // incident yields nothing, so the common case is byte-identical.
+        for ev in self.resolve_incidents_on(instance_key, element_instance_key) {
+            self.emit(log, ev);
         }
         self.emit(
             log,
