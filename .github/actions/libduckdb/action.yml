@@ -1,0 +1,51 @@
+name: libduckdb (cached prebuilt)
+description: >-
+  Provide the prebuilt libduckdb that the processos build links against, from
+  the Actions cache, and point libduckdb-sys at it via DUCKDB_LIB_DIR (which
+  libduckdb-sys checks BEFORE DUCKDB_DOWNLOAD_LIB). Without this, every run
+  fetched the archive from GitHub Releases inside build.rs, so a Releases 504
+  failed the required gate (#1461). The release is derived from the
+  libduckdb-sys version locked in processos/Cargo.lock
+  (scripts/libduckdb-version.mjs). Only a cold cache touches the network.
+  Requires Node on PATH (ubuntu runners ship it).
+runs:
+  using: composite
+  steps:
+    - name: Resolve the locked libduckdb version (processos/Cargo.lock)
+      id: ver
+      shell: bash
+      run: node scripts/libduckdb-version.mjs --github-output
+    - name: Cache the prebuilt libduckdb
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/nanobpm-libduckdb/${{ steps.ver.outputs.duckdb }}
+        key: libduckdb-${{ runner.os }}-${{ runner.arch }}-${{ steps.ver.outputs.duckdb }}
+    - name: Download libduckdb (cold cache only)
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        DUCKDB_VERSION: ${{ steps.ver.outputs.duckdb }}
+      run: |
+        set -euo pipefail
+        dir="$HOME/.cache/nanobpm-libduckdb/$DUCKDB_VERSION"
+        mkdir -p "$dir"
+        curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 \
+          -o "$dir/libduckdb.zip" \
+          "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/libduckdb-linux-amd64.zip"
+        unzip -o -q "$dir/libduckdb.zip" -d "$dir"
+        rm "$dir/libduckdb.zip"
+    - name: Point libduckdb-sys at the cached lib
+      shell: bash
+      env:
+        DUCKDB_VERSION: ${{ steps.ver.outputs.duckdb }}
+      run: |
+        set -euo pipefail
+        dir="$HOME/.cache/nanobpm-libduckdb/$DUCKDB_VERSION"
+        test -f "$dir/libduckdb.so" && test -f "$dir/duckdb.h" \
+          || { echo "::error::cached libduckdb at $dir is incomplete"; exit 1; }
+        {
+          echo "DUCKDB_LIB_DIR=$dir"
+          echo "DUCKDB_INCLUDE_DIR=$dir"
+          echo "LD_LIBRARY_PATH=$dir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        } >> "$GITHUB_ENV"

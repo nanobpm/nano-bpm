@@ -102,13 +102,11 @@ jobs:
           key: console-wasm
           workspaces: engine-wasm
 
-      - name: Install wasm-pack
-        shell: bash
-        # Pinned install from crates.io. The old rustwasm.github.io installer is
-        # permanently stuck on v0.13.1 (the project moved to wasm-bindgen/wasm-pack),
-        # so installing a fixed version here keeps the build deterministic and
-        # silences wasm-pack's "newer version available" self-update warning.
-        run: make install-wasm-pack
+      - name: Install wasm-pack + restore its cached tool downloads (#1461)
+        # Pinned install (Makefile WASM_PACK_VERSION) plus a cached
+        # wasm-bindgen/binaryen tool dir, so `make console-wasm` never depends
+        # on a live GitHub Releases download on a warm cache.
+        uses: ./.github/actions/wasm-pack-cache
 
       - name: Generate REST layer + stubs
         shell: bash

@@ -29,6 +29,7 @@ on:
       - 'Makefile'
       - 'scripts/wasm-cc-env.sh'
       - '.github/actions/engine-wasm-pkg/**'
+      - '.github/actions/wasm-pack-cache/**'
       - 'formal/parity/zeebe-surface.json'
 
 permissions:

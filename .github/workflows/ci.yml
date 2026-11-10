@@ -91,6 +91,8 @@ jobs:
           filters: |
             processos:
               - 'processos/**'
+              - '.github/actions/libduckdb/**'
+              - 'scripts/libduckdb-version.mjs'
               - 'engine-core/**'
               # processos/Cargo.toml path-depends on (and re-exports) the
               # worker-scaling advisor crate, so a change confined to it must
@@ -156,6 +158,7 @@ jobs:
               - 'Makefile'
               - 'scripts/wasm-cc-env.sh'
               - '.github/actions/engine-wasm-pkg/**'
+              - '.github/actions/wasm-pack-cache/**'
               - '.github/workflows/ci.yml'
             # TLA+ models of engine semantics and the Zeebe parity coverage
             # matrix (formal/README.md). TLC needs only a JVM, and the whole suite
@@ -191,6 +194,7 @@ jobs:
               - 'Makefile'
               - 'scripts/wasm-cc-env.sh'
               - '.github/actions/engine-wasm-pkg/**'
+              - '.github/actions/wasm-pack-cache/**'
               - '.github/workflows/ci.yml'
             # True unless EVERY changed file is pure presentation/frontend — the
             # marketing website (`website/**`), the console landing page HTML
@@ -330,6 +334,11 @@ jobs:
         # Fails if any workflow installs an unpinned/other Rust toolchain
         # (`@stable` let Rust 1.99 break clippy + the armv6 release link).
         run: node --test scripts/rust-toolchain-pin.test.mjs
+      - name: No uncached GitHub Releases downloads in gates (#1461)
+        # binaryen/wasm-bindgen (wasm-pack) and libduckdb must come through the
+        # cached composites (.github/actions/wasm-pack-cache, libduckdb), so a
+        # Releases outage cannot fail a required gate on a warm cache.
+        run: node --test scripts/release-download-cache.test.mjs
       - name: armv6 ARM-RTABI shim wired into every zigbuild (#1322)
         # Rust >= 1.99's strict-align armv6 libstd needs __aeabi_uread4 & co.,
         # which zig's compiler-rt lacks; every `cargo zigbuild` site must source
@@ -956,18 +965,13 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: taiki-e/install-action@nextest
-      # rust-cache prunes the prebuilt DuckDB that libduckdb-sys downloads into
-      # target/duckdb-download/ (it is not a recognised cargo artifact) but keeps
-      # the build-script fingerprint + its cached rustc-link-search output. On a
-      # cache hit cargo then skips build.rs, never re-downloads the lib, and the
-      # recorded -L path is empty => `mold: library not found: duckdb` at link
-      # time (Clippy passes since it doesn't link; the Test step is the first to
-      # link, so it's where it fails). Invalidate just the libduckdb-sys
-      # build-script fingerprint so it re-runs and re-materialises the lib during
-      # Clippy; the heavy compiled rlibs stay cached.
-      - name: Re-materialise the prebuilt DuckDB lib (rust-cache prunes it)
-        working-directory: processos
-        run: rm -rf target/*/.fingerprint/libduckdb-sys-* target/*/build/libduckdb-sys-*
+      # Link the prebuilt DuckDB from the Actions cache via DUCKDB_LIB_DIR
+      # (which libduckdb-sys prefers over DUCKDB_DOWNLOAD_LIB), so a GitHub
+      # Releases outage cannot fail this gate on a warm cache (#1461). The lib
+      # lives outside target/, so rust-cache can no longer prune it out from
+      # under a cached build-script fingerprint.
+      - name: Prebuilt libduckdb (cached)
+        uses: ./.github/actions/libduckdb
       - name: Clippy (scripts/clippy-matrix.json, job processos)
         # `--no-default-features` (prebuilt DuckDB) — see the matrix entry.
         run: node scripts/clippy-matrix.mjs run --job processos
