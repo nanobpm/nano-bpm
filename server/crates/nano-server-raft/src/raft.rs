@@ -1222,7 +1222,8 @@ pub struct PartitionSnapshotBuilder {
     /// The streaming capture parts (#1337): a small control skeleton plus the
     /// resident per-instance payloads, the cold routing keys, and the store
     /// handles to resolve off-heap rows during the streaming serialize. `None`
-    /// once taken by `build_snapshot`. Holding the parts — rather than one folded
+    /// once taken by `build_snapshot`, or when the journal was fenced after an
+    /// aborted Raft entry (#1405) so no capture was taken. Holding the parts — rather than one folded
     /// `EngineSnapshot` — is what lets `build_snapshot` stream the cold set
     /// straight from the spill store to disk without materializing it in RAM.
     captured: Option<(
@@ -1254,8 +1255,9 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
                 ErrorVerb::Write,
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "refusing to build a Raft snapshot: the streaming capture parts \
-                     were already consumed (build_snapshot called twice); aborting \
+                    "refusing to build a Raft snapshot: no streaming capture (the \
+                     journal is fenced after an aborted Raft entry, #1405, or the parts \
+                     were already consumed by a second build_snapshot call); aborting \
                      before the covered log is purged",
                 ),
             )
@@ -1623,7 +1625,7 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         };
         PartitionSnapshotBuilder {
             sm: self.clone(),
-            captured: Some(captured),
+            captured,
             last_applied,
             last_membership,
         }
@@ -3770,7 +3772,7 @@ mod tests {
         let captured = src.with(|j| j.streaming_snapshot_parts()).await;
         let mut ok_builder = PartitionSnapshotBuilder {
             sm: src_sm.clone(),
-            captured: Some(captured),
+            captured,
             last_applied: None,
             last_membership: StoredMembership::default(),
         };
@@ -4492,6 +4494,27 @@ mod tests {
                     .is_none()
             );
             assert!(engine.with(|j| j.try_engine_snapshot()).await.is_none());
+            // The streaming capture paths (production non-lean checkpoint loop
+            // and the Raft snapshot builder) are fenced too.
+            assert!(
+                engine
+                    .with(|j| j.streaming_snapshot_and_rotate())
+                    .await
+                    .is_none(),
+                "a streaming checkpoint of the aborted prefix is refused"
+            );
+            assert!(
+                engine
+                    .with(|j| j.streaming_snapshot_parts())
+                    .await
+                    .is_none(),
+                "a Raft snapshot capture of the aborted prefix is refused"
+            );
+            let mut builder = sm.clone().get_snapshot_builder().await;
+            assert!(
+                builder.build_snapshot().await.is_err(),
+                "the Raft snapshot builder fails closed while fenced"
+            );
             // Leader-local soft activation bypasses `apply_command_at`; it too
             // must hand out no work from the aborted prefix.
             assert!(

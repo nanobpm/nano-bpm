@@ -3692,13 +3692,20 @@ impl Journal {
     /// payload is resolved from the spill tier as it streams out. A cold instance
     /// is not read at all here — only its key is captured, and the row is read
     /// lazily during the stream.
+    ///
+    /// Returns `None` while the journal is fenced after an aborted Raft entry
+    /// (#1405): the live engine may hold the entry's partial, non-durable
+    /// effects, so no capture of it may be persisted or shipped.
     pub fn streaming_snapshot_parts(
         &self,
-    ) -> (
+    ) -> Option<(
         crate::snapstream::StreamingCapture,
         Vec<Key>,
         crate::snapstream::SpillStores,
-    ) {
+    )> {
+        if self.fenced {
+            return None;
+        }
         let full = self.engine.snapshot();
         // Move the captured state into decomposition (rather than cloning it):
         // `Engine::snapshot` already cloned the resident `State` off the live
@@ -3726,11 +3733,11 @@ impl Journal {
             spill: self.spill.as_ref().map(|s| Arc::clone(&s.store)),
             varstore: self.varstore.as_ref().map(Arc::clone),
         };
-        (
+        Some((
             crate::snapstream::StreamingCapture { control, resident },
             cold_keys,
             stores,
-        )
+        ))
     }
 
     /// Streaming/sidecar counterpart of [`try_engine_snapshot`](Journal::try_engine_snapshot)
@@ -3746,7 +3753,11 @@ impl Journal {
         header_line: &str,
         covered_events: u64,
     ) -> std::io::Result<()> {
-        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts().ok_or_else(|| {
+            std::io::Error::other(
+                "journal fenced after an aborted Raft entry; refusing to snapshot (#1405)",
+            )
+        })?;
         crate::snapstream::write_streaming_snapshot_from_stores(
             path,
             header_line,
@@ -3901,13 +3912,18 @@ impl Journal {
         crate::snapstream::SpillStores,
         u64,
     )> {
+        // Fenced after an aborted Raft entry (#1405): refuse BEFORE validation
+        // can journal anything or the seal can rotate.
+        if self.fenced {
+            return None;
+        }
         self.seg.as_ref()?;
         // Validate + quarantine row-at-a-time (journaling any `VariablesLost`
         // incident BEFORE the seal), collecting the cold keys proven ABSENT so
         // they are excluded from the streaming write. No whole-set fold happens
         // here — each peeked row is dropped before the next is read.
         let absent_cold = self.validate_offheap_for_streaming()?;
-        let (capture, cold_keys, stores) = self.streaming_snapshot_parts();
+        let (capture, cold_keys, stores) = self.streaming_snapshot_parts()?;
         let cold_keys: Vec<Key> = cold_keys
             .into_iter()
             .filter(|k| !absent_cold.contains(k))
