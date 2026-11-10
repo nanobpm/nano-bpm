@@ -21,7 +21,8 @@ import {
   type ScrubAction,
   type Span,
 } from "./agentHistory";
-import { useAgentHistory } from "./useAgentSessions";
+import { useAgentHistory, useLiveTranscript } from "./useAgentSessions";
+import type { LiveBlock } from "./liveTranscript";
 import { Badge, Button, Spinner } from "./ui.tsx";
 
 /// The agent-session scrubber (nano-bpm#1314): one AgentInstance's committed
@@ -64,6 +65,8 @@ export default function AgentSessionPanel({
     error,
   } = useAgentHistory(instance.agentInstanceKey);
   const items = useMemo(() => history ?? [], [history]);
+  // While the run is in flight, a streaming data source shows what it's doing now.
+  const live = useLiveTranscript(instance.agentInstanceKey, active);
 
   return (
     <aside
@@ -127,6 +130,7 @@ export default function AgentSessionPanel({
           active={active}
         />
       )}
+      {live && <LiveTail key={instance.agentInstanceKey} blocks={live} />}
     </aside>
   );
 }
@@ -551,4 +555,72 @@ function fmtMs(ms: number): string {
   // impossible value like `1m60s` (e.g. 119.9s -> `2m0s`).
   const totalSeconds = Math.round(ms / 1000);
   return `${Math.floor(totalSeconds / 60)}m${totalSeconds % 60}s`;
+}
+
+/// The newest few blocks of the live transcript, following the end.
+const LIVE_BLOCKS = 12;
+
+function LiveTail({ blocks }: { blocks: LiveBlock[] }) {
+  const end = useRef<HTMLDivElement>(null);
+  const shown = blocks.slice(-LIVE_BLOCKS);
+  const last = blocks[blocks.length - 1];
+  const fingerprint = last
+    ? last.kind === "text"
+      ? last.text.length
+      : `${last.name}${last.ok}`
+    : 0;
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: "end" });
+  }, [blocks.length, fingerprint]);
+  return (
+    <section
+      aria-label="Live transcript"
+      className="flex max-h-[45%] min-h-[6rem] shrink-0 flex-col border-t border-edge-strong"
+    >
+      <h3 className="flex shrink-0 items-center gap-2 px-4 py-1.5 text-xs font-semibold uppercase tracking-wide text-fg-muted">
+        <span className="h-1.5 w-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
+        Now
+      </h3>
+      <div className="min-h-0 flex-1 space-y-1.5 overflow-auto px-4 pb-3 text-xs">
+        {shown.length === 0 && (
+          <p className="text-fg-muted">Waiting for the agent…</p>
+        )}
+        {shown.map((b, n) =>
+          b.kind === "text" ? (
+            b.role === "user" ? null : (
+              <p
+                key={n}
+                className={`whitespace-pre-wrap break-words ${b.role === "output" ? "font-mono text-fg-muted" : "text-fg"}`}
+              >
+                {b.text}
+                {b.open && (
+                  <span className="ml-0.5 inline-block h-3 w-1.5 bg-accent align-middle motion-safe:animate-pulse" />
+                )}
+              </p>
+            )
+          ) : (
+            <p
+              key={n}
+              className="truncate font-mono"
+              title={b.result || b.detail}
+            >
+              <span
+                className={
+                  b.ok === undefined
+                    ? "text-accent"
+                    : b.ok
+                      ? "text-fg-muted"
+                      : "text-danger"
+                }
+              >
+                {b.ok === undefined ? "⟳" : b.ok ? "✓" : "✗"} {b.name}
+              </span>
+              {b.detail && <span className="text-fg-muted"> {b.detail}</span>}
+            </p>
+          ),
+        )}
+        <div ref={end} />
+      </div>
+    </section>
+  );
 }

@@ -1,6 +1,12 @@
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useExplorerData } from "./dataSource.tsx";
 import { orderHistory } from "./agentHistory.ts";
+import {
+  appendChunks,
+  foldTranscript,
+  type LiveBlock,
+} from "./liveTranscript.ts";
 
 /// React Query keys. Both are in InstanceDetail's `useLiveInvalidation` list, so
 /// every live edge from the data source (on the console: the exported position
@@ -36,4 +42,60 @@ export function useAgentHistory(agentInstanceKey: string | undefined) {
     queryFn: async () =>
       orderHistory(await agents!.getAgentHistory(agentInstanceKey!)),
   });
+}
+
+/// How often an open transcript stream is polled.
+export const LIVE_POLL_MS = 1000;
+
+/// The live tail of one in-flight AgentInstance, when the data source streams
+/// transcripts (`agents.followTranscript`): polled from the last offset while the
+/// stream is open, folded into display blocks. `undefined` when unsupported or
+/// disabled; `[]` until the first event.
+export function useLiveTranscript(
+  agentInstanceKey: string | undefined,
+  enabled: boolean,
+): LiveBlock[] | undefined {
+  const follow = useExplorerData().agents?.followTranscript;
+  const on = enabled && agentInstanceKey !== undefined && follow !== undefined;
+  const [blocks, setBlocks] = useState<LiveBlock[] | undefined>(undefined);
+  useEffect(() => {
+    if (!on) {
+      setBlocks(undefined);
+      return;
+    }
+    let stopped = false;
+    let from = 0;
+    let carry = "";
+    const lines: string[] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    setBlocks([]);
+    const tick = async () => {
+      try {
+        const page = await follow!(agentInstanceKey!, from);
+        if (stopped) return;
+        if (page) {
+          from = page.nextOffset;
+          const r = appendChunks(
+            carry,
+            page.entries.map((e) => e.chunk),
+          );
+          carry = r.carry;
+          if (r.lines.length) {
+            lines.push(...r.lines);
+            setBlocks(foldTranscript(lines));
+          }
+          if (page.status === "completed") return;
+        }
+      } catch {
+        // A failed poll is retried on the next tick.
+      }
+      if (!stopped) timer = setTimeout(tick, LIVE_POLL_MS);
+    };
+    void tick();
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [on, agentInstanceKey, follow]);
+  return blocks;
 }
